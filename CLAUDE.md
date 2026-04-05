@@ -395,6 +395,48 @@ request_timeout_ms = 120000
 
 **Database:** V3 migration adds `channel_sessions` and `channel_messages` tables.
 
+### Thread-Scoped Conversation History
+
+The DB-level session key is composed as `{sender_id}:{thread_id}` in
+`crates/gateway/src/handler.rs` (~L372), so each thread from the same sender
+gets its own conversation history. Parsers are responsible for populating
+`InboundMessage.thread_id` from the platform's native thread identifier:
+
+- **Slack** — `event.thread_ts` (top-level messages leave it `None`)
+- **Teams** — `activity.reply_to_id` (top-level messages leave it `None`)
+- **Discord** — `interaction.channel_id` (Discord threads are first-class channels with distinct IDs)
+- **Google Chat** — `message.thread.name`
+- **Telegram** — `message.message_thread_id` (forum topics)
+
+### Gateway Bindings (Per-Channel Overrides)
+
+`crates/gateway/src/routing.rs` resolves a per-message binding with a 4-tier
+cascade (`channel+sender+peer_kind` → `channel+sender` → `channel` →
+`default`). A matched binding can override `provider`, `model`, `api_key_env`,
+`temperature`, `max_tokens`, `fallback`, `memory_scope`, `identity`,
+`activation`, and `thinking`. This is the idiomatic way to route different
+channels to different LLMs:
+
+```toml
+[[gateway.bindings]]
+channel = "slack"
+sender  = "U12345*"    # glob prefix
+provider = "anthropic"
+model = "claude-sonnet-4"
+memory_scope = "work"
+
+[[gateway.bindings]]
+channel = "telegram"
+provider = "openrouter"
+model = "google/gemini-2.5-flash"
+```
+
+Heartbeat delivery also honors bindings: when a heartbeat channel matches a
+binding, the daemon runs an additional per-channel heartbeat turn with that
+binding's overridden config, so proactive check-ins reach each channel via the
+model it was routed to. Channels without a matching binding reuse the base
+turn (fast path, no extra LLM calls).
+
 ## Sender Pairing (Access Control)
 
 Gateway messages from unknown senders are gated behind a pairing approval system. When an unapproved sender messages the bot, they receive a pairing code challenge. The bot owner approves via CLI or TUI.
@@ -508,7 +550,7 @@ SQLite at `~/.borg/borg.db` with versioned migrations:
 - Each task spawned as independent tokio task with per-job timeout (default 300s, configurable via `timeout_ms`)
 - Failed tasks are recorded with error details in `task_runs` table
 - **Retry with backoff**: Transient failures (timeout, rate limit, 5xx, connection errors) are retried up to `max_retries` (default 3) with exponential backoff (30s → 60s → 5m → 15m → 1h). Non-transient errors skip retry.
-- **Result delivery**: Tasks with `delivery_channel` and `delivery_target` send results (or failure notifications) to Telegram, Slack, or Discord after execution.
+- **Result delivery**: Tasks with `delivery_channel` and `delivery_target` send results (or failure notifications) to Telegram, Slack, or Discord after execution. Use `delivery_channel = "origin"` when scheduling from a chat conversation to reply back into the same channel/thread — the gateway handler stashes the origin context in a task-local (`borg_core::gateway_context`), and the `schedule` tool resolves it at creation time into the real channel + a JSON `delivery_target` carrying sender/thread so the reply threads correctly.
 - **Missed job catch-up**: On daemon startup, tasks overdue by >7 days are skipped and advanced to next run.
 
 ## Cron Jobs
@@ -530,8 +572,9 @@ Proactive check-in system. The `HeartbeatScheduler` (pure timer) emits `Fire` ev
 - **Scheduling**: Interval-based (default `30m`) or cron-based; minimum 60s enforced
 - **Quiet hours**: Default `00:00`–`06:00`, uses `[user] timezone` from config (IANA string, e.g. `America/New_York`)
 - **HEARTBEAT.md**: Optional checklist at `~/.borg/HEARTBEAT.md`; injected into the heartbeat agent turn so the agent can check email, calendar, etc.
-- **Channel delivery**: `heartbeat.channels` list (e.g. `["telegram"]`); delivers to the owner's sender_id from `approved_senders` table
-- **Suppression**: Empty responses and duplicate hash responses are suppressed
+- **Channel delivery**: `heartbeat.channels` list (e.g. `["telegram"]`). Recipient selection: `heartbeat.recipients.<channel>` is a list of sender IDs (use `["*"]` to broadcast to every approved sender for that channel); absence falls back to the first approved sender.
+- **Per-channel model override**: Heartbeat honors gateway bindings — if a binding matches `(channel, sender)`, the daemon re-runs the turn with the binding's overridden provider/model so check-ins reach each channel via the model routed to it.
+- **Suppression**: Empty responses, duplicate hash responses, and zero-info ack-only responses ("ok", "nothing new", "all good", etc.) are suppressed
 - **Poke**: `borg poke` (CLI) or `/poke` (TUI) triggers an immediate heartbeat (bypasses quiet hours). CLI sends HTTP POST to `/internal/poke` on the gateway; TUI sends directly via channel when owning the scheduler
 - **Daemon**: Heartbeat is spawned in `run_daemon()` alongside the gateway; runs without a TUI
 - **TUI**: Heartbeat renders in cyan as `[heartbeat]` prefix in the transcript
