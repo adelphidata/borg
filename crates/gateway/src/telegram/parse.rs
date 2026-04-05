@@ -10,14 +10,33 @@ pub struct TelegramAudioRef {
     pub duration: i32,
 }
 
-/// Extract an `InboundMessage` and optional audio reference from a Telegram update.
+/// Reference to a photo in a Telegram message (for downstream vision download).
+#[derive(Debug, Clone)]
+pub struct TelegramPhotoRef {
+    /// File ID of the largest photo variant to download.
+    pub file_id: String,
+    /// Filename hint for the downloaded image.
+    pub filename: String,
+}
+
+/// Parsed Telegram inbound with optional media references to download post-parse.
+pub struct TelegramParsed {
+    pub inbound: InboundMessage,
+    pub audio: Option<TelegramAudioRef>,
+    pub photo: Option<TelegramPhotoRef>,
+}
+
+/// Extract an `InboundMessage` and optional media references from a Telegram update.
 ///
 /// Handles text messages, media messages (photo, document, video, audio, voice, sticker),
 /// edited messages, callback queries, and forum topic routing.
 /// Returns `None` for service messages (forum_topic_created, etc.) and empty updates.
 ///
-/// When voice or audio is present, returns a `TelegramAudioRef` for downstream transcription.
-pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramAudioRef>)> {
+/// When voice/audio is present, the returned `TelegramParsed.audio` drives
+/// downstream transcription. When a photo is present, `TelegramParsed.photo`
+/// drives downstream download + base64 attachment so vision-capable models
+/// can actually see the image instead of a `"[Photo]"` placeholder.
+pub fn parse_update(update: &Update) -> Option<TelegramParsed> {
     // Try regular message first, then edited message
     if let Some(msg) = update.message.as_ref().or(update.edited_message.as_ref()) {
         // Skip service messages
@@ -27,6 +46,19 @@ pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramA
 
         // Try text first, then caption, then generate placeholder for media
         let mut audio_ref = None;
+        let mut photo_ref = None;
+
+        // Extract the largest photo variant (last entry) so vision-capable
+        // models can see the image. Applies for both bare photos and photos
+        // with captions.
+        if let Some(ref photos) = msg.photo {
+            if let Some(largest) = photos.last() {
+                photo_ref = Some(TelegramPhotoRef {
+                    file_id: largest.file_id.clone(),
+                    filename: format!("photo_{}.jpg", largest.file_unique_id),
+                });
+            }
+        }
 
         let text = if let Some(ref t) = msg.text {
             if t.is_empty() {
@@ -82,8 +114,8 @@ pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramA
             _ => None,
         };
 
-        return Some((
-            InboundMessage {
+        return Some(TelegramParsed {
+            inbound: InboundMessage {
                 sender_id,
                 text,
                 channel_id: Some(msg.chat.id.to_string()),
@@ -95,8 +127,9 @@ pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramA
                 metadata: serde_json::Value::Null,
                 peer_kind,
             },
-            audio_ref,
-        ));
+            audio: audio_ref,
+            photo: photo_ref,
+        });
     }
 
     // Try callback query
@@ -122,8 +155,8 @@ pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramA
                 _ => PEER_KIND_GROUP.to_string(),
             });
 
-        return Some((
-            InboundMessage {
+        return Some(TelegramParsed {
+            inbound: InboundMessage {
                 sender_id: cb.from.id.to_string(),
                 text: data.to_string(),
                 channel_id: chat_id,
@@ -135,8 +168,9 @@ pub fn parse_update(update: &Update) -> Option<(InboundMessage, Option<TelegramA
                 metadata: serde_json::Value::Null,
                 peer_kind,
             },
-            None,
-        ));
+            audio: None,
+            photo: None,
+        });
     }
 
     None
@@ -166,7 +200,7 @@ mod tests {
     #[test]
     fn parse_text_message() {
         let update = text_update("Hello bot");
-        let (msg, audio) = parse_update(&update).unwrap();
+        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.sender_id, "42");
         assert_eq!(msg.text, "Hello bot");
         assert_eq!(msg.channel_id.as_deref(), Some("42"));
@@ -191,7 +225,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "edited text");
     }
 
@@ -214,7 +248,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, audio) = parse_update(&update).unwrap();
+        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.sender_id, "99");
         assert_eq!(msg.text, "btn_click");
         assert_eq!(msg.channel_id.as_deref(), Some("42"));
@@ -238,7 +272,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "Look at this!");
     }
 
@@ -258,7 +292,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "[Photo]");
     }
 
@@ -278,7 +312,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "[Document: report.pdf]");
     }
 
@@ -298,7 +332,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, audio) = parse_update(&update).unwrap();
+        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Voice message]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "abc");
@@ -322,7 +356,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert!(msg.text.starts_with("[Sticker:"));
     }
 
@@ -342,7 +376,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, audio) = parse_update(&update).unwrap();
+        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Audio]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "audio123");
@@ -386,7 +420,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.thread_id.as_deref(), Some("99"));
         assert_eq!(msg.text, "forum message");
     }
@@ -433,7 +467,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.sender_id, "99");
         assert_eq!(msg.text, "inline_click");
         assert!(msg.channel_id.is_none());
@@ -455,7 +489,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.sender_id, "42");
         assert_eq!(msg.channel_id.as_deref(), Some("-100123"));
     }
@@ -463,7 +497,7 @@ mod tests {
     #[test]
     fn private_chat_is_direct_peer_kind() {
         let update = text_update("hello");
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.peer_kind.as_deref(), Some("direct"));
     }
 
@@ -483,7 +517,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.peer_kind.as_deref(), Some("group"));
     }
 
@@ -503,7 +537,7 @@ mod tests {
         )
         .unwrap();
 
-        let (msg, _) = parse_update(&update).unwrap();
+        let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.text, "[Video]");
     }
 }

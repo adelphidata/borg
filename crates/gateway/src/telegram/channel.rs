@@ -60,12 +60,44 @@ impl NativeChannel for TelegramChannel {
         )
         .await
         {
-            Ok(Some(pair)) => pair,
+            Ok(Some(parsed)) => parsed,
             Ok(None) => return Ok(WebhookOutcome::Skip),
             Err(e) => return Err(e),
         };
 
-        let (mut inbound, audio_ref) = parsed;
+        let super::TelegramParsed {
+            mut inbound,
+            audio: audio_ref,
+            photo: photo_ref,
+        } = parsed;
+
+        // Photo download (must happen before enqueue — URLs expire, so we
+        // inline the bytes as a base64 attachment exactly like Slack does).
+        if let Some(ref photo) = photo_ref {
+            match async {
+                let file_info = self.client.get_file(&photo.file_id).await?;
+                let file_path = file_info
+                    .file_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+                let bytes = self.client.download_file(file_path).await?;
+                Ok::<_, anyhow::Error>(bytes)
+            }
+            .await
+            {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    inbound.attachments.push(crate::handler::InboundAttachment {
+                        mime_type: "image/jpeg".to_string(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        filename: Some(photo.filename.clone()),
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!("Telegram photo download failed: {e}");
+                }
+            }
+        }
 
         // Audio transcription (must happen before enqueue — needs file data)
         if let Some(ref audio) = audio_ref {
