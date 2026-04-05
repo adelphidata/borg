@@ -926,8 +926,27 @@ impl LlmClient {
             })
         };
 
+        let cache_enabled = self.llm_config.cache.enabled;
+
         if let Some(sys) = system_text {
-            body["system"] = serde_json::json!(sys);
+            if cache_enabled {
+                // Structured system block with cache_control so the provider can
+                // reuse the (stable) system prompt across turns.
+                body["system"] = serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": sys,
+                        "cache_control": { "type": "ephemeral" },
+                    }
+                ]);
+            } else {
+                body["system"] = serde_json::json!(sys);
+            }
+        }
+
+        let mut anthropic_messages = anthropic_messages;
+        if cache_enabled {
+            apply_message_cache_control(&mut anthropic_messages);
         }
         body["messages"] = serde_json::json!(anthropic_messages);
         if let Some(tools) = anthropic_tools {
@@ -1354,6 +1373,50 @@ fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     result
 }
 
+/// Attach `cache_control: {"type": "ephemeral"}` to the last content block of the
+/// last two messages in-place. This is the rolling "system + last 2 messages" cache
+/// strategy: the system prompt already carries a cache marker, and the two trailing
+/// markers cover the last user turn plus the current assistant/tool context so that
+/// successive turns can hit the provider's cache for the shared prefix.
+///
+/// If a message's `content` is a plain string, it is first upgraded into a single
+/// text content block so it can carry the marker (Anthropic accepts both forms).
+/// Fewer than two eligible messages is fine — we just mark whatever we can.
+fn apply_message_cache_control(messages: &mut [serde_json::Value]) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let mut remaining = 2usize;
+    for msg in messages.iter_mut().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+
+        // Upgrade plain-string content to a single text block so we can attach cache_control.
+        if let Some(s) = content.as_str() {
+            *content = serde_json::json!([{ "type": "text", "text": s }]);
+        }
+
+        let Some(blocks) = content.as_array_mut() else {
+            continue;
+        };
+        let Some(last_block) = blocks.last_mut() else {
+            continue;
+        };
+        if let Some(obj) = last_block.as_object_mut() {
+            obj.insert(
+                "cache_control".to_string(),
+                serde_json::json!({ "type": "ephemeral" }),
+            );
+            remaining -= 1;
+        }
+    }
+}
+
 /// Parse Anthropic non-streaming response into internal Message.
 fn parse_anthropic_response(resp: &serde_json::Value) -> Result<Message> {
     let content_blocks = resp["content"]
@@ -1478,7 +1541,11 @@ mod tests {
         let client = make_test_anthropic_client();
         let body = client.build_anthropic_request(&messages, None, false);
 
-        assert_eq!(body["system"].as_str(), Some("You are helpful."));
+        // With prompt caching enabled by default, system is emitted as a content-block array.
+        let system_blocks = body["system"].as_array().expect("system should be array");
+        assert_eq!(system_blocks.len(), 1);
+        assert_eq!(system_blocks[0]["type"], "text");
+        assert_eq!(system_blocks[0]["text"], "You are helpful.");
 
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
@@ -1816,5 +1883,132 @@ mod tests {
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("reasoning_effort").is_none());
+    }
+
+    // ── Prompt caching (Anthropic) ──
+
+    #[test]
+    fn anthropic_request_includes_cache_control_on_system() {
+        let client = make_test_anthropic_client();
+        let messages = vec![Message::system("stable system prompt"), Message::user("hi")];
+        let body = client.build_anthropic_request(&messages, None, false);
+
+        let system = body["system"]
+            .as_array()
+            .expect("system should be an array of blocks when caching is enabled");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "stable system prompt");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_request_caches_last_two_messages() {
+        let client = make_test_anthropic_client();
+        // 5 user/assistant messages so we can verify ONLY the last two carry markers.
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::user("turn 2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+            Message::user("turn 5"),
+        ];
+        let body = client.build_anthropic_request(&messages, None, false);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5, "system is stripped, 5 user msgs remain");
+
+        // Last two should carry cache_control on their last content block.
+        for idx in [3usize, 4] {
+            let blocks = msgs[idx]["content"].as_array().unwrap();
+            let last = blocks.last().unwrap();
+            assert_eq!(
+                last["cache_control"]["type"], "ephemeral",
+                "msg[{idx}] last block should carry cache_control"
+            );
+        }
+
+        // Earlier messages must NOT carry the marker. They may still be plain strings
+        // (apply_message_cache_control only upgrades the trailing messages it marks).
+        for idx in [0usize, 1, 2] {
+            let content = &msgs[idx]["content"];
+            if let Some(blocks) = content.as_array() {
+                for block in blocks {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "msg[{idx}] should not carry cache_control"
+                    );
+                }
+            } else {
+                assert!(
+                    content.is_string(),
+                    "msg[{idx}] content should be string or block array"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anthropic_request_cache_disabled_emits_no_markers() {
+        let env_var = "BORG_TEST_ANTHROPIC_CACHE_OFF";
+        std::env::set_var(env_var, "sk-test");
+        let mut config = Config::default();
+        config.llm.provider = Some("anthropic".to_string());
+        config.llm.api_key_env = env_var.to_string();
+        config.llm.model = "claude-sonnet-4".to_string();
+        config.llm.cache.enabled = false;
+        let client = LlmClient::new(&config).unwrap();
+
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("first"),
+            Message::user("second"),
+        ];
+        let body = client.build_anthropic_request(&messages, None, false);
+
+        // System reverts to a plain string.
+        assert_eq!(body["system"].as_str(), Some("sys"));
+
+        // No cache_control markers anywhere in messages.
+        let msgs = body["messages"].as_array().unwrap();
+        for msg in msgs {
+            if let Some(blocks) = msg["content"].as_array() {
+                for block in blocks {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "no cache_control expected when caching disabled"
+                    );
+                }
+            }
+        }
+        std::env::remove_var(env_var);
+    }
+
+    #[test]
+    fn apply_message_cache_control_handles_fewer_than_two_messages() {
+        let mut msgs = vec![serde_json::json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "only one" }],
+        })];
+        apply_message_cache_control(&mut msgs);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn apply_message_cache_control_upgrades_string_content() {
+        // Plain-string content is upgraded to a single text block so cache_control can attach.
+        let mut msgs = vec![
+            serde_json::json!({ "role": "user", "content": "earlier" }),
+            serde_json::json!({ "role": "user", "content": "latest" }),
+        ];
+        apply_message_cache_control(&mut msgs);
+        for msg in &msgs {
+            let blocks = msg["content"]
+                .as_array()
+                .expect("string content should have been upgraded to a block array");
+            assert_eq!(blocks[0]["type"], "text");
+            assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        }
     }
 }

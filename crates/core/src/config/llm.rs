@@ -88,6 +88,27 @@ pub struct LlmConfig {
     /// Only used when provider is `claude-cli`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_cli_path: Option<String>,
+    /// Prompt caching configuration (currently only used by the native Anthropic provider).
+    #[serde(default)]
+    pub cache: PromptCacheConfig,
+}
+
+/// Prompt caching configuration.
+///
+/// When enabled and the provider supports it (currently: Anthropic), the LLM client
+/// attaches `cache_control` markers to the system prompt and the last two non-system
+/// messages, allowing the provider to reuse cached prefixes across turns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromptCacheConfig {
+    /// Whether prompt caching is enabled.
+    pub enabled: bool,
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Default for LlmConfig {
@@ -108,6 +129,7 @@ impl Default for LlmConfig {
             fallback: Vec::new(),
             thinking: ThinkingLevel::Off,
             claude_cli_path: None,
+            cache: PromptCacheConfig::default(),
         }
     }
 }
