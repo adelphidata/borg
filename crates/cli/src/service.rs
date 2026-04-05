@@ -846,8 +846,7 @@ async fn send_telegram(config: &Config, target: &DeliveryTarget, msg: &str) -> a
         .map_err(|_| anyhow::anyhow!("invalid chat_id: {}", target.sender))?;
     // Telegram forum topics use message_thread_id (i32); our string thread_id
     // carries that value when the task was spawned from a forum topic.
-    let message_thread_id: Option<i64> =
-        target.thread_id.as_deref().and_then(|s| s.parse().ok());
+    let message_thread_id: Option<i64> = target.thread_id.as_deref().and_then(|s| s.parse().ok());
     let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
     client
         .send_message(chat_id, msg, None, None, message_thread_id)
@@ -926,9 +925,9 @@ pub fn is_zero_info_heartbeat(response: &str) -> bool {
     if normalized.len() > 40 {
         return false;
     }
-    TRIVIAL_PATTERNS
-        .iter()
-        .any(|pat| normalized == *pat || normalized == format!("{pat}.") || normalized == format!("{pat}!"))
+    TRIVIAL_PATTERNS.iter().any(|pat| {
+        normalized == *pat || normalized == format!("{pat}.") || normalized == format!("{pat}!")
+    })
 }
 
 /// Shared heartbeat turn: creates a temporary agent, sends the heartbeat message

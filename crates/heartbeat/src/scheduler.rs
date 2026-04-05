@@ -340,6 +340,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
         let sched = test_scheduler(config, chrono_tz::UTC);
         assert!(!sched.is_quiet_hours());
@@ -353,6 +354,7 @@ mod tests {
             quiet_hours_end: Some("also-bad".to_string()),
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
         let sched = test_scheduler(config, chrono_tz::UTC);
         assert!(!sched.is_quiet_hours());
@@ -366,6 +368,7 @@ mod tests {
             quiet_hours_end: Some("06:00".to_string()),
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
         // Verify the timezone field is used and doesn't panic
         let sched = test_scheduler(config, chrono_tz::US::Eastern);
@@ -389,6 +392,7 @@ mod tests {
             quiet_hours_end: Some("06:00".to_string()),
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
         let sched = test_scheduler(config, chrono_tz::UTC);
         // This test just ensures the wrap-around path doesn't panic.
@@ -404,6 +408,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
         let sched = test_scheduler(config, chrono_tz::UTC);
         // Missing end => not quiet
@@ -418,6 +423,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (_poke_tx, poke_rx) = mpsc::channel(1);
@@ -446,6 +452,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(8);
@@ -483,6 +490,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(8);
@@ -511,6 +519,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(1);
@@ -540,6 +549,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(8);
@@ -571,6 +581,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(8);
@@ -602,6 +613,7 @@ mod tests {
             quiet_hours_end: None,
             cron: Some("not-a-cron-expression".to_string()),
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(8);
@@ -633,6 +645,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (_poke_tx, poke_rx) = mpsc::channel(1);
@@ -677,6 +690,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (poke_tx, poke_rx) = mpsc::channel(16);
@@ -714,6 +728,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (_poke_tx, poke_rx) = mpsc::channel(8);
@@ -752,6 +767,7 @@ mod tests {
             quiet_hours_end: Some("23:59".to_string()),
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (_poke_tx, poke_rx) = mpsc::channel(1);
@@ -808,6 +824,7 @@ mod tests {
             quiet_hours_end: None,
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         };
 
         let (_wake_tx, wake_rx) = mpsc::channel(8);

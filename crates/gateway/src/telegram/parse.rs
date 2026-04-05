@@ -200,7 +200,8 @@ mod tests {
     #[test]
     fn parse_text_message() {
         let update = text_update("Hello bot");
-        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
+        let p = parse_update(&update).unwrap();
+        let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.sender_id, "42");
         assert_eq!(msg.text, "Hello bot");
         assert_eq!(msg.channel_id.as_deref(), Some("42"));
@@ -248,7 +249,8 @@ mod tests {
         )
         .unwrap();
 
-        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
+        let p = parse_update(&update).unwrap();
+        let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.sender_id, "99");
         assert_eq!(msg.text, "btn_click");
         assert_eq!(msg.channel_id.as_deref(), Some("42"));
@@ -332,7 +334,8 @@ mod tests {
         )
         .unwrap();
 
-        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
+        let p = parse_update(&update).unwrap();
+        let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Voice message]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "abc");
@@ -376,7 +379,8 @@ mod tests {
         )
         .unwrap();
 
-        let p = parse_update(&update).unwrap(); let (msg, audio) = (p.inbound, p.audio);
+        let p = parse_update(&update).unwrap();
+        let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Audio]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "audio123");

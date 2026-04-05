@@ -36,7 +36,7 @@ where
 
 /// Return the current task's gateway origin context, if any.
 pub fn current() -> Option<GatewayOriginContext> {
-    ORIGIN.try_with(|ctx| ctx.clone()).ok()
+    ORIGIN.try_with(Clone::clone).ok()
 }
 
 #[cfg(test)]
