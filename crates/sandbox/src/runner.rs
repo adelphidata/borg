@@ -69,6 +69,13 @@ impl<'a> ScriptRunner<'a> {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // Security: clear the parent environment so sandboxed scripts never
+        // inherit provider API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, ...),
+        // SSH_AUTH_SOCK, AWS credentials, or any other ambient secret.
+        // Only a minimal safe set plus explicitly-declared `extra_env` entries
+        // (from the manifest's credential bindings) are forwarded.
+        cmd.env_clear();
+        apply_minimal_safe_env(&mut cmd);
         for (key, val) in self.extra_env {
             cmd.env(key, val);
         }
@@ -280,6 +287,20 @@ pub fn validate_script_path(base_dir: &Path, script_name: &str) -> Result<std::p
     Ok(canonical_script)
 }
 
+/// Forward only the parent environment variables that runtimes genuinely
+/// need (PATH, HOME, locale, temp dir). Everything else is stripped.
+fn apply_minimal_safe_env(cmd: &mut Command) {
+    const SAFE_VARS: &[&str] = &[
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
+        "TEMP", "TMP", "TERM",
+    ];
+    for key in SAFE_VARS {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
+}
+
 /// Resolve a runtime string to a (program, base_args) pair.
 pub fn resolve_runtime(runtime: &str, work_dir: &Path) -> Result<(String, Vec<String>)> {
     match runtime {
@@ -489,6 +510,50 @@ mod tests {
         let output = runner.run(r#"{"key":"value"}"#).await.unwrap();
         assert!(output.success());
         assert_eq!(output.stdout.trim(), r#"{"key":"value"}"#);
+    }
+
+    #[tokio::test]
+    async fn run_does_not_leak_parent_env_to_child() {
+        let leak_key = format!("BORG_TEST_SECRET_LEAK_{}", std::process::id());
+        // SAFETY: single-threaded test setup; no other thread is reading env.
+        unsafe {
+            std::env::set_var(&leak_key, "should-not-leak");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("dump.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/bash\necho \"VAL=${{{leak_key}:-(unset)}}\"\n"),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let runner = ScriptRunner {
+            runtime: "bash",
+            script_path: &script,
+            work_dir: dir.path(),
+            sandbox_policy: SandboxPolicy::default(),
+            timeout_ms: 5000,
+            extra_env: &[],
+            name: "leak-test",
+        };
+        let output = runner.run("{}").await.unwrap();
+
+        // SAFETY: cleanup
+        unsafe {
+            std::env::remove_var(&leak_key);
+        }
+
+        assert!(output.success(), "script failed: {}", output.stderr);
+        assert!(
+            output.stdout.contains("VAL=(unset)"),
+            "parent env leaked into sandboxed child: {}",
+            output.stdout
+        );
     }
 
     #[tokio::test]

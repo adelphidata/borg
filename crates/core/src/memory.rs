@@ -481,6 +481,27 @@ pub struct MemoryFileInfo {
     pub modified_at: Option<chrono::DateTime<chrono::Local>>,
 }
 
+/// Check whether any component of `path` exactly matches an entry in `blocked`.
+/// This is used to detect blocked names in symlink paths before canonicalization
+/// resolves (and thus hides) the link name.
+fn path_has_blocked_component(path: &std::path::Path, blocked: &[String]) -> bool {
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy();
+        for entry in blocked {
+            // Support multi-component entries like ".config/gh"
+            let entry_path = std::path::Path::new(entry.as_str());
+            let entry_components: Vec<_> = entry_path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            if entry_components.len() == 1 && name == entry_components[0] {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Scan extra paths for .md files. Returns (relative_name, full_path) pairs.
 /// Paths support `~` expansion. Non-existent directories are silently skipped.
 /// Paths matching `blocked_paths` (from security config) are rejected.
@@ -491,13 +512,35 @@ pub fn scan_extra_paths(
     let mut files = Vec::new();
     for raw_path in extra_paths {
         let expanded = shellexpand::tilde(raw_path).to_string();
-        let dir = std::path::PathBuf::from(&expanded);
 
-        // Security: reject paths in blocked_paths
-        if crate::tool_handlers::is_blocked_path(&dir, blocked_paths) {
+        // Canonicalize after tilde expansion; reject traversal and inaccessible paths
+        let canonical = match std::fs::canonicalize(&expanded) {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("Extra path not found or inaccessible: {raw_path}");
+                continue;
+            }
+        };
+
+        // Security: reject paths in blocked_paths.
+        //
+        // We must check the *pre-canonicalize* expanded path in addition to the
+        // canonical one, because `is_blocked_path` re-canonicalizes internally and
+        // thereby resolves symlinks — a symlink named `.aws` pointing elsewhere
+        // would lose its blocked component name after resolution.  By checking both
+        // forms we catch:
+        //   • symlinks whose *link name* matches a blocked component (expanded check)
+        //   • traversal through an innocuous link into a real blocked directory
+        //     (canonical check, e.g. a symlink pointing into ~/.ssh/)
+        let expanded_path = std::path::PathBuf::from(&expanded);
+        if path_has_blocked_component(&expanded_path, blocked_paths)
+            || crate::tool_handlers::is_blocked_path(&canonical, blocked_paths, &[])
+        {
             tracing::warn!("Extra path '{}' is in blocked_paths, skipping", raw_path);
             continue;
         }
+
+        let dir = canonical;
 
         if dir.is_file() && dir.extension().is_some_and(|e| e == "md") {
             let name = format!(
@@ -1034,6 +1077,41 @@ mod tests {
         // Only .md files should be included
         assert_eq!(files.len(), 1);
         assert!(files[0].0.contains("notes.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_extra_paths_rejects_symlink_to_blocked() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a "safe" dir that is actually a symlink to a blocked-ish path
+        let real_dir = tempfile::tempdir().unwrap();
+        std::fs::write(real_dir.path().join("secret.md"), "secret content").unwrap();
+        let link_dir = tmp.path().join(".aws");
+        symlink(real_dir.path(), &link_dir).unwrap();
+
+        // With ".aws" in blocked_paths the symlink should be rejected
+        let files = scan_extra_paths(
+            &[link_dir.to_string_lossy().to_string()],
+            &[".aws".to_string()],
+        );
+        assert!(
+            files.is_empty(),
+            "symlink pointing into blocked path should be rejected"
+        );
+    }
+
+    #[test]
+    fn scan_extra_paths_rejects_nonexistent_path() {
+        // Canonicalize fails on non-existent paths; they should be silently skipped
+        let files = scan_extra_paths(
+            &["/nonexistent/path/that/cannot/exist/xyz123".to_string()],
+            &[],
+        );
+        assert!(
+            files.is_empty(),
+            "non-existent path should be skipped silently"
+        );
     }
 
     #[test]

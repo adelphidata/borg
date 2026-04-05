@@ -118,7 +118,7 @@ jobs:
           cd artifacts
           sha256sum *.tar.gz *.zip 2>/dev/null > checksums.txt || true
           cat checksums.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2
         with:
           tag_name: ${{ needs.tag.outputs.tag || github.ref_name }}
           name: ${{ needs.tag.outputs.tag || github.ref_name }}

@@ -99,9 +99,12 @@ sha256_verify() {
         actual=$(sha256sum "$file" | awk '{print $1}')
     elif has_command shasum; then
         actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    elif has_command openssl; then
+        actual=$(openssl dgst -sha256 -r "$file" | awk '{print $1}')
     else
-        warn "No sha256sum or shasum found — skipping checksum verification"
-        return 0
+        error "Cannot verify checksum: none of sha256sum, shasum, or openssl found."
+        error "Install one of these tools and retry."
+        return 1
     fi
     if [[ "$actual" != "$expected" ]]; then
         error "Checksum mismatch!"
@@ -264,18 +267,22 @@ download_and_install() {
     download "$base_url/$asset" "$archive"
 
     info "Downloading checksums..."
-    if download "$base_url/$checksum_asset" "$checksums" 2>/dev/null; then
-        local expected
-        expected=$(grep "$asset" "$checksums" | awk '{print $1}')
-        if [[ -n "$expected" ]]; then
-            sha256_verify "$archive" "$expected"
-            success "Checksum verified"
-        else
-            warn "No checksum entry found for $asset — skipping verification"
-        fi
-    else
-        warn "Could not download checksums — skipping verification"
+    if ! download "$base_url/$checksum_asset" "$checksums"; then
+        error "Failed to download checksums.txt — cannot verify binary integrity."
+        error "This may indicate a network issue or a tampered release."
+        exit 1
     fi
+
+    local expected
+    expected=$(grep "$asset" "$checksums" | awk '{print $1}')
+    if [[ -z "$expected" ]]; then
+        error "No checksum entry found for $asset in checksums.txt"
+        error "The release may be incomplete or corrupted."
+        exit 1
+    fi
+
+    sha256_verify "$archive" "$expected" || exit 1
+    success "Checksum verified"
 
     # Extract
     tar xzf "$archive" -C "$TMPDIR_INSTALL"

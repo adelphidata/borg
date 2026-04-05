@@ -64,9 +64,20 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_no_token() {
+    fn full_flow_no_token_fails_closed() {
         let body = message_body();
-        let result = handle_google_chat_webhook(&body, None).unwrap();
+        let result = handle_google_chat_webhook(&body, None);
+        assert!(
+            result.is_err(),
+            "must fail when no expected token is configured"
+        );
+        assert!(result.unwrap_err().to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn full_flow_with_valid_token() {
+        let body = message_body();
+        let result = handle_google_chat_webhook(&body, Some("test-token")).unwrap();
         let msg = result.unwrap();
         assert_eq!(msg.sender_id, "users/USER1");
         assert_eq!(msg.text, "hello");
@@ -75,13 +86,6 @@ mod tests {
             msg.thread_id.as_deref(),
             Some("spaces/SPACE1/threads/THREAD1")
         );
-    }
-
-    #[test]
-    fn full_flow_with_valid_token() {
-        let body = message_body();
-        let result = handle_google_chat_webhook(&body, Some("test-token")).unwrap();
-        assert!(result.is_some());
     }
 
     #[test]
@@ -102,10 +106,11 @@ mod tests {
     fn non_message_event_returns_none() {
         let body = r#"{
             "type": "ADDED_TO_SPACE",
+            "token": "test-token",
             "space": {"name": "spaces/SPACE1", "type": "DM"},
             "user": {"name": "users/USER1", "type": "HUMAN"}
         }"#;
-        let result = handle_google_chat_webhook(body, None).unwrap();
+        let result = handle_google_chat_webhook(body, Some("test-token")).unwrap();
         assert!(result.is_none());
     }
 
@@ -113,6 +118,7 @@ mod tests {
     fn bot_message_returns_none() {
         let body = r#"{
             "type": "MESSAGE",
+            "token": "test-token",
             "message": {
                 "name": "spaces/SPACE1/messages/MSG1",
                 "sender": {
@@ -124,7 +130,7 @@ mod tests {
             },
             "space": {"name": "spaces/SPACE1"}
         }"#;
-        let result = handle_google_chat_webhook(body, None).unwrap();
+        let result = handle_google_chat_webhook(body, Some("test-token")).unwrap();
         assert!(result.is_none());
     }
 
@@ -132,6 +138,7 @@ mod tests {
     fn message_without_text_returns_none() {
         let body = r#"{
             "type": "MESSAGE",
+            "token": "test-token",
             "message": {
                 "name": "spaces/SPACE1/messages/MSG1",
                 "sender": {
@@ -141,7 +148,7 @@ mod tests {
             },
             "space": {"name": "spaces/SPACE1"}
         }"#;
-        let result = handle_google_chat_webhook(body, None).unwrap();
+        let result = handle_google_chat_webhook(body, Some("test-token")).unwrap();
         assert!(result.is_none());
     }
 

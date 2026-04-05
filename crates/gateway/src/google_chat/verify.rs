@@ -8,17 +8,18 @@ use super::types::ChatEvent;
 /// in every event payload. This function compares the event's token against
 /// the expected value using constant-time comparison.
 ///
-/// If `expected_token` is `None`, verification is skipped (not configured).
+/// If `expected_token` is `None` or empty, verification **fails closed**:
+/// unauthenticated webhooks are rejected. Set `GOOGLE_CHAT_WEBHOOK_TOKEN`
+/// to enable the channel.
 pub fn verify_google_chat_token(event: &ChatEvent, expected_token: Option<&str>) -> Result<()> {
     let expected = match expected_token {
-        Some(t) => t,
-        None => {
-            tracing::warn!(
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            bail!(
                 "Google Chat webhook verification token not configured — \
-                 accepting message without verification. Set GOOGLE_CHAT_WEBHOOK_TOKEN \
-                 to enable verification."
+                 refusing to accept unverified webhook. Set \
+                 GOOGLE_CHAT_WEBHOOK_TOKEN to enable this channel."
             );
-            return Ok(());
         }
     };
 
@@ -66,15 +67,28 @@ mod tests {
     }
 
     #[test]
-    fn no_token_configured_skips_verification() {
+    fn no_token_configured_fails_closed() {
         let event = make_event(None);
-        assert!(verify_google_chat_token(&event, None).is_ok());
+        let result = verify_google_chat_token(&event, None);
+        assert!(result.is_err(), "must reject when token is not configured");
+        assert!(result.unwrap_err().to_string().contains("not configured"));
     }
 
     #[test]
-    fn no_token_configured_with_token_in_event_skips() {
+    fn no_token_configured_with_token_in_event_fails_closed() {
         let event = make_event(Some("some-token"));
-        assert!(verify_google_chat_token(&event, None).is_ok());
+        let result = verify_google_chat_token(&event, None);
+        assert!(result.is_err(), "must reject even if event carries a token");
+    }
+
+    #[test]
+    fn empty_expected_token_fails_closed() {
+        let event = make_event(Some("some-token"));
+        let result = verify_google_chat_token(&event, Some(""));
+        assert!(
+            result.is_err(),
+            "empty expected token must be treated as unconfigured"
+        );
     }
 
     #[test]

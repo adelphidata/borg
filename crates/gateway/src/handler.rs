@@ -92,6 +92,22 @@ impl InboundMessage {
     }
 }
 
+/// Sanitize a thread_id to prevent session key confusion via delimiter injection.
+///
+/// Allows alphanumeric characters, dots, hyphens, and underscores — enough to
+/// cover all real platform formats (Slack `thread_ts` like `1234567890.123456`,
+/// Discord numeric IDs, Google Chat `spaces/*/threads/*` stripped to the leaf,
+/// Telegram integer IDs). Colons are intentionally excluded because the session
+/// key is composed as `{sender_id}:{thread_id}`, so an injected colon would
+/// corrupt the key structure. Length is capped at 128 characters.
+fn sanitize_thread_id(thread_id: &str) -> String {
+    thread_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .take(128)
+        .collect()
+}
+
 /// Process a webhook request for a channel end-to-end.
 #[instrument(skip_all, fields(channel = %channel.manifest.name))]
 pub async fn handle_webhook(
@@ -399,7 +415,7 @@ async fn invoke_agent_inner(
 
     // Resolve session — include thread_id and binding_id in the key for isolation
     let base_key = match &inbound.thread_id {
-        Some(tid) => format!("{}:{}", inbound.sender_id, tid),
+        Some(tid) => format!("{}:{}", inbound.sender_id, sanitize_thread_id(tid)),
         None => inbound.sender_id.clone(),
     };
     let session_key = if route.binding_id != "default" {

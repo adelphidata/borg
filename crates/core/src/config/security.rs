@@ -44,7 +44,14 @@ impl Default for SandboxConfig {
 #[serde(default)]
 pub struct SecurityConfig {
     pub secret_detection: bool,
+    /// Path component names that, when present anywhere in a canonicalized
+    /// file path, cause file-read/list operations to be denied.
     pub blocked_paths: Vec<String>,
+    /// Explicit allow list that overrides [`blocked_paths`]. Each entry is a
+    /// tilde-expandable prefix; any file whose canonical path starts with one
+    /// of these is allowed regardless of blocklist matches.
+    #[serde(default)]
+    pub allowed_paths: Vec<String>,
     pub host_audit: bool,
     #[serde(default)]
     pub action_limits: crate::rate_guard::ActionLimits,
@@ -69,6 +76,7 @@ impl Default for SecurityConfig {
                 "credentials".into(),
                 "private_key".into(),
             ],
+            allowed_paths: Vec::new(),
             host_audit: true,
             action_limits: crate::rate_guard::ActionLimits::default(),
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
@@ -93,6 +101,7 @@ mod tests {
         assert!(cfg.blocked_paths.contains(&".env".to_string()));
         assert!(cfg.blocked_paths.contains(&"credentials".to_string()));
         assert!(cfg.blocked_paths.contains(&"private_key".to_string()));
+        assert!(cfg.allowed_paths.is_empty());
     }
 
     #[test]
@@ -117,6 +126,15 @@ mod tests {
         assert!(cfg.blocked_paths.is_empty());
         // other defaults still apply
         assert!(cfg.secret_detection);
+    }
+
+    #[test]
+    fn security_config_allowed_paths() {
+        let toml_str = r#"
+            allowed_paths = ["~/work/.env", "/opt/secrets"]
+        "#;
+        let cfg: SecurityConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.allowed_paths.len(), 2);
     }
 
     #[test]

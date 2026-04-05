@@ -41,12 +41,15 @@ pub fn verify_twilio_signature(
 }
 
 /// Compute the expected Twilio signature for a request.
-/// Returns an error if HMAC key construction fails (shouldn't happen with byte keys).
+/// Returns an error if HMAC key construction fails or body parsing fails.
 pub fn compute_signature(url: &str, body: &str, auth_token: &str) -> Result<String> {
     let mut data_string = url.to_string();
 
-    // Parse form-urlencoded params and sort alphabetically
-    let mut params: Vec<(String, String)> = serde_urlencoded::from_str(body).unwrap_or_default();
+    // Parse form-urlencoded params and sort alphabetically.
+    // Fail closed on malformed bodies — unwrap_or_default would let an
+    // attacker submit an empty param vector, altering the HMAC input.
+    let mut params: Vec<(String, String)> = serde_urlencoded::from_str(body)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Twilio webhook body: {e}"))?;
     params.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (key, value) in &params {
@@ -160,6 +163,21 @@ mod tests {
         assert_eq!(
             compute_signature(url, body1, token).unwrap(),
             compute_signature(url, body2, token).unwrap()
+        );
+    }
+
+    #[test]
+    fn body_with_params_differs_from_empty() {
+        // Verify that params are actually included in the signature, so
+        // an attacker can't strip params and reuse a signature computed
+        // against empty params (the old unwrap_or_default risk).
+        let url = "https://example.com/wh";
+        let token = "tok";
+        let sig_with_params = compute_signature(url, "Key=Value", token).unwrap();
+        let sig_empty = compute_signature(url, "", token).unwrap();
+        assert_ne!(
+            sig_with_params, sig_empty,
+            "signatures must differ when params are present vs absent"
         );
     }
 }

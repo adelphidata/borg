@@ -77,7 +77,11 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
     let canonical = base.canonicalize().unwrap_or_else(|_| base.clone());
 
     // Security: reuse the same blocked-path check as read_file
-    if is_blocked_path(&canonical, &config.security.blocked_paths) {
+    if is_blocked_path(
+        &canonical,
+        &config.security.blocked_paths,
+        &config.security.allowed_paths,
+    ) {
         return Ok(format!("Access denied: {path_str} is in a blocked path"));
     }
 
@@ -92,6 +96,7 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
         0,
         include_hidden,
         &config.security.blocked_paths,
+        &config.security.allowed_paths,
         &mut output,
     )?;
     if output.is_empty() {
@@ -100,12 +105,14 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn list_dir_recursive(
     dir: &std::path::Path,
     max_depth: usize,
     current_depth: usize,
     include_hidden: bool,
     blocked_paths: &[String],
+    allowed_paths: &[String],
     output: &mut String,
 ) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(Result::ok).collect();
@@ -125,9 +132,26 @@ fn list_dir_recursive(
             Err(_) => continue,
         };
 
-        // Security: check each entry against blocked paths before displaying/recursing
-        let entry_canonical = entry.path().canonicalize().unwrap_or_else(|_| entry.path());
-        if is_blocked_path(&entry_canonical, blocked_paths) {
+        // Security: check each entry against blocked paths before displaying/
+        // recursing. For symlinks we must resolve the target too — an
+        // unresolved link would be a bypass (e.g. `decoy -> ~/.ssh/id_rsa`).
+        // If canonicalization fails for a symlink, treat it as blocked
+        // rather than falling through to the raw path.
+        let raw_path = entry.path();
+        let is_link = ft.is_symlink();
+        let blocked = if is_link {
+            match raw_path.canonicalize() {
+                Ok(target) => is_blocked_path(&target, blocked_paths, allowed_paths),
+                // Broken/unresolvable symlink: hide it rather than leaking
+                // the raw link target string.
+                Err(_) => true,
+            }
+        } else {
+            let entry_canonical = raw_path.canonicalize().unwrap_or_else(|_| raw_path.clone());
+            is_blocked_path(&entry_canonical, blocked_paths, allowed_paths)
+        };
+
+        if blocked {
             output.push_str(&format!("{indent}[blocked] {name_str}\n"));
             continue;
         }
@@ -136,16 +160,17 @@ fn list_dir_recursive(
             output.push_str(&format!("{indent}[dir]  {name_str}/\n"));
             if current_depth < max_depth {
                 list_dir_recursive(
-                    &entry.path(),
+                    &raw_path,
                     max_depth,
                     current_depth + 1,
                     include_hidden,
                     blocked_paths,
+                    allowed_paths,
                     output,
                 )?;
             }
-        } else if ft.is_symlink() {
-            let target = std::fs::read_link(entry.path())
+        } else if is_link {
+            let target = std::fs::read_link(&raw_path)
                 .map(|t| t.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "?".to_string());
             output.push_str(&format!("{indent}[link] {name_str} -> {target}\n"));
@@ -200,18 +225,94 @@ const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "svg",
 ];
 
-/// Check whether `path` falls under any of the configured blocked paths.
-pub fn is_blocked_path(path: &std::path::Path, blocked: &[String]) -> bool {
-    let Some(home) = dirs::home_dir() else {
-        // Can't verify — deny by default
-        return true;
-    };
-    for entry in blocked {
-        let blocked_abs = home.join(entry);
-        if path.starts_with(&blocked_abs) {
+/// Check whether `path` is denied by the configured blocklist, taking the
+/// allow list into account.
+///
+/// Matching rules:
+/// 1. The path is canonicalized first (resolves symlinks, `..`, and
+///    tilde-expanded entries on the allow list). If canonicalization fails
+///    for a path that doesn't exist, the original path is used — this is
+///    fine because nonexistent paths are handled separately by callers.
+/// 2. If the canonical path starts with any entry in `allowed_paths`,
+///    access is allowed regardless of blocklist matches. This is the
+///    escape hatch for specific `.env` files or `.aws/` directories that
+///    the user legitimately wants the agent to read.
+/// 3. Otherwise, access is denied if **any path component** of the
+///    canonical path matches an entry in `blocked`. Blocked entries may be
+///    single components (e.g. `.ssh`) or multi-component suffixes (e.g.
+///    `.config/gh`) — both forms are supported.
+///
+/// This deliberately does **not** jail access to `$HOME` or CWD: absolute
+/// paths to non-sensitive files elsewhere on the system
+/// (`/etc/hosts`, `/Users/you/other-project/...`, `../sibling/file.rs`)
+/// remain fully accessible, as does cross-directory navigation via `@`.
+pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[String]) -> bool {
+    // Canonicalize so we make decisions on the real on-disk path. If
+    // canonicalization fails (path doesn't exist, permissions), fall back to
+    // the literal path — callers handle nonexistent paths separately.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // 1. Allow list: if the canonical path is under any allowed prefix,
+    //    short-circuit to allow. Entries support tilde expansion.
+    for raw_entry in allowed {
+        let expanded = shellexpand::tilde(raw_entry).into_owned();
+        let entry_path = std::path::PathBuf::from(&expanded);
+        // Canonicalize the allow entry too, so `~/work/.aws` and
+        // `/Users/me/work/.aws` compare equal.
+        let entry_canonical = entry_path.canonicalize().unwrap_or(entry_path);
+        if canonical.starts_with(&entry_canonical) {
+            return false;
+        }
+    }
+
+    // 2. Block list: match any component or multi-component suffix against
+    //    the canonical path's components.
+    for raw_entry in blocked {
+        if path_contains_blocked_entry(&canonical, raw_entry) {
             return true;
         }
     }
+
+    false
+}
+
+/// Returns `true` if `path` contains `entry` as a contiguous sequence of
+/// components. `entry` may itself be multi-component (e.g. `.config/gh`).
+fn path_contains_blocked_entry(path: &std::path::Path, entry: &str) -> bool {
+    // Split the entry into components, tolerating both forward slashes and
+    // the platform separator.
+    let entry_components: Vec<&std::ffi::OsStr> = std::path::Path::new(entry)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    if entry_components.is_empty() {
+        return false;
+    }
+
+    let path_components: Vec<&std::ffi::OsStr> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+
+    if path_components.len() < entry_components.len() {
+        return false;
+    }
+
+    // Sliding window match.
+    for start in 0..=path_components.len() - entry_components.len() {
+        let window = &path_components[start..start + entry_components.len()];
+        if window == entry_components.as_slice() {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -250,7 +351,11 @@ pub fn handle_read_file(args: &serde_json::Value, config: &Config) -> Result<Too
     }
 
     // Security: check blocked paths
-    if is_blocked_path(&canonical, &config.security.blocked_paths) {
+    if is_blocked_path(
+        &canonical,
+        &config.security.blocked_paths,
+        &config.security.allowed_paths,
+    ) {
         return Ok(ToolOutput::Text(format!(
             "Access denied: {raw_path} is in a blocked path."
         )));
@@ -621,7 +726,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let path = home.join(".ssh/id_rsa");
         let blocked = vec![".ssh".to_string()];
-        assert!(is_blocked_path(&path, &blocked));
+        assert!(is_blocked_path(&path, &blocked, &[]));
     }
 
     #[test]
@@ -629,7 +734,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let path = home.join("Documents/safe.txt");
         let blocked = vec![".ssh".to_string(), ".aws".to_string()];
-        assert!(!is_blocked_path(&path, &blocked));
+        assert!(!is_blocked_path(&path, &blocked, &[]));
     }
 
     #[test]
@@ -637,7 +742,7 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let path = home.join(".aws/credentials/secret");
         let blocked = vec![".aws".to_string()];
-        assert!(is_blocked_path(&path, &blocked));
+        assert!(is_blocked_path(&path, &blocked, &[]));
     }
 
     #[test]
@@ -645,14 +750,31 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         let path = home.join(".ssh/id_rsa");
         let blocked: Vec<String> = vec![];
-        assert!(!is_blocked_path(&path, &blocked));
+        assert!(!is_blocked_path(&path, &blocked, &[]));
     }
 
     #[test]
     fn is_blocked_path_outside_home() {
         let blocked = vec![".ssh".to_string()];
         let path = std::path::Path::new("/tmp/.ssh/id_rsa");
-        assert!(!is_blocked_path(path, &blocked));
+        assert!(is_blocked_path(path, &blocked, &[]));
+    }
+
+    #[test]
+    fn is_blocked_path_allowed_overrides_blocked() {
+        let home = dirs::home_dir().unwrap();
+        let path = home.join(".env.example");
+        let blocked = vec![".env".to_string()];
+        // The path has ".env" as a substring of the component ".env.example"
+        // but component matching should only match exact components
+        assert!(!is_blocked_path(&path, &blocked, &[]));
+    }
+
+    #[test]
+    fn is_blocked_path_absolute_path_not_under_home() {
+        let blocked = vec![".aws".to_string()];
+        let path = std::path::Path::new("/etc/hosts");
+        assert!(!is_blocked_path(path, &blocked, &[]));
     }
 
     #[test]

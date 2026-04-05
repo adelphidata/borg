@@ -147,6 +147,17 @@ pub fn apply_patch(patch: &Patch, base_dir: &Path) -> Result<AffectedPaths> {
     Ok(affected)
 }
 
+/// Refuse to write through symlinks to prevent TOCTOU attacks.
+fn reject_symlink(path: &std::path::Path) -> Result<()> {
+    if path.exists() {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!("Refusing to write through symlink: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn apply_patch_inner(
     patch: &Patch,
     base_dir: &Path,
@@ -164,6 +175,8 @@ fn apply_patch_inner(
                     );
                 }
                 let full_path = base_dir.join(path);
+                reject_symlink(&full_path)
+                    .with_context(|| format!("Symlink check failed for {path}"))?;
                 // Snapshot existing file if it exists (overwrite case)
                 if full_path.exists() {
                     let existing = std::fs::read_to_string(&full_path)
@@ -208,6 +221,8 @@ fn apply_patch_inner(
                 if let Some(dest) = move_to {
                     // Move/rename: write to destination, delete original
                     let dest_path = base_dir.join(dest);
+                    reject_symlink(&dest_path)
+                        .with_context(|| format!("Symlink check failed for {dest}"))?;
                     if let Some(parent) = dest_path.parent() {
                         std::fs::create_dir_all(parent)
                             .with_context(|| format!("Failed to create directory for {dest}"))?;
@@ -227,6 +242,8 @@ fn apply_patch_inner(
                     info!("Moved file: {path} -> {dest}");
                     affected.moved.push((path.clone(), dest.clone()));
                 } else {
+                    reject_symlink(&full_path)
+                        .with_context(|| format!("Symlink check failed for {path}"))?;
                     std::fs::write(&full_path, &content)
                         .with_context(|| format!("Failed to write {path}"))?;
                     info!("Updated file: {path}");
@@ -1163,5 +1180,23 @@ EOF";
         let content = std::fs::read_to_string(dir.path().join("f.py")).unwrap();
         assert!(content.contains("x = 2"));
         assert!(!content.contains("x = 1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_target() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "original").unwrap();
+        let link = dir.path().join("link.txt");
+        symlink(&target, &link).unwrap();
+
+        // A patch that tries to write through a symlink should fail
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: link.txt\n@@\n-original\n+hacked\n*** End Patch"
+        );
+        let result = crate::apply_patch_to_dir(&patch, dir.path());
+        assert!(result.is_err(), "should reject write through symlink");
     }
 }

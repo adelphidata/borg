@@ -695,12 +695,26 @@ async fn list_channels_handler(State(state): State<Arc<AppState>>) -> impl IntoR
     axum::Json(serde_json::json!({ "channels": channels }))
 }
 
+/// Returns true if the address is a local (loopback) connection.
+///
+/// Handles both IPv4 loopback (`127.x.x.x`) and IPv6 loopback (`::1`), as
+/// well as IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1`) which some stacks
+/// use when binding on `::` and receiving a connection from localhost.
+fn is_local_request(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
 async fn poke_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> impl IntoResponse {
     // Only allow poke from localhost to prevent unauthorized LLM cost
-    if !addr.ip().is_loopback() {
+    if !is_local_request(&addr) {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({"error": "localhost only"})),
@@ -731,7 +745,7 @@ async fn cancel_handler(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !addr.ip().is_loopback() {
+    if !is_local_request(&addr) {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({"error": "localhost only"})),
@@ -767,7 +781,7 @@ async fn away_handler(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     body: String,
 ) -> impl IntoResponse {
-    if !addr.ip().is_loopback() {
+    if !is_local_request(&addr) {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({"error": "localhost only"})),
@@ -796,7 +810,7 @@ async fn available_handler(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> impl IntoResponse {
-    if !addr.ip().is_loopback() {
+    if !is_local_request(&addr) {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({"error": "localhost only"})),

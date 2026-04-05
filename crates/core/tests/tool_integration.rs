@@ -64,19 +64,19 @@ fn blocked_path_rejects_sensitive_dirs() {
 
     // Path under $HOME/.ssh should be blocked
     let ssh_path = home.join(".ssh/id_rsa");
-    assert!(tool_handlers::is_blocked_path(&ssh_path, &blocked));
+    assert!(tool_handlers::is_blocked_path(&ssh_path, &blocked, &[]));
 
     // Path under $HOME/.aws should be blocked
     let aws_path = home.join(".aws/credentials");
-    assert!(tool_handlers::is_blocked_path(&aws_path, &blocked));
+    assert!(tool_handlers::is_blocked_path(&aws_path, &blocked, &[]));
 
     // Path under $HOME/Documents should NOT be blocked
     let safe_path = home.join("Documents/safe.txt");
-    assert!(!tool_handlers::is_blocked_path(&safe_path, &blocked));
+    assert!(!tool_handlers::is_blocked_path(&safe_path, &blocked, &[]));
 
-    // Path outside home should NOT be blocked
+    // Path outside home IS blocked by component matching (new behavior)
     let outside = std::path::Path::new("/tmp/.ssh/id_rsa");
-    assert!(!tool_handlers::is_blocked_path(outside, &blocked));
+    assert!(tool_handlers::is_blocked_path(outside, &blocked, &[]));
 }
 
 // ── Test: read_file with line numbers ──

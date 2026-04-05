@@ -98,6 +98,18 @@ pub fn generate_profile(
     // manifest level via the blocked_paths security config.
     profile.push_str("(allow file-read*)\n");
 
+    // Defense-in-depth: deny reads to well-known sensitive directories even
+    // though file-read* is broadly allowed. If the manifest-level
+    // blocked_paths filter has a bug, these rules are the backstop.
+    if let Ok(home_str) = std::env::var("HOME") {
+        for sensitive in &[".ssh", ".aws", ".gnupg", ".config/gh"] {
+            let path = format!("{home_str}/{sensitive}");
+            if validate_seatbelt_path(&path).is_ok() {
+                profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));
+            }
+        }
+    }
+
     // Allow writing to /dev (stdout/stderr file descriptors)
     profile.push_str("(allow file-write* (subpath \"/dev\"))\n");
     // Allow writing to /tmp
@@ -420,5 +432,12 @@ mod tests {
         };
         let profile = generate_profile(&policy, Path::new("/tmp/tool"), None).unwrap();
         assert!(profile.contains("(deny file-write* (subpath \"/home/user/.borg\"))"));
+    }
+
+    #[test]
+    fn profile_denies_sensitive_home_dirs() {
+        let profile = generate_profile(&default_policy(), Path::new("/tmp/tool"), None).unwrap();
+        // Should have deny rules for sensitive directories
+        assert!(profile.contains("(deny file-read* (subpath \"/"));
     }
 }
