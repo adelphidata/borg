@@ -216,6 +216,10 @@ struct CliUsage {
     input_tokens: Option<u64>,
     #[serde(default)]
     output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 /// Parse a single JSONL line into a `StreamEvent`.
@@ -269,6 +273,8 @@ fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
                     completion_tokens: usage.output_tokens.unwrap_or(0),
                     total_tokens: usage.input_tokens.unwrap_or(0)
                         + usage.output_tokens.unwrap_or(0),
+                    cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+                    cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
                     provider: "claude-cli".to_string(),
                     model: String::new(),
                 })

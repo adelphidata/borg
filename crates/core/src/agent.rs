@@ -648,12 +648,16 @@ impl Agent {
         };
         let memory = self.load_memory_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
+
+        // === STABLE PREFIX (cache-friendly) ===
+        // Ordered so the largest byte-stable content comes first, enabling
+        // implicit prefix caching on providers that hash the prompt (OpenAI,
+        // Gemini) and maximizing cache hits on providers with explicit markers
+        // (Anthropic). Anything that changes turn-to-turn is pushed to the
+        // dynamic suffix below.
         system.push_str("<system_instructions>\n");
         system.push_str(&identity);
         system.push_str("\n</system_instructions>\n\n");
-
-        system.push_str(&self.build_environment_section().await);
-        system.push_str(&self.build_collaboration_section());
 
         if !memory.is_empty() {
             system.push_str(
@@ -714,6 +718,13 @@ impl Agent {
         system.push_str(&format!(
             "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
         ));
+
+        // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
+        // Collaboration mode is stable per-session but cheap; environment
+        // (time, git status) changes every turn — keep them last so they do
+        // not invalidate the cached prefix above.
+        system.push_str(&self.build_collaboration_section());
+        system.push_str(&self.build_environment_section().await);
 
         // Inject first-conversation instructions from SETUP.md (created during onboarding)
         if let Ok(data_dir) = crate::config::Config::data_dir() {
@@ -1306,8 +1317,12 @@ Rules:
             let tools_clone = tools.map(<[ToolDefinition]>::to_vec);
             let cancel_clone = cancel.clone();
             let stream_handle = {
-                let mut llm_client =
-                    LlmClient::new(&self.config).context("Failed to initialize LLM client")?;
+                // Pass the session id as a stable prompt_cache_key so
+                // OpenAI-family providers route successive turns to the same
+                // cache shard (no-op for providers that ignore the field).
+                let mut llm_client = LlmClient::new(&self.config)
+                    .context("Failed to initialize LLM client")?
+                    .with_prompt_cache_key(self.session.meta.id.clone());
                 tokio::spawn(async move {
                     if let Err(e) = llm_client
                         .stream_chat_with_cancel(
@@ -1383,10 +1398,12 @@ Rules:
                                                 usage.prompt_tokens,
                                                 usage.completion_tokens,
                                             );
-                                            if let Err(e) = db.log_token_usage(
+                                            if let Err(e) = db.log_token_usage_with_cache(
                                                 usage.prompt_tokens,
                                                 usage.completion_tokens,
                                                 total,
+                                                usage.cached_input_tokens,
+                                                usage.cache_creation_tokens,
                                                 &usage.provider,
                                                 &usage.model,
                                                 cost,
@@ -1916,6 +1933,73 @@ struct PartialToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Prompt cache: stable prefix ordering ──
+    //
+    // `build_system_prompt` must emit its stable (cache-friendly) sections
+    // BEFORE the dynamic environment section, otherwise per-turn content
+    // (time, git status) invalidates the cached prefix. These guard tests
+    // read the source of `build_system_prompt` and fail if the order is
+    // perturbed. The full end-to-end behavior is exercised indirectly
+    // through the Anthropic request tests in `llm.rs`.
+
+    const AGENT_RS_SRC: &str = include_str!("agent.rs");
+
+    fn extract_build_system_prompt_body() -> &'static str {
+        let start = AGENT_RS_SRC
+            .find("async fn build_system_prompt")
+            .expect("build_system_prompt must exist");
+        // Extract ~5KB following the signature — plenty to cover the body.
+        let end = (start + 5000).min(AGENT_RS_SRC.len());
+        &AGENT_RS_SRC[start..end]
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_security_policy() {
+        let body = extract_build_system_prompt_body();
+        let security_idx = body
+            .find("security_policy")
+            .expect("security_policy section must exist in build_system_prompt");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist in build_system_prompt");
+        assert!(
+            env_idx > security_idx,
+            "build_environment_section must be pushed AFTER security_policy \
+             to keep the cached prefix stable across turns \
+             (env_idx={env_idx}, security_idx={security_idx})",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_identity() {
+        let body = extract_build_system_prompt_body();
+        let identity_idx = body
+            .find("system_instructions")
+            .expect("system_instructions (identity) section must exist");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist");
+        assert!(
+            env_idx > identity_idx,
+            "dynamic environment section must come after identity",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_environment_is_after_coding_instructions() {
+        let body = extract_build_system_prompt_body();
+        let coding_idx = body
+            .find("coding_instructions")
+            .expect("coding_instructions section must exist");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist");
+        assert!(
+            env_idx > coding_idx,
+            "dynamic environment section must come after coding_instructions",
+        );
+    }
 
     #[test]
     fn require_str_param_present() {

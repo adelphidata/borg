@@ -93,21 +93,80 @@ pub struct LlmConfig {
     pub cache: PromptCacheConfig,
 }
 
+/// TTL for Anthropic `cache_control` markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheTtl {
+    /// Default ephemeral cache (5 minutes).
+    #[default]
+    FiveMin,
+    /// Extended cache (1 hour). Anthropic charges a higher write cost but reads are cheaper.
+    OneHour,
+}
+
+impl CacheTtl {
+    /// Returns the TTL string used in the Anthropic `cache_control` object,
+    /// or `None` for the default 5-minute TTL (which should not be serialized).
+    pub fn as_ttl_str(&self) -> Option<&'static str> {
+        match self {
+            Self::FiveMin => None,
+            Self::OneHour => Some("1h"),
+        }
+    }
+}
+
+impl std::fmt::Display for CacheTtl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FiveMin => f.write_str("5m"),
+            Self::OneHour => f.write_str("1h"),
+        }
+    }
+}
+
 /// Prompt caching configuration.
 ///
-/// When enabled and the provider supports it (currently: Anthropic), the LLM client
-/// attaches `cache_control` markers to the system prompt and the last two non-system
-/// messages, allowing the provider to reuse cached prefixes across turns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// When enabled and the provider supports it, the LLM client attaches
+/// `cache_control` markers across the stable prefix (tools array and system
+/// prompt) plus a rolling window of recent messages, allowing the provider to
+/// reuse cached prefixes across turns.
+///
+/// Anthropic currently allows up to 4 cache breakpoints per request. The
+/// defaults below use all 4: tools + system + last 2 messages.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PromptCacheConfig {
     /// Whether prompt caching is enabled.
     pub enabled: bool,
+    /// Cache TTL (`5m` default or `1h` extended).
+    pub ttl: CacheTtl,
+    /// Attach a cache marker to the last tool definition (caches the whole
+    /// tools array). Anthropic only; ignored by other providers.
+    pub cache_tools: bool,
+    /// Attach a cache marker to the system prompt block. Anthropic only.
+    pub cache_system: bool,
+    /// Number of trailing messages to mark with a rolling cache breakpoint.
+    /// Clamped to at most 2 so tools + system + rolling stays within
+    /// Anthropic's 4-breakpoint budget.
+    pub rolling_messages: u8,
 }
 
 impl Default for PromptCacheConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            ttl: CacheTtl::FiveMin,
+            cache_tools: true,
+            cache_system: true,
+            rolling_messages: 2,
+        }
+    }
+}
+
+impl PromptCacheConfig {
+    /// Returns the rolling message count, clamped to `[0, 2]`.
+    pub fn rolling_messages_clamped(&self) -> usize {
+        self.rolling_messages.min(2) as usize
     }
 }
 

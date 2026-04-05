@@ -304,6 +304,77 @@ fn log_and_query_token_usage() {
 }
 
 #[test]
+fn log_token_usage_with_cache_persists_cache_columns() {
+    let db = test_db();
+    db.log_token_usage_with_cache(
+        1000,
+        200,
+        1200,
+        800,
+        150,
+        "anthropic",
+        "claude-sonnet-4",
+        None,
+    )
+    .expect("log with cache");
+    let (prompt, cached, created) = db
+        .cache_token_summary_since(0)
+        .expect("cache token summary");
+    assert_eq!(prompt, 1000);
+    assert_eq!(cached, 800);
+    assert_eq!(created, 150);
+}
+
+#[test]
+fn log_token_usage_defaults_cache_columns_to_zero() {
+    let db = test_db();
+    db.log_token_usage(500, 100, 600, "openai", "gpt-4", None)
+        .expect("log plain");
+    let (prompt, cached, created) = db
+        .cache_token_summary_since(0)
+        .expect("cache token summary");
+    assert_eq!(prompt, 500);
+    assert_eq!(cached, 0);
+    assert_eq!(created, 0);
+}
+
+#[test]
+fn cache_token_summary_since_empty_returns_zeros() {
+    let db = test_db();
+    let (prompt, cached, created) = db
+        .cache_token_summary_since(0)
+        .expect("cache token summary");
+    assert_eq!(prompt, 0);
+    assert_eq!(cached, 0);
+    assert_eq!(created, 0);
+}
+
+#[test]
+fn migration_v30_adds_cache_columns() {
+    // A fresh test_db() has already run all migrations. Verify the new
+    // columns exist on token_usage and default to 0 for plain inserts.
+    let db = test_db();
+    let cached_exists: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('token_usage') WHERE name = 'cached_input_tokens'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("pragma");
+    let created_exists: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('token_usage') WHERE name = 'cache_creation_tokens'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("pragma");
+    assert_eq!(cached_exists, 1, "cached_input_tokens column must exist");
+    assert_eq!(created_exists, 1, "cache_creation_tokens column must exist");
+}
+
+#[test]
 fn monthly_token_total_empty_returns_zero() {
     let db = test_db();
     let total = db.monthly_token_total().expect("query");

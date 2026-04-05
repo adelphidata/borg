@@ -136,7 +136,7 @@ pub struct DiagnosticRunner {
     step: usize,
 }
 
-const STEP_COUNT: usize = 16;
+const STEP_COUNT: usize = 17;
 
 impl DiagnosticRunner {
     /// Create a new diagnostic runner starting at step 0.
@@ -158,12 +158,13 @@ impl DiagnosticRunner {
             8 => Some("Gateway"),
             9 => Some("Heartbeat"),
             10 => Some("Budget"),
-            11 => Some("Plugins"),
-            12 => Some("Browser"),
-            13 => Some("Agents"),
-            14 => Some("Security"),
-            15 if config.security.host_audit => Some("Host Audit"),
-            15 => None,
+            11 => Some("Prompt Cache"),
+            12 => Some("Plugins"),
+            13 => Some("Browser"),
+            14 => Some("Agents"),
+            15 => Some("Security"),
+            16 if config.security.host_audit => Some("Host Audit"),
+            16 => None,
             _ => None,
         }
     }
@@ -220,22 +221,26 @@ impl DiagnosticRunner {
                 "Budget"
             }
             11 => {
+                check_prompt_cache(config, &mut checks);
+                "Prompt Cache"
+            }
+            12 => {
                 check_plugins(&mut checks);
                 "Plugins"
             }
-            12 => {
+            13 => {
                 check_browser(config, &mut checks);
                 "Browser"
             }
-            13 => {
+            14 => {
                 check_agents(config, &mut checks);
                 "Agents"
             }
-            14 => {
+            15 => {
                 check_config_security(config, &mut checks);
                 "Security"
             }
-            15 => {
+            16 => {
                 if config.security.host_audit {
                     crate::host_audit::run_host_security_checks(&mut checks);
                     self.step += 1;
@@ -826,6 +831,74 @@ fn check_budget(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             ));
         }
     }
+}
+
+fn check_prompt_cache(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+    if !config.llm.cache.enabled {
+        checks.push(DiagnosticCheck::warn(
+            "Prompt Cache",
+            "status",
+            "disabled (llm.cache.enabled = false)",
+        ));
+        return;
+    }
+    checks.push(DiagnosticCheck::pass(
+        "Prompt Cache",
+        format!(
+            "enabled (ttl={}, tools={}, system={}, rolling={})",
+            config.llm.cache.ttl,
+            config.llm.cache.cache_tools,
+            config.llm.cache.cache_system,
+            config.llm.cache.rolling_messages_clamped(),
+        ),
+    ));
+
+    // Hit ratio over the last 24 hours — informational. Providers that do not
+    // support caching (Ollama, Groq, Gemini non-cached) will report 0, which
+    // we surface as a warning only when the primary provider is known to
+    // support caching.
+    let since = chrono::Utc::now().timestamp().saturating_sub(24 * 3600);
+    match Database::open().and_then(|db| db.cache_token_summary_since(since)) {
+        Ok((prompt, cached, created)) => {
+            if prompt == 0 {
+                checks.push(DiagnosticCheck::pass(
+                    "Prompt Cache",
+                    "24h hit ratio: no traffic yet",
+                ));
+                return;
+            }
+            let pct = (cached as f64 / prompt as f64 * 100.0) as u64;
+            let name =
+                format!("24h hit ratio: {pct}% ({cached}/{prompt} cached, {created} created)");
+            let supports_cache = provider_supports_cache(&config.llm);
+            if supports_cache && pct < 20 && prompt > 10_000 {
+                checks.push(DiagnosticCheck::warn(
+                    "Prompt Cache",
+                    name,
+                    "low hit ratio — check system prompt stability",
+                ));
+            } else {
+                checks.push(DiagnosticCheck::pass("Prompt Cache", name));
+            }
+        }
+        Err(e) => {
+            checks.push(DiagnosticCheck::warn(
+                "Prompt Cache",
+                "24h hit ratio",
+                format!("could not read: {e}"),
+            ));
+        }
+    }
+}
+
+/// Returns true if the configured provider is known to honor prompt caching
+/// (either via explicit `cache_control` markers or implicit auto-caching).
+fn provider_supports_cache(llm: &crate::config::LlmConfig) -> bool {
+    let provider = llm.provider.as_deref().unwrap_or("");
+    matches!(
+        provider,
+        "anthropic" | "openai" | "openrouter" | "deepseek" | "claude-cli"
+    )
 }
 
 fn check_plugins(checks: &mut Vec<DiagnosticCheck>) {

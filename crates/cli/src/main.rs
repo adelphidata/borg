@@ -899,6 +899,27 @@ fn run_usage() -> Result<()> {
         println!("Estimated cost: ${cost:.4}");
     }
 
+    // Prompt cache hit ratio (current month).
+    if let Ok((prompt_sum, cached_sum, created_sum)) = {
+        use chrono::Datelike;
+        let now = chrono::Utc::now();
+        let month_start = now
+            .date_naive()
+            .with_day(1)
+            .unwrap_or_else(|| now.date_naive())
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| dt.and_utc().timestamp())
+            .unwrap_or(0);
+        db.cache_token_summary_since(month_start)
+    } {
+        if prompt_sum > 0 && (cached_sum > 0 || created_sum > 0) {
+            let pct = cached_sum as f64 / prompt_sum as f64 * 100.0;
+            println!(
+                "Prompt cache: {cached_sum}/{prompt_sum} hit ({pct:.1}%), {created_sum} created"
+            );
+        }
+    }
+
     if !by_model.is_empty() {
         println!();
         println!(

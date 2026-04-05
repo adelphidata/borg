@@ -27,13 +27,60 @@ impl Database {
         model: &str,
         cost_usd: Option<f64>,
     ) -> Result<()> {
+        self.log_token_usage_with_cache(prompt, completion, total, 0, 0, provider, model, cost_usd)
+    }
+
+    /// Log token usage including prompt-cache breakdown. `cached_input_tokens`
+    /// counts cache-hit tokens (read) and `cache_creation_tokens` counts
+    /// tokens written to the cache this turn (Anthropic only).
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_token_usage_with_cache(
+        &self,
+        prompt: u64,
+        completion: u64,
+        total: u64,
+        cached_input: u64,
+        cache_creation: u64,
+        provider: &str,
+        model: &str,
+        cost_usd: Option<f64>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens, provider, model, cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![now, prompt as i64, completion as i64, total as i64, provider, model, cost_usd],
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens, provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                now,
+                prompt as i64,
+                completion as i64,
+                total as i64,
+                provider,
+                model,
+                cost_usd,
+                cached_input as i64,
+                cache_creation as i64,
+            ],
         )?;
         Ok(())
+    }
+
+    /// Cumulative prompt cache tokens since `since_ts` (Unix seconds).
+    /// Returns `(prompt_tokens, cached_input_tokens, cache_creation_tokens)`.
+    #[instrument(skip_all)]
+    pub fn cache_token_summary_since(&self, since_ts: i64) -> Result<(u64, u64, u64)> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM token_usage WHERE timestamp >= ?1",
+        )?;
+        let row: (i64, i64, i64) =
+            stmt.query_row(params![since_ts], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok((
+            row.0.max(0) as u64,
+            row.1.max(0) as u64,
+            row.2.max(0) as u64,
+        ))
     }
 
     #[instrument(skip_all)]

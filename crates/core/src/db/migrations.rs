@@ -776,4 +776,20 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// V30: Track prompt cache effectiveness by persisting cached-read and
+    /// cache-creation token counts alongside the primary usage row.
+    pub(super) fn migrate_v30(&self) -> Result<()> {
+        for (table, col) in [
+            ("token_usage", "cached_input_tokens"),
+            ("token_usage", "cache_creation_tokens"),
+        ] {
+            if !Self::has_column(&self.conn, table, col) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
+        Ok(())
+    }
 }
