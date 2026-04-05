@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 
+use borg_core::config::CollaborationMode;
+
 use super::app::{App, AppAction, AppState};
 
 impl App<'_> {
@@ -115,8 +117,8 @@ impl App<'_> {
              /help      - Show this help\n  \
              /settings  - Configure settings\n  \
              /usage     - Show usage stats\n  \
-             /plan      - Toggle plan mode\n  \
-             /mode      - Switch mode (default/execute/plan)\n\
+             /mode      - Switch collaboration mode (default/execute/plan)\n  \
+             /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n\
              \n  \
              /compact   - Compact conversation history\n  \
              /clear     - Clear conversation\n  \
@@ -266,10 +268,9 @@ impl App<'_> {
     }
 
     fn cmd_mode_set(&mut self, mode_str: &str) -> Result<AppAction> {
-        match mode_str.parse::<borg_core::config::CollaborationMode>() {
+        match mode_str.parse::<CollaborationMode>() {
             Ok(mode) => {
-                self.config.conversation.collaboration_mode = mode;
-                self.push_system_message(format!("[collaboration mode: {mode}]"));
+                self.set_collaboration_mode(mode);
             }
             Err(e) => {
                 self.push_system_message(format!("Error: {e}"));
@@ -278,23 +279,51 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
+    /// `/plan` toggles between Plan mode and the previously active mode.
+    ///
+    /// `/plan` is the shortcut entry point for `/mode plan`; both wire through
+    /// the same `CollaborationMode::Plan` state so there is only one source of
+    /// truth. Entering Plan stashes the prior mode so the post-turn review
+    /// overlay can restore it when the user chooses "Proceed".
     fn cmd_plan_toggle(&mut self) -> Result<AppAction> {
-        self.plan_mode = !self.plan_mode;
-        if self.plan_mode {
-            self.push_system_message("[plan mode on]".to_string());
+        let current = self.config.conversation.collaboration_mode;
+        let next = if current == CollaborationMode::Plan {
+            self.previous_collab_mode
+                .take()
+                .unwrap_or(CollaborationMode::Default)
         } else {
-            self.push_system_message("[plan mode off]".to_string());
-        }
+            CollaborationMode::Plan
+        };
+        self.set_collaboration_mode(next);
         Ok(AppAction::Continue)
     }
 
     fn cmd_plan_with_message(&mut self, message: &str) -> Result<AppAction> {
-        self.plan_mode = true;
+        self.set_collaboration_mode(CollaborationMode::Plan);
         if message.is_empty() {
-            self.push_system_message("[plan mode on]".to_string());
             return Ok(AppAction::Continue);
         }
         self.handle_submit(message)
+    }
+
+    /// Switch collaboration mode, maintaining `previous_collab_mode` so the
+    /// Plan review overlay can restore the prior mode on "Proceed".
+    fn set_collaboration_mode(&mut self, next: CollaborationMode) {
+        let current = self.config.conversation.collaboration_mode;
+        if next == current {
+            self.push_system_message(format!("[collaboration mode: {next}]"));
+            return;
+        }
+        if next == CollaborationMode::Plan {
+            // Entering Plan: stash the current mode so Proceed can restore it.
+            self.previous_collab_mode = Some(current);
+        } else {
+            // Leaving Plan (or switching between non-Plan modes): the stashed
+            // mode is stale and must be cleared.
+            self.previous_collab_mode = None;
+        }
+        self.config.conversation.collaboration_mode = next;
+        self.push_system_message(format!("[collaboration mode: {next}]"));
     }
 
     fn cmd_memory_cleanup(&mut self) -> Result<AppAction> {

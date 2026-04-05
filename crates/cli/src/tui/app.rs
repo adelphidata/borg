@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use borg_core::agent::AgentEvent;
-use borg_core::config::Config;
+use borg_core::config::{CollaborationMode, Config};
 use borg_core::doctor::DiagnosticCheck;
 use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, SkipReason};
 use throbber_widgets_tui::{Throbber, ThrobberState, BRAILLE_EIGHT};
@@ -166,7 +166,10 @@ pub struct App<'a> {
     /// Conversation backtrack state machine
     pub backtrack: BacktrackPhase,
     pub plan_overlay: PlanOverlay,
-    pub plan_mode: bool,
+    /// When the user enters Plan collaboration mode, the previous mode is stashed here
+    /// so the post-turn review overlay can restore it on "Proceed". `None` when the
+    /// user is not currently in a transient Plan-then-execute flow.
+    pub previous_collab_mode: Option<CollaborationMode>,
     pub schedule_popup: SchedulePopup,
     pub skills_popup: SkillsPopup,
     pub migrate_popup: MigratePopup,
@@ -216,7 +219,7 @@ impl<'a> App<'a> {
             queue_pause_notified: false,
             backtrack: BacktrackPhase::Inactive,
             plan_overlay: PlanOverlay::new(),
-            plan_mode: false,
+            previous_collab_mode: None,
             schedule_popup: SchedulePopup::new(),
             skills_popup: SkillsPopup::new(),
             migrate_popup: MigratePopup::new(),
@@ -475,7 +478,7 @@ impl<'a> App<'a> {
                             text: "[interrupted]".to_string(),
                         });
                     }
-                    self.plan_mode = false;
+                    self.previous_collab_mode = None;
                     self.state = AppState::Idle;
                 } else if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
                     // Pop last queued message back into composer for editing
@@ -513,7 +516,7 @@ impl<'a> App<'a> {
                         self.cells.push(HistoryCell::System {
                             text: "[cancelled]".to_string(),
                         });
-                        self.plan_mode = false;
+                        self.previous_collab_mode = None;
                         self.state = AppState::Idle;
                         return Ok(AppAction::Continue);
                     }
@@ -715,12 +718,19 @@ impl<'a> App<'a> {
 
                 // Shift+Tab — cycle collaboration mode (default → execute → plan → default)
                 if key.code == KeyCode::BackTab {
-                    use borg_core::config::CollaborationMode;
-                    let next = match self.config.conversation.collaboration_mode {
+                    let current = self.config.conversation.collaboration_mode;
+                    let next = match current {
                         CollaborationMode::Default => CollaborationMode::Execute,
                         CollaborationMode::Execute => CollaborationMode::Plan,
                         CollaborationMode::Plan => CollaborationMode::Default,
                     };
+                    // Track entering/leaving Plan so the post-turn review overlay can
+                    // restore the user's prior mode on "Proceed".
+                    if next == CollaborationMode::Plan && current != CollaborationMode::Plan {
+                        self.previous_collab_mode = Some(current);
+                    } else if next != CollaborationMode::Plan {
+                        self.previous_collab_mode = None;
+                    }
                     self.config.conversation.collaboration_mode = next;
                     self.push_system_message(format!("[mode: {next}]"));
                     return Ok(AppAction::Continue);
@@ -1290,8 +1300,7 @@ impl<'a> App<'a> {
                 }
                 self.last_turn_errored = false;
                 self.queue_pause_notified = false;
-                if self.plan_mode {
-                    self.plan_mode = false;
+                if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
                     let pct = self.compute_context_pct();
                     let name = self
                         .config
@@ -1316,7 +1325,11 @@ impl<'a> App<'a> {
                     }
                 }
                 self.last_turn_errored = true;
-                self.plan_mode = false;
+                // If a transient Plan flow failed, roll back to the prior mode so the
+                // user isn't left trapped with mutations blocked.
+                if let Some(prev) = self.previous_collab_mode.take() {
+                    self.config.conversation.collaboration_mode = prev;
+                }
                 self.state = AppState::Idle;
             }
             AgentEvent::SteerReceived { text } => {
@@ -1383,7 +1396,10 @@ impl<'a> App<'a> {
                 break;
             }
         }
-        self.plan_mode = false;
+        // If a transient Plan flow was in flight, roll back to the prior mode.
+        if let Some(prev) = self.previous_collab_mode.take() {
+            self.config.conversation.collaboration_mode = prev;
+        }
         if !matches!(self.state, AppState::Idle) {
             // If queued messages exist, treat unexpected close as an error so queue-pause
             // gives the user a chance to resume or clear instead of silently losing input.
@@ -1635,7 +1651,9 @@ impl<'a> App<'a> {
             AppState::Idle if self.last_turn_errored && !self.queued_messages.is_empty() => {
                 "enter to resume queue  •  esc to clear queue".to_string()
             }
-            AppState::Idle if self.plan_mode => {
+            AppState::Idle
+                if self.config.conversation.collaboration_mode == CollaborationMode::Plan =>
+            {
                 "[plan]  •  shift+tab to toggle off  •  ? for shortcuts".to_string()
             }
             AppState::Idle if self.composer.is_empty() => {
@@ -2548,6 +2566,95 @@ mod tests {
             )
         });
         assert!(!has_unknown, "/plan <msg> should not be treated as unknown");
+    }
+
+    #[test]
+    fn plan_toggle_sets_collaboration_mode_to_plan() {
+        let mut app = make_app();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Default
+        );
+        let _ = app.handle_submit("/plan").unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Plan,
+            "/plan should switch collaboration mode to Plan"
+        );
+        assert_eq!(
+            app.previous_collab_mode,
+            Some(CollaborationMode::Default),
+            "/plan should stash the previous mode for restore"
+        );
+    }
+
+    #[test]
+    fn plan_toggle_twice_restores_previous_mode() {
+        let mut app = make_app();
+        app.config.conversation.collaboration_mode = CollaborationMode::Execute;
+        let _ = app.handle_submit("/plan").unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Plan
+        );
+        let _ = app.handle_submit("/plan").unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Execute,
+            "toggling /plan a second time should restore the prior mode"
+        );
+        assert_eq!(app.previous_collab_mode, None);
+    }
+
+    #[test]
+    fn mode_plan_stashes_previous_mode() {
+        let mut app = make_app();
+        app.config.conversation.collaboration_mode = CollaborationMode::Execute;
+        let _ = app.handle_submit("/mode plan").unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Plan
+        );
+        assert_eq!(app.previous_collab_mode, Some(CollaborationMode::Execute));
+    }
+
+    #[test]
+    fn mode_switch_away_from_plan_clears_previous() {
+        let mut app = make_app();
+        let _ = app.handle_submit("/plan").unwrap();
+        assert_eq!(app.previous_collab_mode, Some(CollaborationMode::Default));
+        let _ = app.handle_submit("/mode execute").unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Execute
+        );
+        assert_eq!(
+            app.previous_collab_mode, None,
+            "leaving Plan via /mode should clear the stashed prior mode"
+        );
+    }
+
+    #[test]
+    fn turn_complete_in_plan_mode_opens_review_overlay() {
+        let mut app = make_app();
+        app.config.conversation.collaboration_mode = CollaborationMode::Plan;
+        app.process_agent_event(AgentEvent::TurnComplete);
+        assert!(
+            matches!(app.state, AppState::PlanReview),
+            "TurnComplete while in Plan mode should enter PlanReview"
+        );
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Plan,
+            "mode should stay Plan until the user picks Proceed on the overlay"
+        );
+    }
+
+    #[test]
+    fn turn_complete_in_default_mode_returns_to_idle() {
+        let mut app = make_app();
+        app.process_agent_event(AgentEvent::TurnComplete);
+        assert!(matches!(app.state, AppState::Idle));
     }
 
     // --- Update command ---

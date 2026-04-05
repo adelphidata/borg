@@ -105,7 +105,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use borg_core::agent::{Agent, AgentEvent};
-use borg_core::config::Config;
+use borg_core::config::{CollaborationMode, Config};
 use borg_core::telemetry::BorgMetrics;
 use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, HeartbeatScheduler};
 
@@ -923,6 +923,17 @@ async fn run_event_loop(
                 }
             },
             AppAction::PlanProceed { clear_context } => {
+                // Exit Plan mode before the follow-up turn — otherwise the proceed
+                // message would itself be blocked by mutation constraints.
+                let restored = app
+                    .previous_collab_mode
+                    .take()
+                    .unwrap_or(CollaborationMode::Default);
+                if app.config.conversation.collaboration_mode != restored {
+                    app.config.conversation.collaboration_mode = restored;
+                    app.push_system_message(format!("[mode: {restored}]"));
+                }
+
                 let proceed_msg = if clear_context {
                     // Extract plan text before clearing so the agent knows what to do
                     let plan_text = app

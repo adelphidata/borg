@@ -163,8 +163,10 @@ Templates in `crates/core/templates/collaboration_mode/`. Mode is injected into 
 Plan mode uses an allowlist of non-mutating tools — new tools default to blocked.
 
 **Config:** `[conversation] collaboration_mode = "default"` (or `execute`, `plan`)
-**TUI:** `/mode execute`, `/mode plan`, `/mode default`
+**TUI:** `/mode execute`, `/mode plan`, `/mode default` (or Shift+Tab to cycle)
 **CLI:** `borg ask --mode execute "do the thing"`
+
+**`/plan` shortcut:** `/plan` is a shortcut for `/mode plan` — it toggles Plan mode on and stashes the prior mode. `/plan <message>` enters Plan mode and submits the message in one step. When a Plan-mode turn completes, the TUI pops a review overlay (`PlanOverlay` in `crates/cli/src/tui/plan_overlay.rs`) with Clear & Proceed / Proceed with Context / Type Feedback options. Choosing Proceed automatically restores the prior collaboration mode so the follow-up execution turn is not blocked by mutation constraints. `App::previous_collab_mode` in `crates/cli/src/tui/app.rs` is the single source of truth for the "transient Plan → execute" flow — there is no separate `plan_mode` TUI flag.
 
 ## Git Utilities
 
