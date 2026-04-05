@@ -887,6 +887,50 @@ pub fn is_duplicate_heartbeat(
     prev_hash == hash && prev_time > 0 && (now_secs.saturating_sub(prev_time)) < dedup_window_secs
 }
 
+/// Returns true if a heartbeat response carries no meaningful information and
+/// should be suppressed before delivery. Inspired by openclaw's heartbeat
+/// transcript pruning — short acknowledgments like "ok", "no updates", "all
+/// good" pollute downstream channels without conveying anything the user
+/// couldn't already assume from the absence of a message.
+pub fn is_zero_info_heartbeat(response: &str) -> bool {
+    const TRIVIAL_PATTERNS: &[&str] = &[
+        "ok",
+        "okay",
+        "nothing new",
+        "nothing to report",
+        "no updates",
+        "no news",
+        "all good",
+        "all clear",
+        "all quiet",
+        "all is well",
+        "quiet",
+        "no changes",
+        "nothing",
+        "nothing here",
+        "nothing happening",
+        "standing by",
+        "standing by.",
+    ];
+    // Normalize: lowercase, strip trailing punctuation, collapse whitespace.
+    let normalized: String = response
+        .trim()
+        .trim_end_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    if normalized.is_empty() {
+        return true;
+    }
+    // Only treat as zero-info when the message is short enough to plausibly
+    // be a pure acknowledgment. Longer replies may contain real content even
+    // if they start with "ok,".
+    if normalized.len() > 40 {
+        return false;
+    }
+    TRIVIAL_PATTERNS
+        .iter()
+        .any(|pat| normalized == *pat || normalized == format!("{pat}.") || normalized == format!("{pat}!"))
+}
+
 /// Shared heartbeat turn: creates a temporary agent, sends the heartbeat message
 /// (with HEARTBEAT.md checklist if present), deduplicates, and returns a structured result.
 pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
@@ -954,14 +998,17 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
     let duration_ms = started.elapsed().as_millis() as u64;
     let trimmed = response.trim().to_string();
 
-    if trimmed.is_empty() {
-        tracing::debug!("Heartbeat: empty response after {duration_ms}ms");
+    if trimmed.is_empty() || is_zero_info_heartbeat(&trimmed) {
+        tracing::debug!(
+            "Heartbeat: empty or zero-info response after {duration_ms}ms ({} chars)",
+            trimmed.len()
+        );
         if let Ok(adb) = borg_core::db::Database::open() {
             borg_core::activity_log::log_activity(
                 &adb,
                 "debug",
                 "heartbeat",
-                "Heartbeat fired but response was empty",
+                "Heartbeat fired but response carried no actionable info",
             );
         }
         return HeartbeatResult::Skipped {
@@ -1685,6 +1732,48 @@ mod tests {
             0,     // prev_time (never set)
             3600,  // window
         ));
+    }
+
+    #[test]
+    fn zero_info_recognizes_trivial_acks() {
+        for ack in &[
+            "OK",
+            "ok.",
+            "ok!",
+            "Nothing new",
+            "all good",
+            "No updates.",
+            "Standing by",
+            "   nothing to report   ",
+        ] {
+            assert!(
+                is_zero_info_heartbeat(ack),
+                "expected '{ack}' to be zero-info"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_info_ignores_meaningful_responses() {
+        for msg in &[
+            "You have 3 new emails from Alice",
+            "Build failed on main — see CI",
+            "Reminder: standup in 10 minutes",
+            // Longer content that happens to start with an ack word is NOT zero-info.
+            "ok, I finished reviewing the PR and left 4 comments on auth.rs",
+        ] {
+            assert!(
+                !is_zero_info_heartbeat(msg),
+                "expected '{msg}' to NOT be zero-info"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_info_handles_empty_and_whitespace() {
+        assert!(is_zero_info_heartbeat(""));
+        assert!(is_zero_info_heartbeat("   "));
+        assert!(is_zero_info_heartbeat("\n\n\t"));
     }
 
     #[test]
