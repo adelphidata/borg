@@ -145,9 +145,9 @@ fn check_no_channels(config: &Config) -> Option<String> {
 const NO_CHANNELS_NUDGE: &str = "\
 No messaging channels are configured yet, so the user can only reach you \
 through the terminal. This tick, briefly and warmly suggest setting one \
-up so you can message them on the go. Mention that `borg plugins` lists \
-every integration and `borg add <name>` (e.g. `borg add telegram`) walks \
-through the credentials. Native options: telegram, slack, discord, teams, \
+up so you can message them on the go. Tell them to run `/plugins` in the \
+TUI (or `borg plugins` from the command line) to browse and install \
+integrations. Native options: telegram, slack, discord, teams, \
 google-chat, twilio. Keep it to 2-3 sentences — don't lecture, and don't \
 repeat yourself if you've already raised this recently.";
 
@@ -283,7 +283,7 @@ mod tests {
         let _guard = EnvGuard::clear_native();
         let cfg = Config::default();
         let snippet = check_no_channels(&cfg).expect("nudge should fire");
-        assert!(snippet.contains("borg add"));
+        assert!(snippet.contains("/plugins"));
         assert!(snippet.contains("borg plugins"));
     }
 
