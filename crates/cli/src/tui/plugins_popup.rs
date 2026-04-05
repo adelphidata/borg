@@ -90,6 +90,19 @@ impl PluginsPopup {
         self.status_message = None;
     }
 
+    /// Handle a bracketed paste event. Returns `true` if the paste was consumed
+    /// (i.e. the popup is visible and in credential-input phase).
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.visible {
+            return false;
+        }
+        if let PluginPhase::CredentialInput { ref mut buffer, .. } = self.phase {
+            buffer.push_str(text);
+            return true;
+        }
+        false
+    }
+
     /// Handle a key event. Returns actions to execute if Enter is pressed.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<Vec<PluginAction>> {
         use crossterm::event::KeyCode;
@@ -760,5 +773,50 @@ mod tests {
             assert_eq!(credentials[0].0, "SLACK_BOT_TOKEN");
             assert_eq!(credentials[1].0, "SLACK_SIGNING_SECRET");
         }
+    }
+
+    #[test]
+    fn handle_paste_consumed_in_credential_input() {
+        let mut popup = PluginsPopup::new();
+        let tmp = std::env::temp_dir().join("borg-plugins-test-paste-cred");
+        popup.show(&tmp);
+
+        // Paste during Browsing phase should NOT be consumed
+        assert!(!popup.handle_paste("should-not-land"));
+
+        // Enter credential input for Telegram
+        select_plugin(&mut popup, "messaging/telegram");
+        let idx = popup.cursor;
+        popup.items[idx].is_installed = false;
+        popup.items[idx].is_selected = false;
+        press(&mut popup, KeyCode::Char(' '));
+        press(&mut popup, KeyCode::Enter);
+        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
+
+        // Paste should be consumed and land in buffer
+        assert!(popup.handle_paste("pasted-bot-token-123"));
+        if let PluginPhase::CredentialInput { ref buffer, .. } = popup.phase {
+            assert_eq!(buffer, "pasted-bot-token-123");
+        } else {
+            panic!("expected CredentialInput phase");
+        }
+
+        // Submit the pasted token
+        let result = press(&mut popup, KeyCode::Enter);
+        assert!(result.is_some());
+        let actions = result.unwrap();
+        let install = actions
+            .iter()
+            .find(|a| matches!(a, PluginAction::Install { id, .. } if id == "messaging/telegram"))
+            .expect("should have telegram install");
+        if let PluginAction::Install { credentials, .. } = install {
+            assert_eq!(credentials[0].1, "pasted-bot-token-123");
+        }
+    }
+
+    #[test]
+    fn handle_paste_not_consumed_when_hidden() {
+        let popup = &mut PluginsPopup::new();
+        assert!(!popup.handle_paste("anything"));
     }
 }

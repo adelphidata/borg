@@ -92,6 +92,19 @@ impl SchedulePopup {
         self.status_message = None;
     }
 
+    /// Handle a bracketed paste event. Returns `true` if the paste was consumed
+    /// (i.e. the popup is visible and in schedule-editing phase).
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.visible {
+            return false;
+        }
+        if let SchedulePhase::EditingSchedule { ref mut buffer } = self.phase {
+            buffer.push_str(text);
+            return true;
+        }
+        false
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<Vec<ScheduleAction>> {
         use crossterm::event::KeyCode;
 
@@ -479,5 +492,30 @@ mod tests {
         assert_eq!(popup.tasks[0].task.status, "active");
         assert!(result.is_none());
         assert!(popup.status_message.is_none());
+    }
+
+    #[test]
+    fn handle_paste_consumed_in_editing_schedule() {
+        let mut popup = make_popup_with_task("active");
+
+        // Paste during Browsing should NOT be consumed
+        assert!(!popup.handle_paste("anything"));
+
+        // Enter editing phase
+        popup.phase = SchedulePhase::EditingSchedule {
+            buffer: String::new(),
+        };
+        assert!(popup.handle_paste("*/5 * * * *"));
+        if let SchedulePhase::EditingSchedule { ref buffer } = popup.phase {
+            assert_eq!(buffer, "*/5 * * * *");
+        } else {
+            panic!("expected EditingSchedule phase");
+        }
+    }
+
+    #[test]
+    fn handle_paste_not_consumed_when_hidden() {
+        let popup = &mut SchedulePopup::new();
+        assert!(!popup.handle_paste("anything"));
     }
 }

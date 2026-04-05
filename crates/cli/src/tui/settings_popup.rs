@@ -259,6 +259,19 @@ impl SettingsPopup {
         }
     }
 
+    /// Handle a bracketed paste event. Returns `true` if the paste was consumed
+    /// (i.e. the popup is visible and in text-editing mode).
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.visible {
+            return false;
+        }
+        if let EditMode::Editing { ref mut buffer } = self.mode {
+            buffer.push_str(text);
+            return true;
+        }
+        false
+    }
+
     pub fn handle_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -1241,5 +1254,32 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         popup.handle_key(esc, &mut cfg).unwrap();
         assert_eq!(popup.mode, EditMode::Browsing);
+    }
+
+    #[test]
+    fn handle_paste_consumed_in_editing_mode() {
+        let mut popup = SettingsPopup::new();
+        let cfg = Config::default();
+        popup.show(&cfg);
+
+        // Paste during Browsing should NOT be consumed
+        assert!(!popup.handle_paste("anything"));
+
+        // Enter editing mode
+        popup.mode = EditMode::Editing {
+            buffer: String::new(),
+        };
+        assert!(popup.handle_paste("pasted-value"));
+        if let EditMode::Editing { ref buffer } = popup.mode {
+            assert_eq!(buffer, "pasted-value");
+        } else {
+            panic!("expected Editing mode");
+        }
+    }
+
+    #[test]
+    fn handle_paste_not_consumed_when_hidden() {
+        let popup = &mut SettingsPopup::new();
+        assert!(!popup.handle_paste("anything"));
     }
 }

@@ -252,9 +252,38 @@ impl<'a> App<'a> {
     }
 
     /// Handle a bracketed paste event (entire pasted text as a single string).
+    ///
+    /// Mirrors the popup priority logic in [`handle_key`]: visible popups
+    /// consume the paste exclusively — either into their text-input buffer or
+    /// as a no-op when no input field is active. Paste never leaks to the
+    /// composer while any popup is open.
     pub fn handle_paste(&mut self, text: String) -> AppAction {
         match self.state {
             AppState::Idle | AppState::AwaitingInput { .. } => {
+                // Popups get first priority (same order as handle_key).
+                // Try to route into the popup's input buffer; if it returns
+                // false the popup is visible but has no text field active —
+                // swallow the paste anyway (matches handle_key behaviour).
+                if self.settings_popup.is_visible() {
+                    self.settings_popup.handle_paste(&text);
+                    return AppAction::Continue;
+                }
+                if self.plugins_popup.is_visible() {
+                    self.plugins_popup.handle_paste(&text);
+                    return AppAction::Continue;
+                }
+                if self.schedule_popup.is_visible() {
+                    self.schedule_popup.handle_paste(&text);
+                    return AppAction::Continue;
+                }
+                // Remaining popups have no text input — just swallow.
+                if self.skills_popup.is_visible()
+                    || self.migrate_popup.is_visible()
+                    || self.status_popup.is_visible()
+                {
+                    return AppAction::Continue;
+                }
+
                 self.composer.handle_paste(&text);
                 // Update popup filters (same as after handle_key)
                 let composer_text = self.composer.text();
