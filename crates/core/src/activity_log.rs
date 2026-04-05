@@ -72,8 +72,8 @@ pub fn log_activity_detail(db: &Database, level: &str, category: &str, msg: &str
 pub fn format_activity_entry(entry: &crate::db::ActivityEntry) -> String {
     let dt = chrono::DateTime::from_timestamp(entry.created_at, 0)
         .map(|d| d.with_timezone(&chrono::Local))
-        .map(|d| d.format("%H:%M").to_string())
-        .unwrap_or_else(|| "??:??".to_string());
+        .map(|d| d.format("%H:%M:%S %Z").to_string())
+        .unwrap_or_else(|| "??:??:?? ???".to_string());
     let base = format!(
         "[{dt}] {:<5} {:<9} {}",
         entry.level.to_uppercase(),
