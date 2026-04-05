@@ -51,5 +51,8 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
+[dev-dependencies]
+rusqlite = { workspace = true }
+
 [lints]
 workspace = true

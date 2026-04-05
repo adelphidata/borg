@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod credentials;
+mod heartbeat_augmenters;
 mod logo;
 mod migrate_tui;
 mod onboarding;

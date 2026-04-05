@@ -967,6 +967,24 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
         user_msg.push_str(cl);
     }
 
+    // Proactive nudges: append LLM directives for heartbeat-only conditions
+    // (e.g. no messaging channels configured). Rate-limited via the `meta`
+    // table so each nudge fires at most once per its declared cooldown.
+    // See `crates/cli/src/heartbeat_augmenters.rs` for how to add one.
+    let augmenter_db = borg_core::db::Database::open().ok();
+    let nudges = crate::heartbeat_augmenters::collect(config, augmenter_db.as_ref());
+    if !nudges.is_empty() {
+        user_msg.push_str("\n\n<proactive_nudges>\n");
+        for n in &nudges {
+            user_msg.push_str("- ");
+            user_msg.push_str(n);
+            user_msg.push('\n');
+        }
+        user_msg.push_str("</proactive_nudges>");
+        tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
+    }
+    drop(augmenter_db);
+
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
     let cancel = CancellationToken::new();
 
