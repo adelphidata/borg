@@ -774,6 +774,38 @@ async fn handle_task_failure(ctx: &TaskFailureContext<'_>, error: &str) {
     }
 }
 
+/// A parsed task delivery target.
+///
+/// Legacy tasks store the target as a raw string (a Telegram chat_id, Slack
+/// channel/user ID, etc.). Tasks created via `delivery_channel = "origin"`
+/// store a JSON object with an explicit sender and optional thread so replies
+/// can be routed back into the same thread they were spawned from.
+struct DeliveryTarget {
+    sender: String,
+    thread_id: Option<String>,
+}
+
+fn parse_delivery_target(target: &str) -> DeliveryTarget {
+    if target.starts_with('{') {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(target) {
+            let sender = parsed
+                .get("sender")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let thread_id = parsed
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            return DeliveryTarget { sender, thread_id };
+        }
+    }
+    DeliveryTarget {
+        sender: target.to_string(),
+        thread_id: None,
+    }
+}
+
 async fn deliver_task_result(
     channel: &str,
     target: &str,
@@ -781,11 +813,19 @@ async fn deliver_task_result(
     text: &str,
     config: &Config,
 ) {
+    if channel == "origin" {
+        tracing::warn!(
+            "Task '{task_name}' has unresolved 'origin' delivery — task was likely \
+             created outside a gateway turn; dropping delivery"
+        );
+        return;
+    }
+    let parsed = parse_delivery_target(target);
     let msg = format!("[Task: {task_name}]\n{text}");
     let result = match channel {
-        "telegram" => send_telegram(config, target, &msg).await,
-        "slack" => send_slack(config, target, &msg).await,
-        "discord" => send_discord(config, target, &msg).await,
+        "telegram" => send_telegram(config, &parsed, &msg).await,
+        "slack" => send_slack(config, &parsed, &msg).await,
+        "discord" => send_discord(config, &parsed, &msg).await,
         _ => {
             tracing::warn!("Unknown delivery channel: {channel}");
             return;
@@ -796,31 +836,44 @@ async fn deliver_task_result(
     }
 }
 
-async fn send_telegram(config: &Config, target: &str, msg: &str) -> anyhow::Result<()> {
+async fn send_telegram(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
     let token = config
         .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
         .ok_or_else(|| anyhow::anyhow!("missing TELEGRAM_BOT_TOKEN"))?;
     let chat_id: i64 = target
+        .sender
         .parse()
-        .map_err(|_| anyhow::anyhow!("invalid chat_id"))?;
+        .map_err(|_| anyhow::anyhow!("invalid chat_id: {}", target.sender))?;
+    // Telegram forum topics use message_thread_id (i32); our string thread_id
+    // carries that value when the task was spawned from a forum topic.
+    let message_thread_id: Option<i64> =
+        target.thread_id.as_deref().and_then(|s| s.parse().ok());
     let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
-    client.send_message(chat_id, msg, None, None, None).await
+    client
+        .send_message(chat_id, msg, None, None, message_thread_id)
+        .await
 }
 
-async fn send_slack(config: &Config, target: &str, msg: &str) -> anyhow::Result<()> {
+async fn send_slack(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
     let token = config
         .resolve_credential_or_env("SLACK_BOT_TOKEN")
         .ok_or_else(|| anyhow::anyhow!("missing SLACK_BOT_TOKEN"))?;
     let client = borg_gateway::slack::api::SlackClient::new(&token)?;
-    client.post_message(target, msg, None).await.map(|_| ())
+    client
+        .post_message(&target.sender, msg, target.thread_id.as_deref())
+        .await
+        .map(|_| ())
 }
 
-async fn send_discord(config: &Config, target: &str, msg: &str) -> anyhow::Result<()> {
+async fn send_discord(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
     let token = config
         .resolve_credential_or_env("DISCORD_BOT_TOKEN")
         .ok_or_else(|| anyhow::anyhow!("missing DISCORD_BOT_TOKEN"))?;
     let client = borg_gateway::discord::api::DiscordClient::new(&token)?;
-    client.send_message(target, msg).await
+    // Discord threads are first-class channels with their own channel_id; if
+    // the task captured a thread_id, post directly into the thread channel.
+    let channel_id = target.thread_id.as_deref().unwrap_or(&target.sender);
+    client.send_message(channel_id, msg).await
 }
 
 /// Returns true if the response hash is a duplicate within the dedup time window.

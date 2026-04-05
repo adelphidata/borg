@@ -35,6 +35,8 @@ pub mod embeddings;
 pub mod error_format;
 /// Conversation evolution and personality drift.
 pub mod evolution;
+/// Task-local gateway origin context for tool handlers.
+pub mod gateway_context;
 /// Git utilities: ghost commits, context enrichment, turn diff tracking.
 pub mod git;
 /// HMAC-SHA256 chain for tamper-proof event logs.

@@ -270,6 +270,35 @@ pub async fn invoke_agent_with_auto_reply(
     bot_identifier: Option<&str>,
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
 ) -> Result<(String, String)> {
+    // Expose the originating (channel, sender, thread) to tool handlers via a
+    // task-local so e.g. the `schedule` tool can resolve `delivery="origin"`.
+    let origin = borg_core::gateway_context::GatewayOriginContext {
+        channel_name: channel_name.to_string(),
+        sender_id: inbound.sender_id.clone(),
+        thread_id: inbound.thread_id.clone(),
+    };
+    borg_core::gateway_context::scope(
+        origin,
+        invoke_agent_inner(
+            channel_name,
+            inbound,
+            config,
+            health,
+            bot_identifier,
+            auto_reply_state,
+        ),
+    )
+    .await
+}
+
+async fn invoke_agent_inner(
+    channel_name: &str,
+    inbound: &InboundMessage,
+    config: &Config,
+    health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
+    bot_identifier: Option<&str>,
+    auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
+) -> Result<(String, String)> {
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
         borg_core::activity_log::log_activity(
             &adb,

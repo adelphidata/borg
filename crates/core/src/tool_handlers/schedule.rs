@@ -106,6 +106,41 @@ pub fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result
     }
 }
 
+/// Resolve an "origin" sentinel on `delivery_channel` to the concrete
+/// `(channel, target)` of the current gateway conversation.
+///
+/// When the agent is running a gateway-triggered turn, [`crate::gateway_context::current`]
+/// returns the originating channel/sender/thread. If `delivery_channel ==
+/// "origin"`, we rewrite it to the real channel name and encode the sender
+/// (and thread, if present) into `delivery_target` as JSON so the delivery
+/// step can thread replies correctly. If no origin context is available the
+/// sentinel is left as-is and `deliver_task_result` will report an error.
+fn resolve_origin_delivery(
+    delivery_channel: Option<String>,
+    delivery_target: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let Some(ch) = delivery_channel else {
+        return (None, delivery_target);
+    };
+    if ch != "origin" {
+        return (Some(ch), delivery_target);
+    }
+    let Some(origin) = crate::gateway_context::current() else {
+        tracing::warn!(
+            "schedule: delivery_channel='origin' requested outside a gateway turn; \
+             leaving unresolved"
+        );
+        return (Some("origin".to_string()), delivery_target);
+    };
+    // Encode sender + thread as JSON so the delivery step can thread replies.
+    let target_json = serde_json::json!({
+        "sender": origin.sender_id,
+        "thread_id": origin.thread_id,
+    })
+    .to_string();
+    (Some(origin.channel_name), Some(target_json))
+}
+
 fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
     let task_name = require_str_param(args, "name")?;
     let prompt = require_str_param(args, "prompt")?;
@@ -120,6 +155,10 @@ fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
         Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
     };
     let id = uuid::Uuid::new_v4().to_string();
+    let (delivery_channel, delivery_target) = resolve_origin_delivery(
+        optional_str_param(args, "delivery_channel").map(str::to_string),
+        optional_str_param(args, "delivery_target").map(str::to_string),
+    );
     with_db(|db| {
         match db.create_task(&crate::db::NewTask {
             id: &id,
@@ -131,8 +170,8 @@ fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
             next_run,
             max_retries: optional_i64_param(args, "max_retries").map(|v| v as i32),
             timeout_ms: optional_i64_param(args, "timeout_ms"),
-            delivery_channel: optional_str_param(args, "delivery_channel"),
-            delivery_target: optional_str_param(args, "delivery_target"),
+            delivery_channel: delivery_channel.as_deref(),
+            delivery_target: delivery_target.as_deref(),
             allowed_tools: optional_str_param(args, "allowed_tools"),
             task_type: "prompt",
         }) {
@@ -391,6 +430,10 @@ fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
     };
 
     let id = uuid::Uuid::new_v4().to_string();
+    let (delivery_channel, delivery_target) = resolve_origin_delivery(
+        optional_str_param(args, "delivery_channel").map(str::to_string),
+        optional_str_param(args, "delivery_target").map(str::to_string),
+    );
     with_db(|db| {
         match db.create_task(&crate::db::NewTask {
             id: &id,
@@ -402,8 +445,8 @@ fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
             next_run,
             max_retries: Some(0),
             timeout_ms: optional_i64_param(args, "timeout_ms"),
-            delivery_channel: optional_str_param(args, "delivery_channel"),
-            delivery_target: optional_str_param(args, "delivery_target"),
+            delivery_channel: delivery_channel.as_deref(),
+            delivery_target: delivery_target.as_deref(),
             allowed_tools: None,
             task_type: "command",
         }) {
