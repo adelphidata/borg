@@ -41,6 +41,10 @@ pub const SLACK_DEDUP_CAPACITY: usize = 5000;
 /// Capacity of the Discord interaction deduplicator.
 pub const DISCORD_DEDUP_CAPACITY: usize = 5000;
 
+/// Capacity of the Microsoft Teams activity deduplicator. The Bot Framework
+/// retries deliveries on 5xx responses, so we dedup by activity ID.
+pub const TEAMS_DEDUP_CAPACITY: usize = 2000;
+
 /// Capacity of the Slack echo cache (recently sent message hashes).
 pub const SLACK_ECHO_CACHE_CAPACITY: usize = 100;
 
@@ -408,6 +412,7 @@ mod tests {
         assert!(TELEGRAM_DEDUP_CAPACITY > 0);
         assert!(SLACK_DEDUP_CAPACITY > 0);
         assert!(DISCORD_DEDUP_CAPACITY > 0);
+        assert!(TEAMS_DEDUP_CAPACITY > 0);
         assert!(SLACK_ECHO_CACHE_CAPACITY > 0);
         assert!(SELF_CHAT_CACHE_MAX_ENTRIES > 0);
     }

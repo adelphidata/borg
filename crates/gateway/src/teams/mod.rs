@@ -1,26 +1,32 @@
 pub mod api;
 pub mod channel;
+pub mod dedup;
 pub mod parse;
 pub mod types;
 pub mod verify;
 
 use anyhow::Result;
 use axum::http::HeaderMap;
+use std::sync::Mutex;
 
 use crate::handler::InboundMessage;
+use dedup::ActivityDeduplicator;
 use types::Activity;
 
 /// Process an incoming Microsoft Teams webhook request.
 ///
-/// Flow: verify HMAC signature (if secret provided) -> parse Activity -> convert to InboundMessage.
-/// Returns `Ok(Some((InboundMessage, Activity)))` for valid message activities.
-/// The `Activity` is returned alongside the message so the caller can extract `service_url`
-/// and other fields needed to send a response.
-/// Returns `Ok(None)` for non-message activities (conversationUpdate, typing, etc.).
+/// Flow: verify HMAC signature (if secret provided) -> parse Activity -> dedup
+/// by activity ID -> convert to InboundMessage. Returns
+/// `Ok(Some((InboundMessage, Activity)))` for valid message activities.
+/// The `Activity` is returned alongside the message so the caller can extract
+/// `service_url` and other fields needed to send a response. Returns
+/// `Ok(None)` for non-message activities (conversationUpdate, typing, etc.)
+/// and for duplicate retried activities.
 pub fn handle_teams_webhook(
     headers: &HeaderMap,
     body: &str,
     app_secret: Option<&str>,
+    dedup: Option<&Mutex<ActivityDeduplicator>>,
 ) -> Result<Option<(InboundMessage, Activity)>> {
     // Verify HMAC signature if secret is provided
     if let Some(secret) = app_secret {
@@ -29,6 +35,16 @@ pub fn handle_teams_webhook(
 
     let activity: Activity = serde_json::from_str(body)
         .map_err(|e| anyhow::anyhow!("Invalid Teams activity JSON: {e}"))?;
+
+    // Dedup by activity ID — the Bot Framework retries on 5xx/timeouts.
+    if let Some(dedup) = dedup {
+        if let Ok(mut guard) = dedup.lock() {
+            if guard.is_duplicate(activity.id.as_str()) {
+                tracing::debug!("Teams: dropping duplicate activity {}", activity.id);
+                return Ok(None);
+            }
+        }
+    }
 
     match parse::parse_activity(&activity) {
         Some(msg) => Ok(Some((msg, activity))),
@@ -86,7 +102,7 @@ mod tests {
         let body = message_body();
         let headers = HeaderMap::new();
 
-        let result = handle_teams_webhook(&headers, &body, None).unwrap();
+        let result = handle_teams_webhook(&headers, &body, None, None).unwrap();
         let (msg, activity) = result.unwrap();
         assert_eq!(msg.sender_id, "user-1");
         assert_eq!(msg.text, "hello bot");
@@ -103,7 +119,7 @@ mod tests {
         let secret = make_secret();
         let headers = make_signed_headers(&secret, &body);
 
-        let result = handle_teams_webhook(&headers, &body, Some(&secret)).unwrap();
+        let result = handle_teams_webhook(&headers, &body, Some(&secret), None).unwrap();
         let (msg, _) = result.unwrap();
         assert_eq!(msg.sender_id, "user-1");
         assert_eq!(msg.text, "hello bot");
@@ -117,7 +133,7 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(b"wrong-key!!!!!!!!!!!!!!!!!!!!!!!");
         let headers = make_signed_headers(&wrong_secret, &body);
 
-        let result = handle_teams_webhook(&headers, &body, Some(&secret));
+        let result = handle_teams_webhook(&headers, &body, Some(&secret), None);
         assert!(result.is_err());
     }
 
@@ -133,14 +149,14 @@ mod tests {
         .to_string();
         let headers = HeaderMap::new();
 
-        let result = handle_teams_webhook(&headers, &body, None).unwrap();
+        let result = handle_teams_webhook(&headers, &body, None, None).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn invalid_json_returns_error() {
         let headers = HeaderMap::new();
-        let result = handle_teams_webhook(&headers, "not json", None);
+        let result = handle_teams_webhook(&headers, "not json", None, None);
         assert!(result.is_err());
     }
 
@@ -158,8 +174,23 @@ mod tests {
         .to_string();
         let headers = HeaderMap::new();
 
-        let result = handle_teams_webhook(&headers, &body, None).unwrap();
+        let result = handle_teams_webhook(&headers, &body, None, None).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn dedup_drops_retried_activity() {
+        let body = message_body();
+        let headers = HeaderMap::new();
+        let dedup = Mutex::new(ActivityDeduplicator::new());
+
+        // First delivery: message parsed.
+        let first = handle_teams_webhook(&headers, &body, None, Some(&dedup)).unwrap();
+        assert!(first.is_some());
+
+        // Bot Framework retry with the same activity id: dropped as duplicate.
+        let second = handle_teams_webhook(&headers, &body, None, Some(&dedup)).unwrap();
+        assert!(second.is_none(), "duplicate activity should be dropped");
     }
 
     #[test]
@@ -168,7 +199,7 @@ mod tests {
         let secret = make_secret();
         let headers = HeaderMap::new();
 
-        let result = handle_teams_webhook(&headers, &body, Some(&secret));
+        let result = handle_teams_webhook(&headers, &body, Some(&secret), None);
         assert!(result.is_err());
     }
 }

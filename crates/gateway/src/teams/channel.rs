@@ -1,6 +1,6 @@
 //! `NativeChannel` implementation for Microsoft Teams.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -11,6 +11,7 @@ use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
 
 use super::api::TeamsClient;
+use super::dedup::ActivityDeduplicator;
 
 /// Teams-specific response context stored in the delivery queue.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -24,6 +25,7 @@ struct TeamsResponseContext {
 pub struct TeamsChannel {
     pub client: Arc<TeamsClient>,
     pub app_secret: Option<String>,
+    pub dedup: Arc<Mutex<ActivityDeduplicator>>,
 }
 
 #[async_trait]
@@ -38,7 +40,12 @@ impl NativeChannel for TeamsChannel {
         body: &str,
         _ctx: &WebhookContext<'_>,
     ) -> Result<WebhookOutcome> {
-        let parsed = super::handle_teams_webhook(headers, body, self.app_secret.as_deref())?;
+        let parsed = super::handle_teams_webhook(
+            headers,
+            body,
+            self.app_secret.as_deref(),
+            Some(self.dedup.as_ref()),
+        )?;
 
         let (inbound, activity) = match parsed {
             Some(pair) => pair,

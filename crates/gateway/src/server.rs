@@ -180,6 +180,9 @@ impl GatewayServer {
                 reg.register(Arc::new(TeamsChannel {
                     client: client.clone(),
                     app_secret: teams_app_secret.clone(),
+                    dedup: Arc::new(std::sync::Mutex::new(
+                        crate::teams::dedup::ActivityDeduplicator::new(),
+                    )),
                 }));
             }
             if let Some(ref client) = google_chat_client {
