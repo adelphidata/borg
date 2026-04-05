@@ -163,6 +163,12 @@ fn check_critical_host_security(config: &Config) -> Option<String> {
     borg_core::host_audit::check_listening_ports(&mut checks);
     borg_core::host_audit::check_ssh_config(&mut checks);
 
+    build_security_nudge(&checks)
+}
+
+/// Build an LLM directive from diagnostic checks. Returns `None` when
+/// all checks pass. Extracted so it can be tested with synthetic data.
+fn build_security_nudge(checks: &[borg_core::doctor::DiagnosticCheck]) -> Option<String> {
     let issues: Vec<&str> = checks
         .iter()
         .filter_map(|c| match &c.status {
@@ -344,6 +350,8 @@ mod tests {
 
     // ── Host security augmenter tests ──
 
+    use borg_core::doctor::{CheckStatus, DiagnosticCheck};
+
     #[test]
     fn check_critical_host_security_respects_config_toggle() {
         let _guard = EnvGuard::clear_native();
@@ -360,46 +368,94 @@ mod tests {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        // On any real machine this either returns None (all checks pass)
-        // or Some(...) with issue details. Either way it must not panic.
         let result = check_critical_host_security(&cfg);
         if let Some(ref snippet) = result {
-            // If issues are found, the snippet must contain actionable info.
-            assert!(
-                snippet.contains("borg doctor"),
-                "nudge should mention `borg doctor`"
-            );
-            assert!(
-                snippet.contains("Critical host security"),
-                "nudge should label severity"
-            );
+            assert!(snippet.contains("borg doctor"));
+            assert!(snippet.contains("Critical host security"));
         }
     }
 
+    // ── build_security_nudge unit tests (synthetic DiagnosticCheck data) ──
+
     #[test]
-    fn check_critical_host_security_snippet_lists_issues() {
-        // Simulate what the nudge builder does with known issues.
-        // This tests the formatting path without depending on real host state.
-        let issues = vec![
-            "Application Firewall is disabled",
-            "risky port open on all interfaces",
+    fn build_security_nudge_returns_none_when_all_pass() {
+        let checks = vec![
+            DiagnosticCheck::pass("Host Security", "Application Firewall"),
+            DiagnosticCheck::pass("Host Security", "risky listening ports"),
+            DiagnosticCheck::pass("Host Security", "SSH daemon config"),
         ];
-        let mut nudge = String::from(
-            "Critical host security issues detected on this machine. \
-             Alert the user clearly but calmly about the following:\n",
-        );
-        for issue in &issues {
-            nudge.push_str("  - ");
-            nudge.push_str(issue);
-            nudge.push('\n');
-        }
-        nudge.push_str(
-            "Suggest running `borg doctor` for a full report. \
-             Keep it brief — list the issues and the command, don't over-explain.",
-        );
-        assert!(nudge.contains("Firewall is disabled"));
-        assert!(nudge.contains("risky port"));
+        assert!(build_security_nudge(&checks).is_none());
+    }
+
+    #[test]
+    fn build_security_nudge_returns_none_on_empty_checks() {
+        assert!(build_security_nudge(&[]).is_none());
+    }
+
+    #[test]
+    fn build_security_nudge_includes_warn_issues() {
+        let checks = vec![
+            DiagnosticCheck::pass("Host Security", "SSH daemon config"),
+            DiagnosticCheck::warn(
+                "Host Security",
+                "Application Firewall",
+                "Application Firewall is disabled",
+            ),
+            DiagnosticCheck::warn(
+                "Host Security",
+                "port 23 (Telnet) listening",
+                "risky port open on all interfaces",
+            ),
+        ];
+        let nudge = build_security_nudge(&checks).expect("should fire with warnings");
+        assert!(nudge.contains("Critical host security issues detected"));
+        assert!(nudge.contains("Application Firewall is disabled"));
+        assert!(nudge.contains("risky port open on all interfaces"));
         assert!(nudge.contains("borg doctor"));
+        // Pass items should NOT appear in the nudge text
+        assert!(!nudge.contains("SSH daemon config"));
+    }
+
+    #[test]
+    fn build_security_nudge_includes_fail_issues() {
+        let checks = vec![DiagnosticCheck::fail(
+            "Host Security",
+            "firewall",
+            "no firewall detected",
+        )];
+        let nudge = build_security_nudge(&checks).expect("should fire with failures");
+        assert!(nudge.contains("no firewall detected"));
+        assert!(nudge.contains("borg doctor"));
+    }
+
+    #[test]
+    fn build_security_nudge_mixed_pass_warn_fail() {
+        let checks = vec![
+            DiagnosticCheck::pass("Host Security", "risky listening ports"),
+            DiagnosticCheck::warn(
+                "Host Security",
+                "SSH: PasswordAuthentication",
+                "PasswordAuthentication is enabled",
+            ),
+            DiagnosticCheck::fail("Host Security", "PF packet filter", "PF is disabled"),
+        ];
+        let nudge = build_security_nudge(&checks).expect("should fire");
+        assert!(nudge.contains("PasswordAuthentication is enabled"));
+        assert!(nudge.contains("PF is disabled"));
+        assert_eq!(nudge.matches("  - ").count(), 2);
+    }
+
+    #[test]
+    fn build_security_nudge_single_issue_format() {
+        let checks = vec![DiagnosticCheck::warn(
+            "Host Security",
+            "FileVault disk encryption",
+            "FileVault is disabled",
+        )];
+        let nudge = build_security_nudge(&checks).expect("should fire");
+        assert!(nudge.starts_with("Critical host security issues detected"));
+        assert!(nudge.contains("  - FileVault is disabled\n"));
+        assert!(nudge.ends_with("don't over-explain."));
     }
 
     #[test]
@@ -409,17 +465,41 @@ mod tests {
         cfg.security.host_audit = true;
         let db = in_memory_db();
 
-        // Run collect — host security may or may not fire depending on
-        // real machine state, but if it does fire it must respect cooldown.
         let first = collect(&cfg, Some(&db));
         let has_security_nudge = first.iter().any(|s| s.contains("Critical host security"));
 
         if has_security_nudge {
-            // Second call within cooldown should not include the security nudge.
             let second = collect(&cfg, Some(&db));
             assert!(
                 !second.iter().any(|s| s.contains("Critical host security")),
                 "security nudge should be suppressed by cooldown on second call"
+            );
+        }
+    }
+
+    #[test]
+    fn host_security_cooldown_resets_after_48h() {
+        let _guard = EnvGuard::clear_native();
+        let mut cfg = Config::default();
+        cfg.security.host_audit = true;
+        let db = in_memory_db();
+
+        let _ = collect(&cfg, Some(&db));
+
+        // Simulate 49h elapsed for the security augmenter.
+        let stale = unix_now().saturating_sub(49 * 60 * 60);
+        db.set_meta(&meta_key("critical_host_security"), &stale.to_string())
+            .unwrap();
+
+        let result = collect(&cfg, Some(&db));
+        let has_security = result.iter().any(|s| s.contains("Critical host security"));
+
+        // If it fired, cooldown must now suppress it again.
+        if has_security {
+            let again = collect(&cfg, Some(&db));
+            assert!(
+                !again.iter().any(|s| s.contains("Critical host security")),
+                "security nudge should be suppressed after re-firing"
             );
         }
     }
