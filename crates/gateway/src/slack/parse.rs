@@ -156,7 +156,10 @@ pub async fn parse_event(
         sender_id: sender_id.to_string(),
         text,
         channel_id: event.channel.clone(),
-        thread_id: None,
+        // Populate thread_id from thread_ts so the gateway handler isolates
+        // per-thread conversation history. `thread_ts` is Slack's parent-message
+        // timestamp and is None for top-level (non-threaded) messages.
+        thread_id: event.thread_ts.clone(),
         message_id: event.ts.clone(),
         thread_ts: event.thread_ts.clone(),
         attachments,
@@ -224,6 +227,15 @@ mod tests {
         let cb = make_event(event);
         let msg = parse_event(&cb, None, None).await.unwrap();
         assert_eq!(msg.thread_ts.as_deref(), Some("1234567890.000001"));
+        // thread_id mirrors thread_ts so the gateway handler isolates per-thread sessions.
+        assert_eq!(msg.thread_id.as_deref(), Some("1234567890.000001"));
+    }
+
+    #[tokio::test]
+    async fn parse_non_threaded_message_has_no_thread_id() {
+        let cb = make_event(make_slack_event("message"));
+        let msg = parse_event(&cb, None, None).await.unwrap();
+        assert!(msg.thread_id.is_none());
     }
 
     #[tokio::test]

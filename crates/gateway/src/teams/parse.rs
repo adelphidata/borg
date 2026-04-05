@@ -39,7 +39,10 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         sender_id,
         text: text.to_string(),
         channel_id: activity.conversation.as_ref().map(|c| c.id.clone()),
-        thread_id: None,
+        // Populate thread_id from reply_to_id so the gateway handler isolates
+        // per-reply-chain history. Top-level messages in a conversation have
+        // no reply_to_id and share the conversation's base session.
+        thread_id: activity.reply_to_id.clone(),
         message_id: Some(activity.id.clone()),
         thread_ts: activity.reply_to_id.clone(),
         attachments: Vec::new(),
@@ -116,6 +119,15 @@ mod tests {
         activity.reply_to_id = Some("parent-1".to_string());
         let msg = parse_activity(&activity).unwrap();
         assert_eq!(msg.thread_ts.as_deref(), Some("parent-1"));
+        // thread_id mirrors reply_to_id so the gateway handler isolates per-thread sessions.
+        assert_eq!(msg.thread_id.as_deref(), Some("parent-1"));
+    }
+
+    #[test]
+    fn parse_top_level_message_has_no_thread_id() {
+        let activity = make_activity();
+        let msg = parse_activity(&activity).unwrap();
+        assert!(msg.thread_id.is_none());
     }
 
     #[test]

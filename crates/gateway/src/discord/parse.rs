@@ -38,7 +38,11 @@ pub fn parse_interaction(interaction: &Interaction) -> Option<InboundMessage> {
         sender_id,
         text,
         channel_id: interaction.channel_id.clone(),
-        thread_id: None,
+        // Discord threads are first-class channels with their own channel_id.
+        // Mirror channel_id into thread_id so the gateway handler isolates
+        // sessions per Discord channel/thread (otherwise every Discord
+        // interaction from the same sender collapses into one history).
+        thread_id: interaction.channel_id.clone(),
         message_id: Some(interaction.id.clone()),
         thread_ts: None,
         attachments: Vec::new(),
@@ -150,6 +154,9 @@ mod tests {
         assert_eq!(msg.text, "What is Rust?");
         assert_eq!(msg.channel_id.as_deref(), Some("ch1"));
         assert_eq!(msg.message_id.as_deref(), Some("int1"));
+        // thread_id mirrors channel_id so per-thread sessions are isolated
+        // (Discord threads are first-class channels with their own channel_id).
+        assert_eq!(msg.thread_id.as_deref(), Some("ch1"));
     }
 
     #[test]

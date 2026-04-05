@@ -422,6 +422,34 @@ fn resolve_channel_session_different_senders() {
     assert_ne!(s1, s2);
 }
 
+/// Two threads from the same sender must resolve to distinct session IDs.
+///
+/// This mirrors the composite session key built by
+/// `crates/gateway/src/handler.rs` (`{sender_id}:{thread_id}`), and guards
+/// against regressions where the Slack/Teams/Discord parsers stop populating
+/// `InboundMessage.thread_id` — a past bug that collapsed every thread from
+/// the same sender into one conversation history.
+#[test]
+fn resolve_channel_session_isolates_threads_from_same_sender() {
+    let db = test_db();
+    let root = db.resolve_channel_session("slack", "alice").expect("root");
+    let thread_a = db
+        .resolve_channel_session("slack", "alice:thread-111")
+        .expect("thread_a");
+    let thread_b = db
+        .resolve_channel_session("slack", "alice:thread-222")
+        .expect("thread_b");
+    assert_ne!(root, thread_a);
+    assert_ne!(root, thread_b);
+    assert_ne!(thread_a, thread_b);
+
+    // Re-resolving the same thread key returns the same session (stable).
+    let thread_a_again = db
+        .resolve_channel_session("slack", "alice:thread-111")
+        .expect("thread_a_again");
+    assert_eq!(thread_a, thread_a_again);
+}
+
 #[test]
 fn update_channel_session_id_works() {
     let db = test_db();
