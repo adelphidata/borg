@@ -1887,6 +1887,7 @@ mod tests {
 
     // ── Prompt caching (Anthropic) ──
 
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
     #[test]
     fn anthropic_request_includes_cache_control_on_system() {
         let client = make_test_anthropic_client();
@@ -1902,6 +1903,7 @@ mod tests {
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
     }
 
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
     #[test]
     fn anthropic_request_caches_last_two_messages() {
         let client = make_test_anthropic_client();
@@ -1948,6 +1950,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::expect_used, clippy::unwrap_used)]
     #[test]
     fn anthropic_request_cache_disabled_emits_no_markers() {
         let env_var = "BORG_TEST_ANTHROPIC_CACHE_OFF";
@@ -1984,6 +1987,7 @@ mod tests {
         std::env::remove_var(env_var);
     }
 
+    #[allow(clippy::unwrap_used)]
     #[test]
     fn apply_message_cache_control_handles_fewer_than_two_messages() {
         let mut msgs = vec![serde_json::json!({
@@ -1995,6 +1999,7 @@ mod tests {
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     }
 
+    #[allow(clippy::expect_used)]
     #[test]
     fn apply_message_cache_control_upgrades_string_content() {
         // Plain-string content is upgraded to a single text block so cache_control can attach.
