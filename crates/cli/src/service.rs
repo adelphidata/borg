@@ -987,16 +987,27 @@ async fn daemon_heartbeat_turn(config: Config) {
 }
 
 /// Send a heartbeat message to all configured channels.
-async fn deliver_heartbeat_to_channels(config: &Config, text: &str) {
+///
+/// The `base_text` is the result of the shared heartbeat turn run with the
+/// root `[llm]` provider. For channels where a gateway binding matches, this
+/// function runs an *additional* per-channel heartbeat turn using the binding's
+/// overridden provider/model/identity so users can route different channels to
+/// different models. Channels with no matching binding reuse `base_text` —
+/// the common case stays a single agent turn.
+async fn deliver_heartbeat_to_channels(config: &Config, base_text: &str) {
     for channel_name in &config.heartbeat.channels {
-        if let Err(e) = deliver_to_channel(config, channel_name, text).await {
+        if let Err(e) = deliver_to_channel(config, channel_name, base_text).await {
             tracing::warn!("Heartbeat delivery to {channel_name} failed: {e}");
         }
     }
 }
 
 /// Deliver a heartbeat message to a single channel using native clients.
-async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> Result<()> {
+///
+/// Resolves the gateway binding for `(channel_name, sender_id)`; if the
+/// binding overrides the LLM config, re-runs the heartbeat turn with that
+/// config so the delivered message reflects the binding's provider/model.
+async fn deliver_to_channel(config: &Config, channel_name: &str, base_text: &str) -> Result<()> {
     let db = borg_core::db::Database::open()?;
 
     // Find the owner's sender_id from approved_senders for this channel
@@ -1007,6 +1018,41 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> 
     }
 
     let sender_id = &approved[0].sender_id;
+
+    // Resolve gateway binding for this (channel, sender). If a binding matches,
+    // re-run the heartbeat turn with the binding's overridden config so the
+    // delivered text reflects the per-channel provider/model/identity. If no
+    // binding matches, reuse the shared base_text (fast path).
+    let route = borg_gateway::routing::resolve_route(config, channel_name, sender_id, None);
+    let text_owned: String;
+    let text: &str = if route.binding_id == "default" {
+        base_text
+    } else {
+        tracing::info!(
+            "Heartbeat: running per-channel turn for {channel_name} with binding {}",
+            route.binding_id
+        );
+        match execute_heartbeat_turn(&route.config).await {
+            HeartbeatResult::Ran { message, .. } => {
+                text_owned = message;
+                &text_owned
+            }
+            HeartbeatResult::Skipped { reason } => {
+                tracing::debug!(
+                    "Heartbeat: per-channel turn for {channel_name} skipped: {reason}, \
+                     falling back to base text"
+                );
+                base_text
+            }
+            HeartbeatResult::Failed { error } => {
+                tracing::warn!(
+                    "Heartbeat: per-channel turn for {channel_name} failed: {error}, \
+                     falling back to base text"
+                );
+                base_text
+            }
+        }
+    };
 
     match channel_name {
         "telegram" => {
