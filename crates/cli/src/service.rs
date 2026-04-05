@@ -1002,23 +1002,70 @@ async fn deliver_heartbeat_to_channels(config: &Config, base_text: &str) {
     }
 }
 
+/// Resolve the list of sender IDs to deliver a heartbeat to for a channel.
+///
+/// Precedence:
+/// 1. If `heartbeat.recipients[channel]` is set and contains `"*"`, broadcast
+///    to every approved sender for the channel.
+/// 2. If `heartbeat.recipients[channel]` is set to explicit IDs, deliver only
+///    to those (intersected with approved senders for safety).
+/// 3. Otherwise fall back to the first approved sender (legacy behavior).
+fn resolve_heartbeat_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {
+    let db = borg_core::db::Database::open()?;
+    let approved = db.list_approved_senders(Some(channel_name))?;
+    if approved.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let override_list = config.heartbeat.recipients.get(channel_name);
+    let result = match override_list {
+        Some(ids) if ids.iter().any(|s| s == "*") => {
+            approved.into_iter().map(|s| s.sender_id).collect()
+        }
+        Some(ids) if !ids.is_empty() => {
+            let approved_set: std::collections::HashSet<String> =
+                approved.into_iter().map(|s| s.sender_id).collect();
+            ids.iter()
+                .filter(|id| approved_set.contains(id.as_str()))
+                .cloned()
+                .collect()
+        }
+        _ => approved.into_iter().take(1).map(|s| s.sender_id).collect(),
+    };
+    Ok(result)
+}
+
 /// Deliver a heartbeat message to a single channel using native clients.
 ///
 /// Resolves the gateway binding for `(channel_name, sender_id)`; if the
 /// binding overrides the LLM config, re-runs the heartbeat turn with that
 /// config so the delivered message reflects the binding's provider/model.
 async fn deliver_to_channel(config: &Config, channel_name: &str, base_text: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-
-    // Find the owner's sender_id from approved_senders for this channel
-    let approved = db.list_approved_senders(Some(channel_name))?;
-    if approved.is_empty() {
-        tracing::debug!("Heartbeat: no approved senders for {channel_name}, skipping");
+    let recipients = resolve_heartbeat_recipients(config, channel_name)?;
+    if recipients.is_empty() {
+        tracing::debug!(
+            "Heartbeat: no recipients resolved for {channel_name}, skipping (configure \
+             [heartbeat.recipients.{channel_name}] or approve a sender)"
+        );
         return Ok(());
     }
 
-    let sender_id = &approved[0].sender_id;
+    for sender_id in &recipients {
+        if let Err(e) = deliver_to_sender(config, channel_name, sender_id, base_text).await {
+            tracing::warn!("Heartbeat delivery to {channel_name}:{sender_id} failed: {e}");
+        }
+    }
 
+    Ok(())
+}
+
+/// Deliver a heartbeat to a specific sender on a specific channel.
+async fn deliver_to_sender(
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+    base_text: &str,
+) -> Result<()> {
     // Resolve gateway binding for this (channel, sender). If a binding matches,
     // re-run the heartbeat turn with the binding's overridden config so the
     // delivered text reflects the per-channel provider/model/identity. If no
@@ -1029,7 +1076,7 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, base_text: &str
         base_text
     } else {
         tracing::info!(
-            "Heartbeat: running per-channel turn for {channel_name} with binding {}",
+            "Heartbeat: running per-channel turn for {channel_name}:{sender_id} with binding {}",
             route.binding_id
         );
         match execute_heartbeat_turn(&route.config).await {
@@ -1039,15 +1086,15 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, base_text: &str
             }
             HeartbeatResult::Skipped { reason } => {
                 tracing::debug!(
-                    "Heartbeat: per-channel turn for {channel_name} skipped: {reason}, \
-                     falling back to base text"
+                    "Heartbeat: per-channel turn for {channel_name}:{sender_id} skipped: \
+                     {reason}, falling back to base text"
                 );
                 base_text
             }
             HeartbeatResult::Failed { error } => {
                 tracing::warn!(
-                    "Heartbeat: per-channel turn for {channel_name} failed: {error}, \
-                     falling back to base text"
+                    "Heartbeat: per-channel turn for {channel_name}:{sender_id} failed: \
+                     {error}, falling back to base text"
                 );
                 base_text
             }

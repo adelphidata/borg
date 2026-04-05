@@ -214,6 +214,12 @@ pub struct HeartbeatConfig {
     pub cron: Option<String>,
     /// Channel names to deliver heartbeat messages to.
     pub channels: Vec<String>,
+    /// Per-channel recipient overrides. Map of channel name → list of sender
+    /// IDs to deliver the heartbeat to. Use `"*"` as the sole entry to
+    /// broadcast to every approved sender for that channel. If a channel is
+    /// listed in `channels` but absent from `recipients`, heartbeat delivery
+    /// defaults to the first approved sender (legacy behavior).
+    pub recipients: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for HeartbeatConfig {
@@ -224,6 +230,7 @@ impl Default for HeartbeatConfig {
             quiet_hours_end: Some("06:00".into()),
             cron: None,
             channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -339,6 +346,7 @@ mod tests {
         assert_eq!(cfg.quiet_hours_end.as_deref(), Some("06:00"));
         assert!(cfg.cron.is_none());
         assert!(cfg.channels.is_empty());
+        assert!(cfg.recipients.is_empty());
     }
 
     #[test]
@@ -350,5 +358,24 @@ mod tests {
         let cfg: HeartbeatConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.interval, "1h");
         assert_eq!(cfg.channels, vec!["telegram", "slack"]);
+    }
+
+    #[test]
+    fn heartbeat_config_recipients_from_toml() {
+        let toml_str = r#"
+            channels = ["telegram", "slack", "discord"]
+            [recipients]
+            telegram = ["123456789"]
+            slack = ["U01ABC", "U02DEF"]
+            discord = ["*"]
+        "#;
+        let cfg: HeartbeatConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(cfg.recipients.len(), 3);
+        assert_eq!(cfg.recipients.get("telegram").unwrap(), &vec!["123456789"]);
+        assert_eq!(
+            cfg.recipients.get("slack").unwrap(),
+            &vec!["U01ABC", "U02DEF"]
+        );
+        assert_eq!(cfg.recipients.get("discord").unwrap(), &vec!["*"]);
     }
 }
