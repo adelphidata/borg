@@ -75,7 +75,7 @@ Release binaries are built via `.github/workflows/release.yml` on tag push (`v*`
 - `borg plugins` — list all integrations with configured/unconfigured status
 - `borg gateway` — start webhook gateway server for messaging channels
 - `borg poke` — trigger an immediate heartbeat check-in (sends poke signal to daemon)
-- `borg status` — show agent vitals (stability, focus, sync, growth, happiness)
+- `borg status` — show agent vitals (stability, focus, sync, growth, happiness). TUI: `/stats` (or `/status`)
 - `borg doctor` — run diagnostics (config, provider, sandbox, tools, skills, memory, gateway, budget, host security)
 - `borg tasks list` — list all scheduled tasks
 - `borg tasks create` — create a scheduled task (supports `--max-retries`, `--timeout`, `--delivery-channel`, `--delivery-target`)

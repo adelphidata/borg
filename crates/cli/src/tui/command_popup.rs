@@ -69,7 +69,7 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Run diagnostics",
     },
     SlashCommandDef {
-        name: "/status",
+        name: "/stats",
         description: "Show agent vitals",
     },
     SlashCommandDef {
@@ -358,7 +358,7 @@ mod tests {
             "/history",
             "/logs",
             "/doctor",
-            "/status",
+            "/stats",
             "/pairing",
             "/update",
             "/sessions",
@@ -377,12 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn filter_st_matches_status_and_schedule() {
+    fn filter_st_matches_stats_and_schedule() {
         let mut popup = CommandPopup::new();
         popup.update_filter("/st");
         let items = popup.filtered();
         let names: Vec<&str> = items.iter().map(|c| c.name).collect();
-        assert!(names.contains(&"/status"), "should match /status");
+        assert!(names.contains(&"/stats"), "should match /stats");
         // /settings starts with /se, not /st — so it should NOT match
         assert!(
             !names.contains(&"/settings"),

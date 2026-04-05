@@ -24,7 +24,7 @@ impl App<'_> {
             }
             "/history" => return Some(self.cmd_history()),
             "/logs" => return Some(self.handle_logs_command(None)),
-            "/status" => {
+            "/status" | "/stats" => {
                 self.status_popup.show(&self.config);
                 return Some(Ok(AppAction::Continue));
             }
@@ -423,5 +423,26 @@ impl App<'_> {
         );
         self.state = AppState::ConfirmingUninstall;
         Ok(AppAction::Continue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn commands_rs_has_stats_and_status_aliases() {
+        let src = include_str!("commands.rs");
+        // Strip test module to avoid self-matching
+        let code = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(
+            code.contains("\"/stats\""),
+            "commands.rs must handle /stats"
+        );
+        assert!(
+            code.contains("\"/status\""),
+            "commands.rs must handle /status"
+        );
     }
 }
