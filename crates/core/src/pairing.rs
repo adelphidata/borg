@@ -83,9 +83,11 @@ fn check_pairing(
         return Ok(AccessCheckResult::Allowed);
     }
 
+    let ttl = config.gateway.pairing_ttl_secs;
+
     // Check for existing non-expired pending request (reuse code)
     if let Some(existing) = db.find_pending_for_sender(channel_name, sender_id)? {
-        let message = format_challenge(channel_name, sender_id, &existing.code);
+        let message = format_challenge(channel_name, sender_id, &existing.code, ttl);
         return Ok(AccessCheckResult::Challenge {
             code: existing.code,
             message,
@@ -93,19 +95,36 @@ fn check_pairing(
     }
 
     // Generate new pairing code and create request
-    let ttl = config.gateway.pairing_ttl_secs;
     let code = generate_code();
     db.create_pairing_request(channel_name, sender_id, &code, None, ttl)?;
 
-    let message = format_challenge(channel_name, sender_id, &code);
+    let message = format_challenge(channel_name, sender_id, &code, ttl);
     Ok(AccessCheckResult::Challenge { code, message })
 }
 
-fn format_challenge(channel_name: &str, sender_id: &str, code: &str) -> String {
+/// Render a TTL duration as a human-readable string (e.g. `60 min`, `2 hr`).
+fn format_ttl(secs: i64) -> String {
+    if secs <= 0 {
+        return "soon".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{mins} min");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours} hr");
+    }
+    let days = hours / 24;
+    format!("{days} days")
+}
+
+fn format_challenge(channel_name: &str, sender_id: &str, code: &str, ttl_secs: i64) -> String {
+    let ttl_hint = format_ttl(ttl_secs);
     format!(
         "Borg: access not configured.\n\n\
          Your sender ID: {sender_id}\n\
-         Pairing code: {code}\n\n\
+         Pairing code: {code}  (expires in {ttl_hint})\n\n\
          Ask the bot owner to approve with:\n  \
          borg pairing approve {channel_name} {code}"
     )
@@ -196,9 +215,21 @@ mod tests {
                 assert!(message.contains("new_user"));
                 assert!(message.contains(&code));
                 assert!(message.contains("borg pairing approve"));
+                // TTL hint is visible so the user knows how long they have.
+                assert!(message.contains("expires in"));
             }
             other => panic!("expected Challenge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_format_ttl_variants() {
+        assert_eq!(format_ttl(0), "soon");
+        assert_eq!(format_ttl(30), "0 min");
+        assert_eq!(format_ttl(60), "1 min");
+        assert_eq!(format_ttl(3600), "1 hr");
+        assert_eq!(format_ttl(3600 * 24), "1 days");
+        assert_eq!(format_ttl(3600 * 48), "2 days");
     }
 
     #[test]
