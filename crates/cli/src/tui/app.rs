@@ -1019,18 +1019,10 @@ impl<'a> App<'a> {
             } else {
                 "No log file found.".to_string()
             };
-            let clipboard_note = if !text.is_empty() {
-                match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
-                    Ok(_) => "\n\n(copied to clipboard)",
-                    Err(_) => "",
-                }
-            } else {
-                ""
-            };
             self.push_system_message(if text.is_empty() {
                 "Log file is empty.".to_string()
             } else {
-                format!("{text}{clipboard_note}")
+                text
             });
             return Ok(AppAction::Continue);
         }
@@ -1063,15 +1055,7 @@ impl<'a> App<'a> {
             Err(e) => format!("Error opening database: {e}"),
         };
 
-        let clipboard_note = if !text.is_empty() {
-            match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.clone())) {
-                Ok(_) => "\n\n(copied to clipboard)",
-                Err(_) => "",
-            }
-        } else {
-            ""
-        };
-        self.push_system_message(format!("{text}{clipboard_note}"));
+        self.push_system_message(text);
         Ok(AppAction::Continue)
     }
 
