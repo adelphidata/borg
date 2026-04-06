@@ -677,6 +677,46 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Update a project's fields. Only non-None values are applied.
+    pub fn update_project(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let mut sets = vec!["updated_at = ?1".to_string()];
+        let mut param_idx = 2u32;
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now)];
+
+        if let Some(n) = name {
+            sets.push(format!("name = ?{param_idx}"));
+            values.push(Box::new(n.to_string()));
+            param_idx += 1;
+        }
+        if let Some(d) = description {
+            sets.push(format!("description = ?{param_idx}"));
+            values.push(Box::new(d.to_string()));
+            param_idx += 1;
+        }
+        if let Some(s) = status {
+            sets.push(format!("status = ?{param_idx}"));
+            values.push(Box::new(s.to_string()));
+            param_idx += 1;
+        }
+
+        let sql = format!(
+            "UPDATE projects SET {} WHERE id = ?{param_idx}",
+            sets.join(", ")
+        );
+        values.push(Box::new(id.to_string()));
+
+        let refs: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(AsRef::as_ref).collect();
+        let count = self.conn.execute(&sql, refs.as_slice())?;
+        Ok(count > 0)
+    }
+
     /// Delete a project. Does not cascade to workflows (they keep a dangling project_id).
     pub fn delete_project(&self, id: &str) -> Result<bool> {
         let count = self

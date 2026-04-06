@@ -1762,6 +1762,7 @@ Rules:
             "schedule" | "manage_tasks" | "manage_cron" => {
                 tool_handlers::handle_schedule(&args, &self.config)
             }
+            "projects" => tool_handlers::handle_projects(&args, &self.config),
             "read_file" => {
                 return tool_handlers::handle_read_file(&args, &self.config);
             }

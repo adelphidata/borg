@@ -830,6 +830,49 @@ fn test_delete_project() {
     assert!(!db.delete_project("nonexistent").unwrap());
 }
 
+#[test]
+fn test_update_project() {
+    let db = test_db();
+    db.create_project("p1", "Original", "Desc").unwrap();
+
+    // Update name only
+    assert!(db
+        .update_project("p1", Some("Renamed"), None, None)
+        .unwrap());
+    let p = db.get_project("p1").unwrap().unwrap();
+    assert_eq!(p.name, "Renamed");
+    assert_eq!(p.description, "Desc"); // unchanged
+
+    // Update description only
+    assert!(db
+        .update_project("p1", None, Some("New desc"), None)
+        .unwrap());
+    let p = db.get_project("p1").unwrap().unwrap();
+    assert_eq!(p.name, "Renamed"); // unchanged
+    assert_eq!(p.description, "New desc");
+
+    // Update status
+    assert!(db
+        .update_project("p1", None, None, Some("archived"))
+        .unwrap());
+    let p = db.get_project("p1").unwrap().unwrap();
+    assert_eq!(p.status, "archived");
+
+    // Update all at once
+    assert!(db
+        .update_project("p1", Some("Final"), Some("Final desc"), Some("active"))
+        .unwrap());
+    let p = db.get_project("p1").unwrap().unwrap();
+    assert_eq!(p.name, "Final");
+    assert_eq!(p.description, "Final desc");
+    assert_eq!(p.status, "active");
+
+    // Nonexistent
+    assert!(!db
+        .update_project("nonexistent", Some("X"), None, None)
+        .unwrap());
+}
+
 // ============================================================
 // Workflow-by-Session Query Tests
 // ============================================================

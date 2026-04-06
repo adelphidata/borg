@@ -83,6 +83,11 @@ Release binaries are built via `.github/workflows/release.yml` on tag push (`v*`
 - `borg tasks runs <id>` — show execution history for a task
 - `borg tasks status <id>` — show detailed task status including retry state and delivery config
 - `borg tasks pause/resume/delete <id>` — manage task lifecycle
+- `borg projects list` — list all projects (supports `--status` filter)
+- `borg projects create --name "Name"` — create a project (supports `--description`)
+- `borg projects get <id>` — show project details and associated workflows
+- `borg projects update <id>` — update project (supports `--name`, `--description`, `--status`)
+- `borg projects archive/delete <id>` — manage project lifecycle
 - `borg cron list` — list all cron jobs
 - `borg cron add "*/5 * * * * echo hello"` — add a cron job (combined crontab format)
 - `borg cron add -s "*/5 * * * *" -c "echo hello"` — add a cron job (separate flags)
@@ -92,6 +97,7 @@ Release binaries are built via `.github/workflows/release.yml` on tag push (`v*`
 - `/update` (TUI command) — update borg to latest version (`/update --dev` for pre-release)
 - `/poke` (TUI command) — trigger an immediate heartbeat check-in
 - `/plugins` (TUI command) — open marketplace popup to install/uninstall messaging, email, and productivity integrations
+- `/projects` (TUI command) — list projects with status and workflow counts
 
 ## Onboarding
 
@@ -193,6 +199,7 @@ Plan mode uses an allowlist of non-mutating tools — new tools default to block
 | `read_file` | Read file contents with line numbers, image rendering, PDF extraction |
 | `list_dir` | List directory contents with types and sizes. Supports depth recursion (max 3) and hidden files. Security: checks blocked paths on every entry |
 | `browser` | Headless Chrome automation (navigate, click, type, screenshot, get_text, evaluate_js, close). Requires `browser.enabled = true` |
+| `projects` | Manage projects — group related workflows into workstreams. Actions: create, list, get, update, archive, delete |
 | `schedule` | Manage scheduled jobs — both AI prompt tasks (type=prompt) and shell cron jobs (type=command). Actions: create, list, get, update, pause, resume, cancel, delete, runs, run_now |
 
 ## Patch DSL
@@ -567,6 +574,17 @@ Linux-style cron jobs that execute shell commands directly (no LLM involved). Us
 - **Output**: stdout/stderr captured and stored in `task_runs.result`; non-zero exit stored in `task_runs.error`
 - **No retry on non-zero exit**: Unlike prompt tasks, script failures are not retried (they're user errors, not transient)
 - **Daemon**: Same daemon loop picks up both prompt and command tasks; branches on `task_type`
+
+## Projects
+
+Projects group related workflows into logical workstreams. Stored in the `projects` table (V31 migration alongside workflows).
+
+- **CLI**: `borg projects list/create/get/update/archive/delete`
+- **TUI**: `/projects` — shows all projects with workflow counts
+- **Agent tool**: `projects` with actions: create, list, get, update, archive, delete
+- **Statuses**: `active` (default), `archived`
+- **Workflow association**: Pass `project_id` when creating a workflow via the `schedule` tool
+- **DB operations**: `create_project`, `get_project`, `list_projects`, `update_project`, `archive_project`, `delete_project` in `crates/core/src/db/workflow.rs`
 
 ## Heartbeat
 

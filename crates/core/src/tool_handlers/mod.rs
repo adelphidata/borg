@@ -2,6 +2,7 @@ mod filesystem;
 mod list;
 mod media;
 mod memory;
+mod projects;
 mod schedule;
 mod scripts;
 mod shell;
@@ -56,6 +57,9 @@ pub use shell::handle_run_shell;
 
 // Web
 pub use web::{handle_web_fetch, handle_web_search};
+
+// Projects
+pub use projects::handle_projects;
 
 // Schedule
 pub use schedule::{handle_manage_cron, handle_manage_tasks, handle_schedule, update_task_status};
@@ -252,8 +256,8 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            13,
-            "expected 13 core tools (all enabled), got: {names:?}"
+            14,
+            "expected 14 core tools (all enabled), got: {names:?}"
         );
 
         let mut minimal_config = Config::default();
@@ -261,7 +265,7 @@ mod tests {
         minimal_config.browser.enabled = false;
         let defs = core_tool_definitions(&minimal_config);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert_eq!(names.len(), 10, "expected 10 base tools, got: {names:?}");
+        assert_eq!(names.len(), 11, "expected 11 base tools, got: {names:?}");
     }
 
     #[test]

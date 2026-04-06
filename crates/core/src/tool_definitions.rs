@@ -27,6 +27,26 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     defs.push(build_schedule_tool_def(config));
 
+    defs.push(ToolDefinition::new(
+        "projects",
+        "Manage projects. Projects group related workflows and track workstreams. Actions: create, list, get, update, archive, delete.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "list", "get", "update", "archive", "delete"],
+                    "description": "Action to perform"
+                },
+                "id": { "type": "string", "description": "Project ID (required for get/update/archive/delete)" },
+                "name": { "type": "string", "description": "Project name (required for create, optional for update)" },
+                "description": { "type": "string", "description": "Project description" },
+                "status": { "type": "string", "enum": ["active", "archived"], "description": "Filter by status (for list) or set status (for update)" }
+            },
+            "required": ["action"]
+        }),
+    ));
+
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
             "browser",
@@ -200,7 +220,38 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"projects"));
         assert!(names.contains(&"request_user_input"));
+    }
+
+    #[test]
+    fn projects_tool_has_correct_schema() {
+        let config = Config::default();
+        let defs = core_tool_definitions(&config);
+        let projects = defs
+            .iter()
+            .find(|d| d.function.name == "projects")
+            .expect("should have projects tool");
+
+        let props = &projects.function.parameters["properties"];
+        assert!(props["action"].is_object());
+        assert!(props["id"].is_object());
+        assert!(props["name"].is_object());
+        assert!(props["description"].is_object());
+        assert!(props["status"].is_object());
+
+        let actions: Vec<&str> = props["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(actions.contains(&"create"));
+        assert!(actions.contains(&"list"));
+        assert!(actions.contains(&"get"));
+        assert!(actions.contains(&"update"));
+        assert!(actions.contains(&"archive"));
+        assert!(actions.contains(&"delete"));
     }
 
     #[test]
