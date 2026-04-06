@@ -106,7 +106,10 @@ impl PluginsPopup {
     /// Test helpers for inspecting/manipulating popup state.
     #[cfg(test)]
     pub fn items_for_test(&self) -> Vec<(&str, bool)> {
-        self.items.iter().map(|i| (i.def.id, i.is_installed)).collect()
+        self.items
+            .iter()
+            .map(|i| (i.def.id, i.is_installed))
+            .collect()
     }
 
     #[cfg(test)]
