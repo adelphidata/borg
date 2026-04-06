@@ -30,25 +30,37 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
 
 /// Model choices per provider.
 pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
-    ("anthropic/claude-sonnet-4", "Claude Sonnet 4 (recommended)"),
+    ("moonshotai/kimi-k2.5", "Kimi K2.5 (recommended)"),
+    ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
+    ("anthropic/claude-opus-4", "Claude Opus 4"),
     ("anthropic/claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
     ("openai/gpt-4.1", "GPT-4.1"),
     ("openai/gpt-4.1-mini", "GPT-4.1 Mini (fast, cheap)"),
+    ("openai/gpt-4.1-nano", "GPT-4.1 Nano (fastest)"),
     ("google/gemini-2.5-pro", "Gemini 2.5 Pro"),
+    ("google/gemini-2.5-flash", "Gemini 2.5 Flash"),
     ("deepseek/deepseek-r1", "DeepSeek R1 (reasoning)"),
+    ("deepseek/deepseek-chat-v3", "DeepSeek V3 (chat)"),
+    ("meta-llama/llama-4-maverick", "Llama 4 Maverick"),
 ];
 
 pub(crate) const OPENAI_MODELS: &[(&str, &str)] = &[
     ("gpt-4.1", "GPT-4.1 (recommended)"),
     ("gpt-4.1-mini", "GPT-4.1 Mini (fast, cheap)"),
     ("gpt-4.1-nano", "GPT-4.1 Nano (fastest)"),
-    ("o3-mini", "o3-mini (reasoning)"),
+    ("o3", "o3 (reasoning)"),
+    ("o3-mini", "o3 Mini (reasoning, fast)"),
+    ("o4-mini", "o4 Mini (reasoning, fast)"),
+    ("gpt-4o", "GPT-4o"),
+    ("gpt-4o-mini", "GPT-4o Mini"),
 ];
 
 pub(crate) const ANTHROPIC_MODELS: &[(&str, &str)] = &[
     ("claude-sonnet-4", "Claude Sonnet 4 (recommended)"),
-    ("claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
     ("claude-opus-4", "Claude Opus 4 (most capable)"),
+    ("claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
+    ("claude-3.5-sonnet", "Claude 3.5 Sonnet"),
+    ("claude-3.5-haiku", "Claude 3.5 Haiku"),
 ];
 
 pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
@@ -60,6 +72,7 @@ pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
 pub(crate) const GEMINI_MODELS: &[(&str, &str)] = &[
     ("gemini-2.5-pro", "Gemini 2.5 Pro (recommended)"),
     ("gemini-2.5-flash", "Gemini 2.5 Flash (fast)"),
+    ("gemini-2.0-flash", "Gemini 2.0 Flash"),
 ];
 
 pub(crate) const DEEPSEEK_MODELS: &[(&str, &str)] = &[
@@ -753,14 +766,14 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_models_trimmed() {
+    fn openrouter_models_count() {
         assert!(
-            OPENROUTER_MODELS.len() <= 7,
-            "OpenRouter models should be trimmed to ~6"
+            OPENROUTER_MODELS.len() <= 15,
+            "OpenRouter models should be at most 15"
         );
         assert!(
-            OPENROUTER_MODELS.len() >= 5,
-            "OpenRouter models should have at least 5"
+            OPENROUTER_MODELS.len() >= 10,
+            "OpenRouter models should have at least 10"
         );
     }
 

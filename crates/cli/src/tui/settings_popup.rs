@@ -34,8 +34,14 @@ pub struct SettingEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum EditMode {
     Browsing,
-    Editing { buffer: String },
+    Editing {
+        buffer: String,
+    },
     ConfirmReset,
+    SelectingModel {
+        selected: usize,
+        scroll_offset: usize,
+    },
 }
 
 pub struct SettingsPopup {
@@ -316,6 +322,9 @@ impl SettingsPopup {
                 }
                 KeyCode::Left => {
                     let entry = &self.entries[self.selected];
+                    if entry.key == "model" {
+                        return self.open_model_selection();
+                    }
                     match entry.kind {
                         SettingKind::Select => self.cycle_select(config, false),
                         SettingKind::Float => self.step_float(config, false),
@@ -324,6 +333,9 @@ impl SettingsPopup {
                 }
                 KeyCode::Right => {
                     let entry = &self.entries[self.selected];
+                    if entry.key == "model" {
+                        return self.open_model_selection();
+                    }
                     match entry.kind {
                         SettingKind::Select => self.cycle_select(config, true),
                         SettingKind::Float => self.step_float(config, true),
@@ -332,6 +344,9 @@ impl SettingsPopup {
                 }
                 KeyCode::Enter => {
                     let entry = &self.entries[self.selected];
+                    if entry.key == "model" {
+                        return self.open_model_selection();
+                    }
                     match entry.kind {
                         SettingKind::Bool | SettingKind::Select => {
                             self.dismiss();
@@ -405,7 +420,82 @@ impl SettingsPopup {
                 }
                 _ => Ok(None),
             },
+            EditMode::SelectingModel {
+                ref mut selected,
+                ref mut scroll_offset,
+            } => match key.code {
+                KeyCode::Up => {
+                    let provider_id = PROVIDERS
+                        .get(self.provider_index)
+                        .map(|(id, _, _)| *id)
+                        .unwrap_or("openrouter");
+                    let count = models_for_provider(provider_id).len();
+                    *selected = if *selected == 0 {
+                        count - 1
+                    } else {
+                        *selected - 1
+                    };
+                    // Adjust scroll
+                    if *selected < *scroll_offset {
+                        *scroll_offset = *selected;
+                    }
+                    Ok(None)
+                }
+                KeyCode::Down => {
+                    let provider_id = PROVIDERS
+                        .get(self.provider_index)
+                        .map(|(id, _, _)| *id)
+                        .unwrap_or("openrouter");
+                    let count = models_for_provider(provider_id).len();
+                    *selected = (*selected + 1) % count;
+                    Ok(None)
+                }
+                KeyCode::Enter => {
+                    let sel = *selected;
+                    let provider_id = PROVIDERS
+                        .get(self.provider_index)
+                        .map(|(id, _, _)| *id)
+                        .unwrap_or("openrouter");
+                    let models = models_for_provider(provider_id);
+                    if let Some((model_id, _)) = models.get(sel) {
+                        match config.apply_setting("model", model_id) {
+                            Ok(confirmation) => {
+                                let _ = self.save_setting("model", model_id);
+                                self.model_index = sel;
+                                self.status_message =
+                                    Some((format!("Updated: {confirmation}"), true));
+                                self.mode = EditMode::Browsing;
+                                return Ok(Some(AppAction::UpdateSetting {
+                                    key: "model".to_string(),
+                                    value: model_id.to_string(),
+                                }));
+                            }
+                            Err(e) => {
+                                self.status_message = Some((format!("Error: {e}"), false));
+                                self.mode = EditMode::Browsing;
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+                KeyCode::Esc => {
+                    self.mode = EditMode::Browsing;
+                    self.status_message = None;
+                    Ok(None)
+                }
+                _ => Ok(None),
+            },
         }
+    }
+
+    /// Open the model selection list, pre-selecting the current model.
+    fn open_model_selection(&mut self) -> anyhow::Result<Option<AppAction>> {
+        self.mode = EditMode::SelectingModel {
+            selected: self.model_index,
+            scroll_offset: 0,
+        };
+        self.status_message = None;
+        Ok(None)
     }
 
     fn cycle_select(
@@ -449,34 +539,6 @@ impl SettingsPopup {
                             key: "model".to_string(),
                             value: model_id.to_string(),
                         });
-                    }
-                }
-            }
-            "model" => {
-                let provider_id = PROVIDERS
-                    .get(self.provider_index)
-                    .map(|(id, _, _)| *id)
-                    .unwrap_or("openrouter");
-                let models = models_for_provider(provider_id);
-                let count = models.len();
-                self.model_index = if forward {
-                    (self.model_index + 1) % count
-                } else {
-                    (self.model_index + count - 1) % count
-                };
-                let (model_id, _) = models[self.model_index];
-                match config.apply_setting("model", model_id) {
-                    Ok(confirmation) => {
-                        let _ = self.save_setting("model", model_id);
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        actions.push(AppAction::UpdateSetting {
-                            key: "model".to_string(),
-                            value: model_id.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        return Ok(None);
                     }
                 }
             }
@@ -640,6 +702,72 @@ impl SettingsPopup {
 
         let area = frame.area();
         let popup_area = popup_utils::popup_area(area);
+
+        // Model selection list mode — render dedicated list
+        if let EditMode::SelectingModel {
+            selected,
+            scroll_offset,
+        } = &self.mode
+        {
+            let inner = popup_utils::render_popup_frame(frame, popup_area, "Select Model");
+            if inner.height < 5 || inner.width < 12 {
+                return;
+            }
+
+            let provider_id = PROVIDERS
+                .get(self.provider_index)
+                .map(|(id, _, _)| *id)
+                .unwrap_or("openrouter");
+            let models = models_for_provider(provider_id);
+            let content_height = (inner.height as usize).saturating_sub(2); // reserve footer + status
+
+            // Build model list lines
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            for (i, (_, display)) in models.iter().enumerate() {
+                let is_current = i == self.model_index;
+                let is_sel = i == *selected;
+                let bullet = if is_current { theme::BULLET } else { "○" };
+                let label = format!("  {bullet} {display}");
+
+                let style = if is_sel {
+                    theme::popup_selected()
+                } else {
+                    ratatui::style::Style::default()
+                };
+
+                let pad = (inner.width as usize).saturating_sub(label.len() + 1);
+                lines.push(Line::from(vec![
+                    Span::styled(label, style),
+                    Span::styled(format!("{:>pad$} ", "", pad = pad), style),
+                ]));
+            }
+
+            // Scroll to keep selected visible
+            let adj_scroll = if *selected >= *scroll_offset + content_height {
+                *selected - content_height + 1
+            } else if *selected < *scroll_offset {
+                *selected
+            } else {
+                *scroll_offset
+            };
+
+            let visible_lines: Vec<Line<'static>> = lines
+                .into_iter()
+                .skip(adj_scroll)
+                .take(content_height)
+                .collect();
+
+            let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
+            frame.render_widget(Paragraph::new(visible_lines), content_area);
+
+            popup_utils::render_footer(
+                frame,
+                inner,
+                " \u{2191}\u{2193}: navigate  Enter: select  Esc: cancel",
+            );
+            return;
+        }
+
         let inner = popup_utils::render_popup_frame(frame, popup_area, "Settings");
 
         if inner.height < 5 || inner.width < 12 {
@@ -680,6 +808,8 @@ impl SettingsPopup {
                         theme::CROSS
                     };
                     icon.to_string()
+                } else if entry.key == "model" {
+                    format!("{value} \u{25B6}")
                 } else if entry.kind == SettingKind::Select {
                     format!("< {value} >")
                 } else {
@@ -696,7 +826,7 @@ impl SettingsPopup {
                 value.clone()
             };
 
-            let customized_suffix = if is_customized { " ●" } else { "" };
+            let customized_suffix = if is_customized { " \u{25CF}" } else { "" };
             let label_width = inner.width.saturating_sub(4) as usize;
             let label = format!("  {}", entry.label);
             let val_with_suffix = format!("{display_value}{customized_suffix}");
@@ -715,7 +845,7 @@ impl SettingsPopup {
                 Span::styled(display_value, base_style),
             ];
             if is_customized {
-                spans.push(Span::styled(" ●", base_style.patch(theme::dim())));
+                spans.push(Span::styled(" \u{25CF}", base_style.patch(theme::dim())));
             }
             // Fill remaining space with base style for consistent highlight
             spans.push(Span::styled(" ", base_style));
@@ -758,21 +888,28 @@ impl SettingsPopup {
         let hint = match self.mode {
             EditMode::Browsing => {
                 let entry = &self.entries[self.selected];
-                match entry.kind {
-                    SettingKind::Bool => " Space: toggle  Enter: apply  r: reset  Esc: close",
-                    SettingKind::Select => {
-                        " \u{25C0}\u{25B6}: cycle  Enter: apply  r: reset  Esc: close"
+                if entry.key == "model" {
+                    " Enter: choose model  r: reset  Esc: close"
+                } else {
+                    match entry.kind {
+                        SettingKind::Bool => " Space: toggle  Enter: apply  r: reset  Esc: close",
+                        SettingKind::Select => {
+                            " \u{25C0}\u{25B6}: cycle  Enter: apply  r: reset  Esc: close"
+                        }
+                        SettingKind::Float => {
+                            " \u{25C0}\u{25B6}: adjust  Enter: edit  r: reset  Esc: close"
+                        }
+                        _ => " Enter: edit  r: reset  Esc: close",
                     }
-                    SettingKind::Float => {
-                        " \u{25C0}\u{25B6}: adjust  Enter: edit  r: reset  Esc: close"
-                    }
-                    _ => " Enter: edit  r: reset  Esc: close",
                 }
             }
             EditMode::ConfirmReset => {
                 " Reset all settings to defaults? y: confirm  any key: cancel"
             }
             EditMode::Editing { .. } => " Enter: apply  Esc: cancel",
+            EditMode::SelectingModel { .. } => {
+                " \u{2191}\u{2193}: navigate  Enter: select  Esc: cancel"
+            }
         };
         popup_utils::render_footer(frame, inner, hint);
     }
@@ -991,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn model_cycle_forward() {
+    fn model_enter_opens_selection() {
         let mut popup = SettingsPopup::new();
         let mut cfg = Config::default();
         popup.show(&cfg);
@@ -1001,10 +1138,10 @@ mod tests {
         assert_eq!(popup.entries[1].key, "model");
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
-        let result = popup.handle_key(right, &mut cfg).unwrap();
-        assert!(result.is_some());
-        assert_eq!(popup.model_index, 1);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = popup.handle_key(enter, &mut cfg).unwrap();
+        assert!(result.is_none());
+        assert!(matches!(popup.mode, EditMode::SelectingModel { .. }));
     }
 
     #[test]
@@ -1067,7 +1204,7 @@ mod tests {
         popup.show(&cfg);
 
         assert_eq!(popup.provider_index, 2); // anthropic is index 2
-        assert_eq!(popup.model_index, 1); // claude-haiku-4 is index 1 in ANTHROPIC_MODELS
+        assert_eq!(popup.model_index, 2); // claude-haiku-4 is index 2 in ANTHROPIC_MODELS
     }
 
     #[test]
@@ -1120,23 +1257,132 @@ mod tests {
     }
 
     #[test]
-    fn model_cycle_wraps() {
+    fn model_right_opens_selection() {
         let mut popup = SettingsPopup::new();
         let mut cfg = Config::default();
-        // Set to anthropic with last model
-        cfg.llm.provider = Some("anthropic".to_string());
-        cfg.llm.model = "claude-opus-4".to_string();
         popup.show(&cfg);
 
         popup.selected = 1; // model
-        assert_eq!(popup.model_index, 2); // last model in ANTHROPIC_MODELS
+        assert_eq!(popup.entries[1].key, "model");
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
         popup.handle_key(right, &mut cfg).unwrap();
-        // Should wrap to 0
-        assert_eq!(popup.model_index, 0);
-        assert_eq!(cfg.llm.model, "claude-sonnet-4");
+        assert!(matches!(popup.mode, EditMode::SelectingModel { .. }));
+    }
+
+    #[test]
+    fn model_left_opens_selection() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        popup.selected = 1; // model
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        popup.handle_key(left, &mut cfg).unwrap();
+        assert!(matches!(popup.mode, EditMode::SelectingModel { .. }));
+    }
+
+    #[test]
+    fn model_selection_up_down_navigates() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        // Enter model selection
+        popup.mode = EditMode::SelectingModel {
+            selected: 0,
+            scroll_offset: 0,
+        };
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        popup.handle_key(down, &mut cfg).unwrap();
+        if let EditMode::SelectingModel { selected, .. } = popup.mode {
+            assert_eq!(selected, 1);
+        } else {
+            panic!("expected SelectingModel");
+        }
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        popup.handle_key(up, &mut cfg).unwrap();
+        if let EditMode::SelectingModel { selected, .. } = popup.mode {
+            assert_eq!(selected, 0);
+        } else {
+            panic!("expected SelectingModel");
+        }
+    }
+
+    #[test]
+    fn model_selection_wraps() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        // Start at first model, go up to wrap
+        popup.mode = EditMode::SelectingModel {
+            selected: 0,
+            scroll_offset: 0,
+        };
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        popup.handle_key(up, &mut cfg).unwrap();
+
+        let provider_id = PROVIDERS[popup.provider_index].0;
+        let count = models_for_provider(provider_id).len();
+        if let EditMode::SelectingModel { selected, .. } = popup.mode {
+            assert_eq!(selected, count - 1);
+        } else {
+            panic!("expected SelectingModel");
+        }
+    }
+
+    #[test]
+    fn model_selection_enter_applies() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        // Select second model in current provider's list
+        popup.mode = EditMode::SelectingModel {
+            selected: 1,
+            scroll_offset: 0,
+        };
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let result = popup.handle_key(enter, &mut cfg).unwrap();
+
+        assert!(result.is_some());
+        assert!(matches!(popup.mode, EditMode::Browsing));
+        assert_eq!(popup.model_index, 1);
+
+        let provider_id = PROVIDERS[popup.provider_index].0;
+        let models = models_for_provider(provider_id);
+        assert_eq!(cfg.llm.model, models[1].0);
+    }
+
+    #[test]
+    fn model_selection_esc_cancels() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        let original_model = cfg.llm.model.clone();
+        popup.show(&cfg);
+
+        popup.mode = EditMode::SelectingModel {
+            selected: 2,
+            scroll_offset: 0,
+        };
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        popup.handle_key(esc, &mut cfg).unwrap();
+
+        assert!(matches!(popup.mode, EditMode::Browsing));
+        assert_eq!(cfg.llm.model, original_model); // unchanged
     }
 
     #[test]
