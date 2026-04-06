@@ -12,15 +12,17 @@ const API_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 pub fn tool_definition() -> ToolDefinition {
     ToolDefinition::new(
         "gmail",
-        "Send, search, read, reply, forward, draft, label, and manage emails via Gmail API.",
+        "Send, search, read, reply, forward, draft, label, archive, and manage emails via Gmail API.",
         json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
                     "enum": ["send", "search", "read", "reply", "forward",
-                             "create_draft", "list_drafts", "send_draft",
-                             "list_labels", "modify_labels", "trash", "get_thread"],
+                             "create_draft", "list_drafts", "send_draft", "read_draft",
+                             "list_labels", "modify_labels", "trash", "untrash",
+                             "get_thread", "mark_read", "mark_unread", "archive",
+                             "batch_modify", "get_attachment"],
                     "description": "Action to perform"
                 },
                 "to": { "type": "string", "description": "Recipient email (for send, forward)" },
@@ -30,14 +32,16 @@ pub fn tool_definition() -> ToolDefinition {
                 "body": { "type": "string", "description": "Email body as plain text (for send, reply, forward, create_draft)" },
                 "body_html": { "type": "string", "description": "Email body as HTML (overrides body for send, reply, create_draft)" },
                 "query": { "type": "string", "description": "Search query using Gmail search operators (for search)" },
-                "message_id": { "type": "string", "description": "Message ID (for read, reply, forward, modify_labels, trash)" },
+                "message_id": { "type": "string", "description": "Message ID (for read, reply, forward, modify_labels, trash, untrash, mark_read, mark_unread, archive, get_attachment)" },
                 "reply_to_message_id": { "type": "string", "description": "Message ID to reply to (for send, threads the reply)" },
-                "draft_id": { "type": "string", "description": "Draft ID (for send_draft)" },
+                "draft_id": { "type": "string", "description": "Draft ID (for send_draft, read_draft)" },
                 "thread_id": { "type": "string", "description": "Thread ID (for get_thread)" },
                 "limit": { "type": "integer", "description": "Max results (for search/list_drafts, default 10)" },
                 "page_token": { "type": "string", "description": "Pagination token (for search)" },
-                "add_labels": { "type": "array", "items": { "type": "string" }, "description": "Label IDs to add (for modify_labels)" },
-                "remove_labels": { "type": "array", "items": { "type": "string" }, "description": "Label IDs to remove (for modify_labels)" }
+                "add_labels": { "type": "array", "items": { "type": "string" }, "description": "Label IDs to add (for modify_labels, batch_modify)" },
+                "remove_labels": { "type": "array", "items": { "type": "string" }, "description": "Label IDs to remove (for modify_labels, batch_modify)" },
+                "message_ids": { "type": "array", "items": { "type": "string" }, "description": "Message IDs (for batch_modify)" },
+                "attachment_id": { "type": "string", "description": "Attachment ID (for get_attachment)" }
             },
             "required": ["action"]
         }),
@@ -60,7 +64,14 @@ pub async fn handle(arguments: &Value, config: &Config) -> Result<String> {
         "list_labels" => list_labels(&client, &token).await,
         "modify_labels" => modify_labels(&client, &token, arguments).await,
         "trash" => trash_email(&client, &token, arguments).await,
+        "untrash" => untrash_email(&client, &token, arguments).await,
         "get_thread" => get_thread(&client, &token, arguments).await,
+        "mark_read" => mark_read(&client, &token, arguments).await,
+        "mark_unread" => mark_unread(&client, &token, arguments).await,
+        "archive" => archive_email(&client, &token, arguments).await,
+        "batch_modify" => batch_modify(&client, &token, arguments).await,
+        "read_draft" => read_draft(&client, &token, arguments).await,
+        "get_attachment" => get_attachment(&client, &token, arguments).await,
         _ => bail!("Unknown action: {action}"),
     }
 }
@@ -90,6 +101,34 @@ fn extract_header(message: &Value, name: &str) -> Option<String> {
         .find(|h| h["name"].as_str() == Some(name))
         .and_then(|h| h["value"].as_str())
         .map(String::from)
+}
+
+/// Format label IDs from a Gmail message metadata response.
+fn format_label_ids(message: &Value) -> String {
+    message["labelIds"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(|l| l.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+/// Truncate a snippet to `max_chars`, appending "..." if truncated.
+fn truncate_snippet(snippet: &str, max_chars: usize) -> String {
+    if snippet.chars().count() <= max_chars {
+        snippet.to_string()
+    } else {
+        let boundary = snippet
+            .char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| i)
+            .unwrap_or(snippet.len());
+        format!("{}...", &snippet[..boundary])
+    }
 }
 
 /// Recursively extract the text body from a Gmail message payload.
@@ -313,7 +352,18 @@ async fn search_emails(client: &Client, token: &str, args: &Value) -> Result<Str
                         let from =
                             extract_header(&meta, "From").unwrap_or_else(|| "unknown".to_string());
                         let date = extract_header(&meta, "Date").unwrap_or_default();
-                        summaries.push(format!("- [{id}] {subject} (from: {from}, {date})"));
+                        let labels = format_label_ids(&meta);
+                        let snippet = truncate_snippet(meta["snippet"].as_str().unwrap_or(""), 100);
+                        let mut entry =
+                            format!("- [{id}] {subject}\n  From: {from} | Date: {date}");
+                        if !labels.is_empty() && !snippet.is_empty() {
+                            entry.push_str(&format!("\n  Labels: {labels} | {snippet}"));
+                        } else if !labels.is_empty() {
+                            entry.push_str(&format!("\n  Labels: {labels}"));
+                        } else if !snippet.is_empty() {
+                            entry.push_str(&format!("\n  {snippet}"));
+                        }
+                        summaries.push(entry);
                     } else {
                         summaries.push(format!("- [{id}] (metadata unavailable)"));
                     }
@@ -669,6 +719,215 @@ async fn get_thread(client: &Client, token: &str, args: &Value) -> Result<String
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Shortcut actions
+// ---------------------------------------------------------------------------
+
+/// Helper for single-message label modification shortcuts.
+async fn modify_single_label(
+    client: &Client,
+    token: &str,
+    args: &Value,
+    add: &[&str],
+    remove: &[&str],
+    success_msg: &str,
+) -> Result<String> {
+    let message_id = require_str(args, "message_id")?;
+    let message_id = validate_resource_id(message_id, "message_id")?;
+
+    send_json(
+        client
+            .post(format!("{API_BASE}/messages/{message_id}/modify"))
+            .bearer_auth(token)
+            .json(&json!({
+                "addLabelIds": add,
+                "removeLabelIds": remove
+            })),
+        "Gmail",
+    )
+    .await
+    .map(|_: Value| format!("{success_msg} {message_id}"))
+}
+
+async fn mark_read(client: &Client, token: &str, args: &Value) -> Result<String> {
+    modify_single_label(
+        client,
+        token,
+        args,
+        &[],
+        &["UNREAD"],
+        "Message marked as read:",
+    )
+    .await
+}
+
+async fn mark_unread(client: &Client, token: &str, args: &Value) -> Result<String> {
+    modify_single_label(
+        client,
+        token,
+        args,
+        &["UNREAD"],
+        &[],
+        "Message marked as unread:",
+    )
+    .await
+}
+
+async fn archive_email(client: &Client, token: &str, args: &Value) -> Result<String> {
+    modify_single_label(client, token, args, &[], &["INBOX"], "Message archived:").await
+}
+
+async fn untrash_email(client: &Client, token: &str, args: &Value) -> Result<String> {
+    let message_id = require_str(args, "message_id")?;
+    let message_id = validate_resource_id(message_id, "message_id")?;
+
+    send_and_check(
+        client
+            .post(format!("{API_BASE}/messages/{message_id}/untrash"))
+            .bearer_auth(token),
+        "Gmail",
+    )
+    .await?;
+
+    Ok(format!("Message {message_id} restored from trash."))
+}
+
+// ---------------------------------------------------------------------------
+// Batch operations
+// ---------------------------------------------------------------------------
+
+async fn batch_modify(client: &Client, token: &str, args: &Value) -> Result<String> {
+    let ids: Vec<&str> = args["message_ids"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Missing 'message_ids' array"))?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    if ids.is_empty() {
+        bail!("At least one message ID is required in 'message_ids'");
+    }
+    if ids.len() > 1000 {
+        bail!("Too many message IDs (max 1000)");
+    }
+
+    for id in &ids {
+        validate_resource_id(id, "message_id")?;
+    }
+
+    let add: Vec<&str> = args["add_labels"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let remove: Vec<&str> = args["remove_labels"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    if add.is_empty() && remove.is_empty() {
+        bail!("At least one of 'add_labels' or 'remove_labels' must be provided");
+    }
+
+    send_and_check(
+        client
+            .post(format!("{API_BASE}/messages/batchModify"))
+            .bearer_auth(token)
+            .json(&json!({
+                "ids": ids,
+                "addLabelIds": add,
+                "removeLabelIds": remove
+            })),
+        "Gmail",
+    )
+    .await?;
+
+    let mut parts = Vec::new();
+    if !add.is_empty() {
+        parts.push(format!("added: {}", add.join(", ")));
+    }
+    if !remove.is_empty() {
+        parts.push(format!("removed: {}", remove.join(", ")));
+    }
+    Ok(format!(
+        "Batch label update applied to {} message(s) ({})",
+        ids.len(),
+        parts.join("; ")
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Draft reading & attachments
+// ---------------------------------------------------------------------------
+
+async fn read_draft(client: &Client, token: &str, args: &Value) -> Result<String> {
+    let draft_id = require_str(args, "draft_id")?;
+    let draft_id = validate_resource_id(draft_id, "draft_id")?;
+
+    let result: Value = send_json(
+        client
+            .get(format!("{API_BASE}/drafts/{draft_id}"))
+            .bearer_auth(token)
+            .query(&[("format", "full")]),
+        "Gmail",
+    )
+    .await?;
+
+    let message = &result["message"];
+    let from = extract_header(message, "From").unwrap_or_else(|| "unknown".to_string());
+    let to = extract_header(message, "To").unwrap_or_default();
+    let cc = extract_header(message, "Cc");
+    let date = extract_header(message, "Date").unwrap_or_default();
+    let subject = extract_header(message, "Subject").unwrap_or_else(|| "(no subject)".to_string());
+
+    let body = extract_body_text(&message["payload"]);
+    let body_display = if body.is_empty() {
+        message["snippet"].as_str().unwrap_or("").to_string()
+    } else {
+        body
+    };
+
+    let mut output = format!("Draft ID: {draft_id}\nFrom: {from}\nTo: {to}\n");
+    if let Some(cc_val) = cc {
+        output.push_str(&format!("Cc: {cc_val}\n"));
+    }
+    output.push_str(&format!(
+        "Date: {date}\nSubject: {subject}\n\n{body_display}"
+    ));
+    Ok(output)
+}
+
+async fn get_attachment(client: &Client, token: &str, args: &Value) -> Result<String> {
+    let message_id = require_str(args, "message_id")?;
+    let message_id = validate_resource_id(message_id, "message_id")?;
+    let attachment_id = require_str(args, "attachment_id")?;
+    let attachment_id = validate_resource_id(attachment_id, "attachment_id")?;
+
+    let result: Value = send_json(
+        client
+            .get(format!(
+                "{API_BASE}/messages/{message_id}/attachments/{attachment_id}"
+            ))
+            .bearer_auth(token),
+        "Gmail",
+    )
+    .await?;
+
+    let size = result["size"].as_u64().unwrap_or(0);
+    let data = result["data"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing attachment data"))?;
+
+    // Guard against large attachments flooding the LLM context window
+    const MAX_DISPLAY_BYTES: u64 = 256 * 1024; // 256 KB
+    if size > MAX_DISPLAY_BYTES {
+        return Ok(format!(
+            "Attachment too large to display ({size} bytes). Use the attachment ID for direct download.",
+        ));
+    }
+
+    Ok(format!("Attachment ({size} bytes):\n{data}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,7 +940,7 @@ mod tests {
         let props = &def.function.parameters["properties"];
         assert!(props["action"].is_object());
         let actions = props["action"]["enum"].as_array().unwrap();
-        assert_eq!(actions.len(), 12);
+        assert_eq!(actions.len(), 19);
         let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
         for expected in &[
             "send",
@@ -692,10 +951,17 @@ mod tests {
             "create_draft",
             "list_drafts",
             "send_draft",
+            "read_draft",
             "list_labels",
             "modify_labels",
             "trash",
+            "untrash",
             "get_thread",
+            "mark_read",
+            "mark_unread",
+            "archive",
+            "batch_modify",
+            "get_attachment",
         ] {
             assert!(action_strs.contains(expected), "missing action: {expected}");
         }
@@ -708,6 +974,8 @@ mod tests {
         assert!(props["add_labels"].is_object());
         assert!(props["remove_labels"].is_object());
         assert!(props["page_token"].is_object());
+        assert!(props["message_ids"].is_object());
+        assert!(props["attachment_id"].is_object());
     }
 
     #[test]
@@ -987,6 +1255,247 @@ mod tests {
         assert_eq!(extract_body_text(&nest(9)), "deep text");
         // 15 levels of nesting (exceeds limit) — returns empty
         assert_eq!(extract_body_text(&nest(15)), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // New helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_label_ids() {
+        let msg = json!({ "labelIds": ["INBOX", "UNREAD", "CATEGORY_PERSONAL"] });
+        assert_eq!(format_label_ids(&msg), "INBOX, UNREAD, CATEGORY_PERSONAL");
+
+        let msg_empty = json!({ "labelIds": [] });
+        assert_eq!(format_label_ids(&msg_empty), "");
+
+        let msg_missing = json!({});
+        assert_eq!(format_label_ids(&msg_missing), "");
+    }
+
+    #[test]
+    fn test_truncate_snippet() {
+        assert_eq!(truncate_snippet("short", 100), "short");
+        assert_eq!(truncate_snippet("", 100), "");
+
+        let long = "a".repeat(200);
+        let truncated = truncate_snippet(&long, 100);
+        assert!(truncated.ends_with("..."));
+        // 100 'a' chars + "..."
+        assert_eq!(truncated.len(), 103);
+
+        // Exact boundary
+        let exact = "a".repeat(100);
+        assert_eq!(truncate_snippet(&exact, 100), exact);
+
+        // Unicode safety
+        let unicode = "日本語のテスト文字列です";
+        let result = truncate_snippet(unicode, 5);
+        assert!(result.ends_with("..."));
+    }
+
+    // -----------------------------------------------------------------------
+    // Shortcut action validation tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_mark_read_missing_message_id() {
+        let client = Client::new();
+        let args = json!({});
+        let err = mark_read(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_mark_unread_missing_message_id() {
+        let client = Client::new();
+        let args = json!({});
+        let err = mark_unread(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_archive_missing_message_id() {
+        let client = Client::new();
+        let args = json!({});
+        let err = archive_email(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_untrash_missing_message_id() {
+        let client = Client::new();
+        let args = json!({});
+        let err = untrash_email(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_mark_read_invalid_message_id() {
+        let client = Client::new();
+        let args = json!({"message_id": "../../evil"});
+        let err = mark_read(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid message_id"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch modify validation tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_batch_modify_missing_message_ids() {
+        let client = Client::new();
+        let args = json!({"add_labels": ["STARRED"]});
+        let err = batch_modify(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_ids'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_batch_modify_empty_ids() {
+        let client = Client::new();
+        let args = json!({"message_ids": [], "add_labels": ["STARRED"]});
+        let err = batch_modify(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("At least one message ID"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_batch_modify_missing_labels() {
+        let client = Client::new();
+        let args = json!({"message_ids": ["abc123"]});
+        let err = batch_modify(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("At least one of 'add_labels' or 'remove_labels'"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_modify_invalid_id() {
+        let client = Client::new();
+        let args = json!({
+            "message_ids": ["valid123", "../evil"],
+            "add_labels": ["STARRED"]
+        });
+        let err = batch_modify(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid message_id"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Draft reading & attachment validation tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_read_draft_missing_draft_id() {
+        let client = Client::new();
+        let args = json!({});
+        let err = read_draft(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'draft_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_attachment_missing_message_id() {
+        let client = Client::new();
+        let args = json!({"attachment_id": "att123"});
+        let err = get_attachment(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'message_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_attachment_missing_attachment_id() {
+        let client = Client::new();
+        let args = json!({"message_id": "msg123"});
+        let err = get_attachment(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Missing 'attachment_id'"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_get_attachment_invalid_ids() {
+        let client = Client::new();
+        let args = json!({"message_id": "msg/../bad", "attachment_id": "att123"});
+        let err = get_attachment(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid message_id"), "got: {err}");
+
+        let args = json!({"message_id": "msg123", "attachment_id": "att/../bad"});
+        let err = get_attachment(&client, "fake-token", &args)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid attachment_id"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Meta-test: all schema actions are dispatched
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_all_schema_actions_dispatched() {
+        let def = tool_definition();
+        let actions = def.function.parameters["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+
+        let mut config = crate::config::Config::default();
+        let env_var = "__BORG_TEST_GMAIL_DISPATCH__";
+        config.credentials.insert(
+            "GMAIL_API_KEY".to_string(),
+            crate::config::CredentialValue::EnvVar(env_var.to_string()),
+        );
+        unsafe {
+            std::env::set_var(env_var, "fake-token");
+        }
+
+        for action_val in actions {
+            let action = action_val.as_str().unwrap();
+            let args = json!({"action": action});
+            let result = handle(&args, &config).await;
+            // The call will fail (no real API), but it must NOT fail with "Unknown action"
+            if let Err(e) = &result {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Unknown action"),
+                    "action '{action}' is in schema but not dispatched"
+                );
+            }
+        }
     }
 
     integration_handle_tests!(gmail, "GMAIL_API_KEY");
