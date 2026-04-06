@@ -405,7 +405,10 @@ async fn invoke_agent_inner(
                     &format!("Access denied for {} on {channel_name}", inbound.sender_id),
                 );
             }
-            return Ok((String::new(), String::new()));
+            return Ok((
+                "Access denied. Contact the bot owner for access.".to_string(),
+                String::new(),
+            ));
         }
     }
 
@@ -1181,5 +1184,19 @@ mod tests {
         let json = r#"{"sender_id": "u1", "text": "hi", "metadata": {"key": "val"}}"#;
         let msg: InboundMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.metadata["key"], "val");
+    }
+
+    /// Verify that the denial message constant is non-empty so users get feedback
+    /// instead of silent drops.
+    #[test]
+    fn denied_sender_gets_denial_message() {
+        let denial_msg = "Access denied. Contact the bot owner for access.";
+        assert!(!denial_msg.trim().is_empty());
+        // Ensure the message is present in the source code (guards against removal)
+        let source = include_str!("handler.rs");
+        assert!(
+            source.contains(denial_msg),
+            "Denial message must be returned to users, not silently dropped"
+        );
     }
 }

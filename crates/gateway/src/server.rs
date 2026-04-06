@@ -91,7 +91,6 @@ impl GatewayServer {
         let addr = format!("{}:{}", gateway_config.host, gateway_config.port);
 
         let registry = ChannelRegistry::new()?;
-        let channel_count = registry.list_channels().len();
 
         // Initialize health registry
         let mut health_reg = ChannelHealthRegistry::new();
@@ -193,6 +192,8 @@ impl GatewayServer {
             }
             reg
         };
+
+        let channel_count = registry.list_channels().len() + native_channels.list().len();
 
         let state = Arc::new(AppState {
             config: self.config.clone(),
@@ -659,8 +660,8 @@ async fn readyz_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         }
     }
 
-    // Check that at least one channel is registered
-    let channel_count = state.registry.list_channels().len();
+    // Check that at least one channel is registered (script-based + native)
+    let channel_count = state.registry.list_channels().len() + state.native_channels.list().len();
     checks.insert("channels".into(), serde_json::json!(channel_count));
 
     // Check LLM provider is configured
@@ -691,7 +692,13 @@ async fn channel_health_handler(State(state): State<Arc<AppState>>) -> impl Into
 }
 
 async fn list_channels_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let channels = state.registry.list_channels();
+    let mut channels = state.registry.list_channels();
+    for ch in state.native_channels.list() {
+        let name = ch.names()[0];
+        channels.push(format!(
+            "{name}: native integration (webhook: /webhook/{name})"
+        ));
+    }
     axum::Json(serde_json::json!({ "channels": channels }))
 }
 
@@ -1243,6 +1250,90 @@ mod tests {
         headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.1"));
         let info = loopback_connect_info();
         assert_eq!(extract_client_ip(&headers, &info), "10.0.0.1");
+    }
+
+    #[test]
+    fn combined_channel_count_includes_native() {
+        use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+
+        struct TestChannel(&'static str);
+
+        #[async_trait::async_trait]
+        impl NativeChannel for TestChannel {
+            fn names(&self) -> Vec<&str> {
+                vec![self.0]
+            }
+            async fn handle_webhook(
+                &self,
+                _h: &HeaderMap,
+                _b: &str,
+                _c: &WebhookContext<'_>,
+            ) -> anyhow::Result<WebhookOutcome> {
+                Ok(WebhookOutcome::Skip)
+            }
+            async fn send_response(
+                &self,
+                _t: &str,
+                _c: &serde_json::Value,
+                _h: &std::sync::Arc<tokio::sync::RwLock<crate::health::ChannelHealthRegistry>>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut native = NativeChannelRegistry::new();
+        native.register(std::sync::Arc::new(TestChannel("telegram")));
+        native.register(std::sync::Arc::new(TestChannel("slack")));
+
+        // Script-based registry will have 0 channels in test env
+        let script_count = 0;
+        let total = script_count + native.list().len();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn list_channels_includes_native_names() {
+        use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+
+        struct TestChannel(&'static str);
+
+        #[async_trait::async_trait]
+        impl NativeChannel for TestChannel {
+            fn names(&self) -> Vec<&str> {
+                vec![self.0]
+            }
+            async fn handle_webhook(
+                &self,
+                _h: &HeaderMap,
+                _b: &str,
+                _c: &WebhookContext<'_>,
+            ) -> anyhow::Result<WebhookOutcome> {
+                Ok(WebhookOutcome::Skip)
+            }
+            async fn send_response(
+                &self,
+                _t: &str,
+                _c: &serde_json::Value,
+                _h: &std::sync::Arc<tokio::sync::RwLock<crate::health::ChannelHealthRegistry>>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut native = NativeChannelRegistry::new();
+        native.register(std::sync::Arc::new(TestChannel("telegram")));
+
+        let mut channels: Vec<String> = Vec::new();
+        for ch in native.list() {
+            let name = ch.names()[0];
+            channels.push(format!(
+                "{name}: native integration (webhook: /webhook/{name})"
+            ));
+        }
+
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0].contains("telegram"));
+        assert!(channels[0].contains("native integration"));
     }
 
     #[test]

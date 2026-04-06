@@ -588,6 +588,31 @@ mod tests {
         assert!(std::ptr::eq(Arc::as_ptr(got), Arc::as_ptr(&channel2_dyn)));
     }
 
+    #[test]
+    fn native_registry_count_multiple_channels() {
+        let mut registry = NativeChannelRegistry::new();
+
+        let telegram = Arc::new(MockChannel {
+            name: "telegram".to_string(),
+            call_count: Arc::new(AtomicU32::new(0)),
+            send_count: Arc::new(AtomicU32::new(0)),
+            should_skip: false,
+        });
+        let slack = Arc::new(MockChannel {
+            name: "slack".to_string(),
+            call_count: Arc::new(AtomicU32::new(0)),
+            send_count: Arc::new(AtomicU32::new(0)),
+            should_skip: false,
+        });
+
+        registry.register(telegram);
+        registry.register(slack);
+
+        assert_eq!(registry.list().len(), 2);
+        assert!(registry.contains("telegram"));
+        assert!(registry.contains("slack"));
+    }
+
     /// Mock channel that returns a protocol response.
     struct ProtocolChannel;
 
