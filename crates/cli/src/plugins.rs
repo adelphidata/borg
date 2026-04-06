@@ -128,17 +128,6 @@ pub const PLUGINS: &[PluginDef] = &[
         is_channel: false,
     },
     PluginDef {
-        name: "outlook",
-        description: "Outlook via Microsoft Graph",
-        category: "email",
-        credentials: &[CredentialSpec {
-            key: "MS_GRAPH_TOKEN",
-            label: "Access Token",
-            help: "Get from Azure Portal > App Registrations",
-        }],
-        is_channel: false,
-    },
-    PluginDef {
         name: "google-calendar",
         description: "Google Calendar API",
         category: "productivity",

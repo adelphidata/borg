@@ -485,7 +485,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn collect_git_context_emits_tracing_span() {
         use tracing_subscriber::layer::SubscriberExt;
         let spans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -502,7 +502,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn run_git_emits_tracing_span_with_args() {
         use tracing_subscriber::layer::SubscriberExt;
         let spans = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

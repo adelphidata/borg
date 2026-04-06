@@ -951,7 +951,7 @@ Rules:
 
     fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = crate::tool_definitions::core_tool_definitions(&self.config);
-        // Append credential-gated integration tools (gmail, outlook, etc.)
+        // Append credential-gated integration tools (gmail, etc.)
         tools.extend(crate::integrations::enabled_tool_definitions(&self.config));
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(

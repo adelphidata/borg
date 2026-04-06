@@ -75,7 +75,7 @@ impl ToolGroup {
             Self::Ui => &["browser"],
             Self::Scheduling => &["schedule"],
             Self::Media => &["generate_image"],
-            Self::Integration => &["gmail", "outlook", "google_calendar", "notion", "linear"],
+            Self::Integration => &["gmail", "google_calendar", "notion", "linear"],
             Self::Agents => &[
                 "spawn_agent",
                 "send_to_agent",
@@ -183,9 +183,7 @@ pub fn tool_group(name: &str) -> Option<ToolGroup> {
         "browser" => Some(ToolGroup::Ui),
         "schedule" | "manage_tasks" | "manage_cron" => Some(ToolGroup::Scheduling),
         "generate_image" => Some(ToolGroup::Media),
-        "gmail" | "outlook" | "google_calendar" | "notion" | "linear" => {
-            Some(ToolGroup::Integration)
-        }
+        "gmail" | "google_calendar" | "notion" | "linear" => Some(ToolGroup::Integration),
         "spawn_agent" | "send_to_agent" | "wait_for_agent" | "close_agent" | "manage_roles" => {
             Some(ToolGroup::Agents)
         }
@@ -342,7 +340,6 @@ mod tests {
     #[test]
     fn tool_group_integration_tools() {
         assert_eq!(tool_group("gmail"), Some(ToolGroup::Integration));
-        assert_eq!(tool_group("outlook"), Some(ToolGroup::Integration));
         assert_eq!(tool_group("google_calendar"), Some(ToolGroup::Integration));
         assert_eq!(tool_group("notion"), Some(ToolGroup::Integration));
         assert_eq!(tool_group("linear"), Some(ToolGroup::Integration));

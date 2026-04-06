@@ -59,10 +59,6 @@ const SMS_VERIFY: &str = include_str!("../templates/messaging/sms/verify.py");
 const GMAIL_TOOL_TOML: &str = include_str!("../templates/email/gmail/tool.toml");
 const GMAIL_MAIN: &str = include_str!("../templates/email/gmail/main.py");
 
-// Outlook
-const OUTLOOK_TOOL_TOML: &str = include_str!("../templates/email/outlook/tool.toml");
-const OUTLOOK_MAIN: &str = include_str!("../templates/email/outlook/main.py");
-
 // Google Calendar
 const GCAL_TOOL_TOML: &str = include_str!("../templates/productivity/google-calendar/tool.toml");
 const GCAL_MAIN: &str = include_str!("../templates/productivity/google-calendar/main.py");
@@ -361,34 +357,6 @@ pub static CATALOG: &[PluginDef] = &[
             TemplateFile {
                 relative_path: "gmail/main.py",
                 content: GMAIL_MAIN,
-                target: TemplateTarget::Tools,
-            },
-        ],
-        platform: Platform::All,
-        is_native: false,
-    },
-    PluginDef {
-        id: "email/outlook",
-        name: "Outlook",
-        category: Category::Email,
-        kind: PluginKind::Tool,
-        description: "Send and search emails via Microsoft Graph API",
-        required_credentials: &[CredentialSpec {
-            key: "MS_GRAPH_TOKEN",
-            label: "Microsoft Graph OAuth Token",
-            help_url: "https://learn.microsoft.com/en-us/graph/auth/",
-            is_optional: false,
-        }],
-        required_bins: &["python3"],
-        templates: &[
-            TemplateFile {
-                relative_path: "outlook/tool.toml",
-                content: OUTLOOK_TOOL_TOML,
-                target: TemplateTarget::Tools,
-            },
-            TemplateFile {
-                relative_path: "outlook/main.py",
-                content: OUTLOOK_MAIN,
                 target: TemplateTarget::Tools,
             },
         ],

@@ -23,7 +23,6 @@ const BUILTIN_GITHUB: &str = include_str!("../skills/github/SKILL.md");
 const BUILTIN_WEATHER: &str = include_str!("../skills/weather/SKILL.md");
 const BUILTIN_SKILL_CREATOR: &str = include_str!("../skills/skill-creator/SKILL.md");
 const BUILTIN_GIT: &str = include_str!("../skills/git/SKILL.md");
-const BUILTIN_HTTP: &str = include_str!("../skills/http/SKILL.md");
 const BUILTIN_SEARCH: &str = include_str!("../skills/search/SKILL.md");
 const BUILTIN_DOCKER: &str = include_str!("../skills/docker/SKILL.md");
 const BUILTIN_DATABASE: &str = include_str!("../skills/database/SKILL.md");
@@ -32,6 +31,7 @@ const BUILTIN_CALENDAR: &str = include_str!("../skills/calendar/SKILL.md");
 const BUILTIN_1PASSWORD: &str = include_str!("../skills/1password/SKILL.md");
 const BUILTIN_BROWSER: &str = include_str!("../skills/browser/SKILL.md");
 const BUILTIN_SCHEDULER: &str = include_str!("../skills/scheduler/SKILL.md");
+const BUILTIN_EMAIL: &str = include_str!("../skills/email/SKILL.md");
 
 const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ("slack", BUILTIN_SLACK),
@@ -40,7 +40,6 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ("weather", BUILTIN_WEATHER),
     ("skill-creator", BUILTIN_SKILL_CREATOR),
     ("git", BUILTIN_GIT),
-    ("http", BUILTIN_HTTP),
     ("search", BUILTIN_SEARCH),
     ("docker", BUILTIN_DOCKER),
     ("database", BUILTIN_DATABASE),
@@ -49,6 +48,7 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[
     ("1password", BUILTIN_1PASSWORD),
     ("browser", BUILTIN_BROWSER),
     ("scheduler", BUILTIN_SCHEDULER),
+    ("email", BUILTIN_EMAIL),
 ];
 
 /// Where a skill was loaded from.
@@ -1505,15 +1505,24 @@ Use docker commands.
     #[test]
     fn test_load_skills_context_empty_when_all_disabled() {
         let mut entries = std::collections::HashMap::new();
+        let disabled_entry = || crate::config::SkillEntryConfig {
+            enabled: false,
+            env: std::collections::HashMap::new(),
+        };
         // Disable all built-in skills
         for &(name, _) in BUNDLED_SKILLS {
-            entries.insert(
-                name.to_string(),
-                crate::config::SkillEntryConfig {
-                    enabled: false,
-                    env: std::collections::HashMap::new(),
-                },
-            );
+            entries.insert(name.to_string(), disabled_entry());
+        }
+        // Also disable any user-installed skills in ~/.borg/skills/
+        if let Ok(user_dir) = skills_dir() {
+            if let Ok(dir_entries) = std::fs::read_dir(&user_dir) {
+                for entry in dir_entries.flatten() {
+                    if entry.path().join("SKILL.md").exists() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        entries.entry(name).or_insert_with(disabled_entry);
+                    }
+                }
+            }
         }
         let config = SkillsConfig {
             enabled: true,

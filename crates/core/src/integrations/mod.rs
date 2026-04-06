@@ -60,7 +60,6 @@ pub mod google_calendar;
 pub(crate) mod http;
 pub mod linear;
 pub mod notion;
-pub mod outlook;
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -159,7 +158,6 @@ macro_rules! integration_dispatch {
 
 integration_dispatch! {
     "gmail" => gmail => "GMAIL_API_KEY",
-    "outlook" => outlook => "MS_GRAPH_TOKEN",
     "google_calendar" => google_calendar => "GOOGLE_CALENDAR_TOKEN",
     "notion" => notion => "NOTION_API_KEY",
     "linear" => linear => "LINEAR_API_KEY",

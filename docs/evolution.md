@@ -119,7 +119,7 @@ Actions are classified to archetypes using a combination of:
 | `docker`, `git`, `database`, shell commands with deploy/k8s/terraform keywords | Ops |
 | `apply_patch`, `apply_skill_patch`, `create_channel` | Builder |
 | `browser` (research), `search`, database queries, `read_pdf` | Analyst |
-| `telegram`, `slack`, `discord`, `gmail`, `outlook`, messaging channels | Communicator |
+| `telegram`, `slack`, `discord`, `gmail`, messaging channels | Communicator |
 | `security_audit`, `1password`, shell commands with security/firewall keywords | Guardian |
 | `calendar`, `notion`, `linear`, planning/summary queries | Strategist |
 | `write_memory` (content), notes, long-form generation | Creator |

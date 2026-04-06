@@ -340,7 +340,7 @@ pub fn classify_tool_archetype(tool_name: &str, metadata: Option<&str>) -> Optio
         "calendar" | "notion" | "linear" | "schedule" | "manage_tasks" => {
             Some(Archetype::Strategist)
         }
-        "gmail" | "outlook" => Some(Archetype::Communicator),
+        "gmail" => Some(Archetype::Communicator),
         "write_memory" => Some(Archetype::Creator),
         "run_shell" => classify_shell_command(metadata),
         _ => None,
