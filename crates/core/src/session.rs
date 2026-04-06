@@ -107,8 +107,11 @@ impl Session {
         if self.meta.title == "New conversation" {
             if let Some(msg) = history.iter().find(|m| m.role == Role::User) {
                 if let Some(content) = msg.text_content() {
-                    let title: String = content.chars().take(60).collect();
-                    self.meta.title = if content.chars().count() > 60 {
+                    // Use first paragraph only — appended metadata blocks
+                    // (e.g. <proactive_nudges>) are separated by \n\n.
+                    let first_para = content.split("\n\n").next().unwrap_or(content);
+                    let title: String = first_para.chars().take(60).collect();
+                    self.meta.title = if first_para.chars().count() > 60 {
                         format!("{title}...")
                     } else {
                         title
@@ -292,6 +295,72 @@ mod tests {
         session.update_from_history(&[]);
         assert_eq!(session.meta.message_count, 0);
         assert_eq!(session.meta.title, "New conversation");
+    }
+
+    #[test]
+    fn update_from_history_strips_proactive_nudges_from_title() {
+        let mut session = Session::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text(
+                "*heartbeat tick*\n\n<proactive_nudges>\n- No messaging channels configured yet\n</proactive_nudges>".to_string(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }];
+        session.update_from_history(&messages);
+        assert_eq!(session.meta.title, "*heartbeat tick*");
+    }
+
+    #[test]
+    fn update_from_history_strips_xml_blocks_from_title() {
+        let mut session = Session::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text(
+                "Hello world\n\n<some_tag>\nstuff\n</some_tag>".to_string(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }];
+        session.update_from_history(&messages);
+        assert_eq!(session.meta.title, "Hello world");
+    }
+
+    #[test]
+    fn update_from_history_preserves_single_paragraph_title() {
+        let mut session = Session::new();
+        let messages = vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text(
+                "Simple question about code".to_string(),
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }];
+        session.update_from_history(&messages);
+        assert_eq!(session.meta.title, "Simple question about code");
+    }
+
+    #[test]
+    fn update_from_history_first_paragraph_truncation() {
+        let mut session = Session::new();
+        let long_first = "A".repeat(80);
+        let content = format!("{long_first}\n\n<proactive_nudges>\nstuff\n</proactive_nudges>");
+        let messages = vec![Message {
+            role: Role::User,
+            content: Some(MessageContent::Text(content)),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }];
+        session.update_from_history(&messages);
+        assert!(session.meta.title.ends_with("..."));
+        assert!(session.meta.title.chars().count() <= 64);
+        assert!(!session.meta.title.contains("proactive_nudges"));
     }
 
     #[test]
