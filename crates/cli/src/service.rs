@@ -89,6 +89,15 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
         _ => {}
     }
 
+    // Recover stale workflow steps left running after a crash
+    match db.recover_stale_workflow_steps() {
+        Ok(count) if count > 0 => {
+            tracing::warn!("Recovered {count} stale workflow step(s) from previous daemon crash");
+        }
+        Err(e) => tracing::warn!("Failed to recover stale workflow steps: {e}"),
+        _ => {}
+    }
+
     borg_core::activity_log::log_activity(&db, "info", "system", "Daemon started");
 
     // Validate that LLM client can be constructed
@@ -340,7 +349,184 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
             }
             Err(e) => tracing::warn!("Failed to check retry tasks: {e}"),
         }
+
+        // Process workflow steps (one step per workflow per tick)
+        match db.get_runnable_workflows() {
+            Ok(workflows) => {
+                for wf in workflows {
+                    if let Ok(Some(step)) = db.claim_next_workflow_step(&wf.id) {
+                        let prior = db.get_completed_workflow_steps(&wf.id).unwrap_or_default();
+                        let all_steps = db.get_workflow_steps(&wf.id).unwrap_or_default();
+                        spawn_workflow_step(
+                            wf,
+                            step,
+                            prior,
+                            all_steps,
+                            semaphore.clone(),
+                            config.clone(),
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("Failed to check runnable workflows: {e}"),
+        }
     }
+}
+
+/// Spawn a workflow step execution in a background task.
+async fn spawn_workflow_step(
+    workflow: borg_core::db::WorkflowRow,
+    step: borg_core::db::WorkflowStepRow,
+    prior_steps: Vec<borg_core::db::WorkflowStepRow>,
+    all_steps: Vec<borg_core::db::WorkflowStepRow>,
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    config: Config,
+) {
+    let permit = semaphore.acquire_owned().await;
+    let step_id = step.id;
+    let step_title = step.title.clone();
+    let workflow_id = workflow.id.clone();
+    let workflow_title = workflow.title.clone();
+    let step_timeout = std::time::Duration::from_millis(step.timeout_ms as u64);
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        tracing::info!(
+            "Executing workflow step: {} / {} (wf: {})",
+            step.step_index + 1,
+            all_steps.len(),
+            workflow_title,
+        );
+
+        // Open DB once for all state transitions in this step execution
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::error!("Failed to open DB for workflow step: {e}");
+                return;
+            }
+        };
+
+        // Build the step context
+        let context = borg_core::workflow::engine::build_step_context_with_remaining(
+            &workflow,
+            &step,
+            &prior_steps,
+            &all_steps,
+        );
+
+        // Execute via LLM (same pattern as execute_prompt_task)
+        let identity = borg_core::identity::load_identity().unwrap_or_default();
+        let memory = borg_core::memory::load_memory_context(4000).unwrap_or_default();
+        let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+
+        let system = format!("{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n{context}");
+
+        let messages = vec![
+            borg_core::types::Message::system(system),
+            borg_core::types::Message::user(&step.instructions),
+        ];
+
+        let llm = match borg_core::llm::LlmClient::new(&config) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to create LLM client for workflow step '{}': {e}",
+                    step_title
+                );
+                let _ = db.fail_workflow_step(step_id, &format!("{e}"));
+                return;
+            }
+        };
+
+        let result = tokio::time::timeout(step_timeout, llm.chat(&messages, None)).await;
+
+        let step_label = format!("{}/{}", step.step_index + 1, all_steps.len());
+
+        match result {
+            Ok(Ok(response)) => {
+                let result_text = response.text_content().unwrap_or("").to_string();
+                tracing::info!(
+                    "Workflow step completed: {step_label} in '{workflow_title}' — {}",
+                    &result_text[..result_text.len().min(100)],
+                );
+                if let Err(e) = db.complete_workflow_step(step_id, &result_text) {
+                    tracing::warn!("Failed to complete workflow step: {e}");
+                }
+                borg_core::activity_log::log_activity(
+                    &db,
+                    "info",
+                    "workflow",
+                    &format!("Step {step_label} completed in workflow '{workflow_title}'"),
+                );
+
+                // Check if workflow is now complete
+                if let Ok(Some(wf)) = db.get_workflow(&workflow_id) {
+                    if wf.status == borg_core::workflow::status::COMPLETED {
+                        tracing::info!("Workflow '{workflow_title}' completed!");
+                        borg_core::activity_log::log_activity(
+                            &db,
+                            "info",
+                            "workflow",
+                            &format!("Workflow '{workflow_title}' completed"),
+                        );
+                        // Deliver final result if configured
+                        if let (Some(ch), Some(tgt)) = (wf.delivery_channel, wf.delivery_target) {
+                            let summary = build_workflow_summary(&db, &wf.id);
+                            deliver_task_result(&ch, &tgt, &workflow_title, &summary, &config)
+                                .await;
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                let error_msg = format!("{e}");
+                tracing::warn!(
+                    "Workflow step failed: {step_label} in '{workflow_title}': {error_msg}",
+                );
+                let exhausted = db.fail_workflow_step(step_id, &error_msg).unwrap_or(false);
+                if exhausted {
+                    tracing::warn!("Workflow '{workflow_title}' failed: {error_msg}");
+                    borg_core::activity_log::log_activity(
+                        &db,
+                        "error",
+                        "workflow",
+                        &format!("Workflow '{workflow_title}' failed: {error_msg}"),
+                    );
+                }
+            }
+            Err(_) => {
+                let error_msg = format!("Step timed out after {}ms", step_timeout.as_millis());
+                tracing::warn!("Workflow step timed out: {step_label} in '{workflow_title}'",);
+                let exhausted = db.fail_workflow_step(step_id, &error_msg).unwrap_or(false);
+                if exhausted {
+                    borg_core::activity_log::log_activity(
+                        &db,
+                        "error",
+                        "workflow",
+                        &format!("Workflow '{workflow_title}' failed: {error_msg}"),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Build a summary of all completed workflow step outputs for delivery.
+fn build_workflow_summary(db: &borg_core::db::Database, workflow_id: &str) -> String {
+    let steps = db
+        .get_completed_workflow_steps(workflow_id)
+        .unwrap_or_default();
+    let mut summary = String::new();
+    for s in &steps {
+        summary.push_str(&format!("**Step {}: {}**\n", s.step_index + 1, s.title));
+        if let Some(ref output) = s.output {
+            summary.push_str(output);
+            summary.push_str("\n\n");
+        }
+    }
+    summary
 }
 
 /// Skip tasks overdue by more than 7 days, advancing them to their next run.

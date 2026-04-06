@@ -1044,6 +1044,40 @@ async fn run_event_loop(
                                     Err(e) => results.push(format!("Error: {e}")),
                                 }
                             }
+                            schedule_popup::ScheduleAction::CancelWorkflow { workflow_id } => {
+                                match db.cancel_workflow(&workflow_id) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Workflow {} cancelled",
+                                            &workflow_id[..8.min(workflow_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Workflow {} not found or already finished",
+                                            &workflow_id[..8.min(workflow_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                            schedule_popup::ScheduleAction::DeleteWorkflow { workflow_id } => {
+                                match db.delete_workflow(&workflow_id) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Workflow {} deleted",
+                                            &workflow_id[..8.min(workflow_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Workflow {} not found",
+                                            &workflow_id[..8.min(workflow_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
                         }
                     }
                 } else {

@@ -135,5 +135,7 @@ pub mod update;
 pub mod vitals;
 /// Web fetching and search capabilities.
 pub mod web;
+/// Workflow engine — durable multi-step task orchestration for weaker models.
+pub mod workflow;
 /// XML utility functions for structured content parsing.
 pub mod xml_util;

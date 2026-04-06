@@ -68,6 +68,7 @@ pub const ALL_SETTING_KEYS: &[&str] = &[
     "conversation.collaboration_mode",
     "evolution.enabled",
     "llm.claude_cli_path",
+    "workflow.enabled",
 ];
 
 /// Merges settings from three layers: DB overrides → config.toml → compiled defaults.
@@ -238,6 +239,7 @@ fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
             .as_deref()
             .unwrap_or("(auto-detect)")
             .to_string(),
+        "workflow.enabled" => config.workflow.enabled.clone(),
         _ => return None,
     })
 }

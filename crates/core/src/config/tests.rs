@@ -1819,3 +1819,44 @@ fn compaction_config_empty_serde() {
     let cfg: Config = toml::from_str(toml_str).unwrap();
     assert!(!cfg.compaction.has_overrides());
 }
+
+#[test]
+fn apply_setting_workflow_enabled_valid_values() {
+    let mut cfg = Config::default();
+
+    let result = cfg.apply_setting("workflow.enabled", "on").unwrap();
+    assert!(result.contains("on"));
+    assert_eq!(cfg.workflow.enabled, "on");
+
+    let result = cfg.apply_setting("workflow.enabled", "off").unwrap();
+    assert!(result.contains("off"));
+    assert_eq!(cfg.workflow.enabled, "off");
+
+    let result = cfg.apply_setting("workflow.enabled", "auto").unwrap();
+    assert!(result.contains("auto"));
+    assert_eq!(cfg.workflow.enabled, "auto");
+}
+
+#[test]
+fn apply_setting_workflow_enabled_invalid_value() {
+    let mut cfg = Config::default();
+    assert!(cfg.apply_setting("workflow.enabled", "maybe").is_err());
+    assert!(cfg.apply_setting("workflow.enabled", "true").is_err());
+    assert!(cfg.apply_setting("workflow.enabled", "").is_err());
+}
+
+#[test]
+fn workflow_config_default_is_auto() {
+    let cfg = Config::default();
+    assert_eq!(cfg.workflow.enabled, "auto");
+}
+
+#[test]
+fn workflow_config_serde_roundtrip() {
+    let toml_str = r#"
+[workflow]
+enabled = "off"
+"#;
+    let cfg: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(cfg.workflow.enabled, "off");
+}

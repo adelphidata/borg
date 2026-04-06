@@ -102,6 +102,9 @@ pub struct Config {
     /// Compaction model overrides (use cheaper model for context compaction).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Workflow engine settings (durable multi-step orchestration).
+    #[serde(default)]
+    pub workflow: WorkflowConfig,
     /// Conversation evolution and personality drift settings.
     #[serde(default)]
     pub evolution: EvolutionConfig,
@@ -517,6 +520,15 @@ impl Config {
                 };
                 Ok(format!("{key} = {value}"))
             }
+            "workflow.enabled" => match value {
+                "auto" | "on" | "off" => {
+                    self.workflow.enabled = value.to_string();
+                    Ok(format!("{key} = {value}"))
+                }
+                _ => anyhow::bail!(
+                    "Invalid value for workflow.enabled: {value}. Use 'auto', 'on', or 'off'."
+                ),
+            },
             _ => anyhow::bail!(
                 "Unknown setting: {key}\nAvailable: {}",
                 crate::settings::ALL_SETTING_KEYS.join(", ")

@@ -570,6 +570,22 @@ impl Default for PluginsConfig {
     }
 }
 
+/// Configuration for the workflow engine (durable multi-step task orchestration).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkflowConfig {
+    /// Whether workflow orchestration is enabled: "auto" (model heuristic), "on", or "off".
+    pub enabled: String,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: "auto".to_string(),
+        }
+    }
+}
+
 /// Configuration for multi-agent spawning and orchestration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

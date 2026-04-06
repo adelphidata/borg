@@ -792,4 +792,60 @@ impl Database {
         }
         Ok(())
     }
+
+    /// V31: Workflow engine — durable multi-step task orchestration + projects
+    pub(super) fn migrate_v31(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
+
+            CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                current_step INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                error TEXT,
+                session_id TEXT REFERENCES sessions(id),
+                project_id TEXT REFERENCES projects(id),
+                delivery_channel TEXT,
+                delivery_target TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status);
+            CREATE INDEX IF NOT EXISTS idx_workflows_session ON workflows(session_id);
+            CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id);
+
+            CREATE TABLE IF NOT EXISTS workflow_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+                step_index INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                instructions TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                output TEXT,
+                error TEXT,
+                started_at INTEGER,
+                completed_at INTEGER,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                timeout_ms INTEGER NOT NULL DEFAULT 300000,
+                UNIQUE(workflow_id, step_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow
+                ON workflow_steps(workflow_id, step_index);
+            ",
+        )?;
+        Ok(())
+    }
 }

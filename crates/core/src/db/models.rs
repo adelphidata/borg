@@ -479,6 +479,97 @@ pub struct NewScript<'a> {
     pub updated_at: i64,
 }
 
+/// Project row from SQLite — groups related workflows.
+#[derive(Debug, Clone)]
+pub struct ProjectRow {
+    /// Unique project identifier.
+    pub id: String,
+    /// Human-readable project name.
+    pub name: String,
+    /// Project description.
+    pub description: String,
+    /// Current status (active, archived).
+    pub status: String,
+    /// Unix timestamp when the project was created.
+    pub created_at: i64,
+    /// Unix timestamp when the project was last updated.
+    pub updated_at: i64,
+}
+
+/// Workflow row from SQLite.
+#[derive(Debug, Clone)]
+pub struct WorkflowRow {
+    /// Unique workflow identifier.
+    pub id: String,
+    /// Human-readable workflow title.
+    pub title: String,
+    /// Full description of the workflow's objective.
+    pub goal: String,
+    /// Current workflow status (pending, running, completed, failed, cancelled).
+    pub status: String,
+    /// Index of the step currently being executed (0-based).
+    pub current_step: i64,
+    /// Unix timestamp when the workflow was created.
+    pub created_at: i64,
+    /// Unix timestamp when the workflow was last updated.
+    pub updated_at: i64,
+    /// Unix timestamp when the workflow completed, if finished.
+    pub completed_at: Option<i64>,
+    /// Error message if the workflow failed.
+    pub error: Option<String>,
+    /// Session that created this workflow (FK to sessions).
+    pub session_id: Option<String>,
+    /// Project this workflow belongs to (FK to projects).
+    pub project_id: Option<String>,
+    /// Channel to deliver final results to.
+    pub delivery_channel: Option<String>,
+    /// Target identifier within the delivery channel.
+    pub delivery_target: Option<String>,
+}
+
+/// Workflow step row from SQLite.
+#[derive(Debug, Clone)]
+pub struct WorkflowStepRow {
+    /// Unique step identifier.
+    pub id: i64,
+    /// ID of the parent workflow.
+    pub workflow_id: String,
+    /// Zero-based ordering index within the workflow.
+    pub step_index: i64,
+    /// Human-readable step title.
+    pub title: String,
+    /// Prompt/instructions for the agent executing this step.
+    pub instructions: String,
+    /// Current step status (pending, running, completed, failed, skipped).
+    pub status: String,
+    /// Accumulated output/result from this step.
+    pub output: Option<String>,
+    /// Error message if the step failed.
+    pub error: Option<String>,
+    /// Unix timestamp when the step started executing.
+    pub started_at: Option<i64>,
+    /// Unix timestamp when the step completed.
+    pub completed_at: Option<i64>,
+    /// Maximum retry attempts for this step.
+    pub max_retries: i32,
+    /// Number of retries already attempted.
+    pub retry_count: i32,
+    /// Per-step execution timeout in milliseconds.
+    pub timeout_ms: i64,
+}
+
+/// Parameters for creating a new workflow step.
+pub struct NewWorkflowStep {
+    /// Human-readable step title.
+    pub title: String,
+    /// Prompt/instructions for the agent executing this step.
+    pub instructions: String,
+    /// Maximum retry attempts for this step (default 3).
+    pub max_retries: i32,
+    /// Per-step execution timeout in milliseconds (default 300000).
+    pub timeout_ms: i64,
+}
+
 /// Health report for all event-sourced HMAC chains.
 #[derive(Debug)]
 pub struct ChainHealth {

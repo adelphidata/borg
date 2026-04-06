@@ -146,6 +146,13 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Bool,
         category: "Evolution",
     },
+    // — Workflow —
+    SettingEntry {
+        key: "workflow.enabled",
+        label: "Workflows",
+        kind: SettingKind::Select,
+        category: "Conversation",
+    },
 ];
 
 impl SettingsPopup {
@@ -255,6 +262,7 @@ impl SettingsPopup {
                 format!("{}", config.conversation.collaboration_mode)
             }
             "evolution.enabled" => format!("{}", config.evolution.enabled),
+            "workflow.enabled" => config.workflow.enabled.clone(),
             _ => "?".to_string(),
         }
     }
@@ -489,6 +497,31 @@ impl SettingsPopup {
                         actions.push(AppAction::UpdateSetting {
                             key: "conversation.collaboration_mode".to_string(),
                             value: new_mode.to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Error: {e}"), false));
+                        return Ok(None);
+                    }
+                }
+            }
+            "workflow.enabled" => {
+                const MODES: &[&str] = &["auto", "on", "off"];
+                let current = config.workflow.enabled.clone();
+                let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
+                let next_idx = if forward {
+                    (idx + 1) % MODES.len()
+                } else {
+                    (idx + MODES.len() - 1) % MODES.len()
+                };
+                let new_val = MODES[next_idx];
+                match config.apply_setting("workflow.enabled", new_val) {
+                    Ok(confirmation) => {
+                        let _ = self.save_setting("workflow.enabled", new_val);
+                        self.status_message = Some((format!("Updated: {confirmation}"), true));
+                        actions.push(AppAction::UpdateSetting {
+                            key: "workflow.enabled".to_string(),
+                            value: new_val.to_string(),
                         });
                     }
                     Err(e) => {
@@ -867,7 +900,7 @@ mod tests {
     #[test]
     fn all_settings_covered() {
         let popup = SettingsPopup::new();
-        assert_eq!(popup.entries.len(), 15);
+        assert_eq!(popup.entries.len(), 16);
 
         let cfg = Config::default();
         for entry in popup.entries {

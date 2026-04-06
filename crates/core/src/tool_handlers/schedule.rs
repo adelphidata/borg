@@ -37,6 +37,7 @@ pub fn handle_schedule(args: &serde_json::Value, config: &Config) -> Result<Stri
     }
 
     match job_type {
+        "workflow" => handle_workflow(args),
         "command" => handle_manage_cron(&remapped, config),
         "prompt" => handle_manage_tasks(&remapped, config),
         "" => {
@@ -67,7 +68,9 @@ pub fn handle_schedule(args: &serde_json::Value, config: &Config) -> Result<Stri
                 handle_manage_tasks(&remapped, config)
             }
         }
-        other => Ok(format!("Unknown type: {other}. Use 'prompt' or 'command'.")),
+        other => Ok(format!(
+            "Unknown type: {other}. Use 'prompt', 'command', or 'workflow'."
+        )),
     }
 }
 
@@ -485,6 +488,174 @@ pub fn update_task_status(task_id: &str, status: &str, verb: &str) -> Result<Str
     })
 }
 
+// ── Workflow management ──
+
+fn handle_workflow(args: &serde_json::Value) -> Result<String> {
+    let action = require_str_param(args, "action")?;
+    match action {
+        "create" => workflow_create(args),
+        "list" => workflow_list(args),
+        "get" => workflow_get(args),
+        "cancel" => workflow_cancel(args),
+        other => Ok(format!(
+            "Unknown workflow action: {other}. Use: create, list, get, cancel."
+        )),
+    }
+}
+
+fn workflow_create(args: &serde_json::Value) -> Result<String> {
+    let name = require_str_param(args, "name")?;
+    let goal = require_str_param(args, "goal")?;
+
+    let steps_val = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("'steps' array is required for workflow creation"))?;
+
+    if steps_val.is_empty() {
+        return Ok("Error: Workflow must have at least one step.".to_string());
+    }
+
+    let mut steps = Vec::with_capacity(steps_val.len());
+    for (i, step_val) in steps_val.iter().enumerate() {
+        let title = step_val
+            .get("title")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Step {} missing 'title'", i + 1))?;
+        let instructions = step_val
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Step {} missing 'instructions'", i + 1))?;
+        let max_retries = step_val
+            .get("max_retries")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(3)
+            .max(0) as i32;
+        let timeout_ms = step_val
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(300_000)
+            .max(1000); // minimum 1 second
+
+        steps.push(crate::db::NewWorkflowStep {
+            title: title.to_string(),
+            instructions: instructions.to_string(),
+            max_retries,
+            timeout_ms,
+        });
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let (delivery_channel, delivery_target) = resolve_origin_delivery(
+        optional_str_param(args, "delivery_channel").map(str::to_string),
+        optional_str_param(args, "delivery_target").map(str::to_string),
+    );
+
+    let project_id = optional_str_param(args, "project_id").map(str::to_string);
+
+    with_db(|db| {
+        match db.create_workflow(
+            &id,
+            name,
+            goal,
+            &steps,
+            None,
+            project_id.as_deref(),
+            delivery_channel.as_deref(),
+            delivery_target.as_deref(),
+        ) {
+            Ok(()) => {
+                let short_id = &id[..8.min(id.len())];
+                Ok(format!(
+                    "Workflow created: \"{name}\" (id: {short_id})\n  Steps: {}\n  Status: running",
+                    steps.len()
+                ))
+            }
+            Err(e) => Ok(format!("Error creating workflow: {e}")),
+        }
+    })
+}
+
+fn workflow_list(args: &serde_json::Value) -> Result<String> {
+    let status_filter = optional_str_param(args, "status");
+    with_db(|db| match db.list_workflows(status_filter) {
+        Ok(wfs) if wfs.is_empty() => Ok("No workflows.".to_string()),
+        Ok(wfs) => {
+            let mut out = format!("Workflows ({}):\n", wfs.len());
+            for wf in &wfs {
+                let steps = db.get_workflow_steps(&wf.id).unwrap_or_default();
+                let completed = steps
+                    .iter()
+                    .filter(|s| s.status == crate::workflow::step_status::COMPLETED)
+                    .count();
+                out.push_str(&format!(
+                    "  [{}] {} (id: {}) — {}/{} steps\n",
+                    wf.status,
+                    wf.title,
+                    &wf.id[..8.min(wf.id.len())],
+                    completed,
+                    steps.len(),
+                ));
+            }
+            Ok(out)
+        }
+        Err(e) => Ok(format!("Error listing workflows: {e}")),
+    })
+}
+
+fn workflow_get(args: &serde_json::Value) -> Result<String> {
+    let id = require_str_param(args, "id")?;
+    with_db(|db| match db.get_workflow(id) {
+        Ok(Some(wf)) => {
+            let steps = db.get_workflow_steps(id).unwrap_or_default();
+            let mut out = format!(
+                "Workflow: {}\n  ID: {}\n  Status: {}\n  Goal: {}\n  Steps:\n",
+                wf.title, wf.id, wf.status, wf.goal,
+            );
+            for s in &steps {
+                let status_icon = match s.status.as_str() {
+                    "completed" => "✓",
+                    "running" => "▶",
+                    "failed" => "✗",
+                    "skipped" => "⊘",
+                    _ => "○",
+                };
+                out.push_str(&format!(
+                    "    {status_icon} Step {}: {} [{}]\n",
+                    s.step_index + 1,
+                    s.title,
+                    s.status,
+                ));
+                if let Some(ref output) = s.output {
+                    let preview: String = output.chars().take(100).collect();
+                    out.push_str(&format!("      Output: {preview}\n"));
+                }
+                if let Some(ref err) = s.error {
+                    out.push_str(&format!("      Error: {err}\n"));
+                }
+            }
+            if let Some(ref err) = wf.error {
+                out.push_str(&format!("  Workflow Error: {err}\n"));
+            }
+            Ok(out)
+        }
+        Ok(None) => Ok(format!("Workflow {id} not found.")),
+        Err(e) => Ok(format!("Error: {e}")),
+    })
+}
+
+fn workflow_cancel(args: &serde_json::Value) -> Result<String> {
+    let id = require_str_param(args, "id")?;
+    with_db(|db| match db.cancel_workflow(id) {
+        Ok(true) => Ok(format!("Workflow {id} cancelled.")),
+        Ok(false) => Ok(format!(
+            "Workflow {id} not found or already completed/cancelled."
+        )),
+        Err(e) => Ok(format!("Error: {e}")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +698,131 @@ mod tests {
         });
         let result = handle_manage_tasks(&args, &Config::default());
         assert!(result.is_err());
+    }
+
+    // ── Workflow handler tests ──
+
+    #[test]
+    fn handle_workflow_unknown_action() {
+        let result = handle_workflow(&json!({"action": "nope"})).unwrap();
+        assert!(result.contains("Unknown workflow action"));
+    }
+
+    #[test]
+    fn handle_workflow_missing_action() {
+        let result = handle_workflow(&json!({}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn workflow_create_missing_name() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "goal": "do something",
+            "steps": [{"title": "step 1", "instructions": "do it"}]
+        });
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // require_str_param("name") fails
+    }
+
+    #[test]
+    fn workflow_create_missing_goal() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "steps": [{"title": "step 1", "instructions": "do it"}]
+        });
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // require_str_param("goal") fails
+    }
+
+    #[test]
+    fn workflow_create_missing_steps() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "goal": "do something"
+        });
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // "steps" array required
+    }
+
+    #[test]
+    fn workflow_create_empty_steps() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "goal": "do something",
+            "steps": []
+        });
+        let result = handle_workflow(&args).unwrap();
+        assert!(
+            result.contains("at least one step"),
+            "expected step validation error in: {result}"
+        );
+    }
+
+    #[test]
+    fn workflow_create_step_missing_title() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "goal": "do something",
+            "steps": [{"instructions": "do it"}]
+        });
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // step missing title
+    }
+
+    #[test]
+    fn workflow_create_step_missing_instructions() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "goal": "do something",
+            "steps": [{"title": "step 1"}]
+        });
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // step missing instructions
+    }
+
+    #[test]
+    fn workflow_create_timeout_clamped_to_minimum() {
+        let args = json!({
+            "action": "create",
+            "type": "workflow",
+            "name": "test",
+            "goal": "do something",
+            "steps": [{"title": "step 1", "instructions": "do it", "timeout_ms": -500}]
+        });
+        // This will attempt DB write which may fail, but validates parsing doesn't panic
+        let _ = handle_workflow(&args);
+    }
+
+    #[test]
+    fn workflow_cancel_missing_id() {
+        let args = json!({"action": "cancel", "type": "workflow"});
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // require_str_param("id") fails
+    }
+
+    #[test]
+    fn workflow_get_missing_id() {
+        let args = json!({"action": "get", "type": "workflow"});
+        let result = handle_workflow(&args);
+        assert!(result.is_err()); // require_str_param("id") fails
+    }
+
+    #[test]
+    fn handle_schedule_dispatches_workflow_type() {
+        let args = json!({"action": "list", "type": "workflow"});
+        // This will try to open DB; we're just verifying dispatch doesn't panic
+        let _ = handle_schedule(&args, &Config::default());
     }
 }

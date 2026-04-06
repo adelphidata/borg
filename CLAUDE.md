@@ -538,6 +538,7 @@ SQLite at `~/.borg/borg.db` with versioned migrations:
 - **V16**: `embedding_cache` table for caching embedding API results
 - **V17**: `session_index_status` table for tracking indexed sessions
 - **V22**: `vitals_events` table (event-sourced agent health tracking with HMAC chain)
+- **V31**: `projects`, `workflows`, `workflow_steps` tables (workflow engine + project grouping)
 - Schema version tracked in `meta` table; migrations run automatically on `Database::open()`
 
 ## Signal Handling & Graceful Shutdown
@@ -580,6 +581,19 @@ Proactive check-in system. The `HeartbeatScheduler` (pure timer) emits `Fire` ev
 - **Poke**: `borg poke` (CLI) or `/poke` (TUI) triggers an immediate heartbeat (bypasses quiet hours). CLI sends HTTP POST to `/internal/poke` on the gateway; TUI sends directly via channel when owning the scheduler
 - **Daemon**: Heartbeat is spawned in `run_daemon()` alongside the gateway; runs without a TUI
 - **TUI**: Heartbeat renders in cyan as `[heartbeat]` prefix in the transcript
+
+## Workflows
+
+Durable multi-step task orchestration for long-running tasks. The LLM decomposes complex requests into ordered steps at runtime. Each step executes as an isolated agent turn (fresh context window) with prior step outputs injected as summaries. State persists in SQLite — workflows survive crashes and restarts.
+
+- **Model-aware**: Only Opus 4.6 skips workflows (`workflow.enabled = "auto"`). All other models get workflow guidance + tool access by default. Override via `/settings` or `config.toml`.
+- **Projects**: Group related workflows under a project (`project_id` FK). Query workflows by project or session.
+- **Execution**: Daemon processes one step per workflow per 60s tick. Steps have per-step retry (exponential backoff) and timeout.
+- **Cancel safety**: `complete/fail_workflow_step` guards against race conditions — operations are no-ops if the step was cancelled mid-execution.
+- **TUI**: `/schedule` popup shows workflows alongside scheduled tasks. `c` to cancel, `d` to delete.
+- **Tool**: Uses existing `schedule` tool with `type: "workflow"`. Actions: `create`, `list`, `get`, `cancel`.
+
+**Key files:** `crates/core/src/workflow/` (engine, tier, types), `crates/core/src/db/workflow.rs` (DB ops), `crates/cli/src/service.rs` (daemon execution). See `docs/workflows.md` for full documentation.
 
 ## Sandboxing
 

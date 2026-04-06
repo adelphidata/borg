@@ -25,7 +25,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
         defs.push(ToolDefinition::new("web_search", "Search the web and return results with titles, URLs, and snippets.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})));
     }
 
-    defs.push(ToolDefinition::new("schedule", "Manage scheduled jobs. Use type='prompt' for AI tasks or type='command' for shell cron jobs. Actions: create, list, get, update, pause, resume, cancel, delete, runs, run_now.", serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["create","list","get","update","pause","resume","cancel","delete","runs","run_now"],"description":"Action to perform"},"type":{"type":"string","enum":["prompt","command"],"description":"Job type: 'prompt' for AI tasks, 'command' for shell cron jobs (required for create, used as filter for list)"},"id":{"type":"string","description":"Job ID (required for get/update/pause/resume/cancel/delete/runs/run_now)"},"name":{"type":"string","description":"Job name (required for create, optional for update)"},"prompt":{"type":"string","description":"Prompt to execute (for type=prompt, required for create)"},"command":{"type":"string","description":"Shell command to execute (for type=command, required for create)"},"schedule":{"type":"string","description":"5-field cron expression (e.g. '*/5 * * * *'). Required for type=command create."},"schedule_type":{"type":"string","enum":["cron","interval","once"],"description":"Schedule type (for type=prompt, required for create)"},"schedule_expr":{"type":"string","description":"Cron expression or interval (for type=prompt, required for create)"},"timezone":{"type":"string","description":"Timezone (default: local)"},"max_retries":{"type":"integer","description":"Max retry attempts for transient failures (default: 3)"},"timeout_ms":{"type":"integer","description":"Timeout in milliseconds (default: 300000)"},"delivery_channel":{"type":"string","description":"Channel to deliver results to (telegram, slack, discord). Use 'origin' when scheduling from a chat message to reply back in the same channel/thread."},"delivery_target":{"type":"string","description":"Target chat/channel ID for delivery. Omit when delivery_channel='origin'."},"limit":{"type":"integer","description":"Number of runs to return (for runs action, default: 5)"}},"required":["action"]})));
+    defs.push(build_schedule_tool_def(config));
 
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
@@ -123,6 +123,61 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     ));
 
     defs
+}
+
+/// Build the schedule tool definition, conditionally including workflow type
+/// when workflows are active for the current model.
+fn build_schedule_tool_def(config: &Config) -> ToolDefinition {
+    let workflows_on = crate::workflow::workflows_active(config);
+
+    let type_enum = if workflows_on {
+        serde_json::json!(["prompt", "command", "workflow"])
+    } else {
+        serde_json::json!(["prompt", "command"])
+    };
+
+    let type_desc = if workflows_on {
+        "Job type: 'prompt' for AI tasks, 'command' for shell cron jobs, 'workflow' for multi-step task orchestration (required for create, used as filter for list)"
+    } else {
+        "Job type: 'prompt' for AI tasks, 'command' for shell cron jobs (required for create, used as filter for list)"
+    };
+
+    let description = if workflows_on {
+        "Manage scheduled jobs and workflows. Use type='prompt' for AI tasks, type='command' for shell cron jobs, or type='workflow' for multi-step task orchestration. Actions: create, list, get, update, pause, resume, cancel, delete, runs, run_now."
+    } else {
+        "Manage scheduled jobs. Use type='prompt' for AI tasks or type='command' for shell cron jobs. Actions: create, list, get, update, pause, resume, cancel, delete, runs, run_now."
+    };
+
+    let mut properties = serde_json::json!({
+        "action": {"type":"string","enum":["create","list","get","update","pause","resume","cancel","delete","runs","run_now"],"description":"Action to perform"},
+        "type": {"type":"string","enum": type_enum,"description": type_desc},
+        "id": {"type":"string","description":"Job/workflow ID (required for get/update/pause/resume/cancel/delete/runs/run_now)"},
+        "name": {"type":"string","description":"Job/workflow name (required for create, optional for update)"},
+        "prompt": {"type":"string","description":"Prompt to execute (for type=prompt, required for create)"},
+        "command": {"type":"string","description":"Shell command to execute (for type=command, required for create)"},
+        "schedule": {"type":"string","description":"5-field cron expression (e.g. '*/5 * * * *'). Required for type=command create."},
+        "schedule_type": {"type":"string","enum":["cron","interval","once"],"description":"Schedule type (for type=prompt, required for create)"},
+        "schedule_expr": {"type":"string","description":"Cron expression or interval (for type=prompt, required for create)"},
+        "timezone": {"type":"string","description":"Timezone (default: local)"},
+        "max_retries": {"type":"integer","description":"Max retry attempts for transient failures (default: 3)"},
+        "timeout_ms": {"type":"integer","description":"Timeout in milliseconds (default: 300000)"},
+        "delivery_channel": {"type":"string","description":"Channel to deliver results to (telegram, slack, discord). Use 'origin' when scheduling from a chat message to reply back in the same channel/thread."},
+        "delivery_target": {"type":"string","description":"Target chat/channel ID for delivery. Omit when delivery_channel='origin'."},
+        "limit": {"type":"integer","description":"Number of runs to return (for runs action, default: 5)"}
+    });
+
+    if workflows_on {
+        properties["goal"] = serde_json::json!({"type":"string","description":"Workflow goal — what the entire workflow should accomplish (required for type=workflow create)"});
+        properties["steps"] = serde_json::json!({"type":"array","description":"Workflow steps (required for type=workflow create)","items":{"type":"object","properties":{"title":{"type":"string","description":"Step title"},"instructions":{"type":"string","description":"Detailed instructions for this step"},"max_retries":{"type":"integer","description":"Max retries for this step (default: 3)"},"timeout_ms":{"type":"integer","description":"Timeout for this step in ms (default: 300000)"}},"required":["title","instructions"]}});
+        properties["status"] = serde_json::json!({"type":"string","description":"Filter workflows by status (for type=workflow list)"});
+        properties["project_id"] = serde_json::json!({"type":"string","description":"Project ID to associate this workflow with (for type=workflow create)"});
+    }
+
+    ToolDefinition::new(
+        "schedule",
+        description,
+        serde_json::json!({"type":"object","properties": properties,"required":["action"]}),
+    )
 }
 
 #[cfg(test)]
@@ -264,5 +319,99 @@ mod tests {
                 def.function.name
             );
         }
+    }
+
+    #[test]
+    fn schedule_tool_excludes_workflow_when_disabled() {
+        let mut config = Config::default();
+        config.workflow.enabled = "off".to_string();
+        let def = build_schedule_tool_def(&config);
+
+        let type_enum = &def.function.parameters["properties"]["type"]["enum"];
+        let types: Vec<&str> = type_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"prompt"));
+        assert!(types.contains(&"command"));
+        assert!(
+            !types.contains(&"workflow"),
+            "workflow type should be hidden"
+        );
+        assert!(
+            def.function.parameters["properties"].get("steps").is_none(),
+            "steps param should be absent"
+        );
+        assert!(
+            def.function.parameters["properties"].get("goal").is_none(),
+            "goal param should be absent"
+        );
+    }
+
+    #[test]
+    fn schedule_tool_includes_workflow_when_enabled() {
+        let mut config = Config::default();
+        config.workflow.enabled = "on".to_string();
+        let def = build_schedule_tool_def(&config);
+
+        let type_enum = &def.function.parameters["properties"]["type"]["enum"];
+        let types: Vec<&str> = type_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            types.contains(&"workflow"),
+            "workflow type should be present"
+        );
+        assert!(
+            def.function.parameters["properties"].get("steps").is_some(),
+            "steps param should be present"
+        );
+        assert!(
+            def.function.parameters["properties"].get("goal").is_some(),
+            "goal param should be present"
+        );
+        assert!(
+            def.function.description.contains("workflow"),
+            "description should mention workflows"
+        );
+    }
+
+    #[test]
+    fn schedule_tool_auto_with_opus_excludes_workflow() {
+        let mut config = Config::default();
+        config.workflow.enabled = "auto".to_string();
+        config.llm.model = "claude-opus-4".to_string();
+        let def = build_schedule_tool_def(&config);
+
+        let type_enum = &def.function.parameters["properties"]["type"]["enum"];
+        let types: Vec<&str> = type_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(!types.contains(&"workflow"));
+    }
+
+    #[test]
+    fn schedule_tool_auto_with_weak_model_includes_workflow() {
+        let mut config = Config::default();
+        config.workflow.enabled = "auto".to_string();
+        config.llm.model = "llama-3.3-70b".to_string();
+        let def = build_schedule_tool_def(&config);
+
+        let type_enum = &def.function.parameters["properties"]["type"]["enum"];
+        let types: Vec<&str> = type_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(types.contains(&"workflow"));
     }
 }

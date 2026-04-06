@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
-use borg_core::db::ScheduledTaskRow;
+use borg_core::db::{ScheduledTaskRow, WorkflowRow};
 
 use super::popup_utils;
 use super::theme;
@@ -17,6 +17,7 @@ enum SchedulePhase {
 pub struct SchedulePopup {
     visible: bool,
     tasks: Vec<TaskItem>,
+    workflows: Vec<WorkflowItem>,
     cursor: usize,
     phase: SchedulePhase,
     status_message: Option<(String, bool)>,
@@ -26,6 +27,13 @@ struct TaskItem {
     task: ScheduledTaskRow,
     original_status: String,
     original_schedule_expr: String,
+    pending_delete: bool,
+}
+
+struct WorkflowItem {
+    workflow: WorkflowRow,
+    step_progress: String, // "2/5" style
+    pending_cancel: bool,
     pending_delete: bool,
 }
 
@@ -42,6 +50,12 @@ pub enum ScheduleAction {
     DeleteTask {
         task_id: String,
     },
+    CancelWorkflow {
+        workflow_id: String,
+    },
+    DeleteWorkflow {
+        workflow_id: String,
+    },
 }
 
 impl SchedulePopup {
@@ -49,6 +63,7 @@ impl SchedulePopup {
         Self {
             visible: false,
             tasks: Vec::new(),
+            workflows: Vec::new(),
             cursor: 0,
             phase: SchedulePhase::Browsing,
             status_message: None,
@@ -59,31 +74,87 @@ impl SchedulePopup {
         self.visible
     }
 
+    /// Total number of selectable rows (tasks + separator + workflows, if any).
+    fn total_rows(&self) -> usize {
+        let t = self.tasks.len();
+        let w = self.workflows.len();
+        if w == 0 {
+            t
+        } else {
+            t + 1 + w // +1 for the separator/header row
+        }
+    }
+
+    /// Map cursor position to either a task index, the separator, or a workflow index.
+    fn cursor_target(&self) -> CursorTarget {
+        let t = self.tasks.len();
+        let w = self.workflows.len();
+        if w == 0 || self.cursor < t {
+            if self.cursor < t {
+                CursorTarget::Task(self.cursor)
+            } else {
+                CursorTarget::None
+            }
+        } else if self.cursor == t {
+            CursorTarget::Separator
+        } else {
+            let wi = self.cursor - t - 1;
+            if wi < w {
+                CursorTarget::Workflow(wi)
+            } else {
+                CursorTarget::None
+            }
+        }
+    }
+
     pub fn show(&mut self) {
         self.visible = true;
         self.cursor = 0;
         self.phase = SchedulePhase::Browsing;
         self.status_message = None;
 
-        self.tasks = match borg_core::db::Database::open() {
-            Ok(db) => match db.list_tasks() {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|task| {
-                        let original_status = task.status.clone();
-                        let original_schedule_expr = task.schedule_expr.clone();
-                        TaskItem {
-                            task,
-                            original_status,
-                            original_schedule_expr,
-                            pending_delete: false,
-                        }
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            },
-            Err(_) => Vec::new(),
-        };
+        match borg_core::db::Database::open() {
+            Ok(db) => {
+                self.tasks = match db.list_tasks() {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|task| {
+                            let original_status = task.status.clone();
+                            let original_schedule_expr = task.schedule_expr.clone();
+                            TaskItem {
+                                task,
+                                original_status,
+                                original_schedule_expr,
+                                pending_delete: false,
+                            }
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                self.workflows = match db.list_workflows(None) {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .map(|wf| {
+                            let steps = db.get_workflow_steps(&wf.id).unwrap_or_default();
+                            let completed =
+                                steps.iter().filter(|s| s.status == "completed").count();
+                            let progress = format!("{completed}/{}", steps.len());
+                            WorkflowItem {
+                                workflow: wf,
+                                step_progress: progress,
+                                pending_cancel: false,
+                                pending_delete: false,
+                            }
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+            }
+            Err(_) => {
+                self.tasks = Vec::new();
+                self.workflows = Vec::new();
+            }
+        }
     }
 
     pub fn dismiss(&mut self) {
@@ -119,10 +190,17 @@ impl SchedulePopup {
                     None
                 }
                 KeyCode::Up => {
-                    if !self.tasks.is_empty() {
+                    let total = self.total_rows();
+                    if total > 0 {
                         if self.cursor == 0 {
-                            self.cursor = self.tasks.len() - 1;
+                            self.cursor = total - 1;
                         } else {
+                            self.cursor -= 1;
+                        }
+                        // Skip separator row
+                        if matches!(self.cursor_target(), CursorTarget::Separator)
+                            && self.cursor > 0
+                        {
                             self.cursor -= 1;
                         }
                     }
@@ -130,49 +208,93 @@ impl SchedulePopup {
                     None
                 }
                 KeyCode::Down => {
-                    if !self.tasks.is_empty() {
-                        self.cursor = (self.cursor + 1) % self.tasks.len();
+                    let total = self.total_rows();
+                    if total > 0 {
+                        self.cursor = (self.cursor + 1) % total;
+                        // Skip separator row
+                        if matches!(self.cursor_target(), CursorTarget::Separator) {
+                            self.cursor = (self.cursor + 1) % total;
+                        }
                     }
                     self.status_message = None;
                     None
                 }
                 KeyCode::Char(' ') => {
-                    if let Some(item) = self.tasks.get_mut(self.cursor) {
-                        let status = item.task.status.as_str();
-                        match status {
-                            "active" => {
-                                item.task.status = "paused".to_string();
-                                self.status_message =
-                                    Some(("Paused (Enter to apply)".to_string(), true));
+                    if let CursorTarget::Task(i) = self.cursor_target() {
+                        if let Some(item) = self.tasks.get_mut(i) {
+                            let status = item.task.status.as_str();
+                            match status {
+                                "active" => {
+                                    item.task.status = "paused".to_string();
+                                    self.status_message =
+                                        Some(("Paused (Enter to apply)".to_string(), true));
+                                }
+                                "paused" => {
+                                    item.task.status = "active".to_string();
+                                    self.status_message =
+                                        Some(("Resumed (Enter to apply)".to_string(), true));
+                                }
+                                _ => {
+                                    self.status_message =
+                                        Some((format!("Cannot toggle {status} task"), false));
+                                }
                             }
-                            "paused" => {
-                                item.task.status = "active".to_string();
-                                self.status_message =
-                                    Some(("Resumed (Enter to apply)".to_string(), true));
-                            }
-                            _ => {
-                                self.status_message =
-                                    Some((format!("Cannot toggle {status} task"), false));
+                        }
+                    }
+                    None
+                }
+                KeyCode::Char('c') => {
+                    if let CursorTarget::Workflow(i) = self.cursor_target() {
+                        if let Some(item) = self.workflows.get_mut(i) {
+                            let status = item.workflow.status.as_str();
+                            match status {
+                                "running" | "pending" => {
+                                    item.pending_cancel = !item.pending_cancel;
+                                    if item.pending_cancel {
+                                        self.status_message = Some((
+                                            "Marked for cancel (Enter to apply)".to_string(),
+                                            true,
+                                        ));
+                                    } else {
+                                        self.status_message = None;
+                                    }
+                                }
+                                _ => {
+                                    self.status_message =
+                                        Some((format!("Cannot cancel {status} workflow"), false));
+                                }
                             }
                         }
                     }
                     None
                 }
                 KeyCode::Char('e') => {
-                    if let Some(item) = self.tasks.get(self.cursor) {
-                        if item.task.status == "cancelled" || item.task.status == "completed" {
-                            self.status_message =
-                                Some(("Cannot edit a finished task".to_string(), false));
-                            return None;
+                    if let CursorTarget::Task(i) = self.cursor_target() {
+                        if let Some(item) = self.tasks.get(i) {
+                            if item.task.status == "cancelled" || item.task.status == "completed" {
+                                self.status_message =
+                                    Some(("Cannot edit a finished task".to_string(), false));
+                                return None;
+                            }
+                            let buf = item.task.schedule_expr.clone();
+                            self.phase = SchedulePhase::EditingSchedule { buffer: buf };
                         }
-                        let buf = item.task.schedule_expr.clone();
-                        self.phase = SchedulePhase::EditingSchedule { buffer: buf };
                     }
                     None
                 }
                 KeyCode::Char('d') => {
-                    if let Some(item) = self.tasks.get_mut(self.cursor) {
-                        item.pending_delete = !item.pending_delete;
+                    match self.cursor_target() {
+                        CursorTarget::Task(i) => {
+                            if let Some(item) = self.tasks.get_mut(i) {
+                                item.pending_delete = !item.pending_delete;
+                            }
+                        }
+                        CursorTarget::Workflow(i) => {
+                            if let Some(item) = self.workflows.get_mut(i) {
+                                item.pending_delete = !item.pending_delete;
+                            }
+                        }
+                        _ => {}
                     }
                     None
                 }
@@ -202,21 +324,28 @@ impl SchedulePopup {
                     None
                 }
                 KeyCode::Enter => {
-                    if buffer.is_empty() {
+                    // Clone buffer to release the mutable borrow on self.phase
+                    let buf_snapshot = buffer.clone();
+                    if buf_snapshot.is_empty() {
                         self.status_message =
                             Some(("Expression cannot be empty".to_string(), false));
                         return None;
                     }
-                    if let Some(item) = self.tasks.get(self.cursor) {
-                        let stype = &item.task.schedule_type;
-                        if let Err(e) = borg_core::tasks::validate_schedule(stype, buffer) {
-                            self.status_message = Some((format!("Invalid: {e}"), false));
-                            return None;
+                    if let CursorTarget::Task(i) = self.cursor_target() {
+                        if let Some(item) = self.tasks.get(i) {
+                            let stype = &item.task.schedule_type;
+                            if let Err(e) =
+                                borg_core::tasks::validate_schedule(stype, &buf_snapshot)
+                            {
+                                self.status_message = Some((format!("Invalid: {e}"), false));
+                                return None;
+                            }
                         }
                     }
-                    let new_expr = buffer.clone();
-                    if let Some(item) = self.tasks.get_mut(self.cursor) {
-                        item.task.schedule_expr = new_expr;
+                    if let CursorTarget::Task(i) = self.cursor_target() {
+                        if let Some(item) = self.tasks.get_mut(i) {
+                            item.task.schedule_expr = buf_snapshot;
+                        }
                     }
                     self.phase = SchedulePhase::Browsing;
                     self.status_message =
@@ -254,6 +383,18 @@ impl SchedulePopup {
             }
         }
 
+        for item in &self.workflows {
+            if item.pending_delete {
+                actions.push(ScheduleAction::DeleteWorkflow {
+                    workflow_id: item.workflow.id.clone(),
+                });
+            } else if item.pending_cancel {
+                actions.push(ScheduleAction::CancelWorkflow {
+                    workflow_id: item.workflow.id.clone(),
+                });
+            }
+        }
+
         actions
     }
 
@@ -263,7 +404,8 @@ impl SchedulePopup {
         }
 
         let popup_area = popup_utils::popup_area(frame.area());
-        let inner = popup_utils::render_popup_frame(frame, popup_area, "Scheduled Tasks");
+        let inner =
+            popup_utils::render_popup_frame(frame, popup_area, "Scheduled Tasks & Workflows");
 
         if inner.height < 5 || inner.width < 12 {
             return;
@@ -271,11 +413,12 @@ impl SchedulePopup {
 
         let content_height = (inner.height as usize).saturating_sub(2);
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut row_indices: Vec<usize> = Vec::new();
+        let mut row_indices: Vec<usize> = Vec::new(); // maps cursor index → line index
 
-        if self.tasks.is_empty() {
+        // ── Tasks section ──
+        if self.tasks.is_empty() && self.workflows.is_empty() {
             lines.push(Line::from(Span::styled(
-                " No scheduled tasks.".to_string(),
+                " No scheduled tasks or workflows.".to_string(),
                 theme::dim(),
             )));
         }
@@ -303,7 +446,7 @@ impl SchedulePopup {
                 item.task.name, item.task.schedule_type, item.task.schedule_expr,
             );
 
-            let is_cursor = i == self.cursor;
+            let is_cursor = self.cursor == i;
             let style = if is_cursor {
                 theme::popup_selected()
             } else if item.task.status == "cancelled" || item.task.status == "completed" {
@@ -325,6 +468,66 @@ impl SchedulePopup {
                 };
                 lines.push(Line::from(Span::styled(
                     format!("      {next_str}"),
+                    detail_style,
+                )));
+            }
+        }
+
+        // ── Workflows section ──
+        if !self.workflows.is_empty() {
+            // Separator row (not selectable)
+            row_indices.push(lines.len()); // separator cursor index
+            lines.push(Line::from(Span::styled(
+                " ── Workflows ──".to_string(),
+                theme::dim(),
+            )));
+
+            for (wi, item) in self.workflows.iter().enumerate() {
+                row_indices.push(lines.len());
+                let cursor_idx = self.tasks.len() + 1 + wi;
+
+                let status_icon = match item.workflow.status.as_str() {
+                    "running" => "▶",
+                    "completed" => "✓",
+                    "failed" => "✗",
+                    "cancelled" => "⊘",
+                    _ => "○",
+                };
+
+                let suffix = if item.pending_cancel {
+                    " (cancel)"
+                } else if item.pending_delete {
+                    " (delete)"
+                } else {
+                    ""
+                };
+
+                let label = format!(
+                    "  {status_icon} {:<28} [{}/steps]",
+                    item.workflow.title, item.step_progress,
+                );
+
+                let is_cursor = self.cursor == cursor_idx;
+                let style = if is_cursor {
+                    theme::popup_selected()
+                } else if item.workflow.status == "completed" || item.workflow.status == "cancelled"
+                {
+                    theme::dim()
+                } else {
+                    ratatui::style::Style::default()
+                };
+
+                lines.push(Line::from(Span::styled(format!("{label}{suffix}"), style)));
+
+                // Detail line: goal (truncated)
+                let goal_preview: String = item.workflow.goal.chars().take(50).collect();
+                let detail_style = if is_cursor {
+                    theme::popup_selected()
+                } else {
+                    theme::dim()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("      {goal_preview}"),
                     detail_style,
                 )));
             }
@@ -367,11 +570,20 @@ impl SchedulePopup {
 
         let hint = if matches!(self.phase, SchedulePhase::EditingSchedule { .. }) {
             " Enter: save  Esc: cancel"
+        } else if matches!(self.cursor_target(), CursorTarget::Workflow(_)) {
+            " c: cancel  d: delete  Enter: apply  Esc: close"
         } else {
             " Space: toggle  e: edit  d: delete  Enter: apply  Esc: close"
         };
         popup_utils::render_footer(frame, inner, hint);
     }
+}
+
+enum CursorTarget {
+    Task(usize),
+    Workflow(usize),
+    Separator,
+    None,
 }
 
 #[cfg(test)]
@@ -517,5 +729,76 @@ mod tests {
     fn handle_paste_not_consumed_when_hidden() {
         let popup = &mut SchedulePopup::new();
         assert!(!popup.handle_paste("anything"));
+    }
+
+    fn make_popup_with_workflow(status: &str) -> SchedulePopup {
+        let mut popup = SchedulePopup::new();
+        popup.visible = true;
+        popup.workflows.push(WorkflowItem {
+            workflow: WorkflowRow {
+                id: "wf-test-1".into(),
+                title: "Test Workflow".into(),
+                goal: "Do something complex".into(),
+                status: status.into(),
+                current_step: 0,
+                created_at: 0,
+                updated_at: 0,
+                completed_at: None,
+                error: None,
+                session_id: None,
+                project_id: None,
+                delivery_channel: None,
+                delivery_target: None,
+            },
+            step_progress: "1/3".into(),
+            pending_cancel: false,
+            pending_delete: false,
+        });
+        popup
+    }
+
+    #[test]
+    fn c_marks_running_workflow_for_cancel() {
+        let mut popup = make_popup_with_workflow("running");
+        // Cursor starts at 0 which is the separator (no tasks), move down to workflow
+        popup.cursor = 1; // separator is at 0, workflow at 1
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+
+        popup.handle_key(c);
+        assert!(popup.workflows[0].pending_cancel);
+
+        // Toggle off
+        popup.handle_key(c);
+        assert!(!popup.workflows[0].pending_cancel);
+    }
+
+    #[test]
+    fn c_rejects_completed_workflow() {
+        let mut popup = make_popup_with_workflow("completed");
+        popup.cursor = 1;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+
+        popup.handle_key(c);
+        assert!(!popup.workflows[0].pending_cancel);
+        assert!(popup.status_message.as_ref().unwrap().0.contains("Cannot"));
+    }
+
+    #[test]
+    fn cancel_workflow_collected_in_actions() {
+        let mut popup = make_popup_with_workflow("running");
+        popup.cursor = 1;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Mark for cancel
+        popup.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        // Apply
+        let result = popup.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(result.is_some());
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(&actions[0], ScheduleAction::CancelWorkflow { .. }));
     }
 }
