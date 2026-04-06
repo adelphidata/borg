@@ -396,6 +396,11 @@ async fn run_heartbeat_turn(config: &Config) -> HeartbeatResult {
 /// If the last turn errored, pause the queue and notify the user.
 fn drain_queued_if_idle(app: &mut App<'_>) -> Result<AppAction> {
     if matches!(app.state, app::AppState::Idle) {
+        // Don't start a new streaming turn while a popup is open — it would
+        // change AppState to Streaming and break input routing to the popup.
+        if app.any_popup_visible() {
+            return Ok(AppAction::Continue);
+        }
         if app.last_turn_errored && !app.queued_messages.is_empty() {
             if !app.queue_pause_notified {
                 app.push_system_message(

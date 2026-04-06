@@ -103,6 +103,25 @@ impl PluginsPopup {
         false
     }
 
+    /// Test helpers for inspecting/manipulating popup state.
+    #[cfg(test)]
+    pub fn items_for_test(&self) -> Vec<(&str, bool)> {
+        self.items.iter().map(|i| (i.def.id, i.is_installed)).collect()
+    }
+
+    #[cfg(test)]
+    pub fn set_cursor_for_test(&mut self, idx: usize) {
+        self.cursor = idx;
+    }
+
+    #[cfg(test)]
+    pub fn force_uninstalled_for_test(&mut self, idx: usize) {
+        if let Some(item) = self.items.get_mut(idx) {
+            item.is_installed = false;
+            item.is_selected = false;
+        }
+    }
+
     /// Handle a key event. Returns actions to execute if Enter is pressed.
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<Vec<PluginAction>> {
         use crossterm::event::KeyCode;

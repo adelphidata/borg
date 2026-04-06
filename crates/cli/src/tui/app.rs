@@ -248,42 +248,56 @@ impl<'a> App<'a> {
     }
 
     pub fn tick_paste_burst(&mut self) {
-        self.composer.tick();
+        // Don't flush paste-burst into the composer while a popup is open.
+        if !self.any_popup_visible() {
+            self.composer.tick();
+        }
+    }
+
+    /// Returns `true` if any popup overlay is currently visible.
+    ///
+    /// Used to suppress input routing to the composer and to prevent
+    /// `drain_queued_if_idle` from starting a new streaming turn while the
+    /// user is interacting with a popup.
+    pub fn any_popup_visible(&self) -> bool {
+        self.settings_popup.is_visible()
+            || self.plugins_popup.is_visible()
+            || self.schedule_popup.is_visible()
+            || self.skills_popup.is_visible()
+            || self.migrate_popup.is_visible()
+            || self.status_popup.is_visible()
     }
 
     /// Handle a bracketed paste event (entire pasted text as a single string).
     ///
-    /// Mirrors the popup priority logic in [`handle_key`]: visible popups
-    /// consume the paste exclusively — either into their text-input buffer or
-    /// as a no-op when no input field is active. Paste never leaks to the
-    /// composer while any popup is open.
+    /// Popups consume the paste exclusively — either into their text-input
+    /// buffer or as a no-op when no input field is active. Paste never leaks
+    /// to the composer while any popup is open, regardless of `AppState`.
     pub fn handle_paste(&mut self, text: String) -> AppAction {
+        // Popups get absolute first priority across ALL states.
+        // A popup can be visible during Streaming if drain_queued_if_idle
+        // started a turn while a popup was open.
+        if self.settings_popup.is_visible() {
+            self.settings_popup.handle_paste(&text);
+            return AppAction::Continue;
+        }
+        if self.plugins_popup.is_visible() {
+            self.plugins_popup.handle_paste(&text);
+            return AppAction::Continue;
+        }
+        if self.schedule_popup.is_visible() {
+            self.schedule_popup.handle_paste(&text);
+            return AppAction::Continue;
+        }
+        if self.skills_popup.is_visible()
+            || self.migrate_popup.is_visible()
+            || self.status_popup.is_visible()
+        {
+            return AppAction::Continue;
+        }
+
         match self.state {
             AppState::Idle | AppState::AwaitingInput { .. } => {
-                // Popups get first priority (same order as handle_key).
-                // Try to route into the popup's input buffer; if it returns
-                // false the popup is visible but has no text field active —
-                // swallow the paste anyway (matches handle_key behaviour).
-                if self.settings_popup.is_visible() {
-                    self.settings_popup.handle_paste(&text);
-                    return AppAction::Continue;
-                }
-                if self.plugins_popup.is_visible() {
-                    self.plugins_popup.handle_paste(&text);
-                    return AppAction::Continue;
-                }
-                if self.schedule_popup.is_visible() {
-                    self.schedule_popup.handle_paste(&text);
-                    return AppAction::Continue;
-                }
-                // Remaining popups have no text input — just swallow.
-                if self.skills_popup.is_visible()
-                    || self.migrate_popup.is_visible()
-                    || self.status_popup.is_visible()
-                {
-                    return AppAction::Continue;
-                }
-
                 self.composer.handle_paste(&text);
                 // Update popup filters (same as after handle_key)
                 let composer_text = self.composer.text();
@@ -576,6 +590,19 @@ impl<'a> App<'a> {
                     }
                 } else if key.code == KeyCode::Tab {
                     // No-op during streaming
+                } else if self.any_popup_visible() {
+                    // A popup can be open during Streaming if
+                    // drain_queued_if_idle started a turn while a popup was
+                    // visible. Route keys to the popup, not the composer.
+                    if self.settings_popup.is_visible() {
+                        self.settings_popup.handle_key(key, &mut self.config)?;
+                    } else if self.plugins_popup.is_visible() {
+                        self.plugins_popup.handle_key(key);
+                    } else if self.schedule_popup.is_visible() {
+                        self.schedule_popup.handle_key(key);
+                    }
+                    // Other popups (skills, migrate, status) have no text
+                    // input — just swallow the key.
                 } else {
                     // Pass other keys to composer so user can type ahead
                     self.composer.handle_key(key);
@@ -2856,5 +2883,67 @@ mod tests {
         assert!(matches!(action, AppAction::Continue));
         let sys = last_system_text(&app).unwrap();
         assert!(sys.contains("already pending"));
+    }
+
+    // --- Popup vs Streaming: paste/key must never leak to composer ---
+
+    #[test]
+    fn any_popup_visible_reflects_plugins_popup() {
+        let mut app = make_app();
+        assert!(!app.any_popup_visible());
+        let data_dir = std::env::temp_dir().join("borg-test-any-popup");
+        app.plugins_popup.show(&data_dir);
+        assert!(app.any_popup_visible());
+    }
+
+    #[test]
+    fn paste_goes_to_popup_not_composer_during_streaming() {
+        let mut app = make_app();
+        // Open plugins popup
+        let data_dir = std::env::temp_dir().join("borg-test-paste-stream");
+        app.plugins_popup.show(&data_dir);
+        // Force Streaming state (simulates drain_queued_if_idle starting a turn)
+        app.state = AppState::Streaming {
+            start: std::time::Instant::now(),
+        };
+        // Paste should be swallowed by the popup, not queued as a steer
+        let action = app.handle_paste("secret-token".to_string());
+        assert!(matches!(action, AppAction::Continue));
+        // Composer must remain empty
+        assert!(app.composer.text().is_empty());
+        // pending_steers must remain empty (paste was NOT queued)
+        assert!(app.pending_steers.is_empty());
+    }
+
+    #[test]
+    fn key_chars_go_to_popup_not_composer_during_streaming() {
+        let mut app = make_app();
+        let data_dir = std::env::temp_dir().join("borg-test-key-stream");
+        app.plugins_popup.show(&data_dir);
+
+        // Select Telegram and enter credential input phase
+        let tg_idx = app
+            .plugins_popup
+            .items_for_test()
+            .iter()
+            .position(|i| i.0 == "messaging/telegram")
+            .unwrap();
+        app.plugins_popup.set_cursor_for_test(tg_idx);
+        // Force uninstalled so toggle + Enter enters CredentialInput
+        app.plugins_popup.force_uninstalled_for_test(tg_idx);
+        app.handle_key(key(KeyCode::Char(' '))).unwrap(); // toggle
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // enter cred input
+
+        // Now force Streaming
+        app.state = AppState::Streaming {
+            start: std::time::Instant::now(),
+        };
+
+        // Type chars — they should go to the popup, not the composer
+        app.handle_key(key(KeyCode::Char('a'))).unwrap();
+        app.handle_key(key(KeyCode::Char('b'))).unwrap();
+        app.handle_key(key(KeyCode::Char('c'))).unwrap();
+
+        assert!(app.composer.text().is_empty());
     }
 }
