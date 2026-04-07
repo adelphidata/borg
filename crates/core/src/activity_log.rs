@@ -136,6 +136,35 @@ mod tests {
     }
 
     #[test]
+    fn test_log_activity_migrate_roundtrip() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+
+        // Use the convenience function (same as TUI migration handler)
+        log_activity(
+            &db,
+            "info",
+            "migrate",
+            "Migration complete: 2 config change(s) applied",
+        );
+        log_activity(
+            &db,
+            "error",
+            "migrate",
+            "Migration failed: connection refused",
+        );
+
+        let entries = db
+            .query_activity(50, Some("info"), Some("migrate"))
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let formatted = format_activity_entry(&entries[0]);
+        assert!(formatted.contains("migrate"));
+        assert!(formatted.contains("Migration"));
+    }
+
+    #[test]
     fn test_level_priority() {
         assert!(level_priority("error") < level_priority("warn"));
         assert!(level_priority("warn") < level_priority("info"));

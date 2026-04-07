@@ -1256,13 +1256,25 @@ async fn run_event_loop(
                                     for warning in &result.warnings {
                                         msg.push_str(&format!("\n  Warning: {warning}"));
                                     }
+                                    // Log to activity log so /logs shows it
+                                    if let Ok(db) = borg_core::db::Database::open() {
+                                        borg_core::activity_log::log_activity(
+                                            &db, "info", "migrate", &msg,
+                                        );
+                                    }
                                     app.push_system_message(msg);
                                     // Reload config to pick up migrated settings
                                     app.config =
                                         borg_core::config::Config::load().unwrap_or_default();
                                 }
                                 Err(e) => {
-                                    app.push_system_message(format!("Migration failed: {e}"));
+                                    let msg = format!("Migration failed: {e}");
+                                    if let Ok(db) = borg_core::db::Database::open() {
+                                        borg_core::activity_log::log_activity(
+                                            &db, "error", "migrate", &msg,
+                                        );
+                                    }
+                                    app.push_system_message(msg);
                                 }
                             }
                         }

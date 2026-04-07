@@ -118,3 +118,83 @@ impl Database {
         Ok(deleted)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_db() -> Database {
+        Database::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_log_and_query_activity() {
+        let db = test_db();
+        db.log_activity(
+            "info",
+            "migrate",
+            "Migration complete: 2 config change(s) applied",
+            None,
+        )
+        .unwrap();
+        db.log_activity("error", "migrate", "Migration failed: timeout", None)
+            .unwrap();
+        db.log_activity(
+            "info",
+            "gateway",
+            "Gateway listening on 127.0.0.1:7842",
+            None,
+        )
+        .unwrap();
+
+        // Query all info+ entries
+        let entries = db.query_activity(50, Some("info"), None).unwrap();
+        assert_eq!(entries.len(), 3);
+
+        // Query filtered by category
+        let migrate_entries = db
+            .query_activity(50, Some("info"), Some("migrate"))
+            .unwrap();
+        assert_eq!(migrate_entries.len(), 2);
+        assert!(migrate_entries.iter().all(|e| e.category == "migrate"));
+
+        // Query errors only — should get only the migrate error
+        let errors = db.query_activity(50, Some("error"), None).unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "Migration failed: timeout");
+    }
+
+    #[test]
+    fn test_log_activity_with_detail() {
+        let db = test_db();
+        db.log_activity(
+            "info",
+            "migrate",
+            "Migration complete",
+            Some("2 config change(s), 1 credential(s)"),
+        )
+        .unwrap();
+
+        let entries = db.query_activity(1, Some("info"), Some("migrate")).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].detail.as_deref(),
+            Some("2 config change(s), 1 credential(s)")
+        );
+    }
+
+    #[test]
+    fn test_prune_activity() {
+        let db = test_db();
+        db.log_activity("info", "migrate", "old entry", None)
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        let pruned = db.prune_activity_before(now + 1).unwrap();
+        assert_eq!(pruned, 1);
+
+        let entries = db.query_activity(50, Some("info"), None).unwrap();
+        assert!(entries.is_empty());
+    }
+}
