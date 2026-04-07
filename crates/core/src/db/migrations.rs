@@ -818,7 +818,7 @@ impl Database {
                 completed_at INTEGER,
                 error TEXT,
                 session_id TEXT REFERENCES sessions(id),
-                project_id TEXT REFERENCES projects(id),
+                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
                 delivery_channel TEXT,
                 delivery_target TEXT
             );

@@ -295,7 +295,7 @@ mod tests {
         assert!(result.contains("CRUD Test"));
 
         // Get
-        let result = handle_projects(&json!({"action": "get", "id": short_id}), &config).unwrap();
+        let _result = handle_projects(&json!({"action": "get", "id": short_id}), &config).unwrap();
         // Short IDs might not match full UUID, so use list to find full ID
         // For this test, we'll use the DB directly
         let db = Database::open().unwrap();

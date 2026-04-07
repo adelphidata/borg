@@ -434,7 +434,7 @@ impl Database {
             .optional()?;
 
         match current_status.as_deref() {
-            Some(status::COMPLETED) | Some(status::CANCELLED) | None => {
+            Some(status::COMPLETED) | Some(status::FAILED) | Some(status::CANCELLED) | None => {
                 return Ok(false);
             }
             _ => {}
@@ -717,7 +717,7 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Delete a project. Does not cascade to workflows (they keep a dangling project_id).
+    /// Delete a project. Cascades to delete all associated workflows (and their steps).
     pub fn delete_project(&self, id: &str) -> Result<bool> {
         let count = self
             .conn

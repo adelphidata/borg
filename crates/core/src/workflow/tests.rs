@@ -1110,3 +1110,372 @@ fn test_workflow_nullable_project_id() {
     let wf = db.get_workflow("wf-1").unwrap().unwrap();
     assert!(wf.project_id.is_none());
 }
+
+// ============================================================
+// Boundary & Edge Case Tests
+// ============================================================
+
+#[test]
+fn test_create_workflow_exactly_max_steps() {
+    let db = test_db();
+    let steps = sample_steps(50);
+
+    db.create_workflow(
+        "wf-max",
+        "Max Steps",
+        "Goal",
+        &steps,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let db_steps = db.get_workflow_steps("wf-max").unwrap();
+    assert_eq!(db_steps.len(), 50);
+    assert_eq!(db_steps[49].step_index, 49);
+}
+
+#[test]
+fn test_workflow_with_zero_max_retries() {
+    let db = test_db();
+    let steps = vec![NewWorkflowStep {
+        title: "No retries".to_string(),
+        instructions: "Fail immediately".to_string(),
+        max_retries: 0,
+        timeout_ms: 300000,
+    }];
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    let exhausted = db.fail_workflow_step(s.id, "fatal").unwrap();
+    assert!(exhausted);
+
+    let wf = db.get_workflow("wf-1").unwrap().unwrap();
+    assert_eq!(wf.status, status::FAILED);
+
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].status, step_status::FAILED);
+    assert_eq!(all_steps[0].retry_count, 1);
+}
+
+#[test]
+fn test_claim_step_nonexistent_workflow() {
+    let db = test_db();
+    let result = db.claim_next_workflow_step("nonexistent").unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_fail_nonexistent_step() {
+    let db = test_db();
+    let result = db.fail_workflow_step(99999, "err").unwrap();
+    assert!(!result);
+}
+
+// ============================================================
+// Recovery Scenario Tests
+// ============================================================
+
+#[test]
+fn test_recover_multiple_stale_steps_across_workflows() {
+    let db = test_db();
+    let steps = sample_steps(2);
+
+    db.create_workflow("wf-1", "WF 1", "G1", &steps, None, None, None, None)
+        .unwrap();
+    db.create_workflow("wf-2", "WF 2", "G2", &steps, None, None, None, None)
+        .unwrap();
+
+    // Claim one step from each workflow
+    let s1 = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    let s2 = db.claim_next_workflow_step("wf-2").unwrap().unwrap();
+
+    // Backdate both to simulate crash
+    let stale_time = chrono::Utc::now().timestamp() - 600;
+    db.conn()
+        .execute(
+            "UPDATE workflow_steps SET started_at = ?1 WHERE id IN (?2, ?3)",
+            rusqlite::params![stale_time, s1.id, s2.id],
+        )
+        .unwrap();
+
+    let count = db.recover_stale_workflow_steps().unwrap();
+    assert_eq!(count, 2);
+
+    // Both should be back to pending
+    let steps1 = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(steps1[0].status, step_status::PENDING);
+    let steps2 = db.get_workflow_steps("wf-2").unwrap();
+    assert_eq!(steps2[0].status, step_status::PENDING);
+}
+
+#[test]
+fn test_recover_preserves_retry_count() {
+    let db = test_db();
+    let steps = sample_steps(1);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Claim, fail (retry_count becomes 1), claim again, fail (retry_count becomes 2)
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "err1").unwrap();
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "err2").unwrap();
+
+    // Now claim again — step has retry_count=2
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    assert_eq!(s.retry_count, 2);
+
+    // Backdate to make it stale
+    let stale_time = chrono::Utc::now().timestamp() - 600;
+    db.conn()
+        .execute(
+            "UPDATE workflow_steps SET started_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale_time, s.id],
+        )
+        .unwrap();
+
+    db.recover_stale_workflow_steps().unwrap();
+
+    // Retry count should be preserved
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].status, step_status::PENDING);
+    assert_eq!(all_steps[0].retry_count, 2);
+}
+
+#[test]
+fn test_recover_mixed_state_workflow() {
+    let db = test_db();
+    let steps = sample_steps(3);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Complete step 0
+    let s0 = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.complete_workflow_step(s0.id, "done").unwrap();
+
+    // Claim step 1, then backdate to make it stale
+    let s1 = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    let stale_time = chrono::Utc::now().timestamp() - 600;
+    db.conn()
+        .execute(
+            "UPDATE workflow_steps SET started_at = ?1 WHERE id = ?2",
+            rusqlite::params![stale_time, s1.id],
+        )
+        .unwrap();
+
+    // Step 2 is still pending (untouched)
+
+    let count = db.recover_stale_workflow_steps().unwrap();
+    assert_eq!(count, 1); // Only step 1 recovered
+
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].status, step_status::COMPLETED); // unchanged
+    assert_eq!(all_steps[1].status, step_status::PENDING); // recovered
+    assert!(all_steps[1].started_at.is_none());
+    assert_eq!(all_steps[2].status, step_status::PENDING); // unchanged
+}
+
+// ============================================================
+// Runnable Query Edge Case Tests
+// ============================================================
+
+#[test]
+fn test_get_runnable_excludes_failed_workflows() {
+    let db = test_db();
+    let mut steps = sample_steps(2);
+    steps[0].max_retries = 1;
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Fail step to exhaust retries → workflow becomes FAILED
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "fatal").unwrap();
+
+    let runnable = db.get_runnable_workflows().unwrap();
+    assert!(runnable.is_empty());
+}
+
+#[test]
+fn test_get_runnable_excludes_completed_workflows() {
+    let db = test_db();
+    let steps = sample_steps(1);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Complete the only step → workflow becomes COMPLETED
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.complete_workflow_step(s.id, "done").unwrap();
+
+    let runnable = db.get_runnable_workflows().unwrap();
+    assert!(runnable.is_empty());
+}
+
+// ============================================================
+// Cancellation Edge Case Tests
+// ============================================================
+
+#[test]
+fn test_cancel_failed_workflow() {
+    let db = test_db();
+    let mut steps = sample_steps(1);
+    steps[0].max_retries = 1;
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Fail to make workflow FAILED
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "fatal").unwrap();
+
+    let wf = db.get_workflow("wf-1").unwrap().unwrap();
+    assert_eq!(wf.status, status::FAILED);
+
+    // Cancelling a failed workflow should return false
+    let cancelled = db.cancel_workflow("wf-1").unwrap();
+    assert!(!cancelled);
+}
+
+// ============================================================
+// Project-Workflow Relationship Tests
+// ============================================================
+
+#[test]
+fn test_delete_project_cascades_to_workflows() {
+    let db = test_db();
+    let steps = sample_steps(2);
+
+    db.create_project("proj-1", "Project", "Desc").unwrap();
+    db.create_workflow(
+        "wf-1",
+        "WF 1",
+        "G1",
+        &steps,
+        None,
+        Some("proj-1"),
+        None,
+        None,
+    )
+    .unwrap();
+    db.create_workflow(
+        "wf-2",
+        "WF 2",
+        "G2",
+        &steps,
+        None,
+        Some("proj-1"),
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Verify workflows and steps exist
+    assert_eq!(db.list_workflows_by_project("proj-1").unwrap().len(), 2);
+    assert_eq!(db.get_workflow_steps("wf-1").unwrap().len(), 2);
+
+    // Delete the project
+    assert!(db.delete_project("proj-1").unwrap());
+
+    // Workflows and their steps should be gone
+    assert!(db.get_workflow("wf-1").unwrap().is_none());
+    assert!(db.get_workflow("wf-2").unwrap().is_none());
+    assert!(db.get_workflow_steps("wf-1").unwrap().is_empty());
+    assert!(db.get_workflow_steps("wf-2").unwrap().is_empty());
+}
+
+#[test]
+fn test_archive_project_preserves_workflow_links() {
+    let db = test_db();
+    let steps = sample_steps(1);
+
+    db.create_project("proj-1", "Project", "Desc").unwrap();
+    db.create_workflow("wf-1", "WF", "G", &steps, None, Some("proj-1"), None, None)
+        .unwrap();
+
+    db.archive_project("proj-1").unwrap();
+
+    // Workflow should still be linked
+    let wf = db.get_workflow("wf-1").unwrap().unwrap();
+    assert_eq!(wf.project_id.as_deref(), Some("proj-1"));
+
+    // Project query should still work
+    let by_proj = db.list_workflows_by_project("proj-1").unwrap();
+    assert_eq!(by_proj.len(), 1);
+}
+
+// ============================================================
+// Step Error Tracking Tests
+// ============================================================
+
+#[test]
+fn test_step_error_updated_on_each_retry() {
+    let db = test_db();
+    let steps = sample_steps(1);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Fail with first error
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "timeout error").unwrap();
+
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].error.as_deref(), Some("timeout error"));
+
+    // Fail with second error
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.fail_workflow_step(s.id, "connection refused").unwrap();
+
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].error.as_deref(), Some("connection refused"));
+    assert_eq!(all_steps[0].retry_count, 2);
+}
+
+// ============================================================
+// Completed Steps Query Tests (Extended)
+// ============================================================
+
+#[test]
+fn test_get_completed_steps_after_cancel() {
+    let db = test_db();
+    let steps = sample_steps(4);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // Complete first 2 steps
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.complete_workflow_step(s.id, "output 1").unwrap();
+    let s = db.claim_next_workflow_step("wf-1").unwrap().unwrap();
+    db.complete_workflow_step(s.id, "output 2").unwrap();
+
+    // Cancel the workflow
+    db.cancel_workflow("wf-1").unwrap();
+
+    // Should return exactly the 2 completed steps
+    let completed = db.get_completed_workflow_steps("wf-1").unwrap();
+    assert_eq!(completed.len(), 2);
+    assert_eq!(completed[0].output.as_deref(), Some("output 1"));
+    assert_eq!(completed[1].output.as_deref(), Some("output 2"));
+}
+
+#[test]
+fn test_get_completed_steps_empty_workflow() {
+    let db = test_db();
+    let steps = sample_steps(3);
+
+    db.create_workflow("wf-1", "WF", "G", &steps, None, None, None, None)
+        .unwrap();
+
+    // No steps completed yet
+    let completed = db.get_completed_workflow_steps("wf-1").unwrap();
+    assert!(completed.is_empty());
+}

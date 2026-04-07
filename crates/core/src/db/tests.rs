@@ -2286,7 +2286,7 @@ fn migrate_v18_adds_status_and_daemon_lock() {
     assert_eq!(version, Database::CURRENT_VERSION);
 
     // Verify status column exists on task_runs
-    let run_id = {
+    let _run_id = {
         db.create_task(&simple_task(
             "t1",
             "task1",
