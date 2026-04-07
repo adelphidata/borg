@@ -472,6 +472,35 @@ async fn invoke_agent_inner(
         return Ok((response, session_id));
     }
 
+    // Handle `/poke` before the sync dispatcher (requires async HTTP call).
+    if crate::commands::is_poke_command(&inbound.text) {
+        let poke_url = format!(
+            "http://{}:{}/internal/poke",
+            config.gateway.host, config.gateway.port
+        );
+        let response = match reqwest::Client::new()
+            .post(&poke_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => "Heartbeat triggered.".to_string(),
+            Ok(resp) => format!("Poke failed (HTTP {})", resp.status()),
+            Err(e) => format!("Poke failed: {e}"),
+        };
+        if let Err(e) = db.log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "outbound",
+            Some(&response),
+            None,
+            Some(&session_id),
+        ) {
+            warn!("Failed to log /poke response: {e}");
+        }
+        return Ok((response, session_id));
+    }
+
     // Check for slash commands before creating agent (use original text for commands)
     if let Some(response) = crate::commands::try_handle_command(
         &inbound.text,
@@ -495,9 +524,28 @@ async fn invoke_agent_inner(
         return Ok((response, session_id));
     }
 
+    // Strip `/plan ` prefix when it was a pass-through (mode was set in the
+    // DB by try_handle_command, but the text still carries the prefix).
+    let cleaned_text = {
+        let lower = cleaned_text.trim().to_ascii_lowercase();
+        if lower.starts_with("/plan ") {
+            cleaned_text.trim()[6..].trim_start().to_string()
+        } else {
+            cleaned_text
+        }
+    };
+
     // Create Agent with gateway-specific (stricter) rate limits
     let mut gw_config = config.clone();
     gw_config.security.action_limits = gw_config.security.gateway_action_limits.clone();
+
+    // Apply per-session collaboration mode override (set via /mode command).
+    if let Ok(Some(mode_str)) = db.get_setting(&format!("gw:mode:{session_id}")) {
+        if let Ok(mode) = mode_str.parse::<borg_core::config::CollaborationMode>() {
+            gw_config.conversation.collaboration_mode = mode;
+        }
+    }
+
     let mut agent = Agent::new(gw_config, borg_core::telemetry::BorgMetrics::noop())
         .context("Failed to create agent")?;
 

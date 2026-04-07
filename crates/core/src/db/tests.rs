@@ -454,6 +454,92 @@ fn delete_session_messages() {
 }
 
 #[test]
+fn compact_session_messages_keeps_recent() {
+    let db = test_db();
+    for i in 0..5 {
+        db.insert_message(
+            "s1",
+            "user",
+            Some(&format!("msg{i}")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert");
+    }
+    let deleted = db.compact_session_messages("s1", 2).expect("compact");
+    assert_eq!(deleted, 3);
+    let msgs = db.load_session_messages("s1").expect("load");
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].content.as_deref(), Some("msg3"));
+    assert_eq!(msgs[1].content.as_deref(), Some("msg4"));
+}
+
+#[test]
+fn compact_session_messages_noop_when_under_threshold() {
+    let db = test_db();
+    db.insert_message("s1", "user", Some("only one"), None, None, None, None)
+        .expect("insert");
+    let deleted = db.compact_session_messages("s1", 10).expect("compact");
+    assert_eq!(deleted, 0);
+    assert_eq!(db.count_session_messages("s1").expect("count"), 1);
+}
+
+#[test]
+fn delete_last_assistant_turn_removes_tool_chain() {
+    let db = test_db();
+    // user -> assistant (with tool call) -> tool -> assistant (final)
+    db.insert_message("s1", "user", Some("hi"), None, None, None, None)
+        .expect("insert");
+    db.insert_message(
+        "s1",
+        "assistant",
+        None,
+        Some(r#"[{"id":"c1"}]"#),
+        None,
+        None,
+        None,
+    )
+    .expect("insert");
+    db.insert_message("s1", "tool", Some("result"), None, Some("c1"), None, None)
+        .expect("insert");
+    db.insert_message("s1", "assistant", Some("done"), None, None, None, None)
+        .expect("insert");
+    let deleted = db.delete_last_assistant_turn("s1").expect("undo");
+    assert_eq!(deleted, 3);
+    let msgs = db.load_session_messages("s1").expect("load");
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].role, "user");
+}
+
+#[test]
+fn delete_last_assistant_turn_noop_when_empty() {
+    let db = test_db();
+    let deleted = db.delete_last_assistant_turn("s1").expect("undo");
+    assert_eq!(deleted, 0);
+}
+
+#[test]
+fn delete_last_assistant_turn_stops_at_user() {
+    let db = test_db();
+    // user -> assistant -> user -> assistant
+    db.insert_message("s1", "user", Some("q1"), None, None, None, None)
+        .expect("insert");
+    db.insert_message("s1", "assistant", Some("a1"), None, None, None, None)
+        .expect("insert");
+    db.insert_message("s1", "user", Some("q2"), None, None, None, None)
+        .expect("insert");
+    db.insert_message("s1", "assistant", Some("a2"), None, None, None, None)
+        .expect("insert");
+    let deleted = db.delete_last_assistant_turn("s1").expect("undo");
+    assert_eq!(deleted, 1); // only last assistant
+    let msgs = db.load_session_messages("s1").expect("load");
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(msgs[2].role, "user");
+}
+
+#[test]
 fn messages_with_tool_calls() {
     let db = test_db();
     let tc_json = r#"[{"id":"c1","type":"function","function":{"name":"test","arguments":"{}"}}]"#;

@@ -1662,6 +1662,23 @@ Use docker commands.
                 }
             }
         }
+        // Also disable any user-installed skills that may exist on the host
+        // (e.g. ~/.borg/skills/email/).
+        let user_dir = skills_dir().ok();
+        if let Some(ref dir) = user_dir {
+            if let Ok(dir_entries) = std::fs::read_dir(dir) {
+                for entry in dir_entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        entries.entry(name.to_string()).or_insert_with(|| {
+                            crate::config::SkillEntryConfig {
+                                enabled: false,
+                                env: std::collections::HashMap::new(),
+                            }
+                        });
+                    }
+                }
+            }
+        }
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,

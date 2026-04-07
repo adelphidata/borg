@@ -193,4 +193,46 @@ impl Database {
         let count: i64 = stmt.query_row(params![session_id], |row| row.get(0))?;
         Ok(count as usize)
     }
+
+    /// Keep the last `keep` messages in a session, deleting older ones.
+    /// Returns the number of deleted messages.
+    pub fn compact_session_messages(&self, session_id: &str, keep: usize) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN \
+             (SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2)",
+            params![session_id, keep as i64],
+        )?;
+        Ok(count)
+    }
+
+    /// Delete the last assistant turn (assistant + tool messages) from a session.
+    /// Walks backwards from the end, collecting messages until a `user` message is
+    /// hit. Returns the number of deleted messages.
+    pub fn delete_last_assistant_turn(&self, session_id: &str) -> Result<usize> {
+        let messages = self.load_session_messages(session_id)?;
+        let mut ids_to_delete = Vec::new();
+        for msg in messages.iter().rev() {
+            if msg.role == "user" {
+                break;
+            }
+            ids_to_delete.push(msg.id);
+        }
+        if ids_to_delete.is_empty() {
+            return Ok(0);
+        }
+        let placeholders: Vec<String> = ids_to_delete.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "DELETE FROM messages WHERE session_id = ?1 AND id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut param_idx = 1;
+        stmt.raw_bind_parameter(param_idx, session_id)?;
+        for id in &ids_to_delete {
+            param_idx += 1;
+            stmt.raw_bind_parameter(param_idx, id)?;
+        }
+        let count = stmt.raw_execute()?;
+        Ok(count)
+    }
 }

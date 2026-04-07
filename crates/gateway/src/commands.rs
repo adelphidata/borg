@@ -94,6 +94,54 @@ pub const GATEWAY_COMMANDS: &[CommandDef] = &[
         accepts_args: false,
         pass_through: false,
     },
+    CommandDef {
+        name: "mode",
+        description: "Show or switch collaboration mode (default/execute/plan)",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "plan",
+        description: "Enter plan mode, optionally with a message",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "compact",
+        description: "Trim session history, keeping last N messages",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "undo",
+        description: "Undo the last agent turn",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "history",
+        description: "Show recent conversation messages",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "schedule",
+        description: "List scheduled tasks",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "settings",
+        description: "Show or change a setting",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "poke",
+        description: "Trigger an immediate heartbeat",
+        accepts_args: false,
+        pass_through: false,
+    },
 ];
 
 /// Trait for platforms that support registering slash commands in native menus.
@@ -116,6 +164,14 @@ enum Command {
     Doctor,
     Pairing,
     Cancel,
+    Mode,
+    Plan,
+    Compact,
+    Undo,
+    History,
+    Schedule,
+    Settings,
+    Poke,
 }
 
 impl Command {
@@ -142,6 +198,14 @@ impl Command {
             "/doctor" => Self::Doctor,
             "/pairing" => Self::Pairing,
             "/cancel" | "/stop" | "/abort" => Self::Cancel,
+            "/mode" => Self::Mode,
+            "/plan" => Self::Plan,
+            "/compact" => Self::Compact,
+            "/undo" => Self::Undo,
+            "/history" => Self::History,
+            "/schedule" => Self::Schedule,
+            "/settings" => Self::Settings,
+            "/poke" => Self::Poke,
             _ => return None,
         };
         Some((cmd, args))
@@ -154,6 +218,13 @@ impl Command {
 /// (it holds a `&Database` which is `!Send`).
 pub fn is_cancel_command(text: &str) -> bool {
     matches!(Command::parse(text), Some((Command::Cancel, _)))
+}
+
+/// Returns `true` if `text` parses as the `/poke` slash command. Handled
+/// separately from [`try_handle_command`] because poke requires an async
+/// HTTP call to the daemon.
+pub fn is_poke_command(text: &str) -> bool {
+    matches!(Command::parse(text), Some((Command::Poke, _)))
 }
 
 /// Try to handle a slash command. Returns `Some(response)` if the message was
@@ -171,7 +242,7 @@ pub fn try_handle_command(
     session_id: &str,
     sender_id: &str,
 ) -> Option<String> {
-    let (cmd, _args) = Command::parse(text)?;
+    let (cmd, args) = Command::parse(text)?;
     let response = match cmd {
         Command::Help => handle_help(),
         Command::Commands => handle_commands(),
@@ -187,6 +258,17 @@ pub fn try_handle_command(
         Command::Pairing => handle_pairing(db, channel_name, sender_id),
         // Handled out-of-band in the caller; see `is_cancel_command`.
         Command::Cancel => return None,
+        Command::Mode => handle_mode(db, config, session_id, args),
+        Command::Plan => {
+            return handle_plan(db, session_id, args);
+        }
+        Command::Compact => handle_compact(db, session_id, args),
+        Command::Undo => handle_undo(db, session_id),
+        Command::History => handle_history(db, session_id, args),
+        Command::Schedule => handle_schedule(db),
+        Command::Settings => handle_settings(db, config, args),
+        // Handled out-of-band in the caller; see `is_poke_command`.
+        Command::Poke => return None,
     };
     Some(response)
 }
@@ -337,6 +419,216 @@ fn handle_doctor(config: &Config) -> String {
     lines.join("\n")
 }
 
+fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> String {
+    let mode_key = format!("gw:mode:{session_id}");
+    if args.is_empty() {
+        let current = db
+            .get_setting(&mode_key)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| config.conversation.collaboration_mode.to_string());
+        return format!("Collaboration mode: {current}\nUsage: /mode <default|execute|plan>");
+    }
+    let mode = args.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        "default" | "execute" | "plan" => {
+            if let Err(e) = db.set_setting(&mode_key, &mode) {
+                warn!("Failed to set mode: {e}");
+                return "Failed to set mode.".to_string();
+            }
+            format!("Switched to {mode} mode.")
+        }
+        _ => "Invalid mode. Choose: default, execute, plan".to_string(),
+    }
+}
+
+/// Handle `/plan [message]`. Returns `Some(response)` for bare `/plan`,
+/// `None` for `/plan <message>` (pass-through to agent after setting mode).
+fn handle_plan(db: &Database, session_id: &str, args: &str) -> Option<String> {
+    let mode_key = format!("gw:mode:{session_id}");
+    if let Err(e) = db.set_setting(&mode_key, "plan") {
+        warn!("Failed to set plan mode: {e}");
+        return Some("Failed to enter plan mode.".to_string());
+    }
+    if args.is_empty() {
+        Some("Entered plan mode. Send your message to begin planning.".to_string())
+    } else {
+        // Pass through to agent — the mode override in handler.rs will
+        // pick up the setting we just wrote.
+        None
+    }
+}
+
+fn handle_compact(db: &Database, session_id: &str, args: &str) -> String {
+    let keep: usize = if args.is_empty() {
+        20
+    } else {
+        match args.trim().parse() {
+            Ok(n) if n > 0 => n,
+            _ => return "Usage: /compact [keep_count] (positive integer, default 20)".to_string(),
+        }
+    };
+    match db.compact_session_messages(session_id, keep) {
+        Ok(0) => format!("Nothing to compact (≤{keep} messages)."),
+        Ok(deleted) => format!("Compacted: removed {deleted} older messages, kept last {keep}."),
+        Err(e) => {
+            warn!("Failed to compact session: {e}");
+            "Failed to compact session.".to_string()
+        }
+    }
+}
+
+fn handle_undo(db: &Database, session_id: &str) -> String {
+    match db.delete_last_assistant_turn(session_id) {
+        Ok(0) => "Nothing to undo.".to_string(),
+        Ok(n) => format!("Undone: removed {n} messages from last agent turn."),
+        Err(e) => {
+            warn!("Failed to undo: {e}");
+            "Failed to undo last turn.".to_string()
+        }
+    }
+}
+
+fn handle_history(db: &Database, session_id: &str, args: &str) -> String {
+    let count: usize = if args.is_empty() {
+        10
+    } else {
+        match args.trim().parse() {
+            Ok(n) if n > 0 && n <= 50 => n,
+            _ => return "Usage: /history [count] (1-50, default 10)".to_string(),
+        }
+    };
+    match db.load_session_messages(session_id) {
+        Ok(msgs) if msgs.is_empty() => "No messages in current session.".to_string(),
+        Ok(msgs) => {
+            let start = msgs.len().saturating_sub(count);
+            let mut lines = vec![format!("Last {} messages:", msgs.len().min(count))];
+            for msg in &msgs[start..] {
+                let content = msg.content.as_deref().unwrap_or("[tool call]");
+                let preview = if content.len() > 200 {
+                    // Find a safe UTF-8 char boundary to avoid panicking on
+                    // multi-byte characters (CJK, emoji, etc.).
+                    let end = (0..=200)
+                        .rev()
+                        .find(|&i| content.is_char_boundary(i))
+                        .unwrap_or(0);
+                    format!("{}…", &content[..end])
+                } else {
+                    content.to_string()
+                };
+                lines.push(format!("  [{}] {}", msg.role, preview));
+            }
+            lines.join("\n")
+        }
+        Err(e) => {
+            warn!("Failed to load history: {e}");
+            "Failed to load history.".to_string()
+        }
+    }
+}
+
+fn handle_schedule(db: &Database) -> String {
+    match db.list_tasks() {
+        Ok(tasks) if tasks.is_empty() => "No scheduled tasks.".to_string(),
+        Ok(tasks) => {
+            let mut lines = vec![format!("Scheduled tasks ({}):", tasks.len())];
+            for t in &tasks {
+                let next = t
+                    .next_run
+                    .map(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    })
+                    .unwrap_or_else(|| "—".to_string());
+                lines.push(format!(
+                    "  {} ({}) [{}] next: {}",
+                    t.name, t.schedule_expr, t.status, next
+                ));
+            }
+            lines.join("\n")
+        }
+        Err(e) => {
+            warn!("Failed to list tasks: {e}");
+            "Failed to list tasks.".to_string()
+        }
+    }
+}
+
+/// Keys that are safe to change from a messaging channel. Security-critical
+/// settings (sandbox, security, budget) are excluded to prevent remote
+/// privilege escalation.
+const GATEWAY_SAFE_SETTING_KEYS: &[&str] = &[
+    "model",
+    "temperature",
+    "max_tokens",
+    "provider",
+    "conversation.max_iterations",
+    "conversation.show_thinking",
+    "conversation.tool_output_max_tokens",
+    "memory.max_context_tokens",
+    "skills.enabled",
+    "skills.max_context_tokens",
+];
+
+fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
+    if args.is_empty() {
+        // Show key settings
+        let provider = config.llm.provider.as_deref().unwrap_or("(auto-detect)");
+        let lines = [
+            "Current settings:".to_string(),
+            format!("  provider = {provider}"),
+            format!("  model = {}", config.llm.model),
+            format!("  temperature = {}", config.llm.temperature),
+            format!("  max_tokens = {}", config.llm.max_tokens),
+            format!(
+                "  collaboration_mode = {}",
+                config.conversation.collaboration_mode
+            ),
+            format!("  sandbox.enabled = {}", config.sandbox.enabled),
+            "\nUsage: /settings <key> <value>".to_string(),
+        ];
+        return lines.join("\n");
+    }
+    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    if parts.len() == 1 {
+        // Show single setting value
+        let key = parts[0];
+        if let Ok(Some(val)) = db.get_setting(key) {
+            return format!("{key} = {val} (DB override)");
+        }
+        match key {
+            "model" => return format!("{key} = {}", config.llm.model),
+            "temperature" => return format!("{key} = {}", config.llm.temperature),
+            "max_tokens" => return format!("{key} = {}", config.llm.max_tokens),
+            "provider" => {
+                return format!(
+                    "{key} = {}",
+                    config.llm.provider.as_deref().unwrap_or("(auto-detect)")
+                )
+            }
+            _ => return format!("Unknown or read-only setting: {key}"),
+        }
+    }
+    // Two args: key value
+    let key = parts[0];
+    let value = parts[1].trim();
+    if !GATEWAY_SAFE_SETTING_KEYS.contains(&key) {
+        return format!("Setting '{key}' cannot be changed from a messaging channel.");
+    }
+    let mut clone = config.clone();
+    match clone.apply_setting(key, value) {
+        Ok(confirmation) => {
+            if let Err(e) = db.set_setting(key, value) {
+                warn!("Failed to persist setting: {e}");
+                return format!("Validated but failed to persist: {e}");
+            }
+            format!("Updated: {confirmation}")
+        }
+        Err(e) => format!("Error: {e}"),
+    }
+}
+
 fn handle_pairing(db: &Database, channel_name: &str, sender_id: &str) -> String {
     let approved = db
         .is_sender_approved(channel_name, sender_id)
@@ -446,6 +738,75 @@ mod tests {
         assert!(is_cancel_command("/cancel"));
         assert!(crate::in_flight::GLOBAL.cancel(session_id).await);
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn parse_new_commands() {
+        assert!(matches!(Command::parse("/mode"), Some((Command::Mode, _))));
+        assert!(matches!(Command::parse("/plan"), Some((Command::Plan, _))));
+        assert!(matches!(
+            Command::parse("/compact"),
+            Some((Command::Compact, _))
+        ));
+        assert!(matches!(Command::parse("/undo"), Some((Command::Undo, _))));
+        assert!(matches!(
+            Command::parse("/history"),
+            Some((Command::History, _))
+        ));
+        assert!(matches!(
+            Command::parse("/schedule"),
+            Some((Command::Schedule, _))
+        ));
+        assert!(matches!(
+            Command::parse("/settings"),
+            Some((Command::Settings, _))
+        ));
+        assert!(matches!(Command::parse("/poke"), Some((Command::Poke, _))));
+    }
+
+    #[test]
+    fn parse_mode_with_args() {
+        let (cmd, args) = Command::parse("/mode execute").unwrap();
+        assert!(matches!(cmd, Command::Mode));
+        assert_eq!(args, "execute");
+    }
+
+    #[test]
+    fn parse_plan_with_args() {
+        let (cmd, args) = Command::parse("/plan analyze the codebase").unwrap();
+        assert!(matches!(cmd, Command::Plan));
+        assert_eq!(args, "analyze the codebase");
+    }
+
+    #[test]
+    fn parse_compact_with_count() {
+        let (cmd, args) = Command::parse("/compact 10").unwrap();
+        assert!(matches!(cmd, Command::Compact));
+        assert_eq!(args, "10");
+    }
+
+    #[test]
+    fn parse_history_with_count() {
+        let (cmd, args) = Command::parse("/history 25").unwrap();
+        assert!(matches!(cmd, Command::History));
+        assert_eq!(args, "25");
+    }
+
+    #[test]
+    fn parse_settings_with_key_value() {
+        let (cmd, args) = Command::parse("/settings temperature 0.5").unwrap();
+        assert!(matches!(cmd, Command::Settings));
+        assert_eq!(args, "temperature 0.5");
+    }
+
+    #[test]
+    fn is_poke_command_matches() {
+        assert!(is_poke_command("/poke"));
+        assert!(is_poke_command("/Poke"));
+        assert!(is_poke_command("/poke@MyBorgBot"));
+        assert!(!is_poke_command("/status"));
+        assert!(!is_poke_command("poke"));
+        assert!(!is_poke_command(""));
     }
 
     #[test]
