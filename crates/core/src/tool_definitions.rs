@@ -465,4 +465,45 @@ mod tests {
             .collect();
         assert!(types.contains(&"workflow"));
     }
+
+    #[test]
+    fn tool_definitions_sorted_deterministically_after_sort() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.web.enabled = true;
+        config.tts.enabled = true;
+        config.image_gen.enabled = true;
+        let mut defs = core_tool_definitions(&config);
+
+        // Apply the same sort used in Agent::build_tool_definitions
+        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        let mut sorted_names = names.clone();
+        sorted_names.sort();
+        assert_eq!(names, sorted_names, "tools should be in alphabetical order");
+    }
+
+    #[test]
+    fn tool_sort_is_stable_across_config_variants() {
+        // Tools with all optional features enabled
+        let mut config_full = Config::default();
+        config_full.browser.enabled = true;
+        config_full.web.enabled = true;
+        config_full.tts.enabled = true;
+        config_full.image_gen.enabled = true;
+        let mut defs_full = core_tool_definitions(&config_full);
+        defs_full.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+        // Same config again — order must be identical
+        let mut defs_full2 = core_tool_definitions(&config_full);
+        defs_full2.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+
+        let names1: Vec<&str> = defs_full.iter().map(|d| d.function.name.as_str()).collect();
+        let names2: Vec<&str> = defs_full2
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert_eq!(names1, names2, "tool order must be identical across calls");
+    }
 }

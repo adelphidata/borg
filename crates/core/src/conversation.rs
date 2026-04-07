@@ -103,11 +103,11 @@ pub fn plan_compaction(history: &[Message], max_tokens: usize) -> Option<usize> 
     Some(keep_from)
 }
 
-/// Compact the oldest tool results before doing full LLM-based compaction.
+/// Compact the newest tool results to preserve the prompt cache prefix.
 ///
 /// Replaces tool result content with a placeholder, cheaply reclaiming tokens
-/// without calling the LLM. Only compacts results from the oldest half of the
-/// history to preserve recent context.
+/// without calling the LLM. Only compacts results from the newest half of the
+/// history so the oldest messages (cached prefix) stay byte-identical.
 pub fn compact_tool_results(history: &mut [Message], max_tokens: usize) {
     let total = history_tokens(history);
     if total <= max_tokens {
@@ -117,7 +117,7 @@ pub fn compact_tool_results(history: &mut [Message], max_tokens: usize) {
     let half = history.len() / 2;
     let placeholder = "[compacted: output removed]";
 
-    for msg in history[..half].iter_mut() {
+    for msg in history[half..].iter_mut().rev() {
         if msg.role != Role::Tool {
             continue;
         }
@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_tool_results_compacts_old_results() {
+    fn compact_tool_results_compacts_newest_preserving_cache_prefix() {
         let big_output = "x".repeat(500);
         let mut history = vec![
             make_user("old question"),
@@ -1101,15 +1101,43 @@ mod tests {
         ];
         // Set budget very low to trigger compaction
         compact_tool_results(&mut history, 10);
-        // The old tool result (index 2, in first half) should be compacted
+        // The old tool result (index 2, in first half) should be PRESERVED (cache prefix)
         let old_result = history[2].text_content().unwrap();
-        assert!(
-            old_result.contains("compacted"),
-            "old result should be compacted: {old_result}"
+        assert_eq!(
+            old_result, big_output,
+            "old result should be preserved for prompt cache prefix"
         );
-        // The new tool result (index 6, in second half) should be preserved
+        // The new tool result (index 6, in second half) should be compacted
         let new_result = history[6].text_content().unwrap();
-        assert_eq!(new_result, big_output);
+        assert!(
+            new_result.contains("compacted"),
+            "new result should be compacted: {new_result}"
+        );
+    }
+
+    #[test]
+    fn compact_tool_results_preserves_all_oldest_half() {
+        let big_output = "x".repeat(500);
+        let mut history = vec![
+            make_user("q1"),
+            make_tool_call_msg("", "c1", "run_shell"),
+            make_tool_result("c1", &big_output),
+            make_assistant("a1"),
+            make_user("q2"),
+            make_tool_call_msg("", "c2", "run_shell"),
+            make_tool_result("c2", &big_output),
+            make_assistant("a2"),
+            make_user("q3"),
+            make_tool_call_msg("", "c3", "run_shell"),
+            make_tool_result("c3", &big_output),
+            make_assistant("a3"),
+        ];
+        compact_tool_results(&mut history, 10);
+        // First half (indices 0..6) should be untouched
+        assert_eq!(history[2].text_content().unwrap(), big_output);
+        // Second half results should be compacted (newest first)
+        assert!(history[6].text_content().unwrap().contains("compacted"));
+        assert!(history[10].text_content().unwrap().contains("compacted"));
     }
 
     #[test]

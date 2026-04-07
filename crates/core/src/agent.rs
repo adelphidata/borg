@@ -973,6 +973,9 @@ Rules:
             tools = crate::tool_policy::filter_tools(tools, policy);
         }
 
+        // Sort deterministically so the tools block is byte-identical across turns,
+        // preserving the Anthropic prompt cache breakpoint on the tools array.
+        tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         tools
     }
 
