@@ -109,6 +109,7 @@ impl PluginsPopup {
                     continue;
                 }
                 let cat = match skill.category() {
+                    "core" => Category::Core,
                     "developer" => Category::Developer,
                     "email" => Category::Email,
                     "productivity" => Category::Productivity,
@@ -131,10 +132,11 @@ impl PluginsPopup {
         let cat_order = |c: &Category| -> usize {
             match c {
                 Category::Channels => 0,
-                Category::Email => 1,
+                Category::Core => 1,
                 Category::Developer => 2,
                 Category::Productivity => 3,
                 Category::Utilities => 4,
+                Category::Email => 5,
             }
         };
         items.sort_by(|a, b| {
@@ -665,11 +667,35 @@ mod tests {
             }
             cats
         };
-        // Channels should come before other categories
+        // Channels should come first, Core second
         if let Some(channels_pos) = categories.iter().position(|c| *c == Category::Channels) {
-            for cat in &categories[..channels_pos] {
-                assert_ne!(*cat, Category::Developer);
-                assert_ne!(*cat, Category::Utilities);
+            assert_eq!(channels_pos, 0, "Channels should be the first category");
+        }
+        if let Some(core_pos) = categories.iter().position(|c| *c == Category::Core) {
+            assert_eq!(core_pos, 1, "Core should be the second category");
+        }
+    }
+
+    #[test]
+    fn scheduler_not_shown_in_popup() {
+        let popup = make_test_popup();
+        assert!(
+            !popup.items.iter().any(|i| i.id == "scheduler"),
+            "scheduler should be hidden from the plugins popup"
+        );
+    }
+
+    #[test]
+    fn core_skills_grouped_under_core_category() {
+        let popup = make_test_popup();
+        let core_skill_ids = ["browser", "calendar", "email", "search"];
+        for id in &core_skill_ids {
+            if let Some(item) = popup.items.iter().find(|i| i.id == *id) {
+                assert_eq!(
+                    item.category,
+                    Category::Core,
+                    "skill {id} should be in Core category"
+                );
             }
         }
     }

@@ -38,6 +38,8 @@ impl std::fmt::Display for PluginKind {
 pub enum Category {
     /// Communication channels — how users talk to Borg (Telegram, Slack, Discord, etc.).
     Channels,
+    /// Core skills — always-on essentials (browser, search, email, calendar).
+    Core,
     /// Email clients and providers.
     Email,
     /// Developer tools (git, docker, databases, etc.).
@@ -52,6 +54,7 @@ impl std::fmt::Display for Category {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Channels => write!(f, "CHANNELS"),
+            Self::Core => write!(f, "CORE"),
             Self::Email => write!(f, "EMAIL"),
             Self::Developer => write!(f, "DEVELOPER"),
             Self::Productivity => write!(f, "PRODUCTIVITY"),
@@ -218,6 +221,7 @@ mod tests {
     #[test]
     fn category_display() {
         assert_eq!(Category::Channels.to_string(), "CHANNELS");
+        assert_eq!(Category::Core.to_string(), "CORE");
         assert_eq!(Category::Email.to_string(), "EMAIL");
         assert_eq!(Category::Developer.to_string(), "DEVELOPER");
         assert_eq!(Category::Productivity.to_string(), "PRODUCTIVITY");

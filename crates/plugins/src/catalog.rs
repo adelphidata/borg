@@ -334,6 +334,7 @@ pub fn by_category(category: Category) -> Vec<&'static PluginDef> {
 pub fn categories() -> &'static [Category] {
     &[
         Category::Channels,
+        Category::Core,
         Category::Email,
         Category::Developer,
         Category::Productivity,

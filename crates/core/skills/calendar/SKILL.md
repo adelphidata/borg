@@ -1,7 +1,7 @@
 ---
 name: calendar
 description: "Check schedule and events via icalBuddy (macOS) or gcalcli (Google Calendar)"
-category: productivity
+category: core
 requires:
   any_bins: ["icalBuddy", "gcalcli"]
 install:

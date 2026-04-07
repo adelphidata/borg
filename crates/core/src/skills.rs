@@ -116,7 +116,7 @@ pub struct SkillManifest {
 pub const DEFAULT_ENABLED_SKILLS: &[&str] = &["browser", "git", "search", "email", "calendar"];
 
 /// Skills hidden from the unified /plugins UI (still loaded for prompt injection).
-pub const HIDDEN_SKILLS: &[&str] = &["skill-creator", "slack", "discord"];
+pub const HIDDEN_SKILLS: &[&str] = &["skill-creator", "slack", "discord", "scheduler"];
 
 /// Hardcoded category fallback for built-in skills without a `category` field.
 const SKILL_CATEGORY_MAP: &[(&str, &str)] = &[
@@ -124,15 +124,15 @@ const SKILL_CATEGORY_MAP: &[(&str, &str)] = &[
     ("github", "developer"),
     ("docker", "developer"),
     ("database", "developer"),
-    ("search", "utilities"),
-    ("browser", "utilities"),
+    ("search", "core"),
+    ("browser", "core"),
+    ("calendar", "core"),
+    ("email", "core"),
     ("weather", "utilities"),
     ("http", "utilities"),
     ("1password", "utilities"),
     ("notes", "utilities"),
     ("scheduler", "utilities"),
-    ("calendar", "productivity"),
-    ("email", "email"),
     ("slack", "channels"),
     ("discord", "channels"),
     ("skill-creator", "utilities"),
@@ -178,16 +178,19 @@ impl Skill {
     }
 
     /// Returns the plugin category for this skill.
-    /// Reads from manifest frontmatter, falls back to the hardcoded map.
+    /// Hardcoded map is authoritative for built-in skills (handles stale on-disk frontmatter),
+    /// then falls back to manifest frontmatter for user-defined skills.
     pub fn category(&self) -> &str {
+        if let Some((_, cat)) = SKILL_CATEGORY_MAP
+            .iter()
+            .find(|(name, _)| *name == self.manifest.name.as_str())
+        {
+            return cat;
+        }
         if let Some(cat) = &self.manifest.category {
             return cat.as_str();
         }
-        SKILL_CATEGORY_MAP
-            .iter()
-            .find(|(name, _)| *name == self.manifest.name.as_str())
-            .map(|(_, cat)| *cat)
-            .unwrap_or("utilities")
+        "utilities"
     }
 
     /// Returns true if this skill should be hidden from the unified /plugins UI.
@@ -516,6 +519,10 @@ pub fn load_all_skills(
             }
         }
     }
+
+    // Deduplicate by skill name (keep first occurrence per name)
+    let mut seen = std::collections::HashSet::new();
+    skills.retain(|s| seen.insert(s.manifest.name.clone()));
 
     Ok(skills)
 }
@@ -1242,14 +1249,14 @@ Short body.
             .iter()
             .find(|s| s.manifest.name == "browser")
             .unwrap();
-        assert_eq!(browser.category(), "utilities");
+        assert_eq!(browser.category(), "core");
         let calendar = skills
             .iter()
             .find(|s| s.manifest.name == "calendar")
             .unwrap();
-        assert_eq!(calendar.category(), "productivity");
+        assert_eq!(calendar.category(), "core");
         let email = skills.iter().find(|s| s.manifest.name == "email").unwrap();
-        assert_eq!(email.category(), "email");
+        assert_eq!(email.category(), "core");
     }
 
     #[test]
@@ -1882,5 +1889,45 @@ Use docker commands.
         let s = make(SkillSource::BuiltIn, false, true);
         assert_eq!(s.status_label(), "disabled");
         assert_eq!(s.status_icon(), "—");
+    }
+
+    #[test]
+    fn scheduler_is_hidden() {
+        assert!(
+            HIDDEN_SKILLS.contains(&"scheduler"),
+            "scheduler should be in HIDDEN_SKILLS"
+        );
+    }
+
+    #[test]
+    fn load_all_skills_no_duplicates() {
+        let skills =
+            load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();
+        let mut names: Vec<&str> = skills.iter().map(|s| s.manifest.name.as_str()).collect();
+        let len_before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            len_before,
+            "load_all_skills returned duplicate skill names"
+        );
+    }
+
+    #[test]
+    fn core_skills_have_core_category() {
+        let skills =
+            load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();
+        for name in &["browser", "search", "email", "calendar"] {
+            let skill = skills
+                .iter()
+                .find(|s| s.manifest.name == *name)
+                .unwrap_or_else(|| panic!("skill {name} not found"));
+            assert_eq!(
+                skill.category(),
+                "core",
+                "skill {name} should have core category"
+            );
+        }
     }
 }
