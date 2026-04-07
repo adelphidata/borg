@@ -37,6 +37,9 @@ pub struct EnvelopeData {
     /// Sync message from another linked device.
     #[serde(default)]
     pub sync_message: Option<SyncMessage>,
+    /// An edit to a previously sent message.
+    #[serde(default)]
+    pub edit_message: Option<EditMessage>,
     /// Delivery/read receipt message.
     #[serde(default)]
     pub receipt_message: Option<serde_json::Value>,
@@ -152,6 +155,18 @@ pub struct Mention {
     /// Phone number of the mentioned user.
     #[serde(default)]
     pub number: Option<String>,
+}
+
+/// A Signal edit message wrapper.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditMessage {
+    /// Timestamp of the original message being edited.
+    #[serde(default)]
+    pub target_sent_timestamp: Option<i64>,
+    /// The replacement data message.
+    #[serde(default)]
+    pub data_message: Option<DataMessage>,
 }
 
 /// A Signal typing indicator message.
@@ -460,6 +475,29 @@ mod tests {
         let err = resp.error.unwrap();
         assert_eq!(err.code, -32601);
         assert_eq!(err.message, "Method not found");
+    }
+
+    #[test]
+    fn deserialize_edit_message_envelope() {
+        let json = r#"{
+            "envelope": {
+                "source": "+15551234567",
+                "timestamp": 1700000001000,
+                "editMessage": {
+                    "targetSentTimestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000001000,
+                        "message": "corrected text"
+                    }
+                }
+            }
+        }"#;
+        let env: SignalEnvelope = serde_json::from_str(json).unwrap();
+        assert!(env.envelope.data_message.is_none());
+        let edit = env.envelope.edit_message.unwrap();
+        assert_eq!(edit.target_sent_timestamp, Some(1700000000000));
+        let dm = edit.data_message.unwrap();
+        assert_eq!(dm.message.as_deref(), Some("corrected text"));
     }
 
     #[test]

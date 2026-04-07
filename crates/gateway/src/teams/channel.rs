@@ -49,7 +49,24 @@ impl NativeChannel for TeamsChannel {
 
         let (inbound, activity) = match parsed {
             Some(pair) => pair,
-            None => return Ok(WebhookOutcome::Skip),
+            None => {
+                // Check for bot-added welcome scenario
+                if let Ok(activity) = serde_json::from_str::<super::types::Activity>(body) {
+                    if super::parse::is_bot_added(&activity) {
+                        if let (Some(svc), Some(conv)) =
+                            (&activity.service_url, &activity.conversation)
+                        {
+                            let welcome =
+                                "Hello! I'm now available in this conversation. How can I help?";
+                            let _ = self
+                                .client
+                                .send_to_conversation(svc, &conv.id, welcome)
+                                .await;
+                        }
+                    }
+                }
+                return Ok(WebhookOutcome::Skip);
+            }
         };
 
         let service_url = activity

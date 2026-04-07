@@ -1,7 +1,37 @@
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use crate::handler::InboundMessage;
 
-use super::types::SignalEnvelope;
+use super::types::{Mention, SignalEnvelope};
+
+/// Replace Signal mention placeholders (U+FFFC) with `@name` text.
+///
+/// Signal uses the Object Replacement Character at `mention.start` for
+/// `mention.length` chars. We replace each placeholder with `@<uuid>` or
+/// `@<number>` from the corresponding [`Mention`] entry.
+fn resolve_mentions(text: &str, mentions: &[Mention]) -> String {
+    let mut result: Vec<char> = text.chars().collect();
+    let mut sorted: Vec<&Mention> = mentions.iter().collect();
+    // Process in reverse order so earlier indices stay valid after replacement.
+    sorted.sort_by(|a, b| b.start.unwrap_or(0).cmp(&a.start.unwrap_or(0)));
+
+    for mention in sorted {
+        let start = mention.start.unwrap_or(0) as usize;
+        let length = mention.length.unwrap_or(1) as usize;
+        let name = mention
+            .uuid
+            .as_deref()
+            .or(mention.number.as_deref())
+            .unwrap_or("unknown");
+        let replacement: Vec<char> = format!("@{name}").chars().collect();
+
+        if start < result.len() {
+            let end = (start + length).min(result.len());
+            result.splice(start..end, replacement);
+        }
+    }
+
+    result.into_iter().collect()
+}
 
 /// Convert a signal-cli SSE envelope into an `InboundMessage`.
 ///
@@ -36,11 +66,42 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         return None;
     }
 
-    // Only process data messages
-    let data_msg = env.data_message.as_ref()?;
+    // Extract data message: prefer direct data_message, fall back to editMessage wrapper
+    let is_edit;
+    let data_msg = if let Some(ref dm) = env.data_message {
+        is_edit = false;
+        dm
+    } else if let Some(ref edit) = env.edit_message {
+        is_edit = true;
+        edit.data_message.as_ref()?
+    } else {
+        return None;
+    };
 
     // Build text from message content
     let mut text = data_msg.message.clone().unwrap_or_default();
+
+    // Resolve mention placeholders (U+FFFC -> @name)
+    if let Some(ref mentions) = data_msg.mentions {
+        if !mentions.is_empty() {
+            text = resolve_mentions(&text, mentions);
+        }
+    }
+
+    // Prepend quoted message context
+    if let Some(ref quote) = data_msg.quote {
+        if let Some(ref quote_text) = quote.text {
+            if !quote_text.is_empty() {
+                let author = quote.author.as_deref().unwrap_or("someone");
+                text = format!("> {author}: {quote_text}\n{text}");
+            }
+        }
+    }
+
+    // Prefix edit messages
+    if is_edit {
+        text = format!("[Edit] {text}");
+    }
 
     // Append attachment placeholders
     if let Some(ref attachments) = data_msg.attachments {
@@ -72,10 +133,15 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
         return None;
     }
 
-    // For reaction-only messages, set text to describe the reaction
+    // For reaction-only messages, set text with target context
     if text.is_empty() {
-        if let Some(ref r) = reaction {
-            text = format!("[Reaction: {r}]");
+        if let Some(ref r) = data_msg.reaction {
+            let target = r.target_author.as_deref().unwrap_or("unknown");
+            if r.is_remove {
+                text = format!("[Removed reaction {} from {}'s message]", r.emoji, target);
+            } else {
+                text = format!("[Reacted {} to {}'s message]", r.emoji, target);
+            }
         }
     }
 
@@ -320,7 +386,7 @@ mod tests {
         );
         let msg = parse_envelope(&env, "+15559876543").unwrap();
         assert_eq!(msg.reaction.as_deref(), Some("👍"));
-        assert!(msg.text.contains("[Reaction: 👍]"));
+        assert!(msg.text.contains("[Reacted 👍 to +15559876543's message]"));
     }
 
     #[test]
@@ -344,6 +410,9 @@ mod tests {
         );
         let msg = parse_envelope(&env, "+15559876543").unwrap();
         assert_eq!(msg.reaction.as_deref(), Some("-👍"));
+        assert!(msg
+            .text
+            .contains("[Removed reaction 👍 from +15559876543's message]"));
     }
 
     #[test]
@@ -394,5 +463,289 @@ mod tests {
             }"#,
         );
         assert!(parse_envelope(&env, "+15559876543").is_none());
+    }
+
+    // ── Mention tests ──
+
+    #[test]
+    fn mention_replaced_in_text() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "\uFFFC hello",
+                        "mentions": [
+                            {"start": 0, "length": 1, "uuid": "abc-123"}
+                        ]
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "@abc-123 hello");
+    }
+
+    #[test]
+    fn multiple_mentions_resolved() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "\uFFFC and \uFFFC",
+                        "mentions": [
+                            {"start": 0, "length": 1, "uuid": "user-a"},
+                            {"start": 6, "length": 1, "uuid": "user-b"}
+                        ]
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert!(msg.text.contains("@user-a"));
+        assert!(msg.text.contains("@user-b"));
+    }
+
+    #[test]
+    fn mention_with_number_fallback() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "\uFFFC hi",
+                        "mentions": [
+                            {"start": 0, "length": 1, "number": "+15559999999"}
+                        ]
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert!(msg.text.contains("@+15559999999"));
+    }
+
+    #[test]
+    fn mention_no_id_uses_unknown() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "\uFFFC hi",
+                        "mentions": [
+                            {"start": 0, "length": 1}
+                        ]
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert!(msg.text.contains("@unknown"));
+    }
+
+    #[test]
+    fn no_mentions_text_unchanged() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "plain text"
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "plain text");
+    }
+
+    // ── Quote tests ──
+
+    #[test]
+    fn quote_prepended_to_text() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "my reply",
+                        "quote": {
+                            "id": 1699999000000,
+                            "author": "+15559876543",
+                            "text": "original message"
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "> +15559876543: original message\nmy reply");
+    }
+
+    #[test]
+    fn quote_without_text_ignored() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "my reply",
+                        "quote": {
+                            "id": 1699999000000,
+                            "author": "+15559876543"
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "my reply");
+    }
+
+    #[test]
+    fn quote_without_author_defaults() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "message": "my reply",
+                        "quote": {
+                            "text": "quoted text"
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert!(msg.text.starts_with("> someone: quoted text"));
+    }
+
+    // ── Edit message tests ──
+
+    #[test]
+    fn edit_message_parsed() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000001000,
+                    "editMessage": {
+                        "targetSentTimestamp": 1700000000000,
+                        "dataMessage": {
+                            "timestamp": 1700000001000,
+                            "message": "corrected text"
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "[Edit] corrected text");
+        assert_eq!(msg.sender_id, "+15551234567");
+    }
+
+    #[test]
+    fn edit_message_with_mentions() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000001000,
+                    "editMessage": {
+                        "targetSentTimestamp": 1700000000000,
+                        "dataMessage": {
+                            "timestamp": 1700000001000,
+                            "message": "\uFFFC corrected",
+                            "mentions": [
+                                {"start": 0, "length": 1, "uuid": "user-x"}
+                            ]
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "[Edit] @user-x corrected");
+    }
+
+    #[test]
+    fn edit_message_no_data_message_returns_none() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000001000,
+                    "editMessage": {
+                        "targetSentTimestamp": 1700000000000
+                    }
+                }
+            }"#,
+        );
+        assert!(parse_envelope(&env, "+15559876543").is_none());
+    }
+
+    // ── Reaction context tests ──
+
+    #[test]
+    fn reaction_includes_target_author() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "reaction": {
+                            "emoji": "❤",
+                            "targetAuthor": "+15550001111",
+                            "targetSentTimestamp": 1699999000000,
+                            "isRemove": false
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert_eq!(msg.text, "[Reacted ❤ to +15550001111's message]");
+    }
+
+    #[test]
+    fn reaction_unknown_target_author() {
+        let env = make_envelope(
+            r#"{
+                "envelope": {
+                    "source": "+15551234567",
+                    "timestamp": 1700000000000,
+                    "dataMessage": {
+                        "timestamp": 1700000000000,
+                        "reaction": {
+                            "emoji": "👍",
+                            "isRemove": false
+                        }
+                    }
+                }
+            }"#,
+        );
+        let msg = parse_envelope(&env, "+15559876543").unwrap();
+        assert!(msg.text.contains("unknown's message"));
     }
 }

@@ -30,6 +30,9 @@ pub struct Activity {
     /// Entities attached to the activity (e.g. @mentions).
     #[serde(default)]
     pub entities: Option<Vec<Entity>>,
+    /// Invoke activity payload (e.g. Adaptive Card submit action).
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
     /// ISO 8601 timestamp of the activity.
     #[serde(default)]
     pub timestamp: Option<String>,
@@ -327,5 +330,21 @@ mod tests {
         let removed = activity.members_removed.unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, "user-gone");
+    }
+
+    #[test]
+    fn deserialize_invoke_activity_with_value() {
+        let json = r#"{
+            "id": "act-inv",
+            "type": "invoke",
+            "from": {"id": "user-1", "name": "Alice"},
+            "conversation": {"id": "conv-1"},
+            "value": {"text": "button clicked", "action": "submit"}
+        }"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.activity_type, "invoke");
+        let value = activity.value.unwrap();
+        assert_eq!(value["text"], "button clicked");
+        assert_eq!(value["action"], "submit");
     }
 }

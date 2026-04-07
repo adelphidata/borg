@@ -7,12 +7,12 @@ use crate::handler::InboundMessage;
 /// Parse a Teams `Activity` into an `InboundMessage`.
 ///
 /// Returns `None` for:
-/// - Non-message activity types (conversationUpdate, typing, etc.)
+/// - Non-message/non-invoke activity types
 /// - Activities without text
 /// - Bot self-messages (from.id matches recipient.id)
 pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
-    // Only handle message activities
-    if activity.activity_type != "message" {
+    // Handle message and invoke activities
+    if activity.activity_type != "message" && activity.activity_type != "invoke" {
         return None;
     }
 
@@ -23,11 +23,38 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         }
     }
 
-    let raw_text = activity.text.as_deref()?;
+    // Extract text based on activity type
+    let raw_text = if activity.activity_type == "invoke" {
+        activity
+            .value
+            .as_ref()
+            .and_then(|v| {
+                v.get("text")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| v.get("action").and_then(|a| a.as_str()))
+            })
+            .map(ToString::to_string)
+    } else {
+        activity.text.clone()
+    };
+    let raw_text = raw_text.as_deref()?;
 
-    // Strip <at>...</at> mention tags from the text
-    let text = strip_mention_tags(raw_text);
-    let text = text.trim();
+    // Extract quoted content from HTML blockquotes in reply messages
+    let quote_context = activity
+        .reply_to_id
+        .as_ref()
+        .and_then(|_| extract_quote_text(raw_text));
+
+    // Process mention tags: bot mentions stripped, user mentions preserved as @Name
+    let bot_id = activity.recipient.as_ref().map(|r| r.id.as_str());
+    let text = resolve_mention_tags(raw_text, activity.entities.as_deref(), bot_id);
+    let text = strip_html_tags(&text);
+    let mut text = text.trim().to_string();
+
+    // Prepend quote context for reply messages
+    if let Some(ref quote) = quote_context {
+        text = format!("> {quote}\n{text}");
+    }
 
     if text.is_empty() {
         return None;
@@ -37,11 +64,8 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
 
     Some(InboundMessage {
         sender_id,
-        text: text.to_string(),
+        text,
         channel_id: activity.conversation.as_ref().map(|c| c.id.clone()),
-        // Populate thread_id from reply_to_id so the gateway handler isolates
-        // per-reply-chain history. Top-level messages in a conversation have
-        // no reply_to_id and share the conversation's base session.
         thread_id: activity.reply_to_id.clone(),
         message_id: Some(activity.id.clone()),
         thread_ts: activity.reply_to_id.clone(),
@@ -62,17 +86,92 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
     })
 }
 
-/// Remove `<at>...</at>` mention tags from Teams message text.
-fn strip_mention_tags(text: &str) -> String {
+/// Check if a conversationUpdate activity indicates the bot was added.
+pub fn is_bot_added(activity: &Activity) -> bool {
+    if activity.activity_type != "conversationUpdate" {
+        return false;
+    }
+    let bot_id = match activity.recipient.as_ref() {
+        Some(r) => r.id.as_str(),
+        None => return false,
+    };
+    activity
+        .members_added
+        .as_ref()
+        .map(|members| members.iter().any(|m| m.id == bot_id))
+        .unwrap_or(false)
+}
+
+/// Process `<at>...</at>` mention tags in Teams message text.
+///
+/// Bot mentions (matched via entity data) are stripped entirely.
+/// Non-bot mentions are replaced with `@Name` to preserve context.
+/// When no entities are provided, all mentions are stripped (conservative fallback).
+fn resolve_mention_tags(
+    text: &str,
+    entities: Option<&[super::types::Entity]>,
+    bot_id: Option<&str>,
+) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"<at>[^<]*</at>\s*").unwrap_or_else(|_| unreachable!()));
-    re.replace_all(text, "").to_string()
+    let re =
+        RE.get_or_init(|| Regex::new(r"<at>([^<]*)</at>\s*").unwrap_or_else(|_| unreachable!()));
+
+    let entities = match entities {
+        Some(e) => e,
+        None => return re.replace_all(text, "").to_string(),
+    };
+
+    // Collect bot mention names from entities
+    let bot_names: Vec<&str> = entities
+        .iter()
+        .filter(|e| e.entity_type == "mention")
+        .filter(|e| {
+            e.mentioned
+                .as_ref()
+                .map(|m| bot_id.is_some_and(|bid| m.id == bid))
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.mentioned.as_ref()?.name.as_deref())
+        .collect();
+
+    re.replace_all(text, |caps: &regex::Captures| {
+        let name = &caps[1];
+        if bot_names.contains(&name) {
+            String::new()
+        } else {
+            format!("@{name} ")
+        }
+    })
+    .to_string()
+}
+
+/// Extract quoted text from Teams HTML message content.
+///
+/// Teams wraps quoted content in `<blockquote>...</blockquote>` tags.
+fn extract_quote_text(text: &str) -> Option<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?s)<blockquote[^>]*>(.*?)</blockquote>").unwrap_or_else(|_| unreachable!())
+    });
+
+    re.captures(text)
+        .map(|caps| strip_html_tags(&caps[1]).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Minimal HTML tag stripping for extracting plain text from Teams content.
+fn strip_html_tags(html: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"<[^>]+>").unwrap_or_else(|_| unreachable!()));
+    re.replace_all(html, "").to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{ChannelAccount, ConversationAccount};
+    use super::super::types::{ChannelAccount, ConversationAccount, Entity};
     use super::*;
 
     fn make_activity() -> Activity {
@@ -99,6 +198,7 @@ mod tests {
             timestamp: Some("2026-03-17T12:00:00Z".to_string()),
             members_added: None,
             members_removed: None,
+            value: None,
         }
     }
 
@@ -119,7 +219,6 @@ mod tests {
         activity.reply_to_id = Some("parent-1".to_string());
         let msg = parse_activity(&activity).unwrap();
         assert_eq!(msg.thread_ts.as_deref(), Some("parent-1"));
-        // thread_id mirrors reply_to_id so the gateway handler isolates per-thread sessions.
         assert_eq!(msg.thread_id.as_deref(), Some("parent-1"));
     }
 
@@ -134,6 +233,7 @@ mod tests {
     fn strip_mention_tags_from_text() {
         let mut activity = make_activity();
         activity.text = Some("<at>MyBot</at> help me please".to_string());
+        // No entities provided — all mentions stripped (conservative fallback)
         let msg = parse_activity(&activity).unwrap();
         assert_eq!(msg.text, "help me please");
     }
@@ -188,7 +288,6 @@ mod tests {
             id: "bot-1".to_string(),
             name: Some("MyBot".to_string()),
         });
-        // recipient is also bot-1
         assert!(parse_activity(&activity).is_none());
     }
 
@@ -205,5 +304,179 @@ mod tests {
         activity.conversation = None;
         let msg = parse_activity(&activity).unwrap();
         assert!(msg.channel_id.is_none());
+    }
+
+    // ── Mention entity tests ──
+
+    #[test]
+    fn bot_mention_stripped_with_entities() {
+        let mut activity = make_activity();
+        activity.text = Some("<at>MyBot</at> help me".to_string());
+        activity.entities = Some(vec![Entity {
+            entity_type: "mention".to_string(),
+            mentioned: Some(ChannelAccount {
+                id: "bot-1".to_string(),
+                name: Some("MyBot".to_string()),
+            }),
+        }]);
+        let msg = parse_activity(&activity).unwrap();
+        assert_eq!(msg.text, "help me");
+    }
+
+    #[test]
+    fn user_mention_preserved_as_at_name() {
+        let mut activity = make_activity();
+        activity.text = Some("<at>Alice</at> what do you think?".to_string());
+        activity.entities = Some(vec![Entity {
+            entity_type: "mention".to_string(),
+            mentioned: Some(ChannelAccount {
+                id: "user-2".to_string(),
+                name: Some("Alice".to_string()),
+            }),
+        }]);
+        let msg = parse_activity(&activity).unwrap();
+        assert!(msg.text.contains("@Alice"));
+        assert!(msg.text.contains("what do you think?"));
+    }
+
+    #[test]
+    fn mixed_bot_and_user_mentions() {
+        let mut activity = make_activity();
+        activity.text = Some("<at>MyBot</at> ask <at>Alice</at> about it".to_string());
+        activity.entities = Some(vec![
+            Entity {
+                entity_type: "mention".to_string(),
+                mentioned: Some(ChannelAccount {
+                    id: "bot-1".to_string(),
+                    name: Some("MyBot".to_string()),
+                }),
+            },
+            Entity {
+                entity_type: "mention".to_string(),
+                mentioned: Some(ChannelAccount {
+                    id: "user-2".to_string(),
+                    name: Some("Alice".to_string()),
+                }),
+            },
+        ]);
+        let msg = parse_activity(&activity).unwrap();
+        assert!(!msg.text.contains("MyBot"));
+        assert!(msg.text.contains("@Alice"));
+        assert!(msg.text.contains("about it"));
+    }
+
+    #[test]
+    fn no_entities_strips_all_mentions() {
+        let mut activity = make_activity();
+        activity.text = Some("<at>Someone</at> hello".to_string());
+        activity.entities = None;
+        let msg = parse_activity(&activity).unwrap();
+        assert_eq!(msg.text, "hello");
+    }
+
+    // ── Quote extraction tests ──
+
+    #[test]
+    fn quote_extracted_from_blockquote() {
+        assert_eq!(
+            extract_quote_text("<blockquote>original text</blockquote>rest"),
+            Some("original text".to_string())
+        );
+    }
+
+    #[test]
+    fn quote_with_inner_html_stripped() {
+        assert_eq!(
+            extract_quote_text("<blockquote><p>quoted</p></blockquote>"),
+            Some("quoted".to_string())
+        );
+    }
+
+    #[test]
+    fn no_blockquote_returns_none() {
+        assert!(extract_quote_text("plain text message").is_none());
+    }
+
+    #[test]
+    fn quote_prepended_to_reply() {
+        let mut activity = make_activity();
+        activity.reply_to_id = Some("parent-1".to_string());
+        activity.text = Some("<blockquote>quoted content</blockquote>reply text".to_string());
+        let msg = parse_activity(&activity).unwrap();
+        assert!(msg.text.starts_with("> quoted content\n"));
+        assert!(msg.text.contains("reply text"));
+    }
+
+    // ── is_bot_added tests ──
+
+    #[test]
+    fn is_bot_added_true() {
+        let mut activity = make_activity();
+        activity.activity_type = "conversationUpdate".to_string();
+        activity.members_added = Some(vec![ChannelAccount {
+            id: "bot-1".to_string(),
+            name: Some("MyBot".to_string()),
+        }]);
+        assert!(is_bot_added(&activity));
+    }
+
+    #[test]
+    fn is_bot_added_false_user_added() {
+        let mut activity = make_activity();
+        activity.activity_type = "conversationUpdate".to_string();
+        activity.members_added = Some(vec![ChannelAccount {
+            id: "user-new".to_string(),
+            name: Some("NewUser".to_string()),
+        }]);
+        assert!(!is_bot_added(&activity));
+    }
+
+    #[test]
+    fn is_bot_added_wrong_type() {
+        let activity = make_activity();
+        assert!(!is_bot_added(&activity));
+    }
+
+    #[test]
+    fn is_bot_added_no_recipient() {
+        let mut activity = make_activity();
+        activity.activity_type = "conversationUpdate".to_string();
+        activity.recipient = None;
+        activity.members_added = Some(vec![ChannelAccount {
+            id: "bot-1".to_string(),
+            name: Some("MyBot".to_string()),
+        }]);
+        assert!(!is_bot_added(&activity));
+    }
+
+    // ── Invoke activity tests ──
+
+    #[test]
+    fn invoke_activity_parsed() {
+        let mut activity = make_activity();
+        activity.activity_type = "invoke".to_string();
+        activity.text = None;
+        activity.value = Some(serde_json::json!({"text": "button clicked"}));
+        let msg = parse_activity(&activity).unwrap();
+        assert_eq!(msg.text, "button clicked");
+    }
+
+    #[test]
+    fn invoke_activity_action_fallback() {
+        let mut activity = make_activity();
+        activity.activity_type = "invoke".to_string();
+        activity.text = None;
+        activity.value = Some(serde_json::json!({"action": "submit"}));
+        let msg = parse_activity(&activity).unwrap();
+        assert_eq!(msg.text, "submit");
+    }
+
+    #[test]
+    fn invoke_activity_no_value_returns_none() {
+        let mut activity = make_activity();
+        activity.activity_type = "invoke".to_string();
+        activity.text = None;
+        activity.value = None;
+        assert!(parse_activity(&activity).is_none());
     }
 }

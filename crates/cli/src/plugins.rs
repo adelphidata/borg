@@ -88,6 +88,24 @@ pub const PLUGINS: &[PluginDef] = &[
         is_channel: true,
     },
     PluginDef {
+        name: "signal",
+        description: "Signal Messenger via signal-cli",
+        category: "messaging",
+        credentials: &[
+            CredentialSpec {
+                key: "SIGNAL_CLI_URL",
+                label: "signal-cli URL",
+                help: "URL of the signal-cli REST API daemon (e.g. http://localhost:8080)",
+            },
+            CredentialSpec {
+                key: "SIGNAL_ACCOUNT",
+                label: "Phone Number",
+                help: "Your Signal phone number (e.g. +15551234567)",
+            },
+        ],
+        is_channel: true,
+    },
+    PluginDef {
         name: "teams",
         description: "Microsoft Teams Bot",
         category: "messaging",
@@ -385,6 +403,7 @@ mod tests {
         assert!(find_plugin("telegram").is_some());
         assert!(find_plugin("slack").is_some());
         assert!(find_plugin("discord").is_some());
+        assert!(find_plugin("signal").is_some());
         assert!(find_plugin("teams").is_some());
         assert!(find_plugin("google-chat").is_some());
         assert!(find_plugin("gmail").is_some());
