@@ -717,11 +717,18 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Delete a project. Cascades to delete all associated workflows (and their steps).
+    /// Delete a project. Nullifies `project_id` on associated workflows first to avoid FK violation.
     pub fn delete_project(&self, id: &str) -> Result<bool> {
-        let count = self
+        let tx = self
             .conn
-            .execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+            .unchecked_transaction()
+            .context("Failed to begin project delete transaction")?;
+        tx.execute(
+            "UPDATE workflows SET project_id = NULL WHERE project_id = ?1",
+            params![id],
+        )?;
+        let count = tx.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        tx.commit().context("Failed to commit project deletion")?;
         Ok(count > 0)
     }
 }

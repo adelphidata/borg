@@ -29,7 +29,11 @@ fn with_db<F: FnOnce(&Database) -> Result<String>>(f: F) -> Result<String> {
 }
 
 fn project_create(args: &Value) -> Result<String> {
-    let name = require_str_param(args, "name")?;
+    let raw_name = require_str_param(args, "name")?;
+    let name = raw_name.trim();
+    if name.is_empty() {
+        return Ok("Project name cannot be empty or whitespace-only.".to_string());
+    }
     let description = optional_str_param(args, "description").unwrap_or("");
     let id = uuid::Uuid::new_v4().to_string();
 
@@ -118,6 +122,12 @@ fn project_update(args: &Value) -> Result<String> {
         return Ok("Nothing to update. Provide name, description, or status.".to_string());
     }
 
+    if let Some(n) = name {
+        if n.trim().is_empty() {
+            return Ok("Project name cannot be empty or whitespace-only.".to_string());
+        }
+    }
+
     if let Some(s) = status {
         if !matches!(s, "active" | "archived") {
             return Ok(format!("Invalid status: {s}. Use 'active' or 'archived'."));
@@ -138,13 +148,22 @@ fn project_update(args: &Value) -> Result<String> {
 
 fn project_archive(args: &Value) -> Result<String> {
     let id = require_str_param(args, "id")?;
-    with_db(|db| match db.archive_project(id) {
-        Ok(true) => {
-            let short = &id[..8.min(id.len())];
-            Ok(format!("Project {short} archived."))
+    with_db(|db| {
+        // Disambiguate "not found" vs "already archived"
+        match db.get_project(id)? {
+            None => Ok(format!("Project not found: {id}")),
+            Some(p) if p.status == "archived" => {
+                let short = &id[..8.min(id.len())];
+                Ok(format!("Project {short} is already archived."))
+            }
+            Some(_) => match db.archive_project(id) {
+                Ok(_) => {
+                    let short = &id[..8.min(id.len())];
+                    Ok(format!("Project {short} archived."))
+                }
+                Err(e) => Ok(format!("Error archiving project: {e}")),
+            },
         }
-        Ok(false) => Ok(format!("Project not found or already archived: {id}")),
-        Err(e) => Ok(format!("Error archiving project: {e}")),
     })
 }
 
@@ -272,6 +291,70 @@ mod tests {
     fn missing_action_errors() {
         let result = handle_projects(&json!({}), &test_config());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_project_empty_name_rejected() {
+        let result =
+            handle_projects(&json!({"action": "create", "name": ""}), &test_config()).unwrap();
+        assert!(result.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn create_project_whitespace_name_rejected() {
+        let result =
+            handle_projects(&json!({"action": "create", "name": "   "}), &test_config()).unwrap();
+        assert!(result.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn update_project_empty_name_rejected() {
+        let result = handle_projects(
+            &json!({"action": "update", "id": "some-id", "name": "  "}),
+            &test_config(),
+        )
+        .unwrap();
+        assert!(result.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn update_project_invalid_status_rejected() {
+        let result = handle_projects(
+            &json!({"action": "update", "id": "some-id", "status": "bogus"}),
+            &test_config(),
+        )
+        .unwrap();
+        assert!(result.contains("Invalid status"));
+    }
+
+    #[test]
+    fn archive_already_archived_returns_distinct_message() {
+        let config = test_config();
+
+        // Create a project
+        let result =
+            handle_projects(&json!({"action": "create", "name": "ArchiveTest"}), &config).unwrap();
+        assert!(result.contains("Project created"));
+
+        // Find the full ID
+        let db = Database::open().unwrap();
+        let projects = db.list_projects(None).unwrap();
+        let project = projects.iter().find(|p| p.name == "ArchiveTest").unwrap();
+        let full_id = project.id.clone();
+
+        // Archive once
+        let result =
+            handle_projects(&json!({"action": "archive", "id": &full_id}), &config).unwrap();
+        assert!(result.contains("archived"));
+
+        // Archive again — should say "already archived", not "not found"
+        let result =
+            handle_projects(&json!({"action": "archive", "id": &full_id}), &config).unwrap();
+        assert!(result.contains("already archived"));
+        assert!(!result.contains("not found"));
+
+        // Clean up
+        let _ = handle_projects(&json!({"action": "delete", "id": &full_id}), &config);
     }
 
     #[test]
