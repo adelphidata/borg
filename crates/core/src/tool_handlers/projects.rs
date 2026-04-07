@@ -10,25 +10,34 @@ use crate::db::Database;
 /// Handle the `projects` tool. Dispatches by action.
 pub fn handle_projects(args: &Value, _config: &Config) -> Result<String> {
     let action = require_str_param(args, "action")?;
+    // Early-return for actions that don't need DB
+    if !matches!(
+        action,
+        "create" | "list" | "get" | "update" | "archive" | "delete"
+    ) {
+        return Ok(format!(
+            "Unknown project action: {action}. Use: create, list, get, update, archive, delete."
+        ));
+    }
+    let db = Database::open()?;
+    handle_projects_with_db(args, action, &db)
+}
+
+fn handle_projects_with_db(args: &Value, action: &str, db: &Database) -> Result<String> {
     match action {
-        "create" => project_create(args),
-        "list" => project_list(args),
-        "get" => project_get(args),
-        "update" => project_update(args),
-        "archive" => project_archive(args),
-        "delete" => project_delete(args),
+        "create" => project_create(args, db),
+        "list" => project_list(args, db),
+        "get" => project_get(args, db),
+        "update" => project_update(args, db),
+        "archive" => project_archive(args, db),
+        "delete" => project_delete(args, db),
         other => Ok(format!(
             "Unknown project action: {other}. Use: create, list, get, update, archive, delete."
         )),
     }
 }
 
-fn with_db<F: FnOnce(&Database) -> Result<String>>(f: F) -> Result<String> {
-    let db = Database::open()?;
-    f(&db)
-}
-
-fn project_create(args: &Value) -> Result<String> {
+fn project_create(args: &Value, db: &Database) -> Result<String> {
     let raw_name = require_str_param(args, "name")?;
     let name = raw_name.trim();
     if name.is_empty() {
@@ -37,18 +46,18 @@ fn project_create(args: &Value) -> Result<String> {
     let description = optional_str_param(args, "description").unwrap_or("");
     let id = uuid::Uuid::new_v4().to_string();
 
-    with_db(|db| match db.create_project(&id, name, description) {
+    match db.create_project(&id, name, description) {
         Ok(()) => {
             let short = &id[..8.min(id.len())];
             Ok(format!("Project created: \"{name}\" (id: {short})"))
         }
         Err(e) => Ok(format!("Error creating project: {e}")),
-    })
+    }
 }
 
-fn project_list(args: &Value) -> Result<String> {
+fn project_list(args: &Value, db: &Database) -> Result<String> {
     let status_filter = optional_str_param(args, "status");
-    with_db(|db| match db.list_projects(status_filter) {
+    match db.list_projects(status_filter) {
         Ok(projects) if projects.is_empty() => Ok("No projects.".to_string()),
         Ok(projects) => {
             let mut out = format!("Projects ({}):\n", projects.len());
@@ -67,52 +76,47 @@ fn project_list(args: &Value) -> Result<String> {
             Ok(out.trim_end().to_string())
         }
         Err(e) => Ok(format!("Error listing projects: {e}")),
-    })
+    }
 }
 
-fn project_get(args: &Value) -> Result<String> {
+fn project_get(args: &Value, db: &Database) -> Result<String> {
     let id = require_str_param(args, "id")?;
-    with_db(|db| {
-        match db.get_project(id)? {
-            Some(p) => {
-                let mut out = format!(
-                    "Project: {}\n  ID: {}\n  Status: {}\n  Description: {}\n  Created: {}\n  Updated: {}",
-                    p.name,
-                    p.id,
-                    p.status,
-                    if p.description.is_empty() { "(none)" } else { &p.description },
-                    format_ts(p.created_at),
-                    format_ts(p.updated_at),
-                );
+    match db.get_project(id)? {
+        Some(p) => {
+            let mut out = format!(
+                "Project: {}\n  ID: {}\n  Status: {}\n  Description: {}\n  Created: {}\n  Updated: {}",
+                p.name,
+                p.id,
+                p.status,
+                if p.description.is_empty() { "(none)" } else { &p.description },
+                format_ts(p.created_at),
+                format_ts(p.updated_at),
+            );
 
-                // Show associated workflows
-                match db.list_workflows_by_project(&p.id) {
-                    Ok(wfs) if wfs.is_empty() => {
-                        out.push_str("\n  Workflows: none");
-                    }
-                    Ok(wfs) => {
-                        out.push_str(&format!("\n  Workflows ({}):", wfs.len()));
-                        for wf in &wfs {
-                            let short = &wf.id[..8.min(wf.id.len())];
-                            out.push_str(&format!(
-                                "\n    [{}] {} (id: {short})",
-                                wf.status, wf.title,
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        out.push_str(&format!("\n  Workflows: error loading ({e})"));
+            // Show associated workflows
+            match db.list_workflows_by_project(&p.id) {
+                Ok(wfs) if wfs.is_empty() => {
+                    out.push_str("\n  Workflows: none");
+                }
+                Ok(wfs) => {
+                    out.push_str(&format!("\n  Workflows ({}):", wfs.len()));
+                    for wf in &wfs {
+                        let short = &wf.id[..8.min(wf.id.len())];
+                        out.push_str(&format!("\n    [{}] {} (id: {short})", wf.status, wf.title,));
                     }
                 }
-
-                Ok(out)
+                Err(e) => {
+                    out.push_str(&format!("\n  Workflows: error loading ({e})"));
+                }
             }
-            None => Ok(format!("Project not found: {id}")),
+
+            Ok(out)
         }
-    })
+        None => Ok(format!("Project not found: {id}")),
+    }
 }
 
-fn project_update(args: &Value) -> Result<String> {
+fn project_update(args: &Value, db: &Database) -> Result<String> {
     let id = require_str_param(args, "id")?;
     let name = optional_str_param(args, "name");
     let description = optional_str_param(args, "description");
@@ -134,49 +138,45 @@ fn project_update(args: &Value) -> Result<String> {
         }
     }
 
-    with_db(
-        |db| match db.update_project(id, name, description, status) {
-            Ok(true) => {
-                let short = &id[..8.min(id.len())];
-                Ok(format!("Project {short} updated."))
-            }
-            Ok(false) => Ok(format!("Project not found: {id}")),
-            Err(e) => Ok(format!("Error updating project: {e}")),
-        },
-    )
-}
-
-fn project_archive(args: &Value) -> Result<String> {
-    let id = require_str_param(args, "id")?;
-    with_db(|db| {
-        // Disambiguate "not found" vs "already archived"
-        match db.get_project(id)? {
-            None => Ok(format!("Project not found: {id}")),
-            Some(p) if p.status == "archived" => {
-                let short = &id[..8.min(id.len())];
-                Ok(format!("Project {short} is already archived."))
-            }
-            Some(_) => match db.archive_project(id) {
-                Ok(_) => {
-                    let short = &id[..8.min(id.len())];
-                    Ok(format!("Project {short} archived."))
-                }
-                Err(e) => Ok(format!("Error archiving project: {e}")),
-            },
+    match db.update_project(id, name, description, status) {
+        Ok(true) => {
+            let short = &id[..8.min(id.len())];
+            Ok(format!("Project {short} updated."))
         }
-    })
+        Ok(false) => Ok(format!("Project not found: {id}")),
+        Err(e) => Ok(format!("Error updating project: {e}")),
+    }
 }
 
-fn project_delete(args: &Value) -> Result<String> {
+fn project_archive(args: &Value, db: &Database) -> Result<String> {
     let id = require_str_param(args, "id")?;
-    with_db(|db| match db.delete_project(id) {
+    // Disambiguate "not found" vs "already archived"
+    match db.get_project(id)? {
+        None => Ok(format!("Project not found: {id}")),
+        Some(p) if p.status == "archived" => {
+            let short = &id[..8.min(id.len())];
+            Ok(format!("Project {short} is already archived."))
+        }
+        Some(_) => match db.archive_project(id) {
+            Ok(_) => {
+                let short = &id[..8.min(id.len())];
+                Ok(format!("Project {short} archived."))
+            }
+            Err(e) => Ok(format!("Error archiving project: {e}")),
+        },
+    }
+}
+
+fn project_delete(args: &Value, db: &Database) -> Result<String> {
+    let id = require_str_param(args, "id")?;
+    match db.delete_project(id) {
         Ok(true) => {
             let short = &id[..8.min(id.len())];
             Ok(format!("Project {short} deleted."))
         }
         Ok(false) => Ok(format!("Project not found: {id}")),
         Err(e) => Ok(format!("Error deleting project: {e}")),
-    })
+    }
 }
 
 /// Truncate a string to at most `max` characters, appending "..." if truncated.
@@ -198,221 +198,197 @@ fn format_ts(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use serde_json::json;
 
-    fn test_config() -> Config {
-        Config::default()
+    fn test_db() -> Database {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        Database::from_connection(conn).expect("init test db")
+    }
+
+    fn run(args: serde_json::Value, db: &Database) -> String {
+        let action = args["action"].as_str().unwrap();
+        handle_projects_with_db(&args, action, db).unwrap()
     }
 
     #[test]
     fn create_project_requires_name() {
-        let result = handle_projects(&json!({"action": "create"}), &test_config());
+        let db = test_db();
+        let result = handle_projects_with_db(&json!({"action": "create"}), "create", &db);
         assert!(result.is_err() || result.unwrap().contains("Missing"));
     }
 
     #[test]
     fn create_project_success() {
-        let result = handle_projects(
-            &json!({"action": "create", "name": "Test Project", "description": "A test"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(
+            json!({"action": "create", "name": "Test Project", "description": "A test"}),
+            &db,
+        );
         assert!(result.contains("Project created"));
         assert!(result.contains("Test Project"));
     }
 
     #[test]
     fn list_projects_empty() {
-        // Fresh DB will have no projects (unless prior test created one)
-        let result = handle_projects(&json!({"action": "list"}), &test_config()).unwrap();
-        // Could be "No projects." or show some — just verify no error
-        assert!(
-            result.contains("projects") || result.contains("Projects") || result.contains("No")
-        );
+        let db = test_db();
+        let result = run(json!({"action": "list"}), &db);
+        assert!(result.contains("No projects."));
     }
 
     #[test]
     fn get_project_not_found() {
-        let result = handle_projects(
-            &json!({"action": "get", "id": "nonexistent"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "get", "id": "nonexistent"}), &db);
         assert!(result.contains("not found"));
     }
 
     #[test]
     fn update_project_nothing_to_update() {
-        let result = handle_projects(
-            &json!({"action": "update", "id": "some-id"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "update", "id": "some-id"}), &db);
         assert!(result.contains("Nothing to update"));
     }
 
     #[test]
     fn update_project_not_found() {
-        let result = handle_projects(
-            &json!({"action": "update", "id": "nonexistent", "name": "New Name"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(
+            json!({"action": "update", "id": "nonexistent", "name": "New Name"}),
+            &db,
+        );
         assert!(result.contains("not found"));
     }
 
     #[test]
     fn delete_project_not_found() {
-        let result = handle_projects(
-            &json!({"action": "delete", "id": "nonexistent"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "delete", "id": "nonexistent"}), &db);
         assert!(result.contains("not found"));
     }
 
     #[test]
     fn archive_project_not_found() {
-        let result = handle_projects(
-            &json!({"action": "archive", "id": "nonexistent"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "archive", "id": "nonexistent"}), &db);
         assert!(result.contains("not found") || result.contains("already archived"));
     }
 
     #[test]
     fn unknown_action_returns_help() {
-        let result = handle_projects(&json!({"action": "nope"}), &test_config()).unwrap();
+        let result = handle_projects(&json!({"action": "nope"}), &Config::default()).unwrap();
         assert!(result.contains("Unknown project action"));
     }
 
     #[test]
     fn missing_action_errors() {
-        let result = handle_projects(&json!({}), &test_config());
+        let result = handle_projects(&json!({}), &Config::default());
         assert!(result.is_err());
     }
 
     #[test]
     fn create_project_empty_name_rejected() {
-        let result =
-            handle_projects(&json!({"action": "create", "name": ""}), &test_config()).unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "create", "name": ""}), &db);
         assert!(result.contains("cannot be empty"));
     }
 
     #[test]
     fn create_project_whitespace_name_rejected() {
-        let result =
-            handle_projects(&json!({"action": "create", "name": "   "}), &test_config()).unwrap();
+        let db = test_db();
+        let result = run(json!({"action": "create", "name": "   "}), &db);
         assert!(result.contains("cannot be empty"));
     }
 
     #[test]
     fn update_project_empty_name_rejected() {
-        let result = handle_projects(
-            &json!({"action": "update", "id": "some-id", "name": "  "}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(
+            json!({"action": "update", "id": "some-id", "name": "  "}),
+            &db,
+        );
         assert!(result.contains("cannot be empty"));
     }
 
     #[test]
     fn update_project_invalid_status_rejected() {
-        let result = handle_projects(
-            &json!({"action": "update", "id": "some-id", "status": "bogus"}),
-            &test_config(),
-        )
-        .unwrap();
+        let db = test_db();
+        let result = run(
+            json!({"action": "update", "id": "some-id", "status": "bogus"}),
+            &db,
+        );
         assert!(result.contains("Invalid status"));
     }
 
     #[test]
     fn archive_already_archived_returns_distinct_message() {
-        let config = test_config();
+        let db = test_db();
 
         // Create a project
-        let result =
-            handle_projects(&json!({"action": "create", "name": "ArchiveTest"}), &config).unwrap();
+        let result = run(json!({"action": "create", "name": "ArchiveTest"}), &db);
         assert!(result.contains("Project created"));
 
         // Find the full ID
-        let db = Database::open().unwrap();
         let projects = db.list_projects(None).unwrap();
         let project = projects.iter().find(|p| p.name == "ArchiveTest").unwrap();
         let full_id = project.id.clone();
 
         // Archive once
-        let result =
-            handle_projects(&json!({"action": "archive", "id": &full_id}), &config).unwrap();
+        let result = run(json!({"action": "archive", "id": &full_id}), &db);
         assert!(result.contains("archived"));
 
         // Archive again — should say "already archived", not "not found"
-        let result =
-            handle_projects(&json!({"action": "archive", "id": &full_id}), &config).unwrap();
+        let result = run(json!({"action": "archive", "id": &full_id}), &db);
         assert!(result.contains("already archived"));
         assert!(!result.contains("not found"));
-
-        // Clean up
-        let _ = handle_projects(&json!({"action": "delete", "id": &full_id}), &config);
     }
 
     #[test]
     fn create_then_get_then_update_then_delete() {
-        let config = test_config();
+        let db = test_db();
 
         // Create
-        let result = handle_projects(
-            &json!({"action": "create", "name": "CRUD Test", "description": "Integration test"}),
-            &config,
-        )
-        .unwrap();
+        let result = run(
+            json!({"action": "create", "name": "CRUD Test", "description": "Integration test"}),
+            &db,
+        );
         assert!(result.contains("Project created"));
 
-        // Extract ID from "Project created: \"CRUD Test\" (id: XXXXXXXX)"
-        let id_start = result.find("id: ").unwrap() + 4;
-        let short_id = &result[id_start..id_start + 8];
+        // Find the full ID via the same in-memory DB
+        let projects = db.list_projects(None).unwrap();
+        let project = projects.iter().find(|p| p.name == "CRUD Test").unwrap();
+        let full_id = project.id.clone();
 
         // List should include it
-        let result = handle_projects(&json!({"action": "list"}), &config).unwrap();
+        let result = run(json!({"action": "list"}), &db);
         assert!(result.contains("CRUD Test"));
 
         // Get
-        let _result = handle_projects(&json!({"action": "get", "id": short_id}), &config).unwrap();
-        // Short IDs might not match full UUID, so use list to find full ID
-        // For this test, we'll use the DB directly
-        let db = Database::open().unwrap();
-        let projects = db.list_projects(None).unwrap();
-        let project = projects.iter().find(|p| p.name == "CRUD Test").unwrap();
-        let full_id = &project.id;
-
-        let result = handle_projects(&json!({"action": "get", "id": full_id}), &config).unwrap();
+        let result = run(json!({"action": "get", "id": &full_id}), &db);
         assert!(result.contains("CRUD Test"));
         assert!(result.contains("Integration test"));
 
         // Update
-        let result = handle_projects(
-            &json!({"action": "update", "id": full_id, "name": "Updated Name"}),
-            &config,
-        )
-        .unwrap();
+        let result = run(
+            json!({"action": "update", "id": &full_id, "name": "Updated Name"}),
+            &db,
+        );
         assert!(result.contains("updated"));
 
         // Verify update
-        let result = handle_projects(&json!({"action": "get", "id": full_id}), &config).unwrap();
+        let result = run(json!({"action": "get", "id": &full_id}), &db);
         assert!(result.contains("Updated Name"));
 
         // Archive
-        let result =
-            handle_projects(&json!({"action": "archive", "id": full_id}), &config).unwrap();
+        let result = run(json!({"action": "archive", "id": &full_id}), &db);
         assert!(result.contains("archived"));
 
         // Delete
-        let result = handle_projects(&json!({"action": "delete", "id": full_id}), &config).unwrap();
+        let result = run(json!({"action": "delete", "id": &full_id}), &db);
         assert!(result.contains("deleted"));
 
         // Verify gone
-        let result = handle_projects(&json!({"action": "get", "id": full_id}), &config).unwrap();
+        let result = run(json!({"action": "get", "id": &full_id}), &db);
         assert!(result.contains("not found"));
     }
 }
