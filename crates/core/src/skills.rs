@@ -17,39 +17,31 @@ pub enum SkillLoadLevel {
     Full,
 }
 
-const BUILTIN_SLACK: &str = include_str!("../skills/slack/SKILL.md");
-const BUILTIN_DISCORD: &str = include_str!("../skills/discord/SKILL.md");
-const BUILTIN_GITHUB: &str = include_str!("../skills/github/SKILL.md");
-const BUILTIN_WEATHER: &str = include_str!("../skills/weather/SKILL.md");
-const BUILTIN_SKILL_CREATOR: &str = include_str!("../skills/skill-creator/SKILL.md");
-const BUILTIN_GIT: &str = include_str!("../skills/git/SKILL.md");
-const BUILTIN_SEARCH: &str = include_str!("../skills/search/SKILL.md");
-const BUILTIN_DOCKER: &str = include_str!("../skills/docker/SKILL.md");
-const BUILTIN_DATABASE: &str = include_str!("../skills/database/SKILL.md");
-const BUILTIN_NOTES: &str = include_str!("../skills/notes/SKILL.md");
-const BUILTIN_CALENDAR: &str = include_str!("../skills/calendar/SKILL.md");
-const BUILTIN_1PASSWORD: &str = include_str!("../skills/1password/SKILL.md");
-const BUILTIN_BROWSER: &str = include_str!("../skills/browser/SKILL.md");
-const BUILTIN_SCHEDULER: &str = include_str!("../skills/scheduler/SKILL.md");
-const BUILTIN_EMAIL: &str = include_str!("../skills/email/SKILL.md");
+macro_rules! bundled_skills {
+    ($( $name:literal => $path:literal ),* $(,)?) => {
+        const BUNDLED_SKILLS: &[(&str, &str)] = &[
+            $( ($name, include_str!(concat!("../skills/", $path, "/SKILL.md"))) ),*
+        ];
+    };
+}
 
-const BUNDLED_SKILLS: &[(&str, &str)] = &[
-    ("slack", BUILTIN_SLACK),
-    ("discord", BUILTIN_DISCORD),
-    ("github", BUILTIN_GITHUB),
-    ("weather", BUILTIN_WEATHER),
-    ("skill-creator", BUILTIN_SKILL_CREATOR),
-    ("git", BUILTIN_GIT),
-    ("search", BUILTIN_SEARCH),
-    ("docker", BUILTIN_DOCKER),
-    ("database", BUILTIN_DATABASE),
-    ("notes", BUILTIN_NOTES),
-    ("calendar", BUILTIN_CALENDAR),
-    ("1password", BUILTIN_1PASSWORD),
-    ("browser", BUILTIN_BROWSER),
-    ("scheduler", BUILTIN_SCHEDULER),
-    ("email", BUILTIN_EMAIL),
-];
+bundled_skills! {
+    "slack" => "slack",
+    "discord" => "discord",
+    "github" => "github",
+    "weather" => "weather",
+    "skill-creator" => "skill-creator",
+    "git" => "git",
+    "search" => "search",
+    "docker" => "docker",
+    "database" => "database",
+    "notes" => "notes",
+    "calendar" => "calendar",
+    "1password" => "1password",
+    "browser" => "browser",
+    "scheduler" => "scheduler",
+    "email" => "email",
+}
 
 /// Where a skill was loaded from.
 #[derive(Debug, Clone, PartialEq)]

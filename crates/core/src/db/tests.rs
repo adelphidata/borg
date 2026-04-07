@@ -2,8 +2,7 @@ use super::*;
 use rusqlite::params;
 
 fn test_db() -> Database {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    Database::from_connection(conn).expect("init test db")
+    Database::test_db()
 }
 
 fn simple_task<'a>(

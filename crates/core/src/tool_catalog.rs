@@ -30,6 +30,52 @@ pub enum ToolGroup {
     Agents,
 }
 
+/// Single source of truth for tool-to-group mapping.
+///
+/// Each entry is `(tool_name, group, is_alias)`. Primary tools (`is_alias = false`)
+/// are returned by `ToolGroup::tool_names()`. Aliases map to the same group in
+/// `tool_group()` but are not listed as primary tools.
+const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
+    // Memory
+    ("write_memory", ToolGroup::Memory, false),
+    ("read_memory", ToolGroup::Memory, false),
+    // Filesystem
+    ("apply_patch", ToolGroup::Fs, false),
+    ("read_file", ToolGroup::Fs, false),
+    ("list_dir", ToolGroup::Fs, false),
+    ("apply_skill_patch", ToolGroup::Fs, true),
+    ("create_channel", ToolGroup::Fs, true),
+    // Runtime
+    ("run_shell", ToolGroup::Runtime, false),
+    // Discovery
+    ("list", ToolGroup::Discovery, false),
+    ("list_skills", ToolGroup::Discovery, true),
+    ("list_channels", ToolGroup::Discovery, true),
+    ("list_agents", ToolGroup::Discovery, true),
+    // Web
+    ("web_fetch", ToolGroup::Web, false),
+    ("web_search", ToolGroup::Web, false),
+    // UI
+    ("browser", ToolGroup::Ui, false),
+    // Scheduling
+    ("schedule", ToolGroup::Scheduling, false),
+    ("manage_tasks", ToolGroup::Scheduling, true),
+    ("manage_cron", ToolGroup::Scheduling, true),
+    // Media
+    ("generate_image", ToolGroup::Media, false),
+    // Integration
+    ("gmail", ToolGroup::Integration, false),
+    ("google_calendar", ToolGroup::Integration, false),
+    ("notion", ToolGroup::Integration, false),
+    ("linear", ToolGroup::Integration, false),
+    // Agents
+    ("spawn_agent", ToolGroup::Agents, false),
+    ("send_to_agent", ToolGroup::Agents, false),
+    ("wait_for_agent", ToolGroup::Agents, false),
+    ("close_agent", ToolGroup::Agents, false),
+    ("manage_roles", ToolGroup::Agents, false),
+];
+
 impl ToolGroup {
     /// Parse a group name from a string (case-insensitive).
     pub fn from_str_opt(s: &str) -> Option<Self> {
@@ -64,26 +110,13 @@ impl ToolGroup {
         }
     }
 
-    /// All tool names that belong to this group.
-    pub fn tool_names(&self) -> &[&str] {
-        match self {
-            Self::Memory => &["write_memory", "read_memory"],
-            Self::Fs => &["apply_patch", "read_file", "list_dir"],
-            Self::Runtime => &["run_shell"],
-            Self::Discovery => &["list"],
-            Self::Web => &["web_fetch", "web_search"],
-            Self::Ui => &["browser"],
-            Self::Scheduling => &["schedule"],
-            Self::Media => &["generate_image"],
-            Self::Integration => &["gmail", "google_calendar", "notion", "linear"],
-            Self::Agents => &[
-                "spawn_agent",
-                "send_to_agent",
-                "wait_for_agent",
-                "close_agent",
-                "manage_roles",
-            ],
-        }
+    /// All primary (non-alias) tool names that belong to this group.
+    pub fn tool_names(&self) -> Vec<&'static str> {
+        TOOL_REGISTRY
+            .iter()
+            .filter(|(_, group, is_alias)| group == self && !is_alias)
+            .map(|(name, _, _)| *name)
+            .collect()
     }
 }
 
@@ -172,23 +205,10 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
 
 /// Map a tool name to its group. Returns `None` for user-created tools.
 pub fn tool_group(name: &str) -> Option<ToolGroup> {
-    match name {
-        "write_memory" | "read_memory" => Some(ToolGroup::Memory),
-        "apply_patch" | "apply_skill_patch" | "create_channel" | "read_file" | "list_dir" => {
-            Some(ToolGroup::Fs)
-        }
-        "run_shell" => Some(ToolGroup::Runtime),
-        "list" | "list_skills" | "list_channels" | "list_agents" => Some(ToolGroup::Discovery),
-        "web_fetch" | "web_search" => Some(ToolGroup::Web),
-        "browser" => Some(ToolGroup::Ui),
-        "schedule" | "manage_tasks" | "manage_cron" => Some(ToolGroup::Scheduling),
-        "generate_image" => Some(ToolGroup::Media),
-        "gmail" | "google_calendar" | "notion" | "linear" => Some(ToolGroup::Integration),
-        "spawn_agent" | "send_to_agent" | "wait_for_agent" | "close_agent" | "manage_roles" => {
-            Some(ToolGroup::Agents)
-        }
-        _ => None, // user tool or unknown
-    }
+    TOOL_REGISTRY
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, group, _)| *group)
 }
 
 #[cfg(test)]

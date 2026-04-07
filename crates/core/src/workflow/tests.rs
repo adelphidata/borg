@@ -1,15 +1,11 @@
 //! Comprehensive tests for the workflow engine.
 
-use rusqlite::Connection;
-
 use crate::db::Database;
 use crate::db::NewWorkflowStep;
 use crate::workflow::{status, step_status};
 
-/// Create an in-memory database with all migrations applied.
 fn test_db() -> Database {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    Database::from_connection(conn).expect("init test db")
+    Database::test_db()
 }
 
 fn sample_steps(n: usize) -> Vec<NewWorkflowStep> {

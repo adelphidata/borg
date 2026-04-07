@@ -273,3 +273,12 @@ impl Database {
         }
     }
 }
+
+#[cfg(test)]
+impl Database {
+    /// Create an in-memory database for tests. Runs all migrations.
+    pub fn test_db() -> Self {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        Self::from_connection(conn).expect("init test db")
+    }
+}

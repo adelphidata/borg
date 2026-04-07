@@ -119,8 +119,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-        Database::from_connection(conn).expect("init test db")
+        Database::test_db()
     }
 
     #[test]

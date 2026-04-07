@@ -99,9 +99,7 @@ mod tests {
     use super::*;
 
     fn test_db() -> Database {
-        let conn = rusqlite::Connection::open_in_memory()
-            .unwrap_or_else(|e| panic!("open in-memory db: {e}"));
-        Database::from_connection(conn).unwrap_or_else(|e| panic!("from_connection: {e}"))
+        Database::test_db()
     }
 
     #[test]

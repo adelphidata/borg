@@ -31,45 +31,108 @@ pub struct SettingInfo {
     pub source: SettingSource,
 }
 
-/// All known setting keys (matches `Config::apply_setting` arms).
-pub const ALL_SETTING_KEYS: &[&str] = &[
-    "model",
-    "temperature",
-    "max_tokens",
-    "provider",
-    "sandbox.mode",
-    "sandbox.enabled",
-    "memory.max_context_tokens",
-    "memory.flush_before_compaction",
-    "memory.flush_min_messages",
-    "memory.extra_paths",
-    "memory.embeddings.mmr_enabled",
-    "memory.embeddings.mmr_lambda",
-    "skills.enabled",
-    "skills.max_context_tokens",
-    "conversation.max_iterations",
-    "conversation.show_thinking",
-    "conversation.tool_output_max_tokens",
-    "conversation.compaction_marker_tokens",
-    "conversation.max_transcript_chars",
-    "security.secret_detection",
-    "security.host_audit",
-    "budget.monthly_token_limit",
-    "budget.warning_threshold",
-    "gateway.max_body_size",
-    "gateway.telegram_poll_timeout_secs",
-    "gateway.telegram_circuit_failure_threshold",
-    "gateway.telegram_circuit_suspension_secs",
-    "gateway.telegram_dedup_capacity",
-    "tts.enabled",
-    "tts.auto_mode",
-    "tts.default_voice",
-    "tts.default_format",
-    "conversation.collaboration_mode",
-    "evolution.enabled",
-    "llm.claude_cli_path",
-    "workflow.enabled",
+type SettingExtractor = fn(&Config) -> String;
+
+/// Single source of truth for setting keys and their config extractors.
+///
+/// Each entry is `(key, extractor_fn)`. `ALL_SETTING_KEYS` and `config_value_for_key()`
+/// are both derived from this table.
+const SETTING_REGISTRY: &[(&str, SettingExtractor)] = &[
+    ("model", |c| c.llm.model.clone()),
+    ("temperature", |c| format!("{}", c.llm.temperature)),
+    ("max_tokens", |c| format!("{}", c.llm.max_tokens)),
+    ("provider", |c| {
+        c.llm
+            .provider
+            .as_deref()
+            .unwrap_or("(auto-detect)")
+            .to_string()
+    }),
+    ("sandbox.mode", |c| c.sandbox.mode.clone()),
+    ("sandbox.enabled", |c| format!("{}", c.sandbox.enabled)),
+    ("memory.max_context_tokens", |c| {
+        format!("{}", c.memory.max_context_tokens)
+    }),
+    ("memory.flush_before_compaction", |c| {
+        format!("{}", c.memory.flush_before_compaction)
+    }),
+    ("memory.flush_min_messages", |c| {
+        format!("{}", c.memory.flush_min_messages)
+    }),
+    ("memory.extra_paths", |c| c.memory.extra_paths.join(", ")),
+    ("memory.embeddings.mmr_enabled", |c| {
+        format!("{}", c.memory.embeddings.mmr_enabled)
+    }),
+    ("memory.embeddings.mmr_lambda", |c| {
+        format!("{}", c.memory.embeddings.mmr_lambda)
+    }),
+    ("skills.enabled", |c| format!("{}", c.skills.enabled)),
+    ("skills.max_context_tokens", |c| {
+        format!("{}", c.skills.max_context_tokens)
+    }),
+    ("conversation.max_iterations", |c| {
+        format!("{}", c.conversation.max_iterations)
+    }),
+    ("conversation.show_thinking", |c| {
+        format!("{}", c.conversation.show_thinking)
+    }),
+    ("conversation.tool_output_max_tokens", |c| {
+        format!("{}", c.conversation.tool_output_max_tokens)
+    }),
+    ("conversation.compaction_marker_tokens", |c| {
+        format!("{}", c.conversation.compaction_marker_tokens)
+    }),
+    ("conversation.max_transcript_chars", |c| {
+        format!("{}", c.conversation.max_transcript_chars)
+    }),
+    ("security.secret_detection", |c| {
+        format!("{}", c.security.secret_detection)
+    }),
+    ("security.host_audit", |c| {
+        format!("{}", c.security.host_audit)
+    }),
+    ("budget.monthly_token_limit", |c| {
+        format!("{}", c.budget.monthly_token_limit)
+    }),
+    ("budget.warning_threshold", |c| {
+        format!("{}", c.budget.warning_threshold)
+    }),
+    ("gateway.max_body_size", |c| {
+        format!("{}", c.gateway.max_body_size)
+    }),
+    ("gateway.telegram_poll_timeout_secs", |c| {
+        format!("{}", c.gateway.telegram_poll_timeout_secs)
+    }),
+    ("gateway.telegram_circuit_failure_threshold", |c| {
+        format!("{}", c.gateway.telegram_circuit_failure_threshold)
+    }),
+    ("gateway.telegram_circuit_suspension_secs", |c| {
+        format!("{}", c.gateway.telegram_circuit_suspension_secs)
+    }),
+    ("gateway.telegram_dedup_capacity", |c| {
+        format!("{}", c.gateway.telegram_dedup_capacity)
+    }),
+    ("tts.enabled", |c| format!("{}", c.tts.enabled)),
+    ("tts.auto_mode", |c| format!("{}", c.tts.auto_mode)),
+    ("tts.default_voice", |c| c.tts.default_voice.clone()),
+    ("tts.default_format", |c| c.tts.default_format.clone()),
+    ("conversation.collaboration_mode", |c| {
+        format!("{}", c.conversation.collaboration_mode)
+    }),
+    ("evolution.enabled", |c| format!("{}", c.evolution.enabled)),
+    ("llm.claude_cli_path", |c| {
+        c.llm
+            .claude_cli_path
+            .as_deref()
+            .unwrap_or("(auto-detect)")
+            .to_string()
+    }),
+    ("workflow.enabled", |c| c.workflow.enabled.clone()),
 ];
+
+/// All known setting keys, derived from `SETTING_REGISTRY`.
+pub static ALL_SETTING_KEYS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| SETTING_REGISTRY.iter().map(|(k, _)| *k).collect());
 
 /// Merges settings from three layers: DB overrides → config.toml → compiled defaults.
 pub struct SettingsResolver {
@@ -156,7 +219,7 @@ impl SettingsResolver {
     /// List all settings with their effective values and sources.
     pub fn list_all(&self) -> Result<Vec<SettingInfo>> {
         let mut result = Vec::new();
-        for &key in ALL_SETTING_KEYS {
+        for &key in ALL_SETTING_KEYS.iter() {
             match self.get_with_source(key) {
                 Ok((value, source)) => result.push(SettingInfo {
                     key: key.to_string(),
@@ -177,71 +240,10 @@ impl SettingsResolver {
 
 /// Extract the current string value of a config key.
 fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
-    Some(match key {
-        "model" => config.llm.model.clone(),
-        "temperature" => format!("{}", config.llm.temperature),
-        "max_tokens" => format!("{}", config.llm.max_tokens),
-        "provider" => config
-            .llm
-            .provider
-            .as_deref()
-            .unwrap_or("(auto-detect)")
-            .to_string(),
-        "sandbox.mode" => config.sandbox.mode.clone(),
-        "sandbox.enabled" => format!("{}", config.sandbox.enabled),
-        "memory.max_context_tokens" => format!("{}", config.memory.max_context_tokens),
-        "memory.flush_before_compaction" => format!("{}", config.memory.flush_before_compaction),
-        "memory.flush_min_messages" => format!("{}", config.memory.flush_min_messages),
-        "memory.extra_paths" => config.memory.extra_paths.join(", "),
-        "memory.embeddings.mmr_enabled" => format!("{}", config.memory.embeddings.mmr_enabled),
-        "memory.embeddings.mmr_lambda" => format!("{}", config.memory.embeddings.mmr_lambda),
-        "skills.enabled" => format!("{}", config.skills.enabled),
-        "skills.max_context_tokens" => format!("{}", config.skills.max_context_tokens),
-        "conversation.max_iterations" => format!("{}", config.conversation.max_iterations),
-        "conversation.show_thinking" => format!("{}", config.conversation.show_thinking),
-        "conversation.tool_output_max_tokens" => {
-            format!("{}", config.conversation.tool_output_max_tokens)
-        }
-        "conversation.compaction_marker_tokens" => {
-            format!("{}", config.conversation.compaction_marker_tokens)
-        }
-        "conversation.max_transcript_chars" => {
-            format!("{}", config.conversation.max_transcript_chars)
-        }
-        "security.secret_detection" => format!("{}", config.security.secret_detection),
-        "security.host_audit" => format!("{}", config.security.host_audit),
-        "budget.monthly_token_limit" => format!("{}", config.budget.monthly_token_limit),
-        "budget.warning_threshold" => format!("{}", config.budget.warning_threshold),
-        "gateway.max_body_size" => format!("{}", config.gateway.max_body_size),
-        "gateway.telegram_poll_timeout_secs" => {
-            format!("{}", config.gateway.telegram_poll_timeout_secs)
-        }
-        "gateway.telegram_circuit_failure_threshold" => {
-            format!("{}", config.gateway.telegram_circuit_failure_threshold)
-        }
-        "gateway.telegram_circuit_suspension_secs" => {
-            format!("{}", config.gateway.telegram_circuit_suspension_secs)
-        }
-        "gateway.telegram_dedup_capacity" => {
-            format!("{}", config.gateway.telegram_dedup_capacity)
-        }
-        "tts.enabled" => format!("{}", config.tts.enabled),
-        "tts.auto_mode" => format!("{}", config.tts.auto_mode),
-        "tts.default_voice" => config.tts.default_voice.clone(),
-        "tts.default_format" => config.tts.default_format.clone(),
-        "conversation.collaboration_mode" => {
-            format!("{}", config.conversation.collaboration_mode)
-        }
-        "evolution.enabled" => format!("{}", config.evolution.enabled),
-        "llm.claude_cli_path" => config
-            .llm
-            .claude_cli_path
-            .as_deref()
-            .unwrap_or("(auto-detect)")
-            .to_string(),
-        "workflow.enabled" => config.workflow.enabled.clone(),
-        _ => return None,
-    })
+    SETTING_REGISTRY
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, extract)| extract(config))
 }
 
 #[cfg(test)]

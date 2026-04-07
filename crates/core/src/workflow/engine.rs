@@ -8,6 +8,14 @@ use crate::db::{WorkflowRow, WorkflowStepRow};
 /// Maximum characters of prior step output to include in context.
 const MAX_PRIOR_OUTPUT_CHARS: usize = 500;
 
+/// How to render remaining steps after the current one.
+enum RemainingSteps<'a> {
+    /// Only step numbers are available (no titles).
+    CountOnly { total: usize },
+    /// Full step rows available — render titles for incomplete steps.
+    WithTitles { all_steps: &'a [WorkflowStepRow] },
+}
+
 /// Build the system prompt context for a workflow step.
 ///
 /// Includes the workflow goal, completed step summaries, current step details,
@@ -18,69 +26,12 @@ pub fn build_step_context(
     prior_steps: &[WorkflowStepRow],
     total_steps: usize,
 ) -> String {
-    let mut ctx = String::with_capacity(2048);
-
-    // Header
-    ctx.push_str(&format!(
-        "# Workflow: {}\nYou are executing step {} of {}.\n\n",
-        workflow.title,
-        step.step_index + 1,
-        total_steps,
-    ));
-
-    // Goal
-    ctx.push_str(&format!("## Goal\n{}\n\n", workflow.goal));
-
-    // Completed steps
-    if !prior_steps.is_empty() {
-        ctx.push_str("## Completed Steps\n");
-        for ps in prior_steps {
-            let output_summary = ps
-                .output
-                .as_deref()
-                .map(|o| truncate_output(o, MAX_PRIOR_OUTPUT_CHARS))
-                .unwrap_or_default();
-            ctx.push_str(&format!(
-                "### Step {}: {} ✓\n{}\n\n",
-                ps.step_index + 1,
-                ps.title,
-                output_summary,
-            ));
-        }
-    }
-
-    // Current step
-    ctx.push_str(&format!(
-        "## Current Step: {}\n{}\n\n",
-        step.title, step.instructions,
-    ));
-
-    // Remaining steps (after current)
-    let remaining_start = step.step_index as usize + 1;
-    if remaining_start < total_steps {
-        ctx.push_str("## Remaining Steps\n");
-        // We don't have the remaining step details here, so just indicate count
-        for i in remaining_start..total_steps {
-            ctx.push_str(&format!("- Step {}\n", i + 1));
-        }
-        ctx.push('\n');
-    }
-
-    // Retry context
-    if step.retry_count > 0 {
-        ctx.push_str("## Previous Attempt Failed\n");
-        if let Some(err) = &step.error {
-            ctx.push_str(&format!("Error: {err}\n"));
-        }
-        ctx.push_str(&format!(
-            "This is retry {}/{}. Try a different approach.\n\n",
-            step.retry_count, step.max_retries,
-        ));
-    }
-
-    ctx.push_str("Provide a clear summary of what you accomplished when done.");
-
-    ctx
+    build_step_context_inner(
+        workflow,
+        step,
+        prior_steps,
+        RemainingSteps::CountOnly { total: total_steps },
+    )
 }
 
 /// Build the step context with full remaining step titles available.
@@ -90,7 +41,25 @@ pub fn build_step_context_with_remaining(
     prior_steps: &[WorkflowStepRow],
     all_steps: &[WorkflowStepRow],
 ) -> String {
-    let total = all_steps.len();
+    build_step_context_inner(
+        workflow,
+        step,
+        prior_steps,
+        RemainingSteps::WithTitles { all_steps },
+    )
+}
+
+fn build_step_context_inner(
+    workflow: &WorkflowRow,
+    step: &WorkflowStepRow,
+    prior_steps: &[WorkflowStepRow],
+    remaining: RemainingSteps<'_>,
+) -> String {
+    let total = match &remaining {
+        RemainingSteps::CountOnly { total } => *total,
+        RemainingSteps::WithTitles { all_steps } => all_steps.len(),
+    };
+
     let mut ctx = String::with_capacity(2048);
 
     // Header
@@ -128,17 +97,31 @@ pub fn build_step_context_with_remaining(
         step.title, step.instructions,
     ));
 
-    // Remaining steps with titles
-    let remaining: Vec<_> = all_steps
-        .iter()
-        .filter(|s| s.step_index > step.step_index && s.status != "completed")
-        .collect();
-    if !remaining.is_empty() {
-        ctx.push_str("## Remaining Steps\n");
-        for s in remaining {
-            ctx.push_str(&format!("- Step {}: {}\n", s.step_index + 1, s.title));
+    // Remaining steps (after current)
+    match &remaining {
+        RemainingSteps::CountOnly { total } => {
+            let remaining_start = step.step_index as usize + 1;
+            if remaining_start < *total {
+                ctx.push_str("## Remaining Steps\n");
+                for i in remaining_start..*total {
+                    ctx.push_str(&format!("- Step {}\n", i + 1));
+                }
+                ctx.push('\n');
+            }
         }
-        ctx.push('\n');
+        RemainingSteps::WithTitles { all_steps } => {
+            let remaining_steps: Vec<_> = all_steps
+                .iter()
+                .filter(|s| s.step_index > step.step_index && s.status != "completed")
+                .collect();
+            if !remaining_steps.is_empty() {
+                ctx.push_str("## Remaining Steps\n");
+                for s in remaining_steps {
+                    ctx.push_str(&format!("- Step {}: {}\n", s.step_index + 1, s.title));
+                }
+                ctx.push('\n');
+            }
+        }
     }
 
     // Retry context
