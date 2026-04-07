@@ -26,6 +26,7 @@ use super::plan_overlay::{PlanOption, PlanOverlay};
 use super::plugins_popup::{PluginAction, PluginsPopup};
 use super::projects_popup::{ProjectAction, ProjectsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
+use super::sessions_popup::{SessionAction, SessionsPopup};
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
 use super::theme;
@@ -113,7 +114,6 @@ pub enum AppAction {
     LoadSession {
         id: String,
     },
-    ListSessions,
     RestartGateway,
     RunPlugins {
         actions: Vec<PluginAction>,
@@ -171,6 +171,7 @@ pub struct App<'a> {
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
     pub projects_popup: ProjectsPopup,
+    pub sessions_popup: SessionsPopup,
     pub schedule_popup: SchedulePopup,
     pub migrate_popup: MigratePopup,
     pub file_popup: FileSearchPopup,
@@ -221,6 +222,7 @@ impl<'a> App<'a> {
             plan_overlay: PlanOverlay::new(),
             previous_collab_mode: None,
             projects_popup: ProjectsPopup::new(),
+            sessions_popup: SessionsPopup::new(),
             schedule_popup: SchedulePopup::new(),
             migrate_popup: MigratePopup::new(),
             file_popup: FileSearchPopup::with_config(
@@ -263,6 +265,7 @@ impl<'a> App<'a> {
         self.settings_popup.is_visible()
             || self.plugins_popup.is_visible()
             || self.projects_popup.is_visible()
+            || self.sessions_popup.is_visible()
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
@@ -293,7 +296,10 @@ impl<'a> App<'a> {
             self.schedule_popup.handle_paste(&text);
             return AppAction::Continue;
         }
-        if self.migrate_popup.is_visible() || self.status_popup.is_visible() {
+        if self.sessions_popup.is_visible()
+            || self.migrate_popup.is_visible()
+            || self.status_popup.is_visible()
+        {
             return AppAction::Continue;
         }
 
@@ -601,6 +607,8 @@ impl<'a> App<'a> {
                         self.plugins_popup.handle_key(key);
                     } else if self.projects_popup.is_visible() {
                         self.projects_popup.handle_key(key);
+                    } else if self.sessions_popup.is_visible() {
+                        self.sessions_popup.handle_key(key);
                     } else if self.schedule_popup.is_visible() {
                         self.schedule_popup.handle_key(key);
                     }
@@ -634,6 +642,20 @@ impl<'a> App<'a> {
                 if self.projects_popup.is_visible() {
                     if let Some(actions) = self.projects_popup.handle_key(key) {
                         return Ok(AppAction::RunProjectActions { actions });
+                    }
+                    return Ok(AppAction::Continue);
+                }
+
+                if self.sessions_popup.is_visible() {
+                    if let Some(action) = self.sessions_popup.handle_key(key) {
+                        match action {
+                            SessionAction::Load { id } => {
+                                self.cells.clear();
+                                self.session_prompt_tokens = 0;
+                                self.session_completion_tokens = 0;
+                                return Ok(AppAction::LoadSession { id });
+                            }
+                        }
                     }
                     return Ok(AppAction::Continue);
                 }
@@ -1536,6 +1558,7 @@ impl<'a> App<'a> {
         self.settings_popup.render(frame, &self.config);
         self.plugins_popup.render(frame);
         self.projects_popup.render(frame);
+        self.sessions_popup.render(frame);
         self.schedule_popup.render(frame);
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);
@@ -2589,14 +2612,6 @@ mod tests {
             !has_unknown,
             "/mode execute should not be treated as unknown"
         );
-    }
-
-    #[test]
-    fn load_prefix_command_not_rejected() {
-        let mut app = make_app();
-        let result = app.handle_submit("/load abc123").unwrap();
-        // /load returns LoadSession action, not Continue
-        assert!(matches!(result, AppAction::LoadSession { .. }));
     }
 
     #[test]

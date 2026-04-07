@@ -16,6 +16,7 @@ mod plugins_popup;
 mod popup_utils;
 mod projects_popup;
 mod schedule_popup;
+mod sessions_popup;
 mod settings_popup;
 mod status_popup;
 pub(crate) mod theme;
@@ -924,29 +925,6 @@ async fn run_event_loop(
                     app.push_system_message(results.join("\n"));
                 }
             }
-            AppAction::ListSessions => match borg_core::session::list_sessions() {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        app.push_system_message("No saved sessions.".to_string());
-                    } else {
-                        let mut text = String::from("Saved sessions:\n");
-                        for (i, s) in sessions.iter().take(20).enumerate() {
-                            text.push_str(&format!(
-                                "  {}. {} ({} msgs) - {}\n     /load {}\n",
-                                i + 1,
-                                s.title,
-                                s.message_count,
-                                &s.updated_at[..19.min(s.updated_at.len())],
-                                &s.id[..8.min(s.id.len())],
-                            ));
-                        }
-                        app.push_system_message(text.trim_end().to_string());
-                    }
-                }
-                Err(e) => {
-                    app.push_system_message(format!("Error listing sessions: {e}"));
-                }
-            },
             AppAction::PlanProceed { clear_context } => {
                 // Exit Plan mode before the follow-up turn — otherwise the proceed
                 // message would itself be blocked by mutation constraints.

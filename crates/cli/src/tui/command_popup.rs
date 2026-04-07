@@ -79,7 +79,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     // Sessions
     SlashCommandDef {
         name: "/sessions",
-        description: "Browse saved sessions",
+        description: "Browse and load saved sessions",
     },
     SlashCommandDef {
         name: "/save",
@@ -88,10 +88,6 @@ const COMMANDS: &[SlashCommandDef] = &[
     SlashCommandDef {
         name: "/new",
         description: "Start new session",
-    },
-    SlashCommandDef {
-        name: "/load",
-        description: "Load a saved session by ID",
     },
     // Integrations
     SlashCommandDef {
@@ -363,7 +359,6 @@ mod tests {
             "/sessions",
             "/save",
             "/new",
-            "/load",
             "/plugins",
             "/projects",
             "/schedule",
@@ -391,12 +386,11 @@ mod tests {
     }
 
     #[test]
-    fn filter_lo_matches_load_and_logs() {
+    fn filter_lo_matches_logs() {
         let mut popup = CommandPopup::new();
         popup.update_filter("/lo");
         let items = popup.filtered();
         let names: Vec<&str> = items.iter().map(|c| c.name).collect();
-        assert!(names.contains(&"/load"), "should match /load");
         assert!(names.contains(&"/logs"), "should match /logs");
     }
 }

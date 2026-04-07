@@ -56,7 +56,10 @@ impl App<'_> {
             }
             "/usage" => return Some(Ok(AppAction::ShowUsage)),
             "/undo" => return Some(Ok(AppAction::UndoLastTurn)),
-            "/sessions" => return Some(Ok(AppAction::ListSessions)),
+            "/sessions" => {
+                self.sessions_popup.show();
+                return Some(Ok(AppAction::Continue));
+            }
             "/save" => return Some(Ok(AppAction::SaveSession)),
             "/new" => return Some(self.cmd_new()),
             _ => {}
@@ -83,10 +86,6 @@ impl App<'_> {
 
         if trimmed == "/memory cleanup" {
             return Some(self.cmd_memory_cleanup());
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("/load ") {
-            return Some(self.cmd_load_session(rest.trim()));
         }
 
         if let Some(rest) = trimmed.strip_prefix("/settings ") {
@@ -135,10 +134,9 @@ impl App<'_> {
              /pairing   - Show channel pairing info\n  \
              /update    - Update borg to latest version\n\
              \n  \
-             /sessions  - Browse saved sessions\n  \
+             /sessions  - Browse and load saved sessions\n  \
              /save      - Save current session\n  \
-             /new       - Start new session\n  \
-             /load      - Load a saved session by ID\n\
+             /new       - Start new session\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
              /projects  - List projects\n  \
@@ -353,18 +351,6 @@ impl App<'_> {
             }
         }
         Ok(AppAction::Continue)
-    }
-
-    fn cmd_load_session(&mut self, id_str: &str) -> Result<AppAction> {
-        let id = id_str.to_string();
-        if id.is_empty() {
-            self.push_system_message("Usage: /load <session_id>".to_string());
-            return Ok(AppAction::Continue);
-        }
-        self.cells.clear();
-        self.session_prompt_tokens = 0;
-        self.session_completion_tokens = 0;
-        Ok(AppAction::LoadSession { id })
     }
 
     fn cmd_settings_set(&mut self, rest: &str) -> Result<AppAction> {
