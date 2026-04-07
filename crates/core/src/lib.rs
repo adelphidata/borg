@@ -49,8 +49,6 @@ pub mod host_audit;
 pub mod identity;
 /// AI image generation (OpenAI DALL-E, Fal).
 pub mod image_gen;
-/// Native tool integrations (Gmail, Outlook, Calendar, Notion, Linear).
-pub mod integrations;
 /// Installation integrity verification.
 pub mod integrity;
 /// Real-time `<internal>` tag stripping from streamed output.

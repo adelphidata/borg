@@ -18,10 +18,7 @@ impl App<'_> {
             "quit" | "exit" | "/exit" => return Some(Ok(AppAction::Quit)),
             "help" | "/help" => return Some(self.cmd_help()),
             "/memory" => return Some(self.cmd_memory()),
-            "/skills" => {
-                self.skills_popup.show(&self.config);
-                return Some(Ok(AppAction::Continue));
-            }
+            "/skills" => return Some(self.cmd_plugins()),
             "/history" => return Some(self.cmd_history()),
             "/logs" => return Some(self.handle_logs_command(None)),
             "/status" | "/stats" => {
@@ -127,7 +124,6 @@ impl App<'_> {
              /undo      - Undo last agent turn\n\
              \n  \
              /memory    - Show memory\n  \
-             /skills    - List skills\n  \
              /history   - Show conversation history\n  \
              /logs      - Show activity log (error|warn|info|debug|all|raw)\n  \
              /doctor    - Run diagnostics\n  \
@@ -141,7 +137,7 @@ impl App<'_> {
              /new       - Start new session\n  \
              /load      - Load a saved session by ID\n\
              \n  \
-             /plugins   - Browse integrations\n  \
+             /plugins   - Manage plugins, channels, and tools\n  \
              /projects  - List projects\n  \
              /schedule  - Manage scheduled tasks\n  \
              /migrate   - Import from another agent\n  \
@@ -246,7 +242,7 @@ impl App<'_> {
 
     fn cmd_plugins(&mut self) -> Result<AppAction> {
         if let Ok(data_dir) = borg_core::config::Config::data_dir() {
-            self.plugins_popup.show(&data_dir);
+            self.plugins_popup.show(&self.config, &data_dir);
         } else {
             self.push_system_message("Error: could not determine data directory".to_string());
         }

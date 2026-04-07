@@ -36,20 +36,26 @@ impl std::fmt::Display for PluginKind {
 /// Integration category for grouping in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Category {
-    /// Chat and messaging platforms (Telegram, Slack, Discord, etc.).
-    Messaging,
-    /// Email services (Gmail, Outlook).
+    /// Communication channels — how users talk to Borg (Telegram, Slack, Discord, etc.).
+    Channels,
+    /// Email clients and providers.
     Email,
+    /// Developer tools (git, docker, databases, etc.).
+    Developer,
     /// Productivity tools (Calendar, Notion, Linear).
     Productivity,
+    /// General utilities (search, browser, weather, etc.).
+    Utilities,
 }
 
 impl std::fmt::Display for Category {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Messaging => write!(f, "MESSAGING"),
+            Self::Channels => write!(f, "CHANNELS"),
             Self::Email => write!(f, "EMAIL"),
+            Self::Developer => write!(f, "DEVELOPER"),
             Self::Productivity => write!(f, "PRODUCTIVITY"),
+            Self::Utilities => write!(f, "UTILITIES"),
         }
     }
 }
@@ -211,9 +217,11 @@ mod tests {
 
     #[test]
     fn category_display() {
-        assert_eq!(Category::Messaging.to_string(), "MESSAGING");
+        assert_eq!(Category::Channels.to_string(), "CHANNELS");
         assert_eq!(Category::Email.to_string(), "EMAIL");
+        assert_eq!(Category::Developer.to_string(), "DEVELOPER");
         assert_eq!(Category::Productivity.to_string(), "PRODUCTIVITY");
+        assert_eq!(Category::Utilities.to_string(), "UTILITIES");
     }
 
     // -- Platform --

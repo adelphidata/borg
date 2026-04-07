@@ -951,8 +951,6 @@ Rules:
 
     fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
         let mut tools = crate::tool_definitions::core_tool_definitions(&self.config);
-        // Append credential-gated integration tools (gmail, etc.)
-        tools.extend(crate::integrations::enabled_tool_definitions(&self.config));
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(
                 self.spawn_depth,
@@ -1834,16 +1832,7 @@ Rules:
             "request_user_input" => {
                 return tool_handlers::handle_request_user_input(&args, event_tx).await;
             }
-            _ => {
-                // Try integration tools first
-                if let Some(result) =
-                    crate::integrations::dispatch_tool_call(name, &args, &self.config).await
-                {
-                    return result.map(ToolOutput::Text);
-                }
-
-                Err(anyhow::anyhow!("Unknown tool: {name}"))
-            }
+            _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
         };
         text_result.map(ToolOutput::Text)
     }

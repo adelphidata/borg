@@ -55,32 +55,16 @@ const SMS_PARSE_INBOUND: &str = include_str!("../templates/messaging/sms/parse_i
 const SMS_SEND_OUTBOUND: &str = include_str!("../templates/messaging/sms/send_outbound.py");
 const SMS_VERIFY: &str = include_str!("../templates/messaging/sms/verify.py");
 
-// Gmail
-const GMAIL_TOOL_TOML: &str = include_str!("../templates/email/gmail/tool.toml");
-const GMAIL_MAIN: &str = include_str!("../templates/email/gmail/main.py");
-
-// Google Calendar
-const GCAL_TOOL_TOML: &str = include_str!("../templates/productivity/google-calendar/tool.toml");
-const GCAL_MAIN: &str = include_str!("../templates/productivity/google-calendar/main.py");
-
-// Notion
-const NOTION_TOOL_TOML: &str = include_str!("../templates/productivity/notion/tool.toml");
-const NOTION_MAIN: &str = include_str!("../templates/productivity/notion/main.py");
-
-// Linear
-const LINEAR_TOOL_TOML: &str = include_str!("../templates/productivity/linear/tool.toml");
-const LINEAR_MAIN: &str = include_str!("../templates/productivity/linear/main.py");
-
 // ── Catalog entries ──
 
-/// Complete catalog of available plugins, embedded at compile time.
+/// Complete catalog of available channel plugins, embedded at compile time.
 pub static CATALOG: &[PluginDef] = &[
-    // ── Messaging ──
+    // ── Channels ──
     // Native integrations (handled in Rust, credential-only)
     PluginDef {
         id: "messaging/telegram",
         name: "Telegram",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Telegram Bot API",
         required_credentials: &[CredentialSpec {
@@ -97,7 +81,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/slack",
         name: "Slack",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Slack Bot API",
         required_credentials: &[
@@ -122,7 +106,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/discord",
         name: "Discord",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Discord Bot API",
         required_credentials: &[
@@ -147,7 +131,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/teams",
         name: "Teams",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Microsoft Teams Bot",
         required_credentials: &[
@@ -172,7 +156,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/google-chat",
         name: "Google Chat",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Google Chat Bot",
         required_credentials: &[CredentialSpec {
@@ -189,7 +173,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/signal",
         name: "Signal",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Signal Messenger via signal-cli daemon",
         required_credentials: &[CredentialSpec {
@@ -203,11 +187,11 @@ pub static CATALOG: &[PluginDef] = &[
         platform: Platform::All,
         is_native: true,
     },
-    // Template-based plugins
+    // Template-based channel plugins
     PluginDef {
         id: "messaging/whatsapp",
         name: "WhatsApp",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "WhatsApp Business API via Twilio",
         required_credentials: &[
@@ -253,7 +237,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/imessage",
         name: "iMessage",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "Bidirectional iMessage via macOS Messages (macOS only)",
         required_credentials: &[],
@@ -291,7 +275,7 @@ pub static CATALOG: &[PluginDef] = &[
     PluginDef {
         id: "messaging/sms",
         name: "SMS",
-        category: Category::Messaging,
+        category: Category::Channels,
         kind: PluginKind::Channel,
         description: "SMS messaging via Twilio",
         required_credentials: &[
@@ -334,120 +318,6 @@ pub static CATALOG: &[PluginDef] = &[
         platform: Platform::All,
         is_native: false,
     },
-    // ── Email ──
-    PluginDef {
-        id: "email/gmail",
-        name: "Gmail",
-        category: Category::Email,
-        kind: PluginKind::Tool,
-        description: "Send and search emails via Gmail API",
-        required_credentials: &[CredentialSpec {
-            key: "GMAIL_API_KEY",
-            label: "Gmail OAuth Token",
-            help_url: "https://developers.google.com/gmail/api/quickstart/python",
-            is_optional: false,
-        }],
-        required_bins: &["python3"],
-        templates: &[
-            TemplateFile {
-                relative_path: "gmail/tool.toml",
-                content: GMAIL_TOOL_TOML,
-                target: TemplateTarget::Tools,
-            },
-            TemplateFile {
-                relative_path: "gmail/main.py",
-                content: GMAIL_MAIN,
-                target: TemplateTarget::Tools,
-            },
-        ],
-        platform: Platform::All,
-        is_native: false,
-    },
-    // ── Productivity ──
-    PluginDef {
-        id: "productivity/google-calendar",
-        name: "Google Calendar",
-        category: Category::Productivity,
-        kind: PluginKind::Tool,
-        description: "Manage Google Calendar events",
-        required_credentials: &[CredentialSpec {
-            key: "GOOGLE_CALENDAR_TOKEN",
-            label: "Google Calendar OAuth Token",
-            help_url: "https://developers.google.com/calendar/api/quickstart/python",
-            is_optional: false,
-        }],
-        required_bins: &["python3"],
-        templates: &[
-            TemplateFile {
-                relative_path: "google-calendar/tool.toml",
-                content: GCAL_TOOL_TOML,
-                target: TemplateTarget::Tools,
-            },
-            TemplateFile {
-                relative_path: "google-calendar/main.py",
-                content: GCAL_MAIN,
-                target: TemplateTarget::Tools,
-            },
-        ],
-        platform: Platform::All,
-        is_native: false,
-    },
-    PluginDef {
-        id: "productivity/notion",
-        name: "Notion",
-        category: Category::Productivity,
-        kind: PluginKind::Tool,
-        description: "Query and create Notion pages and databases",
-        required_credentials: &[CredentialSpec {
-            key: "NOTION_API_KEY",
-            label: "Notion Integration Token",
-            help_url: "https://www.notion.so/my-integrations",
-            is_optional: false,
-        }],
-        required_bins: &["python3"],
-        templates: &[
-            TemplateFile {
-                relative_path: "notion/tool.toml",
-                content: NOTION_TOOL_TOML,
-                target: TemplateTarget::Tools,
-            },
-            TemplateFile {
-                relative_path: "notion/main.py",
-                content: NOTION_MAIN,
-                target: TemplateTarget::Tools,
-            },
-        ],
-        platform: Platform::All,
-        is_native: false,
-    },
-    PluginDef {
-        id: "productivity/linear",
-        name: "Linear",
-        category: Category::Productivity,
-        kind: PluginKind::Tool,
-        description: "Manage Linear issues and projects",
-        required_credentials: &[CredentialSpec {
-            key: "LINEAR_API_KEY",
-            label: "Linear API Key",
-            help_url: "https://linear.app/settings/api",
-            is_optional: false,
-        }],
-        required_bins: &["python3"],
-        templates: &[
-            TemplateFile {
-                relative_path: "linear/tool.toml",
-                content: LINEAR_TOOL_TOML,
-                target: TemplateTarget::Tools,
-            },
-            TemplateFile {
-                relative_path: "linear/main.py",
-                content: LINEAR_MAIN,
-                target: TemplateTarget::Tools,
-            },
-        ],
-        platform: Platform::All,
-        is_native: false,
-    },
 ];
 
 /// Look up a plugin by ID.
@@ -462,7 +332,13 @@ pub fn by_category(category: Category) -> Vec<&'static PluginDef> {
 
 /// All categories in display order.
 pub fn categories() -> &'static [Category] {
-    &[Category::Messaging, Category::Email, Category::Productivity]
+    &[
+        Category::Channels,
+        Category::Email,
+        Category::Developer,
+        Category::Productivity,
+        Category::Utilities,
+    ]
 }
 
 #[cfg(test)]
@@ -556,10 +432,20 @@ mod tests {
     }
 
     #[test]
-    fn categories_cover_all_entries() {
-        for cat in categories() {
-            let entries = by_category(*cat);
-            assert!(!entries.is_empty(), "no entries for {cat}");
+    fn all_catalog_entries_are_channels() {
+        for entry in CATALOG {
+            assert_eq!(
+                entry.category,
+                Category::Channels,
+                "catalog entry {} should be Channels category",
+                entry.id
+            );
         }
+    }
+
+    #[test]
+    fn channels_category_has_entries() {
+        let entries = by_category(Category::Channels);
+        assert!(!entries.is_empty(), "no entries for Channels");
     }
 }

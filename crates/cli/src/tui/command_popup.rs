@@ -52,10 +52,6 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Show memory context",
     },
     SlashCommandDef {
-        name: "/skills",
-        description: "Manage skills",
-    },
-    SlashCommandDef {
         name: "/history",
         description: "Show conversation history",
     },
@@ -100,7 +96,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     // Integrations
     SlashCommandDef {
         name: "/plugins",
-        description: "Browse integrations",
+        description: "Manage plugins, channels, and tools",
     },
     SlashCommandDef {
         name: "/schedule",
@@ -354,7 +350,6 @@ mod tests {
             "/clear",
             "/undo",
             "/memory",
-            "/skills",
             "/history",
             "/logs",
             "/doctor",

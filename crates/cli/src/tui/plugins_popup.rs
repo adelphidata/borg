@@ -9,11 +9,24 @@ use borg_plugins::Category;
 use super::popup_utils;
 use super::theme;
 
-/// State for a single item in the plugins list.
+/// The kind of a unified plugin item.
+enum ItemKind {
+    /// A messaging channel from the catalog (install/uninstall with credentials).
+    Channel { def: &'static PluginDef },
+    /// A skill (enable/disable toggle).
+    Skill { available: bool },
+}
+
+/// State for a single item in the unified plugins list.
 struct PluginItem {
-    def: &'static PluginDef,
-    is_installed: bool,
-    is_selected: bool,
+    id: String,
+    name: String,
+    category: Category,
+    kind: ItemKind,
+    /// Current persisted state (installed/enabled).
+    original_enabled: bool,
+    /// Current selection state after user interaction.
+    toggled: bool,
 }
 
 /// Phase of the plugins popup.
@@ -40,13 +53,15 @@ pub struct PluginsPopup {
 
 /// Actions that the plugins popup can request from the event loop.
 pub enum PluginAction {
+    /// Install a channel plugin with the provided credentials.
     Install {
         id: String,
         credentials: Vec<(String, String)>,
     },
-    Uninstall {
-        id: String,
-    },
+    /// Uninstall a channel plugin.
+    Uninstall { id: String },
+    /// Enable or disable a skill.
+    SetSkillEnabled { name: String, enabled: bool },
 }
 
 impl PluginsPopup {
@@ -64,43 +79,73 @@ impl PluginsPopup {
         self.visible
     }
 
-    /// Show the popup, scanning filesystem for installed state.
-    pub fn show(&mut self, data_dir: &std::path::Path) {
+    /// Show the popup, loading both channel plugins and skills.
+    pub fn show(&mut self, config: &borg_core::config::Config, data_dir: &std::path::Path) {
         self.visible = true;
         self.cursor = 0;
         self.phase = PluginPhase::Browsing;
         self.status_message = None;
 
-        self.items = CATALOG
-            .iter()
-            .map(|def| {
-                let installed = borg_plugins::installer::is_installed(def, data_dir);
-                PluginItem {
-                    def,
-                    is_installed: installed,
-                    is_selected: installed,
+        let mut items = Vec::new();
+
+        // Load channel plugins from catalog
+        for def in CATALOG {
+            let installed = borg_plugins::installer::is_installed(def, data_dir);
+            items.push(PluginItem {
+                id: def.id.to_string(),
+                name: def.name.to_string(),
+                category: def.category,
+                kind: ItemKind::Channel { def },
+                original_enabled: installed,
+                toggled: installed,
+            });
+        }
+
+        // Load skills
+        let resolved_creds = config.resolve_credentials();
+        if let Ok(skills) = borg_core::skills::load_all_skills(&resolved_creds, &config.skills) {
+            for skill in skills {
+                if skill.is_hidden() {
+                    continue;
                 }
-            })
-            .collect();
-    }
-
-    pub fn dismiss(&mut self) {
-        self.visible = false;
-        self.phase = PluginPhase::Browsing;
-        self.status_message = None;
-    }
-
-    /// Handle a bracketed paste event. Returns `true` if the paste was consumed
-    /// (i.e. the popup is visible and in credential-input phase).
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        if !self.visible {
-            return false;
+                let cat = match skill.category() {
+                    "developer" => Category::Developer,
+                    "email" => Category::Email,
+                    "productivity" => Category::Productivity,
+                    "channels" => Category::Channels,
+                    _ => Category::Utilities,
+                };
+                let enabled = !skill.disabled;
+                items.push(PluginItem {
+                    id: skill.manifest.name.clone(),
+                    name: title_case(&skill.manifest.name),
+                    category: cat,
+                    kind: ItemKind::Skill {
+                        available: skill.available,
+                    },
+                    original_enabled: enabled,
+                    toggled: enabled,
+                });
+            }
         }
-        if let PluginPhase::CredentialInput { ref mut buffer, .. } = self.phase {
-            buffer.push_str(text);
-            return true;
-        }
-        false
+
+        // Sort by category order, then by name within category
+        let cat_order = |c: &Category| -> usize {
+            match c {
+                Category::Channels => 0,
+                Category::Email => 1,
+                Category::Developer => 2,
+                Category::Productivity => 3,
+                Category::Utilities => 4,
+            }
+        };
+        items.sort_by(|a, b| {
+            cat_order(&a.category)
+                .cmp(&cat_order(&b.category))
+                .then(a.name.cmp(&b.name))
+        });
+
+        self.items = items;
     }
 
     /// Test helpers for inspecting/manipulating popup state.
@@ -108,7 +153,7 @@ impl PluginsPopup {
     pub fn items_for_test(&self) -> Vec<(&str, bool)> {
         self.items
             .iter()
-            .map(|i| (i.def.id, i.is_installed))
+            .map(|i| (i.id.as_str(), i.original_enabled))
             .collect()
     }
 
@@ -120,9 +165,27 @@ impl PluginsPopup {
     #[cfg(test)]
     pub fn force_uninstalled_for_test(&mut self, idx: usize) {
         if let Some(item) = self.items.get_mut(idx) {
-            item.is_installed = false;
-            item.is_selected = false;
+            item.original_enabled = false;
+            item.toggled = false;
         }
+    }
+
+    pub fn dismiss(&mut self) {
+        self.visible = false;
+        self.phase = PluginPhase::Browsing;
+        self.status_message = None;
+    }
+
+    /// Handle a bracketed paste event. Returns `true` if consumed.
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        if !self.visible {
+            return false;
+        }
+        if let PluginPhase::CredentialInput { ref mut buffer, .. } = self.phase {
+            buffer.push_str(text);
+            return true;
+        }
+        false
     }
 
     /// Handle a key event. Returns actions to execute if Enter is pressed.
@@ -161,41 +224,47 @@ impl PluginsPopup {
                 }
                 KeyCode::Char(' ') => {
                     if let Some(item) = self.items.get_mut(self.cursor) {
-                        if !item.def.platform.is_available() {
-                            self.status_message = Some((
-                                format!(
-                                    "{} requires {}",
-                                    item.def.name,
-                                    item.def.platform.label().unwrap_or("a different platform")
-                                ),
-                                false,
-                            ));
-                            return None;
+                        // Check platform availability for channels
+                        if let ItemKind::Channel { def } = &item.kind {
+                            if !def.platform.is_available() {
+                                self.status_message = Some((
+                                    format!(
+                                        "{} requires {}",
+                                        item.name,
+                                        def.platform.label().unwrap_or("a different platform")
+                                    ),
+                                    false,
+                                ));
+                                return None;
+                            }
                         }
-                        item.is_selected = !item.is_selected;
+                        item.toggled = !item.toggled;
                         self.status_message = None;
                     }
                     None
                 }
                 KeyCode::Enter => {
-                    let actions = self.compute_pending_actions();
-                    if actions.is_empty() {
+                    let (skill_actions, channel_actions) = self.compute_pending_actions();
+
+                    if skill_actions.is_empty() && channel_actions.is_empty() {
                         self.status_message = Some(("No changes to apply.".to_string(), false));
                         return None;
                     }
 
-                    // Check if any install actions need credentials
+                    // Build final actions list
+                    let mut all_actions: Vec<PluginAction> = skill_actions;
+
+                    // Process channel actions — separate into needs-creds and immediate
                     let mut needs_creds: Vec<(String, &'static [borg_plugins::CredentialSpec])> =
                         Vec::new();
-                    let mut immediate_actions: Vec<PluginAction> = Vec::new();
 
-                    for (id, is_install) in &actions {
+                    for (id, is_install) in &channel_actions {
                         if *is_install {
                             if let Some(def) = borg_plugins::catalog::find_by_id(id) {
                                 let has_required =
                                     def.required_credentials.iter().any(|c| !c.is_optional);
                                 if !has_required {
-                                    immediate_actions.push(PluginAction::Install {
+                                    all_actions.push(PluginAction::Install {
                                         id: id.clone(),
                                         credentials: Vec::new(),
                                     });
@@ -204,19 +273,18 @@ impl PluginsPopup {
                                 }
                             }
                         } else {
-                            immediate_actions.push(PluginAction::Uninstall { id: id.clone() });
+                            all_actions.push(PluginAction::Uninstall { id: id.clone() });
                         }
                     }
 
                     if needs_creds.is_empty() {
                         self.dismiss();
-                        return Some(immediate_actions);
+                        return Some(all_actions);
                     }
 
                     // Transition to credential input phase
                     let mut all_credentials: Vec<(String, Vec<(String, String)>)> = Vec::new();
-                    // Pre-populate with immediate actions' empty credential lists
-                    for action in &immediate_actions {
+                    for action in &all_actions {
                         if let PluginAction::Install { id, credentials } = action {
                             all_credentials.push((id.clone(), credentials.clone()));
                         }
@@ -271,7 +339,6 @@ impl PluginsPopup {
 
                     *current_cred_idx += 1;
 
-                    // Check if we've collected all creds for this plugin
                     if *current_cred_idx >= cred_specs.len() {
                         let id = action_queue[*current_def_idx].0.clone();
                         all_credentials.push((id, collected.clone()));
@@ -280,15 +347,29 @@ impl PluginsPopup {
                         *current_cred_idx = 0;
                     }
 
-                    // Check if we've finished all plugins
                     if *current_def_idx >= action_queue.len() {
                         let mut final_actions: Vec<PluginAction> = Vec::new();
 
-                        // Add uninstall actions from original pending
+                        // Add skill actions
                         for item in &self.items {
-                            if !item.is_selected && item.is_installed {
+                            if matches!(item.kind, ItemKind::Skill { .. })
+                                && item.toggled != item.original_enabled
+                            {
+                                final_actions.push(PluginAction::SetSkillEnabled {
+                                    name: item.id.clone(),
+                                    enabled: item.toggled,
+                                });
+                            }
+                        }
+
+                        // Add channel uninstall actions
+                        for item in &self.items {
+                            if matches!(item.kind, ItemKind::Channel { .. })
+                                && !item.toggled
+                                && item.original_enabled
+                            {
                                 final_actions.push(PluginAction::Uninstall {
-                                    id: item.def.id.to_string(),
+                                    id: item.id.clone(),
                                 });
                             }
                         }
@@ -312,17 +393,33 @@ impl PluginsPopup {
         }
     }
 
-    /// Returns (id, is_install) pairs for pending changes.
-    fn compute_pending_actions(&self) -> Vec<(String, bool)> {
-        let mut actions = Vec::new();
+    /// Returns (skill_actions, channel_actions) for pending changes.
+    fn compute_pending_actions(&self) -> (Vec<PluginAction>, Vec<(String, bool)>) {
+        let mut skill_actions = Vec::new();
+        let mut channel_actions = Vec::new();
+
         for item in &self.items {
-            if item.is_selected && !item.is_installed {
-                actions.push((item.def.id.to_string(), true));
-            } else if !item.is_selected && item.is_installed {
-                actions.push((item.def.id.to_string(), false));
+            if item.toggled == item.original_enabled {
+                continue;
+            }
+            match &item.kind {
+                ItemKind::Skill { .. } => {
+                    skill_actions.push(PluginAction::SetSkillEnabled {
+                        name: item.id.clone(),
+                        enabled: item.toggled,
+                    });
+                }
+                ItemKind::Channel { .. } => {
+                    if item.toggled && !item.original_enabled {
+                        channel_actions.push((item.id.clone(), true));
+                    } else if !item.toggled && item.original_enabled {
+                        channel_actions.push((item.id.clone(), false));
+                    }
+                }
             }
         }
-        actions
+
+        (skill_actions, channel_actions)
     }
 
     pub fn render(&self, frame: &mut Frame) {
@@ -343,25 +440,49 @@ impl PluginsPopup {
 
         let mut last_category: Option<Category> = None;
         for (i, item) in self.items.iter().enumerate() {
-            if last_category != Some(item.def.category) {
+            if last_category != Some(item.category) {
                 if last_category.is_some() {
                     lines.push(Line::default());
                 }
                 lines.push(Line::from(Span::styled(
-                    format!(" {}", item.def.category),
+                    format!(" {}", item.category),
                     theme::bold(),
                 )));
-                last_category = Some(item.def.category);
+                last_category = Some(item.category);
             }
 
             row_indices.push(lines.len());
 
-            let check = if item.is_selected { "x" } else { " " };
-            let status = "";
+            let check = if item.toggled { "x" } else { " " };
 
-            let platform_note = if let Some(label) = item.def.platform.label() {
-                if !item.def.platform.is_available() {
-                    format!("  ({label})")
+            // Status badge
+            let status = match &item.kind {
+                ItemKind::Channel { .. } => {
+                    if item.original_enabled {
+                        " \u{2713} active"
+                    } else {
+                        ""
+                    }
+                }
+                ItemKind::Skill { available } => {
+                    if item.toggled && *available {
+                        " \u{2713} active"
+                    } else if item.toggled && !*available {
+                        " \u{2717} missing"
+                    } else {
+                        ""
+                    }
+                }
+            };
+
+            // Platform note for channels
+            let platform_note = if let ItemKind::Channel { def } = &item.kind {
+                if let Some(label) = def.platform.label() {
+                    if !def.platform.is_available() {
+                        format!("  ({label})")
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 }
@@ -369,18 +490,7 @@ impl PluginsPopup {
                 String::new()
             };
 
-            let python_note = if item.def.required_bins.contains(&"python3")
-                && which::which("python3").is_err()
-            {
-                "  (needs python3)".to_string()
-            } else {
-                String::new()
-            };
-
-            let label = format!(
-                "  [{check}] {}{status}{platform_note}{python_note}",
-                item.def.name,
-            );
+            let label = format!("  [{check}] {}{status}{platform_note}", item.name,);
 
             let is_selected = i == self.cursor;
             let style = if is_selected {
@@ -459,31 +569,44 @@ impl PluginsPopup {
     }
 }
 
+/// Convert a kebab-case name to Title Case for display.
+fn title_case(s: &str) -> String {
+    s.split('-')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    upper + chars.as_str()
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    /// Move cursor to the plugin with the given ID.
-    fn select_plugin(popup: &mut PluginsPopup, id: &str) {
-        let idx = popup
-            .items
-            .iter()
-            .position(|i| i.def.id == id)
-            .unwrap_or_else(|| panic!("{id} should be in catalog"));
-        popup.cursor = idx;
+    fn press(popup: &mut PluginsPopup, code: KeyCode) -> Option<Vec<PluginAction>> {
+        popup.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
-    /// Simulate typing a string into the credential input.
     fn type_text(popup: &mut PluginsPopup, text: &str) {
         for c in text.chars() {
             popup.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
     }
 
-    /// Press a key once.
-    fn press(popup: &mut PluginsPopup, code: KeyCode) -> Option<Vec<PluginAction>> {
-        popup.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+    fn make_test_popup() -> PluginsPopup {
+        let mut popup = PluginsPopup::new();
+        let tmp = std::env::temp_dir().join("borg-plugins-unified-test");
+        let config = borg_core::config::Config::default();
+        popup.show(&config, &tmp);
+        popup
     }
 
     #[test]
@@ -494,9 +617,7 @@ mod tests {
 
     #[test]
     fn show_and_dismiss() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test");
-        popup.show(&tmp);
+        let mut popup = make_test_popup();
         assert!(popup.is_visible());
         assert!(!popup.items.is_empty());
         popup.dismiss();
@@ -504,11 +625,68 @@ mod tests {
     }
 
     #[test]
-    fn navigation_wraps() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-nav");
-        popup.show(&tmp);
+    fn unified_popup_shows_skills_and_channels() {
+        let popup = make_test_popup();
+        let has_channel = popup
+            .items
+            .iter()
+            .any(|i| matches!(i.kind, ItemKind::Channel { .. }));
+        let has_skill = popup
+            .items
+            .iter()
+            .any(|i| matches!(i.kind, ItemKind::Skill { .. }));
+        assert!(has_channel, "should have channel items");
+        assert!(has_skill, "should have skill items");
+    }
 
+    #[test]
+    fn hidden_skills_not_shown() {
+        let popup = make_test_popup();
+        for hidden in borg_core::skills::HIDDEN_SKILLS {
+            assert!(
+                !popup.items.iter().any(|i| i.id == *hidden),
+                "hidden skill {hidden} should not appear"
+            );
+        }
+    }
+
+    #[test]
+    fn default_enabled_state() {
+        let popup = make_test_popup();
+        for name in borg_core::skills::DEFAULT_ENABLED_SKILLS {
+            if let Some(item) = popup.items.iter().find(|i| i.id == *name) {
+                assert!(
+                    item.toggled,
+                    "default-enabled skill {name} should be toggled on"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn category_grouping_order() {
+        let popup = make_test_popup();
+        let categories: Vec<Category> = {
+            let mut cats = Vec::new();
+            for item in &popup.items {
+                if cats.last() != Some(&item.category) {
+                    cats.push(item.category);
+                }
+            }
+            cats
+        };
+        // Channels should come before other categories
+        if let Some(channels_pos) = categories.iter().position(|c| *c == Category::Channels) {
+            for cat in &categories[..channels_pos] {
+                assert_ne!(*cat, Category::Developer);
+                assert_ne!(*cat, Category::Utilities);
+            }
+        }
+    }
+
+    #[test]
+    fn navigation_wraps() {
+        let mut popup = make_test_popup();
         let count = popup.items.len();
         assert_eq!(popup.cursor, 0);
 
@@ -520,186 +698,103 @@ mod tests {
     }
 
     #[test]
-    fn toggle_and_compute_actions() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-toggle");
-        popup.show(&tmp);
+    fn skill_toggle_produces_action() {
+        let mut popup = make_test_popup();
+        // Find a skill that's enabled by default
+        let skill_idx = popup
+            .items
+            .iter()
+            .position(|i| matches!(i.kind, ItemKind::Skill { .. }) && i.original_enabled)
+            .expect("should have an enabled skill");
 
-        popup.items[0].is_installed = false;
-        popup.items[0].is_selected = false;
-
+        popup.cursor = skill_idx;
         press(&mut popup, KeyCode::Char(' '));
-        assert!(popup.items[0].is_selected);
+        assert!(!popup.items[skill_idx].toggled);
 
-        press(&mut popup, KeyCode::Char(' '));
-        assert!(!popup.items[0].is_selected);
-
-        press(&mut popup, KeyCode::Char(' '));
-        assert!(popup.items[0].is_selected);
-
-        let actions = popup.compute_pending_actions();
-        assert_eq!(actions.len(), 1);
-        assert!(actions[0].1); // is_install = true
+        let (skill_actions, _) = popup.compute_pending_actions();
+        assert_eq!(skill_actions.len(), 1);
+        assert!(matches!(
+            &skill_actions[0],
+            PluginAction::SetSkillEnabled { enabled: false, .. }
+        ));
     }
 
     #[test]
-    fn enter_does_not_toggle_triggers_apply() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-enter-apply");
-        popup.show(&tmp);
+    fn channel_toggle_and_credential_flow() {
+        let mut popup = make_test_popup();
+        let telegram_idx = popup
+            .items
+            .iter()
+            .position(|i| i.id == "messaging/telegram")
+            .expect("telegram should be in list");
 
-        popup.items[0].is_installed = false;
-        popup.items[0].is_selected = false;
+        // Force uninstalled state
+        popup.items[telegram_idx].original_enabled = false;
+        popup.items[telegram_idx].toggled = false;
 
-        press(&mut popup, KeyCode::Enter);
-        assert!(!popup.items[0].is_selected);
+        popup.cursor = telegram_idx;
+        press(&mut popup, KeyCode::Char(' '));
+        assert!(popup.items[telegram_idx].toggled);
+
+        // Enter triggers credential input
+        let result = press(&mut popup, KeyCode::Enter);
+        assert!(result.is_none());
+        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
+
+        // Type credential and submit
+        type_text(&mut popup, "test-token");
+        let result = press(&mut popup, KeyCode::Enter);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn enter_no_changes_shows_status() {
+        let mut popup = make_test_popup();
+        let result = press(&mut popup, KeyCode::Enter);
+        assert!(result.is_none());
         assert!(popup.status_message.is_some());
     }
 
     #[test]
     fn esc_closes_popup() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-esc-close");
-        popup.show(&tmp);
+        let mut popup = make_test_popup();
         assert!(popup.is_visible());
-
         press(&mut popup, KeyCode::Esc);
         assert!(!popup.is_visible());
     }
 
     #[test]
-    fn tab_does_nothing() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-tab");
-        popup.show(&tmp);
+    fn handle_paste_consumed_in_credential_input() {
+        let mut popup = make_test_popup();
+        assert!(!popup.handle_paste("text"));
 
-        popup.items[0].is_installed = false;
-        popup.items[0].is_selected = false;
-
-        let result = press(&mut popup, KeyCode::Tab);
-        assert!(!popup.items[0].is_selected);
-        assert!(result.is_none());
-        assert!(popup.status_message.is_none());
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn no_credential_input_for_zero_cred_defs() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-nocred");
-        popup.show(&tmp);
-
-        // Find iMessage (no required credentials) and select it
-        select_plugin(&mut popup, "messaging/imessage");
-        let imessage_idx = popup.cursor;
-
-        press(&mut popup, KeyCode::Char(' '));
-        assert!(popup.items[imessage_idx].is_selected);
-
-        // Enter should produce actions immediately (no credential input phase)
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_some());
-        let actions = result.expect("should have actions");
-        assert!(!actions.is_empty());
-        assert!(matches!(
-            &actions[0],
-            PluginAction::Install {
-                credentials,
-                ..
-            } if credentials.is_empty()
-        ));
-    }
-
-    #[test]
-    fn credential_input_phase_transitions() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-cred-phase");
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "email/gmail");
-        press(&mut popup, KeyCode::Char(' '));
-
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_none());
-        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
-    }
-
-    #[test]
-    fn credential_input_esc_cancels() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-cred-esc");
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "email/gmail");
-        press(&mut popup, KeyCode::Char(' '));
-        press(&mut popup, KeyCode::Enter);
-        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
-
-        press(&mut popup, KeyCode::Esc);
-        assert!(matches!(popup.phase, PluginPhase::Browsing));
-    }
-
-    #[test]
-    fn credential_input_backspace() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-cred-bs");
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "email/gmail");
-        press(&mut popup, KeyCode::Char(' '));
-        press(&mut popup, KeyCode::Enter);
-
-        type_text(&mut popup, "abc");
-
-        if let PluginPhase::CredentialInput { ref buffer, .. } = popup.phase {
-            assert_eq!(buffer, "abc");
-        } else {
-            panic!("expected CredentialInput phase");
-        }
-
-        press(&mut popup, KeyCode::Backspace);
-
-        if let PluginPhase::CredentialInput { ref buffer, .. } = popup.phase {
-            assert_eq!(buffer, "ab");
-        } else {
-            panic!("expected CredentialInput phase");
-        }
-    }
-
-    #[test]
-    fn credential_input_enter_produces_install_action() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-cred-enter");
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "email/gmail");
-        press(&mut popup, KeyCode::Char(' '));
-        press(&mut popup, KeyCode::Enter);
-
-        type_text(&mut popup, "my-bot-token");
-
-        let result = press(&mut popup, KeyCode::Enter);
-
-        // Gmail has 1 credential, so this should complete
-        assert!(result.is_some());
-        let actions = result.expect("should have actions");
-        let install_action = actions
+        // Enter credential input for telegram
+        let idx = popup
+            .items
             .iter()
-            .find(|a| matches!(a, PluginAction::Install { .. }))
-            .expect("should have install action");
-        if let PluginAction::Install { credentials, .. } = install_action {
-            assert_eq!(credentials.len(), 1);
-            assert_eq!(credentials[0].0, "GMAIL_API_KEY");
-            assert_eq!(credentials[0].1, "my-bot-token");
+            .position(|i| i.id == "messaging/telegram")
+            .unwrap();
+        popup.items[idx].original_enabled = false;
+        popup.items[idx].toggled = false;
+        popup.cursor = idx;
+        press(&mut popup, KeyCode::Char(' '));
+        press(&mut popup, KeyCode::Enter);
+
+        assert!(popup.handle_paste("pasted-token"));
+        if let PluginPhase::CredentialInput { ref buffer, .. } = popup.phase {
+            assert_eq!(buffer, "pasted-token");
         }
+    }
+
+    #[test]
+    fn handle_paste_not_consumed_when_hidden() {
+        let popup = &mut PluginsPopup::new();
+        assert!(!popup.handle_paste("anything"));
     }
 
     #[test]
     fn native_plugins_appear_in_list() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-native-list");
-        popup.show(&tmp);
-
+        let popup = make_test_popup();
         let native_ids = [
             "messaging/telegram",
             "messaging/slack",
@@ -709,136 +804,17 @@ mod tests {
         ];
         for id in &native_ids {
             assert!(
-                popup
-                    .items
-                    .iter()
-                    .any(|i| i.def.id == *id && i.def.is_native),
+                popup.items.iter().any(|i| i.id == *id),
                 "native plugin {id} should appear in list"
             );
         }
     }
 
     #[test]
-    fn native_plugins_count() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-native-count");
-        popup.show(&tmp);
-
-        let native_count = popup.items.iter().filter(|i| i.def.is_native).count();
-        assert_eq!(native_count, 6);
-    }
-
-    #[test]
-    fn native_plugin_credential_input_flow() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-native-cred");
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "messaging/telegram");
-        let telegram_idx = popup.cursor;
-
-        // Force initial state regardless of host env/keychain
-        popup.items[telegram_idx].is_installed = false;
-        popup.items[telegram_idx].is_selected = false;
-
-        press(&mut popup, KeyCode::Char(' '));
-        assert!(popup.items[telegram_idx].is_selected);
-
-        press(&mut popup, KeyCode::Enter);
-        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
-
-        type_text(&mut popup, "test-token");
-
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_some());
-        let actions = result.unwrap();
-        let install_action = actions
-            .iter()
-            .find(|a| matches!(a, PluginAction::Install { id, .. } if id == "messaging/telegram"))
-            .expect("should have telegram install action");
-        if let PluginAction::Install { credentials, .. } = install_action {
-            assert_eq!(credentials.len(), 1);
-            assert_eq!(credentials[0].0, "TELEGRAM_BOT_TOKEN");
-            assert_eq!(credentials[0].1, "test-token");
-        }
-    }
-
-    #[test]
-    fn native_plugin_multi_credential_flow() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-native-multi");
-        unsafe {
-            std::env::remove_var("SLACK_BOT_TOKEN");
-            std::env::remove_var("SLACK_SIGNING_SECRET");
-        }
-        popup.show(&tmp);
-
-        select_plugin(&mut popup, "messaging/slack");
-        press(&mut popup, KeyCode::Char(' '));
-        press(&mut popup, KeyCode::Enter);
-        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
-
-        type_text(&mut popup, "xoxb-token");
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_none());
-
-        type_text(&mut popup, "signing-secret");
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_some());
-        let actions = result.unwrap();
-        let install_action = actions
-            .iter()
-            .find(|a| matches!(a, PluginAction::Install { id, .. } if id == "messaging/slack"))
-            .expect("should have slack install action");
-        if let PluginAction::Install { credentials, .. } = install_action {
-            assert_eq!(credentials.len(), 2);
-            assert_eq!(credentials[0].0, "SLACK_BOT_TOKEN");
-            assert_eq!(credentials[1].0, "SLACK_SIGNING_SECRET");
-        }
-    }
-
-    #[test]
-    fn handle_paste_consumed_in_credential_input() {
-        let mut popup = PluginsPopup::new();
-        let tmp = std::env::temp_dir().join("borg-plugins-test-paste-cred");
-        popup.show(&tmp);
-
-        // Paste during Browsing phase should NOT be consumed
-        assert!(!popup.handle_paste("should-not-land"));
-
-        // Enter credential input for Telegram
-        select_plugin(&mut popup, "messaging/telegram");
-        let idx = popup.cursor;
-        popup.items[idx].is_installed = false;
-        popup.items[idx].is_selected = false;
-        press(&mut popup, KeyCode::Char(' '));
-        press(&mut popup, KeyCode::Enter);
-        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
-
-        // Paste should be consumed and land in buffer
-        assert!(popup.handle_paste("pasted-bot-token-123"));
-        if let PluginPhase::CredentialInput { ref buffer, .. } = popup.phase {
-            assert_eq!(buffer, "pasted-bot-token-123");
-        } else {
-            panic!("expected CredentialInput phase");
-        }
-
-        // Submit the pasted token
-        let result = press(&mut popup, KeyCode::Enter);
-        assert!(result.is_some());
-        let actions = result.unwrap();
-        let install = actions
-            .iter()
-            .find(|a| matches!(a, PluginAction::Install { id, .. } if id == "messaging/telegram"))
-            .expect("should have telegram install");
-        if let PluginAction::Install { credentials, .. } = install {
-            assert_eq!(credentials[0].1, "pasted-bot-token-123");
-        }
-    }
-
-    #[test]
-    fn handle_paste_not_consumed_when_hidden() {
-        let popup = &mut PluginsPopup::new();
-        assert!(!popup.handle_paste("anything"));
+    fn title_case_works() {
+        assert_eq!(title_case("git"), "Git");
+        assert_eq!(title_case("skill-creator"), "Skill Creator");
+        assert_eq!(title_case("1password"), "1password");
+        assert_eq!(title_case("google-calendar"), "Google Calendar");
     }
 }

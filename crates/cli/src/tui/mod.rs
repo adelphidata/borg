@@ -16,7 +16,6 @@ mod plugins_popup;
 mod popup_utils;
 mod schedule_popup;
 mod settings_popup;
-mod skills_popup;
 mod status_popup;
 pub(crate) mod theme;
 mod tool_display;
@@ -873,6 +872,26 @@ async fn run_event_loop(
                                 }
                             }
                         }
+                        plugins_popup::PluginAction::SetSkillEnabled { name, enabled } => {
+                            if let Ok(db) = borg_core::db::Database::open() {
+                                let key = format!("skills.entries.{name}.enabled");
+                                let val = enabled.to_string();
+                                match app.config.apply_setting(&key, &val) {
+                                    Ok(_) => {
+                                        let _ = db.set_setting(&key, &val);
+                                        let status = if enabled { "enabled" } else { "disabled" };
+                                        results.push(format!("{name}: {status}"));
+                                    }
+                                    Err(e) => {
+                                        results.push(format!("Error updating {name}: {e}"));
+                                    }
+                                }
+                            } else {
+                                results.push(format!(
+                                    "Error persisting {name}: could not open database"
+                                ));
+                            }
+                        }
                         plugins_popup::PluginAction::Uninstall { id } => {
                             if let Some(def) = borg_plugins::catalog::find_by_id(&id) {
                                 match borg_plugins::installer::uninstall(def, &data_dir) {
@@ -1085,34 +1104,6 @@ async fn run_event_loop(
                 }
                 if !results.is_empty() {
                     app.push_system_message(results.join("\n"));
-                }
-            }
-            AppAction::RunSkillActions { actions } => {
-                let mut results: Vec<String> = Vec::new();
-                if let Ok(db) = borg_core::db::Database::open() {
-                    for action in actions {
-                        match action {
-                            skills_popup::SkillAction::SetEnabled { name, enabled } => {
-                                let key = format!("skills.entries.{name}.enabled");
-                                let val = enabled.to_string();
-                                match app.config.apply_setting(&key, &val) {
-                                    Ok(_) => {
-                                        let _ = db.set_setting(&key, &val);
-                                        let status = if enabled { "enabled" } else { "disabled" };
-                                        results.push(format!("{name}: {status}"));
-                                    }
-                                    Err(e) => {
-                                        results.push(format!("Error updating {name}: {e}"));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    results.push("Error: could not open database".to_string());
-                }
-                if !results.is_empty() {
-                    app.push_system_message(format!("Skills updated:\n{}", results.join("\n")));
                 }
             }
             AppAction::RunMigration { actions } => {

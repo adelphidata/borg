@@ -26,7 +26,6 @@ use super::plan_overlay::{PlanOption, PlanOverlay};
 use super::plugins_popup::{PluginAction, PluginsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::settings_popup::SettingsPopup;
-use super::skills_popup::{SkillAction, SkillsPopup};
 use super::status_popup::StatusPopup;
 use super::theme;
 
@@ -124,9 +123,6 @@ pub enum AppAction {
     RunScheduleActions {
         actions: Vec<ScheduleAction>,
     },
-    RunSkillActions {
-        actions: Vec<SkillAction>,
-    },
     RunMigration {
         actions: Vec<MigrateAction>,
     },
@@ -171,7 +167,6 @@ pub struct App<'a> {
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
     pub schedule_popup: SchedulePopup,
-    pub skills_popup: SkillsPopup,
     pub migrate_popup: MigratePopup,
     pub file_popup: FileSearchPopup,
     pub throbber_state: ThrobberState,
@@ -221,7 +216,6 @@ impl<'a> App<'a> {
             plan_overlay: PlanOverlay::new(),
             previous_collab_mode: None,
             schedule_popup: SchedulePopup::new(),
-            skills_popup: SkillsPopup::new(),
             migrate_popup: MigratePopup::new(),
             file_popup: FileSearchPopup::with_config(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -263,7 +257,6 @@ impl<'a> App<'a> {
         self.settings_popup.is_visible()
             || self.plugins_popup.is_visible()
             || self.schedule_popup.is_visible()
-            || self.skills_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
     }
@@ -289,10 +282,7 @@ impl<'a> App<'a> {
             self.schedule_popup.handle_paste(&text);
             return AppAction::Continue;
         }
-        if self.skills_popup.is_visible()
-            || self.migrate_popup.is_visible()
-            || self.status_popup.is_visible()
-        {
+        if self.migrate_popup.is_visible() || self.status_popup.is_visible() {
             return AppAction::Continue;
         }
 
@@ -631,13 +621,6 @@ impl<'a> App<'a> {
                 if self.schedule_popup.is_visible() {
                     if let Some(actions) = self.schedule_popup.handle_key(key) {
                         return Ok(AppAction::RunScheduleActions { actions });
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.skills_popup.is_visible() {
-                    if let Some(actions) = self.skills_popup.handle_key(key) {
-                        return Ok(AppAction::RunSkillActions { actions });
                     }
                     return Ok(AppAction::Continue);
                 }
@@ -1533,7 +1516,6 @@ impl<'a> App<'a> {
         self.settings_popup.render(frame, &self.config);
         self.plugins_popup.render(frame);
         self.schedule_popup.render(frame);
-        self.skills_popup.render(frame);
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);
     }
@@ -2892,7 +2874,7 @@ mod tests {
         let mut app = make_app();
         assert!(!app.any_popup_visible());
         let data_dir = std::env::temp_dir().join("borg-test-any-popup");
-        app.plugins_popup.show(&data_dir);
+        app.plugins_popup.show(&app.config, &data_dir);
         assert!(app.any_popup_visible());
     }
 
@@ -2901,7 +2883,7 @@ mod tests {
         let mut app = make_app();
         // Open plugins popup
         let data_dir = std::env::temp_dir().join("borg-test-paste-stream");
-        app.plugins_popup.show(&data_dir);
+        app.plugins_popup.show(&app.config, &data_dir);
         // Force Streaming state (simulates drain_queued_if_idle starting a turn)
         app.state = AppState::Streaming {
             start: std::time::Instant::now(),
@@ -2919,7 +2901,7 @@ mod tests {
     fn key_chars_go_to_popup_not_composer_during_streaming() {
         let mut app = make_app();
         let data_dir = std::env::temp_dir().join("borg-test-key-stream");
-        app.plugins_popup.show(&data_dir);
+        app.plugins_popup.show(&app.config, &data_dir);
 
         // Select Telegram and enter credential input phase
         let tg_idx = app

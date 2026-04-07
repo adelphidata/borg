@@ -107,7 +107,36 @@ pub struct SkillManifest {
     /// Per-dependency install instructions keyed by dependency name.
     #[serde(default)]
     pub install: std::collections::HashMap<String, InstallSpec>,
+    /// Plugin category for unified UI grouping (e.g., "developer", "utilities").
+    #[serde(default)]
+    pub category: Option<String>,
 }
+
+/// Skills enabled by default when no explicit config entry exists.
+pub const DEFAULT_ENABLED_SKILLS: &[&str] = &["browser", "git", "search", "email", "calendar"];
+
+/// Skills hidden from the unified /plugins UI (still loaded for prompt injection).
+pub const HIDDEN_SKILLS: &[&str] = &["skill-creator", "slack", "discord"];
+
+/// Hardcoded category fallback for built-in skills without a `category` field.
+const SKILL_CATEGORY_MAP: &[(&str, &str)] = &[
+    ("git", "developer"),
+    ("github", "developer"),
+    ("docker", "developer"),
+    ("database", "developer"),
+    ("search", "utilities"),
+    ("browser", "utilities"),
+    ("weather", "utilities"),
+    ("http", "utilities"),
+    ("1password", "utilities"),
+    ("notes", "utilities"),
+    ("scheduler", "utilities"),
+    ("calendar", "productivity"),
+    ("email", "email"),
+    ("slack", "channels"),
+    ("discord", "channels"),
+    ("skill-creator", "utilities"),
+];
 
 /// A loaded skill with its manifest, body, and runtime metadata.
 #[derive(Debug, Clone)]
@@ -146,6 +175,24 @@ impl Skill {
         } else {
             "unavailable (missing requirements)"
         }
+    }
+
+    /// Returns the plugin category for this skill.
+    /// Reads from manifest frontmatter, falls back to the hardcoded map.
+    pub fn category(&self) -> &str {
+        if let Some(cat) = &self.manifest.category {
+            return cat.as_str();
+        }
+        SKILL_CATEGORY_MAP
+            .iter()
+            .find(|(name, _)| *name == self.manifest.name.as_str())
+            .map(|(_, cat)| *cat)
+            .unwrap_or("utilities")
+    }
+
+    /// Returns true if this skill should be hidden from the unified /plugins UI.
+    pub fn is_hidden(&self) -> bool {
+        HIDDEN_SKILLS.contains(&self.manifest.name.as_str())
     }
 
     /// Returns a single-character status icon (checkmark, cross, or dash).
@@ -313,16 +360,21 @@ fn check_requirements(
     true
 }
 
+/// Determine if a skill is disabled given config entries and the default-enabled list.
+fn is_skill_disabled(name: &str, skills_config: &SkillsConfig) -> bool {
+    match skills_config.entries.get(name) {
+        Some(entry) => !entry.enabled, // explicit config wins
+        None => !DEFAULT_ENABLED_SKILLS.contains(&name), // default off unless listed
+    }
+}
+
 fn load_builtin_skill(
     content: &str,
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
 ) -> Result<Skill> {
     let (manifest, body) = parse_skill_md(content)?;
-    let disabled = skills_config
-        .entries
-        .get(&manifest.name)
-        .is_some_and(|e| !e.enabled);
+    let disabled = is_skill_disabled(&manifest.name, skills_config);
     let available =
         !disabled && check_requirements(&manifest.requires, &manifest.os, resolved_creds);
     Ok(Skill {
@@ -394,10 +446,7 @@ pub fn load_all_skills(
                     match std::fs::read_to_string(&skill_file) {
                         Ok(content) => match parse_skill_md(&content) {
                             Ok((manifest, body)) => {
-                                let disabled = skills_config
-                                    .entries
-                                    .get(&manifest.name)
-                                    .is_some_and(|e| !e.enabled);
+                                let disabled = is_skill_disabled(&manifest.name, skills_config);
                                 let available = !disabled
                                     && check_requirements(
                                         &manifest.requires,
@@ -805,7 +854,7 @@ Short body.
         assert!(names.contains(&"weather"));
         assert!(names.contains(&"skill-creator"));
         assert!(names.contains(&"git"));
-        assert!(names.contains(&"http"));
+        assert!(names.contains(&"email"));
         assert!(names.contains(&"search"));
         assert!(names.contains(&"docker"));
         assert!(names.contains(&"database"));
@@ -850,6 +899,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -942,6 +992,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "built-in body".to_string(),
             source: SkillSource::BuiltIn,
@@ -960,6 +1011,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "user body".to_string(),
             source: SkillSource::User,
@@ -983,6 +1035,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "# Full Body\n\nLots of content here.\n\n## Section 2\n\nMore content."
                 .to_string(),
@@ -1011,6 +1064,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "# Title\n\nFirst paragraph here.\n\n## Section 2\n\nMore content.".to_string(),
             source: SkillSource::BuiltIn,
@@ -1036,6 +1090,7 @@ Short body.
                     requires: SkillRequires::default(),
                     os: vec![],
                     install: std::collections::HashMap::new(),
+                    category: None,
                 },
                 body: format!("# Skill {i}\n\nBody content for skill {i}.\n\n## Usage\n\nDetailed usage instructions for skill {i} with examples and documentation."),
                 source: SkillSource::BuiltIn,
@@ -1117,16 +1172,97 @@ Short body.
     }
 
     #[test]
-    fn test_skill_enabled_by_default() {
+    fn test_default_enabled_skills() {
         let config = SkillsConfig::default();
         let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
         for skill in &skills {
-            assert!(
-                !skill.disabled,
-                "Skill {} should not be disabled",
-                skill.manifest.name
-            );
+            if DEFAULT_ENABLED_SKILLS.contains(&skill.manifest.name.as_str()) {
+                assert!(
+                    !skill.disabled,
+                    "Skill {} should be enabled by default",
+                    skill.manifest.name
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_default_disabled_skills() {
+        let config = SkillsConfig::default();
+        let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
+        for skill in &skills {
+            if !DEFAULT_ENABLED_SKILLS.contains(&skill.manifest.name.as_str()) {
+                assert!(
+                    skill.disabled,
+                    "Skill {} should be disabled by default",
+                    skill.manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_explicit_config_overrides_default() {
+        let mut entries = std::collections::HashMap::new();
+        // Explicitly enable a normally-disabled skill
+        entries.insert(
+            "docker".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: true,
+                env: std::collections::HashMap::new(),
+            },
+        );
+        // Explicitly disable a normally-enabled skill
+        entries.insert(
+            "git".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                env: std::collections::HashMap::new(),
+            },
+        );
+        let config = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 4000,
+            entries,
+        };
+        let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
+        let docker = skills.iter().find(|s| s.manifest.name == "docker").unwrap();
+        assert!(!docker.disabled, "docker should be explicitly enabled");
+        let git = skills.iter().find(|s| s.manifest.name == "git").unwrap();
+        assert!(git.disabled, "git should be explicitly disabled");
+    }
+
+    #[test]
+    fn test_skill_category_fallback() {
+        let config = SkillsConfig::default();
+        let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
+        let git = skills.iter().find(|s| s.manifest.name == "git").unwrap();
+        assert_eq!(git.category(), "developer");
+        let browser = skills
+            .iter()
+            .find(|s| s.manifest.name == "browser")
+            .unwrap();
+        assert_eq!(browser.category(), "utilities");
+        let calendar = skills
+            .iter()
+            .find(|s| s.manifest.name == "calendar")
+            .unwrap();
+        assert_eq!(calendar.category(), "productivity");
+        let email = skills.iter().find(|s| s.manifest.name == "email").unwrap();
+        assert_eq!(email.category(), "email");
+    }
+
+    #[test]
+    fn test_hidden_skills() {
+        let config = SkillsConfig::default();
+        let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
+        let skill_creator = skills
+            .iter()
+            .find(|s| s.manifest.name == "skill-creator")
+            .unwrap();
+        assert!(skill_creator.is_hidden());
+        let git = skills.iter().find(|s| s.manifest.name == "git").unwrap();
+        assert!(!git.is_hidden());
     }
 
     #[test]
@@ -1138,6 +1274,7 @@ Short body.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -1355,6 +1492,7 @@ Use docker commands.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install,
+                category: None,
             },
             body: String::new(),
             source: SkillSource::BuiltIn,
@@ -1550,6 +1688,7 @@ Use docker commands.
                 },
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -1579,6 +1718,7 @@ Use docker commands.
                 },
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "body".to_string(),
             source: SkillSource::User,
@@ -1613,6 +1753,7 @@ Use docker commands.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: "# Title\n\nFirst paragraph.".to_string(),
             source: SkillSource::BuiltIn,
@@ -1701,6 +1842,7 @@ Use docker commands.
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
+                category: None,
             },
             body: String::new(),
             source,

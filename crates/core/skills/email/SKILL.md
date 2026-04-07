@@ -1,6 +1,7 @@
 ---
 name: email
-description: "Manage emails via IMAP/SMTP. Use for reading, sending, replying, forwarding, searching, and organizing emails across Gmail, Outlook, iCloud, or any IMAP provider."
+description: "Manage emails via himalaya CLI. Read, send, reply, forward, search, and organize emails across Gmail, Outlook, Yahoo, iCloud, or any IMAP/SMTP provider."
+category: email
 requires:
   bins: ["himalaya"]
 ---
