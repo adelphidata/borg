@@ -1,7 +1,11 @@
-use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
-use crate::handler::InboundMessage;
+use base64::Engine;
+use tracing::warn;
 
-use super::types::{Mention, SignalEnvelope};
+use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
+use crate::handler::{InboundAttachment, InboundMessage};
+
+use super::api::SignalClient;
+use super::types::{Attachment, Mention, SignalEnvelope};
 
 /// Replace Signal mention placeholders (U+FFFC) with `@name` text.
 ///
@@ -174,6 +178,46 @@ pub fn parse_envelope(envelope: &SignalEnvelope, own_account: &str) -> Option<In
             Some(PEER_KIND_DIRECT.to_string())
         },
     })
+}
+
+/// Enrich an `InboundMessage` by downloading attachment data from the signal-cli daemon.
+///
+/// For each attachment with a valid `id`, attempts to download the binary content
+/// and populate `msg.attachments`. On failure, logs a warning and keeps the existing
+/// text placeholder.
+pub async fn enrich_attachments(
+    msg: &mut InboundMessage,
+    raw_attachments: &[Attachment],
+    client: &SignalClient,
+    max_bytes: u64,
+) {
+    for att in raw_attachments {
+        let Some(ref id) = att.id else {
+            continue;
+        };
+
+        match client.download_attachment(id, max_bytes).await {
+            Ok(bytes) => {
+                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let mime_type = att
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                msg.attachments.push(InboundAttachment {
+                    mime_type,
+                    data,
+                    filename: att.filename.clone(),
+                });
+            }
+            Err(e) => {
+                warn!(
+                    attachment_id = id,
+                    error = %e,
+                    "Failed to download Signal attachment; keeping text placeholder"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -747,5 +791,78 @@ mod tests {
         );
         let msg = parse_envelope(&env, "+15559876543").unwrap();
         assert!(msg.text.contains("unknown's message"));
+    }
+
+    // ── Enrich attachments tests ──
+
+    #[test]
+    fn enrich_skips_attachment_without_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let client = SignalClient::new("http://localhost:9999", "+15550000000").unwrap();
+            let mut msg = InboundMessage {
+                sender_id: "test".into(),
+                text: "[Attachment: file.txt]".into(),
+                channel_id: None,
+                thread_id: None,
+                message_id: None,
+                thread_ts: None,
+                attachments: vec![],
+                reaction: None,
+                metadata: serde_json::Value::Null,
+                peer_kind: None,
+            };
+            let raw = vec![Attachment {
+                content_type: Some("text/plain".into()),
+                filename: Some("file.txt".into()),
+                id: None, // No ID — should be skipped
+                size: Some(100),
+            }];
+            enrich_attachments(&mut msg, &raw, &client, 10_000).await;
+            assert!(
+                msg.attachments.is_empty(),
+                "No attachment should be added without ID"
+            );
+        });
+    }
+
+    #[test]
+    fn enrich_gracefully_handles_download_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Client pointing to a non-existent server
+            let client = SignalClient::new("http://127.0.0.1:1", "+15550000000").unwrap();
+            let mut msg = InboundMessage {
+                sender_id: "test".into(),
+                text: "[Attachment: photo.jpg]".into(),
+                channel_id: None,
+                thread_id: None,
+                message_id: None,
+                thread_ts: None,
+                attachments: vec![],
+                reaction: None,
+                metadata: serde_json::Value::Null,
+                peer_kind: None,
+            };
+            let raw = vec![Attachment {
+                content_type: Some("image/jpeg".into()),
+                filename: Some("photo.jpg".into()),
+                id: Some("att-fail".into()),
+                size: Some(50000),
+            }];
+            // Should not panic, just log warning
+            enrich_attachments(&mut msg, &raw, &client, 10_000).await;
+            assert!(
+                msg.attachments.is_empty(),
+                "Failed download should not produce attachment"
+            );
+            assert!(msg.text.contains("[Attachment: photo.jpg]"));
+        });
     }
 }

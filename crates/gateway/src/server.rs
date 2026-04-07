@@ -399,9 +399,9 @@ impl GatewayServer {
                         {
                             Ok((response_text, _)) => {
                                 let send_result = if let Some(ref gid) = group_id {
-                                    client.send_group_message(gid, &response_text).await
+                                    client.send_group_message(gid, &response_text, None).await
                                 } else {
-                                    client.send_message(&recipient, &response_text).await
+                                    client.send_message(&recipient, &response_text, None).await
                                 };
                                 if let Err(e) = send_result {
                                     warn!("Failed to send Signal response: {e}");

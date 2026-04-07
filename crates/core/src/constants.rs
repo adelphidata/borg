@@ -104,6 +104,8 @@ pub const SIGNAL_SSE_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 pub const SIGNAL_MESSAGE_CHUNK_SIZE: usize = 4000;
 /// Timeout in seconds for Signal CLI RPC calls.
 pub const SIGNAL_RPC_TIMEOUT_SECS: u64 = 10;
+/// Maximum attachment size in bytes for Signal downloads (10 MB).
+pub const SIGNAL_MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum number of retries for gateway outbound requests.
 pub const RETRY_MAX_RETRIES: u32 = 5;

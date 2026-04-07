@@ -167,7 +167,105 @@ impl TeamsClient {
         self.send_with_retry(&url, &typing).await
     }
 
-    /// Send a single request with 429 retry logic.
+    /// Send an arbitrary activity to a conversation (used by streaming).
+    pub async fn send_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity: &ReplyActivity,
+    ) -> Result<()> {
+        validate_service_url(service_url)?;
+        let base = ensure_trailing_slash(service_url);
+        let url = format!("{base}v3/conversations/{conversation_id}/activities");
+        self.send_with_retry(&url, activity).await
+    }
+
+    /// Send an activity as a reply to a specific activity (used by streaming finalize).
+    pub async fn send_reply_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        activity: &ReplyActivity,
+    ) -> Result<()> {
+        validate_service_url(service_url)?;
+        let base = ensure_trailing_slash(service_url);
+        let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+        self.send_with_retry(&url, activity).await
+    }
+
+    /// Edit (update) an existing activity in a conversation.
+    pub async fn edit_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        new_text: &str,
+    ) -> Result<()> {
+        validate_service_url(service_url)?;
+        let base = ensure_trailing_slash(service_url);
+        let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+        let body = ReplyActivity::message(new_text);
+        let token = self.get_token().await?;
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to edit Teams activity")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok());
+        let kind = super::errors::classify_status(status.as_u16(), retry_after);
+        let hint = super::errors::error_hint(&kind);
+        let error_body = resp.text().await.unwrap_or_default();
+        bail!("Teams edit_activity failed ({status}): {hint} — {error_body}");
+    }
+
+    /// Delete an activity from a conversation.
+    pub async fn delete_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+    ) -> Result<()> {
+        validate_service_url(service_url)?;
+        let base = ensure_trailing_slash(service_url);
+        let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+        let token = self.get_token().await?;
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .context("Failed to delete Teams activity")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok());
+        let kind = super::errors::classify_status(status.as_u16(), retry_after);
+        let hint = super::errors::error_hint(&kind);
+        let error_body = resp.text().await.unwrap_or_default();
+        bail!("Teams delete_activity failed ({status}): {hint} — {error_body}");
+    }
+
+    /// Send a single request with 429 retry logic and error classification.
     async fn send_with_retry(&self, url: &str, body: &ReplyActivity) -> Result<()> {
         let policy = RateLimitPolicy {
             service_name: "Teams",
@@ -191,8 +289,19 @@ impl TeamsClient {
             return Ok(());
         }
 
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok());
+        let kind = super::errors::classify_status(status.as_u16(), retry_after);
+        let hint = super::errors::error_hint(&kind);
         let error_body = resp.text().await.unwrap_or_default();
-        bail!("Teams API request failed ({status}): {error_body}");
+        if let super::errors::TeamsErrorKind::Throttled { retry_after_secs } = &kind {
+            bail!(
+                "Teams API rate limited ({status}): retry after {retry_after_secs}s — {error_body}"
+            );
+        }
+        bail!("Teams API request failed ({status}): {hint} — {error_body}");
     }
 }
 
@@ -342,5 +451,43 @@ mod tests {
         let typing = super::super::types::ReplyActivity::typing();
         let json = serde_json::to_value(&typing).unwrap();
         assert_eq!(json["type"], "typing");
+    }
+
+    #[test]
+    fn url_construction_edit_activity() {
+        let base = ensure_trailing_slash("https://smba.trafficmanager.net/teams/");
+        let url = format!(
+            "{base}v3/conversations/{conv}/activities/{act}",
+            conv = "conv-123",
+            act = "act-456"
+        );
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/teams/v3/conversations/conv-123/activities/act-456"
+        );
+    }
+
+    #[test]
+    fn url_construction_delete_activity() {
+        let base = ensure_trailing_slash("https://smba.trafficmanager.net/teams");
+        let url = format!(
+            "{base}v3/conversations/{conv}/activities/{act}",
+            conv = "c1",
+            act = "a1"
+        );
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/teams/v3/conversations/c1/activities/a1"
+        );
+    }
+
+    #[test]
+    fn send_activity_url_construction() {
+        let base = ensure_trailing_slash("https://smba.trafficmanager.net/teams/");
+        let url = format!("{base}v3/conversations/{conv}/activities", conv = "conv-1");
+        assert_eq!(
+            url,
+            "https://smba.trafficmanager.net/teams/v3/conversations/conv-1/activities"
+        );
     }
 }

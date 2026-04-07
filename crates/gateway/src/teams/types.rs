@@ -90,6 +90,9 @@ pub struct ReplyActivity {
     /// Adaptive Card attachments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<AdaptiveCardAttachment>>,
+    /// Entities attached to the activity (e.g. streaminfo for streaming).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<serde_json::Value>>,
 }
 
 impl ReplyActivity {
@@ -99,6 +102,7 @@ impl ReplyActivity {
             activity_type: "message".to_string(),
             text: text.into(),
             attachments: None,
+            entities: None,
         }
     }
 
@@ -108,6 +112,7 @@ impl ReplyActivity {
             activity_type: "typing".to_string(),
             text: String::new(),
             attachments: None,
+            entities: None,
         }
     }
 
@@ -120,6 +125,38 @@ impl ReplyActivity {
                 content_type: "application/vnd.microsoft.card.adaptive".to_string(),
                 content: card,
             }]),
+            entities: None,
+        }
+    }
+
+    /// Create a streaming typing activity with `streaminfo` entity.
+    ///
+    /// Teams renders these as a progress indicator while the bot is generating.
+    pub fn streaming_typing(text: impl Into<String>, sequence: u32) -> Self {
+        Self {
+            activity_type: "typing".to_string(),
+            text: text.into(),
+            attachments: None,
+            entities: Some(vec![serde_json::json!({
+                "type": "streaminfo",
+                "streamType": "streaming",
+                "streamSequence": sequence,
+            })]),
+        }
+    }
+
+    /// Create a final streaming message activity.
+    ///
+    /// Closes the streaming session with `streamType: "final"`.
+    pub fn streaming_final(text: impl Into<String>) -> Self {
+        Self {
+            activity_type: "message".to_string(),
+            text: text.into(),
+            attachments: None,
+            entities: Some(vec![serde_json::json!({
+                "type": "streaminfo",
+                "streamType": "final",
+            })]),
         }
     }
 }

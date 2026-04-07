@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::format::{chunk_with_styles, FormattedText, TextStyle};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 use crate::chunker;
 use crate::circuit_breaker::CircuitBreaker;
@@ -96,37 +97,164 @@ impl SignalClient {
 
     /// Send a text message to a recipient (phone number or UUID).
     /// Automatically chunks text exceeding the limit.
-    pub async fn send_message(&self, recipient: &str, text: &str) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
-        for chunk in &chunks {
-            let params = serde_json::json!({
-                "account": self.account,
-                "recipient": [recipient],
-                "message": chunk,
-            });
-            let resp = self.rpc_call("send", params).await?;
-            if let Some(ref err) = resp.error {
-                bail!("Signal send failed (code {}): {}", err.code, err.message);
+    /// When `styles` is provided, includes Signal text style ranges in the RPC call.
+    pub async fn send_message(
+        &self,
+        recipient: &str,
+        text: &str,
+        styles: Option<&[TextStyle]>,
+    ) -> Result<()> {
+        match styles {
+            Some(style_list) if !style_list.is_empty() => {
+                let formatted = FormattedText {
+                    text: text.to_string(),
+                    styles: style_list.to_vec(),
+                };
+                let chunks = chunk_with_styles(&formatted, MESSAGE_CHUNK_SIZE);
+                for chunk in &chunks {
+                    let text_styles: Vec<_> = chunk
+                        .styles
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "start": s.start,
+                                "length": s.length,
+                                "style": s.style,
+                            })
+                        })
+                        .collect();
+                    let mut params = serde_json::json!({
+                        "account": self.account,
+                        "recipient": [recipient],
+                        "message": chunk.text,
+                    });
+                    if !text_styles.is_empty() {
+                        params["textStyle"] = serde_json::Value::Array(text_styles);
+                    }
+                    let resp = self.rpc_call("send", params).await?;
+                    if let Some(ref err) = resp.error {
+                        bail!("Signal send failed (code {}): {}", err.code, err.message);
+                    }
+                }
+            }
+            _ => {
+                let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
+                for chunk in &chunks {
+                    let params = serde_json::json!({
+                        "account": self.account,
+                        "recipient": [recipient],
+                        "message": chunk,
+                    });
+                    let resp = self.rpc_call("send", params).await?;
+                    if let Some(ref err) = resp.error {
+                        bail!("Signal send failed (code {}): {}", err.code, err.message);
+                    }
+                }
             }
         }
         Ok(())
     }
 
     /// Send a text message to a group.
-    pub async fn send_group_message(&self, group_id: &str, text: &str) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
-        for chunk in &chunks {
-            let params = serde_json::json!({
-                "account": self.account,
-                "groupId": group_id,
-                "message": chunk,
-            });
-            let resp = self.rpc_call("send", params).await?;
-            if let Some(ref err) = resp.error {
-                bail!("Signal group send failed: {}", err.message);
+    /// When `styles` is provided, includes Signal text style ranges in the RPC call.
+    pub async fn send_group_message(
+        &self,
+        group_id: &str,
+        text: &str,
+        styles: Option<&[TextStyle]>,
+    ) -> Result<()> {
+        match styles {
+            Some(style_list) if !style_list.is_empty() => {
+                let formatted = FormattedText {
+                    text: text.to_string(),
+                    styles: style_list.to_vec(),
+                };
+                let chunks = chunk_with_styles(&formatted, MESSAGE_CHUNK_SIZE);
+                for chunk in &chunks {
+                    let text_styles: Vec<_> = chunk
+                        .styles
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "start": s.start,
+                                "length": s.length,
+                                "style": s.style,
+                            })
+                        })
+                        .collect();
+                    let mut params = serde_json::json!({
+                        "account": self.account,
+                        "groupId": group_id,
+                        "message": chunk.text,
+                    });
+                    if !text_styles.is_empty() {
+                        params["textStyle"] = serde_json::Value::Array(text_styles);
+                    }
+                    let resp = self.rpc_call("send", params).await?;
+                    if let Some(ref err) = resp.error {
+                        bail!("Signal group send failed: {}", err.message);
+                    }
+                }
+            }
+            _ => {
+                let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
+                for chunk in &chunks {
+                    let params = serde_json::json!({
+                        "account": self.account,
+                        "groupId": group_id,
+                        "message": chunk,
+                    });
+                    let resp = self.rpc_call("send", params).await?;
+                    if let Some(ref err) = resp.error {
+                        bail!("Signal group send failed: {}", err.message);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Download an attachment from the signal-cli daemon by ID.
+    ///
+    /// Returns the raw bytes. Rejects attachments exceeding `max_bytes`.
+    pub async fn download_attachment(
+        &self,
+        attachment_id: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let url = format!("{}/api/v1/attachments/{attachment_id}", self.base_url);
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to download Signal attachment")?;
+
+        if !resp.status().is_success() {
+            bail!("Signal attachment download failed ({})", resp.status());
+        }
+
+        // Check Content-Length before reading body to avoid OOM
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes {
+                bail!("Signal attachment too large ({len} bytes, max {max_bytes})");
+            }
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read attachment body")?;
+
+        if bytes.len() as u64 > max_bytes {
+            bail!(
+                "Signal attachment too large ({} bytes, max {max_bytes})",
+                bytes.len()
+            );
+        }
+
+        Ok(bytes.to_vec())
     }
 
     /// Send a typing indicator to a recipient or group.

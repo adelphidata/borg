@@ -1,7 +1,11 @@
 pub mod api;
 pub mod channel;
 pub mod dedup;
+/// Teams API error classification for structured retry and logging.
+pub mod errors;
 pub mod parse;
+/// Teams streaming message protocol with `streaminfo` entities.
+pub mod stream;
 pub mod types;
 pub mod verify;
 
