@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::types::{CreateMessageRequest, CurrentUser, InteractionResponse};
 use crate::chunker;
@@ -13,6 +13,54 @@ use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const DISCORD_MESSAGE_CHUNK_SIZE: usize = 2000;
+
+/// Validate that a Discord snowflake ID is numeric (prevents path traversal in URL interpolation).
+fn validate_snowflake(id: &str, label: &str) -> Result<()> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
+        bail!("Invalid Discord {label}: must be numeric, got {id:?}");
+    }
+    Ok(())
+}
+
+/// Discord API error codes that will never succeed on retry — the caller must
+/// intervene (fix token, grant permissions, etc.).
+const FATAL_DISCORD_ERROR_CODES: &[u64] = &[
+    10003, // Unknown Channel
+    10004, // Unknown Guild
+    10008, // Unknown Message
+    40001, // Unauthorized
+    50001, // Missing Access
+    50013, // Missing Permissions
+    50035, // Invalid Form Body
+];
+
+/// Parsed Discord error response body.
+#[derive(Deserialize)]
+struct DiscordErrorResponse {
+    code: Option<u64>,
+    message: Option<String>,
+}
+
+/// Returns `true` if the given HTTP status + error code combination is non-recoverable.
+pub(crate) fn is_fatal_discord_error(status: u16, code: Option<u64>) -> bool {
+    matches!(status, 401 | 403 | 404)
+        || code.is_some_and(|c| FATAL_DISCORD_ERROR_CODES.contains(&c))
+}
+
+/// Format a human-readable hint for a Discord API error code.
+fn discord_error_hint(code: u64) -> &'static str {
+    match code {
+        10003 => " — channel does not exist or bot cannot see it",
+        10004 => " — guild does not exist or bot is not a member",
+        10008 => " — message was deleted",
+        40001 => " — check DISCORD_BOT_TOKEN",
+        40005 => " — file exceeds Discord's size limit",
+        50001 => " — bot lacks access to this channel",
+        50013 => " — bot is missing required permissions",
+        50035 => " — request body is malformed",
+        _ => "",
+    }
+}
 
 /// A client for the Discord REST API.
 #[derive(Clone)]
@@ -161,6 +209,7 @@ impl DiscordClient {
 
     /// Send a message to a channel, chunking at 2000 characters.
     pub async fn send_message(&self, channel_id: &str, text: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
         let chunks = chunker::chunk_text_nonempty(text, DISCORD_MESSAGE_CHUNK_SIZE);
 
         for chunk in &chunks {
@@ -194,6 +243,7 @@ impl DiscordClient {
     /// Trigger a typing indicator in a channel.
     /// POST /channels/{channel_id}/typing
     pub async fn trigger_typing_indicator(&self, channel_id: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/typing");
         let token = self.token.clone();
         let client = self.client.clone();
@@ -224,6 +274,8 @@ impl DiscordClient {
         message_id: &str,
         emoji: &str,
     ) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
         let url = format!(
             "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
         );
@@ -281,6 +333,53 @@ impl DiscordClient {
         Ok(())
     }
 
+    /// Fetch recent messages from a Discord channel via GET /channels/{id}/messages.
+    pub async fn get_channel_messages(
+        &self,
+        channel_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ChannelMessage>> {
+        validate_snowflake(channel_id, "channel_id")?;
+        let limit = limit.min(100);
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let limit_str = limit.to_string();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                let limit_str = limit_str.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .query(&[("limit", &limit_str)])
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        let raw_messages: Vec<RawChannelMessage> = resp
+            .json()
+            .await
+            .context("Failed to parse channel messages response")?;
+
+        Ok(raw_messages
+            .into_iter()
+            .map(|m| ChannelMessage {
+                author_id: m.author.id,
+                author_username: m.author.username,
+                content: m.content,
+                id: m.id,
+            })
+            .collect())
+    }
+
     /// Send a request with 429 rate-limit retry logic using the shared retry helper.
     async fn send_with_retry<F, Fut>(&self, make_request: F) -> Result<reqwest::Response>
     where
@@ -297,7 +396,22 @@ impl DiscordClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            bail!("Discord API error ({status}): {body}");
+            let parsed: Option<DiscordErrorResponse> = serde_json::from_str(&body).ok();
+            let code = parsed.as_ref().and_then(|p| p.code);
+            let msg = parsed
+                .as_ref()
+                .and_then(|p| p.message.as_deref())
+                .unwrap_or(&body);
+            let hint = code.map(discord_error_hint).unwrap_or("");
+
+            if is_fatal_discord_error(status.as_u16(), code) {
+                error!(
+                    "Discord API FATAL error ({status}): {msg}{hint} — this will not be retried"
+                );
+                bail!("Discord API FATAL ({status}): {msg}{hint}");
+            }
+
+            bail!("Discord API error ({status}): {msg}{hint}");
         }
 
         Ok(resp)
@@ -333,6 +447,30 @@ impl NativeCommandRegistration for DiscordClient {
 
         self.register_global_commands(app_id, &payloads).await
     }
+}
+
+/// A message from Discord's channel messages endpoint.
+#[derive(Debug, Clone)]
+pub struct ChannelMessage {
+    pub author_id: String,
+    pub author_username: String,
+    pub content: String,
+    pub id: String,
+}
+
+/// Raw Discord message for deserialization.
+#[derive(Deserialize)]
+struct RawChannelMessage {
+    id: String,
+    content: String,
+    author: RawAuthor,
+}
+
+/// Raw Discord author for deserialization.
+#[derive(Deserialize)]
+struct RawAuthor {
+    id: String,
+    username: String,
 }
 
 #[cfg(test)]
@@ -414,5 +552,116 @@ mod tests {
             url,
             "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%8D/@me"
         );
+    }
+
+    // ── Error classification tests ──
+
+    #[test]
+    fn is_fatal_discord_error_classifies_auth() {
+        assert!(is_fatal_discord_error(401, None));
+        assert!(is_fatal_discord_error(200, Some(40001)));
+    }
+
+    #[test]
+    fn is_fatal_discord_error_classifies_permissions() {
+        assert!(is_fatal_discord_error(403, None));
+        assert!(is_fatal_discord_error(404, None));
+        assert!(is_fatal_discord_error(200, Some(50001)));
+        assert!(is_fatal_discord_error(200, Some(50013)));
+    }
+
+    #[test]
+    fn is_fatal_discord_error_classifies_channel_errors() {
+        assert!(is_fatal_discord_error(200, Some(10003)));
+        assert!(is_fatal_discord_error(200, Some(10004)));
+        assert!(is_fatal_discord_error(200, Some(10008)));
+    }
+
+    #[test]
+    fn is_fatal_discord_error_excludes_transient() {
+        assert!(!is_fatal_discord_error(429, None));
+        assert!(!is_fatal_discord_error(500, None));
+        assert!(!is_fatal_discord_error(502, None));
+        assert!(!is_fatal_discord_error(503, None));
+        assert!(!is_fatal_discord_error(200, None));
+        assert!(!is_fatal_discord_error(200, Some(99999)));
+    }
+
+    #[test]
+    fn discord_error_hint_present_for_known() {
+        assert!(discord_error_hint(10003).contains("channel"));
+        assert!(discord_error_hint(10004).contains("guild"));
+        assert!(discord_error_hint(40001).contains("DISCORD_BOT_TOKEN"));
+        assert!(discord_error_hint(50001).contains("access"));
+        assert!(discord_error_hint(50013).contains("permissions"));
+        assert!(discord_error_hint(50035).contains("malformed"));
+        assert!(discord_error_hint(40005).contains("size"));
+    }
+
+    #[test]
+    fn discord_error_hint_empty_for_unknown() {
+        assert_eq!(discord_error_hint(99999), "");
+        assert_eq!(discord_error_hint(0), "");
+    }
+
+    #[test]
+    fn discord_error_response_deserialization() {
+        let json = r#"{"code": 50001, "message": "Missing Access"}"#;
+        let parsed: DiscordErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.code, Some(50001));
+        assert_eq!(parsed.message.as_deref(), Some("Missing Access"));
+    }
+
+    #[test]
+    fn discord_error_response_partial() {
+        let json = r#"{"message": "Unknown error"}"#;
+        let parsed: DiscordErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.code, None);
+        assert_eq!(parsed.message.as_deref(), Some("Unknown error"));
+    }
+
+    // ── Channel history tests ──
+
+    #[test]
+    fn channel_messages_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/789/messages"),
+            "https://discord.com/api/v10/channels/789/messages"
+        );
+    }
+
+    #[test]
+    fn validate_snowflake_accepts_numeric() {
+        assert!(validate_snowflake("123456789", "test").is_ok());
+        assert!(validate_snowflake("0", "test").is_ok());
+    }
+
+    #[test]
+    fn validate_snowflake_rejects_non_numeric() {
+        assert!(validate_snowflake("", "test").is_err());
+        assert!(validate_snowflake("abc", "test").is_err());
+        assert!(validate_snowflake("123/../../users/@me", "test").is_err());
+        assert!(validate_snowflake("123 456", "test").is_err());
+    }
+
+    #[test]
+    fn channel_message_deserialization() {
+        let json = r#"[
+            {
+                "id": "msg1",
+                "content": "hello world",
+                "author": { "id": "u1", "username": "alice" }
+            },
+            {
+                "id": "msg2",
+                "content": "hi there",
+                "author": { "id": "u2", "username": "bob" }
+            }
+        ]"#;
+        let raw: Vec<RawChannelMessage> = serde_json::from_str(json).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(raw[0].id, "msg1");
+        assert_eq!(raw[0].author.username, "alice");
+        assert_eq!(raw[1].content, "hi there");
     }
 }

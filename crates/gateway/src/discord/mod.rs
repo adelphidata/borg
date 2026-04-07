@@ -4,6 +4,8 @@ pub mod api;
 pub mod channel;
 /// Bounded deduplicator for Discord interaction IDs.
 pub mod dedup;
+/// Markdown formatting for Discord messages.
+pub mod format;
 /// Discord interaction parsing into inbound messages.
 pub mod parse;
 /// Discord API type definitions.

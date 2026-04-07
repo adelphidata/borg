@@ -90,7 +90,7 @@ impl NativeChannel for DiscordChannel {
                 Ok(WebhookOutcome::Skip)
             }
             DiscordWebhookResult::Skip => Ok(WebhookOutcome::Skip),
-            DiscordWebhookResult::Message(inbound, interaction) => {
+            DiscordWebhookResult::Message(mut inbound, interaction) => {
                 // Deduplicate on interaction ID. Discord retries webhooks on
                 // non-2xx responses and occasional transient conditions;
                 // without this check the agent can be invoked twice for the
@@ -117,6 +117,42 @@ impl NativeChannel for DiscordChannel {
                     .await
                 {
                     tracing::warn!("Failed to send Discord deferred response: {e}");
+                }
+
+                // Channel history context injection for guild (group) interactions.
+                // Skip for DMs (no useful channel context) to save rate-limit budget.
+                let is_guild = inbound
+                    .peer_kind
+                    .as_deref()
+                    .is_some_and(|pk| pk == crate::constants::PEER_KIND_GROUP);
+                if is_guild {
+                    if let Some(ref channel_id) = inbound.channel_id {
+                        match self.client.get_channel_messages(channel_id, 10).await {
+                            Ok(history) if !history.is_empty() => {
+                                const MAX_CONTEXT_CHARS: usize = 8000;
+                                let mut context = String::new();
+                                for m in history.iter().rev() {
+                                    let line = format!("{}: {}\n", m.author_username, m.content);
+                                    if context.len() + line.len() > MAX_CONTEXT_CHARS {
+                                        break;
+                                    }
+                                    context.push_str(&line);
+                                }
+                                if !context.is_empty() {
+                                    inbound.text = format!(
+                                        "[Channel context]\n{context}[Current message]\n{}",
+                                        inbound.text
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to fetch Discord channel history for context: {e}"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let session_key =
@@ -146,19 +182,17 @@ impl NativeChannel for DiscordChannel {
     ) -> Result<()> {
         let ctx: DiscordResponseContext = serde_json::from_value(response_context.clone())?;
 
+        let formatted = super::format::markdown_to_discord(response_text);
+
         if let Some(ref app_id) = ctx.application_id {
             if let Err(e) = self
                 .client
-                .edit_original_response(app_id, &ctx.interaction_token, response_text)
+                .edit_original_response(app_id, &ctx.interaction_token, &formatted)
                 .await
             {
                 tracing::warn!("Failed to edit Discord interaction response: {e}");
                 // Fallback: send as channel message
-                if let Err(e2) = self
-                    .client
-                    .send_message(&ctx.channel_id, response_text)
-                    .await
-                {
+                if let Err(e2) = self.client.send_message(&ctx.channel_id, &formatted).await {
                     health
                         .write()
                         .await
@@ -166,11 +200,7 @@ impl NativeChannel for DiscordChannel {
                     return Err(e2);
                 }
             }
-        } else if let Err(e) = self
-            .client
-            .send_message(&ctx.channel_id, response_text)
-            .await
-        {
+        } else if let Err(e) = self.client.send_message(&ctx.channel_id, &formatted).await {
             health.write().await.record_error("discord", &e.to_string());
             return Err(e);
         }
