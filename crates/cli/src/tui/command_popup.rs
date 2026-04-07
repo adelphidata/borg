@@ -99,8 +99,12 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Manage plugins, channels, and tools",
     },
     SlashCommandDef {
+        name: "/projects",
+        description: "List projects",
+    },
+    SlashCommandDef {
         name: "/schedule",
-        description: "Manage scheduled tasks",
+        description: "Manage scheduled tasks and workflows",
     },
     SlashCommandDef {
         name: "/migrate",
@@ -361,6 +365,7 @@ mod tests {
             "/new",
             "/load",
             "/plugins",
+            "/projects",
             "/schedule",
             "/migrate",
             "/restart",
