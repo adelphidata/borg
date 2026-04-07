@@ -73,6 +73,9 @@ const COLLAB_MODE_DEFAULT: &str = include_str!("../templates/collaboration_mode/
 const COLLAB_MODE_EXECUTE: &str = include_str!("../templates/collaboration_mode/execute.md");
 const COLLAB_MODE_PLAN: &str = include_str!("../templates/collaboration_mode/plan.md");
 
+// Workflow guidance template (injected when workflows are active for current model)
+const WORKFLOW_GUIDANCE: &str = include_str!("../templates/workflow_guidance.md");
+
 /// Maximum number of parallel tool calls allowed in a single LLM response.
 /// Prevents OOM from malformed stream events with huge indices.
 const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
@@ -635,6 +638,15 @@ impl Agent {
         format!("\n<collaboration_mode>\n{mode_template}\n</collaboration_mode>\n")
     }
 
+    /// Build the `<workflow_guidance>` section when workflows are active.
+    fn build_workflow_guidance_section(&self) -> String {
+        if crate::workflow::workflows_active(&self.config) {
+            format!("\n<workflow_guidance>\n{WORKFLOW_GUIDANCE}\n</workflow_guidance>\n")
+        } else {
+            String::new()
+        }
+    }
+
     #[instrument(skip_all)]
     async fn build_system_prompt(&mut self) -> Result<String> {
         // Use cached identity or load + cache it
@@ -724,6 +736,7 @@ impl Agent {
         // (time, git status) changes every turn — keep them last so they do
         // not invalidate the cached prefix above.
         system.push_str(&self.build_collaboration_section());
+        system.push_str(&self.build_workflow_guidance_section());
         system.push_str(&self.build_environment_section().await);
 
         // Inject first-conversation instructions from SETUP.md (created during onboarding)
@@ -1991,6 +2004,44 @@ mod tests {
         assert!(
             env_idx > coding_idx,
             "dynamic environment section must come after coding_instructions",
+        );
+    }
+
+    #[test]
+    fn workflow_guidance_template_is_not_empty() {
+        assert!(
+            !WORKFLOW_GUIDANCE.trim().is_empty(),
+            "workflow_guidance.md template must not be empty",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_workflow_guidance_after_collaboration() {
+        let body = extract_build_system_prompt_body();
+        let collab_idx = body
+            .find("build_collaboration_section")
+            .expect("build_collaboration_section call must exist");
+        let wf_idx = body
+            .find("build_workflow_guidance_section")
+            .expect("build_workflow_guidance_section call must exist");
+        assert!(
+            wf_idx > collab_idx,
+            "workflow guidance must come after collaboration section",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_workflow_guidance_before_environment() {
+        let body = extract_build_system_prompt_body();
+        let wf_idx = body
+            .find("build_workflow_guidance_section")
+            .expect("build_workflow_guidance_section call must exist");
+        let env_idx = body
+            .find("build_environment_section")
+            .expect("build_environment_section call must exist");
+        assert!(
+            wf_idx < env_idx,
+            "workflow guidance must come before environment section",
         );
     }
 
