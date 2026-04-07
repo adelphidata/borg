@@ -24,6 +24,7 @@ use super::layout;
 use super::migrate_popup::{MigrateAction, MigratePopup};
 use super::plan_overlay::{PlanOption, PlanOverlay};
 use super::plugins_popup::{PluginAction, PluginsPopup};
+use super::projects_popup::{ProjectAction, ProjectsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
@@ -123,6 +124,9 @@ pub enum AppAction {
     RunScheduleActions {
         actions: Vec<ScheduleAction>,
     },
+    RunProjectActions {
+        actions: Vec<ProjectAction>,
+    },
     RunMigration {
         actions: Vec<MigrateAction>,
     },
@@ -166,6 +170,7 @@ pub struct App<'a> {
     /// so the post-turn review overlay can restore it on "Proceed". `None` when the
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
+    pub projects_popup: ProjectsPopup,
     pub schedule_popup: SchedulePopup,
     pub migrate_popup: MigratePopup,
     pub file_popup: FileSearchPopup,
@@ -215,6 +220,7 @@ impl<'a> App<'a> {
             backtrack: BacktrackPhase::Inactive,
             plan_overlay: PlanOverlay::new(),
             previous_collab_mode: None,
+            projects_popup: ProjectsPopup::new(),
             schedule_popup: SchedulePopup::new(),
             migrate_popup: MigratePopup::new(),
             file_popup: FileSearchPopup::with_config(
@@ -256,6 +262,7 @@ impl<'a> App<'a> {
     pub fn any_popup_visible(&self) -> bool {
         self.settings_popup.is_visible()
             || self.plugins_popup.is_visible()
+            || self.projects_popup.is_visible()
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
@@ -276,6 +283,10 @@ impl<'a> App<'a> {
         }
         if self.plugins_popup.is_visible() {
             self.plugins_popup.handle_paste(&text);
+            return AppAction::Continue;
+        }
+        if self.projects_popup.is_visible() {
+            self.projects_popup.handle_paste(&text);
             return AppAction::Continue;
         }
         if self.schedule_popup.is_visible() {
@@ -588,6 +599,8 @@ impl<'a> App<'a> {
                         self.settings_popup.handle_key(key, &mut self.config)?;
                     } else if self.plugins_popup.is_visible() {
                         self.plugins_popup.handle_key(key);
+                    } else if self.projects_popup.is_visible() {
+                        self.projects_popup.handle_key(key);
                     } else if self.schedule_popup.is_visible() {
                         self.schedule_popup.handle_key(key);
                     }
@@ -614,6 +627,13 @@ impl<'a> App<'a> {
                 if self.plugins_popup.is_visible() {
                     if let Some(actions) = self.plugins_popup.handle_key(key) {
                         return Ok(AppAction::RunPlugins { actions });
+                    }
+                    return Ok(AppAction::Continue);
+                }
+
+                if self.projects_popup.is_visible() {
+                    if let Some(actions) = self.projects_popup.handle_key(key) {
+                        return Ok(AppAction::RunProjectActions { actions });
                     }
                     return Ok(AppAction::Continue);
                 }
@@ -1515,6 +1535,7 @@ impl<'a> App<'a> {
         self.file_popup.render(frame, app_layout.composer);
         self.settings_popup.render(frame, &self.config);
         self.plugins_popup.render(frame);
+        self.projects_popup.render(frame);
         self.schedule_popup.render(frame);
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);

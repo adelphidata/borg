@@ -14,6 +14,7 @@ mod paste_burst;
 mod plan_overlay;
 mod plugins_popup;
 mod popup_utils;
+mod projects_popup;
 mod schedule_popup;
 mod settings_popup;
 mod status_popup;
@@ -1092,6 +1093,107 @@ async fn run_event_loop(
                                         results.push(format!(
                                             "Workflow {} not found",
                                             &workflow_id[..8.min(workflow_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    results.push("Error: could not open database".to_string());
+                }
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::RunProjectActions { actions } => {
+                let mut results: Vec<String> = Vec::new();
+                if let Ok(db) = borg_core::db::Database::open() {
+                    for action in actions {
+                        match action {
+                            projects_popup::ProjectAction::Create {
+                                id,
+                                name,
+                                description,
+                            } => match db.create_project(&id, &name, &description) {
+                                Ok(()) => {
+                                    results.push(format!("Project '{name}' created"));
+                                }
+                                Err(e) => results.push(format!("Error: {e}")),
+                            },
+                            projects_popup::ProjectAction::Update {
+                                project_id,
+                                name,
+                                description,
+                            } => {
+                                match db.update_project(
+                                    &project_id,
+                                    name.as_deref(),
+                                    description.as_deref(),
+                                    None,
+                                ) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Project {} updated",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Project {} not found",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                            projects_popup::ProjectAction::Archive { project_id } => {
+                                match db.archive_project(&project_id) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Project {} archived",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Project {} not found or already archived",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                            projects_popup::ProjectAction::Unarchive { project_id } => {
+                                match db.update_project(&project_id, None, None, Some("active")) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Project {} unarchived",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Project {} not found",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                            projects_popup::ProjectAction::Delete { project_id } => {
+                                match db.delete_project(&project_id) {
+                                    Ok(true) => {
+                                        results.push(format!(
+                                            "Project {} deleted",
+                                            &project_id[..8.min(project_id.len())]
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "Project {} not found",
+                                            &project_id[..8.min(project_id.len())]
                                         ));
                                     }
                                     Err(e) => results.push(format!("Error: {e}")),

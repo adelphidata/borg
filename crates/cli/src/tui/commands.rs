@@ -33,7 +33,10 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/plugins" => return Some(self.cmd_plugins()),
-            "/projects" => return Some(self.cmd_projects()),
+            "/projects" => {
+                self.projects_popup.show();
+                return Some(Ok(AppAction::Continue));
+            }
             "/schedule-tasks" | "/schedule" => {
                 self.schedule_popup.show();
                 return Some(Ok(AppAction::Continue));
@@ -246,51 +249,6 @@ impl App<'_> {
         } else {
             self.push_system_message("Error: could not determine data directory".to_string());
         }
-        Ok(AppAction::Continue)
-    }
-
-    fn cmd_projects(&mut self) -> Result<AppAction> {
-        let mut output = String::from("Projects\n");
-        output.push_str("────────────────────────────────\n\n");
-        match borg_core::db::Database::open() {
-            Ok(db) => match db.list_projects(None) {
-                Ok(projects) if projects.is_empty() => {
-                    output.push_str("No projects.\n\nCreate one: ask the agent or use `borg projects create --name \"My Project\"`");
-                }
-                Ok(projects) => {
-                    for p in &projects {
-                        let short = &p.id[..8.min(p.id.len())];
-                        output.push_str(&format!("[{}] {} ({})", p.status, p.name, short));
-                        if !p.description.is_empty() {
-                            let desc: String = p.description.chars().take(50).collect();
-                            if desc.len() < p.description.len() {
-                                output.push_str(&format!("\n  {desc}..."));
-                            } else {
-                                output.push_str(&format!("\n  {desc}"));
-                            }
-                        }
-                        // Show workflow count
-                        if let Ok(wfs) = db.list_workflows_by_project(&p.id) {
-                            if !wfs.is_empty() {
-                                let running = wfs.iter().filter(|w| w.status == "running").count();
-                                let completed =
-                                    wfs.iter().filter(|w| w.status == "completed").count();
-                                output.push_str(&format!(
-                                    "\n  Workflows: {} total, {} running, {} completed",
-                                    wfs.len(),
-                                    running,
-                                    completed
-                                ));
-                            }
-                        }
-                        output.push('\n');
-                    }
-                }
-                Err(e) => output.push_str(&format!("Error: {e}\n")),
-            },
-            Err(e) => output.push_str(&format!("Database error: {e}\n")),
-        }
-        self.push_system_message(output.trim_end().to_string());
         Ok(AppAction::Continue)
     }
 
