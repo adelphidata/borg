@@ -14,7 +14,7 @@ enum ItemKind {
     /// A messaging channel from the catalog (install/uninstall with credentials).
     Channel { def: &'static PluginDef },
     /// A skill (enable/disable toggle).
-    Skill { available: bool },
+    Skill,
 }
 
 /// State for a single item in the unified plugins list.
@@ -120,9 +120,7 @@ impl PluginsPopup {
                     id: skill.manifest.name.clone(),
                     name: title_case(&skill.manifest.name),
                     category: cat,
-                    kind: ItemKind::Skill {
-                        available: skill.available,
-                    },
+                    kind: ItemKind::Skill,
                     original_enabled: enabled,
                     toggled: enabled,
                 });
@@ -352,7 +350,7 @@ impl PluginsPopup {
 
                         // Add skill actions
                         for item in &self.items {
-                            if matches!(item.kind, ItemKind::Skill { .. })
+                            if matches!(item.kind, ItemKind::Skill)
                                 && item.toggled != item.original_enabled
                             {
                                 final_actions.push(PluginAction::SetSkillEnabled {
@@ -403,7 +401,7 @@ impl PluginsPopup {
                 continue;
             }
             match &item.kind {
-                ItemKind::Skill { .. } => {
+                ItemKind::Skill => {
                     skill_actions.push(PluginAction::SetSkillEnabled {
                         name: item.id.clone(),
                         enabled: item.toggled,
@@ -464,15 +462,7 @@ impl PluginsPopup {
                         ""
                     }
                 }
-                ItemKind::Skill { available } => {
-                    if item.toggled && *available {
-                        " \u{2713} active"
-                    } else if item.toggled && !*available {
-                        " \u{2717} missing"
-                    } else {
-                        ""
-                    }
-                }
+                ItemKind::Skill => "",
             };
 
             // Platform note for channels
@@ -634,7 +624,7 @@ mod tests {
         let has_skill = popup
             .items
             .iter()
-            .any(|i| matches!(i.kind, ItemKind::Skill { .. }));
+            .any(|i| matches!(i.kind, ItemKind::Skill));
         assert!(has_channel, "should have channel items");
         assert!(has_skill, "should have skill items");
     }
@@ -704,7 +694,7 @@ mod tests {
         let skill_idx = popup
             .items
             .iter()
-            .position(|i| matches!(i.kind, ItemKind::Skill { .. }) && i.original_enabled)
+            .position(|i| matches!(i.kind, ItemKind::Skill) && i.original_enabled)
             .expect("should have an enabled skill");
 
         popup.cursor = skill_idx;
