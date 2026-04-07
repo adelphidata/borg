@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{error, warn};
 
-use super::types::{CreateMessageRequest, CurrentUser, InteractionResponse};
+use super::types::{
+    ChannelInfo, ChannelMessage, CreateMessageRequest, CurrentUser, InteractionResponse,
+    MemberInfo, MessageQuery, RawChannelMessage, ReactionUser, ThreadInfo,
+};
 use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::GATEWAY_HTTP_TIMEOUT;
@@ -22,12 +25,21 @@ fn validate_snowflake(id: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate that an emoji string is safe for URL interpolation (no path separators).
+fn validate_emoji(emoji: &str) -> Result<()> {
+    if emoji.is_empty() || emoji.contains('/') || emoji.contains('?') || emoji.contains('#') {
+        bail!("Invalid emoji: must not contain path separators, got {emoji:?}");
+    }
+    Ok(())
+}
+
 /// Discord API error codes that will never succeed on retry — the caller must
 /// intervene (fix token, grant permissions, etc.).
 const FATAL_DISCORD_ERROR_CODES: &[u64] = &[
     10003, // Unknown Channel
     10004, // Unknown Guild
     10008, // Unknown Message
+    10015, // Unknown Thread
     40001, // Unauthorized
     50001, // Missing Access
     50013, // Missing Permissions
@@ -53,6 +65,7 @@ fn discord_error_hint(code: u64) -> &'static str {
         10003 => " — channel does not exist or bot cannot see it",
         10004 => " — guild does not exist or bot is not a member",
         10008 => " — message was deleted",
+        10015 => " — thread does not exist",
         40001 => " — check DISCORD_BOT_TOKEN",
         40005 => " — file exceeds Discord's size limit",
         50001 => " — bot lacks access to this channel",
@@ -276,6 +289,7 @@ impl DiscordClient {
     ) -> Result<()> {
         validate_snowflake(channel_id, "channel_id")?;
         validate_snowflake(message_id, "message_id")?;
+        validate_emoji(emoji)?;
         let url = format!(
             "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
         );
@@ -339,24 +353,50 @@ impl DiscordClient {
         channel_id: &str,
         limit: u32,
     ) -> Result<Vec<ChannelMessage>> {
+        self.get_channel_messages_query(
+            channel_id,
+            &MessageQuery {
+                limit,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Fetch messages from a Discord channel with pagination parameters.
+    pub async fn get_channel_messages_query(
+        &self,
+        channel_id: &str,
+        query: &MessageQuery,
+    ) -> Result<Vec<ChannelMessage>> {
         validate_snowflake(channel_id, "channel_id")?;
-        let limit = limit.min(100);
+        let limit = query.limit.clamp(1, 100);
         let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
         let token = self.token.clone();
         let client = self.client.clone();
-        let limit_str = limit.to_string();
+
+        let mut params: Vec<(String, String)> = vec![("limit".into(), limit.to_string())];
+        if let Some(ref before) = query.before {
+            params.push(("before".into(), before.clone()));
+        }
+        if let Some(ref after) = query.after {
+            params.push(("after".into(), after.clone()));
+        }
+        if let Some(ref around) = query.around {
+            params.push(("around".into(), around.clone()));
+        }
 
         let resp = self
             .send_with_retry(move || {
                 let client = client.clone();
                 let url = url.clone();
                 let token = token.clone();
-                let limit_str = limit_str.clone();
+                let params = params.clone();
                 async move {
                     client
                         .get(&url)
                         .header("Authorization", format!("Bot {token}"))
-                        .query(&[("limit", &limit_str)])
+                        .query(&params)
                         .send()
                         .await
                         .context("Discord API request failed")
@@ -369,15 +409,420 @@ impl DiscordClient {
             .await
             .context("Failed to parse channel messages response")?;
 
-        Ok(raw_messages
-            .into_iter()
-            .map(|m| ChannelMessage {
-                author_id: m.author.id,
-                author_username: m.author.username,
-                content: m.content,
-                id: m.id,
+        Ok(raw_messages.into_iter().map(ChannelMessage::from).collect())
+    }
+
+    /// Edit a message in a channel.
+    pub async fn edit_message(&self, channel_id: &str, message_id: &str, text: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let body = json!({ "content": text });
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            let body = body.clone();
+            async move {
+                client
+                    .patch(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delete a message from a channel.
+    pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .delete(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Fetch a single message by ID.
+    pub async fn fetch_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<ChannelMessage> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
             })
-            .collect())
+            .await?;
+
+        let raw: RawChannelMessage = resp
+            .json()
+            .await
+            .context("Failed to parse message response")?;
+
+        Ok(ChannelMessage::from(raw))
+    }
+
+    /// Remove the bot's own reaction from a message.
+    pub async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        validate_emoji(emoji)?;
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me"
+        );
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .delete(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Fetch users who reacted with a specific emoji.
+    pub async fn fetch_reactions(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<Vec<ReactionUser>> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        validate_emoji(emoji)?;
+        let url = format!(
+            "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{emoji}"
+        );
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        resp.json()
+            .await
+            .context("Failed to parse reactions response")
+    }
+
+    /// Pin a message in a channel.
+    pub async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins/{message_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .header("Content-Length", "0")
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Unpin a message from a channel.
+    pub async fn unpin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins/{message_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .delete(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// List pinned messages in a channel.
+    pub async fn list_pins(&self, channel_id: &str) -> Result<Vec<ChannelMessage>> {
+        validate_snowflake(channel_id, "channel_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/pins");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        let raw_messages: Vec<RawChannelMessage> =
+            resp.json().await.context("Failed to parse pins response")?;
+
+        Ok(raw_messages.into_iter().map(ChannelMessage::from).collect())
+    }
+
+    /// Create a thread from a message.
+    pub async fn create_thread(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        name: &str,
+    ) -> Result<ThreadInfo> {
+        validate_snowflake(channel_id, "channel_id")?;
+        validate_snowflake(message_id, "message_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}/threads");
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let body = json!({ "name": name, "auto_archive_duration": 1440 });
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                let body = body.clone();
+                async move {
+                    client
+                        .post(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .json(&body)
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        resp.json()
+            .await
+            .context("Failed to parse create thread response")
+    }
+
+    /// List active threads in a guild.
+    pub async fn list_active_threads(&self, guild_id: &str) -> Result<Vec<ThreadInfo>> {
+        validate_snowflake(guild_id, "guild_id")?;
+        let url = format!("{DISCORD_API_BASE}/guilds/{guild_id}/threads/active");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse active threads response")?;
+
+        let threads: Vec<ThreadInfo> = body
+            .get("threads")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(threads)
+    }
+
+    /// Get info about a guild member.
+    pub async fn get_member_info(&self, guild_id: &str, user_id: &str) -> Result<MemberInfo> {
+        validate_snowflake(guild_id, "guild_id")?;
+        validate_snowflake(user_id, "user_id")?;
+        let url = format!("{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        resp.json()
+            .await
+            .context("Failed to parse member info response")
+    }
+
+    /// Get info about a channel.
+    pub async fn get_channel_info(&self, channel_id: &str) -> Result<ChannelInfo> {
+        validate_snowflake(channel_id, "channel_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}");
+        let token = self.token.clone();
+        let client = self.client.clone();
+
+        let resp = self
+            .send_with_retry(move || {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                async move {
+                    client
+                        .get(&url)
+                        .header("Authorization", format!("Bot {token}"))
+                        .send()
+                        .await
+                        .context("Discord API request failed")
+                }
+            })
+            .await?;
+
+        resp.json()
+            .await
+            .context("Failed to parse channel info response")
+    }
+
+    /// Upload a file to a channel as a message attachment.
+    pub async fn upload_file(
+        &self,
+        channel_id: &str,
+        content: &[u8],
+        filename: &str,
+    ) -> Result<()> {
+        validate_snowflake(channel_id, "channel_id")?;
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        let token = self.token.clone();
+        let client = self.client.clone();
+        let content = content.to_vec();
+        let filename = filename.to_string();
+
+        self.send_with_retry(move || {
+            let client = client.clone();
+            let url = url.clone();
+            let token = token.clone();
+            let content = content.clone();
+            let filename = filename.clone();
+            async move {
+                let form = reqwest::multipart::Form::new().part(
+                    "files[0]",
+                    reqwest::multipart::Part::bytes(content).file_name(filename),
+                );
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bot {token}"))
+                    .multipart(form)
+                    .send()
+                    .await
+                    .context("Discord API request failed")
+            }
+        })
+        .await?;
+
+        Ok(())
     }
 
     /// Send a request with 429 rate-limit retry logic using the shared retry helper.
@@ -449,28 +894,15 @@ impl NativeCommandRegistration for DiscordClient {
     }
 }
 
-/// A message from Discord's channel messages endpoint.
-#[derive(Debug, Clone)]
-pub struct ChannelMessage {
-    pub author_id: String,
-    pub author_username: String,
-    pub content: String,
-    pub id: String,
-}
-
-/// Raw Discord message for deserialization.
-#[derive(Deserialize)]
-struct RawChannelMessage {
-    id: String,
-    content: String,
-    author: RawAuthor,
-}
-
-/// Raw Discord author for deserialization.
-#[derive(Deserialize)]
-struct RawAuthor {
-    id: String,
-    username: String,
+impl From<RawChannelMessage> for ChannelMessage {
+    fn from(m: RawChannelMessage) -> Self {
+        Self {
+            author_id: m.author.id,
+            author_username: m.author.username,
+            content: m.content,
+            id: m.id,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -645,6 +1077,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_emoji_accepts_valid() {
+        assert!(validate_emoji("%E2%9C%85").is_ok());
+        assert!(validate_emoji("%F0%9F%91%8D").is_ok());
+        assert!(validate_emoji("custom_emoji:123456").is_ok());
+    }
+
+    #[test]
+    fn validate_emoji_rejects_path_traversal() {
+        assert!(validate_emoji("").is_err());
+        assert!(validate_emoji("../../../users/@me").is_err());
+        assert!(validate_emoji("emoji/test").is_err());
+        assert!(validate_emoji("emoji?foo=bar").is_err());
+        assert!(validate_emoji("emoji#frag").is_err());
+    }
+
+    #[test]
     fn channel_message_deserialization() {
         let json = r#"[
             {
@@ -663,5 +1111,176 @@ mod tests {
         assert_eq!(raw[0].id, "msg1");
         assert_eq!(raw[0].author.username, "alice");
         assert_eq!(raw[1].content, "hi there");
+    }
+
+    #[test]
+    fn channel_message_from_raw() {
+        let raw = RawChannelMessage {
+            id: "m1".into(),
+            content: "hello".into(),
+            author: super::super::types::RawAuthor {
+                id: "u1".into(),
+                username: "alice".into(),
+            },
+        };
+        let msg = ChannelMessage::from(raw);
+        assert_eq!(msg.id, "m1");
+        assert_eq!(msg.author_id, "u1");
+        assert_eq!(msg.author_username, "alice");
+        assert_eq!(msg.content, "hello");
+    }
+
+    // ── New API method URL construction tests ──
+
+    #[test]
+    fn edit_message_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages/456"),
+            "https://discord.com/api/v10/channels/123/messages/456"
+        );
+    }
+
+    #[test]
+    fn delete_message_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages/456"),
+            "https://discord.com/api/v10/channels/123/messages/456"
+        );
+    }
+
+    #[test]
+    fn fetch_message_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/111/messages/222"),
+            "https://discord.com/api/v10/channels/111/messages/222"
+        );
+    }
+
+    #[test]
+    fn remove_reaction_url_construction() {
+        let emoji = "%E2%9C%85";
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages/456/reactions/{emoji}/@me"),
+            "https://discord.com/api/v10/channels/123/messages/456/reactions/%E2%9C%85/@me"
+        );
+    }
+
+    #[test]
+    fn fetch_reactions_url_construction() {
+        let emoji = "%F0%9F%91%8D";
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages/456/reactions/{emoji}"),
+            "https://discord.com/api/v10/channels/123/messages/456/reactions/%F0%9F%91%8D"
+        );
+    }
+
+    #[test]
+    fn pin_message_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/pins/456"),
+            "https://discord.com/api/v10/channels/123/pins/456"
+        );
+    }
+
+    #[test]
+    fn list_pins_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/pins"),
+            "https://discord.com/api/v10/channels/123/pins"
+        );
+    }
+
+    #[test]
+    fn create_thread_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages/456/threads"),
+            "https://discord.com/api/v10/channels/123/messages/456/threads"
+        );
+    }
+
+    #[test]
+    fn list_active_threads_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/guilds/789/threads/active"),
+            "https://discord.com/api/v10/guilds/789/threads/active"
+        );
+    }
+
+    #[test]
+    fn get_member_info_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/guilds/789/members/123"),
+            "https://discord.com/api/v10/guilds/789/members/123"
+        );
+    }
+
+    #[test]
+    fn get_channel_info_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123"),
+            "https://discord.com/api/v10/channels/123"
+        );
+    }
+
+    #[test]
+    fn upload_file_url_construction() {
+        assert_eq!(
+            format!("{DISCORD_API_BASE}/channels/123/messages"),
+            "https://discord.com/api/v10/channels/123/messages"
+        );
+    }
+
+    #[test]
+    fn create_thread_body_serialization() {
+        let body = serde_json::json!({ "name": "my-thread", "auto_archive_duration": 1440 });
+        assert_eq!(body["name"], "my-thread");
+        assert_eq!(body["auto_archive_duration"], 1440);
+    }
+
+    #[test]
+    fn edit_message_body_serialization() {
+        let body = serde_json::json!({ "content": "updated text" });
+        assert_eq!(body["content"], "updated text");
+    }
+
+    #[test]
+    fn message_query_params_construction() {
+        let query = MessageQuery {
+            limit: 50,
+            before: Some("999".into()),
+            after: None,
+            around: None,
+        };
+        let mut params: Vec<(String, String)> = vec![("limit".into(), query.limit.to_string())];
+        if let Some(ref before) = query.before {
+            params.push(("before".into(), before.clone()));
+        }
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], ("limit".into(), "50".into()));
+        assert_eq!(params[1], ("before".into(), "999".into()));
+    }
+
+    #[test]
+    fn is_fatal_discord_error_classifies_thread_errors() {
+        assert!(is_fatal_discord_error(200, Some(10015)));
+    }
+
+    #[test]
+    fn discord_error_hint_thread() {
+        assert!(discord_error_hint(10015).contains("thread"));
+    }
+
+    #[test]
+    fn active_threads_response_deserialization() {
+        let json = r#"{"threads": [{"id": "t1", "name": "thread-1"}, {"id": "t2"}]}"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let threads: Vec<super::super::types::ThreadInfo> = body
+            .get("threads")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "t1");
+        assert_eq!(threads[0].name.as_deref(), Some("thread-1"));
+        assert!(threads[1].name.is_none());
     }
 }

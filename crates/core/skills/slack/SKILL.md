@@ -57,6 +57,77 @@ curl -s "https://slack.com/api/users.info?user=U123" \
   -H "Authorization: Bearer $SLACK_BOT_TOKEN"
 ```
 
+### Edit a message
+
+```bash
+curl -s -X POST https://slack.com/api/chat.update \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C123","ts":"1712023032.1234","text":"Updated message"}'
+```
+
+### Delete a message
+
+```bash
+curl -s -X POST https://slack.com/api/chat.delete \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C123","ts":"1712023032.1234"}'
+```
+
+### Fetch thread replies
+
+```bash
+curl -s "https://slack.com/api/conversations.replies?channel=C123&ts=1712023032.1234&limit=20" \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+```
+
+### List reactions on a message
+
+```bash
+curl -s "https://slack.com/api/reactions.get?channel=C123&timestamp=1712023032.1234&full=true" \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+```
+
+### Unpin a message
+
+```bash
+curl -s -X POST https://slack.com/api/pins.remove \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C123","timestamp":"1712023032.1234"}'
+```
+
+### List pinned messages
+
+```bash
+curl -s "https://slack.com/api/pins.list?channel=C123" \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+```
+
+### List channels
+
+```bash
+curl -s "https://slack.com/api/conversations.list?limit=100&types=public_channel,private_channel" \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+```
+
+### Get channel info
+
+```bash
+curl -s "https://slack.com/api/conversations.info?channel=C123" \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN"
+```
+
+### Send ephemeral message
+
+```bash
+curl -s -X POST https://slack.com/api/chat.postEphemeral \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"C123","user":"U456","text":"Only you can see this"}'
+```
+
 ## Notes
 
 - Channel IDs look like `C0123456789`, user IDs like `U0123456789`

@@ -251,6 +251,98 @@ pub struct CreateMessageRequest {
     pub content: String,
 }
 
+/// Query parameters for fetching channel messages with pagination.
+#[derive(Debug, Clone, Default)]
+pub struct MessageQuery {
+    /// Maximum number of messages to return (1-100).
+    pub limit: u32,
+    /// Get messages before this message ID.
+    pub before: Option<String>,
+    /// Get messages after this message ID.
+    pub after: Option<String>,
+    /// Get messages around this message ID.
+    pub around: Option<String>,
+}
+
+/// A user who reacted to a message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionUser {
+    /// User ID.
+    pub id: String,
+    /// Username.
+    pub username: String,
+}
+
+/// Info about a Discord thread channel.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ThreadInfo {
+    /// Thread channel ID.
+    pub id: String,
+    /// Thread name.
+    pub name: Option<String>,
+}
+
+/// Info about a Discord guild member.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberInfo {
+    /// The user object for this member.
+    pub user: Option<DiscordUser>,
+    /// Server-specific nickname.
+    pub nick: Option<String>,
+    /// Role IDs assigned to this member.
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+/// Info about a Discord channel.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelInfo {
+    /// Channel ID.
+    pub id: String,
+    /// Channel name.
+    pub name: Option<String>,
+    /// Channel type (0=text, 2=voice, 4=category, 5=announcement, 10/11/12=thread, 13=stage, 15=forum).
+    #[serde(rename = "type")]
+    pub channel_type: u8,
+    /// Channel topic.
+    pub topic: Option<String>,
+    /// Guild ID this channel belongs to.
+    pub guild_id: Option<String>,
+}
+
+/// A message from Discord's channel messages endpoint.
+#[derive(Debug, Clone)]
+pub struct ChannelMessage {
+    /// Author user ID.
+    pub author_id: String,
+    /// Author username.
+    pub author_username: String,
+    /// Message text content.
+    pub content: String,
+    /// Message ID.
+    pub id: String,
+}
+
+/// Raw Discord message for deserialization.
+#[derive(Debug, Deserialize)]
+pub struct RawChannelMessage {
+    /// Message ID.
+    pub id: String,
+    /// Message text content.
+    pub content: String,
+    /// Message author.
+    pub author: RawAuthor,
+}
+
+/// Raw Discord author for deserialization.
+#[derive(Debug, Deserialize)]
+pub struct RawAuthor {
+    /// User ID.
+    pub id: String,
+    /// Username.
+    pub username: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +637,107 @@ mod tests {
         assert_eq!(json["content"], "hello");
         assert!(json.get("embeds").is_none());
         assert!(json.get("components").is_none());
+    }
+
+    // ── New feature-parity types ──
+
+    #[test]
+    fn message_query_default() {
+        let q = MessageQuery::default();
+        assert_eq!(q.limit, 0);
+        assert!(q.before.is_none());
+        assert!(q.after.is_none());
+        assert!(q.around.is_none());
+    }
+
+    #[test]
+    fn deserialize_reaction_user() {
+        let json = r#"{"id": "123", "username": "alice"}"#;
+        let user: ReactionUser = serde_json::from_str(json).unwrap();
+        assert_eq!(user.id, "123");
+        assert_eq!(user.username, "alice");
+    }
+
+    #[test]
+    fn deserialize_reaction_user_list() {
+        let json = r#"[
+            {"id": "1", "username": "alice"},
+            {"id": "2", "username": "bob"}
+        ]"#;
+        let users: Vec<ReactionUser> = serde_json::from_str(json).unwrap();
+        assert_eq!(users.len(), 2);
+    }
+
+    #[test]
+    fn deserialize_thread_info() {
+        let json = r#"{"id": "999", "name": "bug-report"}"#;
+        let info: ThreadInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "999");
+        assert_eq!(info.name.as_deref(), Some("bug-report"));
+    }
+
+    #[test]
+    fn deserialize_thread_info_no_name() {
+        let json = r#"{"id": "999"}"#;
+        let info: ThreadInfo = serde_json::from_str(json).unwrap();
+        assert!(info.name.is_none());
+    }
+
+    #[test]
+    fn deserialize_member_info() {
+        let json = r#"{
+            "user": {"id": "u1", "username": "alice"},
+            "nick": "Ali",
+            "roles": ["r1", "r2"]
+        }"#;
+        let info: MemberInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.user.as_ref().unwrap().id, "u1");
+        assert_eq!(info.nick.as_deref(), Some("Ali"));
+        assert_eq!(info.roles, vec!["r1", "r2"]);
+    }
+
+    #[test]
+    fn deserialize_member_info_minimal() {
+        let json = r#"{}"#;
+        let info: MemberInfo = serde_json::from_str(json).unwrap();
+        assert!(info.user.is_none());
+        assert!(info.nick.is_none());
+        assert!(info.roles.is_empty());
+    }
+
+    #[test]
+    fn deserialize_channel_info() {
+        let json = r#"{
+            "id": "ch1",
+            "name": "general",
+            "type": 0,
+            "topic": "Welcome!",
+            "guild_id": "g1"
+        }"#;
+        let info: ChannelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "ch1");
+        assert_eq!(info.name.as_deref(), Some("general"));
+        assert_eq!(info.channel_type, 0);
+        assert_eq!(info.topic.as_deref(), Some("Welcome!"));
+        assert_eq!(info.guild_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn deserialize_channel_info_thread() {
+        let json = r#"{"id": "t1", "type": 11}"#;
+        let info: ChannelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.channel_type, 11);
+        assert!(info.name.is_none());
+        assert!(info.topic.is_none());
+    }
+
+    #[test]
+    fn deserialize_raw_channel_message() {
+        let json =
+            r#"{"id": "m1", "content": "hello", "author": {"id": "u1", "username": "alice"}}"#;
+        let msg: RawChannelMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.id, "m1");
+        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.author.id, "u1");
     }
 }

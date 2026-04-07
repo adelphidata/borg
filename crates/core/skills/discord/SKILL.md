@@ -62,6 +62,71 @@ curl -s -X PUT "https://discord.com/api/v10/channels/CHANNEL_ID/pins/MESSAGE_ID"
   -H "Authorization: Bot $DISCORD_BOT_TOKEN"
 ```
 
+### Unpin a message
+
+```bash
+curl -s -X DELETE "https://discord.com/api/v10/channels/CHANNEL_ID/pins/MESSAGE_ID" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### List pinned messages
+
+```bash
+curl -s "https://discord.com/api/v10/channels/CHANNEL_ID/pins" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Fetch a single message
+
+```bash
+curl -s "https://discord.com/api/v10/channels/CHANNEL_ID/messages/MESSAGE_ID" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Remove a reaction
+
+```bash
+curl -s -X DELETE "https://discord.com/api/v10/channels/CHANNEL_ID/messages/MESSAGE_ID/reactions/%E2%9C%85/@me" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Fetch reactions on a message
+
+```bash
+curl -s "https://discord.com/api/v10/channels/CHANNEL_ID/messages/MESSAGE_ID/reactions/%E2%9C%85" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Create a thread from a message
+
+```bash
+curl -s -X POST "https://discord.com/api/v10/channels/CHANNEL_ID/messages/MESSAGE_ID/threads" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-thread","auto_archive_duration":1440}'
+```
+
+### List active threads in a guild
+
+```bash
+curl -s "https://discord.com/api/v10/guilds/GUILD_ID/threads/active" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Get member info
+
+```bash
+curl -s "https://discord.com/api/v10/guilds/GUILD_ID/members/USER_ID" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
+### Get channel info
+
+```bash
+curl -s "https://discord.com/api/v10/channels/CHANNEL_ID" \
+  -H "Authorization: Bot $DISCORD_BOT_TOKEN"
+```
+
 ## Notes
 
 - Use snowflake IDs for channels, messages, users, and guilds

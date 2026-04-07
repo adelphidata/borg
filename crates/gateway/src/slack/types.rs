@@ -229,6 +229,71 @@ pub struct ApiResponse<T> {
     pub retry_after: Option<u64>,
 }
 
+/// Reaction info from `reactions.get`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionInfo {
+    /// Emoji name (without colons).
+    pub name: String,
+    /// Number of users who reacted.
+    pub count: u32,
+    /// User IDs who reacted.
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+/// User profile from `users.info`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserInfo {
+    /// User ID.
+    pub id: String,
+    /// Username (handle).
+    pub name: String,
+    /// Display name.
+    pub real_name: Option<String>,
+    /// Whether this user is a bot.
+    #[serde(default)]
+    pub is_bot: bool,
+}
+
+/// Channel info from `conversations.info` / `conversations.list`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlackChannelInfo {
+    /// Channel ID.
+    pub id: String,
+    /// Channel name.
+    pub name: Option<String>,
+    /// Whether the channel is private.
+    #[serde(default)]
+    pub is_private: bool,
+    /// Channel topic.
+    pub topic: Option<ChannelTopic>,
+}
+
+/// Channel topic metadata.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelTopic {
+    /// Topic text value.
+    pub value: String,
+}
+
+/// A pinned item from `pins.list`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PinnedItem {
+    /// The pinned message (if type is "message").
+    pub message: Option<PinnedMessage>,
+}
+
+/// A pinned message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PinnedMessage {
+    /// Message text content.
+    pub text: Option<String>,
+    /// User who sent the message.
+    pub user: Option<String>,
+    /// Message timestamp.
+    pub ts: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -657,5 +722,96 @@ mod tests {
         let payload: InteractionPayload = serde_json::from_str(json).unwrap();
         assert!(payload.channel.is_none());
         assert!(payload.actions.is_none());
+    }
+
+    // ── New feature-parity types ──
+
+    #[test]
+    fn deserialize_reaction_info() {
+        let json = r#"{"name": "thumbsup", "count": 3, "users": ["U1", "U2", "U3"]}"#;
+        let info: ReactionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.name, "thumbsup");
+        assert_eq!(info.count, 3);
+        assert_eq!(info.users.len(), 3);
+    }
+
+    #[test]
+    fn deserialize_reaction_info_no_users() {
+        let json = r#"{"name": "wave", "count": 1}"#;
+        let info: ReactionInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.name, "wave");
+        assert!(info.users.is_empty());
+    }
+
+    #[test]
+    fn deserialize_user_info() {
+        let json =
+            r#"{"id": "U123", "name": "alice", "real_name": "Alice Smith", "is_bot": false}"#;
+        let info: UserInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "U123");
+        assert_eq!(info.name, "alice");
+        assert_eq!(info.real_name.as_deref(), Some("Alice Smith"));
+        assert!(!info.is_bot);
+    }
+
+    #[test]
+    fn deserialize_user_info_bot() {
+        let json = r#"{"id": "U456", "name": "botuser", "is_bot": true}"#;
+        let info: UserInfo = serde_json::from_str(json).unwrap();
+        assert!(info.is_bot);
+        assert!(info.real_name.is_none());
+    }
+
+    #[test]
+    fn deserialize_slack_channel_info() {
+        let json = r#"{
+            "id": "C123",
+            "name": "general",
+            "is_private": false,
+            "topic": {"value": "All the general stuff"}
+        }"#;
+        let info: SlackChannelInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.id, "C123");
+        assert_eq!(info.name.as_deref(), Some("general"));
+        assert!(!info.is_private);
+        assert_eq!(info.topic.as_ref().unwrap().value, "All the general stuff");
+    }
+
+    #[test]
+    fn deserialize_slack_channel_info_private() {
+        let json = r#"{"id": "G123", "name": "secret", "is_private": true}"#;
+        let info: SlackChannelInfo = serde_json::from_str(json).unwrap();
+        assert!(info.is_private);
+        assert!(info.topic.is_none());
+    }
+
+    #[test]
+    fn deserialize_channel_topic() {
+        let json = r#"{"value": "Welcome to the channel"}"#;
+        let topic: ChannelTopic = serde_json::from_str(json).unwrap();
+        assert_eq!(topic.value, "Welcome to the channel");
+    }
+
+    #[test]
+    fn deserialize_pinned_item() {
+        let json = r#"{
+            "message": {
+                "text": "Important announcement",
+                "user": "U123",
+                "ts": "1234567890.123456"
+            }
+        }"#;
+        let item: PinnedItem = serde_json::from_str(json).unwrap();
+        let msg = item.message.unwrap();
+        assert_eq!(msg.text.as_deref(), Some("Important announcement"));
+        assert_eq!(msg.user.as_deref(), Some("U123"));
+        assert_eq!(msg.ts.as_deref(), Some("1234567890.123456"));
+    }
+
+    #[test]
+    fn deserialize_pinned_item_no_message() {
+        let json = r#"{}"#;
+        let item: PinnedItem = serde_json::from_str(json).unwrap();
+        assert!(item.message.is_none());
     }
 }

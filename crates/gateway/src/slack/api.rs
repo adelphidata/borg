@@ -6,7 +6,9 @@ use tokio::sync::Mutex;
 use tracing::{error, warn};
 
 use super::echo::EchoCache;
-use super::types::{AuthTestResponse, PostMessageRequest};
+use super::types::{
+    AuthTestResponse, PinnedItem, PostMessageRequest, ReactionInfo, SlackChannelInfo, UserInfo,
+};
 use crate::chunker;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
@@ -31,6 +33,9 @@ const FATAL_SLACK_ERRORS: &[&str] = &[
     "is_archived",
     "user_not_found",
     "team_added_to_org",
+    "already_pinned",
+    "not_pinned",
+    "message_not_found",
 ];
 
 /// Returns `true` if the given Slack API error code is non-recoverable.
@@ -467,6 +472,394 @@ impl SlackClient {
             warn!("reactions.remove failed: {e}");
         }
     }
+
+    /// Edit an existing message via `chat.update`.
+    pub async fn edit_message(&self, channel: &str, ts: &str, text: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+        });
+
+        let resp = self
+            .slack_post("chat.update", &body)
+            .await
+            .context("Failed to call chat.update")?;
+
+        self.check_slack_response("chat.update", resp).await
+    }
+
+    /// Delete a message via `chat.delete`.
+    pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+        });
+
+        let resp = self
+            .slack_post("chat.delete", &body)
+            .await
+            .context("Failed to call chat.delete")?;
+
+        self.check_slack_response("chat.delete", resp).await
+    }
+
+    /// Fetch thread replies via `conversations.replies`.
+    pub async fn fetch_thread_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        limit: u32,
+    ) -> Result<Vec<HistoryMessage>> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/conversations.replies"))
+            .bearer_auth(&self.token)
+            .query(&[
+                ("channel", channel),
+                ("ts", thread_ts),
+                ("limit", &limit.to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to call conversations.replies")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse conversations.replies response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("conversations.replies failed: {error}");
+        }
+
+        let messages = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        Some(HistoryMessage {
+                            user: m.get("user")?.as_str()?.to_string(),
+                            text: m.get("text")?.as_str()?.to_string(),
+                            ts: m.get("ts")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(messages)
+    }
+
+    /// List reactions on a message via `reactions.get`.
+    pub async fn list_reactions(&self, channel: &str, ts: &str) -> Result<Vec<ReactionInfo>> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/reactions.get"))
+            .bearer_auth(&self.token)
+            .query(&[("channel", channel), ("timestamp", ts), ("full", "true")])
+            .send()
+            .await
+            .context("Failed to call reactions.get")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse reactions.get response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("reactions.get failed: {error}");
+        }
+
+        let reactions: Vec<ReactionInfo> = body
+            .pointer("/message/reactions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(reactions)
+    }
+
+    /// Pin a message via `pins.add`.
+    pub async fn pin_message(&self, channel: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "timestamp": ts,
+        });
+
+        let resp = self
+            .slack_post("pins.add", &body)
+            .await
+            .context("Failed to call pins.add")?;
+
+        self.check_slack_response("pins.add", resp).await
+    }
+
+    /// Unpin a message via `pins.remove`.
+    pub async fn unpin_message(&self, channel: &str, ts: &str) -> Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "timestamp": ts,
+        });
+
+        let resp = self
+            .slack_post("pins.remove", &body)
+            .await
+            .context("Failed to call pins.remove")?;
+
+        self.check_slack_response("pins.remove", resp).await
+    }
+
+    /// List pinned messages in a channel via `pins.list`.
+    pub async fn list_pins(&self, channel: &str) -> Result<Vec<PinnedItem>> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/pins.list"))
+            .bearer_auth(&self.token)
+            .query(&[("channel", channel)])
+            .send()
+            .await
+            .context("Failed to call pins.list")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse pins.list response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("pins.list failed: {error}");
+        }
+
+        let items: Vec<PinnedItem> = body
+            .get("items")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(items)
+    }
+
+    /// Get user info via `users.info`.
+    pub async fn get_user_info(&self, user_id: &str) -> Result<UserInfo> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/users.info"))
+            .bearer_auth(&self.token)
+            .query(&[("user", user_id)])
+            .send()
+            .await
+            .context("Failed to call users.info")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse users.info response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let hint = slack_error_hint(error);
+            bail!("users.info failed: {error}{hint}");
+        }
+
+        serde_json::from_value(
+            body.get("user")
+                .cloned()
+                .context("users.info response missing 'user' field")?,
+        )
+        .context("Failed to parse user info")
+    }
+
+    /// List channels via `conversations.list`.
+    pub async fn list_channels(&self, limit: u32) -> Result<Vec<SlackChannelInfo>> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/conversations.list"))
+            .bearer_auth(&self.token)
+            .query(&[
+                ("limit", &limit.to_string()),
+                ("types", &"public_channel,private_channel".to_string()),
+            ])
+            .send()
+            .await
+            .context("Failed to call conversations.list")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse conversations.list response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            bail!("conversations.list failed: {error}");
+        }
+
+        let channels: Vec<SlackChannelInfo> = body
+            .get("channels")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        Ok(channels)
+    }
+
+    /// Get channel info via `conversations.info`.
+    pub async fn get_channel_info(&self, channel: &str) -> Result<SlackChannelInfo> {
+        let resp = self
+            .client
+            .get(format!("{SLACK_API_BASE}/conversations.info"))
+            .bearer_auth(&self.token)
+            .query(&[("channel", channel)])
+            .send()
+            .await
+            .context("Failed to call conversations.info")?;
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse conversations.info response")?;
+
+        if !body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let error = body
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let hint = slack_error_hint(error);
+            bail!("conversations.info failed: {error}{hint}");
+        }
+
+        serde_json::from_value(
+            body.get("channel")
+                .cloned()
+                .context("conversations.info response missing 'channel' field")?,
+        )
+        .context("Failed to parse channel info")
+    }
+
+    /// Send an ephemeral message via `chat.postEphemeral`.
+    pub async fn send_ephemeral(
+        &self,
+        channel: &str,
+        user: &str,
+        text: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
+            "channel": channel,
+            "user": user,
+            "text": text,
+        });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::Value::String(ts.to_string());
+        }
+
+        let resp = self
+            .slack_post("chat.postEphemeral", &body)
+            .await
+            .context("Failed to call chat.postEphemeral")?;
+
+        self.check_slack_response("chat.postEphemeral", resp).await
+    }
+
+    /// Helper: POST a JSON body to a Slack API method.
+    async fn slack_post(
+        &self,
+        method: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{SLACK_API_BASE}/{method}");
+        let policy = RateLimitPolicy {
+            service_name: "Slack",
+            ..RateLimitPolicy::default()
+        };
+        let client = &self.client;
+        let token = &self.token;
+        let body = body.clone();
+
+        send_with_rate_limit_retry(&policy, || async {
+            client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .context("Slack API request failed")
+        })
+        .await
+    }
+
+    /// Helper: Check a Slack API response for ok/error.
+    async fn check_slack_response(&self, method: &str, resp: reqwest::Response) -> Result<()> {
+        let status = resp.status();
+        let resp_body: serde_json::Value = resp
+            .json()
+            .await
+            .context(format!("Failed to parse {method} response"))?;
+
+        if resp_body
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let error_str = resp_body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+
+        let hint = slack_error_hint(error_str);
+
+        if is_fatal_slack_error(error_str) {
+            error!(
+                "Slack {method} FATAL error ({}): {error_str}{hint} — this will not be retried",
+                status.as_u16()
+            );
+            bail!("{method} FATAL ({}): {error_str}{hint}", status.as_u16());
+        }
+
+        bail!("{method} failed ({}): {error_str}{hint}", status.as_u16());
+    }
 }
 
 /// A message from `conversations.history` for channel context injection.
@@ -609,5 +1002,292 @@ mod tests {
     fn slack_error_hint_empty_for_unknown() {
         assert_eq!(slack_error_hint("ratelimited"), "");
         assert_eq!(slack_error_hint(""), "");
+    }
+
+    // ── New API method tests ──
+
+    #[test]
+    fn edit_message_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/chat.update"),
+            "https://slack.com/api/chat.update"
+        );
+    }
+
+    #[test]
+    fn delete_message_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/chat.delete"),
+            "https://slack.com/api/chat.delete"
+        );
+    }
+
+    #[test]
+    fn fetch_thread_replies_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/conversations.replies"),
+            "https://slack.com/api/conversations.replies"
+        );
+    }
+
+    #[test]
+    fn list_reactions_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/reactions.get"),
+            "https://slack.com/api/reactions.get"
+        );
+    }
+
+    #[test]
+    fn pin_message_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/pins.add"),
+            "https://slack.com/api/pins.add"
+        );
+    }
+
+    #[test]
+    fn unpin_message_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/pins.remove"),
+            "https://slack.com/api/pins.remove"
+        );
+    }
+
+    #[test]
+    fn list_pins_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/pins.list"),
+            "https://slack.com/api/pins.list"
+        );
+    }
+
+    #[test]
+    fn get_user_info_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/users.info"),
+            "https://slack.com/api/users.info"
+        );
+    }
+
+    #[test]
+    fn list_channels_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/conversations.list"),
+            "https://slack.com/api/conversations.list"
+        );
+    }
+
+    #[test]
+    fn get_channel_info_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/conversations.info"),
+            "https://slack.com/api/conversations.info"
+        );
+    }
+
+    #[test]
+    fn send_ephemeral_url_construction() {
+        assert_eq!(
+            format!("{SLACK_API_BASE}/chat.postEphemeral"),
+            "https://slack.com/api/chat.postEphemeral"
+        );
+    }
+
+    #[test]
+    fn edit_message_body_serialization() {
+        let body = serde_json::json!({
+            "channel": "C123",
+            "ts": "1234567890.123456",
+            "text": "updated text",
+        });
+        assert_eq!(body["channel"], "C123");
+        assert_eq!(body["ts"], "1234567890.123456");
+        assert_eq!(body["text"], "updated text");
+    }
+
+    #[test]
+    fn delete_message_body_serialization() {
+        let body = serde_json::json!({
+            "channel": "C123",
+            "ts": "1234567890.123456",
+        });
+        assert_eq!(body["channel"], "C123");
+        assert_eq!(body["ts"], "1234567890.123456");
+    }
+
+    #[test]
+    fn pin_message_body_serialization() {
+        let body = serde_json::json!({
+            "channel": "C123",
+            "timestamp": "1234567890.123456",
+        });
+        assert_eq!(body["channel"], "C123");
+        assert_eq!(body["timestamp"], "1234567890.123456");
+    }
+
+    #[test]
+    fn send_ephemeral_body_serialization() {
+        let mut body = serde_json::json!({
+            "channel": "C123",
+            "user": "U456",
+            "text": "only you can see this",
+        });
+        body["thread_ts"] = serde_json::Value::String("1234567890.123456".into());
+        assert_eq!(body["channel"], "C123");
+        assert_eq!(body["user"], "U456");
+        assert_eq!(body["text"], "only you can see this");
+        assert_eq!(body["thread_ts"], "1234567890.123456");
+    }
+
+    #[test]
+    fn send_ephemeral_body_no_thread() {
+        let body = serde_json::json!({
+            "channel": "C123",
+            "user": "U456",
+            "text": "ephemeral msg",
+        });
+        assert!(body.get("thread_ts").is_none());
+    }
+
+    #[test]
+    fn is_fatal_slack_error_classifies_pin_errors() {
+        assert!(is_fatal_slack_error("already_pinned"));
+        assert!(is_fatal_slack_error("not_pinned"));
+        assert!(is_fatal_slack_error("message_not_found"));
+    }
+
+    #[test]
+    fn reactions_get_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "message": {
+                "reactions": [
+                    {"name": "thumbsup", "count": 2, "users": ["U1", "U2"]},
+                    {"name": "heart", "count": 1, "users": ["U3"]}
+                ]
+            }
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let reactions: Vec<super::super::types::ReactionInfo> = body
+            .pointer("/message/reactions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        assert_eq!(reactions.len(), 2);
+        assert_eq!(reactions[0].name, "thumbsup");
+        assert_eq!(reactions[0].count, 2);
+        assert_eq!(reactions[1].name, "heart");
+    }
+
+    #[test]
+    fn users_info_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "user": {
+                "id": "U123",
+                "name": "alice",
+                "real_name": "Alice Smith",
+                "is_bot": false
+            }
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let user: super::super::types::UserInfo =
+            serde_json::from_value(body["user"].clone()).unwrap();
+        assert_eq!(user.id, "U123");
+        assert_eq!(user.name, "alice");
+        assert!(!user.is_bot);
+    }
+
+    #[test]
+    fn conversations_list_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "channels": [
+                {"id": "C1", "name": "general", "is_private": false},
+                {"id": "G1", "name": "secret", "is_private": true, "topic": {"value": "Top secret"}}
+            ]
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let channels: Vec<super::super::types::SlackChannelInfo> =
+            serde_json::from_value(body["channels"].clone()).unwrap();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].id, "C1");
+        assert!(!channels[0].is_private);
+        assert!(channels[1].is_private);
+        assert_eq!(channels[1].topic.as_ref().unwrap().value, "Top secret");
+    }
+
+    #[test]
+    fn conversations_info_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "channel": {
+                "id": "C123",
+                "name": "general",
+                "is_private": false,
+                "topic": {"value": "Hello"}
+            }
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let channel: super::super::types::SlackChannelInfo =
+            serde_json::from_value(body["channel"].clone()).unwrap();
+        assert_eq!(channel.id, "C123");
+        assert_eq!(channel.name.as_deref(), Some("general"));
+    }
+
+    #[test]
+    fn pins_list_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "items": [
+                {
+                    "message": {
+                        "text": "Important!",
+                        "user": "U123",
+                        "ts": "1234567890.123456"
+                    }
+                },
+                {}
+            ]
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let items: Vec<super::super::types::PinnedItem> =
+            serde_json::from_value(body["items"].clone()).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].message.as_ref().unwrap().text.as_deref(),
+            Some("Important!")
+        );
+        assert!(items[1].message.is_none());
+    }
+
+    #[test]
+    fn conversations_replies_response_deserialization() {
+        let json = r#"{
+            "ok": true,
+            "messages": [
+                {"user": "U1", "text": "parent msg", "ts": "1234567890.111"},
+                {"user": "U2", "text": "reply", "ts": "1234567890.222"}
+            ]
+        }"#;
+        let body: serde_json::Value = serde_json::from_str(json).unwrap();
+        let messages: Vec<HistoryMessage> = body
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        Some(HistoryMessage {
+                            user: m.get("user")?.as_str()?.to_string(),
+                            text: m.get("text")?.as_str()?.to_string(),
+                            ts: m.get("ts")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "parent msg");
+        assert_eq!(messages[1].user, "U2");
     }
 }
