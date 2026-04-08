@@ -148,7 +148,7 @@ fn luminance(r: u8, g: u8, b: u8) -> f64 {
 }
 
 /// Alpha-blend a foreground value onto a background value.
-fn blend_channel(fg: u8, bg: u8, alpha: f64) -> u8 {
+pub(super) fn blend_channel(fg: u8, bg: u8, alpha: f64) -> u8 {
     let v = fg as f64 * alpha + bg as f64 * (1.0 - alpha);
     v.round().clamp(0.0, 255.0) as u8
 }
@@ -164,7 +164,7 @@ fn best_color(r: u8, g: u8, b: u8) -> Option<Color> {
     None
 }
 
-fn supports_truecolor() -> bool {
+pub(super) fn supports_truecolor() -> bool {
     if let Ok(ct) = std::env::var("COLORTERM") {
         matches!(ct.as_str(), "truecolor" | "24bit")
     } else {

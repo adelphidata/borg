@@ -28,6 +28,7 @@ use super::projects_popup::{ProjectAction, ProjectsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::sessions_popup::{SessionAction, SessionsPopup};
 use super::settings_popup::SettingsPopup;
+use super::shimmer;
 use super::status_popup::StatusPopup;
 use super::theme;
 
@@ -1790,12 +1791,18 @@ impl<'a> App<'a> {
                 let throbber = Throbber::default()
                     .throbber_set(BRAILLE_EIGHT)
                     .throbber_style(theme::tool_style());
-                Line::from(vec![
+                let mut spans = vec![
                     Span::raw(" "),
                     throbber.to_symbol_span(&self.throbber_state),
-                    Span::styled(format!("Working ({elapsed}"), theme::tool_style()),
-                    Span::styled(" • esc to interrupt)", theme::dim()),
-                ])
+                ];
+                spans.extend(shimmer::shimmer_spans(
+                    "Working...",
+                    (2, 195, 189),
+                    (180, 255, 252),
+                ));
+                spans.push(Span::styled(format!(" ({elapsed}"), theme::tool_style()));
+                spans.push(Span::styled(" • esc to interrupt)", theme::dim()));
+                Line::from(spans)
             }
             AppState::AwaitingApproval { .. } => Line::from(vec![Span::styled(
                 format!(" {} Approval needed — press y or n", theme::BULLET),

@@ -18,6 +18,7 @@ mod projects_popup;
 mod schedule_popup;
 mod sessions_popup;
 mod settings_popup;
+mod shimmer;
 mod status_popup;
 pub(crate) mod theme;
 mod tool_display;
