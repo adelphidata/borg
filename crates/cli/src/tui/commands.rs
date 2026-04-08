@@ -176,9 +176,8 @@ impl App<'_> {
              /doctor    - Run diagnostics\n  \
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
-             /pairing   - Show channel pairing info\n  \
+             /pairing   - Manage sender pairing\n  \
              /pairing approve <code> - Approve a pairing request\n  \
-             /pairing revoke <channel> <sender_id> - Revoke an approved sender\n  \
              /pairing <code> - Approve (shortcut)\n  \
              /update    - Update borg to latest version\n\
              \n  \
