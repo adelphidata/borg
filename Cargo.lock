@@ -554,6 +554,7 @@ dependencies = [
  "axum 0.8.8",
  "base64 0.22.1",
  "borg-core",
+ "borg-plugins",
  "borg-sandbox",
  "chrono",
  "dirs",
