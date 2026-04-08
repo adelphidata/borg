@@ -889,15 +889,9 @@ async fn run_event_loop(
                                         if def.kind == borg_plugins::PluginKind::Channel {
                                             let gw_msg = restart_gateway(gateway_shutdown).await;
                                             msg.push_str(&format!("\n  {gw_msg}"));
-                                            // Hint: Telegram requires the user to initiate /start
-                                            let channel_name = if def.is_native {
-                                                def.id.rsplit('/').next().unwrap_or(def.id)
-                                            } else {
-                                                def.id
-                                            };
-                                            if channel_name == "telegram" {
-                                                msg.push_str("\n  Open your Borg in Telegram and press /start to begin pairing.");
-                                            }
+                                            msg.push_str(
+                                                "\n  Approve senders with: /pairing approve <CODE>",
+                                            );
                                         }
                                         results.push(msg);
                                     }

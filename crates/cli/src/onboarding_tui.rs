@@ -204,10 +204,17 @@ enum Tab {
     Security,
     Provider,
     ApiKey,
+    Channels,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Welcome, Tab::Security, Tab::Provider, Tab::ApiKey];
+    const ALL: [Tab; 5] = [
+        Tab::Welcome,
+        Tab::Security,
+        Tab::Provider,
+        Tab::ApiKey,
+        Tab::Channels,
+    ];
 
     fn index(self) -> usize {
         Self::ALL.iter().position(|&t| t == self).unwrap_or(0)
@@ -219,6 +226,7 @@ impl Tab {
             Tab::Security => "Disclaimer",
             Tab::Provider => "Provider",
             Tab::ApiKey => "API Key",
+            Tab::Channels => "Channels",
         }
     }
 }
@@ -237,6 +245,33 @@ enum InputMode {
 
 fn is_shift_tab(key: &KeyEvent) -> bool {
     key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+/// A channel plugin item for the onboarding channels picker.
+struct ChannelItem {
+    id: String,
+    name: String,
+    selected: bool,
+    cred_specs: &'static [borg_plugins::CredentialSpec],
+    /// Collected credentials once the user has entered them.
+    credentials: Vec<(String, String)>,
+    platform_available: bool,
+}
+
+/// Phase of the channels picker.
+#[derive(Clone)]
+enum ChannelPhase {
+    Browsing,
+    CredentialInput {
+        /// Index into `channel_items` being configured.
+        item_idx: usize,
+        /// Which credential within the item we're prompting for.
+        cred_idx: usize,
+        /// Current text input buffer.
+        buffer: String,
+        /// Credentials collected so far for this item.
+        collected: Vec<(String, String)>,
+    },
 }
 
 struct OnboardingState {
@@ -259,6 +294,11 @@ struct OnboardingState {
     api_key_input: String,
     api_key_existing: bool,
 
+    // Channels
+    channel_items: Vec<ChannelItem>,
+    channel_cursor: usize,
+    channel_phase: ChannelPhase,
+
     // Validation hints
     api_key_required_hint: bool,
 
@@ -274,6 +314,21 @@ impl OnboardingState {
             .any(|(id, _, _)| Self::check_existing_api_key_cached(id));
 
         let default_name = random_borg_name();
+
+        // Load channel plugins from catalog
+        let channel_items: Vec<ChannelItem> = borg_plugins::catalog::CATALOG
+            .iter()
+            .filter(|def| def.kind == borg_plugins::PluginKind::Channel)
+            .map(|def| ChannelItem {
+                id: def.id.to_string(),
+                name: def.name.to_string(),
+                selected: false,
+                cred_specs: def.required_credentials,
+                credentials: Vec::new(),
+                platform_available: def.platform.is_available(),
+            })
+            .collect();
+
         Self {
             tab: Tab::Welcome,
             input_mode: InputMode::TextInput,
@@ -285,6 +340,9 @@ impl OnboardingState {
             provider_index: 0,
             api_key_input: String::new(),
             api_key_existing,
+            channel_items,
+            channel_cursor: 0,
+            channel_phase: ChannelPhase::Browsing,
             api_key_required_hint: false,
             done: false,
             cancelled: false,
@@ -362,6 +420,7 @@ impl OnboardingState {
             Tab::Security => self.security_accepted,
             Tab::Provider => true, // Always has a selection
             Tab::ApiKey => false,
+            Tab::Channels => true, // Optional step, always completable
         }
     }
 
@@ -386,6 +445,13 @@ impl OnboardingState {
         let models = models_for_provider(provider_id);
         let model_id = models[0].0.to_string();
 
+        let channels: Vec<(String, Vec<(String, String)>)> = self
+            .channel_items
+            .iter()
+            .filter(|item| item.selected)
+            .map(|item| (item.id.clone(), item.credentials.clone()))
+            .collect();
+
         OnboardingResult {
             user_name: self.user_name.clone(),
             agent_name: if self.agent_name.is_empty() {
@@ -396,6 +462,7 @@ impl OnboardingState {
             model_id,
             api_key,
             provider: provider_id.to_string(),
+            channels,
         }
     }
 
@@ -406,8 +473,13 @@ impl OnboardingState {
                 Tab::Welcome if self.user_name.trim().is_empty() => return,
                 Tab::Security if !self.security_accepted => return,
                 Tab::Provider if !self.selected_provider_needs_key() => {
-                    // Skip API Key tab for keyless providers — go straight to done
-                    self.done = true;
+                    // Skip API Key tab for keyless providers — go to Channels
+                    self.tab = Tab::Channels;
+                    self.update_input_mode();
+                    return;
+                }
+                Tab::Channels => {
+                    self.finish_channels();
                     return;
                 }
                 _ => {}
@@ -420,7 +492,12 @@ impl OnboardingState {
     fn prev_tab(&mut self) {
         let idx = self.tab.index();
         if idx > 0 {
-            self.tab = Tab::ALL[idx - 1];
+            let mut target = Tab::ALL[idx - 1];
+            // Skip ApiKey when going back from Channels if provider doesn't need a key
+            if target == Tab::ApiKey && !self.selected_provider_needs_key() {
+                target = Tab::Provider;
+            }
+            self.tab = target;
             self.update_input_mode();
         }
     }
@@ -429,13 +506,53 @@ impl OnboardingState {
         self.input_mode = match self.tab {
             Tab::Welcome => InputMode::TextInput,
             Tab::ApiKey if !self.api_key_existing => InputMode::TextInput,
+            Tab::Channels => match self.channel_phase {
+                ChannelPhase::Browsing => InputMode::Normal,
+                ChannelPhase::CredentialInput { .. } => InputMode::TextInput,
+            },
             Tab::Provider | Tab::Security => InputMode::Normal,
             _ => InputMode::Normal,
         };
     }
 
+    fn handle_paste(&mut self, text: &str) {
+        match self.tab {
+            Tab::Welcome => match self.welcome_focus {
+                WelcomeFocus::UserName => self.user_name.push_str(text),
+                WelcomeFocus::AgentName => self.agent_name.push_str(text),
+            },
+            Tab::ApiKey if !self.api_key_existing => {
+                self.api_key_input.push_str(text);
+                self.api_key_required_hint = false;
+            }
+            Tab::Channels => {
+                if let ChannelPhase::CredentialInput { ref mut buffer, .. } = self.channel_phase {
+                    buffer.push_str(text);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
+        // Esc in credential input cancels back to browsing, not the whole wizard
         if key.code == KeyCode::Esc {
+            if self.tab == Tab::Channels {
+                match &self.channel_phase {
+                    ChannelPhase::CredentialInput { item_idx, .. } => {
+                        // Cancel credential entry — deselect the item
+                        self.channel_items[*item_idx].selected = false;
+                        self.channel_phase = ChannelPhase::Browsing;
+                        self.update_input_mode();
+                        return;
+                    }
+                    ChannelPhase::Browsing => {
+                        // Esc from browsing finishes (channels are optional)
+                        self.finish_channels();
+                        return;
+                    }
+                }
+            }
             self.cancelled = true;
             return;
         }
@@ -445,6 +562,7 @@ impl OnboardingState {
             Tab::Security => self.handle_security_key(key),
             Tab::Provider => self.handle_provider_key(key),
             Tab::ApiKey => self.handle_api_key_key(key),
+            Tab::Channels => self.handle_channels_key(key),
         }
     }
 
@@ -542,12 +660,12 @@ impl OnboardingState {
                     if is_shift_tab(&key) {
                         self.prev_tab();
                     } else {
-                        self.done = true;
+                        self.next_tab();
                     }
                 }
                 KeyCode::Left => self.prev_tab(),
                 KeyCode::Enter => {
-                    self.done = true;
+                    self.next_tab();
                 }
                 _ => {}
             }
@@ -561,7 +679,7 @@ impl OnboardingState {
                     self.api_key_required_hint = true;
                 } else {
                     self.api_key_required_hint = false;
-                    self.done = true;
+                    self.next_tab();
                 }
             }
             KeyCode::Right => {
@@ -569,7 +687,7 @@ impl OnboardingState {
                     self.api_key_required_hint = true;
                 } else {
                     self.api_key_required_hint = false;
-                    self.done = true;
+                    self.next_tab();
                 }
             }
             KeyCode::Left => self.prev_tab(),
@@ -578,7 +696,7 @@ impl OnboardingState {
                     self.api_key_required_hint = true;
                 } else {
                     self.api_key_required_hint = false;
-                    self.done = true;
+                    self.next_tab();
                 }
             }
             KeyCode::Backspace => {
@@ -590,6 +708,142 @@ impl OnboardingState {
                 self.api_key_required_hint = false;
             }
             _ => {}
+        }
+    }
+
+    fn handle_channels_key(&mut self, key: KeyEvent) {
+        match &self.channel_phase.clone() {
+            ChannelPhase::Browsing => match key.code {
+                KeyCode::Up => {
+                    if !self.channel_items.is_empty() {
+                        if self.channel_cursor == 0 {
+                            self.channel_cursor = self.channel_items.len() - 1;
+                        } else {
+                            self.channel_cursor -= 1;
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if !self.channel_items.is_empty() {
+                        self.channel_cursor = (self.channel_cursor + 1) % self.channel_items.len();
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(item) = self.channel_items.get_mut(self.channel_cursor) {
+                        if !item.platform_available {
+                            return;
+                        }
+                        if item.selected {
+                            // Deselect
+                            item.selected = false;
+                            item.credentials.clear();
+                        } else {
+                            // Select — if credentials needed, start input
+                            let has_required = item.cred_specs.iter().any(|c| !c.is_optional);
+                            if has_required {
+                                item.selected = true;
+                                self.channel_phase = ChannelPhase::CredentialInput {
+                                    item_idx: self.channel_cursor,
+                                    cred_idx: 0,
+                                    buffer: String::new(),
+                                    collected: Vec::new(),
+                                };
+                                self.update_input_mode();
+                            } else {
+                                item.selected = true;
+                            }
+                        }
+                    }
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    if is_shift_tab(&key) {
+                        self.prev_tab();
+                    } else {
+                        self.finish_channels();
+                    }
+                }
+                KeyCode::Left => self.prev_tab(),
+                _ => {}
+            },
+            ChannelPhase::CredentialInput {
+                item_idx,
+                cred_idx,
+                buffer,
+                collected,
+            } => {
+                let item_idx = *item_idx;
+                let cred_idx = *cred_idx;
+                let buffer = buffer.clone();
+                let collected = collected.clone();
+
+                match key.code {
+                    KeyCode::Enter => {
+                        let value = buffer.trim().to_string();
+                        let spec = &self.channel_items[item_idx].cred_specs[cred_idx];
+                        // Required credentials must be non-empty; optional ones can be skipped
+                        if value.is_empty() && !spec.is_optional {
+                            return;
+                        }
+                        let mut new_collected = collected;
+                        if !value.is_empty() {
+                            new_collected.push((spec.key.to_string(), value));
+                        }
+
+                        let total_creds = self.channel_items[item_idx].cred_specs.len();
+                        if cred_idx + 1 < total_creds {
+                            // More credentials to collect
+                            self.channel_phase = ChannelPhase::CredentialInput {
+                                item_idx,
+                                cred_idx: cred_idx + 1,
+                                buffer: String::new(),
+                                collected: new_collected,
+                            };
+                        } else {
+                            // All credentials collected
+                            self.channel_items[item_idx].credentials = new_collected;
+                            self.channel_phase = ChannelPhase::Browsing;
+                            self.update_input_mode();
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        if let ChannelPhase::CredentialInput { ref mut buffer, .. } =
+                            self.channel_phase
+                        {
+                            buffer.pop();
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if let ChannelPhase::CredentialInput { ref mut buffer, .. } =
+                            self.channel_phase
+                        {
+                            buffer.push(c);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Finish the channels tab — start credential collection or complete.
+    fn finish_channels(&mut self) {
+        // Check if any selected channels still need credentials
+        let needs_creds = self.channel_items.iter().enumerate().find(|(_, item)| {
+            item.selected
+                && item.credentials.is_empty()
+                && item.cred_specs.iter().any(|c| !c.is_optional)
+        });
+
+        if let Some((idx, _)) = needs_creds {
+            self.channel_phase = ChannelPhase::CredentialInput {
+                item_idx: idx,
+                cred_idx: 0,
+                buffer: String::new(),
+                collected: Vec::new(),
+            };
+            self.update_input_mode();
+        } else {
+            self.done = true;
         }
     }
 }
@@ -690,6 +944,7 @@ fn render_tab_content(frame: &mut ratatui::Frame, area: Rect, state: &Onboarding
         Tab::Security => render_security(frame, content_area, state),
         Tab::Provider => render_provider(frame, content_area, state),
         Tab::ApiKey => render_api_key(frame, content_area, state),
+        Tab::Channels => render_channels(frame, content_area, state),
     }
 }
 
@@ -905,10 +1160,112 @@ fn render_api_key(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
+    let mut lines: Vec<Line> = Vec::new();
+
+    match &state.channel_phase {
+        ChannelPhase::Browsing => {
+            lines.push(Line::from(Span::styled(
+                "Connect messaging channels (optional)",
+                Style::default().fg(theme::CYAN),
+            )));
+            lines.push(Line::default());
+
+            for (i, item) in state.channel_items.iter().enumerate() {
+                let is_selected = i == state.channel_cursor;
+                let check = if item.selected { "[x]" } else { "[ ]" };
+
+                let style = if !item.platform_available {
+                    theme::dim()
+                } else if is_selected {
+                    Style::default()
+                        .fg(theme::CYAN)
+                        .add_modifier(Modifier::BOLD)
+                } else if item.selected {
+                    Style::default().fg(theme::GREEN)
+                } else {
+                    theme::dim()
+                };
+
+                let mut spans = vec![Span::styled(format!("  {check} {}", item.name), style)];
+
+                if !item.platform_available {
+                    spans.push(Span::styled("  (macOS only)", theme::dim()));
+                } else if item.selected && !item.credentials.is_empty() {
+                    spans.push(Span::styled("  ✓", Style::default().fg(theme::GREEN)));
+                }
+
+                lines.push(Line::from(spans));
+            }
+
+            if state.channel_items.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  No channel plugins available",
+                    theme::dim(),
+                )));
+            }
+
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "  Press Enter to finish, or Space to toggle channels",
+                theme::dim(),
+            )));
+        }
+        ChannelPhase::CredentialInput {
+            item_idx,
+            cred_idx,
+            buffer,
+            ..
+        } => {
+            let item = &state.channel_items[*item_idx];
+            let spec = &item.cred_specs[*cred_idx];
+
+            lines.push(Line::from(Span::styled(
+                format!("Configure {}", item.name),
+                Style::default().fg(theme::CYAN),
+            )));
+            lines.push(Line::default());
+
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {} ({}/{})",
+                    spec.label,
+                    cred_idx + 1,
+                    item.cred_specs.len()
+                ),
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD),
+            )));
+
+            if !spec.help_url.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", spec.help_url),
+                    theme::dim(),
+                )));
+            }
+            lines.push(Line::default());
+
+            let masked: String = "*".repeat(buffer.len());
+            lines.push(Line::from(vec![
+                Span::styled("  › ", Style::default().fg(theme::CYAN)),
+                Span::raw(masked),
+                Span::styled("▊", Style::default().fg(theme::CYAN)),
+            ]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_footer(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
     let hint = match state.tab {
         Tab::Welcome => " Tab: next field  Enter: next  Esc: cancel",
         Tab::Provider => " ↑/↓: select  Enter/Tab: next  Shift+Tab: back  Esc: cancel",
+        Tab::Channels => match state.channel_phase {
+            ChannelPhase::Browsing => " ↑/↓: select  Space: toggle  Enter: finish  Esc: skip",
+            ChannelPhase::CredentialInput { .. } => " Type to enter  Enter: submit  Esc: cancel",
+        },
         _ if state.input_mode == InputMode::TextInput => " Type to enter  Tab: next  Esc: cancel",
         _ => " Tab/→: next  Shift+Tab/←: back  Esc: cancel",
     };
@@ -944,11 +1301,17 @@ pub fn run() -> Result<Option<OnboardingResult>> {
         render(&mut terminal, &state)?;
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == crossterm::event::KeyEventKind::Release {
-                    continue;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == crossterm::event::KeyEventKind::Release {
+                        continue;
+                    }
+                    state.handle_key(key);
                 }
-                state.handle_key(key);
+                Event::Paste(text) => {
+                    state.handle_paste(&text);
+                }
+                _ => {}
             }
         }
 
@@ -969,7 +1332,13 @@ mod tests {
     fn tab_flow_is_correct() {
         assert_eq!(
             Tab::ALL,
-            [Tab::Welcome, Tab::Security, Tab::Provider, Tab::ApiKey,]
+            [
+                Tab::Welcome,
+                Tab::Security,
+                Tab::Provider,
+                Tab::ApiKey,
+                Tab::Channels,
+            ]
         );
     }
 
@@ -987,6 +1356,8 @@ mod tests {
         assert_eq!(state.tab, Tab::Provider);
         state.next_tab();
         assert_eq!(state.tab, Tab::ApiKey);
+        state.next_tab();
+        assert_eq!(state.tab, Tab::Channels);
     }
 
     #[test]
@@ -1119,6 +1490,7 @@ mod tests {
         state.security_accepted = true;
         assert!(state.tab_completed(Tab::Security));
         assert!(!state.tab_completed(Tab::ApiKey));
+        assert!(state.tab_completed(Tab::Channels)); // optional, always true
     }
 
     #[test]
@@ -1184,9 +1556,10 @@ mod tests {
             .unwrap();
         state.provider_index = ollama_idx;
 
-        // next_tab from Provider with keyless provider should set done=true
+        // next_tab from Provider with keyless provider should skip to Channels
         state.next_tab();
-        assert!(state.done);
+        assert_eq!(state.tab, Tab::Channels);
+        assert!(!state.done);
     }
 
     #[test]
@@ -1223,5 +1596,55 @@ mod tests {
     fn provider_tab_completed_always_true() {
         let state = OnboardingState::new();
         assert!(state.tab_completed(Tab::Provider));
+    }
+
+    #[test]
+    fn channels_tab_enter_with_no_selection_finishes() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::Channels;
+        // Enter with no channels selected should finish
+        state.finish_channels();
+        assert!(state.done);
+    }
+
+    #[test]
+    fn channels_tab_loads_catalog_items() {
+        let state = OnboardingState::new();
+        // Should have loaded channel plugins from CATALOG
+        assert!(
+            !state.channel_items.is_empty(),
+            "Expected channel items from catalog"
+        );
+        // All items should be channels
+        for item in &state.channel_items {
+            assert!(
+                item.id.starts_with("messaging/"),
+                "Expected messaging plugin, got: {}",
+                item.id
+            );
+        }
+    }
+
+    #[test]
+    fn channels_tab_space_toggles() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::Channels;
+        state.channel_cursor = 0;
+
+        // Find a channel that doesn't need credentials (no required creds)
+        let no_cred_idx = state.channel_items.iter().position(|item| {
+            item.platform_available && !item.cred_specs.iter().any(|c| !c.is_optional)
+        });
+
+        if let Some(idx) = no_cred_idx {
+            state.channel_cursor = idx;
+            assert!(!state.channel_items[idx].selected);
+            // Space toggles on
+            state.handle_channels_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+            assert!(state.channel_items[idx].selected);
+            // Space toggles off
+            state.handle_channels_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+            assert!(!state.channel_items[idx].selected);
+        }
     }
 }

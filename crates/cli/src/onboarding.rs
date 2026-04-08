@@ -94,6 +94,8 @@ pub struct OnboardingResult {
     pub model_id: String,
     pub api_key: Option<String>,
     pub provider: String,
+    /// Channel plugins selected during onboarding: `(plugin_id, credentials)`.
+    pub channels: Vec<(String, Vec<(String, String)>)>,
 }
 
 /// Get the model list for a given provider.
@@ -422,6 +424,107 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 }
             }
             println!("  Created {}", env_path.display());
+        }
+    }
+
+    // Install selected channel plugins
+    if !result.channels.is_empty() {
+        let mut cfg = match Config::load_from_db() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  Warning: failed to load config for channel setup: {e}");
+                tracing::warn!("Config::load_from_db failed during channel install: {e}");
+                // Skip all channel installs — can't wire credentials without config
+                return Ok(());
+            }
+        };
+
+        let db = match borg_core::db::Database::open() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("  Warning: failed to open database for channel setup: {e}");
+                tracing::warn!("Database::open failed during channel install: {e}");
+                return Ok(());
+            }
+        };
+
+        for (plugin_id, credentials) in &result.channels {
+            let Some(def) = borg_plugins::catalog::find_by_id(plugin_id) else {
+                eprintln!("  Warning: unknown plugin '{plugin_id}', skipping");
+                continue;
+            };
+
+            let service = def.service_name();
+            let mut stored_ok = true;
+
+            // Store credentials in keychain
+            for (key, value) in credentials {
+                let account = format!("borg-{key}");
+                if let Err(e) = borg_plugins::keychain::store(&service, &account, value) {
+                    eprintln!("  Warning: failed to store {key} in keychain: {e}");
+                    tracing::warn!("Keychain store failed for {key}: {e}");
+                    stored_ok = false;
+                }
+            }
+
+            if !stored_ok {
+                continue;
+            }
+
+            // Wire credential refs into shared config
+            for (key, _) in credentials {
+                let account = format!("borg-{key}");
+                cfg.credentials.insert(
+                    key.clone(),
+                    borg_core::config::CredentialValue::Ref(
+                        borg_core::secrets_resolve::SecretRef::Keychain {
+                            service: service.clone(),
+                            account,
+                        },
+                    ),
+                );
+            }
+
+            // Record plugin + channel in DB
+            if let Err(e) = db.insert_plugin(
+                def.id,
+                def.name,
+                &def.kind.to_string(),
+                &def.category.to_string(),
+            ) {
+                tracing::warn!("Failed to record plugin: {e}");
+            }
+            let channel_name = def.id.rsplit('/').next().unwrap_or(def.id);
+            let runtime = if def.is_native { "native" } else { "python" };
+            let webhook = format!("/webhook/{channel_name}");
+            if let Err(e) = db.insert_installed_channel(
+                channel_name,
+                def.description,
+                runtime,
+                def.id,
+                &webhook,
+            ) {
+                tracing::warn!("Failed to register channel: {e}");
+            }
+
+            println!(
+                "  Connected {}. Approve senders with: /pairing approve <CODE>",
+                def.name
+            );
+        }
+
+        // Persist accumulated credentials to DB once
+        match serde_json::to_string(&cfg.credentials) {
+            Ok(json) => {
+                if let Err(e) = db.set_setting("credentials", &json) {
+                    eprintln!("  Warning: failed to save credentials to database: {e}");
+                    tracing::warn!("Failed to save credentials after channel install: {e}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  Warning: failed to serialize credentials: {e}");
+                tracing::warn!("serde_json::to_string failed for credentials: {e}");
+            }
         }
     }
 
