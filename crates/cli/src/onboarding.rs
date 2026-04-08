@@ -308,7 +308,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     {
         let db = borg_core::db::Database::open()
             .context("Failed to open database for onboarding settings")?;
-        db.set_setting("llm.provider", &result.provider)?;
+        db.set_setting("provider", &result.provider)?;
         db.set_setting("model", &result.model_id)?;
         if !result.user_name.is_empty() {
             db.set_setting("user.name", &result.user_name)?;

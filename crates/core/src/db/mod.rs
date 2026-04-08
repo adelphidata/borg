@@ -23,10 +23,11 @@ pub use vitals::PendingCelebration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::instrument;
 
 use crate::config::Config;
+use crate::db_key;
 
 /// SQLite database for structured data (session metadata, scheduled tasks, task runs).
 pub struct Database {
@@ -60,25 +61,55 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let db_key = db_key::get_or_create_db_key()?;
+
         let conn =
             Connection::open(&path).with_context(|| format!("Failed to open DB at {path:?}"))?;
-        // Restrict DB file to owner-only access
+        Self::set_file_permissions(&path);
+        Self::init_connection_with_key(conn, busy_timeout_ms, &db_key)
+    }
+
+    /// Create a Database from an existing connection (no encryption). Runs migrations.
+    /// Used for testing with in-memory databases.
+    pub fn from_connection(conn: Connection) -> Result<Self> {
+        Self::init_connection_unencrypted(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
+    }
+
+    /// Restrict DB file to owner-only access on Unix.
+    fn set_file_permissions(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        Self::init_connection_with_timeout(conn, busy_timeout_ms)
+        let _ = path; // suppress unused warning on non-unix
     }
 
-    /// Create a Database from an existing connection. Runs migrations.
-    /// Useful for testing with in-memory databases.
-    pub fn from_connection(conn: Connection) -> Result<Self> {
-        Self::init_connection_with_timeout(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
+    /// Connection initialization with SQLCipher encryption key.
+    fn init_connection_with_key(
+        conn: Connection,
+        busy_timeout_ms: u64,
+        key: &[u8],
+    ) -> Result<Self> {
+        // PRAGMA key must be the first statement (already set if try_set_key succeeded,
+        // but needed for fresh DBs)
+        let key_pragma = db_key::format_sqlcipher_key(key);
+        conn.query_row(&format!("PRAGMA key = \"{key_pragma}\""), [], |_| Ok(()))
+            .map_err(|_| anyhow::anyhow!("Failed to set database encryption key"))?;
+        Self::init_common_pragmas_and_migrate(conn, busy_timeout_ms)
     }
 
-    /// Common connection initialization: pragmas + migrations.
-    fn init_connection_with_timeout(conn: Connection, busy_timeout_ms: u64) -> Result<Self> {
+    /// Connection initialization without encryption (for in-memory test DBs).
+    pub(crate) fn init_connection_unencrypted(
+        conn: Connection,
+        busy_timeout_ms: u64,
+    ) -> Result<Self> {
+        Self::init_common_pragmas_and_migrate(conn, busy_timeout_ms)
+    }
+
+    /// Shared pragma setup and migration logic.
+    fn init_common_pragmas_and_migrate(conn: Connection, busy_timeout_ms: u64) -> Result<Self> {
         let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let _: i64 = conn.query_row(

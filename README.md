@@ -58,6 +58,10 @@ See the [docs/](docs/) directory for detailed guides on configuration, architect
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and PR guidelines.
 
+## Security
+
+See [SECURITY.md](SECURITY.md) for the security architecture, vulnerability reporting, and response policy.
+
 ## License
 
 [MIT](LICENSE)

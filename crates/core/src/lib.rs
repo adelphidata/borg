@@ -27,6 +27,8 @@ pub mod conversation;
 pub mod daily_summary;
 /// SQLite database with versioned migrations.
 pub mod db;
+/// Database encryption key management (SQLCipher).
+pub mod db_key;
 /// Diagnostic checks for `borg doctor`.
 pub mod doctor;
 /// Embedding API client, cosine similarity, and hybrid search.

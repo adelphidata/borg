@@ -2944,7 +2944,7 @@ fn update_role_preserves_none_fields() {
 fn open_with_custom_timeout() {
     // Verify that a custom busy timeout is accepted
     let conn = Connection::open_in_memory().expect("open in-memory db");
-    let db = Database::init_connection_with_timeout(conn, Database::GATEWAY_BUSY_TIMEOUT_MS)
+    let db = Database::init_connection_unencrypted(conn, Database::GATEWAY_BUSY_TIMEOUT_MS)
         .expect("init with gateway timeout");
     // Verify the timeout was applied by reading it back
     let timeout: i64 = db
@@ -2957,7 +2957,7 @@ fn open_with_custom_timeout() {
 #[test]
 fn default_open_uses_5s_timeout() {
     let conn = Connection::open_in_memory().expect("open in-memory db");
-    let db = Database::init_connection_with_timeout(conn, 5000).expect("init with default timeout");
+    let db = Database::init_connection_unencrypted(conn, 5000).expect("init with default timeout");
     let timeout: i64 = db
         .conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
