@@ -3,6 +3,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::constants;
 use crate::db::Database;
 
 /// Unambiguous character set (no 0/O/1/I/L/5/S).
@@ -162,6 +163,20 @@ fn check_pairing(
 
     let ttl = config.gateway.pairing_ttl_secs;
     let name = agent_name.unwrap_or("Borg");
+
+    // Rate limit: max N new codes per sender per hour (checked before reuse
+    // so that even reused-code responses are gated after excessive attempts)
+    let attempts = db.count_pairing_attempts(channel_name, sender_id, constants::SECS_PER_HOUR)?;
+    if attempts >= constants::PAIRING_MAX_ATTEMPTS_PER_HOUR {
+        tracing::warn!(
+            channel = channel_name,
+            sender = sender_id,
+            "pairing rate limit exceeded"
+        );
+        return Ok(AccessCheckResult::Denied {
+            reason: "Too many pairing attempts. Please try again later.".into(),
+        });
+    }
 
     // Check for existing non-expired pending request (reuse code)
     if let Some(existing) = db.find_pending_for_sender(channel_name, sender_id)? {
@@ -583,6 +598,82 @@ mod tests {
         assert_eq!(channel_display_name("telegram"), "Telegram");
         assert_eq!(channel_display_name("slack"), "Slack");
         assert_eq!(channel_display_name("custom"), "custom");
+    }
+
+    #[test]
+    fn test_pairing_rate_limit_exceeded() {
+        let db = test_db();
+        let config = test_config_with_policy(DmPolicy::Pairing);
+
+        // Create max attempts directly in the DB for the same sender
+        for _ in 0..constants::PAIRING_MAX_ATTEMPTS_PER_HOUR {
+            let code = generate_code("telegram");
+            db.create_pairing_request("telegram", "rate_limit_user", &code, None, 3600)
+                .unwrap();
+        }
+
+        // The next attempt should be denied
+        let result =
+            check_sender_access(&db, &config, "telegram", "rate_limit_user", None).unwrap();
+        assert!(
+            matches!(result, AccessCheckResult::Denied { .. }),
+            "expected Denied after exceeding rate limit, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_pairing_rate_limit_reuse_doesnt_count() {
+        let db = test_db();
+        let config = test_config_with_policy(DmPolicy::Pairing);
+
+        // First call creates a code
+        let result = check_sender_access(&db, &config, "telegram", "reuse_user", None).unwrap();
+        assert!(matches!(result, AccessCheckResult::Challenge { .. }));
+
+        // Repeated calls reuse the same code (don't create new ones)
+        let result = check_sender_access(&db, &config, "telegram", "reuse_user", None).unwrap();
+        assert!(matches!(result, AccessCheckResult::Challenge { .. }));
+
+        // Count should be 1, not 2
+        let count = db
+            .count_pairing_attempts("telegram", "reuse_user", 3600)
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_count_pairing_attempts_db_method() {
+        let db = test_db();
+
+        // No attempts yet
+        let count = db
+            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Create some requests
+        for _ in 0..5 {
+            let code = generate_code("telegram");
+            db.create_pairing_request("telegram", "counter_user", &code, None, 3600)
+                .unwrap();
+        }
+
+        let count = db
+            .count_pairing_attempts("telegram", "counter_user", 3600)
+            .unwrap();
+        assert_eq!(count, 5);
+
+        // Different sender should have 0
+        let count = db
+            .count_pairing_attempts("telegram", "other_user", 3600)
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Different channel should have 0
+        let count = db
+            .count_pairing_attempts("slack", "counter_user", 3600)
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

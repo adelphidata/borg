@@ -314,6 +314,9 @@ pub const HMAC_CHECKPOINT_INTERVAL: u32 = 100;
 /// Seconds per hour, used for rate-limit hour bucketing.
 pub const SECS_PER_HOUR: i64 = 3600;
 
+/// Maximum pairing code generation attempts per sender per hour.
+pub const PAIRING_MAX_ATTEMPTS_PER_HOUR: u32 = 20;
+
 #[cfg(test)]
 mod tests {
     use super::*;

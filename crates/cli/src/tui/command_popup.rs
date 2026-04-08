@@ -73,6 +73,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Show pairing codes",
     },
     SlashCommandDef {
+        name: "/pairing revoke",
+        description: "Revoke an approved sender",
+    },
+    SlashCommandDef {
         name: "/update",
         description: "Update borg to latest version",
     },
@@ -355,6 +359,7 @@ mod tests {
             "/doctor",
             "/stats",
             "/pairing",
+            "/pairing revoke",
             "/update",
             "/sessions",
             "/save",

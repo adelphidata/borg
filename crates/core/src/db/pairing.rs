@@ -154,6 +154,22 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Count pairing requests created by a sender within the last `window_secs` seconds.
+    pub fn count_pairing_attempts(
+        &self,
+        channel_name: &str,
+        sender_id: &str,
+        window_secs: i64,
+    ) -> Result<u32> {
+        let cutoff = chrono::Utc::now().timestamp() - window_secs;
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pairing_requests WHERE channel_name = ?1 AND sender_id = ?2 AND created_at > ?3",
+            params![channel_name, sender_id, cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     pub fn revoke_sender(&self, channel_name: &str, sender_id: &str) -> Result<bool> {
         let changes = self.conn.execute(
             "DELETE FROM approved_senders WHERE channel_name = ?1 AND sender_id = ?2",

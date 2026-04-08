@@ -116,6 +116,36 @@ impl App<'_> {
             return Some(Ok(AppAction::Continue));
         }
 
+        // /pairing revoke (no args) — show usage with approved senders
+        if trimmed == "/pairing revoke" {
+            let mut msg = "Usage: /pairing revoke <channel> <sender_id>\n".to_string();
+            if let Ok(db) = borg_core::db::Database::open() {
+                if let Ok(senders) = db.list_approved_senders(None) {
+                    if !senders.is_empty() {
+                        msg.push_str("\nApproved senders:\n");
+                        for s in &senders {
+                            msg.push_str(&format!(
+                                "  {} {} → /pairing revoke {} {}\n",
+                                s.channel_name, s.sender_id, s.channel_name, s.sender_id
+                            ));
+                        }
+                    }
+                }
+            }
+            self.push_system_message(msg);
+            return Some(Ok(AppAction::Continue));
+        }
+
+        // /pairing revoke <channel> <sender_id>
+        if let Some(rest) = trimmed.strip_prefix("/pairing revoke ") {
+            let parts: Vec<&str> = rest.trim().splitn(2, ' ').collect();
+            if parts.len() == 2 && !parts[1].is_empty() {
+                return Some(self.cmd_pairing_revoke(parts[0], parts[1]));
+            }
+            self.push_system_message("Usage: /pairing revoke <channel> <sender_id>".to_string());
+            return Some(Ok(AppAction::Continue));
+        }
+
         // /pairing <code> (shortcut)
         if let Some(rest) = trimmed.strip_prefix("/pairing ") {
             let code = rest.trim();
@@ -161,6 +191,7 @@ impl App<'_> {
              /poke      - Trigger immediate heartbeat\n  \
              /pairing   - Show channel pairing info\n  \
              /pairing approve <code> - Approve a pairing request\n  \
+             /pairing revoke <channel> <sender_id> - Revoke an approved sender\n  \
              /pairing <code> - Approve (shortcut)\n  \
              /update    - Update borg to latest version\n\
              \n  \
@@ -256,8 +287,8 @@ impl App<'_> {
                             for s in &senders {
                                 let name = s.display_name.as_deref().unwrap_or("—");
                                 output.push_str(&format!(
-                                    "  {} | {} | {}\n",
-                                    s.channel_name, s.sender_id, name
+                                    "  {} | {} | {}\n    → /pairing revoke {} {}\n",
+                                    s.channel_name, s.sender_id, name, s.channel_name, s.sender_id
                                 ));
                             }
                         }
@@ -316,6 +347,29 @@ impl App<'_> {
                     }
                 }
             }
+            Err(e) => {
+                self.push_system_message(format!("Database error: {e}"));
+            }
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn cmd_pairing_revoke(&mut self, channel: &str, sender_id: &str) -> Result<AppAction> {
+        match borg_core::db::Database::open() {
+            Ok(db) => match db.revoke_sender(channel, sender_id) {
+                Ok(true) => {
+                    let display = borg_core::pairing::channel_display_name(channel);
+                    self.push_system_message(format!("Revoked sender {sender_id} from {display}."));
+                }
+                Ok(false) => {
+                    self.push_system_message(format!(
+                        "No approved sender found for {channel} with ID {sender_id}."
+                    ));
+                }
+                Err(e) => {
+                    self.push_system_message(format!("Failed to revoke: {e}"));
+                }
+            },
             Err(e) => {
                 self.push_system_message(format!("Database error: {e}"));
             }
