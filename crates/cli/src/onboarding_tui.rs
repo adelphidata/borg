@@ -37,7 +37,6 @@ const BORG_NAMES: &[&str] = &[
     "Victor Borge",
     "Cyborg Jones",
     "Rube Goldborg",
-    "Zuckerborg",
     "Sandborg",
     "Blomborg",
     "Harrisonborg",
@@ -247,6 +246,7 @@ struct OnboardingState {
     // Welcome
     user_name: String,
     agent_name: String,
+    default_agent_name: String,
     welcome_focus: WelcomeFocus,
 
     // Security
@@ -286,11 +286,13 @@ impl OnboardingState {
             0
         };
 
+        let default_name = random_borg_name();
         Self {
             tab: Tab::Welcome,
             input_mode: InputMode::TextInput,
             user_name: String::new(),
-            agent_name: random_borg_name(),
+            agent_name: default_name.clone(),
+            default_agent_name: default_name,
             welcome_focus: WelcomeFocus::UserName,
             security_accepted: false,
             provider_index,
@@ -411,7 +413,7 @@ impl OnboardingState {
         OnboardingResult {
             user_name: self.user_name.clone(),
             agent_name: if self.agent_name.is_empty() {
-                random_borg_name()
+                self.default_agent_name.clone()
             } else {
                 self.agent_name.clone()
             },
@@ -1094,12 +1096,12 @@ mod tests {
     fn empty_agent_name_defaults_to_random_borg_name() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
+        let expected = state.default_agent_name.clone();
         state.agent_name.clear();
         let result = state.build_result();
-        assert!(
-            BORG_NAMES.contains(&result.agent_name.as_str()),
-            "Expected a name from BORG_NAMES, got: {}",
-            result.agent_name
+        assert_eq!(
+            result.agent_name, expected,
+            "Empty agent_name should fall back to the initially generated default"
         );
     }
 
