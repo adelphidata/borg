@@ -1,15 +1,13 @@
-use std::time::Duration;
-
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
 use super::types::CreateMessageRequest;
 use crate::chunker;
+use crate::constants::GATEWAY_HTTP_TIMEOUT;
 use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
 const MESSAGE_CHUNK_SIZE: usize = 4096;
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A client for the Google Chat API.
 #[derive(Clone)]
@@ -22,7 +20,7 @@ impl GoogleChatClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .timeout(HTTP_TIMEOUT)
+                .timeout(GATEWAY_HTTP_TIMEOUT)
                 .build()
                 .context("Failed to build Google Chat HTTP client")?,
             token: token.to_string(),

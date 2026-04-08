@@ -3,12 +3,17 @@
 //! Each platform has different keepalive intervals and send functions, but the
 //! core loop structure (initial trigger, periodic keepalive, TTL deadline,
 //! consecutive failure tracking) is identical.
+//!
+//! [`TypingIndicatorHandle`] provides the reusable start/stop/Drop pattern so
+//! channel modules don't duplicate struct + oneshot + JoinHandle boilerplate.
 
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use borg_core::constants::{TYPING_MAX_CONSECUTIVE_FAILURES, TYPING_MAX_TTL_SECS};
 use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 /// Platform-specific configuration for the keepalive loop.
@@ -70,6 +75,60 @@ pub async fn run_keepalive<F, Fut>(
                 );
                 break;
             }
+        }
+    }
+}
+
+/// Reusable handle for a running typing indicator background task.
+///
+/// Wraps the oneshot-stop + JoinHandle pattern that Discord, Telegram, and
+/// Slack all share. Call [`stop`](Self::stop) to gracefully shut down, or let
+/// [`Drop`] abort the task if the handle is abandoned.
+pub struct TypingIndicatorHandle {
+    stop_tx: Option<oneshot::Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TypingIndicatorHandle {
+    /// Spawn a keepalive loop as a background task.
+    ///
+    /// `spawn_fn` receives a `oneshot::Receiver<()>` (the stop signal) and must
+    /// return a future that runs the keepalive loop. This indirection lets each
+    /// channel do pre-loop setup (e.g. Slack adds a reaction before entering
+    /// `run_keepalive`).
+    pub fn start<F>(spawn_fn: F) -> Self
+    where
+        F: FnOnce(oneshot::Receiver<()>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let handle = tokio::spawn(spawn_fn(stop_rx));
+        Self {
+            stop_tx: Some(stop_tx),
+            handle: Some(handle),
+        }
+    }
+
+    /// Signal the background task to stop and wait for it to finish.
+    pub async fn stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Ensure the background task is killed if the handle is dropped without `stop()`.
+impl Drop for TypingIndicatorHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
         }
     }
 }

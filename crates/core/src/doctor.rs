@@ -1131,24 +1131,18 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
 fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     use crate::pairing::DmPolicy;
 
-    // DM policy
+    // DM policy (three-way match — not table-driven)
     match config.gateway.dm_policy {
-        DmPolicy::Open => {
-            checks.push(DiagnosticCheck::warn(
-                "Security",
-                "DM policy",
-                "set to \"open\" — all senders can interact without approval. Set to \"pairing\" for access control",
-            ));
-        }
-        DmPolicy::Pairing => {
-            checks.push(DiagnosticCheck::pass("Security", "DM policy (pairing)"));
-        }
-        DmPolicy::Disabled => {
-            checks.push(DiagnosticCheck::pass("Security", "DM policy (disabled)"));
-        }
+        DmPolicy::Open => checks.push(DiagnosticCheck::warn(
+            "Security",
+            "DM policy",
+            "set to \"open\" — all senders can interact without approval. Set to \"pairing\" for access control",
+        )),
+        DmPolicy::Pairing => checks.push(DiagnosticCheck::pass("Security", "DM policy (pairing)")),
+        DmPolicy::Disabled => checks.push(DiagnosticCheck::pass("Security", "DM policy (disabled)")),
     }
 
-    // Per-channel open policies
+    // Per-channel open policies (dynamic list — not table-driven)
     let open_channels: Vec<&String> = config
         .gateway
         .channel_policies
@@ -1176,76 +1170,78 @@ fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         ));
     }
 
-    // Sandbox
-    if !config.sandbox.enabled {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "sandbox",
-            "disabled — user tools run without isolation. Set sandbox.enabled = true",
-        ));
-    } else if config.sandbox.mode == "permissive" {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "sandbox mode",
-            "set to \"permissive\" — weaker isolation. Consider \"strict\"",
-        ));
-    } else {
-        checks.push(DiagnosticCheck::pass(
-            "Security",
-            "sandbox enabled (strict)",
-        ));
+    // Table-driven boolean/simple checks
+    struct BoolCheck {
+        ok: bool,
+        pass_label: &'static str,
+        warn_label: &'static str,
+        warn_detail: &'static str,
     }
 
-    // Secret detection
-    if !config.security.secret_detection {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "secret detection",
-            "disabled — API keys and tokens may leak in tool output. Set security.secret_detection = true",
-        ));
-    } else {
-        checks.push(DiagnosticCheck::pass(
-            "Security",
-            "secret detection enabled",
-        ));
+    let bool_checks = [
+        BoolCheck {
+            ok: config.sandbox.enabled && config.sandbox.mode != "permissive",
+            pass_label: if config.sandbox.enabled { "sandbox enabled (strict)" } else { "sandbox" },
+            warn_label: if !config.sandbox.enabled { "sandbox" } else { "sandbox mode" },
+            warn_detail: if !config.sandbox.enabled {
+                "disabled — user tools run without isolation. Set sandbox.enabled = true"
+            } else {
+                "set to \"permissive\" — weaker isolation. Consider \"strict\""
+            },
+        },
+        BoolCheck {
+            ok: config.security.secret_detection,
+            pass_label: "secret detection enabled",
+            warn_label: "secret detection",
+            warn_detail: "disabled — API keys and tokens may leak in tool output. Set security.secret_detection = true",
+        },
+        BoolCheck {
+            ok: !config.security.blocked_paths.is_empty(),
+            pass_label: "blocked paths",
+            warn_label: "blocked paths",
+            warn_detail: "empty — sensitive directories (.ssh, .aws, .gnupg) are not protected. Add entries to security.blocked_paths",
+        },
+        BoolCheck {
+            ok: config.security.action_limits.tool_calls_block <= 1000
+                && config.security.action_limits.shell_commands_block <= 500
+                && config.security.action_limits.file_writes_block <= 300,
+            pass_label: "rate limits within bounds",
+            warn_label: "rate limits",
+            warn_detail: "block thresholds are very high — consider lowering for tighter safety bounds",
+        },
+        BoolCheck {
+            ok: config.budget.monthly_token_limit != 0,
+            pass_label: "budget",
+            warn_label: "budget",
+            warn_detail: "unlimited (monthly_token_limit = 0) — no spend cap. Set a limit to prevent runaway usage",
+        },
+    ];
+
+    for check in &bool_checks {
+        if check.ok {
+            // Dynamic pass labels for blocked_paths count and budget cap
+            let label = match check.pass_label {
+                "blocked paths" => format!(
+                    "blocked paths ({} entries)",
+                    config.security.blocked_paths.len()
+                ),
+                "budget" => format!(
+                    "budget capped ({} tokens/month)",
+                    config.budget.monthly_token_limit
+                ),
+                other => other.to_string(),
+            };
+            checks.push(DiagnosticCheck::pass("Security", label));
+        } else {
+            checks.push(DiagnosticCheck::warn(
+                "Security",
+                check.warn_label,
+                check.warn_detail,
+            ));
+        }
     }
 
-    // Blocked paths
-    if config.security.blocked_paths.is_empty() {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "blocked paths",
-            "empty — sensitive directories (.ssh, .aws, .gnupg) are not protected. Add entries to security.blocked_paths",
-        ));
-    } else {
-        checks.push(DiagnosticCheck::pass(
-            "Security",
-            format!(
-                "blocked paths ({} entries)",
-                config.security.blocked_paths.len()
-            ),
-        ));
-    }
-
-    // Rate limits
-    let limits = &config.security.action_limits;
-    if limits.tool_calls_block > 1000
-        || limits.shell_commands_block > 500
-        || limits.file_writes_block > 300
-    {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "rate limits",
-            "block thresholds are very high — consider lowering for tighter safety bounds",
-        ));
-    } else {
-        checks.push(DiagnosticCheck::pass(
-            "Security",
-            "rate limits within bounds",
-        ));
-    }
-
-    // Browser no-sandbox
+    // Browser no-sandbox (conditional on browser being enabled)
     if config.browser.enabled && config.browser.no_sandbox {
         checks.push(DiagnosticCheck::warn(
             "Security",
@@ -1254,23 +1250,6 @@ fn check_config_security(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         ));
     } else if config.browser.enabled {
         checks.push(DiagnosticCheck::pass("Security", "browser sandbox enabled"));
-    }
-
-    // Budget unlimited
-    if config.budget.monthly_token_limit == 0 {
-        checks.push(DiagnosticCheck::warn(
-            "Security",
-            "budget",
-            "unlimited (monthly_token_limit = 0) — no spend cap. Set a limit to prevent runaway usage",
-        ));
-    } else {
-        checks.push(DiagnosticCheck::pass(
-            "Security",
-            format!(
-                "budget capped ({} tokens/month)",
-                config.budget.monthly_token_limit
-            ),
-        ));
     }
 }
 

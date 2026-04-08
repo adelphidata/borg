@@ -177,7 +177,9 @@ impl HeartbeatScheduler {
         }
 
         let mode = format!("interval: {}", self.config.interval);
-        let _ = tx.try_send(HeartbeatEvent::SchedulerStarted { mode });
+        if let Err(e) = tx.try_send(HeartbeatEvent::SchedulerStarted { mode }) {
+            warn!("Failed to send SchedulerStarted event: {e}");
+        }
 
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -198,9 +200,11 @@ impl HeartbeatScheduler {
                 _ = ticker.tick() => {
                     if self.is_quiet_hours() {
                         debug!("Heartbeat: in quiet hours, skipping");
-                        let _ = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                        if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
                             reason: SkipReason::QuietHours,
-                        }));
+                        })) {
+                            debug!("Failed to send quiet-hours skip event: {e}");
+                        }
                         continue;
                     }
                     if !Self::try_fire(&tx) { return; }
@@ -249,7 +253,9 @@ impl HeartbeatScheduler {
         }
 
         let mode = format!("cron: {cron_expr}");
-        let _ = tx.try_send(HeartbeatEvent::SchedulerStarted { mode });
+        if let Err(e) = tx.try_send(HeartbeatEvent::SchedulerStarted { mode }) {
+            warn!("Failed to send SchedulerStarted event: {e}");
+        }
 
         loop {
             let now = chrono::Local::now();
@@ -279,9 +285,11 @@ impl HeartbeatScheduler {
                 _ = tokio::time::sleep(wait) => {
                     if self.is_quiet_hours() {
                         debug!("Heartbeat: in quiet hours, skipping");
-                        let _ = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                        if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
                             reason: SkipReason::QuietHours,
-                        }));
+                        })) {
+                            debug!("Failed to send quiet-hours skip event: {e}");
+                        }
                         continue;
                     }
                     if !Self::try_fire(&tx) { return; }

@@ -329,7 +329,9 @@ fn imessage_post_install(data_dir: &std::path::Path) -> Vec<String> {
 
 async fn send_event(tx: Option<&mpsc::Sender<InstallEvent>>, event: InstallEvent) {
     if let Some(tx) = tx {
-        let _ = tx.send(event).await;
+        if let Err(e) = tx.send(event).await {
+            tracing::warn!("Failed to send install event: {e}");
+        }
     }
 }
 

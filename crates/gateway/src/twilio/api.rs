@@ -3,8 +3,9 @@ use base64::Engine;
 use reqwest::Client;
 use std::time::Duration;
 
+use crate::constants::GATEWAY_HTTP_TIMEOUT;
+
 const TWILIO_API_BASE: &str = "https://api.twilio.com/2010-04-01";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Client for sending messages via the Twilio REST API.
 pub struct TwilioClient {
@@ -23,7 +24,7 @@ impl TwilioClient {
 
         Ok(Self {
             client: Client::builder()
-                .timeout(HTTP_TIMEOUT)
+                .timeout(GATEWAY_HTTP_TIMEOUT)
                 .connect_timeout(Duration::from_secs(10))
                 .build()
                 .context("Failed to build Twilio HTTP client")?,

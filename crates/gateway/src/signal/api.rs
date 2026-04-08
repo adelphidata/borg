@@ -269,7 +269,9 @@ impl SignalClient {
             params["groupId"] = serde_json::Value::String(g.to_string());
         }
         // Best-effort — don't fail the flow on typing indicator errors
-        let _ = self.rpc_call("sendTyping", params).await;
+        if let Err(e) = self.rpc_call("sendTyping", params).await {
+            tracing::warn!("[signal] sendTyping failed: {e}");
+        }
         Ok(())
     }
 
@@ -285,7 +287,9 @@ impl SignalClient {
             "type": "read",
         });
         // Best-effort
-        let _ = self.rpc_call("sendReceipt", params).await;
+        if let Err(e) = self.rpc_call("sendReceipt", params).await {
+            tracing::warn!("[signal] sendReceipt failed: {e}");
+        }
         Ok(())
     }
 

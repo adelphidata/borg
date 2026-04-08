@@ -1,59 +1,42 @@
+/// Check that `args[key]` is a non-null string, returning an error message if missing.
+fn require_str(action: &str, args: &serde_json::Value, key: &str) -> Option<String> {
+    if args.get(key).and_then(serde_json::Value::as_str).is_some() {
+        None
+    } else {
+        Some(format!("{action} requires '{key}' parameter"))
+    }
+}
+
+/// Check that `args[key]` is a non-null integer, returning an error message if missing.
+fn require_u64(action: &str, args: &serde_json::Value, key: &str) -> Option<String> {
+    if args.get(key).and_then(serde_json::Value::as_u64).is_some() {
+        None
+    } else {
+        Some(format!("{action} requires '{key}' parameter (integer)"))
+    }
+}
+
 /// Validate arguments for a browser action. Returns an error message if invalid.
 pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<String> {
     match action {
-        "navigate" => {
-            if args.get("url").and_then(|v| v.as_str()).is_none() {
-                return Some("navigate requires 'url' parameter".to_string());
-            }
-        }
-        "click" => {
-            if args.get("selector").and_then(|v| v.as_str()).is_none() {
-                return Some("click requires 'selector' parameter".to_string());
-            }
-        }
+        "navigate" => require_str(action, args, "url"),
+        "click" | "hover" => require_str(action, args, "selector"),
         "type" => {
-            if args.get("selector").and_then(|v| v.as_str()).is_none() {
-                return Some("type requires 'selector' parameter".to_string());
-            }
-            if args.get("text").and_then(|v| v.as_str()).is_none() {
-                return Some("type requires 'text' parameter".to_string());
-            }
+            require_str(action, args, "selector").or_else(|| require_str(action, args, "text"))
         }
-        "evaluate_js" => {
-            if args.get("expression").and_then(|v| v.as_str()).is_none() {
-                return Some("evaluate_js requires 'expression' parameter".to_string());
-            }
-        }
-        "hover" => {
-            if args.get("selector").and_then(|v| v.as_str()).is_none() {
-                return Some("hover requires 'selector' parameter".to_string());
-            }
-        }
+        "evaluate_js" => require_str(action, args, "expression"),
         "select" => {
-            if args.get("selector").and_then(|v| v.as_str()).is_none() {
-                return Some("select requires 'selector' parameter".to_string());
-            }
-            if args.get("value").and_then(|v| v.as_str()).is_none() {
-                return Some("select requires 'value' parameter".to_string());
-            }
+            require_str(action, args, "selector").or_else(|| require_str(action, args, "value"))
         }
-        "press" => {
-            if args.get("key").and_then(|v| v.as_str()).is_none() {
-                return Some("press requires 'key' parameter".to_string());
-            }
-        }
+        "press" => require_str(action, args, "key"),
         "drag" => {
-            if args.get("source").and_then(|v| v.as_str()).is_none() {
-                return Some("drag requires 'source' parameter".to_string());
-            }
-            if args.get("target").and_then(|v| v.as_str()).is_none() {
-                return Some("drag requires 'target' parameter".to_string());
-            }
+            require_str(action, args, "source").or_else(|| require_str(action, args, "target"))
         }
         "fill" => {
             if args.get("fields").and_then(|v| v.as_object()).is_none() {
                 return Some("fill requires 'fields' parameter (object)".to_string());
             }
+            None
         }
         "wait" => {
             let condition = args.get("condition").and_then(serde_json::Value::as_str);
@@ -68,53 +51,25 @@ pub fn validate_browser_args(action: &str, args: &serde_json::Value) -> Option<S
                             "wait with condition '{c}' requires 'value' parameter"
                         ));
                     }
+                    None
                 }
-                Some("load") => {}
-                Some(c) => {
-                    return Some(format!(
-                        "Unknown wait condition: {c}. Use: text, element, url, load, js"
-                    ));
-                }
-                None => {
-                    return Some(
-                        "wait requires 'condition' parameter (text|element|url|load|js)"
-                            .to_string(),
-                    );
-                }
+                Some("load") => None,
+                Some(c) => Some(format!(
+                    "Unknown wait condition: {c}. Use: text, element, url, load, js"
+                )),
+                None => Some(
+                    "wait requires 'condition' parameter (text|element|url|load|js)".to_string(),
+                ),
             }
         }
         "resize" => {
-            if args
-                .get("width")
-                .and_then(serde_json::Value::as_u64)
-                .is_none()
-            {
-                return Some("resize requires 'width' parameter (integer)".to_string());
-            }
-            if args
-                .get("height")
-                .and_then(serde_json::Value::as_u64)
-                .is_none()
-            {
-                return Some("resize requires 'height' parameter (integer)".to_string());
-            }
+            require_u64(action, args, "width").or_else(|| require_u64(action, args, "height"))
         }
-        "switch_tab" => {
-            if args
-                .get("tab_index")
-                .and_then(serde_json::Value::as_u64)
-                .is_none()
-            {
-                return Some("switch_tab requires 'tab_index' parameter (integer)".to_string());
-            }
-        }
-        "new_tab" | "list_tabs" | "close_tab" => {}
-        "screenshot" | "get_text" | "close" | "get_console_logs" => {}
-        _ => {
-            return Some(format!("Unknown browser action: {action}"));
-        }
+        "switch_tab" => require_u64(action, args, "tab_index"),
+        "new_tab" | "list_tabs" | "close_tab" => None,
+        "screenshot" | "get_text" | "close" | "get_console_logs" => None,
+        _ => Some(format!("Unknown browser action: {action}")),
     }
-    None
 }
 
 #[cfg(test)]
