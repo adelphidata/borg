@@ -691,9 +691,26 @@ impl LlmClient {
             .thinking
             .openai_reasoning_effort()
             .map(String::from);
+        // Sanitize messages for OpenAI-compatible providers: some backends
+        // (e.g. Gemini via OpenRouter) reject `"content": null`. Replace
+        // None content with empty string on assistant tool-call messages.
+        let sanitized_messages: Vec<Message> = messages
+            .iter()
+            .map(|m| {
+                if m.content.is_none() && m.tool_calls.is_some() {
+                    Message {
+                        content: Some(crate::types::MessageContent::Text(String::new())),
+                        ..m.clone()
+                    }
+                } else {
+                    m.clone()
+                }
+            })
+            .collect();
+
         let request = ChatRequest {
             model: model.clone(),
-            messages: messages.to_vec(),
+            messages: sanitized_messages,
             tools: tools.map(<[ToolDefinition]>::to_vec),
             temperature: self.llm_config.temperature,
             max_tokens: self.llm_config.max_tokens,
@@ -2105,6 +2122,65 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("prompt_cache_key").is_none());
         assert!(json.get("user").is_none());
+    }
+
+    #[test]
+    fn openai_sanitizes_null_content_on_tool_call_messages() {
+        // Gemini (via OpenRouter) rejects `"content": null`. The sanitization
+        // in stream_chat_openai_inner should replace None content on assistant
+        // tool-call messages with an empty string.
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_memory".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: None,
+            },
+            Message::tool_result("call_1", "result"),
+        ];
+
+        // Replicate the sanitization logic from stream_chat_openai_inner
+        let sanitized: Vec<Message> = messages
+            .iter()
+            .map(|m| {
+                if m.content.is_none() && m.tool_calls.is_some() {
+                    Message {
+                        content: Some(crate::types::MessageContent::Text(String::new())),
+                        ..m.clone()
+                    }
+                } else {
+                    m.clone()
+                }
+            })
+            .collect();
+
+        let request = ChatRequest {
+            model: "google/gemini-2.5-flash".to_string(),
+            messages: sanitized,
+            tools: None,
+            temperature: 0.7,
+            max_tokens: 4096,
+            stream: false,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            user: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        let msgs = json["messages"].as_array().unwrap();
+        // Assistant message (index 1) should have content "" not null
+        assert_eq!(msgs[1]["content"], "");
+        assert!(!msgs[1]["content"].is_null());
+        // User message content should be unchanged
+        assert_eq!(msgs[0]["content"], "hello");
     }
 
     // ── Prompt caching (Anthropic) ──

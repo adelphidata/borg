@@ -200,6 +200,10 @@ Event-sourced agent health: 5 stats (stability, focus, sync, growth, happiness) 
 
 `crates/core/src/git.rs` — ghost commits (snapshot repo on session start using temp index, enables atomic undo), git context for system prompt.
 
+### Debugging
+
+Logs at `~/.borg/logs/`: `tui.log` (TUI session), `daemon.log`/`daemon.err` (daemon), `{date}.jsonl` (structured). Check `tui.log` for LLM errors, tool failures, and warnings. Config at `~/.borg/config.toml`. Enable verbose logging with `[debug]` section. `RUST_LOG=debug` env var for module-level control.
+
 ## Adding New Things
 
 ### New Setting (4 touch points)
