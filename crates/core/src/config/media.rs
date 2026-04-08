@@ -430,6 +430,10 @@ pub struct SkillEntryConfig {
     /// Extra environment variables injected when this skill runs.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Env var names a user skill is explicitly allowed to request via `requires.env`.
+    /// Only needed for user-defined skills; built-in skills are always trusted.
+    #[serde(default)]
+    pub allowed_env: Vec<String>,
 }
 
 impl Default for SkillEntryConfig {
@@ -437,6 +441,7 @@ impl Default for SkillEntryConfig {
         Self {
             enabled: true,
             env: HashMap::new(),
+            allowed_env: Vec::new(),
         }
     }
 }
@@ -695,5 +700,38 @@ impl Default for ScriptsConfig {
             max_scripts: 100,
             default_timeout_ms: 60000,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_entry_config_default_allowed_env_empty() {
+        let config = SkillEntryConfig::default();
+        assert!(config.allowed_env.is_empty());
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn skill_entry_config_deserialize_allowed_env() {
+        let toml_str = r#"
+            enabled = true
+            allowed_env = ["MY_API_KEY", "OTHER_KEY"]
+        "#;
+        let config: SkillEntryConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.allowed_env, vec!["MY_API_KEY", "OTHER_KEY"]);
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn skill_entry_config_deserialize_without_allowed_env() {
+        let toml_str = r#"
+            enabled = false
+        "#;
+        let config: SkillEntryConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.allowed_env.is_empty());
+        assert!(!config.enabled);
     }
 }

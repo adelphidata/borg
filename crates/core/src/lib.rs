@@ -101,6 +101,8 @@ pub mod session;
 pub mod session_indexer;
 /// Settings resolver: DB → TOML → compiled defaults.
 pub mod settings;
+/// Security validation for user-defined skills.
+pub mod skill_security;
 /// Skills loading, parsing, and progressive token budgeting.
 pub mod skills;
 /// macOS sleep inhibitor to keep daemon alive.

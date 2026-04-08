@@ -69,7 +69,7 @@ static INJECTION_PATTERNS: LazyLock<Vec<InjectionPattern>> = LazyLock::new(|| {
 });
 
 /// Result of prompt injection scanning.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ThreatLevel {
     /// No injection patterns detected.
     Clean,
