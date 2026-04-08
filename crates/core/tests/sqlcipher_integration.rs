@@ -2,7 +2,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use tempfile::tempdir;
 
-use borg_core::db::Database;
+use borg_core::db::{self, Database};
 use borg_core::db_key;
 
 /// Set the SQLCipher key on a connection. Uses query_row since PRAGMA returns a result.
@@ -117,4 +117,56 @@ fn sqlcipher_key_format() {
     let key = vec![0xab, 0xcd, 0xef, 0x01];
     let formatted = db_key::format_sqlcipher_key(&key);
     assert_eq!(formatted, "x'abcdef01'");
+}
+
+#[test]
+fn plaintext_migration_round_trip() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("migrate.db");
+    let key = db_key::generate_random_key_for_test();
+
+    // Create a plaintext DB with schema and data
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta (key, value) VALUES ('schema_version', '31');
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT);
+             INSERT INTO sessions (id, title) VALUES ('s1', 'Test Session');
+             INSERT INTO sessions (id, title) VALUES ('s2', 'Another Session');",
+        )
+        .unwrap();
+    }
+
+    assert!(db::is_plaintext_sqlite(&db_path));
+
+    // Migrate using the production function
+    db::migrate_plaintext_to_encrypted(&db_path, &key).unwrap();
+
+    // No longer plaintext
+    assert!(!db::is_plaintext_sqlite(&db_path));
+
+    // Backup exists
+    assert!(db_path.with_extension("db.bak").exists());
+
+    // Data intact via encrypted connection
+    let conn = Connection::open(&db_path).unwrap();
+    set_key(&conn, &key);
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "31");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2);
+
+    // Unkeyed open fails
+    let conn2 = Connection::open(&db_path).unwrap();
+    let result = conn2.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()));
+    assert!(result.is_err(), "encrypted DB should fail without key");
 }

@@ -29,6 +29,63 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::db_key;
 
+/// Check if a file starts with the SQLite magic header (unencrypted database).
+/// Returns false if the file doesn't exist, is empty, or is encrypted.
+pub fn is_plaintext_sqlite(path: &Path) -> bool {
+    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 16];
+    use std::io::Read;
+    file.read_exact(&mut buf).is_ok() && buf == *SQLITE_MAGIC
+}
+
+/// Migrate an unencrypted SQLite database to SQLCipher encryption in-place.
+/// Creates a backup at `path.db.bak` before replacing the original.
+pub fn migrate_plaintext_to_encrypted(path: &Path, key: &[u8]) -> Result<()> {
+    let migrating_path = path.with_extension("db.migrating");
+    let backup_path = path.with_extension("db.bak");
+
+    // Clean up leftover from a prior interrupted migration
+    if migrating_path.exists() {
+        std::fs::remove_file(&migrating_path)
+            .with_context(|| format!("Failed to remove stale migration file {migrating_path:?}"))?;
+    }
+
+    tracing::info!("Migrating unencrypted database to SQLCipher: {path:?}");
+
+    let plain_conn = Connection::open(path)
+        .with_context(|| format!("Failed to open plaintext DB at {path:?}"))?;
+
+    let key_pragma = db_key::format_sqlcipher_key(key);
+    let escaped_path = migrating_path.to_string_lossy().replace('\'', "''");
+    plain_conn
+        .execute_batch(&format!(
+            "ATTACH DATABASE '{escaped_path}' AS encrypted KEY \"{key_pragma}\";",
+        ))
+        .context("Failed to ATTACH encrypted database for migration")?;
+
+    plain_conn
+        .query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))
+        .context("sqlcipher_export failed during migration")?;
+
+    plain_conn
+        .execute_batch("DETACH DATABASE encrypted;")
+        .context("Failed to detach encrypted database")?;
+    drop(plain_conn);
+
+    // Swap: original → backup, migrating → original
+    std::fs::rename(path, &backup_path)
+        .with_context(|| format!("Failed to back up original DB to {backup_path:?}"))?;
+    std::fs::rename(&migrating_path, path)
+        .with_context(|| format!("Failed to rename migrated DB to {path:?}"))?;
+
+    Database::set_file_permissions(path);
+    tracing::info!("Database migration complete. Backup at {backup_path:?}");
+    Ok(())
+}
+
 /// SQLite database for structured data (session metadata, scheduled tasks, task runs).
 pub struct Database {
     conn: Connection,
@@ -63,6 +120,28 @@ impl Database {
         }
 
         let db_key = db_key::get_or_create_db_key()?;
+
+        // Recover interrupted migration
+        let migrating_path = path.with_extension("db.migrating");
+        if migrating_path.exists() {
+            if path.exists() {
+                // Original still present — partial migration, discard
+                std::fs::remove_file(&migrating_path).with_context(|| {
+                    format!("Failed to clean up stale migration file {migrating_path:?}")
+                })?;
+            } else {
+                // Original was renamed to .bak, complete the swap
+                std::fs::rename(&migrating_path, &path).with_context(|| {
+                    format!("Failed to complete interrupted migration rename to {path:?}")
+                })?;
+            }
+        }
+
+        // Migrate existing plaintext DB to encrypted
+        if is_plaintext_sqlite(&path) {
+            migrate_plaintext_to_encrypted(&path, &db_key)
+                .context("Failed to migrate plaintext database to encrypted format")?;
+        }
 
         let conn =
             Connection::open(&path).with_context(|| format!("Failed to open DB at {path:?}"))?;

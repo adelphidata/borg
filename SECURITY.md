@@ -47,9 +47,9 @@ Out of scope:
 
 Borg includes multiple layers of security by design:
 
-- **Encryption at rest (SQLCipher)** — the SQLite database (`~/.borg/borg.db`) is encrypted with AES-256 via SQLCipher. A random 256-bit key is generated on first run, stored in the OS keychain, and used transparently on every startup. The key is never logged, printed, or persisted in config files.
+- **Encryption at rest (SQLCipher)** — the database is encrypted with AES-256. A random 256-bit key is generated on first run, stored in the OS keychain, and used transparently on every startup. The key is never logged, printed, or persisted in config files.
 - **Sandboxed tool execution** — macOS Seatbelt and Linux Bubblewrap isolate user tools
-- **Blocked path enforcement** — sensitive directories (`.ssh`, `.aws`, `.gnupg`, `.db_key`, etc.) are filtered from tool access
+- **Blocked path enforcement** — sensitive directories (`.ssh`, `.aws`, `.gnupg`, etc.) are filtered from tool access
 - **Secret redaction** — API keys and tokens are automatically redacted from tool outputs
 - **Prompt injection detection** — scoring-based input sanitization flags suspicious content
 - **Rate limiting** — per-session caps on tool calls, shell commands, file writes, and web requests
