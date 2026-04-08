@@ -643,6 +643,53 @@ async fn collect_agent_response(
     response_text
 }
 
+/// Check sender access and return an early response if denied or challenged.
+/// Returns `Ok(None)` when the sender is allowed through.
+async fn enforce_access_control(
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+) -> Result<Option<(String, String)>> {
+    let access = check_sender_access_control(config, channel_name, sender_id).await?;
+    match access {
+        borg_core::pairing::AccessCheckResult::Allowed => Ok(None),
+        borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+            let suppress = CHALLENGE_THROTTLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .should_suppress(channel_name, sender_id);
+            if suppress {
+                return Ok(Some((String::new(), String::new())));
+            }
+            info!("Pairing challenge issued for sender '{sender_id}' on channel '{channel_name}'");
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+                borg_core::activity_log::log_activity(
+                    &adb,
+                    "info",
+                    "gateway",
+                    &format!("Pairing challenge issued for {sender_id}"),
+                );
+            }
+            Ok(Some((message, String::new())))
+        }
+        borg_core::pairing::AccessCheckResult::Denied { reason } => {
+            info!("Access denied for sender '{sender_id}' on channel '{channel_name}': {reason}");
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+                borg_core::activity_log::log_activity(
+                    &adb,
+                    "warn",
+                    "gateway",
+                    &format!("Access denied for {sender_id} on {channel_name}"),
+                );
+            }
+            Ok(Some((
+                "Access denied. Contact the Borg owner for access.".to_string(),
+                String::new(),
+            )))
+        }
+    }
+}
+
 async fn invoke_agent_inner(
     channel_name: &str,
     inbound: &InboundMessage,
@@ -700,51 +747,8 @@ async fn invoke_agent_inner(
     );
 
     // Phase 4: Access control / pairing check
-    let access = check_sender_access_control(config, channel_name, &inbound.sender_id).await?;
-
-    match access {
-        borg_core::pairing::AccessCheckResult::Allowed => {}
-        borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
-            // Throttle: suppress repeated challenges for the same sender
-            let suppress = CHALLENGE_THROTTLE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .should_suppress(channel_name, &inbound.sender_id);
-            if suppress {
-                return Ok((String::new(), String::new()));
-            }
-            info!(
-                "Pairing challenge issued for sender '{}' on channel '{}'",
-                inbound.sender_id, channel_name
-            );
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
-                    &adb,
-                    "info",
-                    "gateway",
-                    &format!("Pairing challenge issued for {}", inbound.sender_id),
-                );
-            }
-            return Ok((message, String::new()));
-        }
-        borg_core::pairing::AccessCheckResult::Denied { reason } => {
-            info!(
-                "Access denied for sender '{}' on channel '{}': {}",
-                inbound.sender_id, channel_name, reason
-            );
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
-                    &adb,
-                    "warn",
-                    "gateway",
-                    &format!("Access denied for {} on {channel_name}", inbound.sender_id),
-                );
-            }
-            return Ok((
-                "Access denied. Contact the Borg owner for access.".to_string(),
-                String::new(),
-            ));
-        }
+    if let Some(early) = enforce_access_control(config, channel_name, &inbound.sender_id).await? {
+        return Ok(early);
     }
 
     if let Some(h) = health {

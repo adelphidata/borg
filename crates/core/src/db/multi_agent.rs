@@ -3,6 +3,7 @@ use rusqlite::params;
 
 use super::models::{AgentRoleRow, SubAgentRunRow};
 use super::Database;
+use crate::multi_agent::SubAgentStatus;
 
 use rusqlite::OptionalExtension;
 
@@ -124,21 +125,24 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_sub_agent_status(
-        &self,
-        id: &str,
-        status: &str,
-        result_text: Option<&str>,
-        error_text: Option<&str>,
-    ) -> Result<()> {
-        let completed_at = if status == "completed" || status == "errored" || status == "shutdown" {
+    pub fn update_sub_agent_status(&self, id: &str, status: &SubAgentStatus) -> Result<()> {
+        let status_str = status.as_str();
+        let result_text = match status {
+            SubAgentStatus::Completed { result } => Some(result.as_str()),
+            _ => None,
+        };
+        let error_text = match status {
+            SubAgentStatus::Errored { error } => Some(error.as_str()),
+            _ => None,
+        };
+        let completed_at = if status.is_terminal() {
             Some(chrono::Utc::now().timestamp())
         } else {
             None
         };
         self.conn.execute(
             "UPDATE sub_agent_runs SET status = ?2, result_text = ?3, error_text = ?4, completed_at = ?5 WHERE id = ?1",
-            params![id, status, result_text, error_text, completed_at],
+            params![id, status_str, result_text, error_text, completed_at],
         )?;
         Ok(())
     }

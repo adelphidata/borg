@@ -1,4 +1,5 @@
 use super::*;
+use crate::multi_agent::SubAgentStatus;
 use rusqlite::params;
 
 fn test_db() -> Database {
@@ -2865,15 +2866,20 @@ fn update_sub_agent_status_sets_completed_at_on_terminal() {
         .unwrap();
 
     // Non-terminal status should not set completed_at
-    db.update_sub_agent_status("r1", "running", None, None)
+    db.update_sub_agent_status("r1", &SubAgentStatus::Running)
         .unwrap();
     let run = db.get_sub_agent_run("r1").unwrap().unwrap();
     assert_eq!(run.status, "running");
     assert!(run.completed_at.is_none());
 
     // Terminal status should set completed_at
-    db.update_sub_agent_status("r1", "completed", Some("result text"), None)
-        .unwrap();
+    db.update_sub_agent_status(
+        "r1",
+        &SubAgentStatus::Completed {
+            result: "result text".to_string(),
+        },
+    )
+    .unwrap();
     let run = db.get_sub_agent_run("r1").unwrap().unwrap();
     assert_eq!(run.status, "completed");
     assert!(run.completed_at.is_some());
@@ -2885,8 +2891,13 @@ fn update_sub_agent_status_errored_sets_error_text() {
     let db = test_db();
     db.insert_sub_agent_run("r1", "nick", "role", "p1", "s1", 1)
         .unwrap();
-    db.update_sub_agent_status("r1", "errored", None, Some("something failed"))
-        .unwrap();
+    db.update_sub_agent_status(
+        "r1",
+        &SubAgentStatus::Errored {
+            error: "something failed".to_string(),
+        },
+    )
+    .unwrap();
     let run = db.get_sub_agent_run("r1").unwrap().unwrap();
     assert_eq!(run.status, "errored");
     assert!(run.completed_at.is_some());
@@ -2898,7 +2909,7 @@ fn update_sub_agent_status_shutdown_is_terminal() {
     let db = test_db();
     db.insert_sub_agent_run("r1", "nick", "role", "p1", "s1", 1)
         .unwrap();
-    db.update_sub_agent_status("r1", "shutdown", None, None)
+    db.update_sub_agent_status("r1", &SubAgentStatus::Shutdown)
         .unwrap();
     let run = db.get_sub_agent_run("r1").unwrap().unwrap();
     assert_eq!(run.status, "shutdown");

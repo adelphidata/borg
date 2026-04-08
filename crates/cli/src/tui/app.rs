@@ -727,52 +727,8 @@ impl<'a> App<'a> {
         }
 
         // Handle backtrack mode (selecting a past user message to rewind to)
-        if let BacktrackPhase::Selecting {
-            ref user_message_indices,
-            ref mut cursor,
-        } = self.backtrack
-        {
-            match key.code {
-                KeyCode::Up => {
-                    if *cursor + 1 < user_message_indices.len() {
-                        *cursor += 1;
-                    }
-                }
-                KeyCode::Down => {
-                    if *cursor > 0 {
-                        *cursor -= 1;
-                    }
-                }
-                KeyCode::Enter => {
-                    let indices = user_message_indices.clone();
-                    let cur = *cursor;
-                    // cursor 0 = most recent, which is the last element
-                    let cell_idx = indices[indices.len() - 1 - cur];
-                    let text = if let HistoryCell::User { text } = &self.cells[cell_idx] {
-                        text.clone()
-                    } else {
-                        String::new()
-                    };
-                    // Count which user message this is (0-indexed, oldest-first)
-                    let nth = self.cells[..=cell_idx]
-                        .iter()
-                        .filter(|c| matches!(c, HistoryCell::User { .. }))
-                        .count()
-                        - 1;
-                    self.backtrack = BacktrackPhase::Inactive;
-                    self.cells.truncate(cell_idx);
-                    self.composer.set_text(&text);
-                    self.auto_scroll = true;
-                    return Ok(AppAction::RewindTo {
-                        nth_user_message: nth,
-                    });
-                }
-                KeyCode::Esc => {
-                    self.backtrack = BacktrackPhase::Inactive;
-                }
-                _ => {}
-            }
-            return Ok(AppAction::Continue);
+        if let Some(action) = self.handle_backtrack_key(key)? {
+            return Ok(action);
         }
 
         // Handle error-paused queue: Enter resumes, Esc clears
@@ -864,106 +820,11 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        if self.command_popup.is_visible() {
-            match key.code {
-                KeyCode::Up => {
-                    self.command_popup.move_up();
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Down => {
-                    self.command_popup.move_down();
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Tab => {
-                    if let Some(cmd) = self.command_popup.selected_command() {
-                        let name = cmd.name.to_string();
-                        self.composer.set_text(&name);
-                        self.command_popup.dismiss();
-                    }
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Enter => {
-                    if let Some(cmd) = self.command_popup.selected_command() {
-                        let name = cmd.name.to_string();
-                        self.composer.set_text("");
-                        self.command_popup.dismiss();
-                        return self.handle_submit(&name);
-                    }
-                    // No matching command — dismiss popup and submit raw text
-                    let text = self.composer.text().trim().to_string();
-                    self.composer.set_text("");
-                    self.command_popup.dismiss();
-                    if text.is_empty() {
-                        return Ok(AppAction::Continue);
-                    }
-                    return self.handle_submit(&text);
-                }
-                KeyCode::Esc => {
-                    self.command_popup.dismiss();
-                    self.composer.set_text("");
-                    return Ok(AppAction::Continue);
-                }
-                _ => {
-                    // Pass key to composer, then update filter
-                    if let Some(text) = self.composer.handle_key(key) {
-                        self.command_popup.dismiss();
-                        return self.handle_submit(&text);
-                    }
-                    let text = self.composer.text();
-                    self.command_popup.update_filter(&text);
-                    return Ok(AppAction::Continue);
-                }
-            }
+        if let Some(action) = self.handle_command_popup_key(key)? {
+            return Ok(action);
         }
-
-        if self.file_popup.is_visible() {
-            match key.code {
-                KeyCode::Up => {
-                    self.file_popup.move_up();
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Down => {
-                    self.file_popup.move_down();
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Tab | KeyCode::Enter => {
-                    if let Some(file) = self.file_popup.selected_file() {
-                        let display = file.display.clone();
-                        let path = file.full_path.clone();
-                        let is_dir = file.is_dir;
-                        if is_dir {
-                            // Directory: rewrite the in-progress mention to
-                            // `@<path>/` (no trailing space, no FileRef) and
-                            // re-run the popup so the user can drill further.
-                            self.composer.set_partial_mention(display);
-                            let text = self.composer.text();
-                            if let Some(q) = extract_at_query(&text) {
-                                self.file_popup.update_query(&q);
-                            } else {
-                                self.file_popup.dismiss();
-                            }
-                        } else {
-                            self.composer.add_file_ref(display, path);
-                            self.file_popup.dismiss();
-                        }
-                    }
-                    return Ok(AppAction::Continue);
-                }
-                KeyCode::Esc => {
-                    self.file_popup.dismiss();
-                    return Ok(AppAction::Continue);
-                }
-                _ => {
-                    self.composer.handle_key(key);
-                    let text = self.composer.text();
-                    if let Some(q) = extract_at_query(&text) {
-                        self.file_popup.update_query(&q);
-                    } else {
-                        self.file_popup.dismiss();
-                    }
-                    return Ok(AppAction::Continue);
-                }
-            }
+        if let Some(action) = self.handle_file_popup_key(key)? {
+            return Ok(action);
         }
 
         // ? — show keyboard shortcuts when composer is empty
@@ -1106,6 +967,171 @@ impl<'a> App<'a> {
             }
         }
         Ok(AppAction::Continue)
+    }
+
+    /// Handle keys during backtrack mode (selecting a past user message to rewind to).
+    /// Returns `Some(action)` if handled, `None` if backtrack is inactive.
+    fn handle_backtrack_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        if let BacktrackPhase::Selecting {
+            ref user_message_indices,
+            ref mut cursor,
+        } = self.backtrack
+        {
+            match key.code {
+                KeyCode::Up => {
+                    if *cursor + 1 < user_message_indices.len() {
+                        *cursor += 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let indices = user_message_indices.clone();
+                    let cur = *cursor;
+                    let cell_idx = indices[indices.len() - 1 - cur];
+                    let text = if let HistoryCell::User { text } = &self.cells[cell_idx] {
+                        text.clone()
+                    } else {
+                        String::new()
+                    };
+                    let nth = self.cells[..=cell_idx]
+                        .iter()
+                        .filter(|c| matches!(c, HistoryCell::User { .. }))
+                        .count()
+                        - 1;
+                    self.backtrack = BacktrackPhase::Inactive;
+                    self.cells.truncate(cell_idx);
+                    self.composer.set_text(&text);
+                    self.auto_scroll = true;
+                    return Ok(Some(AppAction::RewindTo {
+                        nth_user_message: nth,
+                    }));
+                }
+                KeyCode::Esc => {
+                    self.backtrack = BacktrackPhase::Inactive;
+                }
+                _ => {}
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        Ok(None)
+    }
+
+    /// Handle keys when the command popup is visible.
+    /// Returns `Some(action)` if handled, `None` if popup not visible.
+    fn handle_command_popup_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        if !self.command_popup.is_visible() {
+            return Ok(None);
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.command_popup.move_up();
+            }
+            KeyCode::Down => {
+                self.command_popup.move_down();
+            }
+            KeyCode::Tab => {
+                if let Some(cmd) = self.command_popup.selected_command() {
+                    let name = cmd.name.to_string();
+                    self.composer.set_text(&name);
+                    self.command_popup.dismiss();
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(cmd) = self.command_popup.selected_command() {
+                    let name = cmd.name.to_string();
+                    self.composer.set_text("");
+                    self.command_popup.dismiss();
+                    return Ok(Some(self.handle_submit(&name)?));
+                }
+                let text = self.composer.text().trim().to_string();
+                self.composer.set_text("");
+                self.command_popup.dismiss();
+                if text.is_empty() {
+                    return Ok(Some(AppAction::Continue));
+                }
+                return Ok(Some(self.handle_submit(&text)?));
+            }
+            KeyCode::Esc => {
+                self.command_popup.dismiss();
+                self.composer.set_text("");
+            }
+            _ => {
+                if let Some(text) = self.composer.handle_key(key) {
+                    self.command_popup.dismiss();
+                    return Ok(Some(self.handle_submit(&text)?));
+                }
+                let text = self.composer.text();
+                self.command_popup.update_filter(&text);
+            }
+        }
+        Ok(Some(AppAction::Continue))
+    }
+
+    /// Handle keys when the file popup is visible.
+    /// Returns `Some(action)` if handled, `None` if popup not visible.
+    fn handle_file_popup_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        if !self.file_popup.is_visible() {
+            return Ok(None);
+        }
+        match key.code {
+            KeyCode::Up => {
+                self.file_popup.move_up();
+            }
+            KeyCode::Down => {
+                self.file_popup.move_down();
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                if let Some(file) = self.file_popup.selected_file() {
+                    let display = file.display.clone();
+                    let path = file.full_path.clone();
+                    let is_dir = file.is_dir;
+                    if is_dir {
+                        self.composer.set_partial_mention(display);
+                        let text = self.composer.text();
+                        if let Some(q) = extract_at_query(&text) {
+                            self.file_popup.update_query(&q);
+                        } else {
+                            self.file_popup.dismiss();
+                        }
+                    } else {
+                        self.composer.add_file_ref(display, path);
+                        self.file_popup.dismiss();
+                    }
+                }
+            }
+            KeyCode::Esc => {
+                self.file_popup.dismiss();
+            }
+            _ => {
+                self.composer.handle_key(key);
+                let text = self.composer.text();
+                if let Some(q) = extract_at_query(&text) {
+                    self.file_popup.update_query(&q);
+                } else {
+                    self.file_popup.dismiss();
+                }
+            }
+        }
+        Ok(Some(AppAction::Continue))
     }
 
     pub fn push_system_message(&mut self, text: String) {

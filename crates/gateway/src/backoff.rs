@@ -1,8 +1,11 @@
 use std::time::Duration;
 
+use borg_core::retry::{backoff_with_config, BackoffConfig};
+
 /// Calculate exponential backoff with jitter.
 ///
-/// Uses `min_backoff * factor^(errors-1)` capped at `max_backoff`, plus random jitter.
+/// Thin wrapper around `borg_core::retry::backoff_with_config`.
+/// `consecutive_errors` is 1-indexed (first error = 1).
 pub fn calculate_backoff(
     consecutive_errors: u32,
     min_backoff: Duration,
@@ -10,13 +13,14 @@ pub fn calculate_backoff(
     backoff_factor: f64,
     jitter_fraction: f64,
 ) -> Duration {
-    let base = min_backoff.as_secs_f64()
-        * backoff_factor.powi(consecutive_errors.saturating_sub(1) as i32);
-    let capped = base.min(max_backoff.as_secs_f64());
-
-    // Add jitter
-    let jitter = capped * jitter_fraction * rand::random::<f64>();
-    Duration::from_secs_f64(capped + jitter)
+    let config = BackoffConfig {
+        initial: min_backoff,
+        factor: backoff_factor,
+        max_delay: max_backoff,
+        jitter_fraction,
+    };
+    // Gateway convention: errors are 1-indexed, so subtract 1 for 0-indexed attempt.
+    backoff_with_config(consecutive_errors.saturating_sub(1), &config)
 }
 
 #[cfg(test)]

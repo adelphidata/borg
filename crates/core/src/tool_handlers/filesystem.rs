@@ -523,16 +523,7 @@ pub fn handle_read_file(args: &serde_json::Value, config: &Config) -> Result<Too
 
         let engine = base64::engine::general_purpose::STANDARD;
         let b64 = engine.encode(&raw_bytes);
-        let mime = match ext.as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "bmp" => "image/bmp",
-            "heic" | "heif" => "image/heic",
-            "svg" => "image/svg+xml",
-            _ => "application/octet-stream",
-        };
+        let mime = mime_for_extension(&ext);
 
         // Compress if needed (1MB threshold)
         let (final_b64, final_mime) =
@@ -612,6 +603,20 @@ pub fn handle_read_file(args: &serde_json::Value, config: &Config) -> Result<Too
     }
 
     Ok(ToolOutput::Text(output))
+}
+
+/// Map a file extension to its MIME type.
+fn mime_for_extension(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "heic" | "heif" => "image/heic",
+        "svg" => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
 }
 
 #[cfg(test)]

@@ -69,6 +69,14 @@ impl SubAgentStatus {
         }
     }
 
+    /// Whether the status represents a terminal (finished) state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Errored { .. } | Self::Shutdown
+        )
+    }
+
     /// Reconstruct a status from database columns.
     pub fn from_db(status: &str, result_text: Option<&str>, error_text: Option<&str>) -> Self {
         match status {
@@ -379,15 +387,7 @@ impl AgentControl {
 
             // Update DB
             if let Ok(db) = crate::db::Database::open() {
-                if let Err(e) = db.update_sub_agent_status(
-                    &agent_id_clone,
-                    status.as_str(),
-                    final_response.as_deref(),
-                    match &status {
-                        SubAgentStatus::Errored { error } => Some(error.as_str()),
-                        _ => None,
-                    },
-                ) {
+                if let Err(e) = db.update_sub_agent_status(&agent_id_clone, &status) {
                     tracing::warn!(%agent_id_clone, "failed to update sub-agent status: {e}");
                 }
             }
@@ -517,7 +517,7 @@ impl AgentControl {
 
         // Update DB
         if let Ok(db) = crate::db::Database::open() {
-            if let Err(e) = db.update_sub_agent_status(agent_id, "shutdown", None, None) {
+            if let Err(e) = db.update_sub_agent_status(agent_id, &SubAgentStatus::Shutdown) {
                 tracing::warn!(agent_id, "failed to update sub-agent shutdown status: {e}");
             }
         }
@@ -640,7 +640,7 @@ fn run_sub_agent(
 
         // Update DB status to running
         if let Ok(db) = crate::db::Database::open() {
-            if let Err(e) = db.update_sub_agent_status(&agent_id, "running", None, None) {
+            if let Err(e) = db.update_sub_agent_status(&agent_id, &SubAgentStatus::Running) {
                 tracing::warn!(%agent_id, "failed to update sub-agent running status: {e}");
             }
         }
