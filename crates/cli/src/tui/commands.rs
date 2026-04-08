@@ -303,24 +303,12 @@ impl App<'_> {
                             row.code, display, row.sender_id
                         ));
 
-                        // Send approval notification (fire-and-forget)
-                        let agent_name = self
-                            .config
-                            .user
-                            .agent_name
-                            .clone()
-                            .unwrap_or_else(|| "Borg".to_string());
+                        // Send LLM-generated greeting (fire-and-forget)
                         let config = self.config.clone();
                         let ch = row.channel_name;
                         let sid = row.sender_id;
                         tokio::spawn(async move {
-                            borg_core::pairing::send_approval_notification(
-                                &config,
-                                &ch,
-                                &sid,
-                                &agent_name,
-                            )
-                            .await;
+                            crate::service::send_approval_greeting(&config, &ch, &sid).await;
                         });
                     }
                     Err(e) => {

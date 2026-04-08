@@ -939,23 +939,18 @@ fn run_pairing_approve(code: &str) -> Result<()> {
         request.channel_name, request.sender_id
     );
 
-    // Send approval notification to the user's channel
+    // Send LLM-generated greeting to the user's channel
     let config = match borg_core::config::Config::load_from_db() {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!("Failed to load config for approval notification: {e}");
+            tracing::warn!("Failed to load config for approval greeting: {e}");
             borg_core::config::Config::default()
         }
     };
-    let name = config
-        .user
-        .agent_name
-        .clone()
-        .unwrap_or_else(|| "Borg".to_string());
     let sid = request.sender_id;
     let ch = channel_name;
     tokio::runtime::Handle::current().block_on(async {
-        borg_core::pairing::send_approval_notification(&config, &ch, &sid, &name).await;
+        crate::service::send_approval_greeting(&config, &ch, &sid).await;
     });
 
     Ok(())

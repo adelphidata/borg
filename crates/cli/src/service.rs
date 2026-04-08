@@ -1489,6 +1489,139 @@ async fn deliver_to_sender(
     Ok(())
 }
 
+/// Send a plain text message to a specific sender on a specific channel.
+///
+/// Supports Telegram and Slack native clients. Returns an error for
+/// unsupported channels or missing credentials.
+async fn deliver_message_to_sender(
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+    text: &str,
+) -> Result<()> {
+    match channel_name {
+        "telegram" => {
+            let token = config
+                .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
+            let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
+            let chat_id: i64 = sender_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
+            client.send_message(chat_id, text, None, None, None).await?;
+        }
+        "slack" => {
+            let token = config
+                .resolve_credential_or_env("SLACK_BOT_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("SLACK_BOT_TOKEN not configured"))?;
+            let client = borg_gateway::slack::api::SlackClient::new(&token)?;
+            client.post_message(sender_id, text, None).await?;
+        }
+        other => {
+            anyhow::bail!("Channel '{other}' not supported for message delivery");
+        }
+    }
+    Ok(())
+}
+
+/// Run a quick agent turn to generate a personalized greeting for a newly
+/// approved sender, then deliver it to their channel. Fire-and-forget:
+/// falls back to the static approval message on any failure.
+pub async fn send_approval_greeting(config: &Config, channel_name: &str, sender_id: &str) {
+    let agent_name = config
+        .user
+        .agent_name
+        .as_deref()
+        .unwrap_or("Borg")
+        .to_string();
+
+    match generate_and_deliver_greeting(config, channel_name, sender_id, &agent_name).await {
+        Ok(()) => {
+            tracing::info!(
+                channel = channel_name,
+                sender = sender_id,
+                "Approval greeting delivered via LLM"
+            );
+            match borg_core::db::Database::open() {
+                Ok(adb) => {
+                    borg_core::activity_log::log_activity(
+                        &adb,
+                        "info",
+                        "pairing",
+                        &format!("Approval greeting delivered to {channel_name}:{sender_id}"),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to open DB for activity log: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                channel = channel_name,
+                sender = sender_id,
+                "LLM greeting failed ({e}), falling back to static message"
+            );
+            borg_core::pairing::send_approval_notification(
+                config,
+                channel_name,
+                sender_id,
+                &agent_name,
+            )
+            .await;
+        }
+    }
+}
+
+async fn generate_and_deliver_greeting(
+    config: &Config,
+    channel_name: &str,
+    sender_id: &str,
+    agent_name: &str,
+) -> Result<()> {
+    let metrics = borg_core::telemetry::BorgMetrics::noop();
+    let mut config = config.clone();
+    config.llm.cache.ttl = config.llm.cache.ttl.resolve(false);
+    // Use Plan mode so the agent cannot execute mutating tools (shell, patch, etc.)
+    config.conversation.collaboration_mode = borg_core::config::CollaborationMode::Plan;
+    let mut agent = Agent::new(config.clone(), metrics)?;
+
+    let channel_display = borg_core::pairing::channel_display_name(channel_name);
+    let prompt = format!(
+        "A new user has just been approved to message you on {channel_display}. \
+         Generate a brief, warm greeting to introduce yourself as {agent_name}. \
+         Keep it to 2-3 short sentences. Do NOT use any tools — just reply with the greeting text."
+    );
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    let cancel = CancellationToken::new();
+
+    agent
+        .send_message_with_cancel(&prompt, event_tx, cancel)
+        .await?;
+
+    let mut response = String::new();
+    while let Some(event) = event_rx.recv().await {
+        if let AgentEvent::TextDelta(delta) = event {
+            response.push_str(&delta);
+        }
+    }
+
+    let greeting = response.trim().to_string();
+    if greeting.is_empty() {
+        anyhow::bail!("LLM returned empty greeting");
+    }
+
+    // Truncate to a reasonable length for a greeting message
+    let greeting = if greeting.len() > 500 {
+        format!("{}…", &greeting[..500])
+    } else {
+        greeting
+    };
+
+    deliver_message_to_sender(&config, channel_name, sender_id, &greeting).await
+}
+
 /// Ensure the daemon service is installed and running.
 pub fn ensure_service_running() -> Result<()> {
     ensure_service_installed()?;
@@ -2038,6 +2171,82 @@ mod tests {
 
         // Verify it does contain the old path
         assert!(content.contains("/old/path/to/borg"));
+    }
+
+    #[tokio::test]
+    async fn deliver_message_unsupported_channel() {
+        let config = Config::default();
+        let result = deliver_message_to_sender(&config, "foobar", "123", "hello").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not supported"),
+            "expected 'not supported' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_invalid_telegram_chat_id() {
+        use borg_core::config::media::CredentialValue;
+        let mut config = Config::default();
+        // Insert credential directly to avoid env var race conditions with other tests
+        config.credentials.insert(
+            "TELEGRAM_BOT_TOKEN".to_string(),
+            CredentialValue::EnvVar("BORG_TEST_DUMMY_TG_TOKEN".to_string()),
+        );
+        unsafe { std::env::set_var("BORG_TEST_DUMMY_TG_TOKEN", "dummy") };
+        let result = deliver_message_to_sender(&config, "telegram", "not_a_number", "hi").await;
+        unsafe { std::env::remove_var("BORG_TEST_DUMMY_TG_TOKEN") };
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Invalid Telegram chat_id"),
+            "expected chat_id parse error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_missing_telegram_token() {
+        let config = Config::default();
+        // Temporarily clear env var in case it's set in the test environment
+        let saved = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+        unsafe { std::env::remove_var("TELEGRAM_BOT_TOKEN") };
+        let result = deliver_message_to_sender(&config, "telegram", "12345", "hi").await;
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("TELEGRAM_BOT_TOKEN", v) };
+        }
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("TELEGRAM_BOT_TOKEN not configured"),
+            "expected missing token error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_message_missing_slack_token() {
+        let config = Config::default();
+        let saved = std::env::var("SLACK_BOT_TOKEN").ok();
+        unsafe { std::env::remove_var("SLACK_BOT_TOKEN") };
+        let result = deliver_message_to_sender(&config, "slack", "C12345", "hi").await;
+        if let Some(v) = saved {
+            unsafe { std::env::set_var("SLACK_BOT_TOKEN", v) };
+        }
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("SLACK_BOT_TOKEN not configured"),
+            "expected missing token error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn greeting_fallback_on_agent_failure() {
+        // With default config (no LLM provider), Agent::new will fail,
+        // triggering the fallback path. This should not panic.
+        let config = Config::default();
+        send_approval_greeting(&config, "unsupported_channel", "12345").await;
+        // If we get here without panic, the fallback path worked.
     }
 
     #[test]
