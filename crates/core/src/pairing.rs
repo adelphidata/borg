@@ -286,4 +286,59 @@ mod tests {
         let result = check_sender_access(&db, &config, "telegram", "anyone").unwrap();
         assert!(matches!(result, AccessCheckResult::Challenge { .. }));
     }
+
+    #[test]
+    fn test_find_pending_by_code_returns_match() {
+        let db = test_db();
+        let config = test_config_with_policy(DmPolicy::Pairing);
+        let code = match check_sender_access(&db, &config, "telegram", "user_code").unwrap() {
+            AccessCheckResult::Challenge { code, .. } => code,
+            other => panic!("expected Challenge, got {other:?}"),
+        };
+
+        let found = db.find_pending_by_code(&code).unwrap();
+        assert!(found.is_some());
+        let row = found.unwrap();
+        assert_eq!(row.code, code);
+        assert_eq!(row.channel_name, "telegram");
+        assert_eq!(row.sender_id, "user_code");
+    }
+
+    #[test]
+    fn test_find_pending_by_code_unknown_returns_none() {
+        let db = test_db();
+        let found = db.find_pending_by_code("ZZZZZZZZ").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_pending_by_code_case_insensitive() {
+        let db = test_db();
+        let config = test_config_with_policy(DmPolicy::Pairing);
+        let code = match check_sender_access(&db, &config, "telegram", "user_ci").unwrap() {
+            AccessCheckResult::Challenge { code, .. } => code,
+            other => panic!("expected Challenge, got {other:?}"),
+        };
+
+        // Lookup with lowercase should still find it
+        let found = db.find_pending_by_code(&code.to_lowercase()).unwrap();
+        assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_find_pending_by_code_approved_returns_none() {
+        let db = test_db();
+        let config = test_config_with_policy(DmPolicy::Pairing);
+        let code = match check_sender_access(&db, &config, "telegram", "user_appr").unwrap() {
+            AccessCheckResult::Challenge { code, .. } => code,
+            other => panic!("expected Challenge, got {other:?}"),
+        };
+
+        // Approve the code
+        db.approve_pairing("telegram", &code).unwrap();
+
+        // Should no longer be found as pending
+        let found = db.find_pending_by_code(&code).unwrap();
+        assert!(found.is_none());
+    }
 }

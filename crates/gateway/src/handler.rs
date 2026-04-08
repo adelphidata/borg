@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -14,11 +14,17 @@ use borg_core::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };
 
+use crate::challenge_throttle::ChallengeThrottle;
 use crate::chunker;
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
 use crate::registry::RegisteredChannel;
 use crate::retry::{self, RetryOutcome, RetryPolicy};
+
+/// Global throttle for pairing challenge messages — suppresses repeated
+/// challenges for the same sender within a 5-minute cooldown.
+static CHALLENGE_THROTTLE: LazyLock<Mutex<ChallengeThrottle>> =
+    LazyLock::new(|| Mutex::new(ChallengeThrottle::default()));
 
 /// Sanitize an attachment filename from an external webhook.
 /// Extracts the basename, rejects path traversal, hidden files, and null bytes.
@@ -378,6 +384,14 @@ async fn invoke_agent_inner(
     match access {
         borg_core::pairing::AccessCheckResult::Allowed => {}
         borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+            // Throttle: suppress repeated challenges for the same sender
+            let suppress = CHALLENGE_THROTTLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .should_suppress(channel_name, &inbound.sender_id);
+            if suppress {
+                return Ok((String::new(), String::new()));
+            }
             info!(
                 "Pairing challenge issued for sender '{}' on channel '{}'",
                 inbound.sender_id, channel_name

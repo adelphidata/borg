@@ -96,6 +96,37 @@ impl App<'_> {
             return Some(Ok(AppAction::SelfUpdate { dev: true }));
         }
 
+        // /pairing approve (no args) — show usage
+        if trimmed == "/pairing approve" {
+            self.push_system_message(
+                "Usage: /pairing approve <channel> <code>\n   or: /pairing <code>".to_string(),
+            );
+            return Some(Ok(AppAction::Continue));
+        }
+
+        // /pairing approve <channel> <code>
+        if let Some(rest) = trimmed.strip_prefix("/pairing approve ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            return match parts.as_slice() {
+                [channel, code] => Some(self.cmd_pairing_approve(Some(channel), code)),
+                _ => {
+                    self.push_system_message(
+                        "Usage: /pairing approve <channel> <code>\n   or: /pairing <code>"
+                            .to_string(),
+                    );
+                    Some(Ok(AppAction::Continue))
+                }
+            };
+        }
+
+        // /pairing <code> (shortcut: auto-detect channel from code)
+        if let Some(rest) = trimmed.strip_prefix("/pairing ") {
+            let code = rest.trim();
+            if !code.is_empty() && !code.starts_with('-') {
+                return Some(self.cmd_pairing_approve(None, code));
+            }
+        }
+
         if trimmed == "/uninstall" {
             return Some(self.cmd_uninstall());
         }
@@ -132,6 +163,8 @@ impl App<'_> {
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
              /pairing   - Show channel pairing info\n  \
+             /pairing approve <channel> <code> - Approve a pairing request\n  \
+             /pairing <code> - Approve (auto-detect channel)\n  \
              /update    - Update borg to latest version\n\
              \n  \
              /sessions  - Browse and load saved sessions\n  \
@@ -209,7 +242,7 @@ impl App<'_> {
                         } else {
                             for r in &requests {
                                 output.push_str(&format!(
-                                    "  {} | {} | {}\n    → borg pairing approve {} {}\n",
+                                    "  {} | {} | {}\n    → /pairing approve {} {}\n",
                                     r.channel_name, r.sender_id, r.code, r.channel_name, r.code
                                 ));
                             }
@@ -238,6 +271,47 @@ impl App<'_> {
             Err(e) => output.push_str(&format!("Database error: {e}\n")),
         }
         self.push_system_message(output);
+        Ok(AppAction::Continue)
+    }
+
+    fn cmd_pairing_approve(&mut self, channel: Option<&str>, code: &str) -> Result<AppAction> {
+        match borg_core::db::Database::open() {
+            Ok(db) => {
+                let channel_name = if let Some(ch) = channel {
+                    ch.to_string()
+                } else {
+                    match db.find_pending_by_code(code) {
+                        Ok(Some(row)) => row.channel_name,
+                        Ok(None) => {
+                            self.push_system_message(format!(
+                                "No pending pairing request found for code '{}'",
+                                code.to_uppercase()
+                            ));
+                            return Ok(AppAction::Continue);
+                        }
+                        Err(e) => {
+                            self.push_system_message(format!("Error looking up code: {e}"));
+                            return Ok(AppAction::Continue);
+                        }
+                    }
+                };
+
+                match db.approve_pairing(&channel_name, code) {
+                    Ok(row) => {
+                        self.push_system_message(format!(
+                            "Approved: {} on {} (sender: {})",
+                            row.code, row.channel_name, row.sender_id
+                        ));
+                    }
+                    Err(e) => {
+                        self.push_system_message(format!("Failed to approve: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.push_system_message(format!("Database error: {e}"));
+            }
+        }
         Ok(AppAction::Continue)
     }
 

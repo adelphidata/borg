@@ -7,6 +7,8 @@
 pub mod auto_reply;
 /// Exponential backoff with jitter for polling/SSE reconnection.
 pub mod backoff;
+/// Pairing challenge throttle to prevent spamming unapproved senders.
+pub mod challenge_throttle;
 /// Channel client initialization helpers.
 mod channel_init;
 /// Trait abstraction for native channel implementations.

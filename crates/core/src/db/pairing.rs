@@ -162,6 +162,22 @@ impl Database {
         Ok(changes > 0)
     }
 
+    /// Find a pending pairing request by code alone (across all channels).
+    pub fn find_pending_by_code(&self, code: &str) -> Result<Option<PairingRequestRow>> {
+        let code = code.to_uppercase();
+        let now = chrono::Utc::now().timestamp();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
+             FROM pairing_requests
+             WHERE code = ?1 AND status = 'pending' AND expires_at > ?2
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![code, now], Self::map_pairing_row)
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn list_pairings(&self, channel_name: Option<&str>) -> Result<Vec<PairingRequestRow>> {
         let now = chrono::Utc::now().timestamp();
         if let Some(ch) = channel_name {
