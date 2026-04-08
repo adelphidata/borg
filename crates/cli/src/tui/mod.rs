@@ -168,29 +168,45 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
     true
 }
 
-/// Restart the gateway: cancel old token, reload config, spawn fresh server.
-/// Returns the new shutdown token.
-fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
+/// Restart the gateway: if a daemon owns the port, signal it via HTTP;
+/// otherwise cancel the local token and respawn in-process.
+async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
+    // Try to signal a running daemon's gateway first
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => return format!("Gateway restart failed: could not reload config: {e}"),
+    };
+    let addr = format!("{}:{}", config.gateway.host, config.gateway.port);
+    let url = format!("http://{addr}/internal/restart");
+
+    let daemon_signalled = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let resp = client.post(&url).send().await.ok()?;
+        resp.status().is_success().then_some(())
+    }
+    .await
+    .is_some();
+
+    if daemon_signalled {
+        return "Gateway restarted (daemon).".to_string();
+    }
+
+    // No daemon running — restart the in-process gateway
     let shutdown = gateway_shutdown.try_lock();
     let Ok(mut shutdown) = shutdown else {
         return "Gateway restart failed: could not acquire lock".to_string();
     };
 
-    // Cancel existing gateway
     shutdown.cancel();
 
-    // Create new token
     let new_token = CancellationToken::new();
     *shutdown = new_token.clone();
 
-    // Reload config and spawn
-    match Config::load() {
-        Ok(config) => {
-            spawn_gateway(&config, new_token, BorgMetrics::noop());
-            "Gateway restarted.".to_string()
-        }
-        Err(e) => format!("Gateway restart failed: could not reload config: {e}"),
-    }
+    spawn_gateway(&config, new_token, BorgMetrics::noop());
+    "Gateway restarted.".to_string()
 }
 
 /// Guard that restores terminal state on drop (both normal exit and early error return).
@@ -866,8 +882,17 @@ async fn run_event_loop(
                                             msg.push_str(&format!("\n  {note}"));
                                         }
                                         if def.kind == borg_plugins::PluginKind::Channel {
-                                            let gw_msg = restart_gateway(gateway_shutdown);
+                                            let gw_msg = restart_gateway(gateway_shutdown).await;
                                             msg.push_str(&format!("\n  {gw_msg}"));
+                                            // Hint: Telegram requires the user to initiate /start
+                                            let channel_name = if def.is_native {
+                                                def.id.rsplit('/').next().unwrap_or(def.id)
+                                            } else {
+                                                def.id
+                                            };
+                                            if channel_name == "telegram" {
+                                                msg.push_str("\n  Open your bot in Telegram and press /start to begin pairing.");
+                                            }
                                         }
                                         results.push(msg);
                                     }
@@ -1267,7 +1292,7 @@ async fn run_event_loop(
                 }
             }
             AppAction::RestartGateway => {
-                let msg = restart_gateway(gateway_shutdown);
+                let msg = restart_gateway(gateway_shutdown).await;
                 app.push_system_message(msg);
             }
             AppAction::SelfUpdate { dev } => {

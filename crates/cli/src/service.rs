@@ -53,6 +53,35 @@ Environment=HOME={{HOME}}
 WantedBy=default.target
 "#;
 
+/// Spawn the gateway server as a tokio task. Returns the join handle.
+fn spawn_daemon_gateway(
+    config: &Config,
+    shutdown: CancellationToken,
+    poke_tx: Option<mpsc::Sender<()>>,
+) -> tokio::task::JoinHandle<()> {
+    let gw_config = config.clone();
+    tokio::spawn(async move {
+        match borg_gateway::GatewayServer::new(
+            gw_config,
+            shutdown,
+            borg_core::telemetry::BorgMetrics::noop(),
+            poke_tx,
+        ) {
+            Ok(gateway) => {
+                if let Err(e) = gateway.run().await {
+                    let msg = e.to_string();
+                    if msg.contains("address already in use") || msg.contains("AddrInUse") {
+                        tracing::warn!("Gateway: {e}");
+                    } else {
+                        tracing::error!("Gateway server error: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::error!("Failed to create gateway server: {e}"),
+        }
+    })
+}
+
 /// Run the daemon loop: executes scheduled tasks and heartbeat without a TUI.
 pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     let config = Config::load()?;
@@ -118,32 +147,12 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     });
     println!("Heartbeat scheduler started.");
 
-    // Start gateway server (with poke channel for /internal/poke endpoint)
-    let gw_handle = {
-        let gw_config = config.clone();
-        let gw_shutdown = shutdown.clone();
-        let gw_poke_tx = Some(poke_tx);
-        tokio::spawn(async move {
-            match borg_gateway::GatewayServer::new(
-                gw_config,
-                gw_shutdown,
-                borg_core::telemetry::BorgMetrics::noop(),
-                gw_poke_tx,
-            ) {
-                Ok(gateway) => {
-                    if let Err(e) = gateway.run().await {
-                        let msg = e.to_string();
-                        if msg.contains("address already in use") || msg.contains("AddrInUse") {
-                            tracing::warn!("Gateway: {e}");
-                        } else {
-                            tracing::error!("Gateway server error: {e}");
-                        }
-                    }
-                }
-                Err(e) => tracing::error!("Failed to create gateway server: {e}"),
-            }
-        })
-    };
+    // Start gateway server (with poke channel for /internal/poke endpoint).
+    // The gateway gets its own CancellationToken so /internal/restart can stop
+    // just the gateway without killing the whole daemon.
+    let gw_shutdown = CancellationToken::new();
+    let gw_handle = spawn_daemon_gateway(&config, gw_shutdown.clone(), Some(poke_tx));
+    let mut gw_shutdown = gw_shutdown;
     println!("Gateway server started.");
 
     // Start native iMessage monitor if channel is installed (macOS only)
@@ -190,7 +199,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
 
     // Pin subsystem handles for monitoring in select! loop
     tokio::pin!(hb_handle);
-    tokio::pin!(gw_handle);
+    let mut gw_handle = Box::pin(gw_handle);
 
     // Wrap optional iMessage handle into a future that pends forever if absent
     let im_fut = async {
@@ -238,6 +247,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
             biased;
             _ = shutdown.cancelled() => {
                 println!("Daemon shutting down gracefully...");
+                gw_shutdown.cancel(); // stop the gateway too
                 for _ in 0..max_concurrent {
                     let _ = semaphore.acquire().await;
                 }
@@ -252,9 +262,27 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                 continue; // graceful shutdown branch will handle drain
             }
             result = &mut gw_handle => {
-                tracing::error!("Gateway server exited unexpectedly: {result:?}");
-                borg_core::activity_log::log_activity(&db, "error", "system", "Gateway server crashed, daemon restarting");
-                shutdown.cancel();
+                // Gateway exited — either a restart was requested or it crashed.
+                // Either way, reload config and respawn instead of killing the daemon.
+                let is_restart = gw_shutdown.is_cancelled();
+                if is_restart {
+                    tracing::info!("Gateway restart requested, respawning with fresh config");
+                    borg_core::activity_log::log_activity(&db, "info", "system", "Gateway restarting (requested)");
+                } else {
+                    tracing::error!("Gateway server exited unexpectedly: {result:?}");
+                    borg_core::activity_log::log_activity(&db, "error", "system", "Gateway crashed, respawning");
+                }
+
+                // Small delay to let the port be released
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+                let new_shutdown = CancellationToken::new();
+                gw_handle = Box::pin(spawn_daemon_gateway(
+                    &Config::load().unwrap_or_else(|_| config.clone()),
+                    new_shutdown.clone(),
+                    None, // poke channel only for initial start
+                ));
+                gw_shutdown = new_shutdown;
                 continue;
             }
             result = &mut im_fut => {

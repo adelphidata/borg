@@ -17,6 +17,12 @@ pub struct CommandDef {
 /// platform menu registration (Telegram setMyCommands, Discord global commands).
 pub const GATEWAY_COMMANDS: &[CommandDef] = &[
     CommandDef {
+        name: "start",
+        description: "Start a conversation with Borg",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
         name: "help",
         description: "Show help and available commands",
         accepts_args: false,
@@ -151,6 +157,7 @@ pub trait NativeCommandRegistration {
 }
 
 enum Command {
+    Start,
     Help,
     Commands,
     Status,
@@ -185,6 +192,7 @@ impl Command {
         let cmd_str = lowered.split('@').next().unwrap_or(&lowered);
         let args = text[first_word.len()..].trim_start();
         let cmd = match cmd_str {
+            "/start" => Self::Start,
             "/help" => Self::Help,
             "/commands" => Self::Commands,
             "/status" => Self::Status,
@@ -244,6 +252,7 @@ pub fn try_handle_command(
 ) -> Option<String> {
     let (cmd, args) = Command::parse(text)?;
     let response = match cmd {
+        Command::Start => handle_help(), // welcome approved users with help; unapproved users see pairing challenge before reaching here
         Command::Help => handle_help(),
         Command::Commands => handle_commands(),
         Command::Status => handle_status(db, session_id),

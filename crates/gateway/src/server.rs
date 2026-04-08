@@ -58,6 +58,8 @@ struct AppState {
     poke_tx: Option<mpsc::Sender<()>>,
     /// Auto-reply state (shared across handlers).
     auto_reply_state: crate::auto_reply::SharedAutoReplyState,
+    /// Shutdown token — used by /internal/restart to trigger graceful restart.
+    shutdown: CancellationToken,
 }
 
 /// HTTP webhook server for messaging channel integrations.
@@ -226,6 +228,7 @@ impl GatewayServer {
             auto_reply_state: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::auto_reply::AutoReplyState::default(),
             )),
+            shutdown: self.shutdown.clone(),
         });
 
         let app = Router::new()
@@ -235,6 +238,7 @@ impl GatewayServer {
             .route("/health/channels", get(channel_health_handler))
             .route("/channels", get(list_channels_handler))
             .route("/internal/poke", post(poke_handler))
+            .route("/internal/restart", post(restart_handler))
             .route("/internal/cancel", post(cancel_handler))
             .route("/internal/away", post(away_handler))
             .route("/internal/available", post(available_handler))
@@ -785,6 +789,29 @@ async fn poke_handler(
             axum::Json(serde_json::json!({"error": "heartbeat poke channel not available"})),
         ),
     }
+}
+
+/// Restart the gateway: cancels the shutdown token so the owning process (daemon/TUI)
+/// can detect the clean exit and respawn with fresh config. Only localhost.
+async fn restart_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> impl IntoResponse {
+    if !is_local_request(&addr) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({"error": "localhost only"})),
+        );
+    }
+    info!("Gateway restart requested via /internal/restart");
+    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+        borg_core::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested");
+    }
+    state.shutdown.cancel();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({"status": "restarting"})),
+    )
 }
 
 /// Cancel an in-progress agent turn. Only localhost.
