@@ -18,8 +18,8 @@ enum BlockKind {
 
 /// A structural block of markdown content.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct Block {
+    #[allow(dead_code)] // only read in tests
     kind: BlockKind,
     content: String,
     start_line: usize, // 1-indexed

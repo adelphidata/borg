@@ -374,7 +374,7 @@ mod tests {
 
     // ── Host security augmenter tests ──
 
-    use borg_core::doctor::{CheckStatus, DiagnosticCheck};
+    use borg_core::doctor::DiagnosticCheck;
 
     #[test]
     fn check_critical_host_security_respects_config_toggle() {

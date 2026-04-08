@@ -178,9 +178,6 @@ struct CliEvent {
     #[serde(default)]
     index: Option<usize>,
     #[serde(default)]
-    #[allow(dead_code)]
-    result: Option<String>,
-    #[serde(default)]
     error: Option<String>,
     #[serde(default)]
     usage: Option<CliUsage>,

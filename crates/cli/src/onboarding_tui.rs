@@ -398,28 +398,6 @@ impl OnboardingState {
         }
     }
 
-    #[cfg(test)]
-    fn detect_provider_from_env(&self) -> &'static str {
-        for (id, _, _) in PROVIDERS {
-            if let Ok(p) = Provider::from_str(id) {
-                if !p.requires_api_key() {
-                    // Keyless providers: detect by checking if server is reachable
-                    if Provider::ollama_available() {
-                        return id;
-                    }
-                    continue;
-                }
-                if std::env::var(p.default_env_var())
-                    .ok()
-                    .is_some_and(|k| !k.is_empty())
-                {
-                    return id;
-                }
-            }
-        }
-        "openrouter"
-    }
-
     fn tab_completed(&self, tab: Tab) -> bool {
         match tab {
             Tab::Welcome => !self.user_name.is_empty(),

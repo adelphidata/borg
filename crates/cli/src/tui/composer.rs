@@ -17,8 +17,6 @@ pub struct FileRef {
 }
 
 pub struct ImageAttachment {
-    #[allow(dead_code)]
-    pub placeholder: String,
     pub data: Vec<u8>,
     pub mime_type: String,
 }
@@ -306,11 +304,8 @@ impl<'a> Composer<'a> {
         let n = self.image_attachments.len() + 1;
         let placeholder = format!("[Image #{n}]");
         self.textarea.insert_str(&placeholder);
-        self.image_attachments.push(ImageAttachment {
-            placeholder,
-            data,
-            mime_type,
-        });
+        self.image_attachments
+            .push(ImageAttachment { data, mime_type });
     }
 
     pub fn take_image_attachments(&mut self) -> Vec<ImageAttachment> {
