@@ -299,6 +299,10 @@ struct OnboardingState {
     channel_cursor: usize,
     channel_phase: ChannelPhase,
 
+    // Model selection submenu (between ApiKey/Provider and Channels)
+    selecting_model: bool,
+    model_index: usize,
+
     // Validation hints
     api_key_required_hint: bool,
 
@@ -343,6 +347,8 @@ impl OnboardingState {
             channel_items,
             channel_cursor: 0,
             channel_phase: ChannelPhase::Browsing,
+            selecting_model: false,
+            model_index: 0,
             api_key_required_hint: false,
             done: false,
             cancelled: false,
@@ -443,7 +449,11 @@ impl OnboardingState {
         };
 
         let models = models_for_provider(provider_id);
-        let model_id = models[0].0.to_string();
+        let model_id = models
+            .get(self.model_index)
+            .unwrap_or(&models[0])
+            .0
+            .to_string();
 
         let channels: Vec<(String, Vec<(String, String)>)> = self
             .channel_items
@@ -473,9 +483,13 @@ impl OnboardingState {
                 Tab::Welcome if self.user_name.trim().is_empty() => return,
                 Tab::Security if !self.security_accepted => return,
                 Tab::Provider if !self.selected_provider_needs_key() => {
-                    // Skip API Key tab for keyless providers — go to Channels
-                    self.tab = Tab::Channels;
-                    self.update_input_mode();
+                    // Skip API Key tab — go to model selection submenu
+                    self.activate_model_selection();
+                    return;
+                }
+                Tab::ApiKey => {
+                    // Go to model selection submenu before Channels
+                    self.activate_model_selection();
                     return;
                 }
                 Tab::Channels => {
@@ -490,6 +504,12 @@ impl OnboardingState {
     }
 
     fn prev_tab(&mut self) {
+        // From Channels, go back to model selection submenu
+        if self.tab == Tab::Channels {
+            self.selecting_model = true;
+            self.input_mode = InputMode::Normal;
+            return;
+        }
         let idx = self.tab.index();
         if idx > 0 {
             let mut target = Tab::ALL[idx - 1];
@@ -503,6 +523,10 @@ impl OnboardingState {
     }
 
     fn update_input_mode(&mut self) {
+        if self.selecting_model {
+            self.input_mode = InputMode::Normal;
+            return;
+        }
         self.input_mode = match self.tab {
             Tab::Welcome => InputMode::TextInput,
             Tab::ApiKey if !self.api_key_existing => InputMode::TextInput,
@@ -537,6 +561,10 @@ impl OnboardingState {
     fn handle_key(&mut self, key: KeyEvent) {
         // Esc in credential input cancels back to browsing, not the whole wizard
         if key.code == KeyCode::Esc {
+            if self.selecting_model {
+                self.cancel_model_selection();
+                return;
+            }
             if self.tab == Tab::Channels {
                 match &self.channel_phase {
                     ChannelPhase::CredentialInput { item_idx, .. } => {
@@ -554,6 +582,11 @@ impl OnboardingState {
                 }
             }
             self.cancelled = true;
+            return;
+        }
+
+        if self.selecting_model {
+            self.handle_model_selection_key(key);
             return;
         }
 
@@ -629,6 +662,58 @@ impl OnboardingState {
         }
     }
 
+    fn activate_model_selection(&mut self) {
+        self.model_index = 0;
+        self.selecting_model = true;
+        self.input_mode = InputMode::Normal;
+    }
+
+    fn handle_model_selection_key(&mut self, key: KeyEvent) {
+        let (provider_id, _, _) = PROVIDERS[self.provider_index];
+        let models = models_for_provider(provider_id);
+        let model_count = models.len();
+
+        match key.code {
+            KeyCode::Up => {
+                if self.model_index > 0 {
+                    self.model_index -= 1;
+                } else {
+                    self.model_index = model_count - 1;
+                }
+            }
+            KeyCode::Down => {
+                self.model_index = (self.model_index + 1) % model_count;
+            }
+            KeyCode::Enter | KeyCode::Tab | KeyCode::Right => {
+                if is_shift_tab(&key) {
+                    self.cancel_model_selection();
+                } else {
+                    self.confirm_model_selection();
+                }
+            }
+            KeyCode::Left => {
+                self.cancel_model_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_model_selection(&mut self) {
+        self.selecting_model = false;
+        self.tab = Tab::Channels;
+        self.update_input_mode();
+    }
+
+    fn cancel_model_selection(&mut self) {
+        self.selecting_model = false;
+        if self.selected_provider_needs_key() {
+            self.tab = Tab::ApiKey;
+        } else {
+            self.tab = Tab::Provider;
+        }
+        self.update_input_mode();
+    }
+
     fn handle_provider_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => {
@@ -637,9 +722,11 @@ impl OnboardingState {
                 } else {
                     self.provider_index = PROVIDERS.len() - 1;
                 }
+                self.model_index = 0;
             }
             KeyCode::Down => {
                 self.provider_index = (self.provider_index + 1) % PROVIDERS.len();
+                self.model_index = 0;
             }
             KeyCode::Enter | KeyCode::Tab | KeyCode::Right => {
                 if is_shift_tab(&key) {
@@ -939,6 +1026,11 @@ fn render_tab_content(frame: &mut ratatui::Frame, area: Rect, state: &Onboarding
         area.height.saturating_sub(2),
     );
 
+    if state.selecting_model {
+        render_model_selection(frame, content_area, state);
+        return;
+    }
+
     match state.tab {
         Tab::Welcome => render_welcome(frame, content_area, state),
         Tab::Security => render_security(frame, content_area, state),
@@ -1160,6 +1252,38 @@ fn render_api_key(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingStat
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+fn render_model_selection(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
+    let (provider_id, provider_label, _) = PROVIDERS[state.provider_index];
+    let models = models_for_provider(provider_id);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        format!("Choose a model for {provider_label}"),
+        Style::default().fg(theme::CYAN),
+    )));
+    lines.push(Line::default());
+
+    for (i, (_id, label)) in models.iter().enumerate() {
+        let is_selected = i == state.model_index;
+        let indicator = if is_selected { "● " } else { "○ " };
+        let style = if is_selected {
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            theme::dim()
+        };
+
+        lines.push(Line::from(Span::styled(
+            format!("  {indicator}{label}"),
+            style,
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -1259,15 +1383,23 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
 }
 
 fn render_footer(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
-    let hint = match state.tab {
-        Tab::Welcome => " Tab: next field  Enter: next  Esc: cancel",
-        Tab::Provider => " ↑/↓: select  Enter/Tab: next  Shift+Tab: back  Esc: cancel",
-        Tab::Channels => match state.channel_phase {
-            ChannelPhase::Browsing => " ↑/↓: select  Space: toggle  Enter: finish  Esc: skip",
-            ChannelPhase::CredentialInput { .. } => " Type to enter  Enter: submit  Esc: cancel",
-        },
-        _ if state.input_mode == InputMode::TextInput => " Type to enter  Tab: next  Esc: cancel",
-        _ => " Tab/→: next  Shift+Tab/←: back  Esc: cancel",
+    let hint = if state.selecting_model {
+        " ↑/↓: select  Enter/Tab: next  Shift+Tab/←: back  Esc: back"
+    } else {
+        match state.tab {
+            Tab::Welcome => " Tab: next field  Enter: next  Esc: cancel",
+            Tab::Provider => " ↑/↓: select  Enter/Tab: next  Shift+Tab: back  Esc: cancel",
+            Tab::Channels => match state.channel_phase {
+                ChannelPhase::Browsing => " ↑/↓: select  Space: toggle  Enter: finish  Esc: skip",
+                ChannelPhase::CredentialInput { .. } => {
+                    " Type to enter  Enter: submit  Esc: cancel"
+                }
+            },
+            _ if state.input_mode == InputMode::TextInput => {
+                " Type to enter  Tab: next  Esc: cancel"
+            }
+            _ => " Tab/→: next  Shift+Tab/←: back  Esc: cancel",
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme::dim()))),
@@ -1357,6 +1489,11 @@ mod tests {
         state.next_tab();
         assert_eq!(state.tab, Tab::ApiKey);
         state.next_tab();
+        // Model selection submenu activates instead of going directly to Channels
+        assert!(state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+        state.confirm_model_selection();
+        assert!(!state.selecting_model);
         assert_eq!(state.tab, Tab::Channels);
     }
 
@@ -1556,9 +1693,10 @@ mod tests {
             .unwrap();
         state.provider_index = ollama_idx;
 
-        // next_tab from Provider with keyless provider should skip to Channels
+        // next_tab from Provider with keyless provider should go to model selection submenu
         state.next_tab();
-        assert_eq!(state.tab, Tab::Channels);
+        assert!(state.selecting_model);
+        assert_eq!(state.tab, Tab::Provider);
         assert!(!state.done);
     }
 
@@ -1623,6 +1761,144 @@ mod tests {
                 item.id
             );
         }
+    }
+
+    // ── Model selection submenu tests ──
+
+    #[test]
+    fn model_submenu_activates_after_api_key() {
+        let mut state = OnboardingState::new();
+        state.user_name = "Test".to_string();
+        state.security_accepted = true;
+        state.tab = Tab::ApiKey;
+        state.api_key_input = "sk-test123".to_string();
+        state.provider_index = 0; // OpenRouter
+        state.next_tab();
+        assert!(state.selecting_model);
+        assert_eq!(state.model_index, 0);
+    }
+
+    #[test]
+    fn model_submenu_activates_for_keyless_provider() {
+        let mut state = OnboardingState::new();
+        state.user_name = "Test".to_string();
+        state.security_accepted = true;
+        state.tab = Tab::Provider;
+        let ollama_idx = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "ollama")
+            .unwrap();
+        state.provider_index = ollama_idx;
+        state.next_tab();
+        assert!(state.selecting_model);
+    }
+
+    #[test]
+    fn model_confirm_advances_to_channels() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.confirm_model_selection();
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::Channels);
+    }
+
+    #[test]
+    fn model_cancel_returns_to_api_key() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.provider_index = 0; // OpenRouter (needs key)
+        state.cancel_model_selection();
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+    }
+
+    #[test]
+    fn model_cancel_returns_to_provider_for_keyless() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        let ollama_idx = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "ollama")
+            .unwrap();
+        state.provider_index = ollama_idx;
+        state.cancel_model_selection();
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::Provider);
+    }
+
+    #[test]
+    fn model_selection_up_down_navigation() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.provider_index = 0; // OpenRouter
+        let model_count = models_for_provider("openrouter").len();
+
+        // Down increments
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 1);
+
+        // Up decrements
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 0);
+
+        // Up wraps to last
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.model_index, model_count - 1);
+
+        // Down wraps to first
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 0);
+    }
+
+    #[test]
+    fn model_index_resets_on_provider_change() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::Provider;
+        state.provider_index = 0;
+        state.model_index = 3;
+
+        state.handle_provider_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 0);
+    }
+
+    #[test]
+    fn build_result_uses_model_index() {
+        let mut state = OnboardingState::new();
+        state.user_name = "Test".to_string();
+        state.provider_index = 0; // OpenRouter
+        state.model_index = 2;
+        let result = state.build_result();
+        let models = models_for_provider("openrouter");
+        assert_eq!(result.model_id, models[2].0);
+    }
+
+    #[test]
+    fn model_selection_enter_confirms() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.model_index = 1;
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::Channels);
+    }
+
+    #[test]
+    fn model_selection_esc_cancels() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.provider_index = 0;
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+        assert!(!state.cancelled);
+    }
+
+    #[test]
+    fn back_from_channels_enters_model_submenu() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::Channels;
+        state.prev_tab();
+        assert!(state.selecting_model);
     }
 
     #[test]
