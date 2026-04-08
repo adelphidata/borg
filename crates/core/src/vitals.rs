@@ -260,6 +260,13 @@ pub fn baseline() -> VitalsState {
     }
 }
 
+/// Returns true if the state represents a fresh install with no real interactions.
+/// Baseline initializes timestamps to epoch; a non-epoch `last_interaction_at`
+/// means at least one real interaction event has been replayed.
+pub fn is_fresh_install(state: &VitalsState) -> bool {
+    state.last_interaction_at.timestamp() == 0
+}
+
 /// Deterministic stat deltas for each event category.
 pub fn deltas_for(category: EventCategory) -> StatDeltas {
     match category {
@@ -431,6 +438,12 @@ pub fn replay_events_with_key(key: &[u8], events: &[VitalsEvent]) -> VitalsState
 /// Apply time-based decay based on inactivity duration.
 pub fn apply_decay(state: &VitalsState, now: DateTime<Utc>) -> VitalsState {
     let mut result = state.clone();
+
+    // No decay on fresh install (epoch sentinel = no interactions yet)
+    if is_fresh_install(state) {
+        return result;
+    }
+
     let hours = (now - state.last_interaction_at).num_hours();
 
     if hours >= 24 {
@@ -454,10 +467,13 @@ pub fn apply_decay(state: &VitalsState, now: DateTime<Utc>) -> VitalsState {
 /// Detect drift flags from current state.
 pub fn detect_drift(state: &VitalsState, now: DateTime<Utc>) -> Vec<DriftFlag> {
     let mut flags = Vec::new();
-    let hours = (now - state.last_interaction_at).num_hours();
 
-    if hours > 48 {
-        flags.push(DriftFlag::InactiveTooLong);
+    // Skip inactivity check on fresh install (epoch sentinel = no interactions yet)
+    if !is_fresh_install(state) {
+        let hours = (now - state.last_interaction_at).num_hours();
+        if hours > 48 {
+            flags.push(DriftFlag::InactiveTooLong);
+        }
     }
     if state.stability < 30 {
         flags.push(DriftFlag::LowStability);
@@ -832,7 +848,8 @@ mod tests {
 
     #[test]
     fn test_no_decay_within_24h() {
-        let state = baseline();
+        let mut state = baseline();
+        state.last_interaction_at = Utc::now();
         let now = state.last_interaction_at + Duration::hours(23);
         let decayed = apply_decay(&state, now);
         assert_eq!(decayed.sync, state.sync);
@@ -844,7 +861,8 @@ mod tests {
 
     #[test]
     fn test_decay_24h() {
-        let state = baseline();
+        let mut state = baseline();
+        state.last_interaction_at = Utc::now();
         let now = state.last_interaction_at + Duration::hours(25);
         let decayed = apply_decay(&state, now);
         assert_eq!(decayed.sync, 40 - 6);
@@ -855,7 +873,8 @@ mod tests {
 
     #[test]
     fn test_decay_72h() {
-        let state = baseline();
+        let mut state = baseline();
+        state.last_interaction_at = Utc::now();
         let now = state.last_interaction_at + Duration::hours(73);
         let decayed = apply_decay(&state, now);
         assert_eq!(decayed.sync, 40 - 6);
@@ -866,7 +885,8 @@ mod tests {
 
     #[test]
     fn test_decay_7_days() {
-        let state = baseline();
+        let mut state = baseline();
+        state.last_interaction_at = Utc::now();
         let now = state.last_interaction_at + Duration::hours(169);
         let decayed = apply_decay(&state, now);
         assert_eq!(decayed.sync, 40 - 6);
@@ -1593,11 +1613,10 @@ mod tests {
     }
 
     #[test]
-    fn replay_only_failures_reports_stale_interaction() {
+    fn replay_only_failures_keeps_epoch_interaction() {
         // With baseline timestamps anchored to epoch, a ledger consisting
         // entirely of failures/corrections never advances last_interaction_at
-        // past epoch. This makes `detect_drift` honestly flag inactivity rather
-        // than silently reporting "now" because baseline seeded it that way.
+        // past epoch. Since epoch = fresh install, drift does NOT fire.
         let ts = 86_400 * 10; // arbitrary 10-day point, well past epoch
         let events = build_chain(&[
             (EventCategory::Failure, "a", ts),
@@ -1612,10 +1631,52 @@ mod tests {
             "failures/corrections must not bump last_interaction_at past epoch"
         );
 
-        // And drift detection at a realistic "now" must fire InactiveTooLong.
+        // Epoch sentinel = fresh install → no InactiveTooLong drift.
         let now = DateTime::<Utc>::from_timestamp(ts + 200, 0).unwrap();
         let drift = detect_drift(&s, now);
-        assert!(drift.contains(&DriftFlag::InactiveTooLong));
+        assert!(!drift.contains(&DriftFlag::InactiveTooLong));
+    }
+
+    #[test]
+    fn test_no_drift_on_fresh_install() {
+        let state = baseline();
+        let drift = detect_drift(&state, Utc::now());
+        assert!(
+            !drift.contains(&DriftFlag::InactiveTooLong),
+            "fresh install (epoch sentinel) must not flag InactiveTooLong"
+        );
+    }
+
+    #[test]
+    fn test_no_decay_on_fresh_install() {
+        let state = baseline();
+        let decayed = apply_decay(&state, Utc::now());
+        assert_eq!(decayed.stability, state.stability);
+        assert_eq!(decayed.sync, state.sync);
+        assert_eq!(decayed.happiness, state.happiness);
+        assert_eq!(decayed.focus, state.focus);
+        assert_eq!(decayed.growth, state.growth);
+    }
+
+    #[test]
+    fn test_is_fresh_install() {
+        let fresh = baseline();
+        assert!(is_fresh_install(&fresh));
+
+        let mut used = baseline();
+        used.last_interaction_at = Utc::now();
+        assert!(!is_fresh_install(&used));
+    }
+
+    #[test]
+    fn test_drift_fires_after_real_interaction_then_inactivity() {
+        let mut state = baseline();
+        state.last_interaction_at = Utc::now() - chrono::Duration::hours(72);
+        let drift = detect_drift(&state, Utc::now());
+        assert!(
+            drift.contains(&DriftFlag::InactiveTooLong),
+            "72h-old real interaction must trigger InactiveTooLong"
+        );
     }
 
     #[test]
