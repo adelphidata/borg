@@ -705,7 +705,10 @@ async fn invoke_agent_inner(
                     // If no response text yet, provide a friendly error message
                     // instead of leaving the user with no reply.
                     if response_text.is_empty() {
-                        response_text = borg_core::error_format::format_friendly_error(&e);
+                        response_text = borg_core::error_format::format_error_with_context(
+                            &e,
+                            borg_core::error_format::ErrorContext::Gateway,
+                        );
                     }
                 }
                 AgentEvent::ShellConfirmation { respond, command } => {

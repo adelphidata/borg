@@ -6,6 +6,17 @@
 
 use std::fmt;
 
+/// Where the error is being displayed — determines which actionable hints to append.
+///
+/// Adding a new context (e.g. `Api`) is one enum variant + rows in [`ACTION_HINTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorContext {
+    /// Interactive TUI — can reference `/settings` and slash commands.
+    Tui,
+    /// External messaging channel (Telegram, Slack, etc.) — no slash commands.
+    Gateway,
+}
+
 /// Classified category of an error for user-facing formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
@@ -260,6 +271,58 @@ pub fn format_friendly_error(raw: &str) -> String {
             };
             truncated
         }
+    }
+}
+
+/// Table-driven action hints: `(category, context) → hint text`.
+///
+/// To add a new hint, append a row. To add a new context, add an [`ErrorContext`]
+/// variant and corresponding rows here.
+struct ActionHint {
+    category: ErrorCategory,
+    context: ErrorContext,
+    hint: &'static str,
+}
+
+const ACTION_HINTS: &[ActionHint] = &[
+    ActionHint {
+        category: ErrorCategory::RateLimit,
+        context: ErrorContext::Tui,
+        hint: "Use /settings to switch models.",
+    },
+    ActionHint {
+        category: ErrorCategory::RateLimit,
+        context: ErrorContext::Gateway,
+        hint: "If this persists, try switching to a different model.",
+    },
+    ActionHint {
+        category: ErrorCategory::Auth,
+        context: ErrorContext::Tui,
+        hint: "Check your API key in /settings.",
+    },
+    ActionHint {
+        category: ErrorCategory::Billing,
+        context: ErrorContext::Tui,
+        hint: "Check billing or switch providers in /settings.",
+    },
+];
+
+/// Format a friendly error with context-specific actionable hints.
+///
+/// Builds on [`format_friendly_error`] and appends a hint from [`ACTION_HINTS`]
+/// when one matches the `(category, context)` pair.
+pub fn format_error_with_context(raw: &str, context: ErrorContext) -> String {
+    let base = format_friendly_error(raw);
+    let category = classify_error(raw);
+
+    let hint = ACTION_HINTS
+        .iter()
+        .find(|h| h.category == category && h.context == context)
+        .map(|h| h.hint);
+
+    match hint {
+        Some(h) => format!("{base} {h}"),
+        None => base,
     }
 }
 
@@ -762,5 +825,74 @@ mod tests {
     fn extract_retry_hint_none_when_no_number() {
         let hint = extract_retry_hint("please wait a moment");
         assert!(hint.is_none());
+    }
+
+    // ── format_error_with_context tests ──
+
+    #[test]
+    fn context_tui_rate_limit_suggests_settings() {
+        let msg = format_error_with_context(
+            "openrouter returned 429 (rate limited): too many requests",
+            ErrorContext::Tui,
+        );
+        assert!(msg.contains("/settings"));
+        assert!(msg.contains("switch models"));
+    }
+
+    #[test]
+    fn context_gateway_rate_limit_suggests_different_model() {
+        let msg = format_error_with_context(
+            "openrouter returned 429 (rate limited): too many requests",
+            ErrorContext::Gateway,
+        );
+        assert!(msg.contains("switching to a different model"));
+        assert!(!msg.contains("/settings"));
+    }
+
+    #[test]
+    fn context_tui_auth_suggests_settings() {
+        let msg = format_error_with_context(
+            "Anthropic returned 401 (auth error): invalid key",
+            ErrorContext::Tui,
+        );
+        assert!(msg.contains("/settings"));
+        assert!(msg.contains("API key"));
+    }
+
+    #[test]
+    fn context_tui_billing_suggests_settings() {
+        let msg =
+            format_error_with_context("OpenAI returned 402: payment required", ErrorContext::Tui);
+        assert!(msg.contains("/settings"));
+    }
+
+    #[test]
+    fn context_no_hint_for_timeout() {
+        let base = format_friendly_error("request timed out after 30s");
+        let with_ctx = format_error_with_context("request timed out after 30s", ErrorContext::Tui);
+        assert_eq!(base, with_ctx);
+    }
+
+    #[test]
+    fn context_gateway_no_hint_for_auth() {
+        let base = format_friendly_error("Anthropic returned 401: invalid key");
+        let with_ctx =
+            format_error_with_context("Anthropic returned 401: invalid key", ErrorContext::Gateway);
+        assert_eq!(base, with_ctx);
+    }
+
+    #[test]
+    fn context_real_openrouter_429_error() {
+        let raw = r#"openrouter returned 429 (rate limited): {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"moonshotai/kimi-k2.5 is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations","provider_name":"DeepInfra","is_byok":false}}}"#;
+
+        let tui_msg = format_error_with_context(raw, ErrorContext::Tui);
+        assert!(tui_msg.contains("rate-limited"));
+        assert!(tui_msg.contains("/settings"));
+        assert!(!tui_msg.contains(r#"{"error"#));
+
+        let gw_msg = format_error_with_context(raw, ErrorContext::Gateway);
+        assert!(gw_msg.contains("rate-limited"));
+        assert!(gw_msg.contains("switching to a different model"));
+        assert!(!gw_msg.contains(r#"{"error"#));
     }
 }

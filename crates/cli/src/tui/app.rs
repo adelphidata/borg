@@ -1386,7 +1386,10 @@ impl<'a> App<'a> {
             }
             AgentEvent::Error(e) => {
                 self.cells.push(HistoryCell::System {
-                    text: format!("Error: {e}"),
+                    text: borg_core::error_format::format_error_with_context(
+                        &e,
+                        borg_core::error_format::ErrorContext::Tui,
+                    ),
                 });
                 for cell in self.cells.iter_mut().rev() {
                     if let HistoryCell::Assistant { streaming, .. } = cell {
