@@ -332,8 +332,9 @@ impl<'a> App<'a> {
     // Mouse-wheel scroll still works because xterm Alternate Scroll Mode
     // (?1007h) makes the terminal translate wheel events into CUR_UP / CUR_DOWN
     // key sequences. Those arrive as KeyCode::Up / KeyCode::Down and are routed
-    // by `handle_key` to transcript scroll (when scroll_offset > 0) or composer
-    // history (when pinned at the bottom).
+    // by `handle_key` via a three-tier heuristic: transcript scroll when already
+    // scrolled up or composer is idle, composer history when the composer has
+    // text or is browsing history. See the routing comment in handle_key.
     //
     // DO NOT add `fn handle_mouse`. DO NOT match `Event::Mouse` in mod.rs.
     // Either would require turning on a mouse tracking mode, which breaks text
@@ -980,28 +981,33 @@ impl<'a> App<'a> {
         }
 
         // ------------------------------------------------------------
-        // Up / Down arrow routing.
+        // Up / Down arrow routing — three-tier heuristic.
         // ------------------------------------------------------------
-        // Up/Down arrows primarily navigate **composer history**
-        // (shell-like recall of previously sent messages). The only
-        // exception is when the user has already scrolled up into the
-        // transcript (`scroll_offset > 0`), in which case Up/Down
-        // continue scrolling line-by-line so the user can navigate
-        // the scrollback without switching keys.
+        // ⚠ DO NOT collapse these tiers. The three-tier split is
+        // load-bearing: removing Rule B regresses trackpad/mouse-
+        // wheel scrolling (happened in bf78752). Removing Rule C
+        // regresses shell-style history recall.
         //
-        // Note: mouse-wheel events arrive as KeyCode::Up/Down via
-        // xterm Alternate Scroll Mode (?1007h). Because keyboard and
-        // wheel arrows are indistinguishable, wheel-from-bottom will
-        // trigger history recall rather than scrolling. Users can
-        // start scrolling with PageUp; once `scroll_offset > 0`,
-        // wheel (and keyboard arrows) resume line-by-line scrolling.
+        // Mouse-wheel/trackpad events arrive as KeyCode::Up/Down
+        // via xterm Alternate Scroll Mode (?1007h) — they are
+        // **indistinguishable** from keyboard arrows. We use
+        // composer state to guess intent:
         //
-        // Routing rule:
-        //   A. scroll_offset > 0 → Up/Down scroll the transcript.
-        //   B. Otherwise → Up/Down navigate composer history.
+        // Routing rules (evaluated top to bottom):
+        //   A. scroll_offset > 0 → Up/Down scroll the transcript
+        //      line-by-line (continue scrolling once started).
+        //   B. composer empty & not browsing history → Up starts
+        //      scrolling (wheel-from-bottom), Down is a no-op.
+        //      This makes trackpad/wheel work naturally from the
+        //      bottom of the transcript.
+        //   C. Otherwise (composer has text or is browsing history)
+        //      → Up/Down navigate composer history (shell-like
+        //      recall of previously sent messages).
         //
-        // PageUp / PageDown always scroll the transcript.
-        // Ctrl+P / Ctrl+N always navigate composer history.
+        // Escape hatches:
+        //   - Ctrl+P / Ctrl+N always navigate composer history,
+        //     regardless of scroll state or composer contents.
+        //   - PageUp / PageDown always scroll the transcript.
         // ------------------------------------------------------------
         match key.code {
             KeyCode::PageUp => {
@@ -1038,6 +1044,38 @@ impl<'a> App<'a> {
                 }
                 return Ok(AppAction::Continue);
             }
+
+            // Rule B: composer idle at bottom → treat as wheel scroll.
+            // ⚠ REGRESSION GUARD — DO NOT REMOVE Rule B.
+            // Without this, trackpad/mouse-wheel scroll breaks: wheel
+            // events (delivered as KeyCode::Up/Down via ?1007h) would
+            // navigate composer history instead of scrolling the
+            // transcript. This regressed in bf78752. If you need
+            // keyboard Up to recall history from an empty composer,
+            // use Ctrl+P/Ctrl+N instead — those always work.
+            KeyCode::Up
+                if key.modifiers.is_empty()
+                    && self.composer.is_empty()
+                    && !self.composer.is_browsing_history() =>
+            {
+                let max_scroll = self
+                    .total_lines
+                    .saturating_sub(self.transcript_area.height as usize);
+                if max_scroll > 0 {
+                    self.scroll_offset = 1;
+                    self.auto_scroll = false;
+                }
+                return Ok(AppAction::Continue);
+            }
+            KeyCode::Down
+                if key.modifiers.is_empty()
+                    && self.composer.is_empty()
+                    && !self.composer.is_browsing_history() =>
+            {
+                // Already at bottom with empty composer — nothing to do.
+                return Ok(AppAction::Continue);
+            }
+
             _ => {}
         }
 
@@ -2066,13 +2104,15 @@ mod tests {
         assert_eq!(app.scroll_offset, max_scroll);
     }
 
-    // --- Rule B: idle composer at bottom → arrows scroll (wheel semantics) ---
+    // --- Rule B: idle composer at bottom → arrows scroll (wheel-from-bottom) ---
 
+    /// REGRESSION GUARD: Up with empty composer at bottom MUST scroll the
+    /// transcript, not navigate history. Mouse wheel events arrive as
+    /// KeyCode::Up via ?1007h and are indistinguishable from keyboard
+    /// arrows. Without Rule B, trackpad/wheel users cannot scroll.
+    /// DO NOT weaken this test. Use Ctrl+P for history from empty state.
     #[test]
-    /// Up arrow with an empty composer at the bottom must recall the last
-    /// sent message (shell-like history), NOT scroll the transcript.
-    /// This is a regression guard — do not weaken.
-    fn arrow_up_recalls_history_when_composer_empty() {
+    fn arrow_up_scrolls_when_composer_empty_at_bottom() {
         let mut app = app_with_scrollable_transcript();
         app.composer.set_text("hello world");
         app.composer.handle_key(key(KeyCode::Enter));
@@ -2081,31 +2121,54 @@ mod tests {
 
         app.handle_key(key(KeyCode::Up)).unwrap();
 
-        // Up recalls last sent message; transcript does NOT scroll.
+        // Up scrolls transcript; composer stays empty.
+        assert_eq!(app.scroll_offset, 1);
+        assert!(!app.auto_scroll);
+        assert!(app.composer.is_empty());
+        assert!(!app.composer.is_browsing_history());
+    }
+
+    /// REGRESSION GUARD: Down with empty composer at bottom MUST be a
+    /// no-op, not navigate history. Wheel-down at bottom has nowhere to
+    /// scroll and must not recall history entries.
+    #[test]
+    fn arrow_down_is_noop_when_composer_empty_at_bottom() {
+        let mut app = app_with_scrollable_transcript();
+        app.composer.set_text("hello world");
+        app.composer.handle_key(key(KeyCode::Enter));
+        assert!(app.composer.is_empty());
         assert_eq!(app.scroll_offset, 0);
-        assert_eq!(app.composer.text(), "hello world");
-        assert!(app.composer.is_browsing_history());
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.composer.is_empty());
+        assert!(!app.composer.is_browsing_history());
     }
 
     #[test]
-    fn arrow_up_falls_through_to_history_when_transcript_not_scrollable() {
+    fn arrow_up_is_noop_when_composer_empty_and_transcript_not_scrollable() {
         let mut app = make_app();
-        // Default transcript_area is 0x0, so max_scroll == 0 regardless.
+        // Default transcript_area is 0x0, so max_scroll == 0.
         app.composer.set_text("first");
         app.composer.handle_key(key(KeyCode::Enter));
         assert!(app.composer.is_empty());
 
         app.handle_key(key(KeyCode::Up)).unwrap();
 
-        // History recalled regardless of scrollability.
+        // No scrollable content AND composer empty → no-op.
         assert_eq!(app.scroll_offset, 0);
-        assert_eq!(app.composer.text(), "first");
+        assert!(app.composer.is_empty());
+        assert!(!app.composer.is_browsing_history());
     }
+
+    // --- Rule C: composer has text or is browsing history → arrows navigate history ---
 
     /// Multiple Up presses walk backward through sent messages, most
     /// recent first. This is the core shell-history UX guarantee.
+    /// Requires text in the composer to trigger Rule C (not Rule B).
     #[test]
-    fn multiple_arrow_ups_walk_back_through_history() {
+    fn multiple_arrow_ups_walk_back_through_history_with_draft() {
         let mut app = app_with_scrollable_transcript();
         app.composer.set_text("first");
         app.composer.handle_key(key(KeyCode::Enter));
@@ -2113,7 +2176,8 @@ mod tests {
         app.composer.handle_key(key(KeyCode::Enter));
         app.composer.set_text("third");
         app.composer.handle_key(key(KeyCode::Enter));
-        assert!(app.composer.is_empty());
+        // Put text in composer so history navigation (Rule C) triggers.
+        app.composer.set_text("draft");
 
         app.handle_key(key(KeyCode::Up)).unwrap();
         assert_eq!(app.composer.text(), "third");
@@ -2133,17 +2197,18 @@ mod tests {
         app.composer.handle_key(key(KeyCode::Enter));
         assert!(app.composer.is_empty());
 
-        // Browse into history then back out.
-        app.handle_key(key(KeyCode::Up)).unwrap();
+        // Use Ctrl+P to enter history browse (bypasses Rule B wheel heuristic).
+        let ctrl_p = crossterm::event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_p).unwrap();
         assert_eq!(app.composer.text(), "msg1");
+
+        // Down navigates history back (Rule C: browsing history).
         app.handle_key(key(KeyCode::Down)).unwrap();
         // Past newest → composer cleared, no longer browsing.
         assert_eq!(app.composer.text(), "");
         assert!(!app.composer.is_browsing_history());
         assert_eq!(app.scroll_offset, 0);
     }
-
-    // --- Active composer → arrows navigate history ---
 
     #[test]
     fn arrow_up_navigates_history_when_composer_has_text() {
@@ -2171,13 +2236,14 @@ mod tests {
         app.composer.set_text("msg2");
         app.composer.handle_key(key(KeyCode::Enter));
 
-        // Enter history browse mode.
-        app.handle_key(key(KeyCode::Up)).unwrap(); // -> msg2
-        app.handle_key(key(KeyCode::Up)).unwrap(); // -> msg1
+        // Enter history browse mode with Ctrl+P (always navigates history).
+        let ctrl_p = crossterm::event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_p).unwrap(); // -> msg2
+        app.handle_key(ctrl_p).unwrap(); // -> msg1
         assert!(app.composer.is_browsing_history());
         assert_eq!(app.composer.text(), "msg1");
 
-        // Down must keep navigating history, not scroll.
+        // Down must keep navigating history (Rule C), not scroll.
         app.handle_key(key(KeyCode::Down)).unwrap();
         assert_eq!(app.composer.text(), "msg2");
         assert_eq!(app.scroll_offset, 0);
@@ -2236,6 +2302,88 @@ mod tests {
 
         assert_eq!(app.scroll_offset, 0);
         assert!(app.auto_scroll);
+    }
+
+    // --- Regression guards: wheel vs history three-tier heuristic ---
+
+    /// REGRESSION GUARD: Trackpad/mouse-wheel scroll from bottom.
+    /// Mouse wheel events arrive as KeyCode::Up/Down via ?1007h and are
+    /// indistinguishable from keyboard arrows. When the composer is empty,
+    /// Up MUST scroll the transcript (not navigate history). Without this,
+    /// trackpad users cannot scroll. DO NOT weaken this test.
+    #[test]
+    fn regression_wheel_from_bottom_must_scroll_not_navigate_history() {
+        let mut app = app_with_scrollable_transcript();
+        // Seed history so there IS something to recall.
+        app.composer.set_text("previous message");
+        app.composer.handle_key(key(KeyCode::Enter));
+        assert!(app.composer.is_empty());
+        assert_eq!(app.scroll_offset, 0);
+
+        // Simulate wheel-up (arrives as KeyCode::Up).
+        app.handle_key(key(KeyCode::Up)).unwrap();
+
+        // MUST scroll, not recall "previous message".
+        assert_eq!(app.scroll_offset, 1, "wheel-from-bottom must scroll");
+        assert!(app.composer.is_empty(), "composer must stay empty");
+        assert!(!app.composer.is_browsing_history());
+    }
+
+    /// REGRESSION GUARD: Down arrow at bottom with empty composer must be
+    /// a no-op (not navigate history). Wheel-down at the bottom of the
+    /// transcript has nowhere to scroll — it must not recall history.
+    #[test]
+    fn regression_wheel_down_at_bottom_must_not_navigate_history() {
+        let mut app = app_with_scrollable_transcript();
+        app.composer.set_text("old message");
+        app.composer.handle_key(key(KeyCode::Enter));
+        assert!(app.composer.is_empty());
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.composer.is_empty());
+        assert!(!app.composer.is_browsing_history());
+    }
+
+    /// REGRESSION GUARD: Once scrolled up (e.g. via wheel/PageUp),
+    /// continued Up/Down MUST keep scrolling, not switch to history.
+    #[test]
+    fn regression_continued_wheel_scroll_does_not_switch_to_history() {
+        let mut app = app_with_scrollable_transcript();
+        app.composer.set_text("msg");
+        app.composer.handle_key(key(KeyCode::Enter));
+
+        // Scroll up from bottom (Rule B → sets scroll_offset=1).
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.scroll_offset, 1);
+
+        // Continued Up must keep scrolling (Rule A), not fall to history.
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.scroll_offset, 2);
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.scroll_offset, 3);
+        assert!(app.composer.is_empty(), "composer must remain untouched");
+    }
+
+    /// REGRESSION GUARD: Ctrl+P MUST navigate history even when composer
+    /// is empty (bypassing the wheel-scroll heuristic). This is the
+    /// escape hatch for keyboard users who want history from empty state.
+    #[test]
+    fn regression_ctrl_p_always_navigates_history_regardless_of_state() {
+        let mut app = app_with_scrollable_transcript();
+        app.composer.set_text("recalled");
+        app.composer.handle_key(key(KeyCode::Enter));
+        assert!(app.composer.is_empty());
+        assert_eq!(app.scroll_offset, 0);
+
+        let ctrl_p = crossterm::event::KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_p).unwrap();
+
+        // Ctrl+P always recalls history, even when Rule B would scroll.
+        assert_eq!(app.composer.text(), "recalled");
+        assert!(app.composer.is_browsing_history());
+        assert_eq!(app.scroll_offset, 0);
     }
 
     // --- Regression guards: non-arrow keys unaffected ---
