@@ -151,7 +151,8 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     // The gateway gets its own CancellationToken so /internal/restart can stop
     // just the gateway without killing the whole daemon.
     let gw_shutdown = CancellationToken::new();
-    let gw_handle = spawn_daemon_gateway(&config, gw_shutdown.clone(), Some(poke_tx));
+    let gw_poke_tx = poke_tx.clone();
+    let gw_handle = spawn_daemon_gateway(&config, gw_shutdown.clone(), Some(gw_poke_tx));
     let mut gw_shutdown = gw_shutdown;
     println!("Gateway server started.");
 
@@ -241,6 +242,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
 
     // Track wall-clock time for drift detection after sleep/wake
     let mut last_tick_wall = std::time::Instant::now();
+    let mut gw_crash_count: u32 = 0;
 
     loop {
         tokio::select! {
@@ -266,21 +268,29 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                 // Either way, reload config and respawn instead of killing the daemon.
                 let is_restart = gw_shutdown.is_cancelled();
                 if is_restart {
+                    gw_crash_count = 0;
                     tracing::info!("Gateway restart requested, respawning with fresh config");
                     borg_core::activity_log::log_activity(&db, "info", "system", "Gateway restarting (requested)");
                 } else {
+                    gw_crash_count += 1;
                     tracing::error!("Gateway server exited unexpectedly: {result:?}");
                     borg_core::activity_log::log_activity(&db, "error", "system", "Gateway crashed, respawning");
+                    if gw_crash_count >= 5 {
+                        tracing::error!("Gateway crashed {gw_crash_count} times in rapid succession, stopping respawn");
+                        borg_core::activity_log::log_activity(&db, "error", "system", "Gateway respawn abandoned after 5 crashes");
+                        continue;
+                    }
                 }
 
-                // Small delay to let the port be released
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                // Delay to let the port be released (longer backoff on crashes)
+                let delay_ms = if is_restart { 250 } else { 250 * (1 << gw_crash_count.min(4)) };
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
 
                 let new_shutdown = CancellationToken::new();
                 gw_handle = Box::pin(spawn_daemon_gateway(
                     &Config::load().unwrap_or_else(|_| config.clone()),
                     new_shutdown.clone(),
-                    None, // poke channel only for initial start
+                    Some(poke_tx.clone()),
                 ));
                 gw_shutdown = new_shutdown;
                 continue;

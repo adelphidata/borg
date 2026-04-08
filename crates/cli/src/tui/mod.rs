@@ -944,7 +944,7 @@ async fn run_event_loop(
                                 let mut msg = format!("Removed {}", def.name);
                                 msg.push_str("\n  Data directory wiped.");
                                 if def.kind == borg_plugins::PluginKind::Channel {
-                                    let gw_msg = restart_gateway(gateway_shutdown);
+                                    let gw_msg = restart_gateway(gateway_shutdown).await;
                                     msg.push_str(&format!("\n  {gw_msg}"));
                                 }
                                 results.push(msg);
