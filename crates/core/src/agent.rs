@@ -1833,7 +1833,7 @@ Rules:
             "list_skills" => tool_handlers::handle_list_skills(&self.config),
             "list_channels" => tool_handlers::handle_list_channels(&self.config),
             // Consolidated apply_patch with target param
-            "apply_patch" => tool_handlers::handle_apply_patch_unified(&args),
+            "apply_patch" => tool_handlers::handle_apply_patch_unified(&args, &self.config),
             // Legacy aliases for patch tools
             "apply_skill_patch" => tool_handlers::handle_apply_skill_patch(&args),
             "create_channel" => tool_handlers::handle_create_channel(&args),

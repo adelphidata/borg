@@ -44,6 +44,11 @@ impl AffectedPaths {
     }
 }
 
+/// Validate that `path` stays within `base_dir` after canonicalization.
+///
+/// NOTE: This function enforces base_dir containment. Cross-directory support
+/// is handled at the tool handler layer by setting base_dir="/" and pre-validating
+/// paths against blocked_paths. Do not loosen this check here.
 fn validate_patch_path(path: &str, base_dir: &Path) -> Result<()> {
     if path.is_empty() {
         bail!("Empty file path in patch operation");
