@@ -460,14 +460,15 @@ impl OnboardingState {
             match self.tab {
                 Tab::Welcome if self.user_name.trim().is_empty() => return,
                 Tab::Security if !self.security_accepted => return,
-                Tab::Provider if !self.selected_provider_needs_key() => {
-                    // Skip API Key tab — go to model selection submenu
+                Tab::Provider => {
+                    // Always go to model selection after provider
                     self.activate_model_selection();
                     return;
                 }
                 Tab::ApiKey => {
-                    // Go to model selection submenu before Channels
-                    self.activate_model_selection();
+                    // Go directly to Channels after API key
+                    self.tab = Tab::Channels;
+                    self.update_input_mode();
                     return;
                 }
                 Tab::Channels => {
@@ -482,20 +483,26 @@ impl OnboardingState {
     }
 
     fn prev_tab(&mut self) {
-        // From Channels, go back to model selection submenu
+        // From Channels, go back to ApiKey (if needed) or model selection
         if self.tab == Tab::Channels {
+            if self.selected_provider_needs_key() {
+                self.tab = Tab::ApiKey;
+                self.update_input_mode();
+            } else {
+                self.selecting_model = true;
+                self.input_mode = InputMode::Normal;
+            }
+            return;
+        }
+        // From ApiKey, go back to model selection submenu
+        if self.tab == Tab::ApiKey {
             self.selecting_model = true;
             self.input_mode = InputMode::Normal;
             return;
         }
         let idx = self.tab.index();
         if idx > 0 {
-            let mut target = Tab::ALL[idx - 1];
-            // Skip ApiKey when going back from Channels if provider doesn't need a key
-            if target == Tab::ApiKey && !self.selected_provider_needs_key() {
-                target = Tab::Provider;
-            }
-            self.tab = target;
+            self.tab = Tab::ALL[idx - 1];
             self.update_input_mode();
         }
     }
@@ -678,17 +685,17 @@ impl OnboardingState {
 
     fn confirm_model_selection(&mut self) {
         self.selecting_model = false;
-        self.tab = Tab::Channels;
+        if self.selected_provider_needs_key() {
+            self.tab = Tab::ApiKey;
+        } else {
+            self.tab = Tab::Channels;
+        }
         self.update_input_mode();
     }
 
     fn cancel_model_selection(&mut self) {
         self.selecting_model = false;
-        if self.selected_provider_needs_key() {
-            self.tab = Tab::ApiKey;
-        } else {
-            self.tab = Tab::Provider;
-        }
+        self.tab = Tab::Provider;
         self.update_input_mode();
     }
 
@@ -1465,13 +1472,13 @@ mod tests {
         state.next_tab();
         assert_eq!(state.tab, Tab::Provider);
         state.next_tab();
-        assert_eq!(state.tab, Tab::ApiKey);
-        state.next_tab();
-        // Model selection submenu activates instead of going directly to Channels
+        // Model selection submenu activates after provider
         assert!(state.selecting_model);
-        assert_eq!(state.tab, Tab::ApiKey);
+        assert_eq!(state.tab, Tab::Provider);
         state.confirm_model_selection();
         assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+        state.next_tab();
         assert_eq!(state.tab, Tab::Channels);
     }
 
@@ -1671,7 +1678,7 @@ mod tests {
             .unwrap();
         state.provider_index = ollama_idx;
 
-        // next_tab from Provider with keyless provider should go to model selection submenu
+        // next_tab from Provider always goes to model selection submenu
         state.next_tab();
         assert!(state.selecting_model);
         assert_eq!(state.tab, Tab::Provider);
@@ -1679,15 +1686,17 @@ mod tests {
     }
 
     #[test]
-    fn api_key_provider_goes_to_api_key_tab() {
+    fn api_key_provider_goes_to_model_selection() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
         state.security_accepted = true;
         state.tab = Tab::Provider;
         state.provider_index = 0; // OpenRouter needs API key
 
+        // Provider always goes to model selection first
         state.next_tab();
-        assert_eq!(state.tab, Tab::ApiKey);
+        assert!(state.selecting_model);
+        assert_eq!(state.tab, Tab::Provider);
         assert!(!state.done);
     }
 
@@ -1744,12 +1753,11 @@ mod tests {
     // ── Model selection submenu tests ──
 
     #[test]
-    fn model_submenu_activates_after_api_key() {
+    fn model_submenu_activates_after_provider() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
         state.security_accepted = true;
-        state.tab = Tab::ApiKey;
-        state.api_key_input = "sk-test123".to_string();
+        state.tab = Tab::Provider;
         state.provider_index = 0; // OpenRouter
         state.next_tab();
         assert!(state.selecting_model);
@@ -1772,27 +1780,39 @@ mod tests {
     }
 
     #[test]
-    fn model_confirm_advances_to_channels() {
+    fn model_confirm_advances_to_api_key_when_needed() {
         let mut state = OnboardingState::new();
         state.selecting_model = true;
+        state.provider_index = 0; // OpenRouter (needs key)
+        state.confirm_model_selection();
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+    }
+
+    #[test]
+    fn model_confirm_advances_to_channels_for_keyless() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        let ollama_idx = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "ollama")
+            .unwrap();
+        state.provider_index = ollama_idx;
         state.confirm_model_selection();
         assert!(!state.selecting_model);
         assert_eq!(state.tab, Tab::Channels);
     }
 
     #[test]
-    fn model_cancel_returns_to_api_key() {
+    fn model_cancel_always_returns_to_provider() {
         let mut state = OnboardingState::new();
         state.selecting_model = true;
         state.provider_index = 0; // OpenRouter (needs key)
         state.cancel_model_selection();
         assert!(!state.selecting_model);
-        assert_eq!(state.tab, Tab::ApiKey);
-    }
+        assert_eq!(state.tab, Tab::Provider);
 
-    #[test]
-    fn model_cancel_returns_to_provider_for_keyless() {
-        let mut state = OnboardingState::new();
+        // Same for keyless provider
         state.selecting_model = true;
         let ollama_idx = PROVIDERS
             .iter()
@@ -1854,10 +1874,11 @@ mod tests {
     fn model_selection_enter_confirms() {
         let mut state = OnboardingState::new();
         state.selecting_model = true;
+        state.provider_index = 0; // OpenRouter (needs key)
         state.model_index = 1;
         state.handle_model_selection_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!state.selecting_model);
-        assert_eq!(state.tab, Tab::Channels);
+        assert_eq!(state.tab, Tab::ApiKey);
     }
 
     #[test]
@@ -1867,14 +1888,37 @@ mod tests {
         state.provider_index = 0;
         state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!state.selecting_model);
-        assert_eq!(state.tab, Tab::ApiKey);
+        assert_eq!(state.tab, Tab::Provider);
         assert!(!state.cancelled);
     }
 
     #[test]
-    fn back_from_channels_enters_model_submenu() {
+    fn back_from_channels_goes_to_api_key_when_needed() {
         let mut state = OnboardingState::new();
         state.tab = Tab::Channels;
+        state.provider_index = 0; // OpenRouter (needs key)
+        state.prev_tab();
+        assert!(!state.selecting_model);
+        assert_eq!(state.tab, Tab::ApiKey);
+    }
+
+    #[test]
+    fn back_from_channels_enters_model_submenu_for_keyless() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::Channels;
+        let ollama_idx = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "ollama")
+            .unwrap();
+        state.provider_index = ollama_idx;
+        state.prev_tab();
+        assert!(state.selecting_model);
+    }
+
+    #[test]
+    fn back_from_api_key_enters_model_submenu() {
+        let mut state = OnboardingState::new();
+        state.tab = Tab::ApiKey;
         state.prev_tab();
         assert!(state.selecting_model);
     }
