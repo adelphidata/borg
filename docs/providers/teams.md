@@ -10,7 +10,7 @@ Go to the [Azure Portal](https://portal.azure.com/) and create a new **Bot Chann
 
 ## 2. Install via Borg
 
-Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into `config.toml` automatically. No manual file editing required.
+Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into the settings database automatically. No manual file editing required.
 
 ### TUI (recommended)
 

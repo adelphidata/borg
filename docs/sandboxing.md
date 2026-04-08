@@ -8,12 +8,11 @@ Scripts and channel integrations run inside a platform-specific sandbox. This is
 - **Linux**: Uses [Bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) with namespace isolation
 - **Other platforms**: No sandboxing (tools run unsandboxed)
 
-Sandboxing is enabled by default and configured globally in `config.toml`:
+Sandboxing is enabled by default and configured via settings:
 
-```toml
-[sandbox]
-enabled = true
-mode = "strict"
+```sh
+borg settings set sandbox.enabled true
+borg settings set sandbox.mode strict
 ```
 
 ## Per-script sandbox policy

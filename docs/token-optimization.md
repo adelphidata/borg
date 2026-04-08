@@ -23,38 +23,31 @@ These optimizations reduce that to ~25K-40K without sacrificing functionality.
 
 ## Config Reference
 
-Add these to `~/.borg/config.toml`:
+Configure via `borg settings set`:
 
-```toml
-[tools]
+```sh
 # Only send tool schemas relevant to the current message.
 # Core tools (memory, fs, runtime, discovery) always included.
 # Conditional groups (web, browser, schedule, media, integration, agents)
 # included when keywords match or tools were recently used.
-conditional_loading = true
+borg settings set tools.conditional_loading true
 
 # Strip redundant metadata from tool schemas (remove defaults,
 # shorten enum descriptions). Saves ~200-600 tokens.
-compact_schemas = true
+borg settings set tools.compact_schemas true
 
-[conversation]
 # Progressively degrade old tool results:
 # - Last 12 messages: full fidelity
 # - Messages 13-24: truncate large results to head+tail
 # - Older than 24: replace with one-line status summary
-age_based_degradation = true
+borg settings set conversation.age_based_degradation true
 
-[memory]
 # Load memory at section granularity instead of file granularity.
-# Requires embeddings enabled. Splits files by ## headers and packs
-# most relevant sections within token budget.
-# Default: false (opt-in, higher risk of missing cross-section context)
-chunk_level_selection = false
+# Requires embeddings enabled. Default: false (opt-in).
+borg settings set memory.chunk_level_selection false
 
-[llm.cache]
 # Adaptive cache TTL. "auto" uses 5m for REPL, 1h for gateway/scheduled.
-# Explicit "5m" or "1h" overrides auto-detection.
-ttl = "auto"
+borg settings set llm.cache.ttl auto
 ```
 
 ## How Each Optimization Works
@@ -135,24 +128,17 @@ After enabling optimizations, watch for these signals:
 
 ## Revert Procedures
 
-Each optimization can be instantly disabled by setting its config flag in
-`~/.borg/config.toml` and restarting the session. No data migration or cleanup
-is needed — all changes are per-turn and stateless.
+Each optimization can be instantly disabled via `borg settings set` and restarting
+the session. No data migration or cleanup is needed — all changes are per-turn
+and stateless.
 
-```toml
+```sh
 # Emergency: disable all optimizations
-[tools]
-conditional_loading = false
-compact_schemas = false
-
-[conversation]
-age_based_degradation = false
-
-[memory]
-chunk_level_selection = false
-
-[llm.cache]
-ttl = "5m"
+borg settings set tools.conditional_loading false
+borg settings set tools.compact_schemas false
+borg settings set conversation.age_based_degradation false
+borg settings set memory.chunk_level_selection false
+borg settings set llm.cache.ttl 5m
 ```
 
 ## Changelog

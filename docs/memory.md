@@ -31,24 +31,22 @@ Embeddings are generated on `write_memory` and stored in SQLite. Memory files ar
 
 Auto-detects embedding provider from API keys (OpenAI -> OpenRouter -> Gemini). Silently falls back to recency-only ranking when no embedding provider is available (e.g., Anthropic-only users).
 
-Configure via `[memory.embeddings]` in config:
+Configure via `borg settings set`:
 
-```toml
-[memory.embeddings]
-enabled = true
-recency_weight = 0.2            # 0.0=pure similarity, 1.0=pure recency
-bm25_weight = 0.3               # BM25 keyword weight
-vector_weight = 0.7             # vector similarity weight
+```sh
+borg settings set memory.embeddings.enabled true
+borg settings set memory.embeddings.recency_weight 0.2    # 0.0=pure similarity, 1.0=pure recency
+borg settings set memory.embeddings.bm25_weight 0.3       # BM25 keyword weight
+borg settings set memory.embeddings.vector_weight 0.7     # vector similarity weight
 ```
 
 Token estimation uses tiktoken-rs (cl100k_base BPE tokenizer).
 
 ### Configuration
 
-```toml
-[memory]
-max_context_tokens = 8000    # token budget for memory in system prompt
-# memory_scope = "my-project"  # optional: namespace for scoped memory
+```sh
+borg settings set memory.max_context_tokens 8000
+borg settings set memory.memory_scope "my-project"   # optional: namespace for scoped memory
 ```
 
 ## Writing memory

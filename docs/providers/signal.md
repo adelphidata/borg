@@ -35,7 +35,7 @@ By default, the daemon listens on `localhost:8080`.
 
 ## 4. Install via Borg
 
-Signal is installed through the TUI plugin marketplace. Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into `config.toml` automatically.
+Signal is installed through the TUI plugin marketplace. Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into the settings database automatically.
 
 ```sh
 borg
@@ -65,10 +65,9 @@ signal = "pairing"   # pairing (default) | open | disabled
 
 ### signal-cli connection
 
-Override the signal-cli daemon location in `~/.borg/config.toml` if it is not running on the default `localhost:8080`:
+Override the signal-cli daemon location if it is not running on the default `localhost:8080`:
 
-```toml
-[gateway]
-signal_cli_host = "localhost"   # signal-cli daemon host
-signal_cli_port = 8080          # signal-cli daemon port
+```sh
+borg settings set gateway.signal_cli_host "localhost"
+borg settings set gateway.signal_cli_port 8080
 ```

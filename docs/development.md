@@ -78,8 +78,8 @@ borg/
 │   │   │   ├── tool_policy.rs      # composable tool filtering (profiles, allow/deny)
 │   │   │   ├── tool_catalog.rs     # tool group definitions and profiles
 │   │   │   ├── session.rs          # session persistence + auto-titling
-│   │   │   ├── db/                 # SQLite database with versioned migrations (V29)
-│   │   │   ├── settings.rs         # three-tier settings resolver (DB -> TOML -> defaults)
+│   │   │   ├── db/                 # SQLite database with versioned migrations (V33)
+│   │   │   ├── settings.rs         # two-tier settings resolver (DB -> defaults)
 │   │   │   ├── conversation.rs     # history compaction + normalization
 │   │   │   ├── policy.rs           # execution policy (approve/deny)
 │   │   │   ├── secrets.rs          # secret detection + redaction
@@ -110,7 +110,7 @@ borg/
 │   │       ├── weather/SKILL.md
 │   │       ├── skill-creator/SKILL.md
 │   │       ├── git/SKILL.md
-│   │       ├── http/SKILL.md
+│   │       ├── email/SKILL.md
 │   │       ├── search/SKILL.md
 │   │       ├── docker/SKILL.md
 │   │       ├── database/SKILL.md
@@ -186,7 +186,7 @@ cp .env.example .env
 
 ## Database
 
-SQLite at `~/.borg/borg.db` with versioned migrations (currently V29). Key migrations:
+SQLite at `~/.borg/borg.db` with versioned migrations (currently V33). Key migrations:
 
 - **V1**: sessions, scheduled_tasks, task_runs, meta, token_usage
 - **V2**: messages table (crash recovery)
@@ -200,5 +200,9 @@ SQLite at `~/.borg/borg.db` with versioned migrations (currently V29). Key migra
 - **V25**: append-only triggers on event ledgers
 - **V28**: task_type column for cron job support
 - **V29**: structured activity_log table
+- **V30**: prompt cache effectiveness tracking (cached-read tokens)
+- **V31**: workflow engine — durable multi-step task orchestration + projects
+- **V32**: import config.toml into settings table, rename to .bak (DB-only config)
+- **V33**: pending celebrations outbox for async evolution message delivery
 
 Schema version is tracked in the `meta` table; migrations run automatically on `Database::open()`.

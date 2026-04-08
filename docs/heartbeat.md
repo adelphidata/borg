@@ -13,13 +13,12 @@ The heartbeat system enables proactive check-ins -- the agent can reach out to y
 
 ## Configuration
 
-```toml
-[heartbeat]
-interval = "30m"              # check-in interval
-cron = "0 */30 * * * *"       # optional cron expression (overrides interval)
-quiet_hours_start = "00:00"   # stop heartbeats at this time
-quiet_hours_end = "06:00"     # resume heartbeats at this time
-channels = ["telegram"]       # deliver heartbeat to channels (empty = TUI only)
+```sh
+borg settings set heartbeat.interval "30m"
+borg settings set heartbeat.cron "0 */30 * * * *"       # optional, overrides interval
+borg settings set heartbeat.quiet_hours_start "00:00"
+borg settings set heartbeat.quiet_hours_end "06:00"
+borg settings set heartbeat.channels '["telegram"]'     # empty = TUI only
 ```
 
 ### Interval format

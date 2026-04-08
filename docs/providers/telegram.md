@@ -6,7 +6,7 @@ Open Telegram, message [@BotFather](https://t.me/BotFather), and run `/newbot`. 
 
 ## 2. Install via Borg
 
-Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into `config.toml` automatically. No manual file editing required.
+Credentials are stored in your OS keychain (macOS Keychain / Linux `secret-tool`) and wired into the settings database automatically. No manual file editing required.
 
 ### TUI (recommended)
 
@@ -36,11 +36,10 @@ Expose the gateway publicly (e.g. via ngrok):
 ngrok http 7842
 ```
 
-Set `gateway.public_url` in `~/.borg/config.toml`:
+Set `gateway.public_url`:
 
-```toml
-[gateway]
-public_url = "https://your-domain.ngrok-free.app"
+```sh
+borg settings set gateway.public_url "https://your-domain.ngrok-free.app"
 ```
 
 Borg will automatically register `https://your-domain.ngrok-free.app/webhook/telegram` with Telegram on startup.

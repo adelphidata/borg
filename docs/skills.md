@@ -22,7 +22,7 @@ Fifteen skills are embedded in the binary:
 | `weather` | `curl` | Get weather information |
 | `skill-creator` | -- | Meta-skill for creating new skills |
 | `git` | `git` | Git operations (commit, branch, diff, log) |
-| `http` | `curl` | HTTP requests (GET, POST, PUT, DELETE) |
+| `email` | varies | Email operations |
 | `search` | `curl` | Web search integration |
 | `docker` | `docker` | Docker container management |
 | `database` | varies | SQL/database operations |
@@ -108,12 +108,11 @@ Skills use progressive loading with a configurable token budget (`skills.max_con
 1. **Metadata** (name + description + status) is always loaded for all skills (~50 tokens each)
 2. **Full body** is loaded only for available skills, until the budget is exhausted
 
-Configure the budget in `~/.borg/config.toml`:
+Configure the budget via settings:
 
-```toml
-[skills]
-enabled = true
-max_context_tokens = 4000
+```sh
+borg settings set skills.enabled true
+borg settings set skills.max_context_tokens 4000
 ```
 
 ## Creating a skill

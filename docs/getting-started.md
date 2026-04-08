@@ -61,17 +61,17 @@ This launches an interactive wizard that walks you through setup:
 1. **Welcome** — Your name + agent name
 2. **Security** — Security warning acknowledgment (required)
 3. **Provider** — Select LLM provider (OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Ollama)
-4. **API Key** — Enter API key (auto-detects existing keys)
-5. **Channels** — Configure messaging channels (Telegram, Slack, Discord, etc.)
-6. **Summary** — Review all settings including defaults, confirm and launch
+4. **Model** — Select model for the chosen provider
+5. **API Key** — Enter API key (auto-detects existing keys)
+6. **Channels** — Configure messaging channels (Telegram, Slack, Discord, etc.)
+7. **Summary** — Review all settings including defaults, confirm and launch
 
 Defaults applied automatically: Professional personality, recommended model per provider, 1M token/month budget, gateway at 127.0.0.1:7842, strict sandbox. Customize via `borg settings`.
 
-This creates `~/.borg/` with your customized config, personality, and memory files:
+This creates `~/.borg/` with your personality, memory files, and SQLite database:
 
 ```
 ~/.borg/
-├── config.toml       # Configuration
 ├── IDENTITY.md       # Personality prompt
 ├── MEMORY.md         # Memory index
 ├── memory/           # Topic-specific memories
@@ -79,7 +79,7 @@ This creates `~/.borg/` with your customized config, personality, and memory fil
 ├── skills/           # Bundled + user-created skills
 ├── logs/             # Daily JSONL debug logs
 ├── cache/
-└── borg.db           # SQLite database (sessions, tasks, settings, embeddings)
+└── borg.db           # SQLite database (sessions, tasks, settings, embeddings, config)
 ```
 
 ## Usage

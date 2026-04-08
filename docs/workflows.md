@@ -97,11 +97,10 @@ Actions: `create`, `list`, `get`, `cancel`
 | `"on"` | Always enabled, all models see workflow option |
 | `"off"` | Never enabled, workflow type hidden from tool schema |
 
-Configure via `/settings` (Workflows toggle) or `config.toml`:
+Configure via `/settings` (Workflows toggle) or CLI:
 
-```toml
-[workflow]
-enabled = "auto"
+```sh
+borg settings set workflow.enabled auto
 ```
 
 ## TUI management
