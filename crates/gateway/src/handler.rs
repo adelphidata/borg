@@ -324,10 +324,11 @@ async fn check_sender_access_control(
     let ch = channel_name.to_string();
     let sid = sender_id.to_string();
     let cfg = config.clone();
+    let agent_name = config.user.agent_name.clone();
     let access = tokio::task::spawn_blocking(move || {
         let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
             .context("Failed to open database for pairing check")?;
-        borg_core::pairing::check_sender_access(&db, &cfg, &ch, &sid)
+        borg_core::pairing::check_sender_access(&db, &cfg, &ch, &sid, agent_name.as_deref())
     })
     .await
     .context("Pairing check task panicked")??;
@@ -1376,7 +1377,8 @@ mod tests {
         config.gateway.dm_policy = borg_core::pairing::DmPolicy::Pairing;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "new_user").unwrap();
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "new_user", None)
+                .unwrap();
         match result {
             borg_core::pairing::AccessCheckResult::Challenge { code, message } => {
                 assert!(!code.is_empty(), "pairing code must not be empty");
@@ -1386,8 +1388,12 @@ mod tests {
                     "challenge message must contain the pairing code"
                 );
                 assert!(
-                    message.contains("borg pairing approve"),
-                    "challenge message must contain approval instructions"
+                    code.starts_with("TG_"),
+                    "telegram pairing code must have TG_ prefix"
+                );
+                assert!(
+                    message.contains("Borg's owner"),
+                    "challenge message must reference the Borg owner"
                 );
                 assert!(
                     message.contains("new_user"),
@@ -1416,7 +1422,7 @@ mod tests {
         )
         .unwrap();
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "starter_user")
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "starter_user", None)
                 .unwrap();
         match result {
             borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
@@ -1440,7 +1446,8 @@ mod tests {
         config.gateway.dm_policy = borg_core::pairing::DmPolicy::Disabled;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone").unwrap();
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
+                .unwrap();
         match result {
             borg_core::pairing::AccessCheckResult::Denied { reason } => {
                 assert!(!reason.trim().is_empty(), "denial reason must not be empty");
@@ -1460,7 +1467,8 @@ mod tests {
         config.gateway.dm_policy = borg_core::pairing::DmPolicy::Open;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone").unwrap();
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
+                .unwrap();
         assert!(matches!(
             result,
             borg_core::pairing::AccessCheckResult::Allowed
@@ -1479,7 +1487,8 @@ mod tests {
 
         // Get challenge
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x").unwrap();
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
+                .unwrap();
         let code = match result {
             borg_core::pairing::AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
@@ -1490,7 +1499,8 @@ mod tests {
 
         // Now should be allowed
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x").unwrap();
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
+                .unwrap();
         assert!(matches!(
             result,
             borg_core::pairing::AccessCheckResult::Allowed

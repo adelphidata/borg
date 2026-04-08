@@ -313,9 +313,7 @@ enum PairingAction {
     },
     /// Approve a pairing request by code
     Approve {
-        /// Channel name (e.g. telegram, slack, discord)
-        channel: String,
-        /// Pairing code (8 characters)
+        /// Pairing code with channel prefix (e.g. TG_H4BRWMRW)
         code: String,
     },
     /// Revoke an approved sender
@@ -684,7 +682,7 @@ async fn main() -> Result<()> {
         Some(Commands::Usage) => run_usage()?,
         Some(Commands::Pairing { action }) => match action {
             Some(PairingAction::List { channel }) => run_pairing_list(channel.as_deref())?,
-            Some(PairingAction::Approve { channel, code }) => run_pairing_approve(&channel, &code)?,
+            Some(PairingAction::Approve { code }) => run_pairing_approve(&code)?,
             Some(PairingAction::Revoke { channel, sender_id }) => {
                 run_pairing_revoke(&channel, &sender_id)?
             }
@@ -913,17 +911,53 @@ fn run_pairing_list(channel: Option<&str>) -> Result<()> {
         );
     }
     println!();
-    println!("Approve with: borg pairing approve <channel> <code>");
+    println!("Approve with: borg pairing approve <code>");
     Ok(())
 }
 
-fn run_pairing_approve(channel: &str, code: &str) -> Result<()> {
+fn run_pairing_approve(code: &str) -> Result<()> {
     let db = borg_core::db::Database::open()?;
-    let request = db.approve_pairing(channel, code)?;
+
+    // Extract channel from prefix, or fall back to cross-channel lookup
+    let (channel_name, request) =
+        if let Some((channel, _)) = borg_core::pairing::parse_prefixed_code(code) {
+            let req = db.approve_pairing(channel, code)?;
+            (channel.to_string(), req)
+        } else {
+            match db.find_pending_by_code(code)? {
+                Some(row) => {
+                    let ch = row.channel_name;
+                    let req = db.approve_pairing(&ch, code)?;
+                    (ch, req)
+                }
+                None => anyhow::bail!("No pending pairing request found for code '{code}'"),
+            }
+        };
+
     println!(
         "Approved {} sender {}.",
         request.channel_name, request.sender_id
     );
+
+    // Send approval notification to the user's channel
+    let config = match borg_core::config::Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("Failed to load config for approval notification: {e}");
+            borg_core::config::Config::default()
+        }
+    };
+    let name = config
+        .user
+        .agent_name
+        .clone()
+        .unwrap_or_else(|| "Borg".to_string());
+    let sid = request.sender_id;
+    let ch = channel_name;
+    tokio::runtime::Handle::current().block_on(async {
+        borg_core::pairing::send_approval_notification(&config, &ch, &sid, &name).await;
+    });
+
     Ok(())
 }
 

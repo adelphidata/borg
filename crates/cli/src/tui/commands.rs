@@ -99,31 +99,28 @@ impl App<'_> {
         // /pairing approve (no args) — show usage
         if trimmed == "/pairing approve" {
             self.push_system_message(
-                "Usage: /pairing approve <channel> <code>\n   or: /pairing <code>".to_string(),
+                "Usage: /pairing approve <code>\n   or: /pairing <code>".to_string(),
             );
             return Some(Ok(AppAction::Continue));
         }
 
-        // /pairing approve <channel> <code>
+        // /pairing approve <code>
         if let Some(rest) = trimmed.strip_prefix("/pairing approve ") {
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            return match parts.as_slice() {
-                [channel, code] => Some(self.cmd_pairing_approve(Some(channel), code)),
-                _ => {
-                    self.push_system_message(
-                        "Usage: /pairing approve <channel> <code>\n   or: /pairing <code>"
-                            .to_string(),
-                    );
-                    Some(Ok(AppAction::Continue))
-                }
-            };
+            let code = rest.trim();
+            if !code.is_empty() {
+                return Some(self.cmd_pairing_approve(code));
+            }
+            self.push_system_message(
+                "Usage: /pairing approve <code>\n   or: /pairing <code>".to_string(),
+            );
+            return Some(Ok(AppAction::Continue));
         }
 
-        // /pairing <code> (shortcut: auto-detect channel from code)
+        // /pairing <code> (shortcut)
         if let Some(rest) = trimmed.strip_prefix("/pairing ") {
             let code = rest.trim();
             if !code.is_empty() && !code.starts_with('-') {
-                return Some(self.cmd_pairing_approve(None, code));
+                return Some(self.cmd_pairing_approve(code));
             }
         }
 
@@ -163,8 +160,8 @@ impl App<'_> {
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
              /pairing   - Show channel pairing info\n  \
-             /pairing approve <channel> <code> - Approve a pairing request\n  \
-             /pairing <code> - Approve (auto-detect channel)\n  \
+             /pairing approve <code> - Approve a pairing request\n  \
+             /pairing <code> - Approve (shortcut)\n  \
              /update    - Update borg to latest version\n\
              \n  \
              /sessions  - Browse and load saved sessions\n  \
@@ -242,8 +239,8 @@ impl App<'_> {
                         } else {
                             for r in &requests {
                                 output.push_str(&format!(
-                                    "  {} | {} | {}\n    → /pairing approve {} {}\n",
-                                    r.channel_name, r.sender_id, r.code, r.channel_name, r.code
+                                    "  {} | {} | {}\n    → /pairing approve {}\n",
+                                    r.channel_name, r.sender_id, r.code, r.code
                                 ));
                             }
                         }
@@ -274,34 +271,57 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
-    fn cmd_pairing_approve(&mut self, channel: Option<&str>, code: &str) -> Result<AppAction> {
+    fn cmd_pairing_approve(&mut self, code: &str) -> Result<AppAction> {
         match borg_core::db::Database::open() {
             Ok(db) => {
-                let channel_name = if let Some(ch) = channel {
-                    ch.to_string()
-                } else {
-                    match db.find_pending_by_code(code) {
-                        Ok(Some(row)) => row.channel_name,
-                        Ok(None) => {
-                            self.push_system_message(format!(
-                                "No pending pairing request found for code '{}'",
-                                code.to_uppercase()
-                            ));
-                            return Ok(AppAction::Continue);
+                // Extract channel from prefix, or fall back to cross-channel lookup
+                let channel_name =
+                    if let Some((channel, _)) = borg_core::pairing::parse_prefixed_code(code) {
+                        channel.to_string()
+                    } else {
+                        match db.find_pending_by_code(code) {
+                            Ok(Some(row)) => row.channel_name,
+                            Ok(None) => {
+                                self.push_system_message(format!(
+                                    "No pending pairing request found for code '{}'",
+                                    code.to_uppercase()
+                                ));
+                                return Ok(AppAction::Continue);
+                            }
+                            Err(e) => {
+                                self.push_system_message(format!("Error looking up code: {e}"));
+                                return Ok(AppAction::Continue);
+                            }
                         }
-                        Err(e) => {
-                            self.push_system_message(format!("Error looking up code: {e}"));
-                            return Ok(AppAction::Continue);
-                        }
-                    }
-                };
+                    };
 
                 match db.approve_pairing(&channel_name, code) {
                     Ok(row) => {
+                        let display = borg_core::pairing::channel_display_name(&row.channel_name);
                         self.push_system_message(format!(
                             "Approved: {} on {} (sender: {})",
-                            row.code, row.channel_name, row.sender_id
+                            row.code, display, row.sender_id
                         ));
+
+                        // Send approval notification (fire-and-forget)
+                        let agent_name = self
+                            .config
+                            .user
+                            .agent_name
+                            .clone()
+                            .unwrap_or_else(|| "Borg".to_string());
+                        let config = self.config.clone();
+                        let ch = row.channel_name;
+                        let sid = row.sender_id;
+                        tokio::spawn(async move {
+                            borg_core::pairing::send_approval_notification(
+                                &config,
+                                &ch,
+                                &sid,
+                                &agent_name,
+                            )
+                            .await;
+                        });
                     }
                     Err(e) => {
                         self.push_system_message(format!("Failed to approve: {e}"));

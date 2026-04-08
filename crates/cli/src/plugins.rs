@@ -294,6 +294,18 @@ pub fn add_plugin(name: &str) -> Result<()> {
             Ok(()) => println!("Daemon restarted to activate {name} channel."),
             Err(_) => println!("Gateway will start automatically when you run `borg`."),
         }
+
+        // Print pairing hint for native channels
+        if borg_core::pairing::channel_to_prefix(name).is_some() {
+            let agent_name = config.user.agent_name.as_deref().unwrap_or("Borg");
+            let display = borg_core::pairing::channel_display_name(name);
+            println!();
+            println!(
+                "  {display} connected! When anyone messages {agent_name},\n  \
+                 they'll receive a pairing code automatically. Enter it here or run:\n    \
+                 borg pairing approve <code>"
+            );
+        }
     }
 
     Ok(())
