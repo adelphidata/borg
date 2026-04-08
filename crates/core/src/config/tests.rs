@@ -238,7 +238,7 @@ fn default_llm_config_retry_fields() {
     let cfg = LlmConfig::default();
     assert_eq!(cfg.max_retries, 3);
     assert_eq!(cfg.initial_retry_delay_ms, 200);
-    assert_eq!(cfg.request_timeout_ms, 60000);
+    assert_eq!(cfg.request_timeout_ms, 120_000);
 }
 
 #[test]
@@ -281,7 +281,7 @@ model = "custom-model"
     assert_eq!(cfg.llm.max_tokens, 4096);
     assert_eq!(cfg.llm.max_retries, 3);
     assert_eq!(cfg.llm.initial_retry_delay_ms, 200);
-    assert_eq!(cfg.llm.request_timeout_ms, 60000);
+    assert_eq!(cfg.llm.request_timeout_ms, 120_000);
     assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
     assert!(cfg.llm.base_url.is_none());
 }
@@ -587,7 +587,7 @@ temperature = 0.7
 max_tokens = 4096
 max_retries = 3
 initial_retry_delay_ms = 200
-request_timeout_ms = 60000
+request_timeout_ms = 120000
 
 [heartbeat]
 interval = "30m"

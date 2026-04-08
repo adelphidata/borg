@@ -201,7 +201,7 @@ impl Default for LlmConfig {
             max_tokens: 4096,
             max_retries: 3,
             initial_retry_delay_ms: 200,
-            request_timeout_ms: 60000,
+            request_timeout_ms: 120_000,
             stream_chunk_timeout_secs: 30,
             base_url: None,
             fallback: Vec::new(),
@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(cfg.max_tokens, 4096);
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.initial_retry_delay_ms, 200);
-        assert_eq!(cfg.request_timeout_ms, 60000);
+        assert_eq!(cfg.request_timeout_ms, 120_000);
         assert_eq!(cfg.stream_chunk_timeout_secs, 30);
         assert!(cfg.base_url.is_none());
         assert!(cfg.fallback.is_empty());

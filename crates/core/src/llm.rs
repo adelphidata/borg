@@ -917,24 +917,6 @@ impl LlmClient {
             user: self.prompt_cache_key.clone(),
         };
 
-        let response = self
-            .client
-            .post(self.effective_base_url())
-            .headers(self.provider.build_headers(&self.api_key)?)
-            .json(&request)
-            .send()
-            .await
-            .with_context(|| format!("Failed to connect to {}", self.provider))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_else(|e| {
-                tracing::warn!("Failed to read error response body: {e}");
-                String::new()
-            });
-            bail!("{} returned {status}: {body}", self.provider);
-        }
-
         #[derive(Deserialize)]
         struct ChatResponse {
             choices: Vec<ChatChoice>,
@@ -944,12 +926,46 @@ impl LlmClient {
             message: Message,
         }
 
-        let resp: ChatResponse = response.json().await?;
-        resp.choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .context("No response from LLM")
+        let max_retries = self.llm_config.max_retries;
+        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
+        let cancel = CancellationToken::new();
+
+        for attempt in 0..=max_retries {
+            let result = self.send_request(&request, &cancel).await;
+            match result {
+                Ok(response) => {
+                    let resp: ChatResponse = response.json().await?;
+                    return resp
+                        .choices
+                        .into_iter()
+                        .next()
+                        .map(|c| c.message)
+                        .context("No response from LLM");
+                }
+                Err(e) => {
+                    if !e.is_retryable() || attempt == max_retries {
+                        bail!("{e}");
+                    }
+                    let delay = if let LlmError::Retryable {
+                        retry_after: Some(ra),
+                        ..
+                    } = &e
+                    {
+                        *ra
+                    } else {
+                        backoff_delay(attempt, initial_delay, 2.0)
+                    };
+                    info!(
+                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
+                        attempt + 1,
+                        max_retries,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        bail!("All retries exhausted for non-streaming OpenAI request")
     }
 
     // ── Anthropic path ──
@@ -1348,27 +1364,41 @@ impl LlmClient {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
         let body = self.build_anthropic_request(messages, tools, false);
+        let max_retries = self.llm_config.max_retries;
+        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
+        let cancel = CancellationToken::new();
 
-        let response = self
-            .client
-            .post(self.effective_base_url())
-            .headers(self.provider.build_headers(&self.api_key)?)
-            .json(&body)
-            .send()
-            .await
-            .context("Failed to connect to Anthropic")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_else(|e| {
-                tracing::warn!("Failed to read error response body: {e}");
-                String::new()
-            });
-            bail!("Anthropic returned {status}: {body}");
+        for attempt in 0..=max_retries {
+            let result = self.send_request(&body, &cancel).await;
+            match result {
+                Ok(response) => {
+                    let resp: serde_json::Value = response.json().await?;
+                    return parse_anthropic_response(&resp);
+                }
+                Err(e) => {
+                    if !e.is_retryable() || attempt == max_retries {
+                        bail!("{e}");
+                    }
+                    let delay = if let LlmError::Retryable {
+                        retry_after: Some(ra),
+                        ..
+                    } = &e
+                    {
+                        *ra
+                    } else {
+                        backoff_delay(attempt, initial_delay, 2.0)
+                    };
+                    info!(
+                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
+                        attempt + 1,
+                        max_retries,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
         }
-
-        let resp: serde_json::Value = response.json().await?;
-        parse_anthropic_response(&resp)
+        bail!("All retries exhausted for non-streaming Anthropic request")
     }
 }
 
