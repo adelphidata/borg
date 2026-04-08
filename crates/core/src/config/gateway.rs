@@ -163,9 +163,9 @@ pub struct GatewayBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ActivationMode {
-    /// Bot responds to every message in groups.
+    /// Borg responds to every message in groups.
     Always,
-    /// Bot only responds when @mentioned in groups.
+    /// Borg only responds when @mentioned in groups.
     #[default]
     Mention,
 }

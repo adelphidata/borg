@@ -1697,7 +1697,6 @@ fn uninstall_launchd() -> Result<()> {
             .args(["unload", &plist_path.to_string_lossy()])
             .status();
         std::fs::remove_file(&plist_path)?;
-        println!("Borg decommissioned.");
     } else {
         println!("Borg not installed.");
     }

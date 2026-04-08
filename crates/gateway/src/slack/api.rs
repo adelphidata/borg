@@ -46,11 +46,11 @@ pub(crate) fn is_fatal_slack_error(error: &str) -> bool {
 /// Format a human-readable hint for a Slack API error code.
 fn slack_error_hint(error: &str) -> &'static str {
     match error {
-        "channel_not_found" => " — bot may not be added to this channel",
-        "not_in_channel" => " — invite the bot to the channel first",
+        "channel_not_found" => " — Borg may not be added to this channel",
+        "not_in_channel" => " — invite the Borg to the channel first",
         "invalid_auth" | "not_authed" => " — check SLACK_BOT_TOKEN",
-        "account_inactive" | "token_revoked" | "token_expired" => " — bot token has been revoked",
-        "missing_scope" | "no_permission" => " — bot token is missing required OAuth scopes",
+        "account_inactive" | "token_revoked" | "token_expired" => " — Borg token has been revoked",
+        "missing_scope" | "no_permission" => " — Borg token is missing required OAuth scopes",
         "is_archived" => " — channel is archived",
         _ => "",
     }
@@ -119,7 +119,7 @@ impl SlackClient {
             let err = resp.error.as_deref().unwrap_or("unknown error");
             if is_fatal_slack_error(err) {
                 error!(
-                    "Slack auth.test FATAL error: {err}{} — bot cannot start until this is fixed",
+                    "Slack auth.test FATAL error: {err}{} — Borg cannot start until this is fixed",
                     slack_error_hint(err)
                 );
             }

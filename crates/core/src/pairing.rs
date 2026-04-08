@@ -142,7 +142,7 @@ pub fn check_sender_access(
     match policy {
         DmPolicy::Open => Ok(AccessCheckResult::Allowed),
         DmPolicy::Disabled => Ok(AccessCheckResult::Denied {
-            reason: "This bot is not accepting messages on this channel.".into(),
+            reason: "This Borg is not accepting messages on this channel.".into(),
         }),
         DmPolicy::Pairing => check_pairing(db, config, channel_name, sender_id, agent_name),
     }
@@ -203,7 +203,7 @@ fn format_challenge(agent_name: &str, sender_id: &str, code: &str, ttl_secs: i64
         "{agent_name}: access not configured.\n\n\
          Your sender ID: {sender_id}\n\
          Pairing code: {code}  (expires in {ttl_hint})\n\n\
-         Send this code to {agent_name}'s owner to get approved."
+         {agent_name}'s owner can approve with:  /pairing approve {code}"
     )
 }
 
@@ -377,11 +377,11 @@ mod tests {
                 assert!(message.contains(&code));
                 // Default agent name when None
                 assert!(message.contains("Borg: access not configured"));
-                assert!(message.contains("Borg's owner"));
+                assert!(message.contains("Borg's owner can approve with:"));
                 // TTL hint is visible so the user knows how long they have.
                 assert!(message.contains("expires in"));
-                // Should NOT contain CLI instructions
-                assert!(!message.contains("borg pairing approve"));
+                // Should contain TUI approve command
+                assert!(message.contains("/pairing approve"));
             }
             other => panic!("expected Challenge, got {other:?}"),
         }
@@ -394,9 +394,10 @@ mod tests {
         let result =
             check_sender_access(&db, &config, "telegram", "named_user", Some("Nova")).unwrap();
         match result {
-            AccessCheckResult::Challenge { message, .. } => {
+            AccessCheckResult::Challenge { code, message } => {
                 assert!(message.contains("Nova: access not configured"));
-                assert!(message.contains("Nova's owner"));
+                assert!(message.contains("Nova's owner can approve with:"));
+                assert!(message.contains(&format!("/pairing approve {code}")));
             }
             other => panic!("expected Challenge, got {other:?}"),
         }

@@ -62,14 +62,14 @@ pub(crate) fn is_fatal_discord_error(status: u16, code: Option<u64>) -> bool {
 /// Format a human-readable hint for a Discord API error code.
 fn discord_error_hint(code: u64) -> &'static str {
     match code {
-        10003 => " — channel does not exist or bot cannot see it",
-        10004 => " — guild does not exist or bot is not a member",
+        10003 => " — channel does not exist or Borg cannot see it",
+        10004 => " — guild does not exist or Borg is not a member",
         10008 => " — message was deleted",
         10015 => " — thread does not exist",
         40001 => " — check DISCORD_BOT_TOKEN",
         40005 => " — file exceeds Discord's size limit",
-        50001 => " — bot lacks access to this channel",
-        50013 => " — bot is missing required permissions",
+        50001 => " — Borg lacks access to this channel",
+        50013 => " — Borg is missing required permissions",
         50035 => " — request body is malformed",
         _ => "",
     }

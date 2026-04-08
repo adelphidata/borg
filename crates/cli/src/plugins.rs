@@ -19,7 +19,7 @@ pub struct CredentialSpec {
 pub const PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "telegram",
-        description: "Telegram Bot API",
+        description: "Telegram",
         category: "messaging",
         credentials: &[CredentialSpec {
             key: "TELEGRAM_BOT_TOKEN",
@@ -30,7 +30,7 @@ pub const PLUGINS: &[PluginDef] = &[
     },
     PluginDef {
         name: "slack",
-        description: "Slack Bot API",
+        description: "Slack",
         category: "messaging",
         credentials: &[
             CredentialSpec {
@@ -71,7 +71,7 @@ pub const PLUGINS: &[PluginDef] = &[
     },
     PluginDef {
         name: "discord",
-        description: "Discord Bot API",
+        description: "Discord",
         category: "messaging",
         credentials: &[
             CredentialSpec {
@@ -107,7 +107,7 @@ pub const PLUGINS: &[PluginDef] = &[
     },
     PluginDef {
         name: "teams",
-        description: "Microsoft Teams Bot",
+        description: "Microsoft Teams",
         category: "messaging",
         credentials: &[
             CredentialSpec {
@@ -125,7 +125,7 @@ pub const PLUGINS: &[PluginDef] = &[
     },
     PluginDef {
         name: "google-chat",
-        description: "Google Chat Bot",
+        description: "Google Chat",
         category: "messaging",
         credentials: &[CredentialSpec {
             key: "GOOGLE_CHAT_WEBHOOK_TOKEN",

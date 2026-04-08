@@ -741,7 +741,7 @@ async fn invoke_agent_inner(
                 );
             }
             return Ok((
-                "Access denied. Contact the bot owner for access.".to_string(),
+                "Access denied. Contact the Borg owner for access.".to_string(),
                 String::new(),
             ));
         }
@@ -1354,7 +1354,7 @@ mod tests {
     /// instead of silent drops.
     #[test]
     fn denied_sender_gets_denial_message() {
-        let denial_msg = "Access denied. Contact the bot owner for access.";
+        let denial_msg = "Access denied. Contact the Borg owner for access.";
         assert!(!denial_msg.trim().is_empty());
         // Ensure the message is present in the source code (guards against removal)
         let source = include_str!("handler.rs");
