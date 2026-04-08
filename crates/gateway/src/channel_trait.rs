@@ -264,6 +264,9 @@ pub async fn dispatch_webhook(
                         };
 
                         if response_text.trim().is_empty() {
+                            tracing::debug!(
+                                "{channel_name} response empty after trim, skipping delivery"
+                            );
                             return;
                         }
 

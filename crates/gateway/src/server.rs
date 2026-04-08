@@ -306,6 +306,7 @@ impl GatewayServer {
                 let poll_health = health.clone();
                 let poll_bot_username = telegram_bot_username.clone();
                 let poll_tts = tts_synth.clone();
+                let poll_request_timeout = Duration::from_millis(gateway_config.request_timeout_ms);
 
                 let callback: crate::telegram::polling::PollCallback =
                     Arc::new(move |inbound, chat_id| {
@@ -314,6 +315,7 @@ impl GatewayServer {
                         let health = poll_health.clone();
                         let tg = poll_client.clone();
                         let bot_mention = poll_bot_username.as_deref().map(|u| format!("@{u}"));
+                        let request_timeout = poll_request_timeout;
                         Box::pin(async move {
                             let typing = crate::telegram::typing::TypingIndicator::start(
                                 tg.clone(),
@@ -326,16 +328,20 @@ impl GatewayServer {
                             let reply_to: Option<i64> =
                                 inbound.message_id.as_deref().and_then(|id| id.parse().ok());
 
-                            match handler::invoke_agent(
-                                "telegram",
-                                &inbound,
-                                &config,
-                                Some(&health),
-                                bot_mention.as_deref(),
+                            let agent_result = tokio::time::timeout(
+                                request_timeout,
+                                handler::invoke_agent(
+                                    "telegram",
+                                    &inbound,
+                                    &config,
+                                    Some(&health),
+                                    bot_mention.as_deref(),
+                                ),
                             )
-                            .await
-                            {
-                                Ok((response_text, _)) => {
+                            .await;
+
+                            match agent_result {
+                                Ok(Ok((response_text, _))) => {
                                     typing.stop().await;
                                     send_telegram_response(
                                         &tg,
@@ -348,9 +354,33 @@ impl GatewayServer {
                                     )
                                     .await;
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     typing.stop().await;
-                                    warn!("Agent error in Telegram poll mode: {e}");
+                                    warn!("Agent error in Telegram poll mode: {e:#}");
+                                    send_telegram_response(
+                                        &tg,
+                                        chat_id,
+                                        "Something went wrong. Please try again.",
+                                        thread_id,
+                                        reply_to,
+                                        &health,
+                                        None,
+                                    )
+                                    .await;
+                                }
+                                Err(_) => {
+                                    typing.stop().await;
+                                    warn!("Agent timed out in Telegram poll mode");
+                                    send_telegram_response(
+                                        &tg,
+                                        chat_id,
+                                        "Request timed out. Please try again.",
+                                        thread_id,
+                                        reply_to,
+                                        &health,
+                                        None,
+                                    )
+                                    .await;
                                 }
                             }
                         })
@@ -1141,6 +1171,7 @@ async fn send_telegram_response(
     tts_synthesizer: Option<&borg_core::tts::TtsSynthesizer>,
 ) {
     if response_text.trim().is_empty() {
+        tracing::debug!("Telegram response empty after trim, skipping send for chat {chat_id}");
         return;
     }
 

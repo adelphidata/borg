@@ -1254,4 +1254,158 @@ mod tests {
             "Denial message must be returned to users, not silently dropped"
         );
     }
+
+    // -- Pairing integration tests --
+
+    /// New sender with DmPolicy::Pairing receives a non-empty challenge message.
+    #[test]
+    fn pairing_new_sender_gets_challenge() {
+        let db = borg_core::db::Database::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Pairing;
+
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "new_user").unwrap();
+        match result {
+            borg_core::pairing::AccessCheckResult::Challenge { code, message } => {
+                assert!(!code.is_empty(), "pairing code must not be empty");
+                assert!(!message.is_empty(), "challenge message must not be empty");
+                assert!(
+                    message.contains(&code),
+                    "challenge message must contain the pairing code"
+                );
+                assert!(
+                    message.contains("borg pairing approve"),
+                    "challenge message must contain approval instructions"
+                );
+                assert!(
+                    message.contains("new_user"),
+                    "challenge message must contain the sender ID"
+                );
+            }
+            other => panic!("expected Challenge, got {other:?}"),
+        }
+    }
+
+    /// DM activation + pairing integration: a DM from a new sender should activate
+    /// and then receive a pairing challenge (not be silently dropped).
+    #[test]
+    fn dm_activation_then_pairing_produces_response() {
+        let route = default_route();
+        let config = Config::default(); // default dm_policy = Pairing
+
+        // Step 1: DM activation check should pass
+        let (should_respond, _cleaned) =
+            check_activation("/start", Some("direct"), &route, &config, Some("@bot"));
+        assert!(should_respond, "DMs must always activate");
+
+        // Step 2: Pairing check should return a non-empty challenge
+        let db = borg_core::db::Database::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "starter_user")
+                .unwrap();
+        match result {
+            borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+                assert!(
+                    !message.trim().is_empty(),
+                    "pairing challenge must not be empty (would be silently dropped)"
+                );
+            }
+            other => panic!("expected Challenge for new sender, got {other:?}"),
+        }
+    }
+
+    /// DmPolicy::Disabled returns a non-empty denial message (not silently dropped).
+    #[test]
+    fn disabled_policy_returns_nonempty_denial() {
+        let db = borg_core::db::Database::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Disabled;
+
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone").unwrap();
+        match result {
+            borg_core::pairing::AccessCheckResult::Denied { reason } => {
+                assert!(!reason.trim().is_empty(), "denial reason must not be empty");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    /// DmPolicy::Open lets any sender through without challenge.
+    #[test]
+    fn open_policy_allows_any_sender() {
+        let db = borg_core::db::Database::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Open;
+
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone").unwrap();
+        assert!(matches!(
+            result,
+            borg_core::pairing::AccessCheckResult::Allowed
+        ));
+    }
+
+    /// After approval, the same sender is allowed through.
+    #[test]
+    fn approved_sender_passes_pairing() {
+        let db = borg_core::db::Database::from_connection(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Pairing;
+
+        // Get challenge
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x").unwrap();
+        let code = match result {
+            borg_core::pairing::AccessCheckResult::Challenge { code, .. } => code,
+            other => panic!("expected Challenge, got {other:?}"),
+        };
+
+        // Approve
+        db.approve_pairing("telegram", &code).unwrap();
+
+        // Now should be allowed
+        let result =
+            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x").unwrap();
+        assert!(matches!(
+            result,
+            borg_core::pairing::AccessCheckResult::Allowed
+        ));
+    }
+
+    /// Verify error fallback messages in polling path are non-empty
+    /// (guards against silent drops in the send_telegram_response path).
+    #[test]
+    fn polling_error_messages_are_nonempty() {
+        let error_msg = "Something went wrong. Please try again.";
+        let timeout_msg = "Request timed out. Please try again.";
+        assert!(!error_msg.trim().is_empty());
+        assert!(!timeout_msg.trim().is_empty());
+        // Verify these messages exist in the server source
+        let source = include_str!("server.rs");
+        assert!(
+            source.contains(error_msg),
+            "Error fallback message must be sent to users in polling mode"
+        );
+        assert!(
+            source.contains(timeout_msg),
+            "Timeout fallback message must be sent to users in polling mode"
+        );
+    }
 }

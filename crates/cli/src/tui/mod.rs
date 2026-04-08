@@ -854,7 +854,11 @@ async fn run_event_loop(
                                                         ),
                                                     );
                                                 }
-                                                let _ = cfg.save();
+                                                if let Err(e) = cfg.save() {
+                                                    tracing::warn!(
+                                                        "Failed to save config after plugin install: {e}"
+                                                    );
+                                                }
                                             }
                                         }
                                         let mut msg = format!("Installed {}", def.name);
@@ -907,7 +911,11 @@ async fn run_event_loop(
                                                 for cred in def.required_credentials {
                                                     cfg.credentials.remove(cred.key);
                                                 }
-                                                let _ = cfg.save();
+                                                if let Err(e) = cfg.save() {
+                                                    tracing::warn!(
+                                                        "Failed to save config after plugin uninstall: {e}"
+                                                    );
+                                                }
                                             }
                                         }
                                         results.push(format!("Removed {}", def.name));
