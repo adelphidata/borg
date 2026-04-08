@@ -1233,8 +1233,15 @@ Short body.
 
     #[test]
     fn test_skill_category_fallback() {
+        // Test built-in skills directly to avoid user overrides in ~/.borg/skills/
         let config = SkillsConfig::default();
-        let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
+        let creds = std::collections::HashMap::new();
+        let mut skills: Vec<Skill> = Vec::new();
+        for &(_name, content) in super::BUNDLED_SKILLS {
+            if let Ok(skill) = super::load_builtin_skill(content, &creds, &config) {
+                skills.push(skill);
+            }
+        }
         let git = skills.iter().find(|s| s.manifest.name == "git").unwrap();
         assert_eq!(git.category(), "developer");
         let browser = skills

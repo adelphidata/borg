@@ -160,6 +160,27 @@ impl Provider {
         }
     }
 
+    /// Whether a model supports tool/function calling.
+    ///
+    /// Defaults to `true` for most models. Blocklists known reasoning-only models
+    /// that lack tool use support (e.g., DeepSeek R1, QwQ).
+    pub fn supports_tools(&self, model: &str) -> bool {
+        let m = model.to_lowercase();
+        // Reasoning-only models that don't support tool calling
+        if m.contains("deepseek-r1")
+            || m.contains("deepseek/deepseek-r1")
+            || m.contains("deepseek-reasoner")
+            || m.contains("qwq")
+        {
+            return false;
+        }
+        // o1-mini and o1-preview don't support tools (o1 full does)
+        if (m.contains("o1-mini") || m.contains("o1-preview")) && !m.contains("o1-mini-2") {
+            return false;
+        }
+        true
+    }
+
     /// Whether a model supports vision (image inputs).
     ///
     /// Defaults to `true` for providers where most modern models support vision,
@@ -470,6 +491,32 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("Bearer"));
+    }
+
+    #[test]
+    fn supports_tools_reasoning_models() {
+        // DeepSeek R1 variants — no tool support
+        assert!(!Provider::OpenRouter.supports_tools("deepseek/deepseek-r1"));
+        assert!(!Provider::OpenRouter.supports_tools("deepseek/deepseek-r1:free"));
+        assert!(!Provider::DeepSeek.supports_tools("deepseek-reasoner"));
+        assert!(!Provider::DeepSeek.supports_tools("deepseek-r1"));
+
+        // QwQ — no tool support
+        assert!(!Provider::OpenRouter.supports_tools("qwen/qwq-32b"));
+
+        // o1-mini/preview — no tool support
+        assert!(!Provider::OpenAi.supports_tools("o1-mini"));
+        assert!(!Provider::OpenAi.supports_tools("o1-preview"));
+
+        // Regular models — tool support
+        assert!(Provider::OpenRouter.supports_tools("deepseek/deepseek-chat-v3-0324"));
+        assert!(Provider::DeepSeek.supports_tools("deepseek-chat"));
+        assert!(Provider::OpenAi.supports_tools("gpt-4.1"));
+        assert!(Provider::Anthropic.supports_tools("claude-sonnet-4"));
+        assert!(Provider::OpenRouter.supports_tools("anthropic/claude-sonnet-4"));
+        assert!(Provider::Ollama.supports_tools("llama3.3"));
+        // o1 full supports tools
+        assert!(Provider::OpenAi.supports_tools("o1"));
     }
 
     #[test]

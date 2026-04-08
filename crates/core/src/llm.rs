@@ -455,6 +455,14 @@ impl LlmClient {
         };
         let messages = &messages;
 
+        // Reject models that don't support tool calling — Borg requires tools
+        if !self.provider.supports_tools(&self.llm_config.model) {
+            anyhow::bail!(
+                "Model \"{}\" does not support tool calling. Borg requires tool use — pick a different model.",
+                self.llm_config.model
+            );
+        }
+
         let max_provider_attempts = 1 + self.provider_slots.len();
 
         for _provider_attempt in 0..max_provider_attempts {
