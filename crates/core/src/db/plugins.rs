@@ -169,6 +169,24 @@ impl Database {
         Ok(())
     }
 
+    /// Delete installed channels associated with a plugin. Returns count deleted.
+    pub fn delete_installed_channels_for(&self, plugin_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM installed_channels WHERE customization_id = ?1",
+            params![plugin_id],
+        )?;
+        Ok(count)
+    }
+
+    /// Delete installed tools associated with a plugin. Returns count deleted.
+    pub fn delete_installed_tools_for(&self, plugin_id: &str) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM installed_tools WHERE customization_id = ?1",
+            params![plugin_id],
+        )?;
+        Ok(count)
+    }
+
     /// Record a channel installed by a plugin.
     pub fn insert_installed_channel(
         &self,

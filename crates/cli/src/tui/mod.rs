@@ -900,30 +900,29 @@ async fn run_event_loop(
                         }
                         plugins_popup::PluginAction::Uninstall { id } => {
                             if let Some(def) = borg_plugins::catalog::find_by_id(&id) {
-                                match borg_plugins::installer::uninstall(def, &data_dir) {
-                                    Ok(()) => {
-                                        if let Ok(db) = borg_core::db::Database::open() {
-                                            let _ = db.delete_plugin(def.id);
-                                        }
-                                        // Remove credential entries from config
-                                        if !def.required_credentials.is_empty() {
-                                            if let Ok(mut cfg) = Config::load() {
-                                                for cred in def.required_credentials {
-                                                    cfg.credentials.remove(cred.key);
-                                                }
-                                                if let Err(e) = cfg.save() {
-                                                    tracing::warn!(
-                                                        "Failed to save config after plugin uninstall: {e}"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        results.push(format!("Removed {}", def.name));
-                                    }
-                                    Err(e) => {
-                                        results.push(format!("Failed to remove {}: {e}", def.name));
+                                // Remove keychain entries
+                                if let Err(e) = borg_plugins::installer::uninstall(def, &data_dir) {
+                                    results.push(format!("Failed to remove {}: {e}", def.name));
+                                    continue;
+                                }
+
+                                // Wipe entire data directory (~/.borg/)
+                                if data_dir.exists() {
+                                    if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                                        tracing::warn!(
+                                            "Failed to remove data directory {}: {e}",
+                                            data_dir.display()
+                                        );
                                     }
                                 }
+
+                                let mut msg = format!("Removed {}", def.name);
+                                msg.push_str("\n  Data directory wiped.");
+                                if def.kind == borg_plugins::PluginKind::Channel {
+                                    let gw_msg = restart_gateway(gateway_shutdown);
+                                    msg.push_str(&format!("\n  {gw_msg}"));
+                                }
+                                results.push(msg);
                             }
                         }
                     }

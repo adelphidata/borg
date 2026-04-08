@@ -410,4 +410,37 @@ mod tests {
             }
         }
     }
+
+    /// Guard: TUI uninstall handler must wipe the data directory.
+    #[test]
+    fn uninstall_handler_wipes_data_directory() {
+        let source = include_str!("../../cli/src/tui/mod.rs");
+        let uninstall_section: String = source
+            .lines()
+            .skip_while(|l| !l.contains("PluginAction::Uninstall"))
+            .take(40)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            uninstall_section.contains("remove_dir_all"),
+            "Uninstall handler must wipe the data directory via remove_dir_all"
+        );
+    }
+
+    /// Guard: uninstall must restart gateway for channel plugins.
+    #[test]
+    fn uninstall_restarts_gateway_for_channels() {
+        let source = include_str!("../../cli/src/tui/mod.rs");
+        // Find the Uninstall block and verify it calls restart_gateway
+        let uninstall_section: String = source
+            .lines()
+            .skip_while(|l| !l.contains("PluginAction::Uninstall"))
+            .take(50)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            uninstall_section.contains("restart_gateway"),
+            "Uninstall handler must restart gateway after removing a channel plugin"
+        );
+    }
 }

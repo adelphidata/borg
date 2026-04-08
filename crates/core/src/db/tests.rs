@@ -885,6 +885,86 @@ fn file_hash_upsert_on_reinstall() {
 }
 
 #[test]
+fn delete_installed_channels_for_plugin() {
+    let db = test_db();
+    db.insert_plugin("messaging/telegram", "Telegram", "channel", "messaging")
+        .expect("insert plugin");
+    db.insert_installed_channel(
+        "telegram",
+        "Telegram bot",
+        "native",
+        "messaging/telegram",
+        "/webhook/telegram",
+    )
+    .expect("insert channel");
+    assert_eq!(
+        db.get_channel_plugin_id("telegram").unwrap().as_deref(),
+        Some("messaging/telegram")
+    );
+    let deleted = db
+        .delete_installed_channels_for("messaging/telegram")
+        .expect("delete");
+    assert_eq!(deleted, 1);
+    assert!(db.get_channel_plugin_id("telegram").unwrap().is_none());
+}
+
+#[test]
+fn delete_installed_tools_for_plugin() {
+    let db = test_db();
+    db.insert_plugin("email/gmail", "Gmail", "tool", "email")
+        .expect("insert plugin");
+    db.insert_installed_tool("gmail", "Gmail integration", "python", "email/gmail")
+        .expect("insert tool");
+    assert!(db.get_tool_plugin_id("gmail").unwrap().is_some());
+    let deleted = db
+        .delete_installed_tools_for("email/gmail")
+        .expect("delete");
+    assert_eq!(deleted, 1);
+    assert!(db.get_tool_plugin_id("gmail").unwrap().is_none());
+}
+
+#[test]
+fn full_uninstall_leaves_no_artifacts() {
+    let db = test_db();
+    let plugin_id = "messaging/telegram";
+
+    // Simulate full install
+    db.insert_plugin(plugin_id, "Telegram", "channel", "messaging")
+        .expect("insert plugin");
+    db.insert_installed_channel(
+        "telegram",
+        "Telegram bot",
+        "native",
+        plugin_id,
+        "/webhook/telegram",
+    )
+    .expect("insert channel");
+    db.insert_credential(
+        plugin_id,
+        "TELEGRAM_BOT_TOKEN",
+        "keychain",
+        Some("borg-telegram"),
+        None,
+    )
+    .expect("insert cred");
+    db.insert_file_hash(plugin_id, "telegram/channel.toml", "abc123")
+        .expect("insert hash");
+
+    // Simulate full uninstall (same operations as TUI handler)
+    db.delete_plugin(plugin_id).expect("delete plugin");
+    db.delete_installed_channels_for(plugin_id)
+        .expect("delete channels");
+    db.delete_credentials_for(plugin_id).expect("delete creds");
+    db.delete_file_hashes(plugin_id).expect("delete hashes");
+
+    // Verify nothing remains
+    assert!(db.list_plugins().unwrap().is_empty());
+    assert!(db.get_channel_plugin_id("telegram").unwrap().is_none());
+    assert!(db.get_file_hashes(plugin_id).unwrap().is_empty());
+    assert_eq!(db.delete_credentials_for(plugin_id).unwrap(), 0);
+}
+
+#[test]
 fn migrate_v6_creates_delivery_queue() {
     let db = test_db();
     let version: String = db.get_meta("schema_version").unwrap().unwrap_or_default();

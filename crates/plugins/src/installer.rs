@@ -114,10 +114,17 @@ pub fn uninstall(def: &PluginDef, data_dir: &std::path::Path) -> Result<()> {
         }
     }
 
-    // Remove keychain entries
+    // Remove keychain entries and verify removal
     let service = def.service_name();
     for cred in def.required_credentials {
         remove_credential(&service, cred.key);
+        let account = credential_account(cred.key);
+        if crate::keychain::check(&service, &account) {
+            tracing::warn!(
+                "Keychain entry for {} still present after removal — may resurrect on restart",
+                cred.key
+            );
+        }
     }
 
     Ok(())
