@@ -45,6 +45,7 @@ throbber-widgets-tui = { workspace = true }
 ignore = { workspace = true }
 libc = "0.2"
 arboard = { workspace = true }
+rand = { workspace = true }
 image = { workspace = true }
 base64 = { workspace = true }
 opentelemetry = { workspace = true }

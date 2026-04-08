@@ -19,7 +19,168 @@ use crate::onboarding::{models_for_provider, OnboardingResult, PROVIDERS};
 use crate::tui::theme;
 use borg_core::config::Config;
 use borg_core::provider::Provider;
+use rand::Rng;
 use std::str::FromStr;
+
+const BORG_NAMES: &[&str] = &[
+    // People
+    "Borgan Freeman",
+    "Mark Zuckerborg",
+    "Ruth Bader Ginsborg",
+    "Goldborg",
+    "Bloomborg",
+    "Heidegborg",
+    "Gutenborg",
+    "Borgman",
+    "Steven Spielborg",
+    "Ingeborg",
+    "Victor Borge",
+    "Cyborg Jones",
+    "Rube Goldborg",
+    "Zuckerborg",
+    "Sandborg",
+    "Blomborg",
+    "Harrisonborg",
+    "Lindborg",
+    "Stromborg",
+    "Borgström",
+    "Carlborg",
+    "Weinborg",
+    "Greenborg",
+    "Rosenborg",
+    "Sternborg",
+    "Feinborg",
+    "Borgenstein",
+    "Borgward",
+    "Borgson",
+    "Ellborg",
+    // Places
+    "Pittsborg",
+    "Luxemborg",
+    "Salzborg",
+    "Harrisborg",
+    "Gettysborg",
+    "Williamsborg",
+    "Johannesborg",
+    "Edinborg",
+    "Heidelborg",
+    "Nuremborg",
+    "Borgholm",
+    "Saint Petersborg",
+    "Marborg",
+    "Borgtown",
+    "Frostborg",
+    // Pop Culture
+    "Spongeborg Squarepants",
+    "Borger King",
+    "Borgcraft",
+    "Borg Lightyear",
+    "Borginator",
+    "The Borg Identity",
+    "Borg of the Rings",
+    "Borgzilla",
+    "Cyborg",
+    "Resistance Is Futile McGee",
+    "Seven of Nine Lives",
+    // Misc
+    "Iceborger",
+    "Cheeseborger",
+    "Hamborg",
+    "Borgify",
+    "Newborg Baby",
+    "Reborged",
+    "Borganic",
+    "Unborgivable",
+    // Additional People
+    "Borges",
+    "Schoenberg",
+    "Borgkovich",
+    "Heisenberg",
+    "Borgdorf",
+    "Wittgenborg",
+    "Schrödingborg",
+    "Einsteborg",
+    "Leonardo da Borgci",
+    "Borgart Humphrey",
+    "Borggart",
+    "Schwarzenegborg",
+    "Clint Eastborg",
+    "Alfred Hitchborg",
+    "Borgothy",
+    "Borgatron",
+    "Borgleone",
+    "Neil Armborg",
+    "Amelia Borghart",
+    "Marie Borgie",
+    "Oppenborger",
+    "Borgdwin",
+    "Borgsworth",
+    "Van Borghen",
+    "Remborgdt",
+    "Picasborg",
+    "Shakespeaborg",
+    "Charlesborg",
+    "Napoleborg",
+    "Cleoborga",
+    // Additional Places
+    "Gotheborg",
+    "Strasborg",
+    "Borgdeaux",
+    "Canterborg",
+    "Middelborg",
+    "Augsborg",
+    "Borgona",
+    "Brandenborg",
+    "Regenborg",
+    "Meckleborg",
+    "Borggundy",
+    "Borgcelona",
+    "Flenborg",
+    "Magdeborg",
+    "Borgamo",
+    // Additional Pop Culture
+    "Borgpool",
+    "Borg Vader",
+    "Obi-Wan Kenoborg",
+    "Gandborg",
+    "Frodo Borggins",
+    "Borglock Holmes",
+    "James Borgd",
+    "Indiana Borgs",
+    "Captain Borgmerica",
+    "The Incredible Borg",
+    "Borg Panther",
+    "Borg to the Future",
+    "Jurassic Borg",
+    "The Borgfather",
+    "Borgbusters",
+    "Borg Wars",
+    "The Borgrix",
+    "Borgman Begins",
+    "Doctor Borgenstein",
+    "Frankenborg",
+    // Additional Misc
+    "Borgalicious",
+    "Borgmeister",
+    "Borgnado",
+    "Borgtastic",
+    "Borgpocalypse",
+    "Turborg",
+    "Borgberry",
+    "Borgasaurus",
+    "Borgnarok",
+    "El Borgo",
+    "Borgchamp",
+    "Borgsmith",
+    "Borgolithic",
+    "Borganaut",
+    "Borgopolis",
+];
+
+fn random_borg_name() -> String {
+    let idx = rand::rng().random_range(0..BORG_NAMES.len());
+    BORG_NAMES[idx].to_string()
+}
 
 const LOGO_HEIGHT: u16 = 8; // includes leading blank line
 
@@ -129,7 +290,7 @@ impl OnboardingState {
             tab: Tab::Welcome,
             input_mode: InputMode::TextInput,
             user_name: String::new(),
-            agent_name: "Borg".to_string(),
+            agent_name: random_borg_name(),
             welcome_focus: WelcomeFocus::UserName,
             security_accepted: false,
             provider_index,
@@ -250,7 +411,7 @@ impl OnboardingState {
         OnboardingResult {
             user_name: self.user_name.clone(),
             agent_name: if self.agent_name.is_empty() {
-                "Borg".to_string()
+                random_borg_name()
             } else {
                 self.agent_name.clone()
             },
@@ -930,12 +1091,54 @@ mod tests {
     }
 
     #[test]
-    fn empty_agent_name_defaults_to_borg() {
+    fn empty_agent_name_defaults_to_random_borg_name() {
         let mut state = OnboardingState::new();
         state.user_name = "Test".to_string();
         state.agent_name.clear();
         let result = state.build_result();
-        assert_eq!(result.agent_name, "Borg");
+        assert!(
+            BORG_NAMES.contains(&result.agent_name.as_str()),
+            "Expected a name from BORG_NAMES, got: {}",
+            result.agent_name
+        );
+    }
+
+    #[test]
+    fn borg_names_array_is_non_empty() {
+        assert!(
+            BORG_NAMES.len() >= 100,
+            "Expected at least 100 Borg names, got: {}",
+            BORG_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn borg_names_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for name in BORG_NAMES {
+            assert!(seen.insert(name), "Duplicate Borg name: {name}");
+        }
+    }
+
+    #[test]
+    fn random_borg_name_returns_name_from_list() {
+        for _ in 0..20 {
+            let name = random_borg_name();
+            assert!(
+                BORG_NAMES.contains(&name.as_str()),
+                "random_borg_name() returned unknown name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_agent_name_is_from_borg_names() {
+        let state = OnboardingState::new();
+        assert!(
+            BORG_NAMES.contains(&state.agent_name.as_str()),
+            "Initial agent_name not in BORG_NAMES: {}",
+            state.agent_name
+        );
     }
 
     #[test]

@@ -1685,6 +1685,26 @@ Use docker commands.
                 }
             }
         }
+        // Also disable any user-installed skills on disk
+        if let Ok(user_dir) = skills_dir() {
+            if let Ok(dir_entries) = std::fs::read_dir(&user_dir) {
+                for entry in dir_entries.flatten() {
+                    let skill_file = entry.path().join("SKILL.md");
+                    if skill_file.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&skill_file) {
+                            if let Ok((manifest, _)) = parse_skill_md(&content) {
+                                entries.entry(manifest.name).or_insert(
+                                    crate::config::SkillEntryConfig {
+                                        enabled: false,
+                                        env: std::collections::HashMap::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
