@@ -457,10 +457,14 @@ impl LlmClient {
 
         // Reject models that don't support tool calling — Borg requires tools
         if !self.provider.supports_tools(&self.llm_config.model) {
-            anyhow::bail!(
+            let msg = format!(
                 "Model \"{}\" does not support tool calling. Borg requires tool use — pick a different model.",
                 self.llm_config.model
             );
+            if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
+                tracing::debug!("llm: stream receiver closed while sending tool-support error");
+            }
+            anyhow::bail!("{msg}");
         }
 
         let max_provider_attempts = 1 + self.provider_slots.len();
@@ -561,7 +565,13 @@ impl LlmClient {
             // Continue outer loop with new provider
         }
 
-        bail!("All providers exhausted")
+        let msg =
+            "All LLM providers exhausted. Please try again later or check your configuration."
+                .to_string();
+        if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
+            tracing::debug!("llm: stream receiver closed while sending exhaustion error");
+        }
+        bail!("{msg}")
     }
 
     /// Non-streaming call for heartbeat and simple requests

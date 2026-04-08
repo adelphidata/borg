@@ -1234,13 +1234,14 @@ Rules:
                         )
                         .await
                     {
-                        warn!("LLM stream error: {e}");
+                        warn!("LLM stream error: {e:#}");
                     }
                 })
             };
 
             let mut tag_filter = InternalTagFilter::new();
             let mut tool_calls: Vec<PartialToolCall> = Vec::new();
+            let mut received_terminal = false;
 
             loop {
                 tokio::select! {
@@ -1313,8 +1314,12 @@ Rules:
                                 }
                                 let _ = event_tx.send(AgentEvent::Usage(usage)).await;
                             }
-                            Some(StreamEvent::Done) => break,
+                            Some(StreamEvent::Done) => {
+                                received_terminal = true;
+                                break;
+                            }
                             Some(StreamEvent::Error(e)) => {
+                                received_terminal = true;
                                 if event_tx.send(AgentEvent::Error(e)).await.is_err() {
                                     trace!("Event channel closed, could not deliver stream error");
                                 }
@@ -1328,6 +1333,20 @@ Rules:
                             None => break,
                         }
                     }
+                }
+            }
+
+            // If the stream channel closed without a terminal event and we have
+            // no content, surface an error so the user isn't left with silence.
+            if !received_terminal {
+                warn!("LLM stream channel closed without Done or Error event");
+                let text_content = tag_filter.full_clean();
+                if text_content.is_empty() && tool_calls.is_empty() {
+                    let _ = event_tx
+                        .send(AgentEvent::Error(
+                            "The response stream ended unexpectedly. Please try again.".into(),
+                        ))
+                        .await;
                 }
             }
 

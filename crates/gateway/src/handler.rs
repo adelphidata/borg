@@ -607,13 +607,16 @@ async fn collect_agent_response(
                 }
                 AgentEvent::Error(e) => {
                     warn!("Agent error on channel '{}': {e}", channel_name);
-                    // If no response text yet, provide a friendly error message
-                    // instead of leaving the user with no reply.
+                    let friendly = borg_core::error_format::format_error_with_context(
+                        &e,
+                        borg_core::error_format::ErrorContext::Gateway,
+                    );
                     if response_text.is_empty() {
-                        response_text = borg_core::error_format::format_error_with_context(
-                            &e,
-                            borg_core::error_format::ErrorContext::Gateway,
-                        );
+                        response_text = friendly;
+                    } else {
+                        // Append error to partial response so the user knows
+                        // the response was cut short.
+                        response_text.push_str(&format!("\n\n[Error: {friendly}]"));
                     }
                 }
                 AgentEvent::ShellConfirmation { respond, command } => {
