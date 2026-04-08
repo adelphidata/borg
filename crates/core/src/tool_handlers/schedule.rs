@@ -566,7 +566,19 @@ fn workflow_list(args: &serde_json::Value) -> Result<String> {
         Ok(wfs) => {
             let mut out = format!("Workflows ({}):\n", wfs.len());
             for wf in &wfs {
-                let steps = db.get_workflow_steps(&wf.id).unwrap_or_default();
+                let steps = match db.get_workflow_steps(&wf.id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("Failed to load steps for workflow {}: {e}", &wf.id);
+                        out.push_str(&format!(
+                            "  [{}] {} (id: {}) — error loading steps: {e}\n",
+                            wf.status,
+                            wf.title,
+                            &wf.id[..8.min(wf.id.len())],
+                        ));
+                        continue;
+                    }
+                };
                 let completed = steps
                     .iter()
                     .filter(|s| s.status == crate::workflow::step_status::COMPLETED)
@@ -590,7 +602,16 @@ fn workflow_get(args: &serde_json::Value) -> Result<String> {
     let id = require_str_param(args, "id")?;
     with_db(|db| match db.get_workflow(id) {
         Ok(Some(wf)) => {
-            let steps = db.get_workflow_steps(id).unwrap_or_default();
+            let steps = match db.get_workflow_steps(id) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to load steps for workflow {id}: {e}");
+                    return Ok(format!(
+                        "Workflow: {}\n  ID: {}\n  Status: {}\n  Goal: {}\n  Steps: error loading: {e}\n",
+                        wf.title, wf.id, wf.status, wf.goal,
+                    ));
+                }
+            };
             let mut out = format!(
                 "Workflow: {}\n  ID: {}\n  Status: {}\n  Goal: {}\n  Steps:\n",
                 wf.title, wf.id, wf.status, wf.goal,

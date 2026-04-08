@@ -460,7 +460,12 @@ impl SettingsPopup {
                     if let Some((model_id, _)) = models.get(sel) {
                         match config.apply_setting("model", model_id) {
                             Ok(confirmation) => {
-                                let _ = self.save_setting("model", model_id);
+                                if let Err(e) = self.save_setting("model", model_id) {
+                                    self.status_message =
+                                        Some((format!("Save failed: {e}"), false));
+                                    self.mode = EditMode::Browsing;
+                                    return Ok(None);
+                                }
                                 self.model_index = sel;
                                 self.status_message =
                                     Some((format!("Updated: {confirmation}"), true));
@@ -517,7 +522,10 @@ impl SettingsPopup {
                 let (id, _, _) = PROVIDERS[self.provider_index];
                 match config.apply_setting("provider", id) {
                     Ok(confirmation) => {
-                        let _ = self.save_setting("provider", id);
+                        if let Err(e) = self.save_setting("provider", id) {
+                            self.status_message = Some((format!("Save failed: {e}"), false));
+                            return Ok(None);
+                        }
                         self.status_message = Some((format!("Updated: {confirmation}"), true));
                         actions.push(AppAction::UpdateSetting {
                             key: "provider".to_string(),
@@ -534,7 +542,9 @@ impl SettingsPopup {
                 let models = models_for_provider(id);
                 if let Some((model_id, _)) = models.first() {
                     if config.apply_setting("model", model_id).is_ok() {
-                        let _ = self.save_setting("model", model_id);
+                        if let Err(e) = self.save_setting("model", model_id) {
+                            tracing::warn!("Failed to persist model reset: {e}");
+                        }
                         actions.push(AppAction::UpdateSetting {
                             key: "model".to_string(),
                             value: model_id.to_string(),
@@ -554,7 +564,12 @@ impl SettingsPopup {
                 let new_mode = MODES[next_idx];
                 match config.apply_setting("conversation.collaboration_mode", new_mode) {
                     Ok(confirmation) => {
-                        let _ = self.save_setting("conversation.collaboration_mode", new_mode);
+                        if let Err(e) =
+                            self.save_setting("conversation.collaboration_mode", new_mode)
+                        {
+                            self.status_message = Some((format!("Save failed: {e}"), false));
+                            return Ok(None);
+                        }
                         self.status_message = Some((format!("Updated: {confirmation}"), true));
                         actions.push(AppAction::UpdateSetting {
                             key: "conversation.collaboration_mode".to_string(),
@@ -579,7 +594,10 @@ impl SettingsPopup {
                 let new_val = MODES[next_idx];
                 match config.apply_setting("workflow.enabled", new_val) {
                     Ok(confirmation) => {
-                        let _ = self.save_setting("workflow.enabled", new_val);
+                        if let Err(e) = self.save_setting("workflow.enabled", new_val) {
+                            self.status_message = Some((format!("Save failed: {e}"), false));
+                            return Ok(None);
+                        }
                         self.status_message = Some((format!("Updated: {confirmation}"), true));
                         actions.push(AppAction::UpdateSetting {
                             key: "workflow.enabled".to_string(),
@@ -625,7 +643,10 @@ impl SettingsPopup {
 
         match config.apply_setting(entry.key, &formatted) {
             Ok(confirmation) => {
-                let _ = self.save_setting(entry.key, &formatted);
+                if let Err(e) = self.save_setting(entry.key, &formatted) {
+                    self.status_message = Some((format!("Save failed: {e}"), false));
+                    return Ok(None);
+                }
                 self.status_message = Some((format!("Updated: {confirmation}"), true));
                 Ok(Some(AppAction::UpdateSetting {
                     key: entry.key.to_string(),
@@ -672,16 +693,27 @@ impl SettingsPopup {
 
     /// Reset all settings to compiled defaults by clearing DB overrides and reloading config.
     fn reset_all_to_defaults(&mut self, config: &mut Config) -> anyhow::Result<Option<AppAction>> {
+        let mut failed = 0usize;
         if let Some(ref db) = self.db {
             for entry in self.entries {
-                let _ = db.delete_setting(entry.key);
+                if let Err(e) = db.delete_setting(entry.key) {
+                    tracing::warn!("Failed to reset setting '{}': {e}", entry.key);
+                    failed += 1;
+                }
             }
         }
         // Reload config from disk (TOML + defaults, no DB overrides).
         // If the config file doesn't exist or can't be read, fall back to compiled defaults.
         *config = Config::load().unwrap_or_default();
         self.sync_select_indices(config);
-        self.status_message = Some(("All settings reset to defaults".to_string(), true));
+        if failed > 0 {
+            self.status_message = Some((
+                format!("Reset done, but {failed} setting(s) failed to clear from DB"),
+                false,
+            ));
+        } else {
+            self.status_message = Some(("All settings reset to defaults".to_string(), true));
+        }
         Ok(Some(AppAction::ConfigReloaded))
     }
 
@@ -1560,5 +1592,114 @@ mod tests {
     fn handle_paste_not_consumed_when_hidden() {
         let popup = &mut SettingsPopup::new();
         assert!(!popup.handle_paste("anything"));
+    }
+
+    /// Helper: create a SettingsPopup backed by a read-only SQLite DB so all
+    /// writes fail.  Uses a temp file that is opened normally (so migrations
+    /// run), then re-opened as read-only.
+    fn popup_with_readonly_db() -> SettingsPopup {
+        use borg_core::db::Database;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("readonly.db");
+
+        // Create & migrate normally
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create db");
+            let _db = Database::from_connection(conn).expect("init db");
+        }
+        // Re-open read-only
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let conn = rusqlite::Connection::open_with_flags(&path, flags).expect("open ro");
+        let db = Database::from_connection(conn).expect("wrap ro db");
+
+        let mut popup = SettingsPopup::new();
+        popup.db = Some(db);
+        // Keep the tempdir alive by leaking it (test-only, small).
+        std::mem::forget(dir);
+        popup
+    }
+
+    #[test]
+    fn save_failure_shows_error_on_bool_toggle() {
+        let mut popup = popup_with_readonly_db();
+        let cfg = Config::default();
+        popup.show(&cfg);
+
+        // Select sandbox.enabled (Bool at index 7)
+        popup.selected = 7;
+        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+
+        let mut cfg = Config::default();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+
+        let result = popup.handle_key(space, &mut cfg).unwrap();
+        // Should NOT return an action (save failed)
+        assert!(result.is_none());
+        // Should show error message
+        let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
+        assert!(!is_success, "should be an error, not success");
+        assert!(
+            msg.contains("Save failed") || msg.contains("save failed") || msg.contains("readonly"),
+            "unexpected status message: {msg}"
+        );
+    }
+
+    #[test]
+    fn save_failure_shows_error_on_provider_cycle() {
+        let mut popup = popup_with_readonly_db();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        popup.selected = 0; // provider
+        assert_eq!(popup.entries[0].key, "provider");
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        let result = popup.handle_key(right, &mut cfg).unwrap();
+        assert!(result.is_none());
+        let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
+        assert!(!is_success);
+        assert!(
+            msg.contains("Save failed") || msg.contains("readonly"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn save_failure_shows_error_on_float_step() {
+        let mut popup = popup_with_readonly_db();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        popup.selected = 2; // temperature
+        assert_eq!(popup.entries[2].key, "temperature");
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        let result = popup.handle_key(right, &mut cfg).unwrap();
+        assert!(result.is_none());
+        let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
+        assert!(!is_success);
+        assert!(
+            msg.contains("Save failed") || msg.contains("readonly"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn reset_all_reports_failures_on_readonly_db() {
+        let mut popup = popup_with_readonly_db();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+
+        let result = popup.reset_all_to_defaults(&mut cfg).unwrap();
+        assert!(result.is_some()); // ConfigReloaded still returned
+        let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
+        assert!(!is_success, "should report failures");
+        assert!(msg.contains("failed to clear"), "unexpected: {msg}");
     }
 }

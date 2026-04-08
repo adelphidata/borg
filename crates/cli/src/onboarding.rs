@@ -416,7 +416,14 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) =
+                    std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    eprintln!(
+                        "  Warning: could not restrict permissions on {}: {e}",
+                        env_path.display()
+                    );
+                }
             }
             println!("  Created {}", env_path.display());
         }

@@ -35,6 +35,16 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 ## Critical Invariants
 
+### Error Handling — No Silent Swallowing
+
+**NEVER silently discard errors with `let _ = ...` or `.ok()` on operations that matter.** Every error must be logged and either propagated or handled gracefully.
+
+- **Propagate with `?`** when the caller returns `Result` and handles errors upstream (e.g. tool handlers, settings methods).
+- **Log + continue** in fire-and-forget contexts (async callbacks, hooks, delivery queues) where propagation would crash a background task.
+- **Always `tracing::warn!`** on the error path — even if you fall back to a default, log why.
+- Acceptable to use `let _ = ...` ONLY for truly best-effort operations: typing indicators, terminal cleanup in Drop impls, temp file removal.
+- If an operation reports success to the user (e.g. "Updated: ..."), it MUST actually succeed or show an error. No lying.
+
 ### UX Philosophy — No Approval Prompts
 
 **DO NOT add per-tool-call approval prompts or confirmation dialogs.** The agent just executes.

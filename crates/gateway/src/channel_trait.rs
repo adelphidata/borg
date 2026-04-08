@@ -303,7 +303,9 @@ pub async fn dispatch_webhook(
                         {
                             Ok(()) => {
                                 if let Some(ref db) = db {
-                                    let _ = db.mark_delivered(&delivery_id);
+                                    if let Err(e) = db.mark_delivered(&delivery_id) {
+                                        tracing::warn!("Failed to mark delivery {delivery_id} as delivered: {e}");
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -311,11 +313,13 @@ pub async fn dispatch_webhook(
                                 // Mark as failed — drain loop will retry
                                 if let Some(ref db) = db {
                                     let retry_at = chrono::Utc::now().timestamp() + 30;
-                                    let _ = db.mark_failed(
+                                    if let Err(e2) = db.mark_failed(
                                         &delivery_id,
                                         &e.to_string(),
                                         Some(retry_at),
-                                    );
+                                    ) {
+                                        tracing::warn!("Failed to mark delivery {delivery_id} as failed: {e2}");
+                                    }
                                 }
                             }
                         }

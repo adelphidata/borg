@@ -489,7 +489,13 @@ impl BondHook {
     pub fn new() -> anyhow::Result<Self> {
         let db = Database::open()?;
         // Pre-compute initial state using per-installation derived key
-        let events = db.get_all_bond_events().unwrap_or_default();
+        let events = match db.get_all_bond_events() {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!("bond: failed to load events, using baseline: {e}");
+                Vec::new()
+            }
+        };
         let hmac_key = db.derive_hmac_key(BOND_HMAC_DOMAIN);
         let state = replay_events_with_key(&hmac_key, &events);
         Ok(Self {
@@ -522,7 +528,13 @@ impl BondHook {
                 return state.clone();
             }
         }
-        let events = db.get_all_bond_events().unwrap_or_default();
+        let events = match db.get_all_bond_events() {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!("bond: failed to refresh events, using baseline: {e}");
+                Vec::new()
+            }
+        };
         let hmac_key = db.derive_hmac_key(BOND_HMAC_DOMAIN);
         let state = replay_events_with_key(&hmac_key, &events);
         if let Ok(mut cache) = self.cached_state.lock() {
@@ -1364,5 +1376,15 @@ mod tests {
         // Only event1 applies: baseline 25 + 1 = 26
         assert_eq!(state.score, 26);
         assert!(!state.chain_valid);
+    }
+
+    #[test]
+    fn empty_events_gives_baseline_score() {
+        // This is the fallback behavior when DB read fails — should produce
+        // a valid baseline state, not crash.
+        let state = replay_events(&[]);
+        assert_eq!(state.score, BASELINE_SCORE as u8);
+        assert!(state.chain_valid, "empty chain should be considered valid");
+        assert_eq!(state.level, level_from_score(BASELINE_SCORE as u8));
     }
 }

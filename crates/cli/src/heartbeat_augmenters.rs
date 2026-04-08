@@ -106,12 +106,17 @@ pub fn collect(config: &Config, db: Option<&Database>) -> Vec<String> {
         };
         if let Some(db) = db {
             let key = meta_key(aug.id);
-            let last = db
-                .get_meta(&key)
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
+            let last = match db.get_meta(&key) {
+                Ok(Some(s)) => s.parse::<u64>().unwrap_or(0),
+                Ok(None) => 0,
+                Err(e) => {
+                    tracing::warn!(
+                        "heartbeat_augmenters: failed to read cooldown for '{}': {e}",
+                        aug.id
+                    );
+                    continue;
+                }
+            };
             if now.saturating_sub(last) < aug.cooldown_secs {
                 continue;
             }
@@ -346,6 +351,25 @@ mod tests {
         let db = in_memory_db();
         assert!(collect(&cfg, Some(&db)).is_empty());
         std::env::remove_var("SLACK_BOT_TOKEN");
+    }
+
+    #[test]
+    fn collect_skips_augmenter_on_db_read_error() {
+        let _guard = EnvGuard::clear_native();
+        let cfg = channel_only_config();
+        let db = in_memory_db();
+
+        // Drop the meta table to make get_meta fail
+        db.conn()
+            .execute_batch("DROP TABLE IF EXISTS meta")
+            .unwrap();
+
+        // Should skip augmenters (not spam) rather than treat as never-fired
+        let result = collect(&cfg, Some(&db));
+        assert!(
+            result.is_empty(),
+            "expected no augmenters to fire when DB reads fail, got {result:?}"
+        );
     }
 
     // ── Host security augmenter tests ──
