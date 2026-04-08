@@ -83,6 +83,7 @@ pub(crate) fn rate_limit_for(category: &str) -> u32 {
         "failure" => 5,
         "correction" => 3,
         "creation" => 3,
+        "negative_sentiment" => 3,
         _ => 5,
     }
 }
@@ -129,6 +130,8 @@ pub enum EventCategory {
     Correction,
     /// Agent created something durable (memory, skill, channel, file).
     Creation,
+    /// User expressed strong negative sentiment (profanity, hostility).
+    NegativeSentiment,
 }
 
 impl fmt::Display for EventCategory {
@@ -139,6 +142,7 @@ impl fmt::Display for EventCategory {
             Self::Failure => write!(f, "failure"),
             Self::Correction => write!(f, "correction"),
             Self::Creation => write!(f, "creation"),
+            Self::NegativeSentiment => write!(f, "negative_sentiment"),
         }
     }
 }
@@ -152,6 +156,7 @@ impl EventCategory {
             "failure" => Some(Self::Failure),
             "correction" => Some(Self::Correction),
             "creation" => Some(Self::Creation),
+            "negative_sentiment" => Some(Self::NegativeSentiment),
             _ => None,
         }
     }
@@ -305,6 +310,13 @@ pub fn deltas_for(category: EventCategory) -> StatDeltas {
             growth: 1,
             happiness: 1,
         },
+        EventCategory::NegativeSentiment => StatDeltas {
+            stability: -2,
+            focus: -1,
+            sync: 0,
+            growth: 0,
+            happiness: -10,
+        },
     }
 }
 
@@ -317,6 +329,7 @@ pub(crate) fn validate_deltas(category: &str, deltas: StatDeltas) -> Result<(), 
         "failure" => deltas_for(EventCategory::Failure),
         "correction" => deltas_for(EventCategory::Correction),
         "creation" => deltas_for(EventCategory::Creation),
+        "negative_sentiment" => deltas_for(EventCategory::NegativeSentiment),
         _ => return Err("unknown vitals category"),
     };
     if deltas != expected {
@@ -385,14 +398,16 @@ pub fn replay_events_with_key(key: &[u8], events: &[VitalsEvent]) -> VitalsState
             continue;
         }
 
-        // Diminishing returns: repeated same-source calls yield reduced deltas
+        // Diminishing returns: repeated same-source calls yield reduced deltas.
+        // Negative sentiment bypasses decay — sustained cussing is a genuine signal.
+        let is_negative_sentiment = event.category == "negative_sentiment";
         let source_multiplier =
             rate_limiter.source_decay_multiplier(event.created_at, &event.source);
-        if source_multiplier == 0.0 {
+        if source_multiplier == 0.0 && !is_negative_sentiment {
             continue;
         }
 
-        // Apply deltas with source decay
+        // Apply deltas with source decay (negative sentiment always at full strength)
         let raw_deltas = StatDeltas {
             stability: event.stability_delta as i8,
             focus: event.focus_delta as i8,
@@ -400,7 +415,7 @@ pub fn replay_events_with_key(key: &[u8], events: &[VitalsEvent]) -> VitalsState
             growth: event.growth_delta as i8,
             happiness: event.happiness_delta as i8,
         };
-        let deltas = if source_multiplier < 1.0 {
+        let deltas = if source_multiplier < 1.0 && !is_negative_sentiment {
             StatDeltas {
                 stability: apply_decay_to_delta(raw_deltas.stability, source_multiplier),
                 focus: apply_decay_to_delta(raw_deltas.focus, source_multiplier),
@@ -413,8 +428,11 @@ pub fn replay_events_with_key(key: &[u8], events: &[VitalsEvent]) -> VitalsState
         };
         apply_deltas(&mut state, &deltas);
 
-        // Track last interaction time (only for non-failure/correction events)
-        if event.category != "failure" && event.category != "correction" {
+        // Track last interaction time (only for non-negative events)
+        if event.category != "failure"
+            && event.category != "correction"
+            && event.category != "negative_sentiment"
+        {
             last_interaction_at = Some(event.created_at);
         }
     }
@@ -562,6 +580,19 @@ pub fn looks_like_correction(msg: &str) -> bool {
     CORRECTION_PATTERN.is_match(msg)
 }
 
+#[allow(clippy::expect_used)]
+static NEGATIVE_SENTIMENT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(wtf|wth|ffs|omfg|shit(ty|tiest)?|dumbass|horrible|awful|piss(ed|ing)? off|piece of (shit|crap|junk)|what the (fuck|hell)|fucking? (broken|useless|terrible|awful|horrible)|fuck you|screw (this|you)|so frustrating|this sucks|damn it)\b"
+    ).expect("compile-time literal regex")
+});
+
+/// Regex-based heuristic for detecting strong negative sentiment (profanity, hostility).
+/// Separate from corrections — captures pure frustration rather than agent error feedback.
+pub fn looks_like_negative_sentiment(msg: &str) -> bool {
+    NEGATIVE_SENTIMENT_PATTERN.is_match(msg)
+}
+
 // ── Formatting ──
 
 fn bar(val: u8, width: usize) -> String {
@@ -615,6 +646,7 @@ pub fn format_status(state: &VitalsState, events: &[VitalsEvent], drift: &[Drift
         let mut failures = 0u32;
         let mut creations = 0u32;
         let mut corrections = 0u32;
+        let mut negative_sentiments = 0u32;
 
         for e in events {
             match e.category.as_str() {
@@ -623,6 +655,7 @@ pub fn format_status(state: &VitalsState, events: &[VitalsEvent], drift: &[Drift
                 "failure" => failures += 1,
                 "creation" => creations += 1,
                 "correction" => corrections += 1,
+                "negative_sentiment" => negative_sentiments += 1,
                 _ => {}
             }
         }
@@ -643,6 +676,9 @@ pub fn format_status(state: &VitalsState, events: &[VitalsEvent], drift: &[Drift
         }
         if corrections > 0 {
             parts.push(format!("{corrections} corrections"));
+        }
+        if negative_sentiments > 0 {
+            parts.push(format!("{negative_sentiments} negative"));
         }
         out.push_str(&format!("  {}\n", parts.join(", ")));
     }
@@ -715,7 +751,9 @@ impl Hook for VitalsHook {
                 self.record(EventCategory::Interaction, "session_start");
             }
             HookData::AgentStart { user_message } => {
-                if looks_like_correction(user_message) {
+                if looks_like_negative_sentiment(user_message) {
+                    self.record(EventCategory::NegativeSentiment, "user_message");
+                } else if looks_like_correction(user_message) {
                     self.record(EventCategory::Correction, "user_message");
                 } else {
                     self.record(EventCategory::Interaction, "user_message");
@@ -786,6 +824,12 @@ mod tests {
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
             (1, 0, 0, 1, 1)
+        );
+
+        let d = deltas_for(EventCategory::NegativeSentiment);
+        assert_eq!(
+            (d.stability, d.focus, d.sync, d.growth, d.happiness),
+            (-2, -1, 0, 0, -10)
         );
     }
 
@@ -975,6 +1019,52 @@ mod tests {
         assert!(!looks_like_correction("great work"));
         assert!(!looks_like_correction("I have no idea"));
         assert!(!looks_like_correction("there is no way to know"));
+    }
+
+    // ── Negative Sentiment ──
+
+    #[test]
+    fn test_negative_sentiment_positive() {
+        assert!(looks_like_negative_sentiment("wtf is this"));
+        assert!(looks_like_negative_sentiment("wth happened"));
+        assert!(looks_like_negative_sentiment("ffs not again"));
+        assert!(looks_like_negative_sentiment("omfg this is bad"));
+        assert!(looks_like_negative_sentiment("this is shitty"));
+        assert!(looks_like_negative_sentiment("what a dumbass move"));
+        assert!(looks_like_negative_sentiment("that's horrible"));
+        assert!(looks_like_negative_sentiment("that's awful"));
+        assert!(looks_like_negative_sentiment("I'm pissed off"));
+        assert!(looks_like_negative_sentiment("piece of shit"));
+        assert!(looks_like_negative_sentiment("piece of crap"));
+        assert!(looks_like_negative_sentiment("what the fuck"));
+        assert!(looks_like_negative_sentiment("what the hell"));
+        assert!(looks_like_negative_sentiment("fucking broken again"));
+        assert!(looks_like_negative_sentiment("fuck you"));
+        assert!(looks_like_negative_sentiment("screw this"));
+        assert!(looks_like_negative_sentiment("screw you"));
+        assert!(looks_like_negative_sentiment("so frustrating"));
+        assert!(looks_like_negative_sentiment("this sucks"));
+        assert!(looks_like_negative_sentiment("damn it"));
+    }
+
+    #[test]
+    fn test_negative_sentiment_negative() {
+        assert!(!looks_like_negative_sentiment("sounds good"));
+        assert!(!looks_like_negative_sentiment("ship it"));
+        assert!(!looks_like_negative_sentiment("awesome work"));
+        assert!(!looks_like_negative_sentiment("pass the test"));
+        assert!(!looks_like_negative_sentiment("can you help me?"));
+        assert!(!looks_like_negative_sentiment("try again please"));
+    }
+
+    #[test]
+    fn test_negative_sentiment_takes_priority() {
+        // Messages matching both patterns should be classified as negative sentiment
+        assert!(looks_like_negative_sentiment("wtf is this output"));
+        assert!(looks_like_correction("wtf is this output"));
+        // Messages matching only correction should not trigger negative sentiment
+        assert!(!looks_like_negative_sentiment("try again please"));
+        assert!(looks_like_correction("try again please"));
     }
 
     // ── Formatting ──

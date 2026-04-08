@@ -1032,12 +1032,17 @@ impl EvolutionHook {
             Stage::Base => check_stage1_gates(&evo_state, bond_state.score, min_vital),
             Stage::Evolved => {
                 // Compute correction rate from vitals events (last 14 days)
+                // Includes both corrections and negative sentiment
                 let fourteen_days_ago = chrono::Utc::now().timestamp() - 14 * 86400;
                 let (corrections, total) = db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "correction")
                     .unwrap_or((0, 1));
+                let negatives = db
+                    .count_vitals_events_by_category_since(fourteen_days_ago, "negative_sentiment")
+                    .map(|(n, _)| n)
+                    .unwrap_or(0);
                 let correction_rate = if total > 0 {
-                    corrections as f64 / total as f64
+                    (corrections + negatives) as f64 / total as f64
                 } else {
                     0.0
                 };

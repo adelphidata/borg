@@ -290,7 +290,13 @@ pub fn compute_routine_success_rate(db: &Database) -> f32 {
 pub fn compute_correction_rate(db: &Database) -> f32 {
     let since = Utc::now().timestamp() - 30 * 86400;
     match db.count_vitals_events_by_category_since(since, "correction") {
-        Ok((corrections, total)) if total > 0 => corrections as f32 / total as f32,
+        Ok((corrections, total)) if total > 0 => {
+            let negatives = db
+                .count_vitals_events_by_category_since(since, "negative_sentiment")
+                .map(|(n, _)| n)
+                .unwrap_or(0);
+            (corrections + negatives) as f32 / total as f32
+        }
         _ => 0.0,
     }
 }
