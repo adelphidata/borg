@@ -276,7 +276,9 @@ impl HistoryCell {
                 let mention_style = theme::file_mention_style();
                 let w = width as usize;
                 let mut lines = Vec::new();
-                lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
+                // Unstyled spacer — must NOT use `bg` or it creates a double-background
+                // band above the user message (the render loop already inserts a separator).
+                lines.push(Line::default());
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 {
                         Span::styled(format!("{} ", theme::CHEVRON), prefix_style)
@@ -295,7 +297,6 @@ impl HistoryCell {
                     }
                     lines.push(Line::from(all_spans).style(bg));
                 }
-                lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
                 lines
             }
             HistoryCell::Assistant { text, streaming } => {
@@ -676,8 +677,8 @@ mod tests {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
-        // 1 top pad + 1 content + 1 bottom pad
-        assert_eq!(lines.len(), 3);
+        // 1 unstyled spacer + 1 content
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]
@@ -686,8 +687,7 @@ mod tests {
             text: "hello world".to_string(),
         };
         let lines = cell.render(80, None);
-        // The chevron should appear on an interior line, not the first or last
-        // (first and last are styled background padding blanks).
+        // The chevron should appear on the content line (after the unstyled spacer).
         let chevron_line_idx = lines.iter().position(|l| {
             l.spans
                 .iter()
@@ -695,11 +695,7 @@ mod tests {
         });
         assert!(chevron_line_idx.is_some(), "chevron must be present");
         let idx = chevron_line_idx.unwrap();
-        assert!(idx > 0, "chevron should not be on the first (top pad) line");
-        assert!(
-            idx < lines.len() - 1,
-            "chevron should not be on the last (bottom pad) line"
-        );
+        assert!(idx > 0, "chevron should not be on the first (spacer) line");
     }
 
     #[test]
