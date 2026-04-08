@@ -989,9 +989,13 @@ fn record_delivery_failure_sync(db: &Database, delivery_id: &str, error: &str) {
 }
 
 /// Format an error from `invoke_agent` into a user-friendly message suitable for
-/// sending back to a messaging channel. Wraps `borg_core::error_format::format_friendly_error`.
+/// sending back to a messaging channel. Uses `ErrorContext::Gateway` to include
+/// gateway-appropriate action hints (e.g. "try switching to a different model").
 pub fn format_gateway_error(err: &anyhow::Error) -> String {
-    borg_core::error_format::format_friendly_error(&err.to_string())
+    borg_core::error_format::format_error_with_context(
+        &err.to_string(),
+        borg_core::error_format::ErrorContext::Gateway,
+    )
 }
 
 #[cfg(test)]
@@ -1493,23 +1497,62 @@ mod tests {
         ));
     }
 
-    /// Verify error fallback messages in polling path are non-empty
-    /// (guards against silent drops in the send_telegram_response path).
+    /// Verify the polling error path uses format_gateway_error (not a hard-coded string).
     #[test]
-    fn polling_error_messages_are_nonempty() {
-        let error_msg = "Something went wrong. Please try again.";
-        let timeout_msg = "Request timed out. Please try again.";
-        assert!(!error_msg.trim().is_empty());
-        assert!(!timeout_msg.trim().is_empty());
-        // Verify these messages exist in the server source
+    fn polling_error_path_uses_formatted_errors() {
         let source = include_str!("server.rs");
+        // The polling error arm must call format_gateway_error, not send a hard-coded message.
         assert!(
-            source.contains(error_msg),
-            "Error fallback message must be sent to users in polling mode"
+            source.contains("format_gateway_error"),
+            "Telegram polling error path must use format_gateway_error"
+        );
+        // The old hard-coded messages must not appear.
+        assert!(
+            !source.contains("Something went wrong. Please try again."),
+            "Hard-coded generic error message must not be used in polling path"
+        );
+    }
+
+    /// Verify format_gateway_error produces Gateway-specific hints for rate-limit errors.
+    #[test]
+    fn format_gateway_error_rate_limit_includes_hint() {
+        let err = anyhow::anyhow!("HTTP 429 rate limit exceeded");
+        let msg = format_gateway_error(&err);
+        assert!(
+            msg.contains("rate-limited"),
+            "Rate-limit error should mention rate-limiting: {msg}"
         );
         assert!(
-            source.contains(timeout_msg),
-            "Timeout fallback message must be sent to users in polling mode"
+            msg.contains("switching to a different model"),
+            "Gateway context should suggest switching models: {msg}"
+        );
+    }
+
+    /// Verify format_gateway_error produces a safe message for unknown errors.
+    #[test]
+    fn format_gateway_error_unknown_is_safe() {
+        let err = anyhow::anyhow!("some internal panic trace xyz");
+        let msg = format_gateway_error(&err);
+        assert!(
+            msg.contains("unexpected error"),
+            "Unknown errors should be labeled as unexpected: {msg}"
+        );
+    }
+
+    /// Verify webhook dispatch path formats errors instead of silently returning.
+    #[test]
+    fn webhook_dispatch_formats_errors() {
+        let source = include_str!("channel_trait.rs");
+        // The webhook dispatch must call format_gateway_error on agent errors.
+        assert!(
+            source.contains("format_gateway_error"),
+            "Webhook dispatch must use format_gateway_error for agent errors"
+        );
+        // The old silent-return pattern must not appear after an agent error log.
+        // (We check that the error arm doesn't just `return;` with no response.)
+        assert!(
+            source.contains("format_error_with_context"),
+            "Webhook dispatch must format timeout errors with context"
         );
     }
 }

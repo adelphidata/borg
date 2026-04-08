@@ -376,13 +376,9 @@ impl GatewayServer {
                                 Ok(Err(e)) => {
                                     typing.stop().await;
                                     warn!("Agent error in Telegram poll mode: {e:#}");
+                                    let error_msg = handler::format_gateway_error(&e);
                                     send_telegram_response(
-                                        &tg,
-                                        chat_id,
-                                        "Something went wrong. Please try again.",
-                                        thread_id,
-                                        reply_to,
-                                        &health,
+                                        &tg, chat_id, &error_msg, thread_id, reply_to, &health,
                                         None,
                                     )
                                     .await;
@@ -390,13 +386,13 @@ impl GatewayServer {
                                 Err(_) => {
                                     typing.stop().await;
                                     warn!("Agent timed out in Telegram poll mode");
+                                    let error_msg =
+                                        borg_core::error_format::format_error_with_context(
+                                            "request timed out",
+                                            borg_core::error_format::ErrorContext::Gateway,
+                                        );
                                     send_telegram_response(
-                                        &tg,
-                                        chat_id,
-                                        "Request timed out. Please try again.",
-                                        thread_id,
-                                        reply_to,
-                                        &health,
+                                        &tg, chat_id, &error_msg, thread_id, reply_to, &health,
                                         None,
                                     )
                                     .await;
@@ -464,6 +460,15 @@ impl GatewayServer {
                             }
                             Err(e) => {
                                 warn!("Agent error in Signal SSE mode: {e}");
+                                let error_msg = handler::format_gateway_error(&e);
+                                let send_result = if let Some(ref gid) = group_id {
+                                    client.send_group_message(gid, &error_msg, None).await
+                                } else {
+                                    client.send_message(&recipient, &error_msg, None).await
+                                };
+                                if let Err(send_err) = send_result {
+                                    warn!("Failed to send Signal error response: {send_err}");
+                                }
                             }
                         }
                     })

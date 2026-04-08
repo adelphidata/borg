@@ -255,11 +255,14 @@ pub async fn dispatch_webhook(
                             Ok(Ok((text, _session_id))) => text,
                             Ok(Err(e)) => {
                                 tracing::warn!("{channel_name} agent error: {e:#}");
-                                return;
+                                crate::handler::format_gateway_error(&e)
                             }
                             Err(_) => {
                                 tracing::warn!("{channel_name} agent timed out");
-                                return;
+                                borg_core::error_format::format_error_with_context(
+                                    "request timed out",
+                                    borg_core::error_format::ErrorContext::Gateway,
+                                )
                             }
                         };
 
