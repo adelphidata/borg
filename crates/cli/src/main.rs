@@ -1239,13 +1239,11 @@ fn init_data_dir() -> Result<()> {
             }
 
             println!();
-            println!("Initialized {}", data_dir.display());
 
             // Auto-launch TUI for the first conversation
             let setup_path = data_dir.join("SETUP.md");
             if setup_path.exists() && std::io::stdin().is_terminal() {
                 println!();
-                println!("Launching your agent for the first time...");
                 // The TUI will detect SETUP.md and inject it into the system prompt
                 return Ok(());
             }
@@ -1256,7 +1254,6 @@ fn init_data_dir() -> Result<()> {
         None => {
             // User cancelled — fall back to defaults so the directory is still usable
             init_data_dir_defaults(&data_dir)?;
-            println!("Initialized {} with defaults", data_dir.display());
         }
     }
 
