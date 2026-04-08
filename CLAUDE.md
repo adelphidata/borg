@@ -54,7 +54,7 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 - Click+drag selects text natively (Cmd/Ctrl+C copies). No modifier needed.
 - Mouse wheel scrolls transcript one line per tick (terminal wheel→arrow translation).
 - PageUp/PageDown scroll 20-line jumps.
-- Up/Down dual semantics: scroll transcript if `scroll_offset > 0` or if composer idle at bottom; else composer history.
+- Up/Down navigate composer history (shell-like recall of sent messages). Only exception: if `scroll_offset > 0` (already scrolled up), Up/Down scroll the transcript instead.
 - Ctrl+P/Ctrl+N always navigate composer history regardless of scroll state.
 
 **FORBIDDEN (will regress text selection):**

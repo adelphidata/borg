@@ -332,11 +332,10 @@ impl<'a> Composer<'a> {
     }
 
     /// Whether the composer is currently showing a recalled history entry
+    /// Returns `true` if the composer is in history-browse mode
     /// (i.e. the user pressed Up/Ctrl+P to browse previously submitted
     /// messages and has not yet edited or cleared the recalled text).
-    ///
-    /// Used by `App::handle_key` to disambiguate wheel-sourced Up/Down
-    /// (transcript scroll) from intentional history navigation.
+    #[cfg(test)]
     pub fn is_browsing_history(&self) -> bool {
         self.history.is_browsing()
     }
