@@ -70,11 +70,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         name: "/pairing",
-        description: "Show pairing codes",
-    },
-    SlashCommandDef {
-        name: "/pairing revoke",
-        description: "Revoke an approved sender",
+        description: "Manage sender pairing",
     },
     SlashCommandDef {
         name: "/update",
@@ -359,7 +355,6 @@ mod tests {
             "/doctor",
             "/stats",
             "/pairing",
-            "/pairing revoke",
             "/update",
             "/sessions",
             "/save",

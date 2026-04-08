@@ -22,6 +22,7 @@ use super::file_popup::FileSearchPopup;
 use super::history::{ApprovalStatus, HistoryCell};
 use super::layout;
 use super::migrate_popup::{MigrateAction, MigratePopup};
+use super::pairing_popup::{PairingAction, PairingPopup};
 use super::plan_overlay::{PlanOption, PlanOverlay};
 use super::plugins_popup::{PluginAction, PluginsPopup};
 use super::projects_popup::{ProjectAction, ProjectsPopup};
@@ -128,6 +129,9 @@ pub enum AppAction {
     RunProjectActions {
         actions: Vec<ProjectAction>,
     },
+    RunPairingActions {
+        actions: Vec<PairingAction>,
+    },
     RunMigration {
         actions: Vec<MigrateAction>,
     },
@@ -171,6 +175,7 @@ pub struct App<'a> {
     /// so the post-turn review overlay can restore it on "Proceed". `None` when the
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
+    pub pairing_popup: PairingPopup,
     pub projects_popup: ProjectsPopup,
     pub sessions_popup: SessionsPopup,
     pub schedule_popup: SchedulePopup,
@@ -222,6 +227,7 @@ impl<'a> App<'a> {
             backtrack: BacktrackPhase::Inactive,
             plan_overlay: PlanOverlay::new(),
             previous_collab_mode: None,
+            pairing_popup: PairingPopup::new(),
             projects_popup: ProjectsPopup::new(),
             sessions_popup: SessionsPopup::new(),
             schedule_popup: SchedulePopup::new(),
@@ -265,6 +271,7 @@ impl<'a> App<'a> {
     pub fn any_popup_visible(&self) -> bool {
         self.settings_popup.is_visible()
             || self.plugins_popup.is_visible()
+            || self.pairing_popup.is_visible()
             || self.projects_popup.is_visible()
             || self.sessions_popup.is_visible()
             || self.schedule_popup.is_visible()
@@ -293,7 +300,8 @@ impl<'a> App<'a> {
         }
         // Popups without paste support still consume the event to prevent
         // it from leaking to the composer.
-        self.sessions_popup.is_visible()
+        self.pairing_popup.is_visible()
+            || self.sessions_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
     }
@@ -313,6 +321,12 @@ impl<'a> App<'a> {
         if self.plugins_popup.is_visible() {
             if let Some(actions) = self.plugins_popup.handle_key(key) {
                 return Ok(Some(AppAction::RunPlugins { actions }));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.pairing_popup.is_visible() {
+            if let Some(actions) = self.pairing_popup.handle_key(key) {
+                return Ok(Some(AppAction::RunPairingActions { actions }));
             }
             return Ok(Some(AppAction::Continue));
         }
@@ -1691,6 +1705,7 @@ impl<'a> App<'a> {
         self.file_popup.render(frame, app_layout.composer);
         self.settings_popup.render(frame, &self.config);
         self.plugins_popup.render(frame);
+        self.pairing_popup.render(frame);
         self.projects_popup.render(frame);
         self.sessions_popup.render(frame);
         self.schedule_popup.render(frame);

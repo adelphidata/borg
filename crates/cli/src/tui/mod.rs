@@ -10,6 +10,7 @@ mod history;
 mod layout;
 mod markdown;
 pub(crate) mod migrate_popup;
+mod pairing_popup;
 mod paste_burst;
 mod plan_overlay;
 mod plugins_popup;
@@ -1207,6 +1208,65 @@ async fn run_event_loop(
                                         ));
                                     }
                                     Err(e) => results.push(format!("Error: {e}")),
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    results.push("Error: could not open database".to_string());
+                }
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::RunPairingActions { actions } => {
+                let mut results: Vec<String> = Vec::new();
+                if let Ok(db) = borg_core::db::Database::open() {
+                    for action in actions {
+                        match action {
+                            pairing_popup::PairingAction::Approve { channel, code } => {
+                                match db.approve_pairing(&channel, &code) {
+                                    Ok(row) => {
+                                        let display = borg_core::pairing::channel_display_name(
+                                            &row.channel_name,
+                                        );
+                                        results.push(format!(
+                                            "Approved: {} on {} (sender: {})",
+                                            row.code, display, row.sender_id
+                                        ));
+                                        // Fire-and-forget greeting
+                                        let config = app.config.clone();
+                                        let ch = row.channel_name;
+                                        let sid = row.sender_id;
+                                        tokio::spawn(async move {
+                                            crate::service::send_approval_greeting(
+                                                &config, &ch, &sid,
+                                            )
+                                            .await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        results.push(format!("Failed to approve: {e}"));
+                                    }
+                                }
+                            }
+                            pairing_popup::PairingAction::Revoke { channel, sender_id } => {
+                                match db.revoke_sender(&channel, &sender_id) {
+                                    Ok(true) => {
+                                        let display =
+                                            borg_core::pairing::channel_display_name(&channel);
+                                        results.push(format!(
+                                            "Revoked sender {sender_id} from {display}."
+                                        ));
+                                    }
+                                    Ok(false) => {
+                                        results.push(format!(
+                                            "No approved sender found for {channel}/{sender_id}."
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        results.push(format!("Failed to revoke: {e}"));
+                                    }
                                 }
                             }
                         }

@@ -27,7 +27,16 @@ impl App<'_> {
             }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
             "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
-            "/pairing" => return Some(self.cmd_pairing()),
+            "/pairing" => {
+                if let Ok(data_dir) = borg_core::config::Config::data_dir() {
+                    self.pairing_popup.show(&self.config, &data_dir);
+                } else {
+                    self.push_system_message(
+                        "Error: could not determine data directory".to_string(),
+                    );
+                }
+                return Some(Ok(AppAction::Continue));
+            }
             "/settings" => {
                 self.settings_popup.show(&self.config);
                 return Some(Ok(AppAction::Continue));
@@ -116,33 +125,11 @@ impl App<'_> {
             return Some(Ok(AppAction::Continue));
         }
 
-        // /pairing revoke (no args) — show usage with approved senders
-        if trimmed == "/pairing revoke" {
-            let mut msg = "Usage: /pairing revoke <channel> <sender_id>\n".to_string();
-            if let Ok(db) = borg_core::db::Database::open() {
-                if let Ok(senders) = db.list_approved_senders(None) {
-                    if !senders.is_empty() {
-                        msg.push_str("\nApproved senders:\n");
-                        for s in &senders {
-                            msg.push_str(&format!(
-                                "  {} {} → /pairing revoke {} {}\n",
-                                s.channel_name, s.sender_id, s.channel_name, s.sender_id
-                            ));
-                        }
-                    }
-                }
-            }
-            self.push_system_message(msg);
-            return Some(Ok(AppAction::Continue));
-        }
-
-        // /pairing revoke <channel> <sender_id>
-        if let Some(rest) = trimmed.strip_prefix("/pairing revoke ") {
-            let parts: Vec<&str> = rest.trim().splitn(2, ' ').collect();
-            if parts.len() == 2 && !parts[1].is_empty() {
-                return Some(self.cmd_pairing_revoke(parts[0], parts[1]));
-            }
-            self.push_system_message("Usage: /pairing revoke <channel> <sender_id>".to_string());
+        // /pairing revoke — redirect to popup
+        if trimmed == "/pairing revoke" || trimmed.starts_with("/pairing revoke ") {
+            self.push_system_message(
+                "Use /pairing to manage sender pairing (press 'd' to revoke)".to_string(),
+            );
             return Some(Ok(AppAction::Continue));
         }
 
@@ -257,51 +244,6 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
-    fn cmd_pairing(&mut self) -> Result<AppAction> {
-        let mut output = String::from("Sender Pairing\n");
-        output.push_str("────────────────────────────────\n\n");
-        match borg_core::db::Database::open() {
-            Ok(db) => {
-                output.push_str("Pending Requests\n");
-                match db.list_pairings(None) {
-                    Ok(requests) => {
-                        if requests.is_empty() {
-                            output.push_str("  No pending requests.\n");
-                        } else {
-                            for r in &requests {
-                                output.push_str(&format!(
-                                    "  {} | {} | {}\n    → /pairing approve {}\n",
-                                    r.channel_name, r.sender_id, r.code, r.code
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => output.push_str(&format!("  Error: {e}\n")),
-                }
-                output.push_str("\nApproved Senders\n");
-                match db.list_approved_senders(None) {
-                    Ok(senders) => {
-                        if senders.is_empty() {
-                            output.push_str("  No approved senders.\n");
-                        } else {
-                            for s in &senders {
-                                let name = s.display_name.as_deref().unwrap_or("—");
-                                output.push_str(&format!(
-                                    "  {} | {} | {}\n    → /pairing revoke {} {}\n",
-                                    s.channel_name, s.sender_id, name, s.channel_name, s.sender_id
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => output.push_str(&format!("  Error: {e}\n")),
-                }
-            }
-            Err(e) => output.push_str(&format!("Database error: {e}\n")),
-        }
-        self.push_system_message(output);
-        Ok(AppAction::Continue)
-    }
-
     fn cmd_pairing_approve(&mut self, code: &str) -> Result<AppAction> {
         match borg_core::db::Database::open() {
             Ok(db) => {
@@ -347,29 +289,6 @@ impl App<'_> {
                     }
                 }
             }
-            Err(e) => {
-                self.push_system_message(format!("Database error: {e}"));
-            }
-        }
-        Ok(AppAction::Continue)
-    }
-
-    fn cmd_pairing_revoke(&mut self, channel: &str, sender_id: &str) -> Result<AppAction> {
-        match borg_core::db::Database::open() {
-            Ok(db) => match db.revoke_sender(channel, sender_id) {
-                Ok(true) => {
-                    let display = borg_core::pairing::channel_display_name(channel);
-                    self.push_system_message(format!("Revoked sender {sender_id} from {display}."));
-                }
-                Ok(false) => {
-                    self.push_system_message(format!(
-                        "No approved sender found for {channel} with ID {sender_id}."
-                    ));
-                }
-                Err(e) => {
-                    self.push_system_message(format!("Failed to revoke: {e}"));
-                }
-            },
             Err(e) => {
                 self.push_system_message(format!("Database error: {e}"));
             }
