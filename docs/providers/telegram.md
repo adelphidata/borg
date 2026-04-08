@@ -51,7 +51,7 @@ If `public_url` is not set, the gateway automatically uses long-polling via `get
 
 ## 4. Verify
 
-Open your bot in Telegram and send `/start`. You should get a response from your agent.
+Open your Borg in Telegram and send `/start`. You should get a response from your agent.
 
 ## Features
 

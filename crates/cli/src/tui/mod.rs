@@ -191,7 +191,7 @@ async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> St
     .is_some();
 
     if daemon_signalled {
-        return "Gateway restarted (daemon).".to_string();
+        return "Gateway restarted.".to_string();
     }
 
     // No daemon running — restart the in-process gateway
@@ -891,7 +891,7 @@ async fn run_event_loop(
                                                 def.id
                                             };
                                             if channel_name == "telegram" {
-                                                msg.push_str("\n  Open your bot in Telegram and press /start to begin pairing.");
+                                                msg.push_str("\n  Open your Borg in Telegram and press /start to begin pairing.");
                                             }
                                         }
                                         results.push(msg);
