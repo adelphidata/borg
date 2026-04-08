@@ -17,15 +17,10 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ),
     ("openai", "OpenAI", "GPT models directly"),
     ("anthropic", "Anthropic", "Claude models via API key"),
-    (
-        "claude-cli",
-        "Claude Code",
-        "Use your Claude subscription (no API key)",
-    ),
     ("gemini", "Gemini", "Google Gemini models directly"),
     ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
     ("groq", "Groq", "Ultra-fast inference"),
-    ("ollama", "Ollama", "Run models locally (no API key)"),
+    ("ollama", "Ollama", "Run models locally"),
 ];
 
 /// Model choices per provider.
@@ -61,12 +56,6 @@ pub(crate) const ANTHROPIC_MODELS: &[(&str, &str)] = &[
     ("claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
     ("claude-3.5-sonnet", "Claude 3.5 Sonnet"),
     ("claude-3.5-haiku", "Claude 3.5 Haiku"),
-];
-
-pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
-    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (recommended)"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5 (fast)"),
-    ("claude-opus-4-6", "Claude Opus 4.6 (most capable)"),
 ];
 
 pub(crate) const GEMINI_MODELS: &[(&str, &str)] = &[
@@ -112,7 +101,6 @@ pub(crate) fn models_for_provider(provider_id: &str) -> &'static [(&'static str,
     match provider_id {
         "openai" => OPENAI_MODELS,
         "anthropic" => ANTHROPIC_MODELS,
-        "claude-cli" => CLAUDE_CLI_MODELS,
         "gemini" => GEMINI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
@@ -217,10 +205,7 @@ pub fn generate_config(
 
     let provider = Provider::from_str(provider_id)?;
 
-    let api_key_line = if provider_id == "claude-cli" {
-        // Claude CLI uses the user's Claude subscription via OAuth — no API key needed
-        "# No API key required — uses your Claude Code subscription\n# claude_cli_path = \"/usr/local/bin/claude\"  # uncomment to override auto-detection".to_string()
-    } else if !provider.requires_api_key() {
+    let api_key_line = if !provider.requires_api_key() {
         // Keyless providers (e.g., Ollama) — no API key config needed
         "# No API key required for local provider\n# base_url = \"http://localhost:11434/v1/chat/completions\"  # uncomment to override".to_string()
     } else if use_keychain {
@@ -824,65 +809,5 @@ mod tests {
         std::fs::write(&tmp, "partial").unwrap();
         cleanup_tmp_files(dir.path());
         assert!(!tmp.exists());
-    }
-
-    // ── Claude CLI provider tests ──
-
-    #[test]
-    fn models_for_provider_claude_cli() {
-        let models = models_for_provider("claude-cli");
-        assert_eq!(models.len(), CLAUDE_CLI_MODELS.len());
-        assert!(!models.is_empty());
-    }
-
-    #[test]
-    fn claude_cli_models_valid() {
-        for (id, _) in CLAUDE_CLI_MODELS {
-            assert!(validate_model_id(id).is_ok(), "invalid model id: {id}");
-        }
-    }
-
-    #[test]
-    fn claude_cli_models_all_normalize_to_known_aliases() {
-        // Every entry must map to one of the short CLI aliases so the subprocess
-        // gets a value the `claude` binary understands regardless of version drift.
-        for (id, _) in CLAUDE_CLI_MODELS {
-            let alias = borg_core::claude_cli::normalize_cli_model(id);
-            assert!(
-                matches!(alias.as_str(), "opus" | "sonnet" | "haiku"),
-                "model {id} normalized to {alias}, expected opus/sonnet/haiku"
-            );
-        }
-    }
-
-    #[test]
-    fn providers_includes_claude_cli() {
-        assert!(
-            PROVIDERS.iter().any(|(id, _, _)| *id == "claude-cli"),
-            "PROVIDERS should include claude-cli"
-        );
-    }
-
-    #[test]
-    fn generate_config_claude_cli_provider() {
-        let config = generate_config("claude-sonnet-4-6", "claude-cli", "User", "Agent", false)
-            .expect("valid config");
-        assert!(config.contains("provider = \"claude-cli\""));
-        assert!(config.contains("model = \"claude-sonnet-4-6\""));
-        // Should NOT contain api_key_env or api_key lines
-        assert!(!config.contains("api_key_env"));
-        assert!(!config.contains("api_key = {"));
-        // Should have Claude-specific comment
-        assert!(config.contains("Claude Code subscription"));
-    }
-
-    #[test]
-    fn generate_config_claude_cli_keychain_still_no_api_key() {
-        // Even with keychain flag, claude-cli should skip API key config
-        let config = generate_config("claude-sonnet-4-6", "claude-cli", "User", "Agent", true)
-            .expect("valid config");
-        assert!(config.contains("provider = \"claude-cli\""));
-        assert!(!config.contains("api_key_env"));
-        assert!(!config.contains("api_key = {"));
     }
 }

@@ -254,7 +254,6 @@ struct OnboardingState {
 
     // Provider
     provider_index: usize,
-    claude_cli_detected: bool,
 
     // API Key
     api_key_input: String,
@@ -270,21 +269,9 @@ struct OnboardingState {
 
 impl OnboardingState {
     fn new() -> Self {
-        let claude_cli_detected = borg_core::claude_cli::has_valid_auth();
-
         let api_key_existing = PROVIDERS
             .iter()
-            .any(|(id, _, _)| Self::check_existing_api_key_cached(id, claude_cli_detected));
-
-        // Auto-select Claude CLI if detected, otherwise default to first provider
-        let provider_index = if claude_cli_detected {
-            PROVIDERS
-                .iter()
-                .position(|(id, _, _)| *id == "claude-cli")
-                .unwrap_or(0)
-        } else {
-            0
-        };
+            .any(|(id, _, _)| Self::check_existing_api_key_cached(id));
 
         let default_name = random_borg_name();
         Self {
@@ -295,8 +282,7 @@ impl OnboardingState {
             default_agent_name: default_name,
             welcome_focus: WelcomeFocus::UserName,
             security_accepted: false,
-            provider_index,
-            claude_cli_detected,
+            provider_index: 0,
             api_key_input: String::new(),
             api_key_existing,
             api_key_required_hint: false,
@@ -305,11 +291,7 @@ impl OnboardingState {
         }
     }
 
-    fn check_existing_api_key_cached(provider_id: &str, claude_cli_detected: bool) -> bool {
-        // Claude CLI: use cached detection result
-        if provider_id == "claude-cli" {
-            return claude_cli_detected;
-        }
+    fn check_existing_api_key_cached(provider_id: &str) -> bool {
         let Ok(provider) = Provider::from_str(provider_id) else {
             return false;
         };
@@ -355,12 +337,6 @@ impl OnboardingState {
     #[cfg(test)]
     fn detect_provider_from_env(&self) -> &'static str {
         for (id, _, _) in PROVIDERS {
-            if *id == "claude-cli" {
-                if borg_core::claude_cli::has_valid_auth() {
-                    return id;
-                }
-                continue;
-            }
             if let Ok(p) = Provider::from_str(id) {
                 if !p.requires_api_key() {
                     // Keyless providers: detect by checking if server is reachable
@@ -392,7 +368,7 @@ impl OnboardingState {
     /// Whether the selected provider needs an API key.
     fn selected_provider_needs_key(&self) -> bool {
         let (id, _, _) = PROVIDERS[self.provider_index];
-        id != "claude-cli" && id != "ollama"
+        id != "ollama"
     }
 
     fn build_result(&self) -> OnboardingResult {
@@ -847,7 +823,7 @@ fn render_provider(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
     )));
     lines.push(Line::default());
 
-    for (i, (id, label, desc)) in PROVIDERS.iter().enumerate() {
+    for (i, (_id, label, desc)) in PROVIDERS.iter().enumerate() {
         let is_selected = i == state.provider_index;
         let indicator = if is_selected { "● " } else { "○ " };
         let style = if is_selected {
@@ -858,27 +834,10 @@ fn render_provider(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
             theme::dim()
         };
 
-        // Show availability hint for keyless providers
-        let availability = if *id == "claude-cli" {
-            if state.claude_cli_detected {
-                " ✓"
-            } else {
-                " (not detected)"
-            }
-        } else if *id == "ollama" {
-            if Provider::ollama_available() {
-                " ✓"
-            } else {
-                " (not running)"
-            }
-        } else {
-            ""
-        };
-
         lines.push(Line::from(vec![
             Span::styled(format!("  {indicator}{label}"), style),
             Span::styled(
-                format!("  {desc}{availability}"),
+                format!("  {desc}"),
                 if is_selected {
                     Style::default().fg(theme::DIM_WHITE)
                 } else {
@@ -1218,12 +1177,12 @@ mod tests {
         state.security_accepted = true;
         state.tab = Tab::Provider;
 
-        // Find claude-cli index
-        let cli_idx = PROVIDERS
+        // Find ollama index (keyless provider)
+        let ollama_idx = PROVIDERS
             .iter()
-            .position(|(id, _, _)| *id == "claude-cli")
+            .position(|(id, _, _)| *id == "ollama")
             .unwrap();
-        state.provider_index = cli_idx;
+        state.provider_index = ollama_idx;
 
         // next_tab from Provider with keyless provider should set done=true
         state.next_tab();
@@ -1244,36 +1203,12 @@ mod tests {
     }
 
     #[test]
-    fn build_result_claude_cli_no_api_key() {
-        let mut state = OnboardingState::new();
-        state.user_name = "Test".to_string();
-        let cli_idx = PROVIDERS
-            .iter()
-            .position(|(id, _, _)| *id == "claude-cli")
-            .unwrap();
-        state.provider_index = cli_idx;
-        state.api_key_input = "should-be-ignored".to_string();
-
-        let result = state.build_result();
-        assert_eq!(result.provider, "claude-cli");
-        assert!(result.api_key.is_none()); // No API key for keyless provider
-    }
-
-    #[test]
     fn selected_provider_needs_key_logic() {
         let mut state = OnboardingState::new();
 
         // OpenRouter needs key
         state.provider_index = 0;
         assert!(state.selected_provider_needs_key());
-
-        // Claude CLI doesn't need key
-        let cli_idx = PROVIDERS
-            .iter()
-            .position(|(id, _, _)| *id == "claude-cli")
-            .unwrap();
-        state.provider_index = cli_idx;
-        assert!(!state.selected_provider_needs_key());
 
         // Ollama doesn't need key
         let ollama_idx = PROVIDERS
