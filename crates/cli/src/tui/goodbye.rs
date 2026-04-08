@@ -56,22 +56,34 @@ const TO_BE_CONTINUED: &[&str] = &[
     r" `Y8bood8P'   `Y8bood8P'  o8o        `8      o888o     o888o o8o        `8     `YbodP'    o888ooooood8 o888bood8P'   ",
 ];
 
-const UNTIL_NEXT_TIME: &[&str] = &[
-    r"ooooo     ooo ooooo      ooo ooooooooooooo ooooo ooooo             ooooo      ooo oooooooooooo ooooooo  ooooo ooooooooooooo",
-    r"`888'     `8' `888b.     `8' 8'   888   `8 `888' `888'             `888b.     `8' `888'     `8  `8888    d8'  8'   888   `8",
-    r" 888       8   8 `88b.    8       888       888   888               8 `88b.    8   888            Y888..8P         888     ",
-    r" 888       8   8   `88b.  8       888       888   888               8   `88b.  8   888oooo8        `8888'          888     ",
-    r" 888       8   8     `88b.8       888       888   888               8     `88b.8   888    '       .8PY888.         888     ",
-    r" `88.    .8'   8       `888       888       888   888       o       8       `888   888       o   d8'  `888b        888     ",
-    r"   `YbodP'    o8o        `8      o888o     o888o o888ooooood8      o8o        `8  o888ooooood8 o888o  o88888o     o888o    ",
-    r"",
-    r"ooooooooooooo ooooo ooo        ooooo oooooooooooo",
-    r"8'   888   `8 `888' `88.       .888' `888'     `8",
-    r"     888       888   888b     d'888   888        ",
-    r"     888       888   8 Y88. .P  888   888oooo8   ",
-    r"     888       888   8  `888'   888   888    '   ",
-    r"     888       888   8    Y     888   888       o",
-    r"    o888o     o888o o8o        o888o o888ooooood8",
+const BYE: &[&str] = &[
+    r"oooooooooo.  oooooo   oooo oooooooooooo",
+    r"`888'   `Y8b  `888.   .8'  `888'     `8",
+    r" 888     888   `888. .8'    888        ",
+    r" 888oooo888'    `888.8'     888oooo8   ",
+    r" 888    `88b     `888'      888    '   ",
+    r" 888    .88P      888       888       o",
+    r"o888bood8P'      o888o     o888ooooood8",
+];
+
+const FIN: &[&str] = &[
+    r"oooooooooooo ooooo ooooo      ooo",
+    r"`888'     `8 `888' `888b.     `8'",
+    r" 888          888   8 `88b.    8 ",
+    r" 888oooo8     888   8   `88b.  8 ",
+    r" 888    '     888   8     `88b.8 ",
+    r" 888          888   8       `888 ",
+    r"o888o        o888o o8o        `8 ",
+];
+
+const ADIOS: &[&str] = &[
+    r"      .o.       oooooooooo.   ooooo   .oooooo.    .oooooo..o",
+    r"     .888.      `888'   `Y8b  `888'  d8P'  `Y8b  d8P'    `Y8",
+    r"    .8'888.      888      888  888  888      888 Y88bo.     ",
+    r"   .8' `888.     888      888  888  888      888  `'Y8888o. ",
+    r"  .88ooo8888.    888      888  888  888      888      `'Y88b",
+    r" .8'     `888.   888     d88'  888  `88b    d88' oo     .d8P",
+    r"o88o     o8888o o888bood8P'   o888o  `Y8bood8P'  8''88888P' ",
 ];
 
 const MESSAGES: &[&[&str]] = &[
@@ -79,7 +91,9 @@ const MESSAGES: &[&[&str]] = &[
     END_OF_LINE,
     SAYONARA,
     TO_BE_CONTINUED,
-    UNTIL_NEXT_TIME,
+    BYE,
+    FIN,
+    ADIOS,
 ];
 
 const SUBTITLE: &str = "Borg Decommissioned";
