@@ -2438,7 +2438,7 @@ mod tests {
         assert!(cfg.cache_tools);
         assert!(cfg.cache_system);
         assert_eq!(cfg.rolling_messages, 2);
-        assert_eq!(cfg.ttl, crate::config::CacheTtl::FiveMin);
+        assert_eq!(cfg.ttl, crate::config::CacheTtl::Auto);
     }
 
     #[test]

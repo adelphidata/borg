@@ -97,19 +97,37 @@ pub struct LlmConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheTtl {
-    /// Default ephemeral cache (5 minutes).
+    /// Adaptive: 5 minutes for interactive REPL, 1 hour for gateway/scheduled sessions.
     #[default]
+    Auto,
+    /// Explicit 5-minute ephemeral cache.
     FiveMin,
     /// Extended cache (1 hour). Anthropic charges a higher write cost but reads are cheaper.
     OneHour,
 }
 
 impl CacheTtl {
+    /// Resolve this TTL for a given session context. `is_gateway` should be true
+    /// for gateway, channel, or scheduled sessions where inter-turn latency is higher.
+    pub fn resolve(&self, is_gateway: bool) -> CacheTtl {
+        match self {
+            Self::Auto => {
+                if is_gateway {
+                    Self::OneHour
+                } else {
+                    Self::FiveMin
+                }
+            }
+            other => *other,
+        }
+    }
+
     /// Returns the TTL string used in the Anthropic `cache_control` object,
     /// or `None` for the default 5-minute TTL (which should not be serialized).
+    /// For `Auto`, resolves as FiveMin (caller should use `resolve()` first).
     pub fn as_ttl_str(&self) -> Option<&'static str> {
         match self {
-            Self::FiveMin => None,
+            Self::FiveMin | Self::Auto => None,
             Self::OneHour => Some("1h"),
         }
     }
@@ -118,6 +136,7 @@ impl CacheTtl {
 impl std::fmt::Display for CacheTtl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Auto => f.write_str("auto"),
             Self::FiveMin => f.write_str("5m"),
             Self::OneHour => f.write_str("1h"),
         }
@@ -155,7 +174,7 @@ impl Default for PromptCacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ttl: CacheTtl::FiveMin,
+            ttl: CacheTtl::Auto,
             cache_tools: true,
             cache_system: true,
             rolling_messages: 2,
@@ -436,5 +455,44 @@ mod tests {
             &vec!["U01ABC", "U02DEF"]
         );
         assert_eq!(cfg.recipients.get("discord").unwrap(), &vec!["*"]);
+    }
+
+    // ── CacheTtl ──
+
+    #[test]
+    fn cache_ttl_default_is_auto() {
+        assert_eq!(CacheTtl::default(), CacheTtl::Auto);
+    }
+
+    #[test]
+    fn auto_ttl_repl_uses_five_min() {
+        let resolved = CacheTtl::Auto.resolve(false);
+        assert_eq!(resolved, CacheTtl::FiveMin);
+    }
+
+    #[test]
+    fn auto_ttl_gateway_uses_one_hour() {
+        let resolved = CacheTtl::Auto.resolve(true);
+        assert_eq!(resolved, CacheTtl::OneHour);
+    }
+
+    #[test]
+    fn explicit_ttl_ignores_context() {
+        assert_eq!(CacheTtl::FiveMin.resolve(true), CacheTtl::FiveMin);
+        assert_eq!(CacheTtl::OneHour.resolve(false), CacheTtl::OneHour);
+    }
+
+    #[test]
+    fn cache_ttl_display() {
+        assert_eq!(CacheTtl::Auto.to_string(), "auto");
+        assert_eq!(CacheTtl::FiveMin.to_string(), "5m");
+        assert_eq!(CacheTtl::OneHour.to_string(), "1h");
+    }
+
+    #[test]
+    fn cache_ttl_as_ttl_str() {
+        assert_eq!(CacheTtl::Auto.as_ttl_str(), None);
+        assert_eq!(CacheTtl::FiveMin.as_ttl_str(), None);
+        assert_eq!(CacheTtl::OneHour.as_ttl_str(), Some("1h"));
     }
 }

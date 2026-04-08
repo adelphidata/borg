@@ -656,6 +656,89 @@ pub fn load_daily_logs_from_dir(memory_dir: &std::path::Path, max_tokens: usize)
     parts.join("\n\n")
 }
 
+/// A section (chunk) extracted from a memory file.
+#[derive(Debug, Clone)]
+pub struct MemoryChunk {
+    /// Source filename.
+    pub filename: String,
+    /// Section header or "intro" for the preamble before any headers.
+    pub section: String,
+    /// Section content.
+    pub content: String,
+    /// Estimated token count.
+    pub tokens: usize,
+}
+
+/// Split a memory file's content into sections by `## ` headers.
+///
+/// Returns chunks with provenance (filename + section label). Each chunk's token
+/// count is pre-computed for budget-aware packing.
+pub fn split_into_chunks(filename: &str, content: &str) -> Vec<MemoryChunk> {
+    let mut chunks = Vec::new();
+    let mut current_section = "intro".to_string();
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        if line.starts_with("## ") {
+            // Flush current section
+            if !current_lines.is_empty() {
+                let text = current_lines.join("\n");
+                let tokens = estimate_tokens(&text);
+                if tokens > 0 {
+                    chunks.push(MemoryChunk {
+                        filename: filename.to_string(),
+                        section: current_section.clone(),
+                        content: text,
+                        tokens,
+                    });
+                }
+                current_lines.clear();
+            }
+            current_section = line.trim_start_matches("## ").trim().to_string();
+        }
+        current_lines.push(line);
+    }
+
+    // Flush remaining
+    if !current_lines.is_empty() {
+        let text = current_lines.join("\n");
+        let tokens = estimate_tokens(&text);
+        if tokens > 0 {
+            chunks.push(MemoryChunk {
+                filename: filename.to_string(),
+                section: current_section,
+                content: text,
+                tokens,
+            });
+        }
+    }
+
+    chunks
+}
+
+/// Pack chunks greedily by relevance score until the token budget is exhausted.
+/// Returns the formatted string with provenance comments.
+pub fn pack_chunks(mut scored_chunks: Vec<(MemoryChunk, f32)>, max_tokens: usize) -> String {
+    // Sort by score descending
+    scored_chunks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut parts = Vec::new();
+    let mut used_tokens = 0;
+
+    for (chunk, _score) in scored_chunks {
+        if used_tokens + chunk.tokens > max_tokens {
+            continue;
+        }
+        parts.push(format!(
+            "<!-- from: {} / {} -->\n{}",
+            chunk.filename, chunk.section, chunk.content
+        ));
+        used_tokens += chunk.tokens;
+    }
+
+    parts.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,5 +1222,93 @@ mod tests {
             !combined.contains("nonexistent"),
             "missing file should be skipped"
         );
+    }
+
+    // -- chunk splitting --
+
+    #[test]
+    fn chunk_splitting_by_headers() {
+        let content = "# Title\nIntro text\n\n## Section A\nContent A\n\n## Section B\nContent B";
+        let chunks = split_into_chunks("test.md", content);
+        assert_eq!(chunks.len(), 3); // intro + Section A + Section B
+        assert_eq!(chunks[0].section, "intro");
+        assert_eq!(chunks[1].section, "Section A");
+        assert_eq!(chunks[2].section, "Section B");
+    }
+
+    #[test]
+    fn chunk_splitting_no_headers() {
+        let content = "Just a single block of text\nwith multiple lines.";
+        let chunks = split_into_chunks("test.md", content);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].section, "intro");
+    }
+
+    #[test]
+    fn chunk_splitting_empty_content() {
+        let chunks = split_into_chunks("test.md", "");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn chunk_splitting_preserves_filename() {
+        let chunks = split_into_chunks("notes.md", "## Topic\nSome notes");
+        assert_eq!(chunks[0].filename, "notes.md");
+    }
+
+    #[test]
+    fn chunk_packing_respects_budget() {
+        let chunks = vec![
+            (
+                MemoryChunk {
+                    filename: "a.md".into(),
+                    section: "S1".into(),
+                    content: "word ".repeat(100),
+                    tokens: 100,
+                },
+                0.9,
+            ),
+            (
+                MemoryChunk {
+                    filename: "b.md".into(),
+                    section: "S2".into(),
+                    content: "word ".repeat(200),
+                    tokens: 200,
+                },
+                0.8,
+            ),
+            (
+                MemoryChunk {
+                    filename: "c.md".into(),
+                    section: "S3".into(),
+                    content: "word ".repeat(50),
+                    tokens: 50,
+                },
+                0.7,
+            ),
+        ];
+
+        let result = pack_chunks(chunks, 160);
+        // Should include S1 (100 tokens) and S3 (50 tokens) but not S2 (200 tokens)
+        assert!(result.contains("from: a.md / S1"));
+        assert!(result.contains("from: c.md / S3"));
+        assert!(!result.contains("from: b.md / S2"));
+    }
+
+    #[test]
+    fn chunk_provenance_tags() {
+        let chunks = vec![(
+            MemoryChunk {
+                filename: "notes.md".into(),
+                section: "Git".into(),
+                content: "Git workflow notes".into(),
+                tokens: 5,
+            },
+            1.0,
+        )];
+
+        let result = pack_chunks(chunks, 100);
+        assert!(result.contains("<!-- from: notes.md / Git -->"));
+        assert!(result.contains("Git workflow notes"));
     }
 }

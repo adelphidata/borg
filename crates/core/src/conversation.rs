@@ -154,6 +154,88 @@ pub fn enforce_tool_result_share_limit(history: &mut [Message], max_tokens: usiz
     }
 }
 
+/// Age-based degradation thresholds.
+///
+/// Tool results within `AGE_TIER1_WINDOW` recent messages are kept at full fidelity.
+/// Between tier 1 and tier 2, results over `AGE_TIER1_TOKEN_THRESHOLD` are truncated.
+/// Older than tier 2, results over `AGE_TIER2_TOKEN_THRESHOLD` become one-liners.
+pub const AGE_TIER1_WINDOW: usize = 12;
+pub const AGE_TIER2_WINDOW: usize = 24;
+pub const AGE_TIER1_TOKEN_THRESHOLD: usize = 200;
+pub const AGE_TIER2_TOKEN_THRESHOLD: usize = 50;
+
+/// Progressively degrade old tool results to save tokens without losing recent context.
+///
+/// - Messages in the last `AGE_TIER1_WINDOW` positions: untouched.
+/// - Messages between tier 1 and tier 2: tool results over `AGE_TIER1_TOKEN_THRESHOLD`
+///   tokens are truncated to first 3 lines + omission note + last 2 lines.
+/// - Messages older than tier 2: tool results over `AGE_TIER2_TOKEN_THRESHOLD` tokens
+///   are replaced with a one-line status summary.
+pub fn age_based_tool_result_degradation(history: &mut [Message]) {
+    let len = history.len();
+    if len == 0 {
+        return;
+    }
+
+    for (i, msg) in history.iter_mut().enumerate() {
+        if msg.role != Role::Tool {
+            continue;
+        }
+
+        let age = len - 1 - i; // 0 = newest, len-1 = oldest
+        if age < AGE_TIER1_WINDOW {
+            continue; // recent: full fidelity
+        }
+
+        let text = match &msg.content {
+            Some(MessageContent::Text(s)) => s.clone(),
+            _ => continue,
+        };
+
+        let toks = estimate_tokens(&text);
+
+        if age < AGE_TIER2_WINDOW {
+            // Tier 2: truncate large results
+            if toks > AGE_TIER1_TOKEN_THRESHOLD {
+                msg.content = Some(MessageContent::Text(truncate_with_context(&text)));
+            }
+        } else {
+            // Tier 3: one-liner
+            if toks > AGE_TIER2_TOKEN_THRESHOLD {
+                let text_lower = text.to_lowercase();
+                let status = if text_lower.starts_with("error")
+                    || text_lower.starts_with("fail")
+                    || text_lower.contains("\"error\"")
+                {
+                    "error"
+                } else {
+                    "ok"
+                };
+                let tool_id = msg.tool_call_id.as_deref().unwrap_or("unknown");
+                msg.content = Some(MessageContent::Text(format!(
+                    "[tool result {tool_id} — {status}]"
+                )));
+            }
+        }
+    }
+}
+
+/// Truncate text to first 3 lines + omission note + last 2 lines.
+fn truncate_with_context(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= 7 {
+        return text.to_string();
+    }
+    let head: Vec<&str> = lines[..3].to_vec();
+    let tail: Vec<&str> = lines[lines.len() - 2..].to_vec();
+    let omitted = lines.len() - 5;
+    format!(
+        "{}\n[{omitted} lines omitted]\n{}",
+        head.join("\n"),
+        tail.join("\n")
+    )
+}
+
 /// Compact conversation history using the LLM to summarize dropped messages.
 ///
 /// Strategy:
@@ -1318,5 +1400,129 @@ mod tests {
             .map(|c| c.iter().collect())
             .collect();
         assert_eq!(chunks.len(), 1);
+    }
+
+    // -- age_based_tool_result_degradation --
+
+    /// Build a history with N user/assistant/tool triplets.
+    fn make_history(n: usize) -> Vec<Message> {
+        let mut history = Vec::new();
+        for i in 0..n {
+            let id = format!("call_{i}");
+            history.push(make_user(&format!("turn {i}")));
+            history.push(make_tool_call_msg("", &id, "run_shell"));
+            // Large tool result — enough to trigger degradation
+            let result_text: String = (0..50).map(|j| format!("line {j} of output\n")).collect();
+            history.push(make_tool_result(&id, &result_text));
+        }
+        history
+    }
+
+    #[test]
+    fn age_tier1_preserves_recent() {
+        let mut history = make_history(4); // 12 messages, all within AGE_TIER1_WINDOW
+        let original: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        age_based_tool_result_degradation(&mut history);
+
+        let after: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        assert_eq!(original, after, "recent messages should be untouched");
+    }
+
+    #[test]
+    fn age_tier2_truncates_large_results() {
+        let mut history = make_history(10); // 30 messages
+        age_based_tool_result_degradation(&mut history);
+
+        // The oldest tool results should be truncated (tier 2 or 3)
+        let first_tool = history.iter().find(|m| m.role == Role::Tool).unwrap();
+        let text = first_tool.text_content().unwrap();
+        assert!(
+            text.contains("lines omitted") || text.contains("[tool result"),
+            "old tool results should be degraded: {text}"
+        );
+    }
+
+    #[test]
+    fn age_tier3_replaces_old_results() {
+        let mut history = make_history(12); // 36 messages — oldest are definitely tier 3
+        age_based_tool_result_degradation(&mut history);
+
+        let first_tool = history.iter().find(|m| m.role == Role::Tool).unwrap();
+        let text = first_tool.text_content().unwrap();
+        assert!(
+            text.starts_with("[tool result"),
+            "very old tool results should be one-liners: {text}"
+        );
+    }
+
+    #[test]
+    fn age_degradation_preserves_non_tool_messages() {
+        let mut history = make_history(10);
+        let user_msgs_before: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        age_based_tool_result_degradation(&mut history);
+
+        let user_msgs_after: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        assert_eq!(user_msgs_before, user_msgs_after);
+    }
+
+    #[test]
+    fn age_degradation_idempotent() {
+        let mut history = make_history(10);
+        age_based_tool_result_degradation(&mut history);
+        let after_first: Vec<String> = history
+            .iter()
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        age_based_tool_result_degradation(&mut history);
+        let after_second: Vec<String> = history
+            .iter()
+            .filter_map(|m| m.text_content().map(String::from))
+            .collect();
+
+        assert_eq!(after_first, after_second, "running twice should be no-op");
+    }
+
+    #[test]
+    fn age_degradation_empty_history() {
+        let mut history: Vec<Message> = vec![];
+        age_based_tool_result_degradation(&mut history);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn truncate_with_context_short_text() {
+        let text = "line 1\nline 2\nline 3";
+        assert_eq!(truncate_with_context(text), text);
+    }
+
+    #[test]
+    fn truncate_with_context_long_text() {
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let text = lines.join("\n");
+        let result = truncate_with_context(&text);
+        assert!(result.contains("line 0"));
+        assert!(result.contains("lines omitted"));
+        assert!(result.contains("line 19"));
     }
 }

@@ -1129,6 +1129,9 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
     let started = std::time::Instant::now();
 
     let metrics = borg_core::telemetry::BorgMetrics::noop();
+    // Resolve adaptive cache TTL for heartbeat sessions (longer TTL since these run on schedule).
+    let mut config = config.clone();
+    config.llm.cache.ttl = config.llm.cache.ttl.resolve(true);
     let mut agent = match Agent::new(config.clone(), metrics) {
         Ok(a) => a,
         Err(e) => {
@@ -1158,7 +1161,7 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
     // table so each nudge fires at most once per its declared cooldown.
     // See `crates/cli/src/heartbeat_augmenters.rs` for how to add one.
     let augmenter_db = borg_core::db::Database::open().ok();
-    let nudges = crate::heartbeat_augmenters::collect(config, augmenter_db.as_ref());
+    let nudges = crate::heartbeat_augmenters::collect(&config, augmenter_db.as_ref());
     if !nudges.is_empty() {
         user_msg.push_str("\n\n<proactive_nudges>\n");
         for n in &nudges {

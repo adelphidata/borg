@@ -195,6 +195,8 @@ pub struct Agent {
     config_arc: Arc<Config>,
     /// Channel for receiving user steer messages mid-turn (injected at tool boundaries).
     steer_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Tool names used in recent turns, for conditional tool loading.
+    recent_tool_names: std::collections::HashSet<String>,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -297,6 +299,7 @@ impl Agent {
             cached_credentials: None,
             config_arc,
             steer_rx: None,
+            recent_tool_names: std::collections::HashSet::new(),
         }
     }
 
@@ -687,15 +690,26 @@ impl Agent {
             ));
         }
 
-        // Coding instructions (when filesystem and runtime tools are available)
-        system.push_str("\n<coding_instructions>\n\
-            - Use list_dir to explore project structure before making changes.\n\
-            - Use read_file to understand code before editing. Always read what you plan to change.\n\
-            - Use apply_patch to make file changes. Never use run_shell to write files.\n\
-            - After making changes, verify correctness by reading the modified file or running tests.\n\
-            - If in a git repo, prefer small, atomic changes. Do not commit unless asked.\n\
-            - When you encounter errors, read the relevant code and error context before attempting fixes.\n\
-            </coding_instructions>\n");
+        // Coding instructions: only include when filesystem/runtime tools are in the active profile.
+        // For messaging-only or minimal profiles, these are wasted tokens.
+        {
+            let profile =
+                crate::tool_catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
+                    .unwrap_or_default();
+            let groups = profile.groups();
+            if groups.contains(&crate::tool_catalog::ToolGroup::Fs)
+                || groups.contains(&crate::tool_catalog::ToolGroup::Runtime)
+            {
+                system.push_str("\n<coding_instructions>\n\
+                    - Use list_dir to explore project structure before making changes.\n\
+                    - Use read_file to understand code before editing. Always read what you plan to change.\n\
+                    - Use apply_patch to make file changes. Never use run_shell to write files.\n\
+                    - After making changes, verify correctness by reading the modified file or running tests.\n\
+                    - If in a git repo, prefer small, atomic changes. Do not commit unless asked.\n\
+                    - When you encounter errors, read the relevant code and error context before attempting fixes.\n\
+                    </coding_instructions>\n");
+            }
+        }
 
         system.push_str(&format!(
             "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
@@ -932,7 +946,7 @@ Rules:
         }
     }
 
-    fn build_tool_definitions(&self) -> Vec<ToolDefinition> {
+    fn build_tool_definitions(&self, user_message: &str) -> Vec<ToolDefinition> {
         let mut tools = crate::tool_definitions::core_tool_definitions(&self.config);
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(
@@ -954,6 +968,28 @@ Rules:
             tools = crate::tool_policy::filter_subagent_tools(tools, policy);
         } else {
             tools = crate::tool_policy::filter_tools(tools, policy);
+        }
+
+        // Conditional tool loading: exclude tool groups not relevant to the
+        // current user message or recent tool usage. Saves 500-1500 tokens/turn.
+        if self.config.tools.conditional_loading {
+            let profile =
+                crate::tool_catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
+                    .unwrap_or_default();
+            let profile_groups = profile.groups();
+            tools = crate::tool_catalog::filter_tools_by_relevance(
+                tools,
+                user_message,
+                &self.recent_tool_names,
+                &profile_groups,
+            );
+        }
+
+        // Compact tool schemas: strip redundant metadata to reduce token overhead.
+        if self.config.tools.compact_schemas {
+            for tool in &mut tools {
+                crate::tool_definitions::compact_tool_schema(&mut tool.function.parameters);
+            }
         }
 
         // Sort deterministically so the tools block is byte-identical across turns,
@@ -984,6 +1020,9 @@ Rules:
         let msg = Message::user(user_input);
         self.log_and_persist(msg);
         self.turn_count += 1;
+        // Reset recent tool names each user turn so conditional loading
+        // only considers tools used in the current turn's agent loop.
+        self.recent_tool_names.clear();
         self.run_agent_loop(event_tx, cancel).await
     }
 
@@ -1347,6 +1386,11 @@ Rules:
                 return Ok(());
             }
 
+            // Track tool names for conditional tool loading (recent usage keeps groups active).
+            for t in &tc {
+                self.recent_tool_names.insert(t.function.name.clone());
+            }
+
             self.execute_tool_calls(&tc, &text_content, &event_tx, &cancel)
                 .await;
             needs_response = true;
@@ -1401,6 +1445,12 @@ Rules:
         normalize_history(&mut self.history);
 
         let max_hist = self.config.conversation.max_history_tokens;
+
+        // Age-based degradation: progressively reduce old tool results
+        if self.config.conversation.age_based_degradation {
+            crate::conversation::age_based_tool_result_degradation(&mut self.history);
+        }
+
         enforce_tool_result_share_limit(&mut self.history, max_hist, 0.5);
         if history_tokens(&self.history) > max_hist {
             compact_tool_results(&mut self.history, max_hist);
@@ -1480,14 +1530,8 @@ Rules:
             .build_system_prompt()
             .await
             .context("Failed to build system prompt")?;
-        let tool_defs = self.build_tool_definitions();
 
-        // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
-        let hook_point = if iteration == 1 {
-            HookPoint::BeforeAgentStart
-        } else {
-            HookPoint::BeforeLlmCall
-        };
+        // Extract user message early — needed for conditional tool loading and hooks.
         let user_msg = self
             .history
             .iter()
@@ -1496,6 +1540,15 @@ Rules:
             .and_then(|m| m.text_content())
             .unwrap_or("")
             .to_string();
+
+        let tool_defs = self.build_tool_definitions(&user_msg);
+
+        // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
+        let hook_point = if iteration == 1 {
+            HookPoint::BeforeAgentStart
+        } else {
+            HookPoint::BeforeLlmCall
+        };
         let hook_data = if iteration == 1 {
             HookData::AgentStart {
                 user_message: user_msg,

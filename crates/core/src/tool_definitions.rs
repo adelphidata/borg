@@ -200,6 +200,58 @@ fn build_schedule_tool_def(config: &Config) -> ToolDefinition {
     )
 }
 
+/// Strip redundant metadata from a tool schema to reduce token overhead.
+///
+/// - Removes `"default"` keys (LLM infers from description)
+/// - For properties with an `"enum"` constraint, removes parenthetical enum
+///   listings from the description (the constraint already communicates valid values)
+/// - Strips trailing whitespace from descriptions
+pub fn compact_tool_schema(schema: &mut serde_json::Value) {
+    if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for (_key, prop) in props.iter_mut() {
+            if let Some(obj) = prop.as_object_mut() {
+                // Remove "default" keys — LLM can infer defaults from description
+                obj.remove("default");
+
+                // If property has enum constraint, trim redundant enum listing from description
+                if obj.contains_key("enum") {
+                    if let Some(desc) = obj.get_mut("description") {
+                        if let Some(s) = desc.as_str() {
+                            let trimmed = strip_enum_parenthetical(s);
+                            *desc = serde_json::Value::String(trimmed);
+                        }
+                    }
+                }
+
+                // Recurse into nested object schemas (e.g. items in arrays)
+                if let Some(items) = obj.get_mut("items") {
+                    compact_tool_schema(items);
+                }
+            }
+        }
+    }
+}
+
+/// Remove parenthetical enum listings like "(one of: a, b, c)" or
+/// "(e.g. 1024x1024, 1792x1024)" from a description string. Only strips
+/// parentheticals that start with known enum-listing prefixes to avoid
+/// removing meaningful context like "(relative to project root)".
+fn strip_enum_parenthetical(desc: &str) -> String {
+    let trimmed = desc.trim_end();
+    if let Some(paren_start) = trimmed.rfind(" (") {
+        let after = &trimmed[paren_start + 2..]; // skip " ("
+        let is_enum_listing = after.starts_with("one of:")
+            || after.starts_with("e.g.")
+            || after.starts_with("e.g ")
+            || after.starts_with("options:")
+            || after.starts_with("default:");
+        if is_enum_listing && trimmed.ends_with(')') {
+            return trimmed[..paren_start].trim_end().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +557,108 @@ mod tests {
             .map(|d| d.function.name.as_str())
             .collect();
         assert_eq!(names1, names2, "tool order must be identical across calls");
+    }
+
+    #[test]
+    fn compact_schema_removes_defaults() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "description": "Number of items", "default": 5},
+                "name": {"type": "string", "description": "The name"}
+            }
+        });
+        compact_tool_schema(&mut schema);
+        assert!(schema["properties"]["count"].get("default").is_none());
+        assert!(schema["properties"]["name"].get("default").is_none());
+    }
+
+    #[test]
+    fn compact_schema_shortens_enum_descriptions() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["mp3", "wav"],
+                    "description": "Audio format (one of: mp3, wav)"
+                }
+            }
+        });
+        compact_tool_schema(&mut schema);
+        assert_eq!(
+            schema["properties"]["format"]["description"]
+                .as_str()
+                .unwrap(),
+            "Audio format"
+        );
+    }
+
+    #[test]
+    fn compact_schema_preserves_required_fields() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "Action to perform", "enum": ["a","b"]}
+            },
+            "required": ["action"]
+        });
+        compact_tool_schema(&mut schema);
+        assert!(schema["properties"]["action"]["type"].is_string());
+        assert!(schema["properties"]["action"]["description"].is_string());
+        assert!(schema["required"].is_array());
+    }
+
+    #[test]
+    fn compact_schema_round_trip_valid() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.web.enabled = true;
+        let defs = core_tool_definitions(&config);
+
+        for def in &defs {
+            let mut schema = def.function.parameters.clone();
+            compact_tool_schema(&mut schema);
+            assert_eq!(
+                schema["type"].as_str(),
+                Some("object"),
+                "tool {} schema must remain type=object after compaction",
+                def.function.name,
+            );
+        }
+    }
+
+    #[test]
+    fn compact_schema_reduces_token_count() {
+        let config = Config::default();
+        let defs = core_tool_definitions(&config);
+        // write_memory has "default" keys (append: false, scope: "global")
+        let write_mem = defs
+            .iter()
+            .find(|d| d.function.name == "write_memory")
+            .expect("should have write_memory tool");
+
+        let before = write_mem.function.parameters.to_string().len();
+        let mut schema = write_mem.function.parameters.clone();
+        compact_tool_schema(&mut schema);
+        let after = schema.to_string().len();
+
+        assert!(
+            after < before,
+            "compacted schema should be smaller: {after} >= {before}"
+        );
+    }
+
+    #[test]
+    fn strip_enum_parenthetical_removes_trailing() {
+        assert_eq!(
+            strip_enum_parenthetical("Audio format (one of: mp3, wav)"),
+            "Audio format"
+        );
+        assert_eq!(strip_enum_parenthetical("No parens here"), "No parens here");
+        assert_eq!(
+            strip_enum_parenthetical("Size (e.g. 1024x1024, 1792x1024)"),
+            "Size"
+        );
     }
 }

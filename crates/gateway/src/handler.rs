@@ -546,6 +546,10 @@ async fn invoke_agent_inner(
         }
     }
 
+    // Resolve adaptive cache TTL for gateway sessions (prefer longer TTL
+    // since inter-turn latency is typically >5 minutes).
+    gw_config.llm.cache.ttl = gw_config.llm.cache.ttl.resolve(true);
+
     let mut agent = Agent::new(gw_config, borg_core::telemetry::BorgMetrics::noop())
         .context("Failed to create agent")?;
 

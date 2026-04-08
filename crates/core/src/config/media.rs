@@ -307,6 +307,14 @@ pub struct ToolsConfig {
     /// Tool approval/deny policy configuration.
     #[serde(default)]
     pub policy: super::security::ToolPolicyConfig,
+    /// When true, only include tool groups relevant to the current user message
+    /// (based on keyword matching and recent tool usage). Saves 500-1500 tokens/turn.
+    #[serde(default = "default_true")]
+    pub conditional_loading: bool,
+    /// When true, strip redundant metadata from tool schemas before sending to
+    /// the LLM (remove defaults, shorten enum descriptions). Saves 200-600 tokens/turn.
+    #[serde(default = "default_true")]
+    pub compact_schemas: bool,
 }
 
 impl Default for ToolsConfig {
@@ -314,6 +322,8 @@ impl Default for ToolsConfig {
         Self {
             default_timeout_ms: 30000,
             policy: super::security::ToolPolicyConfig::default(),
+            conditional_loading: true,
+            compact_schemas: true,
         }
     }
 }
@@ -339,6 +349,12 @@ pub struct MemoryConfig {
     /// Additional directories to scan for .md files and index alongside memory.
     #[serde(default)]
     pub extra_paths: Vec<String>,
+    /// When true, load memory at section granularity instead of file granularity.
+    /// Sections are split by `## ` headers or double newlines. Requires embeddings
+    /// to rank sections. Saves 1K-4K tokens when memory files are large but only
+    /// parts are relevant. Default: false (opt-in due to higher risk of missing context).
+    #[serde(default)]
+    pub chunk_level_selection: bool,
 }
 
 impl Default for MemoryConfig {
@@ -351,6 +367,7 @@ impl Default for MemoryConfig {
             flush_soft_threshold_tokens: 2000,
             flush_min_messages: 4,
             extra_paths: Vec::new(),
+            chunk_level_selection: false,
         }
     }
 }
@@ -466,6 +483,11 @@ pub struct ConversationConfig {
     /// Active collaboration mode (default, execute, or plan).
     #[serde(default)]
     pub collaboration_mode: CollaborationMode,
+    /// When true, progressively degrade old tool results to save tokens.
+    /// Recent results stay full-fidelity; older ones get truncated or summarized.
+    /// Saves 2K-8K tokens/turn in long conversations.
+    #[serde(default = "default_true")]
+    pub age_based_degradation: bool,
 }
 
 impl Default for ConversationConfig {
@@ -478,6 +500,7 @@ impl Default for ConversationConfig {
             compaction_marker_tokens: constants::COMPACTION_MARKER_TOKENS,
             max_transcript_chars: constants::MAX_TRANSCRIPT_CHARS,
             collaboration_mode: CollaborationMode::Default,
+            age_based_degradation: true,
         }
     }
 }

@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 
+use crate::types::ToolDefinition;
+
 /// Logical grouping of tools by purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolGroup {
@@ -39,6 +41,7 @@ const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
     // Memory
     ("write_memory", ToolGroup::Memory, false),
     ("read_memory", ToolGroup::Memory, false),
+    ("memory_search", ToolGroup::Memory, false),
     // Filesystem
     ("apply_patch", ToolGroup::Fs, false),
     ("read_file", ToolGroup::Fs, false),
@@ -49,6 +52,8 @@ const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
     ("run_shell", ToolGroup::Runtime, false),
     // Discovery
     ("list", ToolGroup::Discovery, false),
+    ("projects", ToolGroup::Discovery, false),
+    ("request_user_input", ToolGroup::Discovery, false),
     ("list_skills", ToolGroup::Discovery, true),
     ("list_channels", ToolGroup::Discovery, true),
     ("list_agents", ToolGroup::Discovery, true),
@@ -63,6 +68,7 @@ const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
     ("manage_cron", ToolGroup::Scheduling, true),
     // Media
     ("generate_image", ToolGroup::Media, false),
+    ("text_to_speech", ToolGroup::Media, false),
     // Integration
     ("gmail", ToolGroup::Integration, false),
     ("google_calendar", ToolGroup::Integration, false),
@@ -118,6 +124,121 @@ impl ToolGroup {
             .map(|(name, _, _)| *name)
             .collect()
     }
+
+    /// Whether this group is always included regardless of message content.
+    pub fn is_core(&self) -> bool {
+        matches!(
+            self,
+            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery
+        )
+    }
+
+    /// Keyword hints that trigger inclusion of this group when found in the
+    /// user message. Core groups return an empty slice (always included).
+    pub fn keyword_hints(&self) -> &'static [&'static str] {
+        match self {
+            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery => &[],
+            Self::Web => &[
+                "search", "fetch", "url", "website", "http", "link", "web", "scrape",
+            ],
+            Self::Ui => &[
+                "browser",
+                "screenshot",
+                "click",
+                "navigate",
+                "webpage",
+                "dom",
+                "scrape",
+                "open page",
+            ],
+            Self::Scheduling => &[
+                "schedule",
+                "cron",
+                "remind",
+                "recurring",
+                "every day",
+                "weekly",
+                "timer",
+                "alarm",
+            ],
+            Self::Media => &[
+                "image",
+                "generate image",
+                "picture",
+                "draw",
+                "photo",
+                "illustration",
+            ],
+            Self::Integration => &[
+                "email", "gmail", "calendar", "notion", "linear", "slack", "discord",
+            ],
+            Self::Agents => &[
+                "agent",
+                "spawn",
+                "delegate",
+                "parallel",
+                "background task",
+                "sub-agent",
+                "subagent",
+            ],
+        }
+    }
+}
+
+/// Filter tool definitions to only include groups relevant to the given user
+/// message and recently-used tool names. Core groups are always included.
+///
+/// `recent_tool_names` should contain tool names used in the last few turns.
+pub fn filter_tools_by_relevance(
+    tools: Vec<ToolDefinition>,
+    user_message: &str,
+    recent_tool_names: &HashSet<String>,
+    profile_groups: &HashSet<ToolGroup>,
+) -> Vec<ToolDefinition> {
+    let msg_lower = user_message.to_lowercase();
+
+    // Determine which conditional groups are relevant
+    let mut active_groups: HashSet<ToolGroup> =
+        ALL_GROUPS.iter().filter(|g| g.is_core()).copied().collect();
+
+    for group in ALL_GROUPS {
+        if group.is_core() || !profile_groups.contains(group) {
+            continue;
+        }
+        // Check keyword hints
+        let keyword_matched = group
+            .keyword_hints()
+            .iter()
+            .any(|hint| msg_lower.contains(hint));
+        if keyword_matched {
+            active_groups.insert(*group);
+            continue;
+        }
+        // Check if any tool from this group was recently used
+        let group_tools: Vec<&str> = group.tool_names();
+        if group_tools
+            .iter()
+            .any(|name| recent_tool_names.contains(*name))
+        {
+            active_groups.insert(*group);
+        }
+    }
+
+    // Build set of allowed tool names from active groups
+    let allowed: HashSet<&str> = TOOL_REGISTRY
+        .iter()
+        .filter(|(_, group, _)| active_groups.contains(group))
+        .map(|(name, _, _)| *name)
+        .collect();
+
+    tools
+        .into_iter()
+        .filter(|t| {
+            let name = t.function.name.as_str();
+            // Always keep tools not in the registry (user-created / dynamic)
+            tool_group(name).is_none_or(|_| allowed.contains(name))
+        })
+        .collect()
 }
 
 /// Predefined profiles that select which tool groups are available.
@@ -449,5 +570,152 @@ mod tests {
         let labels: Vec<&str> = ALL_GROUPS.iter().map(|g| g.label()).collect();
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
         assert_eq!(labels.len(), unique.len(), "group labels should be unique");
+    }
+
+    #[test]
+    fn keyword_hints_cover_all_conditional_groups() {
+        for group in ALL_GROUPS {
+            if group.is_core() {
+                assert!(
+                    group.keyword_hints().is_empty(),
+                    "{group:?} is core and should have no hints"
+                );
+            } else {
+                assert!(
+                    !group.keyword_hints().is_empty(),
+                    "{group:?} is conditional and must have keyword hints"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_core_returns_expected() {
+        assert!(ToolGroup::Memory.is_core());
+        assert!(ToolGroup::Fs.is_core());
+        assert!(ToolGroup::Runtime.is_core());
+        assert!(ToolGroup::Discovery.is_core());
+        assert!(!ToolGroup::Web.is_core());
+        assert!(!ToolGroup::Ui.is_core());
+        assert!(!ToolGroup::Scheduling.is_core());
+        assert!(!ToolGroup::Media.is_core());
+        assert!(!ToolGroup::Integration.is_core());
+        assert!(!ToolGroup::Agents.is_core());
+    }
+
+    #[test]
+    fn filter_tools_excludes_unused_groups() {
+        let tools = make_test_tools();
+        let profile_groups = ToolProfile::Full.groups();
+        let recent = HashSet::new();
+
+        let filtered =
+            filter_tools_by_relevance(tools, "fix the bug in main.rs", &recent, &profile_groups);
+        let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+
+        // Core tools always present
+        assert!(names.contains(&"apply_patch"));
+        assert!(names.contains(&"run_shell"));
+        assert!(names.contains(&"write_memory"));
+        assert!(names.contains(&"list"));
+
+        // Conditional tools NOT present (no keywords match)
+        assert!(!names.contains(&"browser"));
+        assert!(!names.contains(&"generate_image"));
+        assert!(!names.contains(&"gmail"));
+        assert!(!names.contains(&"spawn_agent"));
+    }
+
+    #[test]
+    fn filter_tools_includes_keyword_match() {
+        let tools = make_test_tools();
+        let profile_groups = ToolProfile::Full.groups();
+        let recent = HashSet::new();
+
+        let filtered = filter_tools_by_relevance(
+            tools,
+            "open the browser and navigate",
+            &recent,
+            &profile_groups,
+        );
+        let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"browser"),
+            "browser should be included via keyword"
+        );
+    }
+
+    #[test]
+    fn filter_tools_includes_recently_used() {
+        let tools = make_test_tools();
+        let profile_groups = ToolProfile::Full.groups();
+        let mut recent = HashSet::new();
+        recent.insert("gmail".to_string());
+
+        let filtered = filter_tools_by_relevance(tools, "fix the bug", &recent, &profile_groups);
+        let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"gmail"),
+            "gmail should be included via recent usage"
+        );
+    }
+
+    #[test]
+    fn filter_tools_always_includes_core() {
+        let tools = make_test_tools();
+        let profile_groups = ToolProfile::Full.groups();
+        let recent = HashSet::new();
+
+        let filtered = filter_tools_by_relevance(tools, "", &recent, &profile_groups);
+        let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(names.contains(&"apply_patch"));
+        assert!(names.contains(&"run_shell"));
+        assert!(names.contains(&"write_memory"));
+        assert!(names.contains(&"list"));
+    }
+
+    #[test]
+    fn filter_tools_preserves_unknown_tools() {
+        // User-created / dynamic tools not in the registry should pass through
+        let mut tools = make_test_tools();
+        tools.push(ToolDefinition::new(
+            "my_custom_tool",
+            "Custom tool",
+            serde_json::json!({"type":"object","properties":{}}),
+        ));
+        let profile_groups = ToolProfile::Full.groups();
+        let recent = HashSet::new();
+
+        let filtered = filter_tools_by_relevance(tools, "fix the bug", &recent, &profile_groups);
+        let names: Vec<&str> = filtered.iter().map(|t| t.function.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"my_custom_tool"),
+            "unknown tools should always pass through"
+        );
+    }
+
+    /// Helper to build a representative set of test tools.
+    fn make_test_tools() -> Vec<ToolDefinition> {
+        let schema = serde_json::json!({"type":"object","properties":{}});
+        vec![
+            ToolDefinition::new("write_memory", "Write memory", schema.clone()),
+            ToolDefinition::new("read_memory", "Read memory", schema.clone()),
+            ToolDefinition::new("apply_patch", "Apply patch", schema.clone()),
+            ToolDefinition::new("read_file", "Read file", schema.clone()),
+            ToolDefinition::new("list_dir", "List dir", schema.clone()),
+            ToolDefinition::new("run_shell", "Run shell", schema.clone()),
+            ToolDefinition::new("list", "List resources", schema.clone()),
+            ToolDefinition::new("web_fetch", "Fetch URL", schema.clone()),
+            ToolDefinition::new("web_search", "Search web", schema.clone()),
+            ToolDefinition::new("browser", "Browser", schema.clone()),
+            ToolDefinition::new("schedule", "Schedule", schema.clone()),
+            ToolDefinition::new("generate_image", "Generate image", schema.clone()),
+            ToolDefinition::new("gmail", "Gmail", schema.clone()),
+            ToolDefinition::new("spawn_agent", "Spawn agent", schema.clone()),
+        ]
     }
 }
