@@ -172,7 +172,7 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
 /// otherwise cancel the local token and respawn in-process.
 async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
     // Try to signal a running daemon's gateway first
-    let config = match Config::load() {
+    let config = match Config::load_from_db() {
         Ok(c) => c,
         Err(e) => return format!("Gateway restart failed: could not reload config: {e}"),
     };
@@ -230,23 +230,21 @@ pub struct ResumeHint {
 }
 
 pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
-    let config = Config::load()?;
+    let config = Config::load_from_db()?;
     let metrics = BorgMetrics::from_config(&config);
     let mut agent = Agent::new(config.clone(), metrics.clone())?;
 
-    // Start config hot reload watcher
-    let config_path = Config::data_dir()?.join("config.toml");
-    let _config_watcher =
-        match borg_core::config_watcher::ConfigWatcher::start(config_path, config.clone()) {
-            Ok(watcher) => {
-                agent.set_config_watcher(watcher.subscribe());
-                Some(watcher)
-            }
-            Err(e) => {
-                tracing::warn!("Config watcher failed to start: {e}");
-                None
-            }
-        };
+    // Start config hot reload watcher (polls DB for changes)
+    let _config_watcher = match borg_core::config_watcher::ConfigWatcher::start(config.clone()) {
+        Ok(watcher) => {
+            agent.set_config_watcher(watcher.subscribe());
+            Some(watcher)
+        }
+        Err(e) => {
+            tracing::warn!("Config watcher failed to start: {e}");
+            None
+        }
+    };
 
     // Register vitals hook for passive health tracking
     if let Ok(vitals_hook) = borg_core::vitals::VitalsHook::new() {
@@ -854,11 +852,9 @@ async fn run_event_loop(
                                             }
                                         }
 
-                                        // Wire credential entries + gateway config in one load/save
-                                        if !install_result.credential_entries.is_empty()
-                                            || def.kind == borg_plugins::PluginKind::Channel
-                                        {
-                                            if let Ok(mut cfg) = Config::load() {
+                                        // Wire credential entries to DB
+                                        if !install_result.credential_entries.is_empty() {
+                                            if let Ok(mut cfg) = Config::load_from_db() {
                                                 for entry in &install_result.credential_entries {
                                                     cfg.credentials.insert(
                                                         entry.key.clone(),
@@ -870,10 +866,19 @@ async fn run_event_loop(
                                                         ),
                                                     );
                                                 }
-                                                if let Err(e) = cfg.save() {
-                                                    tracing::warn!(
-                                                        "Failed to save config after plugin install: {e}"
-                                                    );
+                                                if let Ok(json) =
+                                                    serde_json::to_string(&cfg.credentials)
+                                                {
+                                                    if let Ok(db) = borg_core::db::Database::open()
+                                                    {
+                                                        if let Err(e) =
+                                                            db.set_setting("credentials", &json)
+                                                        {
+                                                            tracing::warn!(
+                                                                "Failed to save credentials after plugin install: {e}"
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1274,8 +1279,8 @@ async fn run_event_loop(
                                     }
                                     app.push_system_message(msg);
                                     // Reload config to pick up migrated settings
-                                    app.config =
-                                        borg_core::config::Config::load().unwrap_or_default();
+                                    app.config = borg_core::config::Config::load_from_db()
+                                        .unwrap_or_default();
                                 }
                                 Err(e) => {
                                     let msg = format!("Migration failed: {e}");

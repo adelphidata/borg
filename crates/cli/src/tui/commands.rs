@@ -455,9 +455,6 @@ impl App<'_> {
             match self.config.apply_setting(&key, &value) {
                 Ok(confirmation) => {
                     self.push_system_message(format!("Updated: {confirmation}"));
-                    if let Err(e) = self.config.save() {
-                        self.push_system_message(format!("Warning: failed to save config: {e}"));
-                    }
                     Ok(AppAction::UpdateSetting { key, value })
                 }
                 Err(e) => {

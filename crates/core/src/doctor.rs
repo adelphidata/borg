@@ -279,7 +279,7 @@ fn check_config(checks: &mut Vec<DiagnosticCheck>) {
             let config_path = data_dir.join("config.toml");
             if config_path.exists() {
                 checks.push(DiagnosticCheck::pass("Config", "config.toml exists"));
-                match Config::load() {
+                match Config::load_from_db() {
                     Ok(_) => {
                         checks.push(DiagnosticCheck::pass("Config", "config.toml valid"));
                     }

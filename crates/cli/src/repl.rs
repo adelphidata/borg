@@ -16,7 +16,7 @@ pub async fn one_shot(
     json_output: bool,
     mode: Option<&str>,
 ) -> Result<()> {
-    let mut config = Config::load()?;
+    let mut config = Config::load_from_db()?;
     if let Some(mode_str) = mode {
         config.conversation.collaboration_mode = mode_str.parse()?;
     }

@@ -200,7 +200,7 @@ fn is_configured(def: &PluginDef, config: &Config) -> bool {
 pub fn add_plugin(name: &str) -> Result<()> {
     let def = find_plugin(name).ok_or_else(|| anyhow::anyhow!("Unknown plugin: {name}"))?;
 
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_from_db().unwrap_or_default();
 
     if is_configured(def, &config) {
         println!("{} is already configured.", def.description);
@@ -343,7 +343,7 @@ pub fn remove_plugin(name: &str) -> Result<()> {
 
 /// List all plugins with their configured/unconfigured status.
 pub fn list_plugins() -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_from_db().unwrap_or_default();
 
     let categories = ["messaging", "email", "productivity"];
     let category_labels = ["Messaging", "Email", "Productivity"];

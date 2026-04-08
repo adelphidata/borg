@@ -84,7 +84,7 @@ fn spawn_daemon_gateway(
 
 /// Run the daemon loop: executes scheduled tasks and heartbeat without a TUI.
 pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
-    let config = Config::load()?;
+    let config = Config::load_from_db()?;
 
     println!("Borg daemon starting...");
 
@@ -288,7 +288,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
 
                 let new_shutdown = CancellationToken::new();
                 gw_handle = Box::pin(spawn_daemon_gateway(
-                    &Config::load().unwrap_or_else(|_| config.clone()),
+                    &Config::load_from_db().unwrap_or_else(|_| config.clone()),
                     new_shutdown.clone(),
                     Some(poke_tx.clone()),
                 ));

@@ -132,7 +132,7 @@ impl MigratePopup {
         match migrate::parse_source(source, &self.categories) {
             Ok(data) => {
                 let borg_dir = Config::data_dir().unwrap_or_default();
-                let config = Config::load().unwrap_or_default();
+                let config = Config::load_from_db().unwrap_or_default();
                 let plan = migrate::plan::build_plan(source, &data, &config, &borg_dir);
                 self.preview_lines = plan.summary_lines();
                 self.source_data = Some(data);

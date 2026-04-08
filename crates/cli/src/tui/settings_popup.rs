@@ -704,7 +704,7 @@ impl SettingsPopup {
         }
         // Reload config from disk (TOML + defaults, no DB overrides).
         // If the config file doesn't exist or can't be read, fall back to compiled defaults.
-        *config = Config::load().unwrap_or_default();
+        *config = Config::load_from_db().unwrap_or_default();
         self.sync_select_indices(config);
         if failed > 0 {
             self.status_message = Some((

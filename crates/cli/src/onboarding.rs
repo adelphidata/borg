@@ -302,23 +302,37 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     // Determine key storage automatically
     let use_keychain = result.api_key.is_some() && keychain_available();
 
-    // Write config.toml (skip if already exists to avoid clobbering manual edits)
-    let config_path = data_dir.join("config.toml");
-    if config_path.exists() {
-        println!("  Skipped {} (already exists)", config_path.display());
-    } else {
-        let config_content = generate_config(
-            &result.model_id,
-            &result.provider,
-            &result.user_name,
-            &result.agent_name,
-            use_keychain,
-        )?;
-        if let Err(e) = atomic_write(&config_path, &config_content) {
-            cleanup_tmp_files(&data_dir);
-            return Err(e.context("Failed to write config.toml during onboarding"));
+    // Write settings to DB
+    {
+        let db = borg_core::db::Database::open()
+            .context("Failed to open database for onboarding settings")?;
+        db.set_setting("llm.provider", &result.provider)?;
+        db.set_setting("model", &result.model_id)?;
+        if !result.user_name.is_empty() {
+            db.set_setting("user.name", &result.user_name)?;
         }
-        println!("  Created {}", config_path.display());
+        if !result.agent_name.is_empty() {
+            db.set_setting("user.agent_name", &result.agent_name)?;
+        }
+
+        if use_keychain {
+            let secret_json = if cfg!(target_os = "macos") {
+                format!(
+                    r#"{{"source":"exec","command":"security","args":["find-generic-password","-s","borg-{}","-a","borg","-w"]}}"#,
+                    result.provider
+                )
+            } else {
+                format!(
+                    r#"{{"source":"exec","command":"secret-tool","args":["lookup","service","borg","provider","{}"]}}"#,
+                    result.provider
+                )
+            };
+            db.set_setting("llm.api_key", &secret_json)?;
+        } else {
+            let provider = Provider::from_str(&result.provider)?;
+            db.set_setting("llm.api_key_env", provider.default_env_var())?;
+        }
+        println!("  Saved settings to database");
     }
 
     // Write IDENTITY.md (skip if already exists)
@@ -374,20 +388,17 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 Err(e) => {
                     eprintln!("  Warning: Failed to store in keychain: {e}");
                     eprintln!("  Falling back to .env file");
-                    let fallback_config = generate_config(
-                        &result.model_id,
-                        &result.provider,
-                        &result.user_name,
-                        &result.agent_name,
-                        false,
-                    )?;
-                    atomic_write(&config_path, &fallback_config)?;
+                    // Update DB to use env var instead of keychain
+                    if let Ok(db) = borg_core::db::Database::open() {
+                        let provider = Provider::from_str(&result.provider)?;
+                        let _ = db.set_setting("llm.api_key_env", provider.default_env_var());
+                        let _ = db.delete_setting("llm.api_key");
+                    }
                     let provider = Provider::from_str(&result.provider)?;
                     let env_var = provider.default_env_var();
                     let env_path = data_dir.join(".env");
                     let clean_key = api_key.trim().replace(['\n', '\r'], "");
                     atomic_write(&env_path, &format!("{env_var}={clean_key}\n"))?;
-                    println!("  Updated config to use .env file");
                     println!("  Created {}", env_path.display());
                 }
             }

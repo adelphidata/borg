@@ -455,7 +455,7 @@ async fn main() -> Result<()> {
     let _telemetry_guard;
 
     {
-        let config = borg_core::config::Config::load().unwrap_or_default();
+        let config = borg_core::config::Config::load_from_db().unwrap_or_default();
         let (otel_layer, tg) = borg_core::telemetry::init_telemetry(&config.telemetry)
             .unwrap_or_else(|e| {
                 eprintln!("Warning: OpenTelemetry init failed: {e}");
@@ -722,7 +722,7 @@ fn run_migrate_direct(source: borg_core::migrate::MigrationSource) -> Result<()>
 
     let categories = MigrationCategories::default();
     let data = migrate::parse_source(source, &categories)?;
-    let config = borg_core::config::Config::load().unwrap_or_default();
+    let config = borg_core::config::Config::load_from_db().unwrap_or_default();
     let borg_dir = borg_core::config::Config::data_dir()?;
     let plan = migrate::plan::build_plan(source, &data, &config, &borg_dir);
 
@@ -782,7 +782,7 @@ fn ensure_onboarded() -> Result<()> {
 }
 
 async fn run_poke() -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     let url = format!(
         "http://{}:{}/internal/poke",
         config.gateway.host, config.gateway.port
@@ -805,7 +805,7 @@ async fn run_poke() -> Result<()> {
 }
 
 async fn run_cancel(session: Option<String>) -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     let url = format!(
         "http://{}:{}/internal/cancel",
         config.gateway.host, config.gateway.port
@@ -840,7 +840,7 @@ async fn run_cancel(session: Option<String>) -> Result<()> {
 }
 
 async fn run_away(message: Option<String>) -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     let url = format!(
         "http://{}:{}/internal/away",
         config.gateway.host, config.gateway.port
@@ -870,7 +870,7 @@ async fn run_away(message: Option<String>) -> Result<()> {
 }
 
 async fn run_available() -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     let url = format!(
         "http://{}:{}/internal/available",
         config.gateway.host, config.gateway.port
@@ -940,7 +940,7 @@ fn run_pairing_approve(code: &str) -> Result<()> {
     );
 
     // Send approval notification to the user's channel
-    let config = match borg_core::config::Config::load() {
+    let config = match borg_core::config::Config::load_from_db() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("Failed to load config for approval notification: {e}");
@@ -1052,7 +1052,7 @@ fn run_usage() -> Result<()> {
         }
     }
 
-    let config = borg_core::config::Config::load().unwrap_or_default();
+    let config = borg_core::config::Config::load_from_db().unwrap_or_default();
     let budget_limit = config.budget.monthly_token_limit;
     if budget_limit > 0 {
         let pct = total_tokens as f64 / budget_limit as f64 * 100.0;
@@ -1065,7 +1065,7 @@ fn run_usage() -> Result<()> {
 
 fn run_status() -> Result<()> {
     let now = chrono::Utc::now();
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     let db = borg_core::db::Database::open()?;
 
     // Evolution header
@@ -1123,7 +1123,7 @@ fn format_bar(value: usize, width: usize) -> String {
 }
 
 fn run_status_history() -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     if !config.evolution.enabled {
         println!(
             "Evolution system is disabled. Enable with: borg settings set evolution.enabled true"
@@ -1140,7 +1140,7 @@ fn run_status_history() -> Result<()> {
 }
 
 fn run_status_archetypes() -> Result<()> {
-    let config = borg_core::config::Config::load()?;
+    let config = borg_core::config::Config::load_from_db()?;
     if !config.evolution.enabled {
         println!(
             "Evolution system is disabled. Enable with: borg settings set evolution.enabled true"
@@ -1178,7 +1178,7 @@ fn run_bond_history(count: usize) -> Result<()> {
 }
 
 fn run_doctor() -> Result<()> {
-    let config = borg_core::config::Config::load().unwrap_or_default();
+    let config = borg_core::config::Config::load_from_db().unwrap_or_default();
     let report = borg_core::doctor::run_diagnostics(&config);
     println!("{}", report.format());
     let (_pass, _warn, fail) = report.counts();

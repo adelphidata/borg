@@ -1,5 +1,6 @@
 use anyhow::Result;
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 
 use super::Database;
 
@@ -846,6 +847,72 @@ impl Database {
                 ON workflow_steps(workflow_id, step_index);
             ",
         )?;
+        Ok(())
+    }
+
+    /// V32: Import config.toml into settings table, then rename to .bak.
+    /// This is the migration that moves config from file to DB-only.
+    pub(super) fn migrate_v32(&self) -> Result<()> {
+        use crate::config::Config;
+        use crate::settings::SETTING_REGISTRY;
+
+        let config_path = match Config::data_dir() {
+            Ok(dir) => dir.join("config.toml"),
+            Err(_) => return Ok(()),
+        };
+
+        if !config_path.exists() {
+            return Ok(());
+        }
+
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("V32 migration: cannot read config.toml: {e}");
+                return Ok(());
+            }
+        };
+
+        // Deduplicate TOML table headers before parsing
+        let content = Config::dedup_toml_tables(&content);
+        let file_config: Config = match toml::from_str(&content) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("V32 migration: cannot parse config.toml: {e}");
+                return Ok(());
+            }
+        };
+
+        let default_config = Config::default();
+        let now = chrono::Utc::now().timestamp();
+
+        for &(key, extractor) in SETTING_REGISTRY {
+            let file_val = extractor(&file_config);
+            let default_val = extractor(&default_config);
+            if file_val != default_val && !file_val.is_empty() {
+                // Only import if not already set in DB
+                let existing: Option<String> = self
+                    .conn
+                    .prepare("SELECT value FROM settings WHERE key = ?1")
+                    .and_then(|mut stmt| stmt.query_row(params![key], |row| row.get(0)).optional())
+                    .unwrap_or(None);
+                if existing.is_none() {
+                    if let Err(e) = self.conn.execute(
+                        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+                        params![key, file_val, now],
+                    ) {
+                        tracing::warn!("V32 migration: failed to import {key}: {e}");
+                    }
+                }
+            }
+        }
+
+        // Rename config.toml to config.toml.bak
+        let bak_path = config_path.with_extension("toml.bak");
+        if let Err(e) = std::fs::rename(&config_path, &bak_path) {
+            tracing::warn!("V32 migration: could not rename config.toml to .bak: {e}");
+        }
+
         Ok(())
     }
 }

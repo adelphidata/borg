@@ -1,18 +1,16 @@
 //! Settings resolution integration tests.
 //!
-//! Tests the three-layer resolution (DB → config.toml → defaults) using
+//! Tests the two-layer resolution (DB → defaults) using
 //! in-memory SQLite. Validates set/get/unset lifecycle, type validation,
 //! and config application.
 
-use borg_core::config::Config;
 use borg_core::db::Database;
 use borg_core::settings::{SettingSource, SettingsResolver, ALL_SETTING_KEYS};
 
 fn test_resolver() -> SettingsResolver {
     let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
     let db = Database::from_connection(conn).expect("init db");
-    let config = Config::default();
-    SettingsResolver::new(db, config, false)
+    SettingsResolver::new(db)
 }
 
 // ── Test: defaults resolve without DB overrides ──

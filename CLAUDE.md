@@ -128,11 +128,9 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 ### Config
 
-`~/.borg/config.toml` — modularized at `crates/core/src/config/` (mod.rs, llm.rs, gateway.rs, media.rs, security.rs).
+DB-only config — modularized at `crates/core/src/config/` (mod.rs, llm.rs, gateway.rs, media.rs, security.rs). All settings stored in SQLite `settings` table as key-value pairs. Complex types (gateway bindings, fallback chains, credentials) stored as JSON.
 
-Sections: `[llm]`, `[heartbeat]`, `[tools]`, `[sandbox]`, `[memory]`, `[memory.embeddings]`, `[skills]`, `[security]`, `[budget]`, `[browser]`, `[credentials]`, `[gateway]`, `[conversation]`, `[user]`, `[policy]`, `[debug]`, `[web]`, `[tasks]`, `[plugins]`, `[agents]`, `[telemetry]`, `[audio]`, `[tts]`, `[media]`, `[image_gen]`, `[scripts]`, `[compaction]`, `[workflow]`, `[evolution]`, `[identity_override]`.
-
-Three-tier resolution: **Database** → **config.toml** → **compiled defaults**. Settings persisted in SQLite, applied as runtime overrides.
+Two-tier resolution: **Database** → **compiled defaults**. `Config::load_from_db()` builds the runtime Config. `SettingsResolver` provides set/get/unset with validation. No config.toml (V32 migration imports and renames to .bak).
 
 ### Memory
 
@@ -206,12 +204,11 @@ Logs at `~/.borg/logs/`: `tui.log` (TUI session), `daemon.log`/`daemon.err` (dae
 
 ## Adding New Things
 
-### New Setting (4 touch points)
+### New Setting (3 touch points)
 
 1. **`crates/core/src/config/mod.rs`** — Add field to config struct + `apply_setting()` match arm
-2. **`crates/core/src/settings.rs`** — Add key to `ALL_SETTING_KEYS` + `config_value_for_key()` match arm
+2. **`crates/core/src/settings.rs`** — Add entry to `SETTING_REGISTRY` (key + extractor fn)
 3. **`crates/cli/src/tui/settings_popup.rs`** — Add `SettingEntry` to `SETTINGS` array (key, label, kind, category)
-4. Tests in each file verifying parse/resolve/display
 
 `SettingKind` options: Bool (Space toggles), Float (arrows ±0.1), Uint (Enter to edit), Text (Enter to edit), Select (Left/Right cycle).
 

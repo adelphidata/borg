@@ -1,4 +1,4 @@
-//! Settings resolution layer: DB → config.toml → constants.rs defaults.
+//! Settings resolution layer: DB → compiled defaults.
 
 use anyhow::{Context, Result};
 
@@ -9,7 +9,6 @@ use crate::db::Database;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSource {
     Default,
-    ConfigToml,
     Database,
 }
 
@@ -17,7 +16,6 @@ impl std::fmt::Display for SettingSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SettingSource::Default => write!(f, "default"),
-            SettingSource::ConfigToml => write!(f, "toml"),
             SettingSource::Database => write!(f, "db"),
         }
     }
@@ -31,13 +29,13 @@ pub struct SettingInfo {
     pub source: SettingSource,
 }
 
-type SettingExtractor = fn(&Config) -> String;
+pub type SettingExtractor = fn(&Config) -> String;
 
 /// Single source of truth for setting keys and their config extractors.
 ///
 /// Each entry is `(key, extractor_fn)`. `ALL_SETTING_KEYS` and `config_value_for_key()`
 /// are both derived from this table.
-const SETTING_REGISTRY: &[(&str, SettingExtractor)] = &[
+pub const SETTING_REGISTRY: &[(&str, SettingExtractor)] = &[
     ("model", |c| c.llm.model.clone()),
     ("temperature", |c| format!("{}", c.llm.temperature)),
     ("max_tokens", |c| format!("{}", c.llm.max_tokens)),
@@ -128,45 +126,287 @@ const SETTING_REGISTRY: &[(&str, SettingExtractor)] = &[
             .to_string()
     }),
     ("workflow.enabled", |c| c.workflow.enabled.clone()),
+    // ── LLM extended ──
+    ("llm.api_key_env", |c| c.llm.api_key_env.clone()),
+    ("llm.api_key", |c| {
+        c.llm
+            .api_key
+            .as_ref()
+            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
+            .unwrap_or_default()
+    }),
+    ("llm.api_keys", |c| {
+        serde_json::to_string(&c.llm.api_keys).unwrap_or_default()
+    }),
+    ("llm.max_retries", |c| format!("{}", c.llm.max_retries)),
+    ("llm.initial_retry_delay_ms", |c| {
+        format!("{}", c.llm.initial_retry_delay_ms)
+    }),
+    ("llm.request_timeout_ms", |c| {
+        format!("{}", c.llm.request_timeout_ms)
+    }),
+    ("llm.stream_chunk_timeout_secs", |c| {
+        format!("{}", c.llm.stream_chunk_timeout_secs)
+    }),
+    ("llm.base_url", |c| {
+        c.llm.base_url.clone().unwrap_or_default()
+    }),
+    ("llm.thinking", |c| {
+        serde_json::to_string(&c.llm.thinking)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string()
+    }),
+    ("llm.fallback", |c| {
+        serde_json::to_string(&c.llm.fallback).unwrap_or_default()
+    }),
+    ("llm.cache.enabled", |c| format!("{}", c.llm.cache.enabled)),
+    ("llm.cache.ttl", |c| format!("{}", c.llm.cache.ttl)),
+    ("llm.cache.cache_tools", |c| {
+        format!("{}", c.llm.cache.cache_tools)
+    }),
+    ("llm.cache.cache_system", |c| {
+        format!("{}", c.llm.cache.cache_system)
+    }),
+    ("llm.cache.rolling_messages", |c| {
+        format!("{}", c.llm.cache.rolling_messages)
+    }),
+    // ── Tools extended ──
+    ("tools.default_timeout_ms", |c| {
+        format!("{}", c.tools.default_timeout_ms)
+    }),
+    ("tools.conditional_loading", |c| {
+        format!("{}", c.tools.conditional_loading)
+    }),
+    ("tools.compact_schemas", |c| {
+        format!("{}", c.tools.compact_schemas)
+    }),
+    ("tools.policy.profile", |c| c.tools.policy.profile.clone()),
+    ("tools.policy.allow", |c| {
+        serde_json::to_string(&c.tools.policy.allow).unwrap_or_default()
+    }),
+    ("tools.policy.deny", |c| {
+        serde_json::to_string(&c.tools.policy.deny).unwrap_or_default()
+    }),
+    ("tools.policy.subagent_deny", |c| {
+        serde_json::to_string(&c.tools.policy.subagent_deny).unwrap_or_default()
+    }),
+    // ── Heartbeat extended ──
+    ("heartbeat.interval", |c| c.heartbeat.interval.clone()),
+    ("heartbeat.quiet_hours_start", |c| {
+        c.heartbeat.quiet_hours_start.clone().unwrap_or_default()
+    }),
+    ("heartbeat.quiet_hours_end", |c| {
+        c.heartbeat.quiet_hours_end.clone().unwrap_or_default()
+    }),
+    ("heartbeat.cron", |c| {
+        c.heartbeat.cron.clone().unwrap_or_default()
+    }),
+    ("heartbeat.channels", |c| {
+        serde_json::to_string(&c.heartbeat.channels).unwrap_or_default()
+    }),
+    ("heartbeat.recipients", |c| {
+        serde_json::to_string(&c.heartbeat.recipients).unwrap_or_default()
+    }),
+    // ── Conversation extended ──
+    ("conversation.max_history_tokens", |c| {
+        format!("{}", c.conversation.max_history_tokens)
+    }),
+    ("conversation.age_based_degradation", |c| {
+        format!("{}", c.conversation.age_based_degradation)
+    }),
+    // ── User ──
+    ("user.name", |c| c.user.name.clone().unwrap_or_default()),
+    ("user.agent_name", |c| {
+        c.user.agent_name.clone().unwrap_or_default()
+    }),
+    ("user.timezone", |c| {
+        c.user.timezone.clone().unwrap_or_default()
+    }),
+    // ── Web ──
+    ("web.enabled", |c| format!("{}", c.web.enabled)),
+    ("web.search_provider", |c| c.web.search_provider.clone()),
+    // ── Tasks ──
+    ("tasks.max_concurrent", |c| {
+        format!("{}", c.tasks.max_concurrent)
+    }),
+    // ── Gateway extended ──
+    ("gateway.host", |c| c.gateway.host.clone()),
+    ("gateway.port", |c| format!("{}", c.gateway.port)),
+    ("gateway.max_concurrent", |c| {
+        format!("{}", c.gateway.max_concurrent)
+    }),
+    ("gateway.request_timeout_ms", |c| {
+        format!("{}", c.gateway.request_timeout_ms)
+    }),
+    ("gateway.rate_limit_per_minute", |c| {
+        format!("{}", c.gateway.rate_limit_per_minute)
+    }),
+    ("gateway.public_url", |c| {
+        c.gateway.public_url.clone().unwrap_or_default()
+    }),
+    ("gateway.dm_policy", |c| {
+        serde_json::to_string(&c.gateway.dm_policy)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string()
+    }),
+    ("gateway.pairing_ttl_secs", |c| {
+        format!("{}", c.gateway.pairing_ttl_secs)
+    }),
+    ("gateway.group_activation", |c| {
+        serde_json::to_string(&c.gateway.group_activation)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string()
+    }),
+    ("gateway.error_policy", |c| {
+        format!("{}", c.gateway.error_policy)
+    }),
+    ("gateway.error_cooldown_ms", |c| {
+        format!("{}", c.gateway.error_cooldown_ms)
+    }),
+    ("gateway.bindings", |c| {
+        serde_json::to_string(&c.gateway.bindings).unwrap_or_default()
+    }),
+    ("gateway.channel_policies", |c| {
+        serde_json::to_string(&c.gateway.channel_policies).unwrap_or_default()
+    }),
+    ("gateway.auto_reply", |c| {
+        serde_json::to_string(&c.gateway.auto_reply).unwrap_or_default()
+    }),
+    ("gateway.link_understanding", |c| {
+        serde_json::to_string(&c.gateway.link_understanding).unwrap_or_default()
+    }),
+    ("gateway.channel_error_policies", |c| {
+        serde_json::to_string(&c.gateway.channel_error_policies).unwrap_or_default()
+    }),
+    // ── Memory extended ──
+    ("memory.flush_soft_threshold_tokens", |c| {
+        format!("{}", c.memory.flush_soft_threshold_tokens)
+    }),
+    ("memory.chunk_level_selection", |c| {
+        format!("{}", c.memory.chunk_level_selection)
+    }),
+    ("memory.embeddings.enabled", |c| {
+        format!("{}", c.memory.embeddings.enabled)
+    }),
+    ("memory.embeddings.recency_weight", |c| {
+        format!("{}", c.memory.embeddings.recency_weight)
+    }),
+    ("memory.embeddings.chunk_size_tokens", |c| {
+        format!("{}", c.memory.embeddings.chunk_size_tokens)
+    }),
+    ("memory.embeddings.chunk_overlap_tokens", |c| {
+        format!("{}", c.memory.embeddings.chunk_overlap_tokens)
+    }),
+    ("memory.embeddings.bm25_weight", |c| {
+        format!("{}", c.memory.embeddings.bm25_weight)
+    }),
+    ("memory.embeddings.vector_weight", |c| {
+        format!("{}", c.memory.embeddings.vector_weight)
+    }),
+    // ── Security extended ──
+    ("security.blocked_paths", |c| {
+        serde_json::to_string(&c.security.blocked_paths).unwrap_or_default()
+    }),
+    ("security.allowed_paths", |c| {
+        serde_json::to_string(&c.security.allowed_paths).unwrap_or_default()
+    }),
+    ("security.action_limits", |c| {
+        serde_json::to_string(&c.security.action_limits).unwrap_or_default()
+    }),
+    ("security.gateway_action_limits", |c| {
+        serde_json::to_string(&c.security.gateway_action_limits).unwrap_or_default()
+    }),
+    // ── Agents ──
+    ("agents.enabled", |c| format!("{}", c.agents.enabled)),
+    ("agents.max_spawn_depth", |c| {
+        format!("{}", c.agents.max_spawn_depth)
+    }),
+    ("agents.max_children_per_agent", |c| {
+        format!("{}", c.agents.max_children_per_agent)
+    }),
+    ("agents.max_concurrent", |c| {
+        format!("{}", c.agents.max_concurrent)
+    }),
+    // ── Debug ──
+    ("debug.llm_logging", |c| format!("{}", c.debug.llm_logging)),
+    // ── Audio ──
+    ("audio.enabled", |c| format!("{}", c.audio.enabled)),
+    ("audio.models", |c| {
+        serde_json::to_string(&c.audio.models).unwrap_or_default()
+    }),
+    // ── TTS extended ──
+    ("tts.models", |c| {
+        serde_json::to_string(&c.tts.models).unwrap_or_default()
+    }),
+    ("tts.max_text_length", |c| {
+        format!("{}", c.tts.max_text_length)
+    }),
+    ("tts.timeout_ms", |c| format!("{}", c.tts.timeout_ms)),
+    // ── Media ──
+    ("media.max_image_bytes", |c| {
+        format!("{}", c.media.max_image_bytes)
+    }),
+    ("media.compression_enabled", |c| {
+        format!("{}", c.media.compression_enabled)
+    }),
+    ("media.max_dimension_px", |c| {
+        format!("{}", c.media.max_dimension_px)
+    }),
+    // ── Image Gen ──
+    ("image_gen.enabled", |c| format!("{}", c.image_gen.enabled)),
+    ("image_gen.default_size", |c| {
+        c.image_gen.default_size.clone()
+    }),
+    // ── Scripts ──
+    ("scripts.enabled", |c| format!("{}", c.scripts.enabled)),
+    ("scripts.default_timeout_ms", |c| {
+        format!("{}", c.scripts.default_timeout_ms)
+    }),
+    // ── Compaction ──
+    ("compaction.provider", |c| {
+        c.compaction.provider.clone().unwrap_or_default()
+    }),
+    ("compaction.model", |c| {
+        c.compaction.model.clone().unwrap_or_default()
+    }),
+    // ── Plugins ──
+    ("plugins.enabled", |c| format!("{}", c.plugins.enabled)),
+    ("plugins.auto_verify", |c| {
+        format!("{}", c.plugins.auto_verify)
+    }),
+    // ── Credentials (JSON) ──
+    ("credentials", |c| {
+        serde_json::to_string(&c.credentials).unwrap_or_default()
+    }),
 ];
 
 /// All known setting keys, derived from `SETTING_REGISTRY`.
 pub static ALL_SETTING_KEYS: std::sync::LazyLock<Vec<&'static str>> =
     std::sync::LazyLock::new(|| SETTING_REGISTRY.iter().map(|(k, _)| *k).collect());
 
-/// Merges settings from three layers: DB overrides → config.toml → compiled defaults.
+/// Merges settings from two layers: DB overrides → compiled defaults.
 pub struct SettingsResolver {
     db: Database,
-    file_config: Config,
-    has_toml: bool,
 }
 
 impl SettingsResolver {
-    /// Load config from disk and open the database.
+    /// Open the database for settings resolution.
     pub fn load() -> Result<Self> {
-        let config_path = Config::data_dir()?.join("config.toml");
-        let has_toml = config_path.exists();
-        let file_config = Config::load()?;
         let db = Database::open().with_context(|| "Failed to open database for settings")?;
-        Ok(Self {
-            db,
-            file_config,
-            has_toml,
-        })
+        Ok(Self { db })
     }
 
-    /// Build from pre-existing Config and Database.
-    pub fn new(db: Database, file_config: Config, has_toml: bool) -> Self {
-        Self {
-            db,
-            file_config,
-            has_toml,
-        }
+    /// Build from a pre-existing Database.
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
-    /// Resolve a full Config with DB overrides applied on top of file_config.
+    /// Resolve a full Config from defaults + DB overrides.
     pub fn resolve(&self) -> Result<Config> {
-        let mut config = self.file_config.clone();
+        let mut config = Config::default();
         let db_settings = self.db.list_settings()?;
         for (key, value, _) in &db_settings {
             // Silently skip keys that no longer exist
@@ -179,13 +419,13 @@ impl SettingsResolver {
     /// Returns the confirmation string from `apply_setting`.
     pub fn set(&self, key: &str, value: &str) -> Result<String> {
         // Validate by applying to a throwaway config
-        let mut scratch = self.file_config.clone();
+        let mut scratch = Config::default();
         let confirmation = scratch.apply_setting(key, value)?;
         self.db.set_setting(key, value)?;
         Ok(confirmation)
     }
 
-    /// Remove a DB override, reverting to TOML/default value.
+    /// Remove a DB override, reverting to default value.
     pub fn unset(&self, key: &str) -> Result<()> {
         self.db.delete_setting(key)?;
         Ok(())
@@ -198,20 +438,9 @@ impl SettingsResolver {
             return Ok((value, SettingSource::Database));
         }
 
-        // Read from file config
-        let default_config = Config::default();
-        let file_value = config_value_for_key(&self.file_config, key);
-        let default_value = config_value_for_key(&default_config, key);
-
-        match file_value {
-            Some(val) => {
-                let source = if self.has_toml && default_value.as_deref() != Some(&val) {
-                    SettingSource::ConfigToml
-                } else {
-                    SettingSource::Default
-                };
-                Ok((val, source))
-            }
+        // Fall back to default
+        match config_value_for_key(&Config::default(), key) {
+            Some(val) => Ok((val, SettingSource::Default)),
             None => anyhow::bail!("Unknown setting key: {key}"),
         }
     }
@@ -254,8 +483,7 @@ mod tests {
     fn test_resolver() -> SettingsResolver {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         let db = Database::from_connection(conn).expect("db setup");
-        let config = Config::default();
-        SettingsResolver::new(db, config, false)
+        SettingsResolver::new(db)
     }
 
     #[test]
@@ -340,5 +568,107 @@ mod tests {
         assert!(all
             .iter()
             .any(|s| s.key == "conversation.tool_output_max_tokens"));
+    }
+
+    #[test]
+    fn json_secret_ref_round_trip() {
+        let resolver = test_resolver();
+        let json =
+            r#"{"source":"exec","command":"security","args":["find-generic-password","-w"]}"#;
+        resolver.set("llm.api_key", json).unwrap();
+        let config = resolver.resolve().unwrap();
+        assert!(config.llm.api_key.is_some());
+        let (val, source) = resolver.get_with_source("llm.api_key").unwrap();
+        assert_eq!(source, SettingSource::Database);
+        assert!(val.contains("exec"));
+    }
+
+    #[test]
+    fn json_gateway_bindings_round_trip() {
+        let resolver = test_resolver();
+        let json = r#"[{"channel":"telegram","provider":"anthropic","model":"claude-sonnet-4"}]"#;
+        resolver.set("gateway.bindings", json).unwrap();
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.gateway.bindings.len(), 1);
+        assert_eq!(config.gateway.bindings[0].channel, "telegram");
+    }
+
+    #[test]
+    fn json_credentials_round_trip() {
+        let resolver = test_resolver();
+        let json = r#"{"SLACK_TOKEN":"SLACK_TOKEN"}"#;
+        resolver.set("credentials", json).unwrap();
+        let config = resolver.resolve().unwrap();
+        assert!(config.credentials.contains_key("SLACK_TOKEN"));
+    }
+
+    #[test]
+    fn user_name_round_trip() {
+        let resolver = test_resolver();
+        resolver.set("user.name", "mike").unwrap();
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.user.name.as_deref(), Some("mike"));
+    }
+
+    #[test]
+    fn llm_thinking_round_trip() {
+        let resolver = test_resolver();
+        resolver.set("llm.thinking", "high").unwrap();
+        let config = resolver.resolve().unwrap();
+        assert!(config.llm.thinking.is_enabled());
+    }
+
+    #[test]
+    fn tools_policy_allow_round_trip() {
+        let resolver = test_resolver();
+        let json = r#"["group:git","browser"]"#;
+        resolver.set("tools.policy.allow", json).unwrap();
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.tools.policy.allow, vec!["group:git", "browser"]);
+    }
+
+    #[test]
+    fn heartbeat_channels_round_trip() {
+        let resolver = test_resolver();
+        resolver
+            .set("heartbeat.channels", r#"["telegram","slack"]"#)
+            .unwrap();
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.heartbeat.channels, vec!["telegram", "slack"]);
+    }
+
+    #[test]
+    fn security_blocked_paths_round_trip() {
+        let resolver = test_resolver();
+        resolver
+            .set("security.blocked_paths", r#"[".ssh",".env"]"#)
+            .unwrap();
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.security.blocked_paths, vec![".ssh", ".env"]);
+    }
+
+    #[test]
+    fn invalid_json_setting_errors() {
+        let resolver = test_resolver();
+        assert!(resolver.set("gateway.bindings", "not json").is_err());
+        assert!(resolver.set("llm.api_key", "{bad}").is_err());
+    }
+
+    #[test]
+    fn new_scalar_settings_round_trip() {
+        let resolver = test_resolver();
+
+        resolver.set("llm.max_retries", "5").unwrap();
+        resolver.set("gateway.port", "8080").unwrap();
+        resolver.set("agents.enabled", "false").unwrap();
+        resolver.set("debug.llm_logging", "true").unwrap();
+        resolver.set("web.enabled", "false").unwrap();
+
+        let config = resolver.resolve().unwrap();
+        assert_eq!(config.llm.max_retries, 5);
+        assert_eq!(config.gateway.port, 8080);
+        assert!(!config.agents.enabled);
+        assert!(config.debug.llm_logging);
+        assert!(!config.web.enabled);
     }
 }

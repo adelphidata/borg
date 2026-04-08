@@ -21,10 +21,10 @@ use tracing::warn;
 use crate::policy::ExecutionPolicy;
 use crate::provider::Provider;
 
-/// Top-level configuration, loaded from `~/.borg/config.toml`.
+/// Top-level configuration, loaded from SQLite settings DB.
 ///
-/// All sections default to sensible values — a completely empty TOML file is valid.
-/// Parsed from TOML with `serde`, then runtime overrides applied from the settings DB.
+/// All sections default to sensible values. Settings are stored in the
+/// `settings` table as key-value pairs and applied via `apply_setting()`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// LLM provider, model, temperature, retries, and fallback chain.
@@ -253,14 +253,22 @@ impl Config {
         Ok(Self::data_dir()?.join("MEMORY.md"))
     }
 
-    /// Load config from the default path (`~/.borg/config.toml`).
-    pub fn load() -> Result<Self> {
-        let config_path = Self::data_dir()?.join("config.toml");
-        Self::load_from(&config_path)
+    /// Load config from the database (DB overrides + compiled defaults).
+    pub fn load_from_db() -> Result<Self> {
+        let db = crate::db::Database::open()?;
+        let mut config = Self::default();
+        for (key, value, _) in db.list_settings()? {
+            if let Err(e) = config.apply_setting(&key, &value) {
+                tracing::warn!("Ignoring invalid setting {key}: {e}");
+            }
+        }
+        config.validate()?;
+        Ok(config)
     }
 
-    /// Load config from a specific file path.
-    pub fn load_from(path: &Path) -> Result<Self> {
+    /// Load config from a specific TOML file path (used by tests).
+    #[allow(dead_code)]
+    pub(crate) fn load_from(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -295,7 +303,7 @@ impl Config {
     /// Remove duplicate TOML table headers that would cause parse errors.
     /// Keeps the first occurrence of each `[table]` header and drops subsequent
     /// duplicates along with their content until the next section header.
-    fn dedup_toml_tables(input: &str) -> String {
+    pub(crate) fn dedup_toml_tables(input: &str) -> String {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         let mut output = String::with_capacity(input.len());
@@ -319,15 +327,6 @@ impl Config {
             output.push('\n');
         }
         output
-    }
-
-    /// Serialize and write config to `~/.borg/config.toml`.
-    pub fn save(&self) -> Result<()> {
-        let config_path = Self::data_dir()?.join("config.toml");
-        let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
-        std::fs::write(&config_path, content)
-            .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-        Ok(())
     }
 
     /// Format current settings as a human-readable string.
@@ -529,6 +528,505 @@ impl Config {
                     "Invalid value for workflow.enabled: {value}. Use 'auto', 'on', or 'off'."
                 ),
             },
+
+            // ── LLM extended ──
+            "llm.api_key_env" => {
+                self.llm.api_key_env = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+            "llm.api_key" => {
+                if value.is_empty() {
+                    self.llm.api_key = None;
+                } else {
+                    self.llm.api_key = Some(
+                        serde_json::from_str(value)
+                            .with_context(|| format!("Invalid JSON for {key}"))?,
+                    );
+                }
+                Ok(format!("{key} = (set)"))
+            }
+            "llm.api_keys" => {
+                self.llm.api_keys = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = ({} keys)", self.llm.api_keys.len()))
+            }
+            "llm.max_retries" => {
+                self.llm.max_retries = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.max_retries))
+            }
+            "llm.initial_retry_delay_ms" => {
+                self.llm.initial_retry_delay_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.initial_retry_delay_ms))
+            }
+            "llm.request_timeout_ms" => {
+                self.llm.request_timeout_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.request_timeout_ms))
+            }
+            "llm.stream_chunk_timeout_secs" => {
+                self.llm.stream_chunk_timeout_secs = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.stream_chunk_timeout_secs))
+            }
+            "llm.base_url" => {
+                self.llm.base_url = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "llm.thinking" => {
+                self.llm.thinking =
+                    serde_json::from_str(&format!("\"{value}\"")).with_context(|| {
+                        format!("Invalid thinking level: {value}. Use off/low/medium/high/xhigh")
+                    })?;
+                Ok(format!("{key} = {value}"))
+            }
+            "llm.fallback" => {
+                self.llm.fallback = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = ({} providers)", self.llm.fallback.len()))
+            }
+            "llm.cache.enabled" => {
+                self.llm.cache.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.cache.enabled))
+            }
+            "llm.cache.ttl" => {
+                self.llm.cache.ttl =
+                    serde_json::from_str(&format!("\"{value}\"")).with_context(|| {
+                        format!("Invalid cache TTL: {value}. Use auto/five_min/one_hour")
+                    })?;
+                Ok(format!("{key} = {value}"))
+            }
+            "llm.cache.cache_tools" => {
+                self.llm.cache.cache_tools = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.cache.cache_tools))
+            }
+            "llm.cache.cache_system" => {
+                self.llm.cache.cache_system = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.cache.cache_system))
+            }
+            "llm.cache.rolling_messages" => {
+                self.llm.cache.rolling_messages = parse_value::<u8>(value, key)?;
+                Ok(format!("{key} = {}", self.llm.cache.rolling_messages))
+            }
+
+            // ── Tools extended ──
+            "tools.default_timeout_ms" => {
+                self.tools.default_timeout_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.tools.default_timeout_ms))
+            }
+            "tools.conditional_loading" => {
+                self.tools.conditional_loading = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.tools.conditional_loading))
+            }
+            "tools.compact_schemas" => {
+                self.tools.compact_schemas = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.tools.compact_schemas))
+            }
+            "tools.policy.profile" => {
+                self.tools.policy.profile = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+            "tools.policy.allow" => {
+                self.tools.policy.allow = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+            "tools.policy.deny" => {
+                self.tools.policy.deny = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+            "tools.policy.subagent_deny" => {
+                self.tools.policy.subagent_deny = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+
+            // ── Heartbeat extended ──
+            "heartbeat.interval" => {
+                self.heartbeat.interval = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+            "heartbeat.quiet_hours_start" => {
+                self.heartbeat.quiet_hours_start = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "heartbeat.quiet_hours_end" => {
+                self.heartbeat.quiet_hours_end = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "heartbeat.cron" => {
+                self.heartbeat.cron = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "heartbeat.channels" => {
+                self.heartbeat.channels = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+            "heartbeat.recipients" => {
+                self.heartbeat.recipients = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+
+            // ── Conversation extended ──
+            "conversation.max_history_tokens" => {
+                self.conversation.max_history_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!("{key} = {}", self.conversation.max_history_tokens))
+            }
+            "conversation.tool_output_max_tokens" => {
+                self.conversation.tool_output_max_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.conversation.tool_output_max_tokens
+                ))
+            }
+            "conversation.compaction_marker_tokens" => {
+                self.conversation.compaction_marker_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.conversation.compaction_marker_tokens
+                ))
+            }
+            "conversation.max_transcript_chars" => {
+                self.conversation.max_transcript_chars = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.conversation.max_transcript_chars
+                ))
+            }
+            "conversation.age_based_degradation" => {
+                self.conversation.age_based_degradation = parse_value::<bool>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.conversation.age_based_degradation
+                ))
+            }
+
+            // ── User ──
+            "user.name" => {
+                self.user.name = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "user.agent_name" => {
+                self.user.agent_name = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "user.timezone" => {
+                self.user.timezone = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+
+            // ── Web ──
+            "web.enabled" => {
+                self.web.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.web.enabled))
+            }
+            "web.search_provider" => {
+                self.web.search_provider = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+
+            // ── Tasks ──
+            "tasks.max_concurrent" => {
+                self.tasks.max_concurrent = parse_value::<usize>(value, key)?;
+                Ok(format!("{key} = {}", self.tasks.max_concurrent))
+            }
+
+            // ── Gateway extended ──
+            "gateway.host" => {
+                self.gateway.host = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+            "gateway.port" => {
+                self.gateway.port = parse_value::<u16>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.port))
+            }
+            "gateway.max_concurrent" => {
+                self.gateway.max_concurrent = parse_value::<usize>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.max_concurrent))
+            }
+            "gateway.request_timeout_ms" => {
+                self.gateway.request_timeout_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.request_timeout_ms))
+            }
+            "gateway.rate_limit_per_minute" => {
+                self.gateway.rate_limit_per_minute = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.rate_limit_per_minute))
+            }
+            "gateway.public_url" => {
+                self.gateway.public_url = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "gateway.dm_policy" => {
+                self.gateway.dm_policy = serde_json::from_str(&format!("\"{value}\""))
+                    .with_context(|| {
+                        format!("Invalid DM policy: {value}. Use pairing/open/disabled")
+                    })?;
+                Ok(format!("{key} = {value}"))
+            }
+            "gateway.pairing_ttl_secs" => {
+                self.gateway.pairing_ttl_secs = parse_value::<i64>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.pairing_ttl_secs))
+            }
+            "gateway.group_activation" => {
+                self.gateway.group_activation = serde_json::from_str(&format!("\"{value}\""))
+                    .with_context(|| {
+                        format!("Invalid activation mode: {value}. Use always/mention")
+                    })?;
+                Ok(format!("{key} = {value}"))
+            }
+            "gateway.error_policy" => {
+                self.gateway.error_policy = value.parse()?;
+                Ok(format!("{key} = {value}"))
+            }
+            "gateway.error_cooldown_ms" => {
+                self.gateway.error_cooldown_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.gateway.error_cooldown_ms))
+            }
+            "gateway.bindings" => {
+                self.gateway.bindings = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!(
+                    "{key} = ({} bindings)",
+                    self.gateway.bindings.len()
+                ))
+            }
+            "gateway.channel_policies" => {
+                self.gateway.channel_policies = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+            "gateway.auto_reply" => {
+                self.gateway.auto_reply = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+            "gateway.link_understanding" => {
+                self.gateway.link_understanding = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+            "gateway.channel_error_policies" => {
+                self.gateway.channel_error_policies = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+
+            // ── Memory extended ──
+            "memory.flush_soft_threshold_tokens" => {
+                self.memory.flush_soft_threshold_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.memory.flush_soft_threshold_tokens
+                ))
+            }
+            "memory.chunk_level_selection" => {
+                self.memory.chunk_level_selection = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.memory.chunk_level_selection))
+            }
+            "memory.embeddings.enabled" => {
+                self.memory.embeddings.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.memory.embeddings.enabled))
+            }
+            "memory.embeddings.recency_weight" => {
+                self.memory.embeddings.recency_weight = parse_range(value, key, 0.0_f32, 1.0)?;
+                Ok(format!("{key} = {}", self.memory.embeddings.recency_weight))
+            }
+            "memory.embeddings.chunk_size_tokens" => {
+                self.memory.embeddings.chunk_size_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.memory.embeddings.chunk_size_tokens
+                ))
+            }
+            "memory.embeddings.chunk_overlap_tokens" => {
+                self.memory.embeddings.chunk_overlap_tokens = parse_value::<usize>(value, key)?;
+                Ok(format!(
+                    "{key} = {}",
+                    self.memory.embeddings.chunk_overlap_tokens
+                ))
+            }
+            "memory.embeddings.bm25_weight" => {
+                self.memory.embeddings.bm25_weight = parse_range(value, key, 0.0_f32, 1.0)?;
+                Ok(format!("{key} = {}", self.memory.embeddings.bm25_weight))
+            }
+            "memory.embeddings.vector_weight" => {
+                self.memory.embeddings.vector_weight = parse_range(value, key, 0.0_f32, 1.0)?;
+                Ok(format!("{key} = {}", self.memory.embeddings.vector_weight))
+            }
+
+            // ── Security extended ──
+            "security.blocked_paths" => {
+                self.security.blocked_paths = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+            "security.allowed_paths" => {
+                self.security.allowed_paths = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = {value}"))
+            }
+            "security.action_limits" => {
+                self.security.action_limits = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+            "security.gateway_action_limits" => {
+                self.security.gateway_action_limits = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = (set)"))
+            }
+
+            // ── Agents ──
+            "agents.enabled" => {
+                self.agents.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.agents.enabled))
+            }
+            "agents.max_spawn_depth" => {
+                self.agents.max_spawn_depth = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.agents.max_spawn_depth))
+            }
+            "agents.max_children_per_agent" => {
+                self.agents.max_children_per_agent = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.agents.max_children_per_agent))
+            }
+            "agents.max_concurrent" => {
+                self.agents.max_concurrent = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.agents.max_concurrent))
+            }
+
+            // ── Debug ──
+            "debug.llm_logging" => {
+                self.debug.llm_logging = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.debug.llm_logging))
+            }
+
+            // ── Audio ──
+            "audio.enabled" => {
+                self.audio.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.audio.enabled))
+            }
+            "audio.models" => {
+                self.audio.models = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = ({} models)", self.audio.models.len()))
+            }
+
+            // ── TTS extended ──
+            "tts.models" => {
+                self.tts.models = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = ({} models)", self.tts.models.len()))
+            }
+            "tts.max_text_length" => {
+                self.tts.max_text_length = parse_value::<usize>(value, key)?;
+                Ok(format!("{key} = {}", self.tts.max_text_length))
+            }
+            "tts.timeout_ms" => {
+                self.tts.timeout_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.tts.timeout_ms))
+            }
+
+            // ── Media ──
+            "media.max_image_bytes" => {
+                self.media.max_image_bytes = parse_value::<usize>(value, key)?;
+                Ok(format!("{key} = {}", self.media.max_image_bytes))
+            }
+            "media.compression_enabled" => {
+                self.media.compression_enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.media.compression_enabled))
+            }
+            "media.max_dimension_px" => {
+                self.media.max_dimension_px = parse_value::<u32>(value, key)?;
+                Ok(format!("{key} = {}", self.media.max_dimension_px))
+            }
+
+            // ── Image Gen ──
+            "image_gen.enabled" => {
+                self.image_gen.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.image_gen.enabled))
+            }
+            "image_gen.default_size" => {
+                self.image_gen.default_size = value.to_string();
+                Ok(format!("{key} = {value}"))
+            }
+
+            // ── Scripts ──
+            "scripts.enabled" => {
+                self.scripts.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.scripts.enabled))
+            }
+            "scripts.default_timeout_ms" => {
+                self.scripts.default_timeout_ms = parse_value::<u64>(value, key)?;
+                Ok(format!("{key} = {}", self.scripts.default_timeout_ms))
+            }
+
+            // ── Compaction ──
+            "compaction.provider" => {
+                self.compaction.provider = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+            "compaction.model" => {
+                self.compaction.model = if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                Ok(format!("{key} = {value}"))
+            }
+
+            // ── Plugins ──
+            "plugins.enabled" => {
+                self.plugins.enabled = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.plugins.enabled))
+            }
+            "plugins.auto_verify" => {
+                self.plugins.auto_verify = parse_value::<bool>(value, key)?;
+                Ok(format!("{key} = {}", self.plugins.auto_verify))
+            }
+
+            // ── Credentials (JSON) ──
+            "credentials" => {
+                self.credentials = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                Ok(format!("{key} = ({} entries)", self.credentials.len()))
+            }
+
             _ => anyhow::bail!(
                 "Unknown setting: {key}\nAvailable: {}",
                 crate::settings::ALL_SETTING_KEYS.join(", ")
