@@ -7,7 +7,7 @@ fn default_config_values() {
     let cfg = Config::default();
     assert!(cfg.llm.provider.is_none());
     assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
-    assert_eq!(cfg.llm.model, "anthropic/claude-sonnet-4");
+    assert_eq!(cfg.llm.model, "");
     assert!((cfg.llm.temperature - 0.7).abs() < f32::EPSILON);
     assert_eq!(cfg.llm.max_tokens, 4096);
     assert!(cfg.llm.base_url.is_none());

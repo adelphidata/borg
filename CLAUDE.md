@@ -164,7 +164,7 @@ Three modes (config, `/mode` TUI, `--mode` CLI): **Default** (asks questions), *
 
 ### Workflows
 
-Durable multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn with prior outputs injected. Persists in SQLite — survives crashes/restarts. Only Opus 4.6 skips workflows (`workflow.enabled = "auto"`). Key files: `crates/core/src/workflow/`, `crates/core/src/db/workflow.rs`.
+Durable multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn with prior outputs injected. Persists in SQLite — survives crashes/restarts. All Claude models skip workflows (`workflow.enabled = "auto"`). Key files: `crates/core/src/workflow/`, `crates/core/src/db/workflow.rs`.
 
 ### Heartbeat
 

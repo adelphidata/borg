@@ -44,6 +44,7 @@ pub mod step_status {
 /// Check whether workflow orchestration should be active for the current config.
 ///
 /// Resolution: `"on"` → true, `"off"` → false, `"auto"` → model heuristic.
+/// All Claude models are excluded in auto mode; workflows target non-Claude models.
 pub fn workflows_active(config: &Config) -> bool {
     match config.workflow.enabled.as_str() {
         "on" => true,

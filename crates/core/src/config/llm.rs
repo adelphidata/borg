@@ -196,7 +196,7 @@ impl Default for LlmConfig {
             api_key_env: "OPENROUTER_API_KEY".into(),
             api_key: None,
             api_keys: Vec::new(),
-            model: "anthropic/claude-sonnet-4".into(),
+            model: String::new(),
             temperature: 0.7,
             max_tokens: 4096,
             max_retries: 3,
@@ -361,7 +361,7 @@ mod tests {
         let cfg = LlmConfig::default();
         assert_eq!(cfg.provider, None);
         assert_eq!(cfg.api_key_env, "OPENROUTER_API_KEY");
-        assert_eq!(cfg.model, "anthropic/claude-sonnet-4");
+        assert_eq!(cfg.model, "");
         assert!((cfg.temperature - 0.7).abs() < f32::EPSILON);
         assert_eq!(cfg.max_tokens, 4096);
         assert_eq!(cfg.max_retries, 3);

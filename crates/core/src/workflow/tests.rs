@@ -740,9 +740,9 @@ fn test_workflows_active_auto_uses_model_heuristic() {
     config.llm.model = "claude-opus-4".to_string();
     assert!(!crate::workflow::workflows_active(&config));
 
-    // Sonnet → workflows
+    // Sonnet → no workflows (all Claude models skip)
     config.llm.model = "claude-sonnet-4".to_string();
-    assert!(crate::workflow::workflows_active(&config));
+    assert!(!crate::workflow::workflows_active(&config));
 
     // GPT-4o → workflows
     config.llm.model = "gpt-4o".to_string();

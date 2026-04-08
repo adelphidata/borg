@@ -1,22 +1,23 @@
 //! Model tiering for workflow auto-enable.
 //!
-//! Only Claude Opus 4.6 is considered strong enough to handle complex multi-step
-//! tasks without workflow scaffolding. All other models get workflows enabled by
-//! default. Users can override via `workflow.enabled = "on"` or `"off"` in settings.
+//! All Claude models (Anthropic native and via OpenRouter) are considered strong
+//! enough to handle complex multi-step tasks without workflow scaffolding.
+//! All other models get workflows enabled by default.
+//! Users can override via `workflow.enabled = "on"` or `"off"` in settings.
 
 /// Model prefixes that do NOT need workflow scaffolding.
-/// Currently only Opus 4.6 — the only model proven to reliably manage
-/// long-running multi-step tasks without explicit structure.
-const STRONG_PREFIXES: &[&str] = &["claude-opus-4", "anthropic/claude-opus-4"];
+/// All Claude models are exempt — they reliably manage long-running
+/// multi-step tasks without explicit structure.
+const NO_WORKFLOW_PREFIXES: &[&str] = &["claude-", "anthropic/claude-"];
 
 /// Returns `true` if the given model needs workflow scaffolding.
 ///
-/// Only Opus 4.6 returns `false`. Everything else — Sonnet, GPT-4o, open-source
+/// All Claude models return `false`. Everything else — GPT, open-source
 /// models, unknown models — returns `true`.
 pub fn model_needs_workflows(model: &str) -> bool {
     let lower = model.to_lowercase();
 
-    for prefix in STRONG_PREFIXES {
+    for prefix in NO_WORKFLOW_PREFIXES {
         if lower.starts_with(prefix) {
             return false;
         }
@@ -31,32 +32,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_opus_no_workflows() {
-        let strong = [
+    fn test_claude_models_no_workflows() {
+        let models = [
             "claude-opus-4",
             "claude-opus-4-20250514",
+            "claude-sonnet-4",
+            "claude-sonnet-4-20250514",
+            "claude-haiku-4",
+            "claude-haiku-4-5",
+            "claude-3.5-sonnet",
+            "claude-3.5-haiku",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
             "anthropic/claude-opus-4",
             "anthropic/claude-opus-4-20250514",
-        ];
-        for model in strong {
-            assert!(
-                !model_needs_workflows(model),
-                "Expected {model} to NOT need workflows (Opus 4.6)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_other_claude_models_need_workflows() {
-        let models = [
-            "claude-sonnet-4-20250514",
-            "anthropic/claude-sonnet-4-20250514",
-            "claude-haiku-3.5",
+            "anthropic/claude-sonnet-4",
+            "anthropic/claude-haiku-4",
         ];
         for model in models {
             assert!(
-                model_needs_workflows(model),
-                "Expected {model} to need workflows"
+                !model_needs_workflows(model),
+                "Expected {model} to NOT need workflows (Claude model)"
             );
         }
     }
@@ -108,7 +104,8 @@ mod tests {
     #[test]
     fn test_case_insensitive() {
         assert!(!model_needs_workflows("Claude-Opus-4"));
+        assert!(!model_needs_workflows("Claude-Sonnet-4"));
+        assert!(!model_needs_workflows("Claude-Haiku-4"));
         assert!(model_needs_workflows("GPT-4O"));
-        assert!(model_needs_workflows("Claude-Sonnet-4"));
     }
 }

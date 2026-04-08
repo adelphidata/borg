@@ -93,7 +93,7 @@ Actions: `create`, `list`, `get`, `cancel`
 
 | Config value | Behavior |
 |-------------|----------|
-| `"auto"` (default) | Opus 4.6: off. Everything else: on. |
+| `"auto"` (default) | All Claude models: off. Everything else: on. |
 | `"on"` | Always enabled, all models see workflow option |
 | `"off"` | Never enabled, workflow type hidden from tool schema |
 
