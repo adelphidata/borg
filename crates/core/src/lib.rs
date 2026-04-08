@@ -117,6 +117,8 @@ pub mod tokenizer;
 pub mod tool_catalog;
 /// Core tool definitions sent to the LLM.
 pub mod tool_definitions;
+/// Tool dispatch helpers (write_memory effects, multi-agent routing).
+pub(crate) mod tool_dispatch;
 /// Tool execution dispatch and result handling.
 pub mod tool_handlers;
 /// Tool access policy (allow/deny lists, profiles).

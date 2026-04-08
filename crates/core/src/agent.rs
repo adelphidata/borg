@@ -36,7 +36,10 @@ use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition,
 use std::sync::LazyLock;
 
 /// Spawn a background task that logs panics instead of silently swallowing them.
-fn spawn_logged(name: &'static str, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+pub(crate) fn spawn_logged(
+    name: &'static str,
+    fut: impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let handle = tokio::spawn(fut);
     tokio::spawn(async move {
         if let Err(e) = handle.await {
@@ -1775,68 +1778,53 @@ Rules:
             }
         };
 
-        let text_result: Result<String> = match name {
-            "write_memory" => {
-                let result = tool_handlers::handle_write_memory(&args);
-                // Invalidate identity cache if IDENTITY.md was written
-                if result.is_ok() {
-                    let target = args["filename"].as_str().unwrap_or_default();
-                    if target == "IDENTITY.md" {
-                        self.cached_identity = None;
-                    }
-                }
-                if result.is_ok() && self.config.memory.embeddings.enabled {
-                    let config = Arc::clone(&self.config_arc);
-                    let filename = args["filename"].as_str().unwrap_or_default().to_string();
-                    let scope = args["scope"].as_str().unwrap_or("global").to_string();
-                    let full_content = match crate::memory::read_memory(&filename) {
-                        Ok(content) => crate::secrets::redact_secrets(&content),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read memory file {filename} for embedding: {e}"
-                            );
-                            String::new()
-                        }
-                    };
-                    spawn_logged("embed_memory_write", async move {
-                        // Generate whole-file embedding (legacy, for backward compat)
-                        if let Err(e) = crate::embeddings::embed_memory_file(
-                            &config,
-                            &filename,
-                            &full_content,
-                            &scope,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Failed to embed memory {filename}: {e}");
-                        }
-                        // Also generate chunked embeddings for hybrid search
-                        if let Err(e) = crate::embeddings::embed_memory_file_chunked(
-                            &config,
-                            &filename,
-                            &full_content,
-                            &scope,
-                        )
-                        .await
-                        {
-                            tracing::warn!("Failed to chunk-embed memory {filename}: {e}");
-                        }
-                    });
-                }
-                result
+        // Tools that return ToolOutput directly (may contain multimodal content)
+        match name {
+            "read_file" => return tool_handlers::handle_read_file(&args, &self.config),
+            "browser" => {
+                return tool_handlers::handle_browser(
+                    &args,
+                    &self.config,
+                    &mut self.browser_session,
+                )
+                .await;
             }
+            "text_to_speech" => {
+                if let Some(ref synth) = self.tts_synthesizer {
+                    return Ok(tool_handlers::handle_text_to_speech(&args, synth).await);
+                }
+                return Ok(ToolOutput::Text(
+                    "TTS is not configured. Enable it via: borg settings set tts.enabled true"
+                        .into(),
+                ));
+            }
+            "request_user_input" => {
+                return tool_handlers::handle_request_user_input(&args, event_tx).await;
+            }
+            _ => {}
+        }
+
+        // Tools that return Result<String> (wrapped to ToolOutput::Text below)
+        let text_result: Result<String> = match name {
+            // Memory
+            "write_memory" => crate::tool_dispatch::handle_write_memory_with_effects(
+                &args,
+                &self.config,
+                &self.config_arc,
+                &mut self.cached_identity,
+            ),
             "read_memory" => tool_handlers::handle_read_memory(&args),
             "memory_search" => tool_handlers::handle_memory_search(&args, &self.config).await,
-            // Consolidated list tool
+            // Resource listing
             "list" => tool_handlers::handle_list(&args, &self.config, self.agent_control.as_ref()),
-            // Legacy aliases for list
             "list_skills" => tool_handlers::handle_list_skills(&self.config),
             "list_channels" => tool_handlers::handle_list_channels(&self.config),
-            // Consolidated apply_patch with target param
+            // File operations
             "apply_patch" => tool_handlers::handle_apply_patch_unified(&args, &self.config),
-            // Legacy aliases for patch tools
             "apply_skill_patch" => tool_handlers::handle_apply_skill_patch(&args),
             "create_channel" => tool_handlers::handle_create_channel(&args),
+            "list_dir" => tool_handlers::handle_list_dir(&args, &self.config),
+            // Shell & web
             "run_shell" => {
                 tool_handlers::handle_run_shell(
                     &args,
@@ -1849,80 +1837,28 @@ Rules:
             }
             "web_fetch" => tool_handlers::handle_web_fetch(&args, &self.config).await,
             "web_search" => tool_handlers::handle_web_search(&args, &self.config).await,
+            // Scheduling & projects
             "schedule" | "manage_tasks" | "manage_cron" => {
                 tool_handlers::handle_schedule(&args, &self.config)
             }
             "projects" => tool_handlers::handle_projects(&args, &self.config),
-            "read_file" => {
-                return tool_handlers::handle_read_file(&args, &self.config);
-            }
-            "list_dir" => tool_handlers::handle_list_dir(&args, &self.config),
-            "browser" => {
-                return tool_handlers::handle_browser(
-                    &args,
-                    &self.config,
-                    &mut self.browser_session,
-                )
-                .await;
-            }
+            // Media
             "generate_image" => tool_handlers::handle_generate_image(&args, &self.config).await,
-            "text_to_speech" => {
-                if let Some(ref synth) = self.tts_synthesizer {
-                    return Ok(tool_handlers::handle_text_to_speech(&args, synth).await);
-                }
-                Ok(
-                    "TTS is not configured. Enable it via: borg settings set tts.enabled true"
-                        .into(),
+            // Multi-agent tools
+            name @ ("spawn_agent" | "send_to_agent" | "wait_for_agent" | "list_agents"
+            | "close_agent" | "manage_roles") => {
+                match crate::tool_dispatch::try_handle_multi_agent_tool(
+                    name,
+                    &args,
+                    &mut self.agent_control,
+                    &self.config,
+                    &self.history,
                 )
-            }
-            "spawn_agent" => {
-                if let Some(ref mut ctrl) = self.agent_control {
-                    let history = if args["fork_context"].as_bool().unwrap_or(false) {
-                        Some(self.history.as_slice())
-                    } else {
-                        None
-                    };
-                    crate::multi_agent::tools::handle_spawn_agent(
-                        &args,
-                        ctrl,
-                        &self.config,
-                        history,
-                    )
-                    .await
-                } else {
-                    Ok("Error: Multi-agent system is not enabled.".to_string())
+                .await
+                {
+                    Some(result) => result,
+                    None => Err(anyhow::anyhow!("Unknown tool: {name}")),
                 }
-            }
-            "send_to_agent" => {
-                // send_to_agent is not yet implemented (messages are silently dropped).
-                // Disabled until the receiving end in run_sub_agent properly handles additional messages.
-                Err(anyhow::anyhow!("send_to_agent is not yet implemented"))
-            }
-            "wait_for_agent" => {
-                if let Some(ref mut ctrl) = self.agent_control {
-                    crate::multi_agent::tools::handle_wait_for_agent(&args, ctrl).await
-                } else {
-                    Ok("Error: Multi-agent system is not enabled.".to_string())
-                }
-            }
-            "list_agents" => {
-                // Legacy alias — prefer `list` with `what: "agents"`
-                if let Some(ref ctrl) = self.agent_control {
-                    crate::multi_agent::tools::handle_list_agents(ctrl)
-                } else {
-                    Ok("Error: Multi-agent system is not enabled.".to_string())
-                }
-            }
-            "close_agent" => {
-                if let Some(ref mut ctrl) = self.agent_control {
-                    crate::multi_agent::tools::handle_close_agent(&args, ctrl)
-                } else {
-                    Ok("Error: Multi-agent system is not enabled.".to_string())
-                }
-            }
-            "manage_roles" => crate::multi_agent::tools::handle_manage_roles(&args),
-            "request_user_input" => {
-                return tool_handlers::handle_request_user_input(&args, event_tx).await;
             }
             _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
         };

@@ -271,6 +271,88 @@ impl<'a> App<'a> {
             || self.status_popup.is_visible()
     }
 
+    /// Route a paste event to the first visible popup that accepts paste input.
+    /// Returns `true` if a popup consumed the paste (caller should return Continue).
+    fn dispatch_paste_to_popup(&mut self, text: &str) -> bool {
+        if self.settings_popup.is_visible() {
+            self.settings_popup.handle_paste(text);
+            return true;
+        }
+        if self.plugins_popup.is_visible() {
+            self.plugins_popup.handle_paste(text);
+            return true;
+        }
+        if self.projects_popup.is_visible() {
+            self.projects_popup.handle_paste(text);
+            return true;
+        }
+        if self.schedule_popup.is_visible() {
+            self.schedule_popup.handle_paste(text);
+            return true;
+        }
+        // Popups without paste support still consume the event to prevent
+        // it from leaking to the composer.
+        self.sessions_popup.is_visible()
+            || self.migrate_popup.is_visible()
+            || self.status_popup.is_visible()
+    }
+
+    /// Route a key event to the first visible popup.
+    /// Returns `Some(AppAction)` if a popup handled the key, `None` if no popup is visible.
+    fn dispatch_key_to_popup(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<Option<AppAction>> {
+        if self.settings_popup.is_visible() {
+            if let Some(action) = self.settings_popup.handle_key(key, &mut self.config)? {
+                return Ok(Some(action));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.plugins_popup.is_visible() {
+            if let Some(actions) = self.plugins_popup.handle_key(key) {
+                return Ok(Some(AppAction::RunPlugins { actions }));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.projects_popup.is_visible() {
+            if let Some(actions) = self.projects_popup.handle_key(key) {
+                return Ok(Some(AppAction::RunProjectActions { actions }));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.sessions_popup.is_visible() {
+            if let Some(action) = self.sessions_popup.handle_key(key) {
+                match action {
+                    SessionAction::Load { id } => {
+                        self.cells.clear();
+                        self.session_prompt_tokens = 0;
+                        self.session_completion_tokens = 0;
+                        return Ok(Some(AppAction::LoadSession { id }));
+                    }
+                }
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.schedule_popup.is_visible() {
+            if let Some(actions) = self.schedule_popup.handle_key(key) {
+                return Ok(Some(AppAction::RunScheduleActions { actions }));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.migrate_popup.is_visible() {
+            if let Some(actions) = self.migrate_popup.handle_key(key) {
+                return Ok(Some(AppAction::RunMigration { actions }));
+            }
+            return Ok(Some(AppAction::Continue));
+        }
+        if self.status_popup.is_visible() {
+            self.status_popup.handle_key(key);
+            return Ok(Some(AppAction::Continue));
+        }
+        Ok(None)
+    }
+
     /// Handle a bracketed paste event (entire pasted text as a single string).
     ///
     /// Popups consume the paste exclusively — either into their text-input
@@ -280,26 +362,7 @@ impl<'a> App<'a> {
         // Popups get absolute first priority across ALL states.
         // A popup can be visible during Streaming if drain_queued_if_idle
         // started a turn while a popup was open.
-        if self.settings_popup.is_visible() {
-            self.settings_popup.handle_paste(&text);
-            return AppAction::Continue;
-        }
-        if self.plugins_popup.is_visible() {
-            self.plugins_popup.handle_paste(&text);
-            return AppAction::Continue;
-        }
-        if self.projects_popup.is_visible() {
-            self.projects_popup.handle_paste(&text);
-            return AppAction::Continue;
-        }
-        if self.schedule_popup.is_visible() {
-            self.schedule_popup.handle_paste(&text);
-            return AppAction::Continue;
-        }
-        if self.sessions_popup.is_visible()
-            || self.migrate_popup.is_visible()
-            || self.status_popup.is_visible()
-        {
+        if self.dispatch_paste_to_popup(&text) {
             return AppAction::Continue;
         }
 
@@ -659,58 +722,8 @@ impl<'a> App<'a> {
         }
 
         // Popups get first priority for all key events (including Esc)
-        if self.settings_popup.is_visible() {
-            if let Some(action) = self.settings_popup.handle_key(key, &mut self.config)? {
-                return Ok(action);
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.plugins_popup.is_visible() {
-            if let Some(actions) = self.plugins_popup.handle_key(key) {
-                return Ok(AppAction::RunPlugins { actions });
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.projects_popup.is_visible() {
-            if let Some(actions) = self.projects_popup.handle_key(key) {
-                return Ok(AppAction::RunProjectActions { actions });
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.sessions_popup.is_visible() {
-            if let Some(action) = self.sessions_popup.handle_key(key) {
-                match action {
-                    SessionAction::Load { id } => {
-                        self.cells.clear();
-                        self.session_prompt_tokens = 0;
-                        self.session_completion_tokens = 0;
-                        return Ok(AppAction::LoadSession { id });
-                    }
-                }
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.schedule_popup.is_visible() {
-            if let Some(actions) = self.schedule_popup.handle_key(key) {
-                return Ok(AppAction::RunScheduleActions { actions });
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.migrate_popup.is_visible() {
-            if let Some(actions) = self.migrate_popup.handle_key(key) {
-                return Ok(AppAction::RunMigration { actions });
-            }
-            return Ok(AppAction::Continue);
-        }
-
-        if self.status_popup.is_visible() {
-            self.status_popup.handle_key(key);
-            return Ok(AppAction::Continue);
+        if let Some(action) = self.dispatch_key_to_popup(key)? {
+            return Ok(action);
         }
 
         // Handle backtrack mode (selecting a past user message to rewind to)

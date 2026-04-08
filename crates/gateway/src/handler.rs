@@ -313,65 +313,16 @@ pub async fn invoke_agent_with_auto_reply(
     .await
 }
 
-async fn invoke_agent_inner(
-    channel_name: &str,
-    inbound: &InboundMessage,
+/// Check sender access control (pairing/approval status).
+///
+/// Returns the `AccessCheckResult` from the pairing subsystem.
+async fn check_sender_access_control(
     config: &Config,
-    health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
-    bot_identifier: Option<&str>,
-    auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
-) -> Result<(String, String)> {
-    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        borg_core::activity_log::log_activity(
-            &adb,
-            "info",
-            "gateway",
-            &format!("Webhook from {channel_name}: {}", inbound.sender_id),
-        );
-    }
-
-    // Resolve gateway routing (per-channel/sender config overrides)
-    let route = crate::routing::resolve_route(
-        config,
-        channel_name,
-        &inbound.sender_id,
-        inbound.peer_kind.as_deref(),
-    );
-    let config = &route.config;
-
-    // Check group activation mode before any processing
-    let (should_respond, cleaned_text) = check_activation(
-        &inbound.text,
-        inbound.peer_kind.as_deref(),
-        &route,
-        config,
-        bot_identifier,
-    );
-    if !should_respond {
-        return Ok((String::new(), String::new()));
-    }
-
-    // Auto-reply check: if agent is away, return the away message immediately
-    if let Some(ar_state) = auto_reply_state {
-        if let Some(reply) =
-            crate::auto_reply::check_auto_reply(ar_state, &config.gateway.auto_reply).await
-        {
-            info!(
-                "Auto-reply for '{}' on channel '{}': away",
-                inbound.sender_id, channel_name
-            );
-            return Ok((reply, String::new()));
-        }
-    }
-
-    info!(
-        "Channel '{}' received message from '{}' (route: {})",
-        channel_name, inbound.sender_id, route.matched_by
-    );
-
-    // Access control: check sender pairing status
+    channel_name: &str,
+    sender_id: &str,
+) -> Result<borg_core::pairing::AccessCheckResult> {
     let ch = channel_name.to_string();
-    let sid = inbound.sender_id.clone();
+    let sid = sender_id.to_string();
     let cfg = config.clone();
     let access = tokio::task::spawn_blocking(move || {
         let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
@@ -380,56 +331,25 @@ async fn invoke_agent_inner(
     })
     .await
     .context("Pairing check task panicked")??;
+    Ok(access)
+}
 
-    match access {
-        borg_core::pairing::AccessCheckResult::Allowed => {}
-        borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
-            // Throttle: suppress repeated challenges for the same sender
-            let suppress = CHALLENGE_THROTTLE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .should_suppress(channel_name, &inbound.sender_id);
-            if suppress {
-                return Ok((String::new(), String::new()));
-            }
-            info!(
-                "Pairing challenge issued for sender '{}' on channel '{}'",
-                inbound.sender_id, channel_name
-            );
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
-                    &adb,
-                    "info",
-                    "gateway",
-                    &format!("Pairing challenge issued for {}", inbound.sender_id),
-                );
-            }
-            return Ok((message, String::new()));
-        }
-        borg_core::pairing::AccessCheckResult::Denied { reason } => {
-            info!(
-                "Access denied for sender '{}' on channel '{}': {}",
-                inbound.sender_id, channel_name, reason
-            );
-            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
-                    &adb,
-                    "warn",
-                    "gateway",
-                    &format!("Access denied for {} on {channel_name}", inbound.sender_id),
-                );
-            }
-            return Ok((
-                "Access denied. Contact the bot owner for access.".to_string(),
-                String::new(),
-            ));
-        }
-    }
+/// Result of session resolution and command handling.
+struct SessionResolution {
+    db: Database,
+    session_id: String,
+    /// If a slash command handled the request, contains the response text.
+    /// When `Some`, no further agent processing is needed.
+    command_response: Option<String>,
+}
 
-    if let Some(h) = health {
-        h.write().await.record_inbound(channel_name);
-    }
-
+/// Resolve the session and handle slash commands (`/cancel`, `/poke`, other commands).
+async fn resolve_session_and_commands(
+    channel_name: &str,
+    inbound: &InboundMessage,
+    config: &Config,
+    route: &crate::routing::ResolvedRoute,
+) -> Result<SessionResolution> {
     // Resolve session — include thread_id and binding_id in the key for isolation
     let base_key = match &inbound.thread_id {
         Some(tid) => format!("{}:{}", inbound.sender_id, sanitize_thread_id(tid)),
@@ -483,7 +403,11 @@ async fn invoke_agent_inner(
         ) {
             warn!("Failed to log /cancel response: {e}");
         }
-        return Ok((response, session_id));
+        return Ok(SessionResolution {
+            db,
+            session_id,
+            command_response: Some(response),
+        });
     }
 
     // Handle `/poke` before the sync dispatcher (requires async HTTP call).
@@ -512,7 +436,11 @@ async fn invoke_agent_inner(
         ) {
             warn!("Failed to log /poke response: {e}");
         }
-        return Ok((response, session_id));
+        return Ok(SessionResolution {
+            db,
+            session_id,
+            command_response: Some(response),
+        });
     }
 
     // Check for slash commands before creating agent (use original text for commands)
@@ -535,47 +463,30 @@ async fn invoke_agent_inner(
         ) {
             warn!("Failed to log command response: {e}");
         }
-        return Ok((response, session_id));
+        return Ok(SessionResolution {
+            db,
+            session_id,
+            command_response: Some(response),
+        });
     }
 
-    // Strip `/plan ` prefix when it was a pass-through (mode was set in the
-    // DB by try_handle_command, but the text still carries the prefix).
-    let cleaned_text = {
-        let lower = cleaned_text.trim().to_ascii_lowercase();
-        if lower.starts_with("/plan ") {
-            cleaned_text.trim()[6..].trim_start().to_string()
-        } else {
-            cleaned_text
-        }
-    };
+    Ok(SessionResolution {
+        db,
+        session_id,
+        command_response: None,
+    })
+}
 
-    // Create Agent with gateway-specific (stricter) rate limits
-    let mut gw_config = config.clone();
-    gw_config.security.action_limits = gw_config.security.gateway_action_limits.clone();
-
-    // Apply per-session collaboration mode override (set via /mode command).
-    if let Ok(Some(mode_str)) = db.get_setting(&format!("gw:mode:{session_id}")) {
-        if let Ok(mode) = mode_str.parse::<borg_core::config::CollaborationMode>() {
-            gw_config.conversation.collaboration_mode = mode;
-        }
-    }
-
-    // Resolve adaptive cache TTL for gateway sessions (prefer longer TTL
-    // since inter-turn latency is typically >5 minutes).
-    gw_config.llm.cache.ttl = gw_config.llm.cache.ttl.resolve(true);
-
-    let mut agent = Agent::new(gw_config, borg_core::telemetry::BorgMetrics::noop())
-        .context("Failed to create agent")?;
-
-    if let Err(e) = agent.load_session(&session_id) {
-        warn!(
-            "Could not load session '{session_id}' for channel '{}': {e}",
-            channel_name
-        );
-    }
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
-
+/// Prepare the final message text for the agent.
+///
+/// Handles link understanding, injection scanning, truncation, and wrapping.
+/// Returns the final message text and whether the inbound has image attachments.
+async fn prepare_message_text(
+    channel_name: &str,
+    inbound: &InboundMessage,
+    config: &Config,
+    cleaned_text: String,
+) -> (String, bool) {
     // Link understanding: augment message with fetched URL content
     let cleaned_text = if config.gateway.link_understanding.enabled {
         let (augmented, fetched) = crate::link_understanding::augment_with_links(
@@ -643,49 +554,24 @@ async fn invoke_agent_inner(
         }
     };
 
-    // Check for image attachments and build multimodal message if present
+    // Check for image attachments
     let has_image_attachments = inbound
         .attachments
         .iter()
         .any(|a| a.mime_type.starts_with("image/"));
 
-    let agent_cancel = CancellationToken::new();
-    // Register this turn's cancel token so a subsequent `/cancel` from the
-    // same sender (or a `borg cancel` CLI call) can interrupt it. Cleared
-    // unconditionally once the turn completes, below.
-    crate::in_flight::GLOBAL
-        .register(&session_id, agent_cancel.clone())
-        .await;
-    let agent_handle = if has_image_attachments {
-        let mut parts = vec![borg_core::types::ContentPart::Text(message_text)];
-        for att in &inbound.attachments {
-            if att.mime_type.starts_with("image/") {
-                parts.push(borg_core::types::ContentPart::ImageBase64 {
-                    media: borg_core::types::MediaData {
-                        mime_type: att.mime_type.clone(),
-                        data: att.data.clone(),
-                        filename: sanitize_filename(&att.filename),
-                    },
-                });
-            }
-        }
-        // Compress images before sending to agent
-        if config.media.compression_enabled {
-            borg_core::media::compress_content_parts(&mut parts, config.media.max_image_bytes);
-        }
-        let msg = borg_core::types::Message::user_multimodal(parts);
-        let cancel = agent_cancel.clone();
-        tokio::spawn(async move { agent.send_message_raw(msg, event_tx, cancel).await })
-    } else {
-        let cancel = agent_cancel.clone();
-        tokio::spawn(async move {
-            agent
-                .send_message_with_cancel(&message_text, event_tx, cancel)
-                .await
-        })
-    };
+    (message_text, has_image_attachments)
+}
 
-    // Collect the full response text, with timeout to prevent indefinite hangs
+/// Collect the full agent response from the event channel, with timeout.
+///
+/// Returns the final response text.
+async fn collect_agent_response(
+    channel_name: &str,
+    config: &Config,
+    event_rx: &mut mpsc::Receiver<AgentEvent>,
+    agent_cancel: &CancellationToken,
+) -> String {
     let request_timeout = Duration::from_millis(config.gateway.request_timeout_ms);
     let mut response_text = String::new();
     let mut response_capped = false;
@@ -752,6 +638,210 @@ async fn invoke_agent_inner(
             response_text = "(request timed out)".to_string();
         }
     }
+
+    response_text
+}
+
+async fn invoke_agent_inner(
+    channel_name: &str,
+    inbound: &InboundMessage,
+    config: &Config,
+    health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
+    bot_identifier: Option<&str>,
+    auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
+) -> Result<(String, String)> {
+    // Phase 1: Activity logging
+    if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+        borg_core::activity_log::log_activity(
+            &adb,
+            "info",
+            "gateway",
+            &format!("Webhook from {channel_name}: {}", inbound.sender_id),
+        );
+    }
+
+    // Phase 2: Route resolution + activation check
+    let route = crate::routing::resolve_route(
+        config,
+        channel_name,
+        &inbound.sender_id,
+        inbound.peer_kind.as_deref(),
+    );
+    let config = &route.config;
+
+    let (should_respond, cleaned_text) = check_activation(
+        &inbound.text,
+        inbound.peer_kind.as_deref(),
+        &route,
+        config,
+        bot_identifier,
+    );
+    if !should_respond {
+        return Ok((String::new(), String::new()));
+    }
+
+    // Phase 3: Auto-reply check
+    if let Some(ar_state) = auto_reply_state {
+        if let Some(reply) =
+            crate::auto_reply::check_auto_reply(ar_state, &config.gateway.auto_reply).await
+        {
+            info!(
+                "Auto-reply for '{}' on channel '{}': away",
+                inbound.sender_id, channel_name
+            );
+            return Ok((reply, String::new()));
+        }
+    }
+
+    info!(
+        "Channel '{}' received message from '{}' (route: {})",
+        channel_name, inbound.sender_id, route.matched_by
+    );
+
+    // Phase 4: Access control / pairing check
+    let access = check_sender_access_control(config, channel_name, &inbound.sender_id).await?;
+
+    match access {
+        borg_core::pairing::AccessCheckResult::Allowed => {}
+        borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+            // Throttle: suppress repeated challenges for the same sender
+            let suppress = CHALLENGE_THROTTLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .should_suppress(channel_name, &inbound.sender_id);
+            if suppress {
+                return Ok((String::new(), String::new()));
+            }
+            info!(
+                "Pairing challenge issued for sender '{}' on channel '{}'",
+                inbound.sender_id, channel_name
+            );
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+                borg_core::activity_log::log_activity(
+                    &adb,
+                    "info",
+                    "gateway",
+                    &format!("Pairing challenge issued for {}", inbound.sender_id),
+                );
+            }
+            return Ok((message, String::new()));
+        }
+        borg_core::pairing::AccessCheckResult::Denied { reason } => {
+            info!(
+                "Access denied for sender '{}' on channel '{}': {}",
+                inbound.sender_id, channel_name, reason
+            );
+            if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
+                borg_core::activity_log::log_activity(
+                    &adb,
+                    "warn",
+                    "gateway",
+                    &format!("Access denied for {} on {channel_name}", inbound.sender_id),
+                );
+            }
+            return Ok((
+                "Access denied. Contact the bot owner for access.".to_string(),
+                String::new(),
+            ));
+        }
+    }
+
+    if let Some(h) = health {
+        h.write().await.record_inbound(channel_name);
+    }
+
+    // Phase 5: Session resolution + slash commands
+    let resolution = resolve_session_and_commands(channel_name, inbound, config, &route).await?;
+    let db = resolution.db;
+    let session_id = resolution.session_id;
+
+    if let Some(response) = resolution.command_response {
+        return Ok((response, session_id));
+    }
+
+    // Strip `/plan ` prefix when it was a pass-through (mode was set in the
+    // DB by try_handle_command, but the text still carries the prefix).
+    let cleaned_text = {
+        let lower = cleaned_text.trim().to_ascii_lowercase();
+        if lower.starts_with("/plan ") {
+            cleaned_text.trim()[6..].trim_start().to_string()
+        } else {
+            cleaned_text
+        }
+    };
+
+    // Phase 6: Agent creation, input preparation, invocation, and response collection
+
+    // Create Agent with gateway-specific (stricter) rate limits
+    let mut gw_config = config.clone();
+    gw_config.security.action_limits = gw_config.security.gateway_action_limits.clone();
+
+    // Apply per-session collaboration mode override (set via /mode command).
+    if let Ok(Some(mode_str)) = db.get_setting(&format!("gw:mode:{session_id}")) {
+        if let Ok(mode) = mode_str.parse::<borg_core::config::CollaborationMode>() {
+            gw_config.conversation.collaboration_mode = mode;
+        }
+    }
+
+    // Resolve adaptive cache TTL for gateway sessions (prefer longer TTL
+    // since inter-turn latency is typically >5 minutes).
+    gw_config.llm.cache.ttl = gw_config.llm.cache.ttl.resolve(true);
+
+    let mut agent = Agent::new(gw_config, borg_core::telemetry::BorgMetrics::noop())
+        .context("Failed to create agent")?;
+
+    if let Err(e) = agent.load_session(&session_id) {
+        warn!(
+            "Could not load session '{session_id}' for channel '{}': {e}",
+            channel_name
+        );
+    }
+
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+
+    // Prepare the message text (link understanding, injection scan, truncation, wrapping)
+    let (message_text, has_image_attachments) =
+        prepare_message_text(channel_name, inbound, config, cleaned_text).await;
+
+    let agent_cancel = CancellationToken::new();
+    // Register this turn's cancel token so a subsequent `/cancel` from the
+    // same sender (or a `borg cancel` CLI call) can interrupt it. Cleared
+    // unconditionally once the turn completes, below.
+    crate::in_flight::GLOBAL
+        .register(&session_id, agent_cancel.clone())
+        .await;
+    let agent_handle = if has_image_attachments {
+        let mut parts = vec![borg_core::types::ContentPart::Text(message_text)];
+        for att in &inbound.attachments {
+            if att.mime_type.starts_with("image/") {
+                parts.push(borg_core::types::ContentPart::ImageBase64 {
+                    media: borg_core::types::MediaData {
+                        mime_type: att.mime_type.clone(),
+                        data: att.data.clone(),
+                        filename: sanitize_filename(&att.filename),
+                    },
+                });
+            }
+        }
+        // Compress images before sending to agent
+        if config.media.compression_enabled {
+            borg_core::media::compress_content_parts(&mut parts, config.media.max_image_bytes);
+        }
+        let msg = borg_core::types::Message::user_multimodal(parts);
+        let cancel = agent_cancel.clone();
+        tokio::spawn(async move { agent.send_message_raw(msg, event_tx, cancel).await })
+    } else {
+        let cancel = agent_cancel.clone();
+        tokio::spawn(async move {
+            agent
+                .send_message_with_cancel(&message_text, event_tx, cancel)
+                .await
+        })
+    };
+
+    // Collect the full response text
+    let mut response_text =
+        collect_agent_response(channel_name, config, &mut event_rx, &agent_cancel).await;
 
     // Wait for agent to finish (with a short grace period after cancellation)
     match tokio::time::timeout(Duration::from_secs(5), agent_handle).await {
