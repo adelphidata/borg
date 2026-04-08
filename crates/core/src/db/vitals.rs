@@ -692,4 +692,101 @@ impl Database {
             .unwrap_or(None);
         Ok(result)
     }
+
+    // ── Pending Celebrations ──
+
+    /// Insert a pending celebration for async delivery.
+    pub fn insert_pending_celebration(
+        &self,
+        celebration_type: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO pending_celebrations (celebration_type, payload_json, created_at) VALUES (?1, ?2, ?3)",
+            params![celebration_type, payload_json, now],
+        )?;
+        Ok(())
+    }
+
+    /// Get all undelivered celebrations.
+    pub fn get_pending_celebrations(&self) -> Result<Vec<PendingCelebration>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingCelebration {
+                    id: row.get(0)?,
+                    celebration_type: row.get(1)?,
+                    payload_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Atomically claim undelivered celebrations by setting `delivered_at` to a
+    /// sentinel value (-1) and returning the claimed rows. This prevents
+    /// concurrent daemon ticks from delivering the same celebration twice.
+    /// Call `mark_celebration_delivered` on success or `unclaim_celebration` on
+    /// failure.
+    pub fn claim_pending_celebrations(&self) -> Result<Vec<PendingCelebration>> {
+        let sentinel: i64 = -1;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingCelebration {
+                    id: row.get(0)?,
+                    celebration_type: row.get(1)?,
+                    payload_json: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        // Mark all claimed rows with sentinel so next tick skips them
+        for c in &rows {
+            self.conn.execute(
+                "UPDATE pending_celebrations SET delivered_at = ?1 WHERE id = ?2 AND delivered_at IS NULL",
+                params![sentinel, c.id],
+            )?;
+        }
+        Ok(rows)
+    }
+
+    /// Mark a celebration as successfully delivered.
+    pub fn mark_celebration_delivered(&self, id: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "UPDATE pending_celebrations SET delivered_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Release a claimed celebration back to pending state (on delivery failure).
+    pub fn unclaim_celebration(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE pending_celebrations SET delivered_at = NULL WHERE id = ?1 AND delivered_at = -1",
+            params![id],
+        )?;
+        Ok(())
+    }
+}
+
+/// A pending celebration awaiting async delivery to channels.
+#[derive(Debug, Clone)]
+pub struct PendingCelebration {
+    /// Row ID.
+    pub id: i64,
+    /// Type of celebration (e.g. "evolution").
+    pub celebration_type: String,
+    /// Serialized celebration payload.
+    pub payload_json: String,
+    /// Unix timestamp when recorded.
+    pub created_at: i64,
 }

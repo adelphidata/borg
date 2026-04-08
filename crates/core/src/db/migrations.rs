@@ -915,4 +915,20 @@ impl Database {
 
         Ok(())
     }
+
+    /// V33: Pending celebrations outbox for async delivery of evolution messages.
+    pub(super) fn migrate_v33(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_celebrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                celebration_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                delivered_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_celebrations_undelivered
+                ON pending_celebrations (delivered_at) WHERE delivered_at IS NULL;",
+        )?;
+        Ok(())
+    }
 }

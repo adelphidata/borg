@@ -343,6 +343,10 @@ The status command supports tab navigation between views:
 
 In CLI mode, tabs are accessed via `borg status`, `borg status history`, `borg status archetypes`. In TUI mode, `/status` opens an interactive popup with tab switching.
 
+## Celebration Messages
+
+When a stage transition occurs, Borg sends a celebratory ASCII art message to all configured heartbeat channels (Slack, Telegram, etc.) via a database outbox pattern. The ASCII art is configurable per stage and archetype — see `celebration_art()` in `crates/core/src/evolution/mod.rs`.
+
 ## Hook Integration
 
 `EvolutionHook` implements the `Hook` trait:

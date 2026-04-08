@@ -409,6 +409,42 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
             }
             Err(e) => tracing::warn!("Failed to check runnable workflows: {e}"),
         }
+
+        // Deliver pending evolution celebrations to configured channels.
+        // Claim atomically to prevent duplicate delivery across ticks.
+        match db.claim_pending_celebrations() {
+            Ok(celebrations) => {
+                for c in celebrations {
+                    let celebration_id = c.id;
+                    let config_clone = config.clone();
+                    tokio::spawn(async move {
+                        let delivered = deliver_celebration_to_channels(&config_clone, &c).await;
+                        match borg_core::db::Database::open() {
+                            Ok(cdb) => {
+                                if delivered {
+                                    if let Err(e) = cdb.mark_celebration_delivered(celebration_id) {
+                                        tracing::warn!(
+                                            "Failed to mark celebration {celebration_id} delivered: {e}"
+                                        );
+                                    }
+                                } else {
+                                    // Release back to pending for retry on next tick
+                                    if let Err(e) = cdb.unclaim_celebration(celebration_id) {
+                                        tracing::warn!(
+                                            "Failed to unclaim celebration {celebration_id}: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to open DB after celebration delivery: {e}");
+                            }
+                        }
+                    });
+                }
+            }
+            Err(e) => tracing::warn!("Failed to check pending celebrations: {e}"),
+        }
     }
 }
 
@@ -1522,6 +1558,66 @@ async fn deliver_message_to_sender(
         }
     }
     Ok(())
+}
+
+/// Deliver an evolution celebration message to all configured heartbeat channels.
+/// Returns `true` if at least one delivery succeeded.
+async fn deliver_celebration_to_channels(
+    config: &Config,
+    celebration: &borg_core::db::PendingCelebration,
+) -> bool {
+    let payload: borg_core::evolution::CelebrationPayload =
+        match serde_json::from_str(&celebration.payload_json) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to deserialize celebration payload: {e}");
+                return false;
+            }
+        };
+
+    let message = borg_core::evolution::format_celebration_message(&payload);
+    let mut any_delivered = false;
+
+    for channel_name in &config.heartbeat.channels {
+        match resolve_heartbeat_recipients(config, channel_name) {
+            Ok(recipients) => {
+                for sender_id in &recipients {
+                    if let Err(e) =
+                        deliver_message_to_sender(config, channel_name, sender_id, &message).await
+                    {
+                        tracing::warn!(
+                            "Evolution celebration delivery to {channel_name}:{sender_id} failed: {e}"
+                        );
+                    } else {
+                        any_delivered = true;
+                        tracing::info!(
+                            "Evolution celebration delivered to {channel_name}:{sender_id}"
+                        );
+                        if let Ok(adb) = borg_core::db::Database::open() {
+                            borg_core::activity_log::log_activity(
+                                &adb,
+                                "info",
+                                "evolution",
+                                &format!(
+                                    "Evolution celebration delivered to {channel_name}:{sender_id}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to resolve recipients for {channel_name}: {e}");
+            }
+        }
+    }
+
+    // If no heartbeat channels configured, consider it delivered (nothing to send)
+    if config.heartbeat.channels.is_empty() {
+        return true;
+    }
+
+    any_delivered
 }
 
 /// Run a quick agent turn to generate a personalized greeting for a newly

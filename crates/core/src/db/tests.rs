@@ -3918,3 +3918,49 @@ fn vitals_accepts_correct_deltas_for_each_category() {
     let events = db.vitals_events_since(0).unwrap();
     assert_eq!(events.len(), 5, "all 5 valid categories should persist");
 }
+
+// ── Pending Celebrations ──
+
+#[test]
+fn pending_celebrations_round_trip() {
+    let db = test_db();
+    let payload = r#"{"from_stage":"base","to_stage":"evolved","evolution_name":"Test Borg"}"#;
+    db.insert_pending_celebration("evolution", payload).unwrap();
+
+    let pending = db.get_pending_celebrations().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].celebration_type, "evolution");
+    assert_eq!(pending[0].payload_json, payload);
+
+    db.mark_celebration_delivered(pending[0].id).unwrap();
+
+    let after = db.get_pending_celebrations().unwrap();
+    assert!(after.is_empty(), "should be empty after marking delivered");
+}
+
+#[test]
+fn no_pending_celebrations_initially() {
+    let db = test_db();
+    let pending = db.get_pending_celebrations().unwrap();
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn multiple_pending_celebrations_ordered() {
+    let db = test_db();
+    db.insert_pending_celebration("evolution", r#"{"id":1}"#)
+        .unwrap();
+    db.insert_pending_celebration("evolution", r#"{"id":2}"#)
+        .unwrap();
+
+    let pending = db.get_pending_celebrations().unwrap();
+    assert_eq!(pending.len(), 2);
+    // Should be ordered by created_at ASC
+    assert!(pending[0].created_at <= pending[1].created_at);
+
+    // Mark first delivered, second should remain
+    db.mark_celebration_delivered(pending[0].id).unwrap();
+    let remaining = db.get_pending_celebrations().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].payload_json, r#"{"id":2}"#);
+}

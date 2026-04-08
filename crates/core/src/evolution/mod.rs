@@ -696,6 +696,182 @@ pub fn format_evolution_context(state: &EvolutionState) -> String {
     )
 }
 
+/// Data captured at evolution time for celebration message rendering.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CelebrationPayload {
+    /// Stage transitioning from (e.g. "base", "evolved").
+    pub from_stage: String,
+    /// Stage transitioning to (e.g. "evolved", "final").
+    pub to_stage: String,
+    /// LLM-generated evolution name, if available.
+    pub evolution_name: Option<String>,
+    /// LLM-generated evolution description, if available.
+    pub evolution_description: Option<String>,
+    /// Dominant archetype at evolution time.
+    pub dominant_archetype: Option<String>,
+    /// Bond score at evolution time.
+    pub bond_score: u8,
+    /// Vitals at evolution time.
+    pub stability: u8,
+    /// Vitals at evolution time.
+    pub focus: u8,
+    /// Vitals at evolution time.
+    pub sync_stat: u8,
+    /// Vitals at evolution time.
+    pub growth: u8,
+    /// Vitals at evolution time.
+    pub happiness: u8,
+}
+
+/// ASCII art for a specific stage transition.
+///
+/// Each entry is a slice of lines to render inside the celebration box.
+/// Extend this by adding new entries keyed on `(from_stage, to_stage)` or
+/// `(to_stage, archetype)` combinations.
+pub struct CelebrationArt {
+    /// Lines of ASCII art to display.
+    pub lines: &'static [&'static str],
+}
+
+/// Get ASCII art for a stage transition.
+///
+/// Currently provides base art for each transition type. Add archetype-specific
+/// variants by matching on `archetype` in the future.
+pub fn celebration_art(to_stage: &str, _archetype: Option<&str>) -> CelebrationArt {
+    match to_stage {
+        "final" => CelebrationArt {
+            lines: &[
+                "       /\\_____/\\           __/|__",
+                "      (  o . o  )   -->   / o.O  \\___",
+                "       > ^ ^ ^ <         |  __    __ \\",
+                "       /_______\\         | /  \\  /  ||",
+                "                         |_\\__/  \\__/|",
+                "                          \\_________/",
+            ],
+        },
+        // Default: base -> evolved
+        _ => CelebrationArt {
+            lines: &[
+                "          .  .",
+                "         /(..)\\ ",
+                "        ( (\")(\")))          /\\_____/\\",
+                "         \\  ~ /    -->    (  o . o  )",
+                "          ~~~~             > ^ ^ ^ <",
+                "                           /_______\\",
+            ],
+        },
+    }
+}
+
+/// Format a fun ASCII art celebration message for an evolution stage transition.
+pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
+    let mut out = String::new();
+
+    let is_final = payload.to_stage == "final";
+
+    // Header
+    let title = if is_final {
+        "* * *  F I N A L   F O R M  * * *"
+    } else {
+        "* * *  E V O L U T I O N  * * *"
+    };
+
+    let w = 45; // inner width
+    let border = "\u{2550}".repeat(w);
+    let pad_title = format!("{title:^w$}");
+
+    out.push_str(&format!("\u{2554}{border}\u{2557}\n"));
+    out.push_str(&format!("\u{2551}{pad_title}\u{2551}\n"));
+    out.push_str(&format!("\u{2560}{border}\u{2563}\n"));
+
+    let line =
+        |text: &str| -> String { format!("\u{2551} {:<width$}\u{2551}\n", text, width = w - 2) };
+    let empty = || -> String { line("") };
+
+    out.push_str(&empty());
+
+    // ASCII art — looked up by stage transition and archetype
+    let art = celebration_art(&payload.to_stage, payload.dominant_archetype.as_deref());
+    for art_line in art.lines {
+        out.push_str(&line(art_line));
+    }
+
+    out.push_str(&empty());
+
+    // Stage transition
+    let from_label = match payload.from_stage.as_str() {
+        "base" => "Base Borg",
+        "evolved" => payload.evolution_name.as_deref().unwrap_or("Evolved Borg"),
+        _ => "Borg",
+    };
+    let to_label = payload.evolution_name.as_deref().unwrap_or(if is_final {
+        "Final Form"
+    } else {
+        "Evolved Borg"
+    });
+    let (from_num, to_num) = if is_final {
+        ("Stage 2/3", "Stage 3/3")
+    } else {
+        ("Stage 1/3", "Stage 2/3")
+    };
+
+    out.push_str(&line(&format!("  {from_label}  -->  {to_label}")));
+    out.push_str(&line(&format!("  {from_num}  -->  {to_num}")));
+
+    if let Some(ref arch) = payload.dominant_archetype {
+        out.push_str(&line(&format!("  Archetype: {}", capitalize_first(arch))));
+    }
+
+    out.push_str(&empty());
+
+    // Vitals
+    out.push_str(&line("  Vitals"));
+    out.push_str(&line(&format!(
+        "    STB: {:>3}  FOC: {:>3}  SYN: {:>3}",
+        payload.stability, payload.focus, payload.sync_stat
+    )));
+    out.push_str(&line(&format!(
+        "    GRW: {:>3}  HAP: {:>3}",
+        payload.growth, payload.happiness
+    )));
+    out.push_str(&line(&format!("  Bond: {}", payload.bond_score)));
+
+    out.push_str(&empty());
+
+    // Description
+    if let Some(ref desc) = payload.evolution_description {
+        let max_line = w - 6;
+        let words: Vec<&str> = desc.split_whitespace().collect();
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for word in &words {
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.len() + 1 + word.len() <= max_line {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+        for (i, l) in lines.iter().enumerate() {
+            let prefix = if i == 0 { "  \"" } else { "   " };
+            let suffix = if i == lines.len() - 1 { "\"" } else { "" };
+            out.push_str(&line(&format!("{prefix}{l}{suffix}")));
+        }
+        out.push_str(&empty());
+    }
+
+    // Bottom border
+    out.push_str(&format!("\u{255A}{border}\u{255D}\n"));
+
+    out
+}
+
 fn capitalize_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -739,7 +915,10 @@ impl EvolutionHook {
     fn attempt_evolution(&self, db: &Database) {
         let evo_state = match db.get_evolution_state() {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("evolution: failed to get evolution state: {e}");
+                return;
+            }
         };
 
         // Only trigger at level 99 (stage cap)
@@ -766,7 +945,10 @@ impl EvolutionHook {
         // Get vitals state for gate checks
         let vitals_state = match db.get_vitals_state() {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("evolution: failed to get vitals state: {e}");
+                return;
+            }
         };
         let min_vital = vitals_state
             .stability
@@ -816,6 +998,36 @@ impl EvolutionHook {
             tracing::warn!("evolution: failed to record evolution event: {e}");
         } else {
             tracing::info!("evolution: stage transition triggered — gates verified");
+
+            // Record a pending celebration for async channel delivery
+            let to_stage = match evo_state.stage {
+                Stage::Base => "evolved",
+                Stage::Evolved => "final",
+                Stage::Final => "final",
+            };
+            let celebration = CelebrationPayload {
+                from_stage: evo_state.stage.to_string(),
+                to_stage: to_stage.to_string(),
+                evolution_name: evo_state.evolution_name.clone(),
+                evolution_description: evo_state.evolution_description.clone(),
+                dominant_archetype: evo_state.dominant_archetype.map(|a| a.to_string()),
+                bond_score: bond_state.score,
+                stability: vitals_state.stability,
+                focus: vitals_state.focus,
+                sync_stat: vitals_state.sync,
+                growth: vitals_state.growth,
+                happiness: vitals_state.happiness,
+            };
+            match serde_json::to_string(&celebration) {
+                Ok(payload_json) => {
+                    if let Err(e) = db.insert_pending_celebration("evolution", &payload_json) {
+                        tracing::warn!("evolution: failed to insert pending celebration: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("evolution: failed to serialize celebration payload: {e}");
+                }
+            }
         }
     }
 
@@ -2327,5 +2539,134 @@ mod tests {
         assert_eq!(state.level, 1);
         // xp_to_next = xp_for_level(stage, level=1) - 4 = (20 + floor(1^1.4)) - 4 = 21 - 4 = 17.
         assert_eq!(state.xp_to_next_level, 17);
+    }
+
+    // ── Celebration Messages ──
+
+    fn test_payload(to_stage: &str) -> CelebrationPayload {
+        CelebrationPayload {
+            from_stage: if to_stage == "final" {
+                "evolved".to_string()
+            } else {
+                "base".to_string()
+            },
+            to_stage: to_stage.to_string(),
+            evolution_name: Some("Pipeline Warden".to_string()),
+            evolution_description: Some(
+                "A vigilant DevOps guardian that keeps your builds green".to_string(),
+            ),
+            dominant_archetype: Some("ops".to_string()),
+            bond_score: 45,
+            stability: 85,
+            focus: 72,
+            sync_stat: 90,
+            growth: 65,
+            happiness: 88,
+        }
+    }
+
+    #[test]
+    fn celebration_message_base_to_evolved() {
+        let payload = test_payload("evolved");
+        let msg = format_celebration_message(&payload);
+        assert!(
+            msg.contains("E V O L U T I O N"),
+            "should have evolution header"
+        );
+        assert!(
+            msg.contains("Pipeline Warden"),
+            "should contain evolution name"
+        );
+        assert!(msg.contains("Stage 1/3"), "should show from stage");
+        assert!(msg.contains("Stage 2/3"), "should show to stage");
+        assert!(msg.contains("-->"), "should have transition arrow");
+        // Verify box borders present
+        assert!(msg.contains('\u{2554}'), "should have top-left corner");
+        assert!(msg.contains('\u{255A}'), "should have bottom-left corner");
+    }
+
+    #[test]
+    fn celebration_message_evolved_to_final() {
+        let payload = test_payload("final");
+        let msg = format_celebration_message(&payload);
+        assert!(
+            msg.contains("F I N A L   F O R M"),
+            "should have final form header"
+        );
+        assert!(msg.contains("Stage 2/3"), "should show from stage");
+        assert!(msg.contains("Stage 3/3"), "should show to stage");
+    }
+
+    #[test]
+    fn celebration_message_no_name() {
+        let mut payload = test_payload("evolved");
+        payload.evolution_name = None;
+        let msg = format_celebration_message(&payload);
+        assert!(msg.contains("Base Borg"), "should fall back to Base Borg");
+        assert!(
+            msg.contains("Evolved Borg"),
+            "should fall back to Evolved Borg"
+        );
+    }
+
+    #[test]
+    fn celebration_message_no_archetype() {
+        let mut payload = test_payload("evolved");
+        payload.dominant_archetype = None;
+        let msg = format_celebration_message(&payload);
+        assert!(!msg.contains("Archetype:"), "should omit archetype line");
+    }
+
+    #[test]
+    fn celebration_message_includes_vitals_and_bond() {
+        let payload = test_payload("evolved");
+        let msg = format_celebration_message(&payload);
+        assert!(msg.contains("STB:  85"), "should show stability");
+        assert!(msg.contains("FOC:  72"), "should show focus");
+        assert!(msg.contains("SYN:  90"), "should show sync");
+        assert!(msg.contains("GRW:  65"), "should show growth");
+        assert!(msg.contains("HAP:  88"), "should show happiness");
+        assert!(msg.contains("Bond: 45"), "should show bond score");
+    }
+
+    #[test]
+    fn celebration_message_includes_description() {
+        let payload = test_payload("evolved");
+        let msg = format_celebration_message(&payload);
+        assert!(
+            msg.contains("vigilant DevOps"),
+            "should contain description text"
+        );
+    }
+
+    #[test]
+    fn celebration_art_default_for_unknown_stage() {
+        let art = celebration_art("unknown", None);
+        assert!(!art.lines.is_empty(), "should return default art");
+    }
+
+    #[test]
+    fn celebration_art_final_differs_from_evolved() {
+        let evolved_art = celebration_art("evolved", None);
+        let final_art = celebration_art("final", None);
+        assert_ne!(
+            evolved_art.lines, final_art.lines,
+            "evolved and final art should differ"
+        );
+    }
+
+    #[test]
+    fn celebration_payload_serialization_round_trip() {
+        let payload = test_payload("evolved");
+        let json = serde_json::to_string(&payload).unwrap();
+        let deserialized: CelebrationPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.from_stage, "base");
+        assert_eq!(deserialized.to_stage, "evolved");
+        assert_eq!(
+            deserialized.evolution_name.as_deref(),
+            Some("Pipeline Warden")
+        );
+        assert_eq!(deserialized.bond_score, 45);
+        assert_eq!(deserialized.stability, 85);
     }
 }
