@@ -247,7 +247,7 @@ impl PluginsPopup {
                     let (skill_actions, channel_actions) = self.compute_pending_actions();
 
                     if skill_actions.is_empty() && channel_actions.is_empty() {
-                        self.status_message = Some(("No changes to apply.".to_string(), false));
+                        self.status_message = Some(("No changes".to_string(), false));
                         return None;
                     }
 

@@ -226,13 +226,11 @@ impl SchedulePopup {
                             match status {
                                 "active" => {
                                     item.task.status = "paused".to_string();
-                                    self.status_message =
-                                        Some(("Paused (Enter to apply)".to_string(), true));
+                                    self.status_message = Some(("Paused".to_string(), true));
                                 }
                                 "paused" => {
                                     item.task.status = "active".to_string();
-                                    self.status_message =
-                                        Some(("Resumed (Enter to apply)".to_string(), true));
+                                    self.status_message = Some(("Resumed".to_string(), true));
                                 }
                                 _ => {
                                     self.status_message =
@@ -251,10 +249,8 @@ impl SchedulePopup {
                                 "running" | "pending" => {
                                     item.pending_cancel = !item.pending_cancel;
                                     if item.pending_cancel {
-                                        self.status_message = Some((
-                                            "Marked for cancel (Enter to apply)".to_string(),
-                                            true,
-                                        ));
+                                        self.status_message =
+                                            Some(("Will cancel".to_string(), true));
                                     } else {
                                         self.status_message = None;
                                     }
@@ -301,7 +297,7 @@ impl SchedulePopup {
                 KeyCode::Enter => {
                     let actions = self.collect_actions();
                     if actions.is_empty() {
-                        self.status_message = Some(("No changes to apply.".to_string(), false));
+                        self.status_message = Some(("No changes".to_string(), false));
                         return None;
                     }
                     self.dismiss();
@@ -348,8 +344,7 @@ impl SchedulePopup {
                         }
                     }
                     self.phase = SchedulePhase::Browsing;
-                    self.status_message =
-                        Some(("Schedule updated (Enter to apply)".to_string(), true));
+                    self.status_message = Some(("Schedule updated".to_string(), true));
                     None
                 }
                 _ => None,
@@ -399,13 +394,9 @@ impl SchedulePopup {
     }
 
     pub fn render(&self, frame: &mut Frame) {
-        let Some((inner, content_height)) = popup_utils::begin_popup_render(
-            frame,
-            self.visible,
-            "Scheduled Tasks & Workflows",
-            5,
-            2,
-        ) else {
+        let Some((inner, content_height)) =
+            popup_utils::begin_popup_render(frame, self.visible, "Schedule", 5, 2)
+        else {
             return;
         };
 
@@ -415,7 +406,7 @@ impl SchedulePopup {
         // ── Tasks section ──
         if self.tasks.is_empty() && self.workflows.is_empty() {
             lines.push(Line::from(Span::styled(
-                " No scheduled tasks or workflows.".to_string(),
+                " Nothing scheduled".to_string(),
                 theme::dim(),
             )));
         }
@@ -428,8 +419,6 @@ impl SchedulePopup {
                 "paused" => " ",
                 _ => "-",
             };
-
-            let delete_label = if item.pending_delete { " (delete)" } else { "" };
 
             let next_str = item
                 .task
@@ -452,10 +441,7 @@ impl SchedulePopup {
                 ratatui::style::Style::default()
             };
 
-            lines.push(Line::from(Span::styled(
-                format!("{label}{delete_label}"),
-                style,
-            )));
+            lines.push(Line::from(Span::styled(label, style)));
 
             if !next_str.is_empty() {
                 let detail_style = if is_cursor {
@@ -491,14 +477,6 @@ impl SchedulePopup {
                     _ => "○",
                 };
 
-                let suffix = if item.pending_cancel {
-                    " (cancel)"
-                } else if item.pending_delete {
-                    " (delete)"
-                } else {
-                    ""
-                };
-
                 let label = format!(
                     "  {status_icon} {:<28} [{}/steps]",
                     item.workflow.title, item.step_progress,
@@ -514,7 +492,7 @@ impl SchedulePopup {
                     ratatui::style::Style::default()
                 };
 
-                lines.push(Line::from(Span::styled(format!("{label}{suffix}"), style)));
+                lines.push(Line::from(Span::styled(label, style)));
 
                 // Detail line: goal (truncated)
                 let goal_preview: String = item.workflow.goal.chars().take(50).collect();

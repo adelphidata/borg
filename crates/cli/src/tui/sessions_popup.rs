@@ -93,7 +93,7 @@ impl SessionsPopup {
 
         if self.sessions.is_empty() {
             lines.push(Line::from(Span::styled(
-                " No saved sessions.".to_string(),
+                " No saved sessions".to_string(),
                 theme::dim(),
             )));
         }
@@ -101,7 +101,7 @@ impl SessionsPopup {
         for (i, session) in self.sessions.iter().enumerate() {
             let date = &session.updated_at[..16.min(session.updated_at.len())];
             let title: String = session.title.chars().take(40).collect();
-            let label = format!("  {title:<40} ({} msgs)  {date}", session.message_count);
+            let label = format!("  {title:<40} {} messages  {date}", session.message_count);
 
             let style = if i == self.cursor {
                 theme::popup_selected()

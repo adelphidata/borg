@@ -304,7 +304,7 @@ impl MigratePopup {
 
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            " Select migration source:",
+            " Choose a source:",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
@@ -357,7 +357,7 @@ impl MigratePopup {
 
         lines.push(Line::default());
         lines.push(Line::from(Span::styled(
-            " Select what to migrate (Space to toggle):",
+            " What to migrate:",
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
@@ -392,7 +392,7 @@ impl MigratePopup {
             .map(|s| s.label())
             .unwrap_or("Unknown");
         lines.push(Line::from(Span::styled(
-            format!(" Migration preview ({source_label}):"),
+            format!(" Preview ({source_label}):"),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::default());
@@ -456,22 +456,22 @@ impl MigratePopup {
             let skills = plan.skill_dirs.len();
 
             lines.push(Line::from(Span::styled(
-                " Ready to apply migration:",
+                " Ready to apply:",
                 Style::default().add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::default());
 
             if active > 0 {
-                lines.push(Line::from(format!("   {active} config change(s)")));
+                lines.push(Line::from(format!("   {active} settings")));
             }
             if creds > 0 {
-                lines.push(Line::from(format!("   {creds} credential(s)")));
+                lines.push(Line::from(format!("   {creds} credentials")));
             }
             if files > 0 {
-                lines.push(Line::from(format!("   {files} file(s) to copy")));
+                lines.push(Line::from(format!("   {files} files")));
             }
             if skills > 0 {
-                lines.push(Line::from(format!("   {skills} skill(s)")));
+                lines.push(Line::from(format!("   {skills} skills")));
             }
 
             if plan.is_empty() {
@@ -480,12 +480,6 @@ impl MigratePopup {
                     theme::dim(),
                 )));
             }
-
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                " Press Enter to apply, Esc to go back.",
-                Style::default().fg(theme::CYAN),
-            )));
         }
 
         frame.render_widget(Paragraph::new(lines), area);

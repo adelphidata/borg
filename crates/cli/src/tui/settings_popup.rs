@@ -96,7 +96,7 @@ const SETTINGS: &[SettingEntry] = &[
     },
     SettingEntry {
         key: "conversation.collaboration_mode",
-        label: "Collaboration mode",
+        label: "Mode",
         kind: SettingKind::Select,
         category: "Conversation",
     },
@@ -122,13 +122,13 @@ const SETTINGS: &[SettingEntry] = &[
     // — Budget —
     SettingEntry {
         key: "budget.monthly_token_limit",
-        label: "Monthly token limit",
+        label: "Monthly limit",
         kind: SettingKind::Uint,
         category: "Budget",
     },
     SettingEntry {
         key: "budget.warning_threshold",
-        label: "Budget warning (%)",
+        label: "Budget warning",
         kind: SettingKind::Float,
         category: "Budget",
     },
@@ -141,14 +141,14 @@ const SETTINGS: &[SettingEntry] = &[
     },
     SettingEntry {
         key: "tts.auto_mode",
-        label: "Auto voice reply",
+        label: "Auto reply",
         kind: SettingKind::Bool,
         category: "Voice",
     },
     // — Evolution —
     SettingEntry {
         key: "evolution.enabled",
-        label: "Evolution system",
+        label: "Evolution",
         kind: SettingKind::Bool,
         category: "Evolution",
     },
@@ -910,7 +910,7 @@ impl SettingsPopup {
         let cli_hint_area = Rect::new(inner.x, cli_hint_y, inner.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " More settings: borg settings set <key> <value>".to_string(),
+                " More: borg settings set <key> <value>".to_string(),
                 theme::dim(),
             ))),
             cli_hint_area,

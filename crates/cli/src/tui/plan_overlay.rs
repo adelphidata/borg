@@ -76,19 +76,13 @@ impl PlanOverlay {
         let options = [
             (
                 PlanOption::ClearAndProceed,
-                format!(
-                    "1. Yes, clear context ({}% used) and proceed",
-                    self.context_pct
-                ),
+                format!("1. Clear context ({}% used) and proceed", self.context_pct),
             ),
             (
                 PlanOption::ProceedWithContext,
-                "2. Yes, proceed with context".to_string(),
+                "2. Proceed with context".to_string(),
             ),
-            (
-                PlanOption::TypeFeedback,
-                format!("3. Type here to tell {} what to change", self.agent_name),
-            ),
+            (PlanOption::TypeFeedback, "3. Give feedback".to_string()),
         ];
 
         let lines: Vec<Line<'_>> = options

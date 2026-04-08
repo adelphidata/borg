@@ -222,7 +222,7 @@ impl StatusPopup {
         // Footer hint
         let footer_y = popup_area.y + popup_area.height.saturating_sub(1);
         if popup_area.width > 20 {
-            let hint = " Esc=close  \u{2191}\u{2193}=scroll ";
+            let hint = " Esc: close  \u{2191}\u{2193}: scroll ";
             let hint_x = popup_area.x + 2;
             let hint_area = Rect::new(hint_x, footer_y, hint.len() as u16, 1);
             let hint_widget = Paragraph::new(Line::from(Span::styled(hint, theme::dim())));

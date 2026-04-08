@@ -27,11 +27,11 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         name: "/plan",
-        description: "Toggle plan mode (review before proceeding)",
+        description: "Toggle plan mode",
     },
     SlashCommandDef {
         name: "/mode",
-        description: "Switch mode (default/execute/plan)",
+        description: "Switch collaboration mode",
     },
     // Conversation
     SlashCommandDef {
@@ -57,7 +57,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         name: "/logs",
-        description: "Show activity log (error|warn|info|debug|all|raw)",
+        description: "Show activity log",
     },
     // Diagnostics
     SlashCommandDef {
@@ -70,7 +70,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         name: "/pairing",
-        description: "Show channel pairing info",
+        description: "Show pairing codes",
     },
     SlashCommandDef {
         name: "/update",
@@ -92,7 +92,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     // Integrations
     SlashCommandDef {
         name: "/plugins",
-        description: "Manage plugins, channels, and tools",
+        description: "Manage plugins and channels",
     },
     SlashCommandDef {
         name: "/projects",
@@ -100,7 +100,7 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
     SlashCommandDef {
         name: "/schedule",
-        description: "Manage scheduled tasks and workflows",
+        description: "Manage schedules",
     },
     SlashCommandDef {
         name: "/migrate",

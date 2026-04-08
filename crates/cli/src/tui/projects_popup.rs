@@ -198,13 +198,11 @@ impl ProjectsPopup {
                         match item.project.status.as_str() {
                             "active" => {
                                 item.project.status = "archived".to_string();
-                                self.status_message =
-                                    Some(("Archived (Enter to apply)".to_string(), true));
+                                self.status_message = Some(("Archived".to_string(), true));
                             }
                             "archived" => {
                                 item.project.status = "active".to_string();
-                                self.status_message =
-                                    Some(("Unarchived (Enter to apply)".to_string(), true));
+                                self.status_message = Some(("Unarchived".to_string(), true));
                             }
                             _ => {}
                         }
@@ -215,8 +213,7 @@ impl ProjectsPopup {
                     if let Some(item) = self.projects.get_mut(self.cursor) {
                         item.pending_delete = !item.pending_delete;
                         if item.pending_delete {
-                            self.status_message =
-                                Some(("Marked for delete (Enter to apply)".to_string(), true));
+                            self.status_message = Some(("Will delete".to_string(), true));
                         } else {
                             self.status_message = None;
                         }
@@ -226,7 +223,7 @@ impl ProjectsPopup {
                 KeyCode::Enter => {
                     let actions = self.collect_actions();
                     if actions.is_empty() {
-                        self.status_message = Some(("No changes to apply.".to_string(), false));
+                        self.status_message = Some(("No changes".to_string(), false));
                         return None;
                     }
                     self.dismiss();
@@ -329,8 +326,7 @@ impl ProjectsPopup {
                                     item.project.description = val;
                                 }
                                 self.phase = Phase::Browsing;
-                                self.status_message =
-                                    Some(("Updated (Enter to apply)".to_string(), true));
+                                self.status_message = Some(("Updated".to_string(), true));
                                 None
                             }
                         }
@@ -400,7 +396,7 @@ impl ProjectsPopup {
 
         if self.projects.is_empty() && matches!(self.phase, Phase::Browsing) {
             lines.push(Line::from(Span::styled(
-                " No projects. Press 'n' to create one.".to_string(),
+                " No projects yet".to_string(),
                 theme::dim(),
             )));
         }
@@ -412,18 +408,6 @@ impl ProjectsPopup {
                 "●"
             } else {
                 "○"
-            };
-
-            let suffix = if item.pending_delete {
-                " (delete)"
-            } else if item.project.status != item.original_status {
-                if item.project.status == "archived" {
-                    " (archive)"
-                } else {
-                    " (unarchive)"
-                }
-            } else {
-                ""
             };
 
             let wf_label = if item.workflow_count == 1 {
@@ -443,7 +427,7 @@ impl ProjectsPopup {
                 ratatui::style::Style::default()
             };
 
-            lines.push(Line::from(Span::styled(format!("{label}{suffix}"), style)));
+            lines.push(Line::from(Span::styled(label, style)));
 
             // Description line
             if !item.project.description.is_empty() {
