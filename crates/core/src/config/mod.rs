@@ -680,11 +680,18 @@ impl Config {
     /// Resolve a credential by name: credential store first, then env var fallback.
     /// Returns `None` if not found or empty.
     pub fn resolve_credential_or_env(&self, name: &str) -> Option<String> {
-        self.credentials
-            .get(name)
-            .and_then(|cv| cv.resolve().ok())
-            .or_else(|| std::env::var(name).ok())
-            .filter(|t| !t.is_empty())
+        if let Some(cv) = self.credentials.get(name) {
+            match cv.resolve() {
+                Ok(v) if !v.is_empty() => return Some(v),
+                Ok(_) => {
+                    tracing::warn!("Credential '{name}' resolved to empty string");
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to resolve credential '{name}': {e}");
+                }
+            }
+        }
+        std::env::var(name).ok().filter(|t| !t.is_empty())
     }
 
     /// Returns true if any native channel credentials are configured.

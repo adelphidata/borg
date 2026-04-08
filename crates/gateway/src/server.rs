@@ -193,6 +193,21 @@ impl GatewayServer {
             reg
         };
 
+        // Log native channel init summary
+        {
+            let native_list = native_channels.list();
+            if native_list.is_empty() {
+                info!("Gateway: no native channel integrations active");
+            } else {
+                let names: Vec<&str> = native_list.iter().map(|c| c.names()[0]).collect();
+                info!(
+                    "Gateway: {} native channel(s) active: {}",
+                    names.len(),
+                    names.join(", ")
+                );
+            }
+        }
+
         let channel_count = registry.list_channels().len() + native_channels.list().len();
 
         let state = Arc::new(AppState {

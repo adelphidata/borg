@@ -1860,3 +1860,75 @@ enabled = "off"
     let cfg: Config = toml::from_str(toml_str).unwrap();
     assert_eq!(cfg.workflow.enabled, "off");
 }
+
+#[test]
+fn resolve_credential_or_env_returns_none_for_missing() {
+    let config = Config::default();
+    assert!(config
+        .resolve_credential_or_env("BORG_TEST_NONEXISTENT_CRED_XYZ")
+        .is_none());
+}
+
+#[test]
+fn resolve_credential_or_env_finds_env_var() {
+    let config = Config::default();
+    let key = "BORG_TEST_RESOLVE_CRED_ENV";
+    unsafe { std::env::set_var(key, "env-value") };
+    let result = config.resolve_credential_or_env(key);
+    unsafe { std::env::remove_var(key) };
+    assert_eq!(result.as_deref(), Some("env-value"));
+}
+
+#[test]
+fn resolve_credential_or_env_skips_empty_env() {
+    let config = Config::default();
+    let key = "BORG_TEST_RESOLVE_CRED_EMPTY";
+    unsafe { std::env::set_var(key, "") };
+    let result = config.resolve_credential_or_env(key);
+    unsafe { std::env::remove_var(key) };
+    assert!(result.is_none());
+}
+
+#[test]
+fn resolve_credential_or_env_uses_config_over_env() {
+    let key = "BORG_TEST_RESOLVE_CRED_PRIORITY";
+    unsafe { std::env::set_var(key, "env-value") };
+
+    let mut config = Config::default();
+    // A config credential that references the same env var should resolve identically
+    config
+        .credentials
+        .insert(key.to_string(), CredentialValue::EnvVar(key.to_string()));
+    let result = config.resolve_credential_or_env(key);
+    unsafe { std::env::remove_var(key) };
+    assert_eq!(result.as_deref(), Some("env-value"));
+}
+
+/// Credential refs with keychain source survive TOML round-trip.
+#[test]
+fn credential_keychain_ref_toml_roundtrip() {
+    let mut config = Config::default();
+    config.credentials.insert(
+        "TEST_TOKEN".to_string(),
+        CredentialValue::Ref(SecretRef::Keychain {
+            service: "borg-messaging-test".to_string(),
+            account: "borg-TEST_TOKEN".to_string(),
+        }),
+    );
+
+    let toml_str = toml::to_string_pretty(&config).expect("serialize");
+    let parsed: Config = toml::from_str(&toml_str).expect("deserialize");
+
+    assert!(
+        parsed.credentials.contains_key("TEST_TOKEN"),
+        "credential ref must survive TOML round-trip"
+    );
+    // Verify it's a Ref, not an EnvVar
+    match &parsed.credentials["TEST_TOKEN"] {
+        CredentialValue::Ref(SecretRef::Keychain { service, account }) => {
+            assert_eq!(service, "borg-messaging-test");
+            assert_eq!(account, "borg-TEST_TOKEN");
+        }
+        other => panic!("expected Keychain ref, got {other:?}"),
+    }
+}
