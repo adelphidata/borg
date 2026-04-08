@@ -449,17 +449,7 @@ impl PluginsPopup {
 
             let check = if item.toggled { "x" } else { " " };
 
-            // Status badge
-            let status = match &item.kind {
-                ItemKind::Channel { .. } => {
-                    if item.original_enabled {
-                        " \u{2713} active"
-                    } else {
-                        ""
-                    }
-                }
-                ItemKind::Skill => "",
-            };
+            let status = "";
 
             // Platform note for channels
             let platform_note = if let ItemKind::Channel { def } = &item.kind {
