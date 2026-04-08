@@ -259,23 +259,20 @@ impl Agent {
         resolved
     }
 
-    /// Create a new agent with the given config and metrics.
-    pub fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
-        let common = build_common(&config)?;
-        let agent_control = if config.agents.enabled {
-            Some(crate::multi_agent::AgentControl::new(
-                &config.agents,
-                &common.session.meta.id,
-                0,
-            ))
-        } else {
-            None
-        };
+    /// Assemble an `Agent` from pre-computed parts shared by all constructors.
+    fn build_agent(
+        config: Config,
+        common: AgentCommon,
+        agent_control: Option<crate::multi_agent::AgentControl>,
+        spawn_depth: u32,
+        tools_filter: Option<Vec<String>>,
+        metrics: BorgMetrics,
+    ) -> Self {
         let git_repo_root = std::env::current_dir()
             .ok()
             .and_then(|cwd| crate::git::find_repo_root(&cwd));
         let config_arc = Arc::new(config.clone());
-        Ok(Self {
+        Self {
             config,
             history: Vec::new(),
             session: common.session,
@@ -284,8 +281,8 @@ impl Agent {
             turn_count: 0,
             rate_guard: common.rate_guard,
             agent_control,
-            spawn_depth: 0,
-            tools_filter: None,
+            spawn_depth,
+            tools_filter,
             skill_env_allowlist: common.skill_env_allowlist,
             tts_synthesizer: common.tts_synthesizer,
             metrics,
@@ -300,7 +297,29 @@ impl Agent {
             cached_credentials: None,
             config_arc,
             steer_rx: None,
-        })
+        }
+    }
+
+    /// Create a new agent with the given config and metrics.
+    pub fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
+        let common = build_common(&config)?;
+        let agent_control = if config.agents.enabled {
+            Some(crate::multi_agent::AgentControl::new(
+                &config.agents,
+                &common.session.meta.id,
+                0,
+            ))
+        } else {
+            None
+        };
+        Ok(Self::build_agent(
+            config,
+            common,
+            agent_control,
+            0,
+            None,
+            metrics,
+        ))
     }
 
     /// Set a channel for receiving user steer messages mid-turn.
@@ -346,36 +365,14 @@ impl Agent {
         } else {
             None
         };
-        let git_repo_root = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| crate::git::find_repo_root(&cwd));
-        let config_arc = Arc::new(config.clone());
-        Ok(Self {
+        Ok(Self::build_agent(
             config,
-            history: Vec::new(),
-            session: common.session,
-            policy: common.policy,
-            hook_registry: HookRegistry::new(),
-            turn_count: 0,
-            rate_guard: common.rate_guard,
+            common,
             agent_control,
             spawn_depth,
             tools_filter,
-            skill_env_allowlist: common.skill_env_allowlist,
-            tts_synthesizer: common.tts_synthesizer,
             metrics,
-            browser_session: None,
-            config_rx: None,
-            db: Mutex::new(common.db),
-            cached_skills_context: None,
-            ghost_commit: None,
-            git_repo_root,
-            cached_project_docs: None,
-            cached_identity: None,
-            cached_credentials: None,
-            config_arc,
-            steer_rx: None,
-        })
+        ))
     }
 
     /// Inject a message directly into the conversation history.
@@ -1125,39 +1122,15 @@ Rules:
         self.prepare_loop().await;
 
         loop {
-            // Hot-reload config between turns (in-flight keeps old config)
-            if let Some(ref mut rx) = self.config_rx {
-                if rx.has_changed().unwrap_or(false) {
-                    let new_config = rx.borrow_and_update().clone();
-                    info_span!("config_reload").in_scope(|| {
-                        warn!("Config reloaded from disk");
-                    });
-                    self.reload_config(new_config);
-                }
-            }
+            self.maybe_reload_config();
 
             if cancel.is_cancelled() {
-                if let Some(ref mut ctrl) = self.agent_control {
-                    ctrl.shutdown_all();
-                }
+                self.shutdown_sub_agents();
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
                 return Ok(());
             }
-            if let Some(ref mut ctrl) = self.agent_control {
-                for completion in ctrl.drain_completions() {
-                    let ctx = format!(
-                        "[Sub-agent \"{}\" (id: {}) status: {}]\n{}",
-                        completion.nickname,
-                        completion.agent_id,
-                        completion.status.as_str(),
-                        completion
-                            .final_response
-                            .as_deref()
-                            .unwrap_or("(no output)")
-                    );
-                    self.persist_message(Message::tool_result("sub-agent", &ctx));
-                }
-            }
+
+            self.drain_sub_agent_completions();
 
             // Budget enforcement
             match self.check_budget() {
@@ -1189,124 +1162,23 @@ Rules:
                 let _ = event_tx.send(AgentEvent::Preparing).await;
             }
 
-            normalize_history(&mut self.history);
+            self.compact_history_if_needed().await?;
+            self.warm_skills_cache();
 
-            // Tool result context management before LLM compaction
-            let max_hist = self.config.conversation.max_history_tokens;
-            enforce_tool_result_share_limit(&mut self.history, max_hist, 0.5);
-            if history_tokens(&self.history) > max_hist {
-                // Try cheap tool result compaction first
-                compact_tool_results(&mut self.history, max_hist);
-            }
-            // Only run LLM-based compaction when history still exceeds the token budget
-            if history_tokens(&self.history) > max_hist {
-                let pre_compaction_len = self.history.len();
-                // Pre-compaction memory flush: save important info before messages are dropped
-                if self.config.memory.flush_before_compaction {
-                    if let Some(keep_from) =
-                        crate::conversation::plan_compaction(&self.history, max_hist)
-                    {
-                        let dropped = &self.history[..keep_from];
-                        let dropped_tokens: usize = dropped
-                            .iter()
-                            .map(|m| match m.text_content() {
-                                Some(s) => crate::tokenizer::estimate_tokens(s),
-                                None => 0,
-                            })
-                            .sum();
-                        let dropped_count = dropped.len();
-                        if dropped_tokens > self.config.memory.flush_soft_threshold_tokens
-                            && dropped_count >= self.config.memory.flush_min_messages
-                        {
-                            let dropped = dropped.to_vec();
-                            self.flush_memory_before_compaction(&dropped).await;
-                        }
-                    }
-                }
-                let compaction_config = self.config.with_compaction_overrides();
-                let compaction_llm = LlmClient::new(&compaction_config)?;
-                compact_history(&mut self.history, max_hist, &compaction_llm).await;
-                let dropped_count = pre_compaction_len.saturating_sub(self.history.len());
-                if dropped_count > 0 {
-                    if let Ok(guard) = self.db.lock() {
-                        if let Some(ref db) = *guard {
-                            crate::activity_log::log_activity(
-                                db,
-                                "info",
-                                "agent",
-                                &format!("Compaction: dropped {dropped_count} messages"),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Warm skills cache on first iteration (avoids re-parsing every turn)
-            if self.cached_skills_context.is_none() && self.config.skills.enabled {
-                let resolved_creds = self.resolve_credentials_cached();
-                match load_skills_context(
-                    self.config.skills.max_context_tokens,
-                    &resolved_creds,
-                    &self.config.skills,
-                ) {
-                    Ok(ctx) => self.cached_skills_context = Some(ctx),
-                    Err(e) => warn!("Failed to load skills context: {e}"),
-                }
-            }
-
-            let mut system_prompt = self
-                .build_system_prompt()
-                .await
-                .context("Failed to build system prompt")?;
-            let tool_defs = self.build_tool_definitions();
-
-            // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
-            let hook_point = if iteration == 1 {
-                HookPoint::BeforeAgentStart
-            } else {
-                HookPoint::BeforeLlmCall
-            };
-            let user_msg = self
-                .history
-                .iter()
-                .rev()
-                .find(|m| m.role == crate::types::Role::User)
-                .and_then(|m| m.text_content())
-                .unwrap_or("")
-                .to_string();
-            let hook_data = if iteration == 1 {
-                HookData::AgentStart {
-                    user_message: user_msg,
-                }
-            } else {
-                HookData::LlmCall {
-                    message_count: self.history.len(),
-                }
-            };
-            let hook_ctx = self.hook_ctx(hook_point, hook_data);
-            if let HookAction::InjectContext(extra) = self.hook_registry.dispatch(&hook_ctx) {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(&extra);
-            }
-
-            let mut messages = vec![Message::system(&system_prompt)];
-            messages.extend(self.history.clone());
-
+            let (messages, tool_defs) = self.prepare_llm_request(iteration).await?;
             let tools = if tool_defs.is_empty() {
                 None
             } else {
                 Some(tool_defs.as_slice())
             };
 
+            // --- Stream LLM response ---
             let llm_start = Instant::now();
             self.metrics.llm_requests.add(1, &[]);
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
             let tools_clone = tools.map(<[ToolDefinition]>::to_vec);
             let cancel_clone = cancel.clone();
             let stream_handle = {
-                // Pass the session id as a stable prompt_cache_key so
-                // OpenAI-family providers route successive turns to the same
-                // cache shard (no-op for providers that ignore the field).
                 let mut llm_client = LlmClient::new(&self.config)
                     .context("Failed to initialize LLM client")?
                     .with_prompt_cache_key(self.session.meta.id.clone());
@@ -1348,9 +1220,6 @@ Rules:
                         match event {
                             Some(StreamEvent::TextDelta(delta)) => {
                                 if let Some(filtered) = tag_filter.push(&delta) {
-                                    // Best-effort stream-time redaction. Patterns split across
-                                    // chunk boundaries won't match here but are caught by the
-                                    // post-hoc redaction on the full assembled text.
                                     let redacted = self.maybe_redact(filtered);
                                     let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
                                 }
@@ -1453,8 +1322,6 @@ Rules:
             self.hook_registry.dispatch(&hook_ctx);
 
             if tool_calls.is_empty() {
-                // Safety net: if LLM returned empty text after tool execution,
-                // nudge once for a confirmation response before terminating.
                 if should_nudge_for_response(&text_content, needs_response, nudged_for_response) {
                     nudged_for_response = true;
                     self.log_and_persist(Message::system(
@@ -1463,19 +1330,7 @@ Rules:
                     continue;
                 }
 
-                // Fire TurnComplete hook
-                let hook_ctx = self.hook_ctx(
-                    HookPoint::TurnComplete,
-                    HookData::TurnEnd {
-                        total_tool_calls: 0,
-                    },
-                );
-                self.hook_registry.dispatch(&hook_ctx);
-
-                self.log_and_persist(Message::assistant(&text_content));
-                self.auto_save();
-                self.metrics.agent_turns.add(1, &[]);
-                let _ = event_tx.send(AgentEvent::TurnComplete).await;
+                self.finalize_text_response(&text_content, &event_tx).await;
                 return Ok(());
             }
 
@@ -1492,31 +1347,226 @@ Rules:
                 return Ok(());
             }
 
-            let tc_for_msg = tc.clone();
-            let assistant_msg = Message {
-                role: crate::types::Role::Assistant,
-                content: if text_content.is_empty() {
-                    None
-                } else {
-                    Some(crate::types::MessageContent::Text(text_content.clone()))
-                },
-                tool_calls: Some(tc_for_msg),
-                tool_call_id: None,
-                timestamp: Some(chrono::Local::now().to_rfc3339()),
-            };
-            self.log_and_persist(assistant_msg);
-
-            let (sequential, parallel): (Vec<_>, Vec<_>) = tc
-                .iter()
-                .partition(|t| t.function.name == "run_shell" || t.function.name == "browser");
-
-            self.run_tool_calls(&parallel, &event_tx, &cancel).await;
-            self.run_tool_calls(&sequential, &event_tx, &cancel).await;
+            self.execute_tool_calls(&tc, &text_content, &event_tx, &cancel)
+                .await;
             needs_response = true;
 
             // Drain any steer messages from the user at the tool boundary
             self.drain_steers(&event_tx).await;
         }
+    }
+
+    /// Hot-reload config if the watcher has detected changes.
+    fn maybe_reload_config(&mut self) {
+        if let Some(ref mut rx) = self.config_rx {
+            if rx.has_changed().unwrap_or(false) {
+                let new_config = rx.borrow_and_update().clone();
+                info_span!("config_reload").in_scope(|| {
+                    warn!("Config reloaded from disk");
+                });
+                self.reload_config(new_config);
+            }
+        }
+    }
+
+    /// Shut down all sub-agents (called on cancellation).
+    fn shutdown_sub_agents(&mut self) {
+        if let Some(ref mut ctrl) = self.agent_control {
+            ctrl.shutdown_all();
+        }
+    }
+
+    /// Collect completed sub-agent results and persist them as tool result messages.
+    fn drain_sub_agent_completions(&mut self) {
+        if let Some(ref mut ctrl) = self.agent_control {
+            for completion in ctrl.drain_completions() {
+                let ctx = format!(
+                    "[Sub-agent \"{}\" (id: {}) status: {}]\n{}",
+                    completion.nickname,
+                    completion.agent_id,
+                    completion.status.as_str(),
+                    completion
+                        .final_response
+                        .as_deref()
+                        .unwrap_or("(no output)")
+                );
+                self.persist_message(Message::tool_result("sub-agent", &ctx));
+            }
+        }
+    }
+
+    /// Normalize history and run compaction (tool-result trimming, then LLM-based)
+    /// if the token budget is exceeded.
+    async fn compact_history_if_needed(&mut self) -> Result<()> {
+        normalize_history(&mut self.history);
+
+        let max_hist = self.config.conversation.max_history_tokens;
+        enforce_tool_result_share_limit(&mut self.history, max_hist, 0.5);
+        if history_tokens(&self.history) > max_hist {
+            compact_tool_results(&mut self.history, max_hist);
+        }
+
+        // Only run LLM-based compaction when history still exceeds the token budget
+        if history_tokens(&self.history) > max_hist {
+            let pre_compaction_len = self.history.len();
+
+            // Pre-compaction memory flush: save important info before messages are dropped
+            if self.config.memory.flush_before_compaction {
+                if let Some(keep_from) =
+                    crate::conversation::plan_compaction(&self.history, max_hist)
+                {
+                    let dropped = &self.history[..keep_from];
+                    let dropped_tokens: usize = dropped
+                        .iter()
+                        .map(|m| match m.text_content() {
+                            Some(s) => crate::tokenizer::estimate_tokens(s),
+                            None => 0,
+                        })
+                        .sum();
+                    let dropped_count = dropped.len();
+                    if dropped_tokens > self.config.memory.flush_soft_threshold_tokens
+                        && dropped_count >= self.config.memory.flush_min_messages
+                    {
+                        let dropped = dropped.to_vec();
+                        self.flush_memory_before_compaction(&dropped).await;
+                    }
+                }
+            }
+
+            let compaction_config = self.config.with_compaction_overrides();
+            let compaction_llm = LlmClient::new(&compaction_config)?;
+            compact_history(&mut self.history, max_hist, &compaction_llm).await;
+
+            let dropped_count = pre_compaction_len.saturating_sub(self.history.len());
+            if dropped_count > 0 {
+                if let Ok(guard) = self.db.lock() {
+                    if let Some(ref db) = *guard {
+                        crate::activity_log::log_activity(
+                            db,
+                            "info",
+                            "agent",
+                            &format!("Compaction: dropped {dropped_count} messages"),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Warm the skills context cache on first call (avoids re-parsing every turn).
+    fn warm_skills_cache(&mut self) {
+        if self.cached_skills_context.is_none() && self.config.skills.enabled {
+            let resolved_creds = self.resolve_credentials_cached();
+            match load_skills_context(
+                self.config.skills.max_context_tokens,
+                &resolved_creds,
+                &self.config.skills,
+            ) {
+                Ok(ctx) => self.cached_skills_context = Some(ctx),
+                Err(e) => warn!("Failed to load skills context: {e}"),
+            }
+        }
+    }
+
+    /// Build system prompt, tool definitions, fire pre-LLM hooks, and assemble
+    /// the full message list for the LLM request.
+    async fn prepare_llm_request(
+        &mut self,
+        iteration: usize,
+    ) -> Result<(Vec<Message>, Vec<ToolDefinition>)> {
+        let mut system_prompt = self
+            .build_system_prompt()
+            .await
+            .context("Failed to build system prompt")?;
+        let tool_defs = self.build_tool_definitions();
+
+        // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
+        let hook_point = if iteration == 1 {
+            HookPoint::BeforeAgentStart
+        } else {
+            HookPoint::BeforeLlmCall
+        };
+        let user_msg = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::types::Role::User)
+            .and_then(|m| m.text_content())
+            .unwrap_or("")
+            .to_string();
+        let hook_data = if iteration == 1 {
+            HookData::AgentStart {
+                user_message: user_msg,
+            }
+        } else {
+            HookData::LlmCall {
+                message_count: self.history.len(),
+            }
+        };
+        let hook_ctx = self.hook_ctx(hook_point, hook_data);
+        if let HookAction::InjectContext(extra) = self.hook_registry.dispatch(&hook_ctx) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&extra);
+        }
+
+        let mut messages = vec![Message::system(&system_prompt)];
+        messages.extend(self.history.clone());
+
+        Ok((messages, tool_defs))
+    }
+
+    /// Finalize a text-only response: fire TurnComplete hook, persist, auto-save,
+    /// and send the TurnComplete event.
+    async fn finalize_text_response(
+        &mut self,
+        text_content: &str,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let hook_ctx = self.hook_ctx(
+            HookPoint::TurnComplete,
+            HookData::TurnEnd {
+                total_tool_calls: 0,
+            },
+        );
+        self.hook_registry.dispatch(&hook_ctx);
+
+        self.log_and_persist(Message::assistant(text_content));
+        self.auto_save();
+        self.metrics.agent_turns.add(1, &[]);
+        let _ = event_tx.send(AgentEvent::TurnComplete).await;
+    }
+
+    /// Persist the assistant message with tool calls, partition and execute them,
+    /// running shell/browser sequentially and other tools in parallel.
+    async fn execute_tool_calls(
+        &mut self,
+        tc: &[ToolCall],
+        text_content: &str,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) {
+        let tc_for_msg = tc.to_vec();
+        let assistant_msg = Message {
+            role: crate::types::Role::Assistant,
+            content: if text_content.is_empty() {
+                None
+            } else {
+                Some(crate::types::MessageContent::Text(text_content.to_string()))
+            },
+            tool_calls: Some(tc_for_msg),
+            tool_call_id: None,
+            timestamp: Some(chrono::Local::now().to_rfc3339()),
+        };
+        self.log_and_persist(assistant_msg);
+
+        let (sequential, parallel): (Vec<_>, Vec<_>) = tc
+            .iter()
+            .partition(|t| t.function.name == "run_shell" || t.function.name == "browser");
+
+        self.run_tool_calls(&parallel, event_tx, cancel).await;
+        self.run_tool_calls(&sequential, event_tx, cancel).await;
     }
 
     /// Drain pending steer messages from the user and inject them into history.

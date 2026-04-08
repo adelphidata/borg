@@ -83,18 +83,11 @@ impl SessionsPopup {
     }
 
     pub fn render(&self, frame: &mut Frame) {
-        if !self.visible {
+        let Some((inner, content_height)) =
+            popup_utils::begin_popup_render(frame, self.visible, "Sessions", 3, 1)
+        else {
             return;
-        }
-
-        let popup_area = popup_utils::popup_area(frame.area());
-        let inner = popup_utils::render_popup_frame(frame, popup_area, "Sessions");
-
-        if inner.height < 3 || inner.width < 12 {
-            return;
-        }
-
-        let content_height = (inner.height as usize).saturating_sub(1); // reserve 1 for footer
+        };
 
         let mut lines: Vec<Line<'static>> = Vec::new();
 

@@ -43,6 +43,30 @@ pub fn render_footer(frame: &mut Frame, inner: Rect, hint: &str) {
     );
 }
 
+/// Common popup render preamble: visibility check, centered area, frame, size
+/// guard, and content height calculation. Returns `None` if the popup should
+/// not be rendered (invisible or too small). `min_height` is the minimum inner
+/// height required to render. `footer_lines` is the number of rows reserved at
+/// the bottom (footer + status bar).
+pub fn begin_popup_render(
+    frame: &mut Frame,
+    visible: bool,
+    title: &str,
+    min_height: u16,
+    footer_lines: usize,
+) -> Option<(Rect, usize)> {
+    if !visible {
+        return None;
+    }
+    let area = popup_area(frame.area());
+    let inner = render_popup_frame(frame, area, title);
+    if inner.height < min_height || inner.width < 12 {
+        return None;
+    }
+    let content_height = (inner.height as usize).saturating_sub(footer_lines);
+    Some((inner, content_height))
+}
+
 /// Render an optional status message above the footer.
 pub fn render_status_message(
     frame: &mut Frame,

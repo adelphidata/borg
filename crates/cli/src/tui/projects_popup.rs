@@ -389,18 +389,12 @@ impl ProjectsPopup {
     }
 
     pub fn render(&self, frame: &mut Frame) {
-        if !self.visible {
+        let Some((inner, content_height)) =
+            popup_utils::begin_popup_render(frame, self.visible, "Projects", 5, 2)
+        else {
             return;
-        }
+        };
 
-        let popup_area = popup_utils::popup_area(frame.area());
-        let inner = popup_utils::render_popup_frame(frame, popup_area, "Projects");
-
-        if inner.height < 5 || inner.width < 12 {
-            return;
-        }
-
-        let content_height = (inner.height as usize).saturating_sub(2);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut row_indices: Vec<usize> = Vec::new();
 

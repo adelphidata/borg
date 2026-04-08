@@ -341,20 +341,41 @@ impl<'a> App<'a> {
     // =========================================================================
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
-        use crossterm::event::{KeyCode, KeyModifiers};
+        match &self.state {
+            AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
+            AppState::AwaitingApproval { .. } => self.handle_key_awaiting_approval(key),
+            AppState::AwaitingInput { .. } => self.handle_key_awaiting_input(key),
+            AppState::PlanReview => self.handle_key_plan_review(key),
+            AppState::Streaming { .. } => self.handle_key_streaming(key),
+            AppState::Idle => self.handle_key_idle(key),
+        }
+    }
 
-        match &mut self.state {
-            AppState::ConfirmingUninstall => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    return Ok(AppAction::Uninstall);
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                    self.push_system_message("Uninstall cancelled.".to_string());
-                    self.state = AppState::Idle;
-                }
-                _ => {}
-            },
-            AppState::AwaitingApproval { respond } => match key.code {
+    fn handle_key_confirming_uninstall(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<AppAction> {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                return Ok(AppAction::Uninstall);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
+                self.push_system_message("Uninstall cancelled.".to_string());
+                self.state = AppState::Idle;
+            }
+            _ => {}
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn handle_key_awaiting_approval(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<AppAction> {
+        use crossterm::event::KeyCode;
+        if let AppState::AwaitingApproval { respond } = &mut self.state {
+            match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     if let Some(tx) = respond.take() {
                         let _ = tx.send(true);
@@ -378,8 +399,15 @@ impl<'a> App<'a> {
                     };
                 }
                 _ => {}
-            },
-            AppState::AwaitingInput { respond, .. } => match key.code {
+            }
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn handle_key_awaiting_input(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if let AppState::AwaitingInput { respond, .. } = &mut self.state {
+            match key.code {
                 KeyCode::Enter => {
                     let text = self.composer.text().trim().to_string();
                     if text.is_empty() {
@@ -422,608 +450,610 @@ impl<'a> App<'a> {
                 _ => {
                     self.composer.handle_key(key);
                 }
-            },
-            AppState::PlanReview => {
-                match key.code {
-                    KeyCode::BackTab => {
-                        self.plan_overlay.cycle();
+            }
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn handle_key_plan_review(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::BackTab => {
+                self.plan_overlay.cycle();
+            }
+            KeyCode::Char('1') => {
+                self.plan_overlay.select(PlanOption::ClearAndProceed);
+            }
+            KeyCode::Char('2') => {
+                self.plan_overlay.select(PlanOption::ProceedWithContext);
+            }
+            KeyCode::Char('3') => {
+                self.plan_overlay.select(PlanOption::TypeFeedback);
+            }
+            KeyCode::Enter => {
+                let selected = self.plan_overlay.selected();
+                self.plan_overlay.dismiss();
+                self.state = AppState::Idle;
+                match selected {
+                    PlanOption::ClearAndProceed => {
+                        return Ok(AppAction::PlanProceed {
+                            clear_context: true,
+                        });
                     }
-                    KeyCode::Char('1') => {
-                        self.plan_overlay.select(PlanOption::ClearAndProceed);
+                    PlanOption::ProceedWithContext => {
+                        return Ok(AppAction::PlanProceed {
+                            clear_context: false,
+                        });
                     }
-                    KeyCode::Char('2') => {
-                        self.plan_overlay.select(PlanOption::ProceedWithContext);
+                    PlanOption::TypeFeedback => {
+                        // Dismiss to idle so user can type feedback
                     }
-                    KeyCode::Char('3') => {
-                        self.plan_overlay.select(PlanOption::TypeFeedback);
-                    }
-                    KeyCode::Enter => {
-                        let selected = self.plan_overlay.selected();
-                        self.plan_overlay.dismiss();
-                        self.state = AppState::Idle;
-                        match selected {
-                            PlanOption::ClearAndProceed => {
-                                return Ok(AppAction::PlanProceed {
-                                    clear_context: true,
-                                });
-                            }
-                            PlanOption::ProceedWithContext => {
-                                return Ok(AppAction::PlanProceed {
-                                    clear_context: false,
-                                });
-                            }
-                            PlanOption::TypeFeedback => {
-                                // Dismiss to idle so user can type feedback
-                            }
-                        }
-                    }
-                    KeyCode::Esc => {
-                        self.plan_overlay.dismiss();
-                        self.state = AppState::Idle;
-                    }
-                    _ => {}
                 }
             }
-            AppState::Streaming { .. } => {
-                if key.code == KeyCode::Esc
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL))
-                {
-                    // Cancel the in-flight agent task via token
-                    if let Some(token) = self.cancel_token.take() {
-                        token.cancel();
-                    }
-                    self.event_rx = None;
-                    self.steer_tx = None;
-                    self.pending_steers.clear();
-                    for cell in self.cells.iter_mut().rev() {
-                        if let HistoryCell::Assistant { streaming, .. } = cell {
-                            *streaming = false;
-                            break;
-                        }
-                    }
-                    // Restore queued messages to composer instead of discarding
-                    if !self.queued_messages.is_empty() {
-                        let mut dropped_images = 0usize;
-                        let mut messages: Vec<QueuedMessage> =
-                            self.queued_messages.drain(..).collect();
-                        let queued_text: String = messages
-                            .iter()
-                            .map(|qm| qm.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let current = self.composer.text();
-                        let restored = if current.trim().is_empty() {
-                            queued_text
-                        } else {
-                            format!("{}\n{}", current.trim(), queued_text)
-                        };
-                        self.composer.set_text(&restored);
-                        // Restore images if only one queued message had them
-                        if messages.len() == 1 {
-                            let qm = messages.remove(0);
-                            if !qm.images.is_empty() {
-                                self.composer.set_image_attachments(qm.images);
-                            }
-                        } else {
-                            for qm in &messages {
-                                dropped_images += qm.images.len();
-                            }
-                        }
-                        if dropped_images > 0 {
-                            self.cells.push(HistoryCell::System {
-                                text: format!(
-                                    "[interrupted — queued messages restored to composer ({dropped_images} image{} discarded)]",
-                                    if dropped_images == 1 { "" } else { "s" }
-                                ),
-                            });
-                        } else {
-                            self.cells.push(HistoryCell::System {
-                                text: "[interrupted — queued messages restored to composer]"
-                                    .to_string(),
-                            });
-                        }
-                    } else {
-                        self.cells.push(HistoryCell::System {
-                            text: "[interrupted]".to_string(),
-                        });
-                    }
-                    self.previous_collab_mode = None;
-                    self.state = AppState::Idle;
-                } else if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
-                    // Pop last queued message back into composer for editing
-                    if let Some(qm) = self.queued_messages.pop_back() {
-                        self.composer.set_text(&qm.text);
-                        self.composer.set_image_attachments(qm.images);
-                        // Remove the User + System cells that were added when it was queued
-                        let len = self.cells.len();
-                        if len >= 2
-                            && matches!(self.cells[len - 1], HistoryCell::System { .. })
-                            && matches!(self.cells[len - 2], HistoryCell::User { .. })
-                        {
-                            self.cells.truncate(len - 2);
-                        }
-                    }
-                } else if key.code == KeyCode::Enter {
-                    // Send as a steer (mid-turn injection at tool boundary)
-                    let text = self.composer.text().trim().to_string();
-                    // Intercept /cancel mid-stream so it doesn't get sent to
-                    // the agent as a steer. Equivalent to pressing Esc.
-                    if matches!(text.as_str(), "/cancel" | "/stop" | "/abort") {
-                        self.composer.set_text("");
-                        if let Some(token) = self.cancel_token.take() {
-                            token.cancel();
-                        }
-                        self.event_rx = None;
-                        self.steer_tx = None;
-                        self.pending_steers.clear();
-                        for cell in self.cells.iter_mut().rev() {
-                            if let HistoryCell::Assistant { streaming, .. } = cell {
-                                *streaming = false;
-                                break;
-                            }
-                        }
-                        self.cells.push(HistoryCell::System {
-                            text: "[cancelled]".to_string(),
-                        });
-                        self.previous_collab_mode = None;
-                        self.state = AppState::Idle;
-                        return Ok(AppAction::Continue);
-                    }
-                    if !text.is_empty() {
-                        if let Some(ref steer_tx) = self.steer_tx {
-                            let _ = steer_tx.send(text.clone());
-                            self.cells.push(HistoryCell::User { text: text.clone() });
-                            self.cells.push(HistoryCell::System {
-                                text: "[steer queued — will be sent at next tool boundary]"
-                                    .to_string(),
-                            });
-                            self.pending_steers.push_back(text);
-                        } else {
-                            // Fallback: queue normally if no steer channel
-                            let images = self.composer.take_image_attachments();
-                            self.cells.push(HistoryCell::User { text: text.clone() });
-                            self.cells.push(HistoryCell::System {
-                                text: format!(
-                                    "[queued — {} in queue]",
-                                    self.queued_messages.len() + 1
-                                ),
-                            });
-                            self.queued_messages
-                                .push_back(QueuedMessage { text, images });
-                        }
-                        self.composer.set_text("");
-                        self.auto_scroll = true;
-                    }
-                } else if key.code == KeyCode::Tab {
-                    // No-op during streaming
-                } else if self.any_popup_visible() {
-                    // A popup can be open during Streaming if
-                    // drain_queued_if_idle started a turn while a popup was
-                    // visible. Route keys to the popup, not the composer.
-                    if self.settings_popup.is_visible() {
-                        self.settings_popup.handle_key(key, &mut self.config)?;
-                    } else if self.plugins_popup.is_visible() {
-                        self.plugins_popup.handle_key(key);
-                    } else if self.projects_popup.is_visible() {
-                        self.projects_popup.handle_key(key);
-                    } else if self.sessions_popup.is_visible() {
-                        self.sessions_popup.handle_key(key);
-                    } else if self.schedule_popup.is_visible() {
-                        self.schedule_popup.handle_key(key);
-                    }
-                    // Other popups (skills, migrate, status) have no text
-                    // input — just swallow the key.
+            KeyCode::Esc => {
+                self.plan_overlay.dismiss();
+                self.state = AppState::Idle;
+            }
+            _ => {}
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn handle_key_streaming(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            // Cancel the in-flight agent task via token
+            if let Some(token) = self.cancel_token.take() {
+                token.cancel();
+            }
+            self.event_rx = None;
+            self.steer_tx = None;
+            self.pending_steers.clear();
+            for cell in self.cells.iter_mut().rev() {
+                if let HistoryCell::Assistant { streaming, .. } = cell {
+                    *streaming = false;
+                    break;
+                }
+            }
+            // Restore queued messages to composer instead of discarding
+            if !self.queued_messages.is_empty() {
+                let mut dropped_images = 0usize;
+                let mut messages: Vec<QueuedMessage> = self.queued_messages.drain(..).collect();
+                let queued_text: String = messages
+                    .iter()
+                    .map(|qm| qm.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let current = self.composer.text();
+                let restored = if current.trim().is_empty() {
+                    queued_text
                 } else {
-                    // Pass other keys to composer so user can type ahead
-                    self.composer.handle_key(key);
+                    format!("{}\n{}", current.trim(), queued_text)
+                };
+                self.composer.set_text(&restored);
+                // Restore images if only one queued message had them
+                if messages.len() == 1 {
+                    let qm = messages.remove(0);
+                    if !qm.images.is_empty() {
+                        self.composer.set_image_attachments(qm.images);
+                    }
+                } else {
+                    for qm in &messages {
+                        dropped_images += qm.images.len();
+                    }
+                }
+                if dropped_images > 0 {
+                    self.cells.push(HistoryCell::System {
+                        text: format!(
+                            "[interrupted — queued messages restored to composer ({dropped_images} image{} discarded)]",
+                            if dropped_images == 1 { "" } else { "s" }
+                        ),
+                    });
+                } else {
+                    self.cells.push(HistoryCell::System {
+                        text: "[interrupted — queued messages restored to composer]".to_string(),
+                    });
+                }
+            } else {
+                self.cells.push(HistoryCell::System {
+                    text: "[interrupted]".to_string(),
+                });
+            }
+            self.previous_collab_mode = None;
+            self.state = AppState::Idle;
+        } else if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+            // Pop last queued message back into composer for editing
+            if let Some(qm) = self.queued_messages.pop_back() {
+                self.composer.set_text(&qm.text);
+                self.composer.set_image_attachments(qm.images);
+                // Remove the User + System cells that were added when it was queued
+                let len = self.cells.len();
+                if len >= 2
+                    && matches!(self.cells[len - 1], HistoryCell::System { .. })
+                    && matches!(self.cells[len - 2], HistoryCell::User { .. })
+                {
+                    self.cells.truncate(len - 2);
                 }
             }
-            AppState::Idle => {
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(AppAction::Quit);
+        } else if key.code == KeyCode::Enter {
+            // Send as a steer (mid-turn injection at tool boundary)
+            let text = self.composer.text().trim().to_string();
+            // Intercept /cancel mid-stream so it doesn't get sent to
+            // the agent as a steer. Equivalent to pressing Esc.
+            if matches!(text.as_str(), "/cancel" | "/stop" | "/abort") {
+                self.composer.set_text("");
+                if let Some(token) = self.cancel_token.take() {
+                    token.cancel();
                 }
-
-                // Popups get first priority for all key events (including Esc)
-                if self.settings_popup.is_visible() {
-                    if let Some(action) = self.settings_popup.handle_key(key, &mut self.config)? {
-                        return Ok(action);
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.plugins_popup.is_visible() {
-                    if let Some(actions) = self.plugins_popup.handle_key(key) {
-                        return Ok(AppAction::RunPlugins { actions });
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.projects_popup.is_visible() {
-                    if let Some(actions) = self.projects_popup.handle_key(key) {
-                        return Ok(AppAction::RunProjectActions { actions });
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.sessions_popup.is_visible() {
-                    if let Some(action) = self.sessions_popup.handle_key(key) {
-                        match action {
-                            SessionAction::Load { id } => {
-                                self.cells.clear();
-                                self.session_prompt_tokens = 0;
-                                self.session_completion_tokens = 0;
-                                return Ok(AppAction::LoadSession { id });
-                            }
-                        }
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.schedule_popup.is_visible() {
-                    if let Some(actions) = self.schedule_popup.handle_key(key) {
-                        return Ok(AppAction::RunScheduleActions { actions });
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.migrate_popup.is_visible() {
-                    if let Some(actions) = self.migrate_popup.handle_key(key) {
-                        return Ok(AppAction::RunMigration { actions });
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                if self.status_popup.is_visible() {
-                    self.status_popup.handle_key(key);
-                    return Ok(AppAction::Continue);
-                }
-
-                // Handle backtrack mode (selecting a past user message to rewind to)
-                if let BacktrackPhase::Selecting {
-                    ref user_message_indices,
-                    ref mut cursor,
-                } = self.backtrack
-                {
-                    match key.code {
-                        KeyCode::Up => {
-                            if *cursor + 1 < user_message_indices.len() {
-                                *cursor += 1;
-                            }
-                        }
-                        KeyCode::Down => {
-                            if *cursor > 0 {
-                                *cursor -= 1;
-                            }
-                        }
-                        KeyCode::Enter => {
-                            let indices = user_message_indices.clone();
-                            let cur = *cursor;
-                            // cursor 0 = most recent, which is the last element
-                            let cell_idx = indices[indices.len() - 1 - cur];
-                            let text = if let HistoryCell::User { text } = &self.cells[cell_idx] {
-                                text.clone()
-                            } else {
-                                String::new()
-                            };
-                            // Count which user message this is (0-indexed, oldest-first)
-                            let nth = self.cells[..=cell_idx]
-                                .iter()
-                                .filter(|c| matches!(c, HistoryCell::User { .. }))
-                                .count()
-                                - 1;
-                            self.backtrack = BacktrackPhase::Inactive;
-                            self.cells.truncate(cell_idx);
-                            self.composer.set_text(&text);
-                            self.auto_scroll = true;
-                            return Ok(AppAction::RewindTo {
-                                nth_user_message: nth,
-                            });
-                        }
-                        KeyCode::Esc => {
-                            self.backtrack = BacktrackPhase::Inactive;
-                        }
-                        _ => {}
-                    }
-                    return Ok(AppAction::Continue);
-                }
-
-                // Handle error-paused queue: Enter resumes, Esc clears
-                if self.last_turn_errored && !self.queued_messages.is_empty() {
-                    match key.code {
-                        KeyCode::Enter => {
-                            self.last_turn_errored = false;
-                            self.queue_pause_notified = false;
-                            if let Some(qm) = self.queued_messages.pop_front() {
-                                return self.handle_queued_submit(qm);
-                            }
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Esc => {
-                            self.last_turn_errored = false;
-                            self.queue_pause_notified = false;
-                            self.queued_messages.clear();
-                            self.push_system_message("[queue cleared]".to_string());
-                            return Ok(AppAction::Continue);
-                        }
-                        _ => {}
+                self.event_rx = None;
+                self.steer_tx = None;
+                self.pending_steers.clear();
+                for cell in self.cells.iter_mut().rev() {
+                    if let HistoryCell::Assistant { streaming, .. } = cell {
+                        *streaming = false;
+                        break;
                     }
                 }
+                self.cells.push(HistoryCell::System {
+                    text: "[cancelled]".to_string(),
+                });
+                self.previous_collab_mode = None;
+                self.state = AppState::Idle;
+                return Ok(AppAction::Continue);
+            }
+            if !text.is_empty() {
+                if let Some(ref steer_tx) = self.steer_tx {
+                    let _ = steer_tx.send(text.clone());
+                    self.cells.push(HistoryCell::User { text: text.clone() });
+                    self.cells.push(HistoryCell::System {
+                        text: "[steer queued — will be sent at next tool boundary]".to_string(),
+                    });
+                    self.pending_steers.push_back(text);
+                } else {
+                    // Fallback: queue normally if no steer channel
+                    let images = self.composer.take_image_attachments();
+                    self.cells.push(HistoryCell::User { text: text.clone() });
+                    self.cells.push(HistoryCell::System {
+                        text: format!("[queued — {} in queue]", self.queued_messages.len() + 1),
+                    });
+                    self.queued_messages
+                        .push_back(QueuedMessage { text, images });
+                }
+                self.composer.set_text("");
+                self.auto_scroll = true;
+            }
+        } else if key.code == KeyCode::Tab {
+            // No-op during streaming
+        } else if self.any_popup_visible() {
+            // A popup can be open during Streaming if
+            // drain_queued_if_idle started a turn while a popup was
+            // visible. Route keys to the popup, not the composer.
+            if self.settings_popup.is_visible() {
+                self.settings_popup.handle_key(key, &mut self.config)?;
+            } else if self.plugins_popup.is_visible() {
+                self.plugins_popup.handle_key(key);
+            } else if self.projects_popup.is_visible() {
+                self.projects_popup.handle_key(key);
+            } else if self.sessions_popup.is_visible() {
+                self.sessions_popup.handle_key(key);
+            } else if self.schedule_popup.is_visible() {
+                self.schedule_popup.handle_key(key);
+            }
+            // Other popups (skills, migrate, status) have no text
+            // input — just swallow the key.
+        } else {
+            // Pass other keys to composer so user can type ahead
+            self.composer.handle_key(key);
+        }
+        Ok(AppAction::Continue)
+    }
 
-                // Esc with empty composer enters backtrack mode
-                if key.code == KeyCode::Esc && self.composer.is_empty() && !self.last_turn_errored {
-                    let user_indices: Vec<usize> = self
-                        .cells
+    fn handle_key_idle(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(AppAction::Quit);
+        }
+
+        // Popups get first priority for all key events (including Esc)
+        if self.settings_popup.is_visible() {
+            if let Some(action) = self.settings_popup.handle_key(key, &mut self.config)? {
+                return Ok(action);
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.plugins_popup.is_visible() {
+            if let Some(actions) = self.plugins_popup.handle_key(key) {
+                return Ok(AppAction::RunPlugins { actions });
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.projects_popup.is_visible() {
+            if let Some(actions) = self.projects_popup.handle_key(key) {
+                return Ok(AppAction::RunProjectActions { actions });
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.sessions_popup.is_visible() {
+            if let Some(action) = self.sessions_popup.handle_key(key) {
+                match action {
+                    SessionAction::Load { id } => {
+                        self.cells.clear();
+                        self.session_prompt_tokens = 0;
+                        self.session_completion_tokens = 0;
+                        return Ok(AppAction::LoadSession { id });
+                    }
+                }
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.schedule_popup.is_visible() {
+            if let Some(actions) = self.schedule_popup.handle_key(key) {
+                return Ok(AppAction::RunScheduleActions { actions });
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.migrate_popup.is_visible() {
+            if let Some(actions) = self.migrate_popup.handle_key(key) {
+                return Ok(AppAction::RunMigration { actions });
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        if self.status_popup.is_visible() {
+            self.status_popup.handle_key(key);
+            return Ok(AppAction::Continue);
+        }
+
+        // Handle backtrack mode (selecting a past user message to rewind to)
+        if let BacktrackPhase::Selecting {
+            ref user_message_indices,
+            ref mut cursor,
+        } = self.backtrack
+        {
+            match key.code {
+                KeyCode::Up => {
+                    if *cursor + 1 < user_message_indices.len() {
+                        *cursor += 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let indices = user_message_indices.clone();
+                    let cur = *cursor;
+                    // cursor 0 = most recent, which is the last element
+                    let cell_idx = indices[indices.len() - 1 - cur];
+                    let text = if let HistoryCell::User { text } = &self.cells[cell_idx] {
+                        text.clone()
+                    } else {
+                        String::new()
+                    };
+                    // Count which user message this is (0-indexed, oldest-first)
+                    let nth = self.cells[..=cell_idx]
                         .iter()
-                        .enumerate()
-                        .filter(|(_, c)| matches!(c, HistoryCell::User { .. }))
-                        .map(|(i, _)| i)
-                        .collect();
-                    if !user_indices.is_empty() {
-                        self.backtrack = BacktrackPhase::Selecting {
-                            user_message_indices: user_indices,
-                            cursor: 0, // 0 = most recent
-                        };
+                        .filter(|c| matches!(c, HistoryCell::User { .. }))
+                        .count()
+                        - 1;
+                    self.backtrack = BacktrackPhase::Inactive;
+                    self.cells.truncate(cell_idx);
+                    self.composer.set_text(&text);
+                    self.auto_scroll = true;
+                    return Ok(AppAction::RewindTo {
+                        nth_user_message: nth,
+                    });
+                }
+                KeyCode::Esc => {
+                    self.backtrack = BacktrackPhase::Inactive;
+                }
+                _ => {}
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        // Handle error-paused queue: Enter resumes, Esc clears
+        if self.last_turn_errored && !self.queued_messages.is_empty() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.last_turn_errored = false;
+                    self.queue_pause_notified = false;
+                    if let Some(qm) = self.queued_messages.pop_front() {
+                        return self.handle_queued_submit(qm);
+                    }
+                    return Ok(AppAction::Continue);
+                }
+                KeyCode::Esc => {
+                    self.last_turn_errored = false;
+                    self.queue_pause_notified = false;
+                    self.queued_messages.clear();
+                    self.push_system_message("[queue cleared]".to_string());
+                    return Ok(AppAction::Continue);
+                }
+                _ => {}
+            }
+        }
+
+        // Esc with empty composer enters backtrack mode
+        if key.code == KeyCode::Esc && self.composer.is_empty() && !self.last_turn_errored {
+            let user_indices: Vec<usize> = self
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(c, HistoryCell::User { .. }))
+                .map(|(i, _)| i)
+                .collect();
+            if !user_indices.is_empty() {
+                self.backtrack = BacktrackPhase::Selecting {
+                    user_message_indices: user_indices,
+                    cursor: 0, // 0 = most recent
+                };
+                return Ok(AppAction::Continue);
+            }
+        }
+
+        // Ctrl+L — clear visual transcript
+        if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.cells.clear();
+            self.scroll_offset = 0;
+            self.auto_scroll = true;
+            return Ok(AppAction::Continue);
+        }
+
+        // Ctrl+D — quit when composer is empty (EOF)
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.composer.is_empty()
+        {
+            return Ok(AppAction::Quit);
+        }
+
+        // Ctrl+G — launch external editor
+        if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(AppAction::LaunchExternalEditor);
+        }
+
+        // Ctrl+V — paste clipboard image (fall through to normal paste if no image)
+        if key.code == KeyCode::Char('v')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && try_paste_clipboard_image(&mut self.composer)
+        {
+            return Ok(AppAction::Continue);
+        }
+
+        // Shift+Tab — cycle collaboration mode (default → execute → plan → default)
+        if key.code == KeyCode::BackTab {
+            let current = self.config.conversation.collaboration_mode;
+            let next = match current {
+                CollaborationMode::Default => CollaborationMode::Execute,
+                CollaborationMode::Execute => CollaborationMode::Plan,
+                CollaborationMode::Plan => CollaborationMode::Default,
+            };
+            // Track entering/leaving Plan so the post-turn review overlay can
+            // restore the user's prior mode on "Proceed".
+            if next == CollaborationMode::Plan && current != CollaborationMode::Plan {
+                self.previous_collab_mode = Some(current);
+            } else if next != CollaborationMode::Plan {
+                self.previous_collab_mode = None;
+            }
+            self.config.conversation.collaboration_mode = next;
+            self.push_system_message(format!("[mode: {next}]"));
+            return Ok(AppAction::Continue);
+        }
+
+        if self.command_popup.is_visible() {
+            match key.code {
+                KeyCode::Up => {
+                    self.command_popup.move_up();
+                    return Ok(AppAction::Continue);
+                }
+                KeyCode::Down => {
+                    self.command_popup.move_down();
+                    return Ok(AppAction::Continue);
+                }
+                KeyCode::Tab => {
+                    if let Some(cmd) = self.command_popup.selected_command() {
+                        let name = cmd.name.to_string();
+                        self.composer.set_text(&name);
+                        self.command_popup.dismiss();
+                    }
+                    return Ok(AppAction::Continue);
+                }
+                KeyCode::Enter => {
+                    if let Some(cmd) = self.command_popup.selected_command() {
+                        let name = cmd.name.to_string();
+                        self.composer.set_text("");
+                        self.command_popup.dismiss();
+                        return self.handle_submit(&name);
+                    }
+                    // No matching command — dismiss popup and submit raw text
+                    let text = self.composer.text().trim().to_string();
+                    self.composer.set_text("");
+                    self.command_popup.dismiss();
+                    if text.is_empty() {
                         return Ok(AppAction::Continue);
                     }
+                    return self.handle_submit(&text);
                 }
-
-                // Ctrl+L — clear visual transcript
-                if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.cells.clear();
-                    self.scroll_offset = 0;
-                    self.auto_scroll = true;
+                KeyCode::Esc => {
+                    self.command_popup.dismiss();
+                    self.composer.set_text("");
                     return Ok(AppAction::Continue);
                 }
-
-                // Ctrl+D — quit when composer is empty (EOF)
-                if key.code == KeyCode::Char('d')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                    && self.composer.is_empty()
-                {
-                    return Ok(AppAction::Quit);
-                }
-
-                // Ctrl+G — launch external editor
-                if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(AppAction::LaunchExternalEditor);
-                }
-
-                // Ctrl+V — paste clipboard image (fall through to normal paste if no image)
-                if key.code == KeyCode::Char('v')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                    && try_paste_clipboard_image(&mut self.composer)
-                {
-                    return Ok(AppAction::Continue);
-                }
-
-                // Shift+Tab — cycle collaboration mode (default → execute → plan → default)
-                if key.code == KeyCode::BackTab {
-                    let current = self.config.conversation.collaboration_mode;
-                    let next = match current {
-                        CollaborationMode::Default => CollaborationMode::Execute,
-                        CollaborationMode::Execute => CollaborationMode::Plan,
-                        CollaborationMode::Plan => CollaborationMode::Default,
-                    };
-                    // Track entering/leaving Plan so the post-turn review overlay can
-                    // restore the user's prior mode on "Proceed".
-                    if next == CollaborationMode::Plan && current != CollaborationMode::Plan {
-                        self.previous_collab_mode = Some(current);
-                    } else if next != CollaborationMode::Plan {
-                        self.previous_collab_mode = None;
+                _ => {
+                    // Pass key to composer, then update filter
+                    if let Some(text) = self.composer.handle_key(key) {
+                        self.command_popup.dismiss();
+                        return self.handle_submit(&text);
                     }
-                    self.config.conversation.collaboration_mode = next;
-                    self.push_system_message(format!("[mode: {next}]"));
+                    let text = self.composer.text();
+                    self.command_popup.update_filter(&text);
                     return Ok(AppAction::Continue);
                 }
+            }
+        }
 
-                if self.command_popup.is_visible() {
-                    match key.code {
-                        KeyCode::Up => {
-                            self.command_popup.move_up();
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Down => {
-                            self.command_popup.move_down();
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Tab => {
-                            if let Some(cmd) = self.command_popup.selected_command() {
-                                let name = cmd.name.to_string();
-                                self.composer.set_text(&name);
-                                self.command_popup.dismiss();
-                            }
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Enter => {
-                            if let Some(cmd) = self.command_popup.selected_command() {
-                                let name = cmd.name.to_string();
-                                self.composer.set_text("");
-                                self.command_popup.dismiss();
-                                return self.handle_submit(&name);
-                            }
-                            // No matching command — dismiss popup and submit raw text
-                            let text = self.composer.text().trim().to_string();
-                            self.composer.set_text("");
-                            self.command_popup.dismiss();
-                            if text.is_empty() {
-                                return Ok(AppAction::Continue);
-                            }
-                            return self.handle_submit(&text);
-                        }
-                        KeyCode::Esc => {
-                            self.command_popup.dismiss();
-                            self.composer.set_text("");
-                            return Ok(AppAction::Continue);
-                        }
-                        _ => {
-                            // Pass key to composer, then update filter
-                            if let Some(text) = self.composer.handle_key(key) {
-                                self.command_popup.dismiss();
-                                return self.handle_submit(&text);
-                            }
-                            let text = self.composer.text();
-                            self.command_popup.update_filter(&text);
-                            return Ok(AppAction::Continue);
-                        }
-                    }
+        if self.file_popup.is_visible() {
+            match key.code {
+                KeyCode::Up => {
+                    self.file_popup.move_up();
+                    return Ok(AppAction::Continue);
                 }
-
-                if self.file_popup.is_visible() {
-                    match key.code {
-                        KeyCode::Up => {
-                            self.file_popup.move_up();
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Down => {
-                            self.file_popup.move_down();
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Tab | KeyCode::Enter => {
-                            if let Some(file) = self.file_popup.selected_file() {
-                                let display = file.display.clone();
-                                let path = file.full_path.clone();
-                                let is_dir = file.is_dir;
-                                if is_dir {
-                                    // Directory: rewrite the in-progress mention to
-                                    // `@<path>/` (no trailing space, no FileRef) and
-                                    // re-run the popup so the user can drill further.
-                                    self.composer.set_partial_mention(display);
-                                    let text = self.composer.text();
-                                    if let Some(q) = extract_at_query(&text) {
-                                        self.file_popup.update_query(&q);
-                                    } else {
-                                        self.file_popup.dismiss();
-                                    }
-                                } else {
-                                    self.composer.add_file_ref(display, path);
-                                    self.file_popup.dismiss();
-                                }
-                            }
-                            return Ok(AppAction::Continue);
-                        }
-                        KeyCode::Esc => {
-                            self.file_popup.dismiss();
-                            return Ok(AppAction::Continue);
-                        }
-                        _ => {
-                            self.composer.handle_key(key);
+                KeyCode::Down => {
+                    self.file_popup.move_down();
+                    return Ok(AppAction::Continue);
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    if let Some(file) = self.file_popup.selected_file() {
+                        let display = file.display.clone();
+                        let path = file.full_path.clone();
+                        let is_dir = file.is_dir;
+                        if is_dir {
+                            // Directory: rewrite the in-progress mention to
+                            // `@<path>/` (no trailing space, no FileRef) and
+                            // re-run the popup so the user can drill further.
+                            self.composer.set_partial_mention(display);
                             let text = self.composer.text();
                             if let Some(q) = extract_at_query(&text) {
                                 self.file_popup.update_query(&q);
                             } else {
                                 self.file_popup.dismiss();
                             }
-                            return Ok(AppAction::Continue);
+                        } else {
+                            self.composer.add_file_ref(display, path);
+                            self.file_popup.dismiss();
                         }
                     }
-                }
-
-                // ? — show keyboard shortcuts when composer is empty
-                if key.code == KeyCode::Char('?')
-                    && key.modifiers == KeyModifiers::NONE
-                    && self.composer.is_empty()
-                {
-                    self.push_system_message(
-                        "Keyboard Shortcuts:\n  \
-                         Enter        — Send message\n  \
-                         Shift+Enter  — New line\n  \
-                         Up / Ctrl+P  — Previous history entry\n  \
-                         Down / Ctrl+N — Next history entry\n  \
-                         Esc          — Clear input / Rewind (when empty)\n  \
-                         Ctrl+L       — Clear screen\n  \
-                         Ctrl+D       — Quit (when empty)\n  \
-                         Ctrl+G       — Open external editor ($EDITOR)\n  \
-                         Enter        — Queue message while streaming\n  \
-                         Alt+Up       — Edit last queued message\n  \
-                         Ctrl+C       — Cancel / Quit\n  \
-                         Shift+Tab    — Cycle mode (default/execute/plan)\n  \
-                         PageUp/Down  — Scroll transcript\n  \
-                         Mouse wheel  — Scroll transcript\n  \
-                         /            — Show command menu"
-                            .to_string(),
-                    );
                     return Ok(AppAction::Continue);
                 }
-
-                // ------------------------------------------------------------
-                // Up / Down arrow routing.
-                // ------------------------------------------------------------
-                // Up/Down arrows primarily navigate **composer history**
-                // (shell-like recall of previously sent messages). The only
-                // exception is when the user has already scrolled up into the
-                // transcript (`scroll_offset > 0`), in which case Up/Down
-                // continue scrolling line-by-line so the user can navigate
-                // the scrollback without switching keys.
-                //
-                // Note: mouse-wheel events arrive as KeyCode::Up/Down via
-                // xterm Alternate Scroll Mode (?1007h). Because keyboard and
-                // wheel arrows are indistinguishable, wheel-from-bottom will
-                // trigger history recall rather than scrolling. Users can
-                // start scrolling with PageUp; once `scroll_offset > 0`,
-                // wheel (and keyboard arrows) resume line-by-line scrolling.
-                //
-                // Routing rule:
-                //   A. scroll_offset > 0 → Up/Down scroll the transcript.
-                //   B. Otherwise → Up/Down navigate composer history.
-                //
-                // PageUp / PageDown always scroll the transcript.
-                // Ctrl+P / Ctrl+N always navigate composer history.
-                // ------------------------------------------------------------
-                match key.code {
-                    KeyCode::PageUp => {
-                        self.scroll_offset = self
-                            .scroll_offset
-                            .saturating_add(borg_core::constants::PAGE_SCROLL_LINES);
-                        self.auto_scroll = false;
-                        return Ok(AppAction::Continue);
-                    }
-                    KeyCode::PageDown => {
-                        self.scroll_offset = self
-                            .scroll_offset
-                            .saturating_sub(borg_core::constants::PAGE_SCROLL_LINES);
-                        if self.scroll_offset == 0 {
-                            self.auto_scroll = true;
-                        }
-                        return Ok(AppAction::Continue);
-                    }
-                    KeyCode::Up if key.modifiers.is_empty() && self.scroll_offset > 0 => {
-                        let max_scroll = self
-                            .total_lines
-                            .saturating_sub(self.transcript_area.height as usize);
-                        if max_scroll > 0 {
-                            self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
-                            self.auto_scroll = false;
-                            return Ok(AppAction::Continue);
-                        }
-                        // No scrollable content — fall through to composer.
-                    }
-                    KeyCode::Down if key.modifiers.is_empty() && self.scroll_offset > 0 => {
-                        self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                        if self.scroll_offset == 0 {
-                            self.auto_scroll = true;
-                        }
-                        return Ok(AppAction::Continue);
-                    }
-                    _ => {}
+                KeyCode::Esc => {
+                    self.file_popup.dismiss();
+                    return Ok(AppAction::Continue);
                 }
-
-                if let Some(text) = self.composer.handle_key(key) {
-                    return self.handle_submit(&text);
-                }
-                // Update popup filters after normal key input
-                let text = self.composer.text();
-                self.command_popup.update_filter(&text);
-                if !self.command_popup.is_visible() {
+                _ => {
+                    self.composer.handle_key(key);
+                    let text = self.composer.text();
                     if let Some(q) = extract_at_query(&text) {
                         self.file_popup.update_query(&q);
                     } else {
                         self.file_popup.dismiss();
                     }
+                    return Ok(AppAction::Continue);
                 }
             }
         }
 
+        // ? — show keyboard shortcuts when composer is empty
+        if key.code == KeyCode::Char('?')
+            && key.modifiers == KeyModifiers::NONE
+            && self.composer.is_empty()
+        {
+            self.push_system_message(
+                "Keyboard Shortcuts:\n  \
+                 Enter        — Send message\n  \
+                 Shift+Enter  — New line\n  \
+                 Up / Ctrl+P  — Previous history entry\n  \
+                 Down / Ctrl+N — Next history entry\n  \
+                 Esc          — Clear input / Rewind (when empty)\n  \
+                 Ctrl+L       — Clear screen\n  \
+                 Ctrl+D       — Quit (when empty)\n  \
+                 Ctrl+G       — Open external editor ($EDITOR)\n  \
+                 Enter        — Queue message while streaming\n  \
+                 Alt+Up       — Edit last queued message\n  \
+                 Ctrl+C       — Cancel / Quit\n  \
+                 Shift+Tab    — Cycle mode (default/execute/plan)\n  \
+                 PageUp/Down  — Scroll transcript\n  \
+                 Mouse wheel  — Scroll transcript\n  \
+                 /            — Show command menu"
+                    .to_string(),
+            );
+            return Ok(AppAction::Continue);
+        }
+
+        // ------------------------------------------------------------
+        // Up / Down arrow routing.
+        // ------------------------------------------------------------
+        // Up/Down arrows primarily navigate **composer history**
+        // (shell-like recall of previously sent messages). The only
+        // exception is when the user has already scrolled up into the
+        // transcript (`scroll_offset > 0`), in which case Up/Down
+        // continue scrolling line-by-line so the user can navigate
+        // the scrollback without switching keys.
+        //
+        // Note: mouse-wheel events arrive as KeyCode::Up/Down via
+        // xterm Alternate Scroll Mode (?1007h). Because keyboard and
+        // wheel arrows are indistinguishable, wheel-from-bottom will
+        // trigger history recall rather than scrolling. Users can
+        // start scrolling with PageUp; once `scroll_offset > 0`,
+        // wheel (and keyboard arrows) resume line-by-line scrolling.
+        //
+        // Routing rule:
+        //   A. scroll_offset > 0 → Up/Down scroll the transcript.
+        //   B. Otherwise → Up/Down navigate composer history.
+        //
+        // PageUp / PageDown always scroll the transcript.
+        // Ctrl+P / Ctrl+N always navigate composer history.
+        // ------------------------------------------------------------
+        match key.code {
+            KeyCode::PageUp => {
+                self.scroll_offset = self
+                    .scroll_offset
+                    .saturating_add(borg_core::constants::PAGE_SCROLL_LINES);
+                self.auto_scroll = false;
+                return Ok(AppAction::Continue);
+            }
+            KeyCode::PageDown => {
+                self.scroll_offset = self
+                    .scroll_offset
+                    .saturating_sub(borg_core::constants::PAGE_SCROLL_LINES);
+                if self.scroll_offset == 0 {
+                    self.auto_scroll = true;
+                }
+                return Ok(AppAction::Continue);
+            }
+            KeyCode::Up if key.modifiers.is_empty() && self.scroll_offset > 0 => {
+                let max_scroll = self
+                    .total_lines
+                    .saturating_sub(self.transcript_area.height as usize);
+                if max_scroll > 0 {
+                    self.scroll_offset = (self.scroll_offset + 1).min(max_scroll);
+                    self.auto_scroll = false;
+                    return Ok(AppAction::Continue);
+                }
+                // No scrollable content — fall through to composer.
+            }
+            KeyCode::Down if key.modifiers.is_empty() && self.scroll_offset > 0 => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                if self.scroll_offset == 0 {
+                    self.auto_scroll = true;
+                }
+                return Ok(AppAction::Continue);
+            }
+            _ => {}
+        }
+
+        if let Some(text) = self.composer.handle_key(key) {
+            return self.handle_submit(&text);
+        }
+        // Update popup filters after normal key input
+        let text = self.composer.text();
+        self.command_popup.update_filter(&text);
+        if !self.command_popup.is_visible() {
+            if let Some(q) = extract_at_query(&text) {
+                self.file_popup.update_query(&q);
+            } else {
+                self.file_popup.dismiss();
+            }
+        }
         Ok(AppAction::Continue)
     }
 
@@ -1223,240 +1253,274 @@ impl<'a> App<'a> {
 
     pub fn process_agent_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Preparing => {
-                self.cells.push(HistoryCell::Thinking {
-                    text: String::new(),
-                });
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
-            }
-            AgentEvent::TextDelta(delta) => {
-                // Remove empty Thinking placeholder (from Preparing event)
-                if matches!(self.cells.last(), Some(HistoryCell::Thinking { text }) if text.is_empty())
-                {
-                    self.cells.pop();
-                }
-                if let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() {
-                    text.push_str(&delta);
-                } else {
-                    self.cells.push(HistoryCell::Assistant {
-                        text: delta,
-                        streaming: true,
-                    });
-                }
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
-            }
-            AgentEvent::ThinkingDelta(delta) => {
-                // Check if the second-to-last cell is a Thinking cell (last is the
-                // streaming Assistant cell), or if the last cell itself is Thinking.
-                let len = self.cells.len();
-                let thinking_idx = if len >= 2 {
-                    if matches!(self.cells[len - 2], HistoryCell::Thinking { .. }) {
-                        Some(len - 2)
-                    } else if matches!(self.cells[len - 1], HistoryCell::Thinking { .. }) {
-                        Some(len - 1)
-                    } else {
-                        None
-                    }
-                } else if len == 1 && matches!(self.cells[0], HistoryCell::Thinking { .. }) {
-                    Some(0)
-                } else {
-                    None
-                };
-
-                if let Some(idx) = thinking_idx {
-                    if let HistoryCell::Thinking { text, .. } = &mut self.cells[idx] {
-                        text.push_str(&delta);
-                    }
-                } else {
-                    // Insert thinking cell before the trailing Assistant cell so
-                    // text deltas continue appending to the Assistant cell at the end.
-                    let insert_pos = if len > 0
-                        && matches!(self.cells[len - 1], HistoryCell::Assistant { .. })
-                    {
-                        len - 1
-                    } else {
-                        len
-                    };
-                    self.cells
-                        .insert(insert_pos, HistoryCell::Thinking { text: delta });
-                }
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
-            }
+            AgentEvent::Preparing => self.handle_event_preparing(),
+            AgentEvent::TextDelta(delta) => self.handle_event_text_delta(delta),
+            AgentEvent::ThinkingDelta(delta) => self.handle_event_thinking_delta(delta),
             AgentEvent::ToolExecuting { name, args } => {
-                self.cells.push(HistoryCell::ToolStart {
-                    name,
-                    args,
-                    completed: false,
-                    start_time: Some(Instant::now()),
-                });
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
+                self.handle_event_tool_executing(name, args)
             }
-            AgentEvent::ToolResult { name, result } => {
-                // Mark matching ToolStart as completed and compute duration + display label
-                let mut duration_ms = None;
-                let mut matched_args = None;
-                for cell in self.cells.iter_mut().rev() {
-                    if let HistoryCell::ToolStart {
-                        name: ref start_name,
-                        args,
-                        completed,
-                        start_time,
-                        ..
-                    } = cell
-                    {
-                        if start_name == &name && !*completed {
-                            *completed = true;
-                            matched_args = Some(args.clone());
-                            if let Some(t) = start_time {
-                                duration_ms = Some(t.elapsed().as_millis() as u64);
-                            }
-                            break;
-                        }
-                    }
-                }
-                let display_label = if let Some(ref args) = matched_args {
-                    let cat = super::tool_display::classify_tool(&name, args);
-                    super::tool_display::tool_result_label(&cat)
-                } else {
-                    format!("Ran {name}")
-                };
-                let is_error = result.starts_with("Error:");
-                self.cells.push(HistoryCell::ToolResult {
-                    output: result,
-                    is_error,
-                    duration_ms,
-                    display_label,
-                });
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
-            }
+            AgentEvent::ToolResult { name, result } => self.handle_event_tool_result(name, result),
             AgentEvent::ShellConfirmation { command, respond } => {
-                self.cells.push(HistoryCell::ShellApproval {
-                    command,
-                    status: ApprovalStatus::Pending,
-                });
-                self.state = AppState::AwaitingApproval {
-                    respond: Some(respond),
-                };
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
+                self.handle_event_shell_confirmation(command, respond)
             }
-            AgentEvent::Usage(usage) => {
-                self.session_prompt_tokens += usage.prompt_tokens;
-                self.session_completion_tokens += usage.completion_tokens;
-            }
-            AgentEvent::TurnComplete => {
-                // Clean up steer channel on turn completion
-                self.steer_tx = None;
-                self.pending_steers.clear();
-                // Clean up any leftover empty thinking placeholders
-                self.cells
-                    .retain(|c| !matches!(c, HistoryCell::Thinking { text } if text.is_empty()));
-                for cell in self.cells.iter_mut().rev() {
-                    if let HistoryCell::Assistant { streaming, .. } = cell {
-                        *streaming = false;
-                        break;
-                    }
-                }
-                self.last_turn_errored = false;
-                self.queue_pause_notified = false;
-                if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
-                    let pct = self.compute_context_pct();
-                    let name = self
-                        .config
-                        .user
-                        .agent_name
-                        .clone()
-                        .unwrap_or_else(|| "Borg".to_string());
-                    self.plan_overlay.show(pct, name);
-                    self.state = AppState::PlanReview;
-                } else {
-                    self.state = AppState::Idle;
-                }
-            }
-            AgentEvent::Error(e) => {
-                self.cells.push(HistoryCell::System {
-                    text: borg_core::error_format::format_error_with_context(
-                        &e,
-                        borg_core::error_format::ErrorContext::Tui,
-                    ),
-                });
-                for cell in self.cells.iter_mut().rev() {
-                    if let HistoryCell::Assistant { streaming, .. } = cell {
-                        *streaming = false;
-                        break;
-                    }
-                }
-                self.last_turn_errored = true;
-                // If a transient Plan flow failed, roll back to the prior mode so the
-                // user isn't left trapped with mutations blocked.
-                if let Some(prev) = self.previous_collab_mode.take() {
-                    self.config.conversation.collaboration_mode = prev;
-                }
-                self.state = AppState::Idle;
-            }
-            AgentEvent::SteerReceived { text } => {
-                // Remove matching steer from pending
-                if let Some(pos) = self.pending_steers.iter().position(|s| *s == text) {
-                    self.pending_steers.remove(pos);
-                }
-            }
-            AgentEvent::PlanUpdated { steps } => {
-                self.plan_steps = steps.clone();
-                // Update existing Plan cell in-place, or insert a new one
-                let existing = self
-                    .cells
-                    .iter()
-                    .rposition(|c| matches!(c, HistoryCell::Plan { .. }));
-                if let Some(idx) = existing {
-                    self.cells[idx] = HistoryCell::Plan { steps };
-                } else {
-                    self.cells.push(HistoryCell::Plan { steps });
-                }
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
-            }
+            AgentEvent::Usage(usage) => self.handle_event_usage(usage),
+            AgentEvent::TurnComplete => self.handle_event_turn_complete(),
+            AgentEvent::Error(e) => self.handle_event_error(e),
+            AgentEvent::SteerReceived { text } => self.handle_event_steer_received(text),
+            AgentEvent::PlanUpdated { steps } => self.handle_event_plan_updated(steps),
             AgentEvent::UserInputRequest { prompt, respond } => {
-                // Show prompt and transition to awaiting input
-                self.cells.push(HistoryCell::System {
-                    text: format!("[agent asks: {prompt}]"),
-                });
-                self.state = AppState::AwaitingInput {
-                    prompt,
-                    respond: Some(respond),
-                };
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
-                }
+                self.handle_event_user_input_request(prompt, respond)
             }
             AgentEvent::SubAgentUpdate { .. } => {
                 // Sub-agent updates are informational; no TUI action needed yet.
             }
             AgentEvent::ToolOutputDelta {
                 delta, is_stderr, ..
-            } => {
-                if let Some(HistoryCell::ToolStreaming { lines, .. }) = self.cells.last_mut() {
-                    lines.push((delta, is_stderr));
+            } => self.handle_event_tool_output_delta(delta, is_stderr),
+        }
+    }
+
+    fn handle_event_preparing(&mut self) {
+        self.cells.push(HistoryCell::Thinking {
+            text: String::new(),
+        });
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_text_delta(&mut self, delta: String) {
+        // Remove empty Thinking placeholder (from Preparing event)
+        if matches!(self.cells.last(), Some(HistoryCell::Thinking { text }) if text.is_empty()) {
+            self.cells.pop();
+        }
+        if let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() {
+            text.push_str(&delta);
+        } else {
+            self.cells.push(HistoryCell::Assistant {
+                text: delta,
+                streaming: true,
+            });
+        }
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_thinking_delta(&mut self, delta: String) {
+        // Check if the second-to-last cell is a Thinking cell (last is the
+        // streaming Assistant cell), or if the last cell itself is Thinking.
+        let len = self.cells.len();
+        let thinking_idx = if len >= 2 {
+            if matches!(self.cells[len - 2], HistoryCell::Thinking { .. }) {
+                Some(len - 2)
+            } else if matches!(self.cells[len - 1], HistoryCell::Thinking { .. }) {
+                Some(len - 1)
+            } else {
+                None
+            }
+        } else if len == 1 && matches!(self.cells[0], HistoryCell::Thinking { .. }) {
+            Some(0)
+        } else {
+            None
+        };
+
+        if let Some(idx) = thinking_idx {
+            if let HistoryCell::Thinking { text, .. } = &mut self.cells[idx] {
+                text.push_str(&delta);
+            }
+        } else {
+            // Insert thinking cell before the trailing Assistant cell so
+            // text deltas continue appending to the Assistant cell at the end.
+            let insert_pos =
+                if len > 0 && matches!(self.cells[len - 1], HistoryCell::Assistant { .. }) {
+                    len - 1
                 } else {
-                    self.cells.push(HistoryCell::ToolStreaming {
-                        lines: vec![(delta, is_stderr)],
-                    });
-                }
-                if self.auto_scroll {
-                    self.scroll_offset = 0;
+                    len
+                };
+            self.cells
+                .insert(insert_pos, HistoryCell::Thinking { text: delta });
+        }
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_tool_executing(&mut self, name: String, args: String) {
+        self.cells.push(HistoryCell::ToolStart {
+            name,
+            args,
+            completed: false,
+            start_time: Some(Instant::now()),
+        });
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_tool_result(&mut self, name: String, result: String) {
+        // Mark matching ToolStart as completed and compute duration + display label
+        let mut duration_ms = None;
+        let mut matched_args = None;
+        for cell in self.cells.iter_mut().rev() {
+            if let HistoryCell::ToolStart {
+                name: ref start_name,
+                args,
+                completed,
+                start_time,
+                ..
+            } = cell
+            {
+                if start_name == &name && !*completed {
+                    *completed = true;
+                    matched_args = Some(args.clone());
+                    if let Some(t) = start_time {
+                        duration_ms = Some(t.elapsed().as_millis() as u64);
+                    }
+                    break;
                 }
             }
+        }
+        let display_label = if let Some(ref args) = matched_args {
+            let cat = super::tool_display::classify_tool(&name, args);
+            super::tool_display::tool_result_label(&cat)
+        } else {
+            format!("Ran {name}")
+        };
+        let is_error = result.starts_with("Error:");
+        self.cells.push(HistoryCell::ToolResult {
+            output: result,
+            is_error,
+            duration_ms,
+            display_label,
+        });
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_shell_confirmation(&mut self, command: String, respond: oneshot::Sender<bool>) {
+        self.cells.push(HistoryCell::ShellApproval {
+            command,
+            status: ApprovalStatus::Pending,
+        });
+        self.state = AppState::AwaitingApproval {
+            respond: Some(respond),
+        };
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_usage(&mut self, usage: borg_core::llm::UsageData) {
+        self.session_prompt_tokens += usage.prompt_tokens;
+        self.session_completion_tokens += usage.completion_tokens;
+    }
+
+    fn handle_event_turn_complete(&mut self) {
+        // Clean up steer channel on turn completion
+        self.steer_tx = None;
+        self.pending_steers.clear();
+        // Clean up any leftover empty thinking placeholders
+        self.cells
+            .retain(|c| !matches!(c, HistoryCell::Thinking { text } if text.is_empty()));
+        for cell in self.cells.iter_mut().rev() {
+            if let HistoryCell::Assistant { streaming, .. } = cell {
+                *streaming = false;
+                break;
+            }
+        }
+        self.last_turn_errored = false;
+        self.queue_pause_notified = false;
+        if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
+            let pct = self.compute_context_pct();
+            let name = self
+                .config
+                .user
+                .agent_name
+                .clone()
+                .unwrap_or_else(|| "Borg".to_string());
+            self.plan_overlay.show(pct, name);
+            self.state = AppState::PlanReview;
+        } else {
+            self.state = AppState::Idle;
+        }
+    }
+
+    fn handle_event_error(&mut self, e: String) {
+        self.cells.push(HistoryCell::System {
+            text: borg_core::error_format::format_error_with_context(
+                &e,
+                borg_core::error_format::ErrorContext::Tui,
+            ),
+        });
+        for cell in self.cells.iter_mut().rev() {
+            if let HistoryCell::Assistant { streaming, .. } = cell {
+                *streaming = false;
+                break;
+            }
+        }
+        self.last_turn_errored = true;
+        // If a transient Plan flow failed, roll back to the prior mode so the
+        // user isn't left trapped with mutations blocked.
+        if let Some(prev) = self.previous_collab_mode.take() {
+            self.config.conversation.collaboration_mode = prev;
+        }
+        self.state = AppState::Idle;
+    }
+
+    fn handle_event_steer_received(&mut self, text: String) {
+        // Remove matching steer from pending
+        if let Some(pos) = self.pending_steers.iter().position(|s| *s == text) {
+            self.pending_steers.remove(pos);
+        }
+    }
+
+    fn handle_event_plan_updated(&mut self, steps: Vec<borg_core::types::PlanStep>) {
+        self.plan_steps = steps.clone();
+        // Update existing Plan cell in-place, or insert a new one
+        let existing = self
+            .cells
+            .iter()
+            .rposition(|c| matches!(c, HistoryCell::Plan { .. }));
+        if let Some(idx) = existing {
+            self.cells[idx] = HistoryCell::Plan { steps };
+        } else {
+            self.cells.push(HistoryCell::Plan { steps });
+        }
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_user_input_request(
+        &mut self,
+        prompt: String,
+        respond: oneshot::Sender<String>,
+    ) {
+        // Show prompt and transition to awaiting input
+        self.cells.push(HistoryCell::System {
+            text: format!("[agent asks: {prompt}]"),
+        });
+        self.state = AppState::AwaitingInput {
+            prompt,
+            respond: Some(respond),
+        };
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn handle_event_tool_output_delta(&mut self, delta: String, is_stderr: bool) {
+        if let Some(HistoryCell::ToolStreaming { lines, .. }) = self.cells.last_mut() {
+            lines.push((delta, is_stderr));
+        } else {
+            self.cells.push(HistoryCell::ToolStreaming {
+                lines: vec![(delta, is_stderr)],
+            });
+        }
+        if self.auto_scroll {
+            self.scroll_offset = 0;
         }
     }
 

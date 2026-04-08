@@ -298,6 +298,23 @@ fn manage_tasks_run_now(args: &serde_json::Value) -> Result<String> {
 
 // ── Cron job management ──
 
+/// Looks up a cron job by ID, verifies it has `task_type == "command"`, and
+/// passes the verified task to the callback. Returns appropriate error messages
+/// for missing or mistyped jobs.
+fn with_cron_job<F>(job_id: &str, f: F) -> Result<String>
+where
+    F: FnOnce(&Database, &crate::db::ScheduledTaskRow) -> Result<String>,
+{
+    with_db(|db| match db.get_task_by_id(job_id) {
+        Ok(Some(task)) if task.task_type == "command" => f(db, &task),
+        Ok(Some(_)) => Ok(format!(
+            "Job {job_id} is a prompt task, not a cron job. Use manage_tasks to manage it."
+        )),
+        Ok(None) => Ok(format!("Cron job {job_id} not found.")),
+        Err(e) => Ok(format!("Error: {e}")),
+    })
+}
+
 pub fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> Result<String> {
     let action = require_str_param(args, "action")?;
     match action {
@@ -305,54 +322,26 @@ pub fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> Result<
         "list" => manage_cron_list(),
         "get" => {
             let job_id = require_str_param(args, "job_id")?;
-            with_db(|db| match db.get_task_by_id(job_id) {
-                Ok(Some(task)) if task.task_type == "command" => Ok(tasks::format_task(&task)),
-                Ok(Some(_)) => Ok(format!(
-                    "Job {job_id} is not a cron job (it's a prompt task)."
-                )),
-                Ok(None) => Ok(format!("Cron job {job_id} not found.")),
-                Err(e) => Ok(format!("Error: {e}")),
-            })
+            with_cron_job(job_id, |_, task| Ok(tasks::format_task(task)))
         }
         "delete" => {
             let job_id = require_str_param(args, "job_id")?;
-            with_db(|db| match db.get_task_by_id(job_id) {
-                Ok(Some(task)) if task.task_type == "command" => match db.delete_task(job_id) {
-                    Ok(true) => Ok(format!("Cron job {job_id} deleted.")),
-                    Ok(false) => Ok(format!("Cron job {job_id} not found.")),
-                    Err(e) => Ok(format!("Error: {e}")),
-                },
-                Ok(Some(_)) => Ok(format!(
-                    "Job {job_id} is a prompt task, not a cron job. Use manage_tasks to manage it."
-                )),
-                Ok(None) => Ok(format!("Cron job {job_id} not found.")),
+            with_cron_job(job_id, |db, _| match db.delete_task(job_id) {
+                Ok(true) => Ok(format!("Cron job {job_id} deleted.")),
+                Ok(false) => Ok(format!("Cron job {job_id} not found.")),
                 Err(e) => Ok(format!("Error: {e}")),
             })
         }
         "pause" => {
             let job_id = require_str_param(args, "job_id")?;
-            with_db(|db| match db.get_task_by_id(job_id) {
-                Ok(Some(task)) if task.task_type == "command" => {
-                    update_task_status(job_id, tasks::TASK_STATUS_PAUSED, "paused")
-                }
-                Ok(Some(_)) => Ok(format!(
-                    "Job {job_id} is a prompt task, not a cron job. Use manage_tasks to manage it."
-                )),
-                Ok(None) => Ok(format!("Cron job {job_id} not found.")),
-                Err(e) => Ok(format!("Error: {e}")),
+            with_cron_job(job_id, |_, _| {
+                update_task_status(job_id, tasks::TASK_STATUS_PAUSED, "paused")
             })
         }
         "resume" => {
             let job_id = require_str_param(args, "job_id")?;
-            with_db(|db| match db.get_task_by_id(job_id) {
-                Ok(Some(task)) if task.task_type == "command" => {
-                    update_task_status(job_id, tasks::TASK_STATUS_ACTIVE, "resumed")
-                }
-                Ok(Some(_)) => Ok(format!(
-                    "Job {job_id} is a prompt task, not a cron job. Use manage_tasks to manage it."
-                )),
-                Ok(None) => Ok(format!("Cron job {job_id} not found.")),
-                Err(e) => Ok(format!("Error: {e}")),
+            with_cron_job(job_id, |_, _| {
+                update_task_status(job_id, tasks::TASK_STATUS_ACTIVE, "resumed")
             })
         }
         "runs" => {
@@ -389,20 +378,13 @@ pub fn handle_manage_cron(args: &serde_json::Value, _config: &Config) -> Result<
         }
         "run_now" => {
             let job_id = require_str_param(args, "job_id")?;
-            with_db(|db| match db.get_task_by_id(job_id) {
-                Ok(Some(task)) if task.task_type == "command" => {
-                    let now = chrono::Utc::now().timestamp();
-                    if let Err(e) = db.update_task_next_run(job_id, Some(now)) {
-                        return Ok(format!("Error: {e}"));
-                    }
-                    let _ = db.clear_task_retry(job_id);
-                    Ok(format!("Cron job {job_id} queued for immediate execution."))
+            with_cron_job(job_id, |db, _| {
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = db.update_task_next_run(job_id, Some(now)) {
+                    return Ok(format!("Error: {e}"));
                 }
-                Ok(Some(_)) => Ok(format!(
-                    "Job {job_id} is a prompt task, not a cron job. Use manage_tasks to manage it."
-                )),
-                Ok(None) => Ok(format!("Cron job {job_id} not found.")),
-                Err(e) => Ok(format!("Error: {e}")),
+                let _ = db.clear_task_retry(job_id);
+                Ok(format!("Cron job {job_id} queued for immediate execution."))
             })
         }
         other => Ok(format!(

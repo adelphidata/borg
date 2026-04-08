@@ -17,31 +17,128 @@ pub enum SkillLoadLevel {
     Full,
 }
 
+/// Metadata for a single built-in skill entry in the registry.
+/// Content and category are captured separately by `BUNDLED_SKILLS` and `SKILL_CATEGORY_MAP`.
+struct SkillEntry {
+    name: &'static str,
+    default_enabled: bool,
+    hidden: bool,
+}
+
+/// Declares all built-in skills in a single registry table, generating:
+/// - `SKILL_REGISTRY`: `&[SkillEntry]` — the single source of truth
+/// - `BUNDLED_SKILLS`: `&[(&str, &str)]` — name + included SKILL.md content
+/// - `SKILL_CATEGORY_MAP`: `&[(&str, &str)]` — name → category
+///
+/// `DEFAULT_ENABLED_SKILLS` and `HIDDEN_SKILLS` are derived from the registry
+/// so that all skill metadata lives in one place.
+///
+/// Each entry declares name, path, category, default_enabled, and hidden.
 macro_rules! bundled_skills {
-    ($( $name:literal => $path:literal ),* $(,)?) => {
+    ($(
+        $name:literal => $path:literal {
+            category: $cat:literal,
+            default_enabled: $de:literal,
+            hidden: $hid:literal
+        }
+    ),* $(,)?) => {
+        const SKILL_REGISTRY: &[SkillEntry] = &[
+            $(
+                SkillEntry {
+                    name: $name,
+                    default_enabled: $de,
+                    hidden: $hid,
+                },
+            )*
+        ];
+
         const BUNDLED_SKILLS: &[(&str, &str)] = &[
             $( ($name, include_str!(concat!("../skills/", $path, "/SKILL.md"))) ),*
+        ];
+
+        /// Hardcoded category fallback for built-in skills without a `category` field.
+        const SKILL_CATEGORY_MAP: &[(&str, &str)] = &[
+            $( ($name, $cat) ),*
         ];
     };
 }
 
 bundled_skills! {
-    "slack" => "slack",
-    "discord" => "discord",
-    "github" => "github",
-    "weather" => "weather",
-    "skill-creator" => "skill-creator",
-    "git" => "git",
-    "search" => "search",
-    "docker" => "docker",
-    "database" => "database",
-    "notes" => "notes",
-    "calendar" => "calendar",
-    "1password" => "1password",
-    "browser" => "browser",
-    "scheduler" => "scheduler",
-    "email" => "email",
+    "slack"          => "slack"          { category: "channels",  default_enabled: false, hidden: true  },
+    "discord"        => "discord"        { category: "channels",  default_enabled: false, hidden: true  },
+    "github"         => "github"         { category: "developer", default_enabled: false, hidden: false },
+    "weather"        => "weather"        { category: "utilities", default_enabled: false, hidden: false },
+    "skill-creator"  => "skill-creator"  { category: "utilities", default_enabled: false, hidden: true  },
+    "git"            => "git"            { category: "developer", default_enabled: true,  hidden: false },
+    "search"         => "search"         { category: "core",      default_enabled: true,  hidden: false },
+    "docker"         => "docker"         { category: "developer", default_enabled: false, hidden: false },
+    "database"       => "database"       { category: "developer", default_enabled: false, hidden: false },
+    "notes"          => "notes"          { category: "utilities", default_enabled: false, hidden: false },
+    "calendar"       => "calendar"       { category: "core",      default_enabled: true,  hidden: false },
+    "1password"      => "1password"      { category: "utilities", default_enabled: false, hidden: false },
+    "browser"        => "browser"        { category: "core",      default_enabled: true,  hidden: false },
+    "scheduler"      => "scheduler"      { category: "utilities", default_enabled: false, hidden: true  },
+    "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
 }
+
+/// Skills enabled by default when no explicit config entry exists.
+pub const DEFAULT_ENABLED_SKILLS: &[&str] = &{
+    // Count entries at compile time
+    const COUNT: usize = {
+        let mut n = 0;
+        let mut i = 0;
+        while i < SKILL_REGISTRY.len() {
+            if SKILL_REGISTRY[i].default_enabled {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    };
+    const fn build() -> [&'static str; COUNT] {
+        let mut out = [""; COUNT];
+        let mut i = 0;
+        let mut j = 0;
+        while i < SKILL_REGISTRY.len() {
+            if SKILL_REGISTRY[i].default_enabled {
+                out[j] = SKILL_REGISTRY[i].name;
+                j += 1;
+            }
+            i += 1;
+        }
+        out
+    }
+    build()
+};
+
+/// Skills hidden from the unified /plugins UI (still loaded for prompt injection).
+pub const HIDDEN_SKILLS: &[&str] = &{
+    const COUNT: usize = {
+        let mut n = 0;
+        let mut i = 0;
+        while i < SKILL_REGISTRY.len() {
+            if SKILL_REGISTRY[i].hidden {
+                n += 1;
+            }
+            i += 1;
+        }
+        n
+    };
+    const fn build() -> [&'static str; COUNT] {
+        let mut out = [""; COUNT];
+        let mut i = 0;
+        let mut j = 0;
+        while i < SKILL_REGISTRY.len() {
+            if SKILL_REGISTRY[i].hidden {
+                out[j] = SKILL_REGISTRY[i].name;
+                j += 1;
+            }
+            i += 1;
+        }
+        out
+    }
+    build()
+};
 
 /// Where a skill was loaded from.
 #[derive(Debug, Clone, PartialEq)]
@@ -103,32 +200,6 @@ pub struct SkillManifest {
     #[serde(default)]
     pub category: Option<String>,
 }
-
-/// Skills enabled by default when no explicit config entry exists.
-pub const DEFAULT_ENABLED_SKILLS: &[&str] = &["browser", "git", "search", "email", "calendar"];
-
-/// Skills hidden from the unified /plugins UI (still loaded for prompt injection).
-pub const HIDDEN_SKILLS: &[&str] = &["skill-creator", "slack", "discord", "scheduler"];
-
-/// Hardcoded category fallback for built-in skills without a `category` field.
-const SKILL_CATEGORY_MAP: &[(&str, &str)] = &[
-    ("git", "developer"),
-    ("github", "developer"),
-    ("docker", "developer"),
-    ("database", "developer"),
-    ("search", "core"),
-    ("browser", "core"),
-    ("calendar", "core"),
-    ("email", "core"),
-    ("weather", "utilities"),
-    ("http", "utilities"),
-    ("1password", "utilities"),
-    ("notes", "utilities"),
-    ("scheduler", "utilities"),
-    ("slack", "channels"),
-    ("discord", "channels"),
-    ("skill-creator", "utilities"),
-];
 
 /// A loaded skill with its manifest, body, and runtime metadata.
 #[derive(Debug, Clone)]

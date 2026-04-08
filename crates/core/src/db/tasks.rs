@@ -4,6 +4,9 @@ use anyhow::Result;
 use rusqlite::params;
 use rusqlite::OptionalExtension;
 
+/// Column list shared by all scheduled-task SELECT queries.
+const TASK_COLUMNS: &str = "id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type";
+
 impl Database {
     /// Insert a new scheduled task into the database.
     pub fn create_task(&self, task: &NewTask<'_>) -> Result<()> {
@@ -20,11 +23,9 @@ impl Database {
 
     /// List all scheduled tasks ordered by creation time descending.
     pub fn list_tasks(&self) -> Result<Vec<ScheduledTaskRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at,
-                    max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type
-             FROM scheduled_tasks ORDER BY created_at DESC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks ORDER BY created_at DESC"
+        ))?;
         let rows = stmt
             .query_map([], Self::map_task_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -33,14 +34,12 @@ impl Database {
 
     /// Fetch active tasks whose next_run is at or before `now` and not pending retry.
     pub fn get_due_tasks(&self, now: i64) -> Result<Vec<ScheduledTaskRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at,
-                    max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type
-             FROM scheduled_tasks
-             WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1
-               AND retry_after IS NULL
-             ORDER BY next_run ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
+             WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1 \
+             AND retry_after IS NULL \
+             ORDER BY next_run ASC"
+        ))?;
         let rows = stmt
             .query_map(params![now], Self::map_task_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -111,11 +110,9 @@ impl Database {
 
     /// Look up a single task by its ID.
     pub fn get_task_by_id(&self, id: &str) -> Result<Option<ScheduledTaskRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at,
-                    max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type
-             FROM scheduled_tasks WHERE id = ?1",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks WHERE id = ?1"
+        ))?;
         let mut rows = stmt.query_map(params![id], Self::map_task_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
@@ -174,13 +171,11 @@ impl Database {
 
     /// Fetch tasks whose retry_after time has elapsed.
     pub fn get_tasks_pending_retry(&self, now: i64) -> Result<Vec<ScheduledTaskRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at,
-                    max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type
-             FROM scheduled_tasks
-             WHERE status = 'active' AND retry_after IS NOT NULL AND retry_after <= ?1
-             ORDER BY retry_after ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
+             WHERE status = 'active' AND retry_after IS NOT NULL AND retry_after <= ?1 \
+             ORDER BY retry_after ASC"
+        ))?;
         let rows = stmt
             .query_map(params![now], Self::map_task_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -202,14 +197,12 @@ impl Database {
     }
 
     fn claim_due_tasks_inner(&self, now: i64) -> Result<Vec<ClaimedTask>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at,
-                    max_retries, retry_count, retry_after, last_error, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type
-             FROM scheduled_tasks
-             WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1
-               AND retry_after IS NULL
-             ORDER BY next_run ASC",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
+             WHERE status = 'active' AND next_run IS NOT NULL AND next_run <= ?1 \
+             AND retry_after IS NULL \
+             ORDER BY next_run ASC"
+        ))?;
         let tasks: Vec<ScheduledTaskRow> = stmt
             .query_map(params![now], Self::map_task_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
