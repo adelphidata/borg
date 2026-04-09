@@ -157,6 +157,18 @@ pub struct GatewayBinding {
     /// Extended thinking level override for this binding.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingLevel>,
+    /// Override LLM request timeout in milliseconds.
+    /// Useful for slow thinking models that need more than the default 120s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    /// Override gateway agent-processing timeout in milliseconds.
+    /// Should be >= request_timeout_ms to avoid premature cancellation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_timeout_ms: Option<u64>,
+    /// Override per-SSE-chunk timeout in seconds.
+    /// Increase for models with long thinking phases before first token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_chunk_timeout_secs: Option<u64>,
 }
 
 /// Activation mode for group chats.

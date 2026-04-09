@@ -167,6 +167,20 @@ fn apply_binding_overrides(config: &mut Config, binding: &GatewayBinding) {
     if let Some(ref thinking) = binding.thinking {
         config.llm.thinking = thinking.clone();
     }
+    if let Some(timeout) = binding.request_timeout_ms {
+        config.llm.request_timeout_ms = timeout;
+    }
+    if let Some(timeout) = binding.gateway_timeout_ms {
+        config.gateway.request_timeout_ms = timeout;
+    }
+    if let Some(timeout) = binding.stream_chunk_timeout_secs {
+        config.llm.stream_chunk_timeout_secs = timeout;
+    }
+    // Ensure gateway timeout is at least as large as LLM request timeout
+    // to prevent the gateway timer from cancelling mid-request.
+    if config.gateway.request_timeout_ms < config.llm.request_timeout_ms {
+        config.gateway.request_timeout_ms = config.llm.request_timeout_ms;
+    }
     if let Some(ref identity) = binding.identity {
         // Validate identity path to prevent traversal outside data dir
         if identity.contains("..") || identity.starts_with('/') || identity.starts_with('\\') {
@@ -233,6 +247,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -260,6 +277,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "slack", "U12345678", None);
@@ -284,6 +304,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "discord", "user1", Some("group"));
@@ -309,6 +332,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
         // Tier 2: channel+sender
         config.gateway.bindings.push(GatewayBinding {
@@ -325,6 +351,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -350,6 +379,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -373,6 +405,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
         config.gateway.bindings.push(GatewayBinding {
             channel: "telegram".to_string(),
@@ -388,6 +423,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -411,6 +449,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -435,6 +476,9 @@ mod tests {
             fallback: Vec::new(),
             activation: Some(ActivationMode::Always),
             thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -459,6 +503,9 @@ mod tests {
             fallback: Vec::new(),
             activation: None,
             thinking: Some(ThinkingLevel::High),
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -470,5 +517,61 @@ mod tests {
         let config = Config::default();
         let route = resolve_route(&config, "unknown", "user1", None);
         assert!(route.activation.is_none());
+    }
+
+    #[test]
+    fn timeout_overrides_propagate_from_binding() {
+        let mut config = Config::default();
+        config.gateway.bindings.push(GatewayBinding {
+            channel: "telegram".to_string(),
+            sender: None,
+            peer_kind: None,
+            provider: None,
+            model: None,
+            api_key_env: None,
+            temperature: None,
+            max_tokens: None,
+            identity: None,
+            memory_scope: None,
+            fallback: Vec::new(),
+            activation: None,
+            thinking: None,
+            request_timeout_ms: Some(300_000),
+            gateway_timeout_ms: Some(360_000),
+            stream_chunk_timeout_secs: Some(120),
+        });
+
+        let route = resolve_route(&config, "telegram", "user1", None);
+        assert_eq!(route.config.llm.request_timeout_ms, 300_000);
+        assert_eq!(route.config.gateway.request_timeout_ms, 360_000);
+        assert_eq!(route.config.llm.stream_chunk_timeout_secs, 120);
+    }
+
+    #[test]
+    fn gateway_timeout_auto_bumped_to_match_llm_timeout() {
+        let mut config = Config::default();
+        config.gateway.bindings.push(GatewayBinding {
+            channel: "telegram".to_string(),
+            sender: None,
+            peer_kind: None,
+            provider: None,
+            model: None,
+            api_key_env: None,
+            temperature: None,
+            max_tokens: None,
+            identity: None,
+            memory_scope: None,
+            fallback: Vec::new(),
+            activation: None,
+            thinking: None,
+            request_timeout_ms: Some(300_000),
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
+        });
+
+        let route = resolve_route(&config, "telegram", "user1", None);
+        assert_eq!(route.config.llm.request_timeout_ms, 300_000);
+        // Gateway timeout should be bumped from 120s default to 300s
+        assert_eq!(route.config.gateway.request_timeout_ms, 300_000);
     }
 }
