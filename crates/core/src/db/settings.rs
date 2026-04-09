@@ -6,6 +6,55 @@ use super::Database;
 impl Database {
     // ── Settings CRUD ──
 
+    /// Ensure every key in SETTING_REGISTRY has a row in the settings table.
+    /// Missing keys are inserted with their compiled default value.
+    /// Existing rows are never overwritten (`INSERT OR IGNORE` on PRIMARY KEY).
+    /// Wrapped in a transaction for atomicity and first-run performance.
+    pub fn ensure_all_settings(&self) -> Result<()> {
+        use crate::config::Config;
+        use crate::settings::SETTING_REGISTRY;
+
+        let defaults = Config::default();
+        let now = chrono::Utc::now().timestamp();
+
+        self.conn.execute_batch("BEGIN")?;
+        let result = (|| -> Result<()> {
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            )?;
+            for &(key, extractor) in SETTING_REGISTRY.iter() {
+                let value = extractor(&defaults);
+                stmt.execute(params![key, value, now])?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns SQLite's `data_version` counter, which increments whenever any
+    /// connection (including other processes) modifies the database.
+    /// This is an in-memory check — no disk I/O.
+    ///
+    /// Note: in WAL mode, `data_version` only reflects changes visible to this
+    /// connection. A long-lived read transaction (snapshot) will not see bumps
+    /// from other writers. The config watcher poll loop does not hold read
+    /// transactions between polls, so this works correctly there.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn

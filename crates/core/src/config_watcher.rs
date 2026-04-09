@@ -8,8 +8,9 @@ use crate::config::Config;
 use crate::db::Database;
 
 /// Poll interval for cross-process change detection (e.g. CLI while TUI runs).
-/// In-process changes are delivered immediately via `notify()`.
-const POLL_INTERVAL_SECS: u64 = 30;
+/// Uses `PRAGMA data_version` (in-memory check, no disk I/O) so a short
+/// interval is cheap. In-process changes are delivered immediately via `notify()`.
+const POLL_INTERVAL_SECS: u64 = 3;
 
 /// Watches the settings database for changes and broadcasts validated updates.
 ///
@@ -105,6 +106,12 @@ async fn poll_loop(
         }
     };
 
+    // Track SQLite's data_version — increments on any write from any connection.
+    let mut last_data_version: i64 = db
+        .as_ref()
+        .and_then(|d| d.data_version().ok())
+        .unwrap_or(0);
+
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     // Skip the first immediate tick
     interval.tick().await;
@@ -117,18 +124,28 @@ async fn poll_loop(
             }
             // In-process notification — immediate broadcast, no DB read needed.
             Some(config) = notify_rx.recv() => {
+                // Update tracked version so the next poll doesn't redundantly reload.
+                if let Some(ref db) = db {
+                    if let Ok(ver) = db.data_version() {
+                        last_data_version = ver;
+                    }
+                }
                 send_if_changed(&config_tx, config);
             }
-            // Cross-process poll — read DB at a relaxed interval.
+            // Cross-process poll — cheap PRAGMA data_version check, only reload on change.
             _ = interval.tick() => {
                 if let Some(ref db) = db {
-                    match load_config_from(db) {
-                        Ok(new_config) => {
-                            send_if_changed(&config_tx, new_config);
+                    match db.data_version() {
+                        Ok(ver) => {
+                            if ver != last_data_version {
+                                last_data_version = ver;
+                                match load_config_from(db) {
+                                    Ok(new_config) => send_if_changed(&config_tx, new_config),
+                                    Err(e) => warn!("Config reload from DB failed: {e}"),
+                                }
+                            }
                         }
-                        Err(e) => {
-                            warn!("Config reload from DB failed: {e}");
-                        }
+                        Err(e) => warn!("Config watcher: data_version check failed: {e}"),
                     }
                 }
             }
@@ -293,10 +310,10 @@ mod tests {
 
     #[test]
     fn poll_interval_is_reasonable() {
-        // Ensure we don't accidentally regress back to 1-second polling
+        // data_version check is cheap (in-memory, no disk I/O) so 2-5s is fine
         assert!(
-            POLL_INTERVAL_SECS >= 10,
-            "poll interval should be >= 10s to avoid excessive DB access, got {POLL_INTERVAL_SECS}s"
+            POLL_INTERVAL_SECS >= 2,
+            "poll interval should be >= 2s, got {POLL_INTERVAL_SECS}s"
         );
     }
 }

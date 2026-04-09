@@ -409,8 +409,9 @@ impl SettingsResolver {
         let mut config = Config::default();
         let db_settings = self.db.list_settings()?;
         for (key, value, _) in &db_settings {
-            // Silently skip keys that no longer exist
-            let _ = config.apply_setting(key, value);
+            if let Err(e) = config.apply_setting(key, value) {
+                tracing::warn!("Ignoring invalid setting {key}: {e}");
+            }
         }
         Ok(config)
     }
@@ -425,24 +426,36 @@ impl SettingsResolver {
         Ok(confirmation)
     }
 
-    /// Remove a DB override, reverting to default value.
+    /// Revert a setting to its compiled default value.
+    /// Writes the default back to the DB rather than deleting the row,
+    /// keeping the settings table as the complete source of truth.
     pub fn unset(&self, key: &str) -> Result<()> {
-        self.db.delete_setting(key)?;
+        let defaults = Config::default();
+        let default_value = config_value_for_key(&defaults, key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
+        self.db.set_setting(key, &default_value)?;
         Ok(())
     }
 
     /// Get the effective value and its source for a single key.
+    /// Source is determined by comparing the DB value to the compiled default:
+    /// matching values report `Default`, differing values report `Database`.
     pub fn get_with_source(&self, key: &str) -> Result<(String, SettingSource)> {
-        // Check DB first
-        if let Some(value) = self.db.get_setting(key)? {
-            return Ok((value, SettingSource::Database));
+        let defaults = Config::default();
+        let default_value = config_value_for_key(&defaults, key)
+            .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
+
+        if let Some(db_value) = self.db.get_setting(key)? {
+            let source = if db_value == default_value {
+                SettingSource::Default
+            } else {
+                SettingSource::Database
+            };
+            return Ok((db_value, source));
         }
 
-        // Fall back to default
-        match config_value_for_key(&Config::default(), key) {
-            Some(val) => Ok((val, SettingSource::Default)),
-            None => anyhow::bail!("Unknown setting key: {key}"),
-        }
+        // Fallback for keys not yet seeded (e.g. new setting added between startups)
+        Ok((default_value, SettingSource::Default))
     }
 
     /// List all settings with their effective values and sources.
@@ -455,7 +468,10 @@ impl SettingsResolver {
                     value,
                     source,
                 }),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!("Failed to resolve setting {key}: {e}");
+                    continue;
+                }
             }
         }
         Ok(result)
@@ -670,5 +686,99 @@ mod tests {
         assert!(!config.agents.enabled);
         assert!(config.debug.llm_logging);
         assert!(!config.web.enabled);
+    }
+
+    // ── DB-as-source-of-truth tests ──
+
+    #[test]
+    fn ensure_all_settings_seeds_defaults() {
+        let resolver = test_resolver();
+        let settings = resolver.database().list_settings().unwrap();
+        // After from_connection (which calls ensure_all_settings via init_connection),
+        // every SETTING_REGISTRY key should have a row.
+        assert_eq!(
+            settings.len(),
+            SETTING_REGISTRY.len(),
+            "expected {} settings rows, got {}",
+            SETTING_REGISTRY.len(),
+            settings.len()
+        );
+        let keys: Vec<&str> = settings.iter().map(|(k, _, _)| k.as_str()).collect();
+        for &(key, _) in SETTING_REGISTRY.iter() {
+            assert!(keys.contains(&key), "missing setting key: {key}");
+        }
+    }
+
+    #[test]
+    fn ensure_all_settings_preserves_overrides() {
+        let resolver = test_resolver();
+        resolver.set("temperature", "1.5").unwrap();
+        // Re-seed — should not clobber the override
+        resolver.database().ensure_all_settings().unwrap();
+        let (val, source) = resolver.get_with_source("temperature").unwrap();
+        assert_eq!(val, "1.5");
+        assert_eq!(source, SettingSource::Database);
+    }
+
+    #[test]
+    fn ensure_all_settings_idempotent() {
+        let resolver = test_resolver();
+        let before = resolver.database().list_settings().unwrap();
+        resolver.database().ensure_all_settings().unwrap();
+        let after = resolver.database().list_settings().unwrap();
+        assert_eq!(before.len(), after.len());
+        for ((k1, v1, _), (k2, v2, _)) in before.iter().zip(after.iter()) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2, "value changed for key {k1}");
+        }
+    }
+
+    #[test]
+    fn unset_writes_default_not_delete() {
+        let resolver = test_resolver();
+        resolver.set("temperature", "1.5").unwrap();
+        resolver.unset("temperature").unwrap();
+        // Row should still exist in DB with the default value
+        let db_val = resolver.database().get_setting("temperature").unwrap();
+        assert_eq!(db_val, Some("0.7".to_string()));
+        // Source should report Default since value matches compiled default
+        let (val, source) = resolver.get_with_source("temperature").unwrap();
+        assert_eq!(val, "0.7");
+        assert_eq!(source, SettingSource::Default);
+    }
+
+    #[test]
+    fn get_source_default_for_seeded() {
+        let resolver = test_resolver();
+        // All settings are seeded with defaults — should report Default source
+        let (_, source) = resolver.get_with_source("sandbox.enabled").unwrap();
+        assert_eq!(source, SettingSource::Default);
+    }
+
+    #[test]
+    fn get_source_database_for_modified() {
+        let resolver = test_resolver();
+        resolver.set("sandbox.enabled", "false").unwrap();
+        let (val, source) = resolver.get_with_source("sandbox.enabled").unwrap();
+        assert_eq!(val, "false");
+        assert_eq!(source, SettingSource::Database);
+    }
+
+    #[test]
+    fn list_all_complete_after_seeding() {
+        let resolver = test_resolver();
+        let all = resolver.list_all().unwrap();
+        assert_eq!(
+            all.len(),
+            SETTING_REGISTRY.len(),
+            "list_all should return exactly SETTING_REGISTRY.len() entries"
+        );
+    }
+
+    #[test]
+    fn data_version_available() {
+        let resolver = test_resolver();
+        let v1 = resolver.database().data_version().unwrap();
+        assert!(v1 >= 0, "data_version should be non-negative");
     }
 }

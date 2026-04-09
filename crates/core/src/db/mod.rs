@@ -101,6 +101,9 @@ impl Database {
             hmac_salt: Vec::new(),
         };
         db.run_migrations()?;
+        // Seed all SETTING_REGISTRY defaults into the settings table.
+        // INSERT OR IGNORE preserves existing user overrides; idempotent on every startup.
+        db.ensure_all_settings()?;
         // Initialize per-installation HMAC salt after migrations (meta table must exist)
         let salt = db.get_or_create_hmac_salt()?;
         Ok(Self {
