@@ -2,6 +2,9 @@ pub mod gateway;
 pub mod llm;
 pub mod media;
 pub mod security;
+#[macro_use]
+mod settings_macro;
+pub mod settings_table;
 
 #[cfg(test)]
 mod tests;
@@ -146,7 +149,7 @@ impl Config {
     }
 }
 
-fn parse_value<T: FromStr>(value: &str, key: &str) -> Result<T>
+pub fn parse_value<T: FromStr>(value: &str, key: &str) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -155,7 +158,7 @@ where
         .map_err(|e: T::Err| anyhow::anyhow!("Invalid value for {key}: {e}"))
 }
 
-fn parse_nonzero<T: FromStr + Default + PartialEq>(value: &str, key: &str) -> Result<T>
+pub fn parse_nonzero<T: FromStr + Default + PartialEq>(value: &str, key: &str) -> Result<T>
 where
     T::Err: std::fmt::Display,
 {
@@ -166,7 +169,7 @@ where
     Ok(v)
 }
 
-fn parse_range<T: FromStr + PartialOrd + std::fmt::Display>(
+pub fn parse_range<T: FromStr + PartialOrd + std::fmt::Display>(
     value: &str,
     key: &str,
     min: T,
@@ -370,344 +373,7 @@ impl Config {
         )
     }
 
-    /// Apply a single key=value setting, returning a confirmation string.
-    pub fn apply_setting(&mut self, key: &str, value: &str) -> Result<String> {
-        // Helper macros to reduce repetition across the ~100 match arms.
-        macro_rules! set_parsed {
-            ($field:expr, $T:ty) => {{
-                $field = parse_value::<$T>(value, key)?;
-                Ok(format!("{key} = {}", $field))
-            }};
-        }
-        macro_rules! set_string {
-            ($field:expr) => {{
-                $field = value.to_string();
-                Ok(format!("{key} = {value}"))
-            }};
-        }
-        macro_rules! set_opt_string {
-            ($field:expr) => {{
-                $field = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.to_string())
-                };
-                Ok(format!("{key} = {value}"))
-            }};
-        }
-        macro_rules! set_range {
-            ($field:expr, $T:ty, $min:expr, $max:expr) => {{
-                $field = parse_range(value, key, $min, $max)?;
-                Ok(format!("{key} = {}", $field))
-            }};
-        }
-        macro_rules! set_nonzero {
-            ($field:expr, $T:ty) => {{
-                $field = parse_nonzero::<$T>(value, key)?;
-                Ok(format!("{key} = {}", $field))
-            }};
-        }
-        macro_rules! set_json {
-            ($field:expr) => {{
-                $field = serde_json::from_str(value)
-                    .with_context(|| format!("Invalid JSON for {key}"))?;
-                Ok(format!("{key} = {value}"))
-            }};
-            ($field:expr, set) => {{
-                $field = serde_json::from_str(value)
-                    .with_context(|| format!("Invalid JSON for {key}"))?;
-                Ok(format!("{key} = (set)"))
-            }};
-            ($field:expr, count $label:expr) => {{
-                $field = serde_json::from_str(value)
-                    .with_context(|| format!("Invalid JSON for {key}"))?;
-                Ok(format!("{key} = ({} {})", $field.len(), $label))
-            }};
-        }
-        macro_rules! set_json_quoted {
-            ($field:expr, $err:expr) => {{
-                $field = serde_json::from_str(&format!("\"{value}\""))
-                    .with_context(|| format!("{}: {value}", $err))?;
-                Ok(format!("{key} = {value}"))
-            }};
-        }
-
-        match key {
-            // ── LLM core ──
-            "model" => set_string!(self.llm.model),
-            "provider" => {
-                self.llm.provider = Some(value.to_string());
-                Ok(format!("{key} = {value}"))
-            }
-            "temperature" => set_range!(self.llm.temperature, f32, 0.0_f32, 2.0),
-            "max_tokens" => set_nonzero!(self.llm.max_tokens, u32),
-            "llm.api_key_env" => set_string!(self.llm.api_key_env),
-            "llm.max_retries" => set_parsed!(self.llm.max_retries, u32),
-            "llm.initial_retry_delay_ms" => set_parsed!(self.llm.initial_retry_delay_ms, u64),
-            "llm.request_timeout_ms" => set_parsed!(self.llm.request_timeout_ms, u64),
-            "llm.stream_chunk_timeout_secs" => set_parsed!(self.llm.stream_chunk_timeout_secs, u64),
-            "llm.claude_cli_path" => set_opt_string!(self.llm.claude_cli_path),
-            "llm.base_url" => set_opt_string!(self.llm.base_url),
-            "llm.thinking" => set_json_quoted!(self.llm.thinking, "Invalid thinking level"),
-            "llm.fallback" => set_json!(self.llm.fallback, count "providers"),
-            "llm.api_key" => {
-                if value.is_empty() {
-                    self.llm.api_key = None;
-                } else {
-                    self.llm.api_key = Some(
-                        serde_json::from_str(value)
-                            .with_context(|| format!("Invalid JSON for {key}"))?,
-                    );
-                }
-                Ok(format!("{key} = (set)"))
-            }
-            "llm.api_keys" => set_json!(self.llm.api_keys, count "keys"),
-
-            // ── LLM cache ──
-            "llm.cache.enabled" => set_parsed!(self.llm.cache.enabled, bool),
-            "llm.cache.ttl" => set_json_quoted!(self.llm.cache.ttl, "Invalid cache TTL"),
-            "llm.cache.cache_tools" => set_parsed!(self.llm.cache.cache_tools, bool),
-            "llm.cache.cache_system" => set_parsed!(self.llm.cache.cache_system, bool),
-            "llm.cache.rolling_messages" => set_parsed!(self.llm.cache.rolling_messages, u8),
-
-            // ── Sandbox ──
-            "sandbox.enabled" => set_parsed!(self.sandbox.enabled, bool),
-            "sandbox.mode" => {
-                match value {
-                    "strict" | "permissive" => {}
-                    other => {
-                        anyhow::bail!("Unknown sandbox mode '{other}'. Valid: strict, permissive")
-                    }
-                }
-                self.sandbox.mode = value.to_string();
-                Ok(format!("{key} = {value}"))
-            }
-
-            // ── Memory ──
-            "memory.max_context_tokens" => set_nonzero!(self.memory.max_context_tokens, usize),
-            "memory.flush_before_compaction" => {
-                set_parsed!(self.memory.flush_before_compaction, bool)
-            }
-            "memory.flush_min_messages" => set_parsed!(self.memory.flush_min_messages, usize),
-            "memory.flush_soft_threshold_tokens" => {
-                set_parsed!(self.memory.flush_soft_threshold_tokens, usize)
-            }
-            "memory.chunk_level_selection" => set_parsed!(self.memory.chunk_level_selection, bool),
-            "memory.extra_paths" => {
-                let paths: Vec<String> = value
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                self.memory.extra_paths = paths.clone();
-                Ok(format!("{key} = {}", paths.join(", ")))
-            }
-
-            // ── Memory embeddings ──
-            "memory.embeddings.enabled" => set_parsed!(self.memory.embeddings.enabled, bool),
-            "memory.embeddings.mmr_enabled" => {
-                set_parsed!(self.memory.embeddings.mmr_enabled, bool)
-            }
-            "memory.embeddings.mmr_lambda" => {
-                set_range!(self.memory.embeddings.mmr_lambda, f32, 0.0_f32, 1.0)
-            }
-            "memory.embeddings.recency_weight" => {
-                set_range!(self.memory.embeddings.recency_weight, f32, 0.0_f32, 1.0)
-            }
-            "memory.embeddings.bm25_weight" => {
-                set_range!(self.memory.embeddings.bm25_weight, f32, 0.0_f32, 1.0)
-            }
-            "memory.embeddings.vector_weight" => {
-                set_range!(self.memory.embeddings.vector_weight, f32, 0.0_f32, 1.0)
-            }
-            "memory.embeddings.chunk_size_tokens" => {
-                set_parsed!(self.memory.embeddings.chunk_size_tokens, usize)
-            }
-            "memory.embeddings.chunk_overlap_tokens" => {
-                set_parsed!(self.memory.embeddings.chunk_overlap_tokens, usize)
-            }
-
-            // ── Skills ──
-            "skills.enabled" => set_parsed!(self.skills.enabled, bool),
-            "skills.max_context_tokens" => set_parsed!(self.skills.max_context_tokens, usize),
-            key if key.starts_with("skills.entries.") && key.ends_with(".enabled") => {
-                let name = key
-                    .strip_prefix("skills.entries.")
-                    .and_then(|s| s.strip_suffix(".enabled"))
-                    .ok_or_else(|| anyhow::anyhow!("Invalid skill entry key: {key}"))?
-                    .to_string();
-                let enabled = parse_value::<bool>(value, key)?;
-                self.skills.entries.entry(name).or_default().enabled = enabled;
-                Ok(format!("{key} = {enabled}"))
-            }
-
-            // ── Conversation ──
-            "conversation.max_iterations" => set_parsed!(self.conversation.max_iterations, u32),
-            "conversation.show_thinking" => set_parsed!(self.conversation.show_thinking, bool),
-            "conversation.max_history_tokens" => {
-                set_parsed!(self.conversation.max_history_tokens, usize)
-            }
-            "conversation.tool_output_max_tokens" => {
-                set_parsed!(self.conversation.tool_output_max_tokens, usize)
-            }
-            "conversation.compaction_marker_tokens" => {
-                set_parsed!(self.conversation.compaction_marker_tokens, usize)
-            }
-            "conversation.max_transcript_chars" => {
-                set_parsed!(self.conversation.max_transcript_chars, usize)
-            }
-            "conversation.age_based_degradation" => {
-                set_parsed!(self.conversation.age_based_degradation, bool)
-            }
-            "conversation.collaboration_mode" => {
-                let mode: CollaborationMode = value.parse()?;
-                self.conversation.collaboration_mode = mode;
-                Ok(format!("{key} = {mode}"))
-            }
-
-            // ── Security ──
-            "security.secret_detection" => set_parsed!(self.security.secret_detection, bool),
-            "security.host_audit" => set_parsed!(self.security.host_audit, bool),
-            "security.blocked_paths" => set_json!(self.security.blocked_paths),
-            "security.allowed_paths" => set_json!(self.security.allowed_paths),
-            "security.action_limits" => set_json!(self.security.action_limits, set),
-            "security.gateway_action_limits" => set_json!(self.security.gateway_action_limits, set),
-
-            // ── Budget ──
-            "budget.monthly_token_limit" => set_parsed!(self.budget.monthly_token_limit, u64),
-            "budget.warning_threshold" => {
-                set_range!(self.budget.warning_threshold, f64, 0.0_f64, 1.0)
-            }
-
-            // ── Browser ──
-            "browser.enabled" => set_parsed!(self.browser.enabled, bool),
-            "browser.headless" => set_parsed!(self.browser.headless, bool),
-
-            // ── TTS ──
-            "tts.enabled" => set_parsed!(self.tts.enabled, bool),
-            "tts.auto_mode" => set_parsed!(self.tts.auto_mode, bool),
-            "tts.default_voice" => set_string!(self.tts.default_voice),
-            "tts.max_text_length" => set_parsed!(self.tts.max_text_length, usize),
-            "tts.timeout_ms" => set_parsed!(self.tts.timeout_ms, u64),
-            "tts.models" => set_json!(self.tts.models, count "models"),
-            "tts.default_format" => {
-                let allowed = ["mp3", "opus", "aac", "flac", "wav"];
-                if !allowed.contains(&value) {
-                    anyhow::bail!("Invalid format: {value}. Allowed: {}", allowed.join(", "));
-                }
-                self.tts.default_format = value.to_string();
-                Ok(format!("{key} = {value}"))
-            }
-
-            // ── Evolution ──
-            "evolution.enabled" => set_parsed!(self.evolution.enabled, bool),
-
-            // ── Workflow ──
-            "workflow.enabled" => match value {
-                "auto" | "on" | "off" => {
-                    self.workflow.enabled = value.to_string();
-                    Ok(format!("{key} = {value}"))
-                }
-                _ => anyhow::bail!(
-                    "Invalid value for workflow.enabled: {value}. Use 'auto', 'on', or 'off'."
-                ),
-            },
-
-            // ── Tools ──
-            "tools.default_timeout_ms" => set_parsed!(self.tools.default_timeout_ms, u64),
-            "tools.conditional_loading" => set_parsed!(self.tools.conditional_loading, bool),
-            "tools.compact_schemas" => set_parsed!(self.tools.compact_schemas, bool),
-            "tools.policy.profile" => set_string!(self.tools.policy.profile),
-            "tools.policy.allow" => set_json!(self.tools.policy.allow),
-            "tools.policy.deny" => set_json!(self.tools.policy.deny),
-            "tools.policy.subagent_deny" => set_json!(self.tools.policy.subagent_deny),
-
-            // ── Heartbeat ──
-            "heartbeat.interval" => set_string!(self.heartbeat.interval),
-            "heartbeat.quiet_hours_start" => set_opt_string!(self.heartbeat.quiet_hours_start),
-            "heartbeat.quiet_hours_end" => set_opt_string!(self.heartbeat.quiet_hours_end),
-            "heartbeat.cron" => set_opt_string!(self.heartbeat.cron),
-            "heartbeat.channels" => set_json!(self.heartbeat.channels),
-            "heartbeat.recipients" => set_json!(self.heartbeat.recipients, set),
-
-            // ── User ──
-            "user.name" => set_opt_string!(self.user.name),
-            "user.agent_name" => set_opt_string!(self.user.agent_name),
-            "user.timezone" => set_opt_string!(self.user.timezone),
-
-            // ── Web ──
-            "web.enabled" => set_parsed!(self.web.enabled, bool),
-            "web.search_provider" => set_string!(self.web.search_provider),
-
-            // ── Tasks ──
-            "tasks.max_concurrent" => set_parsed!(self.tasks.max_concurrent, usize),
-
-            // ── Gateway ──
-            "gateway.host" => set_string!(self.gateway.host),
-            "gateway.port" => set_parsed!(self.gateway.port, u16),
-            "gateway.max_concurrent" => set_parsed!(self.gateway.max_concurrent, usize),
-            "gateway.request_timeout_ms" => set_parsed!(self.gateway.request_timeout_ms, u64),
-            "gateway.rate_limit_per_minute" => set_parsed!(self.gateway.rate_limit_per_minute, u32),
-            "gateway.public_url" => set_opt_string!(self.gateway.public_url),
-            "gateway.pairing_ttl_secs" => set_parsed!(self.gateway.pairing_ttl_secs, i64),
-            "gateway.error_cooldown_ms" => set_parsed!(self.gateway.error_cooldown_ms, u64),
-            "gateway.error_policy" => {
-                self.gateway.error_policy = value.parse()?;
-                Ok(format!("{key} = {value}"))
-            }
-            "gateway.dm_policy" => set_json_quoted!(self.gateway.dm_policy, "Invalid DM policy"),
-            "gateway.group_activation" => {
-                set_json_quoted!(self.gateway.group_activation, "Invalid activation mode")
-            }
-            "gateway.bindings" => set_json!(self.gateway.bindings, count "bindings"),
-            "gateway.channel_policies" => set_json!(self.gateway.channel_policies, set),
-            "gateway.auto_reply" => set_json!(self.gateway.auto_reply, set),
-            "gateway.link_understanding" => set_json!(self.gateway.link_understanding, set),
-            "gateway.channel_error_policies" => set_json!(self.gateway.channel_error_policies, set),
-
-            // ── Agents ──
-            "agents.enabled" => set_parsed!(self.agents.enabled, bool),
-            "agents.max_spawn_depth" => set_parsed!(self.agents.max_spawn_depth, u32),
-            "agents.max_children_per_agent" => set_parsed!(self.agents.max_children_per_agent, u32),
-            "agents.max_concurrent" => set_parsed!(self.agents.max_concurrent, u32),
-
-            // ── Debug ──
-            "debug.llm_logging" => set_parsed!(self.debug.llm_logging, bool),
-
-            // ── Audio ──
-            "audio.enabled" => set_parsed!(self.audio.enabled, bool),
-            "audio.models" => set_json!(self.audio.models, count "models"),
-
-            // ── Media ──
-            "media.max_image_bytes" => set_parsed!(self.media.max_image_bytes, usize),
-            "media.compression_enabled" => set_parsed!(self.media.compression_enabled, bool),
-            "media.max_dimension_px" => set_parsed!(self.media.max_dimension_px, u32),
-
-            // ── Image Gen ──
-            "image_gen.enabled" => set_parsed!(self.image_gen.enabled, bool),
-            "image_gen.default_size" => set_string!(self.image_gen.default_size),
-
-            // ── Scripts ──
-            "scripts.enabled" => set_parsed!(self.scripts.enabled, bool),
-            "scripts.default_timeout_ms" => set_parsed!(self.scripts.default_timeout_ms, u64),
-
-            // ── Compaction ──
-            "compaction.provider" => set_opt_string!(self.compaction.provider),
-            "compaction.model" => set_opt_string!(self.compaction.model),
-
-            // ── Plugins ──
-            "plugins.enabled" => set_parsed!(self.plugins.enabled, bool),
-            "plugins.auto_verify" => set_parsed!(self.plugins.auto_verify, bool),
-
-            // ── Credentials ──
-            "credentials" => set_json!(self.credentials, count "entries"),
-
-            _ => anyhow::bail!(
-                "Unknown setting: {key}\nAvailable: {}",
-                crate::settings::ALL_SETTING_KEYS.join(", ")
-            ),
-        }
-    }
+    // apply_setting() is generated by define_settings! macro in settings_table.rs
 
     /// Resolve the API key from config or environment.
     pub fn api_key(&self) -> Result<String> {

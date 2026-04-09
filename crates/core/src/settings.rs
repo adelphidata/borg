@@ -31,357 +31,8 @@ pub struct SettingInfo {
 
 pub type SettingExtractor = fn(&Config) -> String;
 
-/// Single source of truth for setting keys and their config extractors.
-///
-/// Each entry is `(key, extractor_fn)`. `ALL_SETTING_KEYS` and `config_value_for_key()`
-/// are both derived from this table.
-pub const SETTING_REGISTRY: &[(&str, SettingExtractor)] = &[
-    ("model", |c| c.llm.model.clone()),
-    ("temperature", |c| format!("{}", c.llm.temperature)),
-    ("max_tokens", |c| format!("{}", c.llm.max_tokens)),
-    ("provider", |c| {
-        c.llm
-            .provider
-            .as_deref()
-            .unwrap_or("(auto-detect)")
-            .to_string()
-    }),
-    ("sandbox.mode", |c| c.sandbox.mode.clone()),
-    ("sandbox.enabled", |c| format!("{}", c.sandbox.enabled)),
-    ("memory.max_context_tokens", |c| {
-        format!("{}", c.memory.max_context_tokens)
-    }),
-    ("memory.flush_before_compaction", |c| {
-        format!("{}", c.memory.flush_before_compaction)
-    }),
-    ("memory.flush_min_messages", |c| {
-        format!("{}", c.memory.flush_min_messages)
-    }),
-    ("memory.extra_paths", |c| c.memory.extra_paths.join(", ")),
-    ("memory.embeddings.mmr_enabled", |c| {
-        format!("{}", c.memory.embeddings.mmr_enabled)
-    }),
-    ("memory.embeddings.mmr_lambda", |c| {
-        format!("{}", c.memory.embeddings.mmr_lambda)
-    }),
-    ("skills.enabled", |c| format!("{}", c.skills.enabled)),
-    ("skills.max_context_tokens", |c| {
-        format!("{}", c.skills.max_context_tokens)
-    }),
-    ("conversation.max_iterations", |c| {
-        format!("{}", c.conversation.max_iterations)
-    }),
-    ("conversation.show_thinking", |c| {
-        format!("{}", c.conversation.show_thinking)
-    }),
-    ("conversation.tool_output_max_tokens", |c| {
-        format!("{}", c.conversation.tool_output_max_tokens)
-    }),
-    ("conversation.compaction_marker_tokens", |c| {
-        format!("{}", c.conversation.compaction_marker_tokens)
-    }),
-    ("conversation.max_transcript_chars", |c| {
-        format!("{}", c.conversation.max_transcript_chars)
-    }),
-    ("security.secret_detection", |c| {
-        format!("{}", c.security.secret_detection)
-    }),
-    ("security.host_audit", |c| {
-        format!("{}", c.security.host_audit)
-    }),
-    ("budget.monthly_token_limit", |c| {
-        format!("{}", c.budget.monthly_token_limit)
-    }),
-    ("budget.warning_threshold", |c| {
-        format!("{}", c.budget.warning_threshold)
-    }),
-    ("gateway.max_body_size", |c| {
-        format!("{}", c.gateway.max_body_size)
-    }),
-    ("gateway.telegram_poll_timeout_secs", |c| {
-        format!("{}", c.gateway.telegram_poll_timeout_secs)
-    }),
-    ("gateway.telegram_circuit_failure_threshold", |c| {
-        format!("{}", c.gateway.telegram_circuit_failure_threshold)
-    }),
-    ("gateway.telegram_circuit_suspension_secs", |c| {
-        format!("{}", c.gateway.telegram_circuit_suspension_secs)
-    }),
-    ("gateway.telegram_dedup_capacity", |c| {
-        format!("{}", c.gateway.telegram_dedup_capacity)
-    }),
-    ("tts.enabled", |c| format!("{}", c.tts.enabled)),
-    ("tts.auto_mode", |c| format!("{}", c.tts.auto_mode)),
-    ("tts.default_voice", |c| c.tts.default_voice.clone()),
-    ("tts.default_format", |c| c.tts.default_format.clone()),
-    ("conversation.collaboration_mode", |c| {
-        format!("{}", c.conversation.collaboration_mode)
-    }),
-    ("evolution.enabled", |c| format!("{}", c.evolution.enabled)),
-    ("llm.claude_cli_path", |c| {
-        c.llm
-            .claude_cli_path
-            .as_deref()
-            .unwrap_or("(auto-detect)")
-            .to_string()
-    }),
-    ("workflow.enabled", |c| c.workflow.enabled.clone()),
-    // ── LLM extended ──
-    ("llm.api_key_env", |c| c.llm.api_key_env.clone()),
-    ("llm.api_key", |c| {
-        c.llm
-            .api_key
-            .as_ref()
-            .map(|sr| serde_json::to_string(sr).unwrap_or_default())
-            .unwrap_or_default()
-    }),
-    ("llm.api_keys", |c| {
-        serde_json::to_string(&c.llm.api_keys).unwrap_or_default()
-    }),
-    ("llm.max_retries", |c| format!("{}", c.llm.max_retries)),
-    ("llm.initial_retry_delay_ms", |c| {
-        format!("{}", c.llm.initial_retry_delay_ms)
-    }),
-    ("llm.request_timeout_ms", |c| {
-        format!("{}", c.llm.request_timeout_ms)
-    }),
-    ("llm.stream_chunk_timeout_secs", |c| {
-        format!("{}", c.llm.stream_chunk_timeout_secs)
-    }),
-    ("llm.base_url", |c| {
-        c.llm.base_url.clone().unwrap_or_default()
-    }),
-    ("llm.thinking", |c| {
-        serde_json::to_string(&c.llm.thinking)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string()
-    }),
-    ("llm.fallback", |c| {
-        serde_json::to_string(&c.llm.fallback).unwrap_or_default()
-    }),
-    ("llm.cache.enabled", |c| format!("{}", c.llm.cache.enabled)),
-    ("llm.cache.ttl", |c| format!("{}", c.llm.cache.ttl)),
-    ("llm.cache.cache_tools", |c| {
-        format!("{}", c.llm.cache.cache_tools)
-    }),
-    ("llm.cache.cache_system", |c| {
-        format!("{}", c.llm.cache.cache_system)
-    }),
-    ("llm.cache.rolling_messages", |c| {
-        format!("{}", c.llm.cache.rolling_messages)
-    }),
-    // ── Tools extended ──
-    ("tools.default_timeout_ms", |c| {
-        format!("{}", c.tools.default_timeout_ms)
-    }),
-    ("tools.conditional_loading", |c| {
-        format!("{}", c.tools.conditional_loading)
-    }),
-    ("tools.compact_schemas", |c| {
-        format!("{}", c.tools.compact_schemas)
-    }),
-    ("tools.policy.profile", |c| c.tools.policy.profile.clone()),
-    ("tools.policy.allow", |c| {
-        serde_json::to_string(&c.tools.policy.allow).unwrap_or_default()
-    }),
-    ("tools.policy.deny", |c| {
-        serde_json::to_string(&c.tools.policy.deny).unwrap_or_default()
-    }),
-    ("tools.policy.subagent_deny", |c| {
-        serde_json::to_string(&c.tools.policy.subagent_deny).unwrap_or_default()
-    }),
-    // ── Heartbeat extended ──
-    ("heartbeat.interval", |c| c.heartbeat.interval.clone()),
-    ("heartbeat.quiet_hours_start", |c| {
-        c.heartbeat.quiet_hours_start.clone().unwrap_or_default()
-    }),
-    ("heartbeat.quiet_hours_end", |c| {
-        c.heartbeat.quiet_hours_end.clone().unwrap_or_default()
-    }),
-    ("heartbeat.cron", |c| {
-        c.heartbeat.cron.clone().unwrap_or_default()
-    }),
-    ("heartbeat.channels", |c| {
-        serde_json::to_string(&c.heartbeat.channels).unwrap_or_default()
-    }),
-    ("heartbeat.recipients", |c| {
-        serde_json::to_string(&c.heartbeat.recipients).unwrap_or_default()
-    }),
-    // ── Conversation extended ──
-    ("conversation.max_history_tokens", |c| {
-        format!("{}", c.conversation.max_history_tokens)
-    }),
-    ("conversation.age_based_degradation", |c| {
-        format!("{}", c.conversation.age_based_degradation)
-    }),
-    // ── User ──
-    ("user.name", |c| c.user.name.clone().unwrap_or_default()),
-    ("user.agent_name", |c| {
-        c.user.agent_name.clone().unwrap_or_default()
-    }),
-    ("user.timezone", |c| {
-        c.user.timezone.clone().unwrap_or_default()
-    }),
-    // ── Web ──
-    ("web.enabled", |c| format!("{}", c.web.enabled)),
-    ("web.search_provider", |c| c.web.search_provider.clone()),
-    // ── Tasks ──
-    ("tasks.max_concurrent", |c| {
-        format!("{}", c.tasks.max_concurrent)
-    }),
-    // ── Gateway extended ──
-    ("gateway.host", |c| c.gateway.host.clone()),
-    ("gateway.port", |c| format!("{}", c.gateway.port)),
-    ("gateway.max_concurrent", |c| {
-        format!("{}", c.gateway.max_concurrent)
-    }),
-    ("gateway.request_timeout_ms", |c| {
-        format!("{}", c.gateway.request_timeout_ms)
-    }),
-    ("gateway.rate_limit_per_minute", |c| {
-        format!("{}", c.gateway.rate_limit_per_minute)
-    }),
-    ("gateway.public_url", |c| {
-        c.gateway.public_url.clone().unwrap_or_default()
-    }),
-    ("gateway.dm_policy", |c| {
-        serde_json::to_string(&c.gateway.dm_policy)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string()
-    }),
-    ("gateway.pairing_ttl_secs", |c| {
-        format!("{}", c.gateway.pairing_ttl_secs)
-    }),
-    ("gateway.group_activation", |c| {
-        serde_json::to_string(&c.gateway.group_activation)
-            .unwrap_or_default()
-            .trim_matches('"')
-            .to_string()
-    }),
-    ("gateway.error_policy", |c| {
-        format!("{}", c.gateway.error_policy)
-    }),
-    ("gateway.error_cooldown_ms", |c| {
-        format!("{}", c.gateway.error_cooldown_ms)
-    }),
-    ("gateway.bindings", |c| {
-        serde_json::to_string(&c.gateway.bindings).unwrap_or_default()
-    }),
-    ("gateway.channel_policies", |c| {
-        serde_json::to_string(&c.gateway.channel_policies).unwrap_or_default()
-    }),
-    ("gateway.auto_reply", |c| {
-        serde_json::to_string(&c.gateway.auto_reply).unwrap_or_default()
-    }),
-    ("gateway.link_understanding", |c| {
-        serde_json::to_string(&c.gateway.link_understanding).unwrap_or_default()
-    }),
-    ("gateway.channel_error_policies", |c| {
-        serde_json::to_string(&c.gateway.channel_error_policies).unwrap_or_default()
-    }),
-    // ── Memory extended ──
-    ("memory.flush_soft_threshold_tokens", |c| {
-        format!("{}", c.memory.flush_soft_threshold_tokens)
-    }),
-    ("memory.chunk_level_selection", |c| {
-        format!("{}", c.memory.chunk_level_selection)
-    }),
-    ("memory.embeddings.enabled", |c| {
-        format!("{}", c.memory.embeddings.enabled)
-    }),
-    ("memory.embeddings.recency_weight", |c| {
-        format!("{}", c.memory.embeddings.recency_weight)
-    }),
-    ("memory.embeddings.chunk_size_tokens", |c| {
-        format!("{}", c.memory.embeddings.chunk_size_tokens)
-    }),
-    ("memory.embeddings.chunk_overlap_tokens", |c| {
-        format!("{}", c.memory.embeddings.chunk_overlap_tokens)
-    }),
-    ("memory.embeddings.bm25_weight", |c| {
-        format!("{}", c.memory.embeddings.bm25_weight)
-    }),
-    ("memory.embeddings.vector_weight", |c| {
-        format!("{}", c.memory.embeddings.vector_weight)
-    }),
-    // ── Security extended ──
-    ("security.blocked_paths", |c| {
-        serde_json::to_string(&c.security.blocked_paths).unwrap_or_default()
-    }),
-    ("security.allowed_paths", |c| {
-        serde_json::to_string(&c.security.allowed_paths).unwrap_or_default()
-    }),
-    ("security.action_limits", |c| {
-        serde_json::to_string(&c.security.action_limits).unwrap_or_default()
-    }),
-    ("security.gateway_action_limits", |c| {
-        serde_json::to_string(&c.security.gateway_action_limits).unwrap_or_default()
-    }),
-    // ── Agents ──
-    ("agents.enabled", |c| format!("{}", c.agents.enabled)),
-    ("agents.max_spawn_depth", |c| {
-        format!("{}", c.agents.max_spawn_depth)
-    }),
-    ("agents.max_children_per_agent", |c| {
-        format!("{}", c.agents.max_children_per_agent)
-    }),
-    ("agents.max_concurrent", |c| {
-        format!("{}", c.agents.max_concurrent)
-    }),
-    // ── Debug ──
-    ("debug.llm_logging", |c| format!("{}", c.debug.llm_logging)),
-    // ── Audio ──
-    ("audio.enabled", |c| format!("{}", c.audio.enabled)),
-    ("audio.models", |c| {
-        serde_json::to_string(&c.audio.models).unwrap_or_default()
-    }),
-    // ── TTS extended ──
-    ("tts.models", |c| {
-        serde_json::to_string(&c.tts.models).unwrap_or_default()
-    }),
-    ("tts.max_text_length", |c| {
-        format!("{}", c.tts.max_text_length)
-    }),
-    ("tts.timeout_ms", |c| format!("{}", c.tts.timeout_ms)),
-    // ── Media ──
-    ("media.max_image_bytes", |c| {
-        format!("{}", c.media.max_image_bytes)
-    }),
-    ("media.compression_enabled", |c| {
-        format!("{}", c.media.compression_enabled)
-    }),
-    ("media.max_dimension_px", |c| {
-        format!("{}", c.media.max_dimension_px)
-    }),
-    // ── Image Gen ──
-    ("image_gen.enabled", |c| format!("{}", c.image_gen.enabled)),
-    ("image_gen.default_size", |c| {
-        c.image_gen.default_size.clone()
-    }),
-    // ── Scripts ──
-    ("scripts.enabled", |c| format!("{}", c.scripts.enabled)),
-    ("scripts.default_timeout_ms", |c| {
-        format!("{}", c.scripts.default_timeout_ms)
-    }),
-    // ── Compaction ──
-    ("compaction.provider", |c| {
-        c.compaction.provider.clone().unwrap_or_default()
-    }),
-    ("compaction.model", |c| {
-        c.compaction.model.clone().unwrap_or_default()
-    }),
-    // ── Plugins ──
-    ("plugins.enabled", |c| format!("{}", c.plugins.enabled)),
-    ("plugins.auto_verify", |c| {
-        format!("{}", c.plugins.auto_verify)
-    }),
-    // ── Credentials (JSON) ──
-    ("credentials", |c| {
-        serde_json::to_string(&c.credentials).unwrap_or_default()
-    }),
-];
+// SETTING_REGISTRY is generated by the define_settings! macro in config/settings_table.rs
+pub use crate::config::settings_table::SETTING_REGISTRY;
 
 /// All known setting keys, derived from `SETTING_REGISTRY`.
 pub static ALL_SETTING_KEYS: std::sync::LazyLock<Vec<&'static str>> =
@@ -780,5 +431,167 @@ mod tests {
         let resolver = test_resolver();
         let v1 = resolver.database().data_version().unwrap();
         assert!(v1 >= 0, "data_version should be non-negative");
+    }
+
+    // ── Macro-generated setter kind coverage ──
+
+    #[test]
+    fn setter_string_kind() {
+        let mut config = Config::default();
+        let result = config.apply_setting("model", "gpt-4").unwrap();
+        assert!(result.contains("gpt-4"));
+        assert_eq!(config.llm.model, "gpt-4");
+    }
+
+    #[test]
+    fn setter_opt_string_empty_becomes_none() {
+        let mut config = Config::default();
+        config.apply_setting("user.name", "alice").unwrap();
+        assert_eq!(config.user.name.as_deref(), Some("alice"));
+        config.apply_setting("user.name", "").unwrap();
+        assert_eq!(config.user.name, None);
+    }
+
+    #[test]
+    fn setter_parsed_bool() {
+        let mut config = Config::default();
+        config.apply_setting("sandbox.enabled", "false").unwrap();
+        assert!(!config.sandbox.enabled);
+        config.apply_setting("sandbox.enabled", "true").unwrap();
+        assert!(config.sandbox.enabled);
+    }
+
+    #[test]
+    fn setter_parsed_invalid_rejects() {
+        let mut config = Config::default();
+        assert!(config.apply_setting("sandbox.enabled", "maybe").is_err());
+    }
+
+    #[test]
+    fn setter_nonzero_rejects_zero() {
+        let mut config = Config::default();
+        assert!(config.apply_setting("max_tokens", "0").is_err());
+    }
+
+    #[test]
+    fn setter_range_rejects_out_of_bounds() {
+        let mut config = Config::default();
+        assert!(config.apply_setting("temperature", "5.0").is_err());
+        assert!(config.apply_setting("temperature", "-1.0").is_err());
+        config.apply_setting("temperature", "1.5").unwrap();
+        assert!((config.llm.temperature - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn setter_json_invalid_rejects() {
+        let mut config = Config::default();
+        assert!(config
+            .apply_setting("security.blocked_paths", "not json")
+            .is_err());
+    }
+
+    #[test]
+    fn setter_json_count_works() {
+        let mut config = Config::default();
+        let result = config
+            .apply_setting("gateway.bindings", r#"[{"channel":"telegram"}]"#)
+            .unwrap();
+        assert!(result.contains("1 bindings"));
+    }
+
+    #[test]
+    fn setter_json_set_works() {
+        let mut config = Config::default();
+        let result = config
+            .apply_setting("security.action_limits", r#"{"shell":10}"#)
+            .unwrap();
+        assert!(result.contains("(set)"));
+    }
+
+    #[test]
+    fn setter_json_quoted_works() {
+        let mut config = Config::default();
+        config.apply_setting("llm.thinking", "high").unwrap();
+        assert!(config.llm.thinking.is_enabled());
+    }
+
+    #[test]
+    fn custom_setter_sandbox_mode_validates() {
+        let mut config = Config::default();
+        config.apply_setting("sandbox.mode", "strict").unwrap();
+        assert_eq!(config.sandbox.mode, "strict");
+        assert!(config.apply_setting("sandbox.mode", "chaos").is_err());
+    }
+
+    #[test]
+    fn custom_setter_workflow_enabled_validates() {
+        let mut config = Config::default();
+        config.apply_setting("workflow.enabled", "on").unwrap();
+        assert_eq!(config.workflow.enabled, "on");
+        assert!(config.apply_setting("workflow.enabled", "maybe").is_err());
+    }
+
+    #[test]
+    fn custom_setter_tts_format_validates() {
+        let mut config = Config::default();
+        config.apply_setting("tts.default_format", "opus").unwrap();
+        assert_eq!(config.tts.default_format, "opus");
+        assert!(config.apply_setting("tts.default_format", "mp5").is_err());
+    }
+
+    #[test]
+    fn custom_setter_collaboration_mode() {
+        let mut config = Config::default();
+        config
+            .apply_setting("conversation.collaboration_mode", "execute")
+            .unwrap();
+        assert_eq!(
+            format!("{}", config.conversation.collaboration_mode),
+            "execute"
+        );
+    }
+
+    #[test]
+    fn custom_setter_memory_extra_paths() {
+        let mut config = Config::default();
+        config
+            .apply_setting("memory.extra_paths", "/a, /b, /c")
+            .unwrap();
+        assert_eq!(config.memory.extra_paths, vec!["/a", "/b", "/c"]);
+    }
+
+    #[test]
+    fn dynamic_skill_entry_setting() {
+        let mut config = Config::default();
+        config
+            .apply_setting("skills.entries.git.enabled", "false")
+            .unwrap();
+        assert!(!config.skills.entries["git"].enabled);
+    }
+
+    #[test]
+    fn unknown_setting_rejects() {
+        let mut config = Config::default();
+        assert!(config.apply_setting("nonexistent.key", "value").is_err());
+    }
+
+    #[test]
+    fn registry_count_guard() {
+        // Guard against accidentally dropping entries during macro migration.
+        // Update this count when adding/removing settings.
+        assert!(
+            ALL_SETTING_KEYS.len() >= 100,
+            "SETTING_REGISTRY should have at least 100 entries, got {}",
+            ALL_SETTING_KEYS.len()
+        );
+    }
+
+    #[test]
+    fn every_registry_key_has_working_extractor() {
+        let config = Config::default();
+        for &(key, extractor) in SETTING_REGISTRY.iter() {
+            // Should not panic
+            let _value = extractor(&config);
+        }
     }
 }
