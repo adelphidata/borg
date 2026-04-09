@@ -296,8 +296,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
 
     // Install bundled skills to filesystem
     match borg_core::skills::install_default_skills(&data_dir) {
-        Ok(0) => {}
-        Ok(n) => println!("  Installed {n} default skill(s)"),
+        Ok(_) => {}
         Err(e) => eprintln!("  Warning: failed to install default skills: {e}"),
     }
 
@@ -334,27 +333,21 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             let provider = Provider::from_str(&result.provider)?;
             db.set_setting("llm.api_key_env", provider.default_env_var())?;
         }
-        println!("  Saved settings to database");
     }
 
     // Write IDENTITY.md (skip if already exists)
     let identity_path = data_dir.join("IDENTITY.md");
-    if identity_path.exists() {
-        println!("  Skipped {} (already exists)", identity_path.display());
-    } else {
+    if !identity_path.exists() {
         let identity_content = generate_identity(&result.agent_name, &result.user_name);
         if let Err(e) = atomic_write(&identity_path, &identity_content) {
             cleanup_tmp_files(&data_dir);
             return Err(e.context("Failed to write IDENTITY.md during onboarding"));
         }
-        println!("  Created {}", identity_path.display());
     }
 
     // Write MEMORY.md with owner name seeded (skip if already exists)
     let memory_path = data_dir.join("MEMORY.md");
-    if memory_path.exists() {
-        println!("  Skipped {} (already exists)", memory_path.display());
-    } else {
+    if !memory_path.exists() {
         let memory_content = format!(
             "# Memory Index\n\n## Owner\n- Name: {}\n- Agent: {}\n",
             result.user_name, result.agent_name
@@ -363,7 +356,6 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             cleanup_tmp_files(&data_dir);
             return Err(e.context("Failed to write MEMORY.md during onboarding"));
         }
-        println!("  Created {}", memory_path.display());
     }
 
     // Write SETUP.md for first conversation instructions
@@ -374,19 +366,13 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             cleanup_tmp_files(&data_dir);
             return Err(e.context("Failed to write SETUP.md during onboarding"));
         }
-        println!("  Created {}", setup_path.display());
     }
 
     // Store API key based on chosen storage method
     if let Some(ref api_key) = result.api_key {
         if use_keychain {
             match store_in_keychain(&result.provider, api_key) {
-                Ok(()) => {
-                    println!(
-                        "  Stored API key in OS keychain (service: borg-{})",
-                        result.provider
-                    );
-                }
+                Ok(()) => {}
                 Err(e) => {
                     eprintln!("  Warning: Failed to store in keychain: {e}");
                     eprintln!("  Falling back to .env file");
