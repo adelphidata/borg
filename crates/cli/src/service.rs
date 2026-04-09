@@ -1844,6 +1844,36 @@ pub fn uninstall_service() -> Result<()> {
     }
 }
 
+/// Kill all other borg processes (daemon, gateway, etc.) except ourselves.
+/// Best-effort — used during uninstall to prevent a running daemon from
+/// recreating `~/.borg/` after we delete it.
+pub fn kill_other_borg_processes() {
+    let my_pid = std::process::id();
+    let output = match std::process::Command::new("pgrep")
+        .args(["-x", "borg"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::debug!("pgrep not available: {e}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(pid) = line.trim().parse::<u32>() {
+            if pid != my_pid {
+                tracing::info!("Killing borg process {pid}");
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    // Brief pause so the OS can release file handles
+    std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
 /// Stop the daemon service without uninstalling it.
 pub fn stop_service() -> Result<()> {
     if cfg!(target_os = "macos") {

@@ -1925,6 +1925,15 @@ Rules:
             let _ = session.close().await;
         }
     }
+
+    /// Close the database connection, releasing all file locks.
+    /// Call before deleting the data directory (e.g. during uninstall).
+    pub fn close_db(&self) {
+        let mut guard = self.db_guard();
+        if guard.take().is_some() {
+            tracing::info!("Database connection closed for uninstall");
+        }
+    }
 }
 
 /// Validate and convert partial tool calls from the LLM stream into well-formed `ToolCall`s.

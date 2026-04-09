@@ -1391,24 +1391,32 @@ async fn run_event_loop(
                 }
             }
             AppAction::Uninstall => {
-                // Step 1: Daemon service
-                app.push_system_message("Removing daemon service...".to_string());
+                // Step 1: Uninstall daemon service + kill any lingering borg processes
+                app.push_system_message("Stopping daemon...".to_string());
                 terminal.draw(|f| app.render(f))?;
                 if let Err(e) = crate::service::uninstall_service() {
                     tracing::debug!("Service uninstall skipped: {e}");
                 }
+                crate::service::kill_other_borg_processes();
 
-                // Step 2: Data directory
+                // Step 2: Close our own database connection
+                {
+                    let a = agent.lock().await;
+                    a.close_db();
+                }
+
+                // Step 3: Data directory
                 app.push_system_message("Removing data directory (~/.borg/)...".to_string());
                 terminal.draw(|f| app.render(f))?;
                 if let Ok(data_dir) = borg_core::config::Config::data_dir() {
                     if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                        tracing::warn!("Failed to remove data dir: {e}");
                         app.push_system_message(format!("Warning: failed to remove data dir: {e}"));
                         terminal.draw(|f| app.render(f))?;
                     }
                 }
 
-                // Step 3: Binary
+                // Step 4: Binary
                 app.push_system_message("Removing binary...".to_string());
                 terminal.draw(|f| app.render(f))?;
                 if let Ok(exe) = std::env::current_exe() {

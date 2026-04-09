@@ -1789,8 +1789,17 @@ fn run_uninstall() -> Result<()> {
         if let Err(e) = service::uninstall_service() {
             tracing::debug!("Service uninstall skipped: {e}");
         }
+        service::kill_other_borg_processes();
 
         delete_data_dir(&data_dir)?;
+
+        // Also remove the binary itself
+        if let Ok(exe) = std::env::current_exe() {
+            let exe = exe.canonicalize().unwrap_or(exe);
+            if let Err(e) = std::fs::remove_file(&exe) {
+                tracing::debug!("Could not remove binary: {e}");
+            }
+        }
 
         println!("Borg data deleted. Goodbye!");
     } else {
