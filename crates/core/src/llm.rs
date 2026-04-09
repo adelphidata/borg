@@ -701,22 +701,7 @@ impl LlmClient {
             .thinking
             .openai_reasoning_effort()
             .map(String::from);
-        // Sanitize messages for OpenAI-compatible providers: some backends
-        // (e.g. Gemini via OpenRouter) reject `"content": null`. Replace
-        // None content with empty string on assistant tool-call messages.
-        let sanitized_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| {
-                if m.content.is_none() && m.tool_calls.is_some() {
-                    Message {
-                        content: Some(crate::types::MessageContent::Text(String::new())),
-                        ..m.clone()
-                    }
-                } else {
-                    m.clone()
-                }
-            })
-            .collect();
+        let sanitized_messages = sanitize_openai_messages(messages);
 
         let request = ChatRequest {
             model: model.clone(),
@@ -1410,6 +1395,43 @@ impl LlmClient {
         }
         bail!("All retries exhausted for non-streaming Anthropic request")
     }
+}
+
+// ── OpenAI message sanitization ──
+
+/// Sanitize messages for OpenAI-compatible providers (OpenRouter, Gemini, DeepSeek, etc.).
+///
+/// - Replaces `None` content with empty string on assistant tool-call messages
+///   (some backends reject `"content": null`).
+/// - Drops empty user/assistant messages that carry no semantic value — these
+///   shouldn't be in history (agent.rs guards against creating them), but legacy
+///   sessions or edge cases may still have them. Gemini rejects messages with no
+///   content parts.
+fn sanitize_openai_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter_map(|m| {
+            let content_empty = m
+                .content
+                .as_ref()
+                .map(super::types::MessageContent::is_empty)
+                .unwrap_or(true);
+
+            if m.content.is_none() && m.tool_calls.is_some() {
+                // Assistant tool-call with null content — set empty string
+                Some(Message {
+                    content: Some(crate::types::MessageContent::Text(String::new())),
+                    ..m.clone()
+                })
+            } else if content_empty && m.tool_calls.is_none() && m.tool_call_id.is_none() {
+                // Empty message with no tool interaction — drop
+                tracing::debug!(role = ?m.role, "dropping empty message for Gemini compat");
+                None
+            } else {
+                Some(m.clone())
+            }
+        })
+        .collect()
 }
 
 // ── Anthropic message conversion helpers ──
@@ -2188,20 +2210,8 @@ mod tests {
             Message::tool_result("call_1", "result"),
         ];
 
-        // Replicate the sanitization logic from stream_chat_openai_inner
-        let sanitized: Vec<Message> = messages
-            .iter()
-            .map(|m| {
-                if m.content.is_none() && m.tool_calls.is_some() {
-                    Message {
-                        content: Some(crate::types::MessageContent::Text(String::new())),
-                        ..m.clone()
-                    }
-                } else {
-                    m.clone()
-                }
-            })
-            .collect();
+        let sanitized = sanitize_openai_messages(&messages);
+        assert_eq!(sanitized.len(), 3);
 
         let request = ChatRequest {
             model: "google/gemini-2.5-flash".to_string(),
@@ -2221,6 +2231,116 @@ mod tests {
         assert!(!msgs[1]["content"].is_null());
         // User message content should be unchanged
         assert_eq!(msgs[0]["content"], "hello");
+    }
+
+    #[test]
+    fn openai_drops_empty_user_message_for_gemini_compat() {
+        // Gemini 2.5 Pro/Flash reject user messages with no content parts.
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message {
+                role: Role::User,
+                content: Some(crate::types::MessageContent::Text(String::new())),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ];
+
+        let sanitized = sanitize_openai_messages(&messages);
+        // Empty user message should be dropped
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(
+            sanitized[0].content.as_ref().unwrap().text().unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            sanitized[1].content.as_ref().unwrap().text().unwrap(),
+            "hi there"
+        );
+    }
+
+    #[test]
+    fn openai_drops_empty_assistant_message_without_tool_calls() {
+        // Empty assistant responses (e.g. suppressed heartbeat acks) should be
+        // dropped when they have no tool calls, to avoid Gemini rejection.
+        let messages = vec![
+            Message::user("*heartbeat tick*"),
+            Message {
+                role: Role::Assistant,
+                content: Some(crate::types::MessageContent::Text(String::new())),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            Message::user("actual question"),
+        ];
+
+        let sanitized = sanitize_openai_messages(&messages);
+        // Empty assistant message should be dropped
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(
+            sanitized[0].content.as_ref().unwrap().text().unwrap(),
+            "*heartbeat tick*"
+        );
+        assert_eq!(
+            sanitized[1].content.as_ref().unwrap().text().unwrap(),
+            "actual question"
+        );
+    }
+
+    #[test]
+    fn openai_drops_none_content_assistant_without_tool_calls() {
+        // Assistant message with None content and no tool calls should be dropped.
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            Message::user("follow up"),
+        ];
+
+        let sanitized = sanitize_openai_messages(&messages);
+        assert_eq!(sanitized.len(), 2);
+    }
+
+    #[test]
+    fn openai_preserves_tool_result_messages() {
+        // Tool result messages (with tool_call_id) should never be dropped,
+        // even if their content happens to be empty.
+        let messages = vec![
+            Message::user("hello"),
+            Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    call_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_memory".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: Some(crate::types::MessageContent::Text(String::new())),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                timestamp: None,
+            },
+        ];
+
+        let sanitized = sanitize_openai_messages(&messages);
+        // All 3 messages should be preserved (tool result has tool_call_id)
+        assert_eq!(sanitized.len(), 3);
     }
 
     // ── Prompt caching (Anthropic) ──

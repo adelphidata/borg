@@ -1020,6 +1020,13 @@ Rules:
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        if user_input.trim().is_empty() {
+            tracing::debug!("Ignoring empty user input");
+            if let Err(e) = event_tx.send(AgentEvent::TurnComplete).await {
+                tracing::warn!("Failed to send TurnComplete for empty input: {e}");
+            }
+            return Ok(());
+        }
         let msg = Message::user(user_input);
         self.log_and_persist(msg);
         self.turn_count += 1;
@@ -1607,7 +1614,13 @@ Rules:
         );
         self.hook_registry.dispatch(&hook_ctx);
 
-        self.log_and_persist(Message::assistant(text_content));
+        // Don't persist empty assistant responses — they pollute the context
+        // window and cause Gemini to reject subsequent requests ("no parts").
+        if !text_content.trim().is_empty() {
+            self.log_and_persist(Message::assistant(text_content));
+        } else {
+            tracing::debug!("Skipping persistence of empty assistant response");
+        }
         self.auto_save();
         self.metrics.agent_turns.add(1, &[]);
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
