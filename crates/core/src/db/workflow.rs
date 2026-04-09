@@ -1,7 +1,7 @@
 //! Database operations for workflow persistence.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::models::{NewWorkflowStep, ProjectRow, WorkflowRow, WorkflowStepRow};
 use super::Database;
@@ -37,9 +37,7 @@ impl Database {
 
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin workflow transaction")?;
 
         tx.execute(
@@ -249,9 +247,7 @@ impl Database {
     pub fn complete_workflow_step(&self, step_id: i64, output: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin step completion transaction")?;
 
         // Only update if step is still running (guard against cancel race)
@@ -312,9 +308,7 @@ impl Database {
     pub fn fail_workflow_step(&self, step_id: i64, error: &str) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin step failure transaction")?;
 
         // Get current step info — check it's still running
@@ -419,9 +413,7 @@ impl Database {
     pub fn cancel_workflow(&self, id: &str) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin cancel transaction")?;
 
         // Check current status
@@ -719,9 +711,7 @@ impl Database {
 
     /// Delete a project. Nullifies `project_id` on associated workflows first to avoid FK violation.
     pub fn delete_project(&self, id: &str) -> Result<bool> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin project delete transaction")?;
         tx.execute(
             "UPDATE workflows SET project_id = NULL WHERE project_id = ?1",

@@ -22,7 +22,7 @@ pub use models::*;
 pub use vitals::PendingCelebration;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use tracing::instrument;
 
@@ -299,9 +299,7 @@ impl Database {
         // SQLite supports transactional DDL (CREATE TABLE, ALTER TABLE).
         // unchecked_transaction avoids rusqlite's borrow-check restriction
         // while still giving us automatic ROLLBACK on drop if not committed.
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin migration transaction")?;
 
         const MIGRATIONS: &[fn(&Database) -> Result<()>] = &[

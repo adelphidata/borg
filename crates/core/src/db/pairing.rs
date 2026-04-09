@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::models::{ApprovedSenderRow, PairingRequestRow};
 use super::Database;
@@ -89,7 +89,7 @@ impl Database {
         let code = code.to_uppercase();
         let now = chrono::Utc::now().timestamp();
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
 
         // Find the pending request within the transaction
         let request = {

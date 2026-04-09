@@ -48,7 +48,7 @@ textwrap = "0.16"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 regex = "1"
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher", "bundled-full"] }
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 scraper = "0.22"
 pdf-extract = "0.7"
 shellexpand = "3"

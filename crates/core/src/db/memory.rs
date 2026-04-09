@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
 use super::models::{ChunkData, ChunkRow, EmbeddingRow};
 use super::Database;
@@ -182,7 +182,7 @@ impl Database {
             self.conn.is_autocommit(),
             "upsert_chunks must not be called from within another transaction"
         );
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
             params![scope, filename],
