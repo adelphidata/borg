@@ -279,6 +279,9 @@ struct OnboardingState {
     // Validation hints
     api_key_required_hint: bool,
 
+    /// Highest tab index the user has reached (for tab-bar checkmarks).
+    furthest_tab: usize,
+
     // Result
     done: bool,
     cancelled: bool,
@@ -323,6 +326,7 @@ impl OnboardingState {
             selecting_model: false,
             model_index: 0,
             api_key_required_hint: false,
+            furthest_tab: 0,
             done: false,
             cancelled: false,
         }
@@ -372,12 +376,15 @@ impl OnboardingState {
     }
 
     fn tab_completed(&self, tab: Tab) -> bool {
+        // Only show a checkmark if the user has visited this tab
+        if tab.index() > self.furthest_tab {
+            return false;
+        }
         match tab {
             Tab::Welcome => !self.user_name.is_empty(),
             Tab::Security => self.security_accepted,
-            Tab::Provider => true, // Always has a selection
+            Tab::Provider | Tab::Channels => true,
             Tab::ApiKey => false,
-            Tab::Channels => true, // Optional step, always completable
         }
     }
 
@@ -554,6 +561,12 @@ impl OnboardingState {
             Tab::Provider => self.handle_provider_key(key),
             Tab::ApiKey => self.handle_api_key_key(key),
             Tab::Channels => self.handle_channels_key(key),
+        }
+
+        // Track the furthest tab the user has reached (for tab-bar checkmarks)
+        let idx = self.tab.index();
+        if idx > self.furthest_tab {
+            self.furthest_tab = idx;
         }
     }
 
@@ -1592,6 +1605,8 @@ mod tests {
     #[test]
     fn tab_completed_checks() {
         let mut state = OnboardingState::new();
+        // Simulate having visited all tabs
+        state.furthest_tab = Tab::Channels.index();
         assert!(!state.tab_completed(Tab::Welcome)); // empty name
         state.user_name = "Test".to_string();
         assert!(state.tab_completed(Tab::Welcome));
@@ -1600,6 +1615,14 @@ mod tests {
         assert!(state.tab_completed(Tab::Security));
         assert!(!state.tab_completed(Tab::ApiKey));
         assert!(state.tab_completed(Tab::Channels)); // optional, always true
+    }
+
+    #[test]
+    fn tab_completed_requires_visited() {
+        let state = OnboardingState::new();
+        // On a fresh install, no tabs should show as completed
+        assert!(!state.tab_completed(Tab::Provider));
+        assert!(!state.tab_completed(Tab::Channels));
     }
 
     #[test]
@@ -1705,8 +1728,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_tab_completed_always_true() {
-        let state = OnboardingState::new();
+    fn provider_tab_completed_after_visited() {
+        let mut state = OnboardingState::new();
+        // Not completed until user has reached it
+        assert!(!state.tab_completed(Tab::Provider));
+        state.furthest_tab = Tab::Provider.index();
         assert!(state.tab_completed(Tab::Provider));
     }
 
