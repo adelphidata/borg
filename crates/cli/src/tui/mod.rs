@@ -236,8 +236,8 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let metrics = BorgMetrics::from_config(&config);
     let mut agent = Agent::new(config.clone(), metrics.clone())?;
 
-    // Start config hot reload watcher (polls DB for changes)
-    let _config_watcher = match borg_core::config_watcher::ConfigWatcher::start(config.clone()) {
+    // Start config hot reload watcher (polls DB for changes, instant in-process notify)
+    let config_watcher = match borg_core::config_watcher::ConfigWatcher::start(config.clone()) {
         Ok(watcher) => {
             agent.set_config_watcher(watcher.subscribe());
             Some(watcher)
@@ -364,6 +364,10 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config, heartbeat_rx, heartbeat_event_tx, poke_tx);
+    if let Some(ref watcher) = config_watcher {
+        let tx = watcher.notify_sender();
+        app.config_notify_tx = Some(tx);
+    }
     if let Some((title, count)) = resumed_info {
         app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
     }
@@ -693,10 +697,16 @@ async fn run_event_loop(
                 if let Err(e) = agent.config_mut().apply_setting(&key, &value) {
                     app.push_system_message(format!("Warning: failed to sync agent config: {e}"));
                 }
+                if let Some(ref tx) = app.config_notify_tx {
+                    let _ = tx.try_send(agent.config().clone());
+                }
             }
             AppAction::ConfigReloaded => {
                 let mut agent = agent.lock().await;
                 *agent.config_mut() = app.config.clone();
+                if let Some(ref tx) = app.config_notify_tx {
+                    let _ = tx.try_send(app.config.clone());
+                }
             }
             AppAction::SaveSession => {
                 let mut agent = agent.lock().await;

@@ -163,7 +163,13 @@ const SETTINGS: &[SettingEntry] = &[
 
 impl SettingsPopup {
     pub fn new() -> Self {
-        let db = Database::open().ok();
+        let db = match Database::open() {
+            Ok(db) => Some(db),
+            Err(e) => {
+                tracing::warn!("Settings popup: failed to open database: {e}");
+                None
+            }
+        };
         Self {
             visible: false,
             entries: SETTINGS,
@@ -683,11 +689,13 @@ impl SettingsPopup {
         }
     }
 
-    /// Save a setting to DB if available, otherwise fall back to config.toml.
+    /// Save a setting to DB. Returns an error if the DB connection is unavailable.
     fn save_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        if let Some(ref db) = self.db {
-            db.set_setting(key, value)?;
-        }
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No database connection"))?;
+        db.set_setting(key, value)?;
         Ok(())
     }
 
@@ -1618,6 +1626,33 @@ mod tests {
         // Keep the tempdir alive by leaking it (test-only, small).
         std::mem::forget(dir);
         popup
+    }
+
+    #[test]
+    fn save_failure_shows_error_when_db_is_none() {
+        // Simulate the case where Database::open() failed at construction
+        let mut popup = SettingsPopup::new();
+        popup.db = None;
+        let cfg = Config::default();
+        popup.show(&cfg);
+
+        // Select sandbox.enabled (Bool at index 7)
+        popup.selected = 7;
+        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+
+        let mut cfg = Config::default();
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+
+        let result = popup.handle_key(space, &mut cfg).unwrap();
+        // Should NOT return an action (no DB to save to)
+        assert!(result.is_none());
+        let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
+        assert!(!is_success, "should be an error, not success");
+        assert!(
+            msg.contains("Save failed") || msg.contains("No database"),
+            "unexpected status message: {msg}"
+        );
     }
 
     #[test]

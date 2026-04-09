@@ -193,6 +193,8 @@ pub struct App<'a> {
     pub evolution_title: Option<String>,
     pub status_popup: StatusPopup,
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
+    /// Sender for notifying the config watcher of in-process changes.
+    pub config_notify_tx: Option<tokio::sync::mpsc::Sender<Config>>,
 }
 
 impl<'a> App<'a> {
@@ -247,6 +249,7 @@ impl<'a> App<'a> {
                 .map(|state| borg_core::evolution::format_compact(&state)),
             status_popup: StatusPopup::new(),
             doctor_rx: None,
+            config_notify_tx: None,
         }
     }
 
