@@ -347,25 +347,31 @@ fn extract_retry_hint(raw: &str) -> Option<String> {
 }
 
 /// Try to extract the provider name from a raw error message.
-fn extract_provider_name(raw: &str) -> Option<&str> {
-    let lower = raw.to_lowercase();
-    if lower.contains("anthropic") {
-        Some("Anthropic")
-    } else if lower.contains("openai") {
-        Some("OpenAI")
-    } else if lower.contains("openrouter") {
-        Some("OpenRouter")
-    } else if lower.contains("gemini") || lower.contains("google") {
-        Some("Gemini")
-    } else if lower.contains("deepseek") {
-        Some("DeepSeek")
-    } else if lower.contains("groq") {
-        Some("Groq")
-    } else if lower.contains("ollama") {
-        Some("Ollama")
-    } else {
-        None
+///
+/// `classify_status` always formats errors as `"{provider} returned {status}..."`
+/// where `{provider}` is `Provider::as_str()` (lowercase). We parse the prefix
+/// to get an exact match rather than scanning the entire body for substrings.
+fn extract_provider_name(raw: &str) -> Option<&'static str> {
+    // Provider names as produced by Provider::as_str() → display name
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("anthropic", "Anthropic"),
+        ("openrouter", "OpenRouter"),
+        ("openai", "OpenAI"),
+        ("gemini", "Gemini"),
+        ("deepseek", "DeepSeek"),
+        ("groq", "Groq"),
+        ("ollama", "Ollama"),
+        ("claude-cli", "Claude CLI"),
+    ];
+
+    let prefix = raw.split_once(' ').map(|(w, _)| w).unwrap_or(raw);
+    let lower = prefix.to_lowercase();
+    for &(key, display) in PROVIDERS {
+        if lower == key {
+            return Some(display);
+        }
     }
+    None
 }
 
 /// Extract a user-friendly transport error detail.
