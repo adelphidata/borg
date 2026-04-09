@@ -383,7 +383,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         let setup_path = data_dir.join("SETUP.md");
         if setup_path.exists() {
             app.queued_messages.push_back(app::QueuedMessage {
-                text: String::new(),
+                text: "Hello! I just finished onboarding.".to_string(),
                 images: Vec::new(),
             });
         }
