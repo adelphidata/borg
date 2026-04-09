@@ -2341,11 +2341,13 @@ mod tests {
         if let Some(v) = saved {
             unsafe { std::env::set_var("TELEGRAM_BOT_TOKEN", v) };
         }
+        // If the OS keychain has a real token (dev machine), the call will reach the API
+        // and fail with a different error. Either way, it should be an error.
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("TELEGRAM_BOT_TOKEN not configured"),
-            "expected missing token error, got: {err}"
+            err.contains("TELEGRAM_BOT_TOKEN not configured") || err.contains("sendMessage failed"),
+            "expected missing token or API error, got: {err}"
         );
     }
 

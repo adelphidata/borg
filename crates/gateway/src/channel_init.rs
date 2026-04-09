@@ -17,38 +17,12 @@ use crate::teams::api::TeamsClient;
 use crate::telegram::api::TelegramClient;
 use crate::twilio::api::TwilioClient;
 
-/// Resolve a credential from config, env vars, or keychain fallback.
+/// Resolve a credential for a channel plugin.
 ///
-/// Tries in order:
-/// 1. Config credential store (`[credentials]` section) + env var fallback
-/// 2. OS keychain using the plugin's naming convention (`borg-{plugin_id}` / `borg-{key}`)
-///
-/// The keychain fallback handles the case where `config.toml` lost the credential
-/// reference (e.g. config was re-serialized without it) but the keychain still has
-/// the secret from a prior plugin install.
-fn resolve_credential(config: &Config, plugin_id: &str, key: &str) -> Option<String> {
-    if let Some(v) = config.resolve_credential_or_env(key) {
-        return Some(v);
-    }
-
-    let service = format!("borg-{}", plugin_id.replace('/', "-"));
-    let account = format!("borg-{key}");
-    if !borg_plugins::keychain::check(&service, &account) {
-        return None;
-    }
-
-    let sr = borg_core::secrets_resolve::SecretRef::Keychain { service, account };
-    match sr.resolve() {
-        Ok(v) if !v.is_empty() => {
-            info!("Resolved {key} from keychain fallback (credential ref missing from config)");
-            Some(v)
-        }
-        Ok(_) => None,
-        Err(e) => {
-            warn!("Keychain fallback for {key} failed: {e}");
-            None
-        }
-    }
+/// Delegates to `Config::resolve_credential_or_env` which handles config store,
+/// env var, and OS keychain fallback (using the plugin naming convention).
+fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -> Option<String> {
+    config.resolve_credential_or_env(key)
 }
 
 fn log_gateway_activity(message: &str) {

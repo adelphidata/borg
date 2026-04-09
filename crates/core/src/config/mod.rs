@@ -850,9 +850,11 @@ impl Config {
             .collect()
     }
 
-    /// Resolve a credential by name: credential store first, then env var fallback.
+    /// Resolve a credential by name: credential store first, then env var,
+    /// then OS keychain fallback using the plugin naming convention.
     /// Returns `None` if not found or empty.
     pub fn resolve_credential_or_env(&self, name: &str) -> Option<String> {
+        // 1. Config credential store (may itself be a keychain SecretRef)
         if let Some(cv) = self.credentials.get(name) {
             match cv.resolve() {
                 Ok(v) if !v.is_empty() => return Some(v),
@@ -864,7 +866,63 @@ impl Config {
                 }
             }
         }
-        std::env::var(name).ok().filter(|t| !t.is_empty())
+
+        // 2. Environment variable
+        if let Some(v) = std::env::var(name).ok().filter(|t| !t.is_empty()) {
+            return Some(v);
+        }
+
+        // 3. OS keychain fallback — try the plugin naming convention
+        //    (service: borg-messaging-{channel}, account: borg-{KEY})
+        self.resolve_keychain_fallback(name)
+    }
+
+    /// Try to resolve a credential from the OS keychain using the plugin naming
+    /// convention: service = `borg-{plugin_id with / → -}`, account = `borg-{key}`.
+    fn resolve_keychain_fallback(&self, key: &str) -> Option<String> {
+        /// Maps credential key → plugin ID for keychain service name derivation.
+        /// Plugin IDs must match those in the plugin catalog (`crates/plugins/src/catalog.rs`)
+        /// and the gateway's `resolve_credential` call sites (`crates/gateway/src/channel_init.rs`).
+        const KEY_PLUGIN_MAP: &[(&str, &str)] = &[
+            ("TELEGRAM_BOT_TOKEN", "messaging/telegram"),
+            ("TELEGRAM_WEBHOOK_SECRET", "messaging/telegram"),
+            ("SLACK_BOT_TOKEN", "messaging/slack"),
+            ("SLACK_SIGNING_SECRET", "messaging/slack"),
+            ("DISCORD_BOT_TOKEN", "messaging/discord"),
+            ("DISCORD_PUBLIC_KEY", "messaging/discord"),
+            ("TEAMS_APP_ID", "messaging/teams"),
+            ("TEAMS_APP_SECRET", "messaging/teams"),
+            ("TWILIO_ACCOUNT_SID", "messaging/whatsapp"),
+            ("TWILIO_AUTH_TOKEN", "messaging/whatsapp"),
+            ("TWILIO_PHONE_NUMBER", "messaging/whatsapp"),
+            ("TWILIO_WHATSAPP_NUMBER", "messaging/whatsapp"),
+            ("GOOGLE_CHAT_SERVICE_TOKEN", "messaging/google-chat"),
+            ("GOOGLE_CHAT_WEBHOOK_TOKEN", "messaging/google-chat"),
+            ("SIGNAL_ACCOUNT", "messaging/signal"),
+        ];
+
+        let plugin_id = KEY_PLUGIN_MAP
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, pid)| *pid)?;
+
+        let service = format!("borg-{}", plugin_id.replace('/', "-"));
+        let account = format!("borg-{key}");
+
+        let sr = crate::secrets_resolve::SecretRef::Keychain { service, account };
+        match sr.resolve() {
+            Ok(v) if !v.is_empty() => {
+                tracing::info!(
+                    "Resolved {key} from keychain fallback (credential ref missing from config)"
+                );
+                Some(v)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!("Keychain fallback for {key} failed: {e}");
+                None
+            }
+        }
     }
 
     /// Returns true if any native channel credentials are configured.

@@ -896,6 +896,16 @@ async fn run_event_loop(
                                                 }
                                             }
                                         }
+                                        // Reload config to pick up newly saved credentials
+                                        match borg_core::config::Config::load_from_db() {
+                                            Ok(c) => app.config = c,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to reload config after plugin install: {e}"
+                                                );
+                                            }
+                                        }
+
                                         let mut msg = format!("Installed {}", def.name);
                                         for note in &install_result.notes {
                                             msg.push_str(&format!("\n  {note}"));
