@@ -403,6 +403,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         &mut event_stream,
         tick_rate,
         &gateway_shutdown,
+        &heartbeat_cancel,
     )
     .await
 }
@@ -445,6 +446,7 @@ async fn run_event_loop(
     event_stream: &mut EventStream,
     tick_rate: Duration,
     gateway_shutdown: &Arc<Mutex<CancellationToken>>,
+    heartbeat_cancel: &CancellationToken,
 ) -> Result<Option<ResumeHint>> {
     let mut tick_interval = tokio::time::interval(tick_rate);
 
@@ -1399,11 +1401,22 @@ async fn run_event_loop(
                 }
                 crate::service::kill_other_borg_processes();
 
-                // Step 2: Close our own database connection
+                // Step 2: Stop all in-process background tasks (gateway, heartbeat)
+                // so they can't reopen / recreate the database after we delete it.
+                heartbeat_cancel.cancel();
                 {
-                    let a = agent.lock().await;
+                    if let Ok(gw) = gateway_shutdown.try_lock() {
+                        gw.cancel();
+                    }
+                }
+                // Close browser + DB
+                {
+                    let mut a = agent.lock().await;
+                    a.close_browser().await;
                     a.close_db();
                 }
+                // Let spawned tasks notice cancellation and wind down
+                tokio::task::yield_now().await;
 
                 // Step 3: Data directory
                 app.push_system_message("Removing data directory (~/.borg/)...".to_string());
@@ -1426,13 +1439,15 @@ async fn run_event_loop(
                     }
                 }
 
-                // Close browser
-                agent.lock().await.close_browser().await;
-
                 // Fullscreen ASCII art goodbye
                 goodbye::render(terminal)?;
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                // Binary is being removed — no point offering a resume hint.
+
+                // Final sweep: delete data dir again in case a background task
+                // recreated it (e.g. Database::open creates ~/.borg/ via create_dir_all)
+                if let Ok(data_dir) = borg_core::config::Config::data_dir() {
+                    let _ = std::fs::remove_dir_all(&data_dir);
+                }
                 return Ok(None);
             }
             AppAction::Poke => {
