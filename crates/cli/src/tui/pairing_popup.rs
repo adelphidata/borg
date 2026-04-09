@@ -6,12 +6,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use anyhow::Result;
+
 use borg_core::config::Config;
 use borg_core::db::{ApprovedSenderRow, PairingRequestRow};
 use borg_core::pairing::channel_display_name;
 use borg_plugins::catalog::CATALOG;
 use borg_plugins::installer::is_installed;
 
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -316,6 +319,22 @@ impl PairingPopup {
 /// Extract the channel name from a plugin catalog ID like "messaging/telegram" → "telegram".
 fn channel_name_from_plugin_id(id: &str) -> String {
     id.rsplit('/').next().unwrap_or(id).to_string()
+}
+
+impl PopupHandler for PairingPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        Ok(self
+            .handle_key(key)
+            .map(|actions| AppAction::RunPairingActions { actions }))
+    }
 }
 
 #[cfg(test)]

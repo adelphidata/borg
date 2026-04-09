@@ -27,11 +27,29 @@ use super::plan_overlay::{PlanOption, PlanOverlay};
 use super::plugins_popup::{PluginAction, PluginsPopup};
 use super::projects_popup::{ProjectAction, ProjectsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
-use super::sessions_popup::{SessionAction, SessionsPopup};
+use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
 use super::shimmer;
 use super::status_popup::StatusPopup;
 use super::theme;
+
+/// Trait for popup windows that handle keyboard and paste events.
+/// Each popup converts its domain-specific actions into `AppAction` variants internally.
+pub(super) trait PopupHandler {
+    fn is_visible(&self) -> bool;
+    /// Handle a key event. `config` is provided for popups that need to mutate settings.
+    /// Returns `Ok(Some(action))` if an action should be dispatched, `Ok(None)` to absorb
+    /// the event (caller will map to `Continue`).
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> Result<Option<AppAction>>;
+    /// Handle a paste event. Returns `true` if consumed.
+    fn handle_paste_event(&mut self, _text: &str) -> bool {
+        false
+    }
+}
 
 pub enum AppState {
     Idle,
@@ -266,6 +284,20 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Collect mutable references to all popups for trait-based dispatch.
+    fn popups_mut(&mut self) -> [&mut dyn PopupHandler; 8] {
+        [
+            &mut self.settings_popup,
+            &mut self.plugins_popup,
+            &mut self.pairing_popup,
+            &mut self.projects_popup,
+            &mut self.sessions_popup,
+            &mut self.schedule_popup,
+            &mut self.migrate_popup,
+            &mut self.status_popup,
+        ]
+    }
+
     /// Returns `true` if any popup overlay is currently visible.
     ///
     /// Used to suppress input routing to the composer and to prevent
@@ -285,28 +317,13 @@ impl<'a> App<'a> {
     /// Route a paste event to the first visible popup that accepts paste input.
     /// Returns `true` if a popup consumed the paste (caller should return Continue).
     fn dispatch_paste_to_popup(&mut self, text: &str) -> bool {
-        if self.settings_popup.is_visible() {
-            self.settings_popup.handle_paste(text);
-            return true;
+        for popup in self.popups_mut() {
+            if popup.is_visible() {
+                popup.handle_paste_event(text);
+                return true;
+            }
         }
-        if self.plugins_popup.is_visible() {
-            self.plugins_popup.handle_paste(text);
-            return true;
-        }
-        if self.projects_popup.is_visible() {
-            self.projects_popup.handle_paste(text);
-            return true;
-        }
-        if self.schedule_popup.is_visible() {
-            self.schedule_popup.handle_paste(text);
-            return true;
-        }
-        // Popups without paste support still consume the event to prevent
-        // it from leaking to the composer.
-        self.pairing_popup.is_visible()
-            || self.sessions_popup.is_visible()
-            || self.migrate_popup.is_visible()
-            || self.status_popup.is_visible()
+        false
     }
 
     /// Route a key event to the first visible popup.
@@ -315,60 +332,47 @@ impl<'a> App<'a> {
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Result<Option<AppAction>> {
-        if self.settings_popup.is_visible() {
-            if let Some(action) = self.settings_popup.handle_key(key, &mut self.config)? {
-                return Ok(Some(action));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.plugins_popup.is_visible() {
-            if let Some(actions) = self.plugins_popup.handle_key(key) {
-                return Ok(Some(AppAction::RunPlugins { actions }));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.pairing_popup.is_visible() {
-            if let Some(actions) = self.pairing_popup.handle_key(key) {
-                return Ok(Some(AppAction::RunPairingActions { actions }));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.projects_popup.is_visible() {
-            if let Some(actions) = self.projects_popup.handle_key(key) {
-                return Ok(Some(AppAction::RunProjectActions { actions }));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.sessions_popup.is_visible() {
-            if let Some(action) = self.sessions_popup.handle_key(key) {
-                match action {
-                    SessionAction::Load { id } => {
-                        self.cells.clear();
-                        self.session_prompt_tokens = 0;
-                        self.session_completion_tokens = 0;
-                        return Ok(Some(AppAction::LoadSession { id }));
-                    }
-                }
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.schedule_popup.is_visible() {
-            if let Some(actions) = self.schedule_popup.handle_key(key) {
-                return Ok(Some(AppAction::RunScheduleActions { actions }));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.migrate_popup.is_visible() {
-            if let Some(actions) = self.migrate_popup.handle_key(key) {
-                return Ok(Some(AppAction::RunMigration { actions }));
-            }
-            return Ok(Some(AppAction::Continue));
-        }
-        if self.status_popup.is_visible() {
-            self.status_popup.handle_key(key);
-            return Ok(Some(AppAction::Continue));
-        }
-        Ok(None)
+        // We can't iterate popups_mut() because handle_key_event needs &mut config,
+        // and popups_mut() borrows &mut self. Instead, check visibility first, then dispatch.
+        let visible_idx = {
+            let popups: [&dyn PopupHandler; 8] = [
+                &self.settings_popup,
+                &self.plugins_popup,
+                &self.pairing_popup,
+                &self.projects_popup,
+                &self.sessions_popup,
+                &self.schedule_popup,
+                &self.migrate_popup,
+                &self.status_popup,
+            ];
+            popups.iter().position(|p| p.is_visible())
+        };
+
+        let Some(idx) = visible_idx else {
+            return Ok(None);
+        };
+
+        let action = match idx {
+            0 => self
+                .settings_popup
+                .handle_key_event(key, &mut self.config)?,
+            1 => self.plugins_popup.handle_key_event(key, &mut self.config)?,
+            2 => self.pairing_popup.handle_key_event(key, &mut self.config)?,
+            3 => self
+                .projects_popup
+                .handle_key_event(key, &mut self.config)?,
+            4 => self
+                .sessions_popup
+                .handle_key_event(key, &mut self.config)?,
+            5 => self
+                .schedule_popup
+                .handle_key_event(key, &mut self.config)?,
+            6 => self.migrate_popup.handle_key_event(key, &mut self.config)?,
+            7 => self.status_popup.handle_key_event(key, &mut self.config)?,
+            _ => unreachable!(),
+        };
+
+        Ok(Some(action.unwrap_or(AppAction::Continue)))
     }
 
     /// Handle a bracketed paste event (entire pasted text as a single string).
@@ -712,19 +716,8 @@ impl<'a> App<'a> {
             // A popup can be open during Streaming if
             // drain_queued_if_idle started a turn while a popup was
             // visible. Route keys to the popup, not the composer.
-            if self.settings_popup.is_visible() {
-                self.settings_popup.handle_key(key, &mut self.config)?;
-            } else if self.plugins_popup.is_visible() {
-                self.plugins_popup.handle_key(key);
-            } else if self.projects_popup.is_visible() {
-                self.projects_popup.handle_key(key);
-            } else if self.sessions_popup.is_visible() {
-                self.sessions_popup.handle_key(key);
-            } else if self.schedule_popup.is_visible() {
-                self.schedule_popup.handle_key(key);
-            }
-            // Other popups (skills, migrate, status) have no text
-            // input — just swallow the key.
+            // Discard the returned action — we only need Continue during streaming.
+            let _ = self.dispatch_key_to_popup(key)?;
         } else {
             // Pass other keys to composer so user can type ahead
             self.composer.handle_key(key);

@@ -1,3 +1,4 @@
+use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -7,6 +8,7 @@ use ratatui::Frame;
 
 use borg_core::config::Config;
 
+use super::app::{AppAction, PopupHandler};
 use super::theme;
 
 pub struct StatusPopup {
@@ -235,6 +237,21 @@ impl StatusPopup {
             self.lines.push(Line::from(line.to_string()));
         }
         self.lines.push(Line::default());
+    }
+}
+
+impl PopupHandler for StatusPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        self.handle_key(key);
+        Ok(None)
     }
 }
 

@@ -4,84 +4,88 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::db::Database;
 
-use super::{optional_bool_param, optional_str_param, require_str_param};
+use super::{check_enabled, optional_bool_param, optional_str_param, require_str_param, with_db};
 
 pub fn handle_manage_scripts(args: &serde_json::Value, config: &Config) -> Result<String> {
-    if !config.scripts.enabled {
-        return Ok("Scripts system is disabled.".to_string());
+    if let Some(msg) = check_enabled(config.scripts.enabled, "scripts") {
+        return Ok(msg);
     }
-    let action = require_str_param(args, "action")?;
-    let db = Database::open()?;
+    with_db(|db| {
+        crate::dispatch_action!(args, {
+            "create" => scripts_create(args, config, db),
+            "update" => scripts_update(args, db),
+            "delete" => scripts_delete(args, db),
+            "get" => scripts_get(args, db),
+            "list" => crate::scripts::list_scripts(db),
+        })
+    })
+}
 
-    match action {
-        "create" => {
-            let name = require_str_param(args, "name")?;
-            let patch = require_str_param(args, "patch")?;
-            let description = optional_str_param(args, "description").unwrap_or("");
-            let runtime = optional_str_param(args, "runtime").unwrap_or("python");
-            let entrypoint = optional_str_param(args, "entrypoint").unwrap_or("main.py");
-            let sandbox_profile = optional_str_param(args, "sandbox_profile")
-                .unwrap_or(&config.scripts.default_sandbox_profile);
-            let network_access = optional_bool_param(args, "network_access", false);
-            let fs_read: Vec<String> = args["fs_read"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let fs_write: Vec<String> = args["fs_write"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let ephemeral = optional_bool_param(args, "ephemeral", false);
+fn scripts_create(args: &serde_json::Value, config: &Config, db: &Database) -> Result<String> {
+    let name = require_str_param(args, "name")?;
+    let patch = require_str_param(args, "patch")?;
+    let description = optional_str_param(args, "description").unwrap_or("");
+    let runtime = optional_str_param(args, "runtime").unwrap_or("python");
+    let entrypoint = optional_str_param(args, "entrypoint").unwrap_or("main.py");
+    let sandbox_profile = optional_str_param(args, "sandbox_profile")
+        .unwrap_or(&config.scripts.default_sandbox_profile);
+    let network_access = optional_bool_param(args, "network_access", false);
+    let fs_read: Vec<String> = args["fs_read"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let fs_write: Vec<String> = args["fs_write"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ephemeral = optional_bool_param(args, "ephemeral", false);
 
-            crate::scripts::create_script(
-                &db,
-                &crate::scripts::CreateScriptParams {
-                    name,
-                    description,
-                    patch,
-                    runtime,
-                    entrypoint,
-                    sandbox_profile,
-                    network_access,
-                    fs_read: &fs_read,
-                    fs_write: &fs_write,
-                    ephemeral,
-                    max_scripts: config.scripts.max_scripts,
-                },
-            )
-        }
-        "update" => {
-            let name = require_str_param(args, "name")?;
-            let patch = require_str_param(args, "patch")?;
-            crate::scripts::update_script(&db, name, patch)
-        }
-        "delete" => {
-            let name = require_str_param(args, "name")?;
-            crate::scripts::delete_script(&db, name)
-        }
-        "get" => {
-            let name = require_str_param(args, "name")?;
-            crate::scripts::get_script(&db, name)
-        }
-        "list" => crate::scripts::list_scripts(&db),
-        other => Ok(format!(
-            "Unknown action: {other}. Use: create, list, get, update, delete."
-        )),
-    }
+    crate::scripts::create_script(
+        db,
+        &crate::scripts::CreateScriptParams {
+            name,
+            description,
+            patch,
+            runtime,
+            entrypoint,
+            sandbox_profile,
+            network_access,
+            fs_read: &fs_read,
+            fs_write: &fs_write,
+            ephemeral,
+            max_scripts: config.scripts.max_scripts,
+        },
+    )
+}
+
+fn scripts_update(args: &serde_json::Value, db: &Database) -> Result<String> {
+    let name = require_str_param(args, "name")?;
+    let patch = require_str_param(args, "patch")?;
+    crate::scripts::update_script(db, name, patch)
+}
+
+fn scripts_delete(args: &serde_json::Value, db: &Database) -> Result<String> {
+    let name = require_str_param(args, "name")?;
+    crate::scripts::delete_script(db, name)
+}
+
+fn scripts_get(args: &serde_json::Value, db: &Database) -> Result<String> {
+    let name = require_str_param(args, "name")?;
+    crate::scripts::get_script(db, name)
 }
 
 #[instrument(skip_all, fields(tool.name = "run_script"))]
 pub async fn handle_run_script(args: &serde_json::Value, config: &Config) -> Result<String> {
-    if !config.scripts.enabled {
-        return Ok("Scripts system is disabled.".to_string());
+    if let Some(msg) = check_enabled(config.scripts.enabled, "scripts") {
+        return Ok(msg);
     }
     let name = require_str_param(args, "name")?;
     let script_args = args.get("args").cloned().unwrap_or(serde_json::json!({}));

@@ -70,7 +70,6 @@ bundled_skills! {
     "discord"        => "discord"        { category: "channels",  default_enabled: false, hidden: true  },
     "github"         => "github"         { category: "developer", default_enabled: false, hidden: false },
     "weather"        => "weather"        { category: "utilities", default_enabled: false, hidden: false },
-    "skill-creator"  => "skill-creator"  { category: "utilities", default_enabled: false, hidden: true  },
     "git"            => "git"            { category: "developer", default_enabled: true,  hidden: false },
     "search"         => "search"         { category: "core",      default_enabled: true,  hidden: false },
     "docker"         => "docker"         { category: "developer", default_enabled: false, hidden: false },
@@ -79,7 +78,6 @@ bundled_skills! {
     "calendar"       => "calendar"       { category: "core",      default_enabled: true,  hidden: false },
     "1password"      => "1password"      { category: "utilities", default_enabled: false, hidden: false },
     "browser"        => "browser"        { category: "core",      default_enabled: true,  hidden: false },
-    "scheduler"      => "scheduler"      { category: "utilities", default_enabled: false, hidden: true  },
     "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
 }
 
@@ -949,7 +947,6 @@ Short body.
         assert!(names.contains(&"discord"));
         assert!(names.contains(&"github"));
         assert!(names.contains(&"weather"));
-        assert!(names.contains(&"skill-creator"));
         assert!(names.contains(&"git"));
         assert!(names.contains(&"email"));
         assert!(names.contains(&"search"));
@@ -959,7 +956,6 @@ Short body.
         assert!(names.contains(&"calendar"));
         assert!(names.contains(&"1password"));
         assert!(names.contains(&"browser"));
-        assert!(names.contains(&"scheduler"));
     }
 
     #[test]
@@ -1364,11 +1360,8 @@ Short body.
     fn test_hidden_skills() {
         let config = SkillsConfig::default();
         let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
-        let skill_creator = skills
-            .iter()
-            .find(|s| s.manifest.name == "skill-creator")
-            .unwrap();
-        assert!(skill_creator.is_hidden());
+        let slack = skills.iter().find(|s| s.manifest.name == "slack").unwrap();
+        assert!(slack.is_hidden());
         let git = skills.iter().find(|s| s.manifest.name == "git").unwrap();
         assert!(!git.is_hidden());
     }
@@ -2015,14 +2008,6 @@ Use docker commands.
         let s = make(SkillSource::BuiltIn, false, true);
         assert_eq!(s.status_label(), "disabled");
         assert_eq!(s.status_icon(), "—");
-    }
-
-    #[test]
-    fn scheduler_is_hidden() {
-        assert!(
-            HIDDEN_SKILLS.contains(&"scheduler"),
-            "scheduler should be in HIDDEN_SKILLS"
-        );
     }
 
     #[test]

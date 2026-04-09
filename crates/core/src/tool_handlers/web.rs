@@ -4,12 +4,12 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::web;
 
-use super::require_str_param;
+use super::{check_enabled, require_str_param};
 
 #[instrument(skip_all, fields(tool.name = "web_fetch"))]
 pub async fn handle_web_fetch(args: &serde_json::Value, config: &Config) -> Result<String> {
-    if !config.web.enabled {
-        return Ok("Web access is disabled. Enable it in config: [web] enabled = true".to_string());
+    if let Some(msg) = check_enabled(config.web.enabled, "web") {
+        return Ok(msg);
     }
     let url = require_str_param(args, "url")?;
     let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
@@ -21,8 +21,8 @@ pub async fn handle_web_fetch(args: &serde_json::Value, config: &Config) -> Resu
 
 #[instrument(skip_all, fields(tool.name = "web_search"))]
 pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Result<String> {
-    if !config.web.enabled {
-        return Ok("Web access is disabled. Enable it in config: [web] enabled = true".to_string());
+    if let Some(msg) = check_enabled(config.web.enabled, "web") {
+        return Ok(msg);
     }
     let query = require_str_param(args, "query")?;
     match web::web_search(query, &config.web).await {

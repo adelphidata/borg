@@ -1,10 +1,13 @@
+use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
+use borg_core::config::Config;
 use borg_core::db::{ScheduledTaskRow, WorkflowRow};
 
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -559,6 +562,26 @@ enum CursorTarget {
     Workflow(usize),
     Separator,
     None,
+}
+
+impl PopupHandler for SchedulePopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        Ok(self
+            .handle_key(key)
+            .map(|actions| AppAction::RunScheduleActions { actions }))
+    }
+
+    fn handle_paste_event(&mut self, text: &str) -> bool {
+        self.handle_paste(text)
+    }
 }
 
 #[cfg(test)]

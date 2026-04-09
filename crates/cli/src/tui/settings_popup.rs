@@ -9,7 +9,7 @@ use borg_core::settings::SettingSource;
 
 use crate::onboarding::{models_for_provider, PROVIDERS};
 
-use super::app::AppAction;
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -952,6 +952,24 @@ impl SettingsPopup {
             }
         };
         popup_utils::render_footer(frame, inner, hint);
+    }
+}
+
+impl PopupHandler for SettingsPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
+        self.handle_key(key, config)
+    }
+
+    fn handle_paste_event(&mut self, text: &str) -> bool {
+        self.handle_paste(text)
     }
 }
 

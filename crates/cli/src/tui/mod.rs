@@ -725,6 +725,10 @@ async fn run_event_loop(
                 app.push_system_message("New session started.".to_string());
             }
             AppAction::LoadSession { id } => {
+                // Clear existing UI state before loading a new session.
+                app.cells.clear();
+                app.session_prompt_tokens = 0;
+                app.session_completion_tokens = 0;
                 // Support partial ID matching (prefix) via shared resolver.
                 let load_id = match borg_core::session::resolve_session_id(&id) {
                     Ok(meta) => meta.id,

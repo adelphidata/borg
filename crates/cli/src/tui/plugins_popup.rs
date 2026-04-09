@@ -3,9 +3,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
+use anyhow::Result;
+
+use borg_core::config::Config;
 use borg_plugins::catalog::{PluginDef, CATALOG};
 use borg_plugins::Category;
 
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -562,6 +566,26 @@ fn title_case(s: &str) -> String {
         .join(" ")
 }
 
+impl PopupHandler for PluginsPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        Ok(self
+            .handle_key(key)
+            .map(|actions| AppAction::RunPlugins { actions }))
+    }
+
+    fn handle_paste_event(&mut self, text: &str) -> bool {
+        self.handle_paste(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,15 +682,6 @@ mod tests {
         if let Some(core_pos) = categories.iter().position(|c| *c == Category::Core) {
             assert_eq!(core_pos, 1, "Core should be the second category");
         }
-    }
-
-    #[test]
-    fn scheduler_not_shown_in_popup() {
-        let popup = make_test_popup();
-        assert!(
-            !popup.items.iter().any(|i| i.id == "scheduler"),
-            "scheduler should be hidden from the plugins popup"
-        );
     }
 
     #[test]

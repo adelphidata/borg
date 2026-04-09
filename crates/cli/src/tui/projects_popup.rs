@@ -1,10 +1,13 @@
+use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
+use borg_core::config::Config;
 use borg_core::db::ProjectRow;
 
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -502,6 +505,26 @@ impl ProjectsPopup {
             )),
         ];
         frame.render_widget(Paragraph::new(edit_lines), edit_area);
+    }
+}
+
+impl PopupHandler for ProjectsPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        Ok(self
+            .handle_key(key)
+            .map(|actions| AppAction::RunProjectActions { actions }))
+    }
+
+    fn handle_paste_event(&mut self, text: &str) -> bool {
+        self.handle_paste(text)
     }
 }
 

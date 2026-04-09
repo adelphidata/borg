@@ -1,10 +1,13 @@
+use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+use borg_core::config::Config;
 use borg_core::session::SessionMeta;
 
+use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
@@ -128,6 +131,24 @@ impl SessionsPopup {
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
         popup_utils::render_footer(frame, inner, " Enter: load  Esc: close");
+    }
+}
+
+impl PopupHandler for SessionsPopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> Result<Option<AppAction>> {
+        if let Some(SessionAction::Load { id }) = self.handle_key(key) {
+            Ok(Some(AppAction::LoadSession { id }))
+        } else {
+            Ok(None)
+        }
     }
 }
 

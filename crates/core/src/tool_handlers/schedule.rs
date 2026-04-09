@@ -4,18 +4,9 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::tasks;
 
-use super::{optional_i64_param, optional_str_param, optional_u64_param, require_str_param};
-
-/// Open the database and run a callback, formatting the open error if it fails.
-fn with_db<F>(f: F) -> Result<String>
-where
-    F: FnOnce(&Database) -> Result<String>,
-{
-    match Database::open() {
-        Ok(db) => f(&db),
-        Err(e) => Ok(format!("Error opening database: {e}")),
-    }
-}
+use super::{
+    optional_i64_param, optional_str_param, optional_u64_param, require_str_param, with_db,
+};
 
 /// Unified schedule handler: dispatches to manage_tasks or manage_cron based on `type` field.
 pub fn handle_schedule(args: &serde_json::Value, config: &Config) -> Result<String> {

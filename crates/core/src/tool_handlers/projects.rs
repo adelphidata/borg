@@ -3,38 +3,24 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{optional_str_param, require_str_param};
+use super::{optional_str_param, require_str_param, with_db};
 use crate::config::Config;
 use crate::db::Database;
 
 /// Handle the `projects` tool. Dispatches by action.
 pub fn handle_projects(args: &Value, _config: &Config) -> Result<String> {
-    let action = require_str_param(args, "action")?;
-    // Early-return for actions that don't need DB
-    if !matches!(
-        action,
-        "create" | "list" | "get" | "update" | "archive" | "delete"
-    ) {
-        return Ok(format!(
-            "Unknown project action: {action}. Use: create, list, get, update, archive, delete."
-        ));
-    }
-    let db = Database::open()?;
-    handle_projects_with_db(args, action, &db)
+    with_db(|db| dispatch_project(args, db))
 }
 
-fn handle_projects_with_db(args: &Value, action: &str, db: &Database) -> Result<String> {
-    match action {
+fn dispatch_project(args: &Value, db: &Database) -> Result<String> {
+    crate::dispatch_action!(args, {
         "create" => project_create(args, db),
         "list" => project_list(args, db),
         "get" => project_get(args, db),
         "update" => project_update(args, db),
         "archive" => project_archive(args, db),
         "delete" => project_delete(args, db),
-        other => Ok(format!(
-            "Unknown project action: {other}. Use: create, list, get, update, archive, delete."
-        )),
-    }
+    })
 }
 
 fn project_create(args: &Value, db: &Database) -> Result<String> {
@@ -207,14 +193,13 @@ mod tests {
     }
 
     fn run(args: serde_json::Value, db: &Database) -> String {
-        let action = args["action"].as_str().unwrap();
-        handle_projects_with_db(&args, action, db).unwrap()
+        dispatch_project(&args, db).unwrap()
     }
 
     #[test]
     fn create_project_requires_name() {
         let db = test_db();
-        let result = handle_projects_with_db(&json!({"action": "create"}), "create", &db);
+        let result = dispatch_project(&json!({"action": "create"}), &db);
         assert!(result.is_err() || result.unwrap().contains("Missing"));
     }
 
@@ -277,7 +262,7 @@ mod tests {
     #[test]
     fn unknown_action_returns_help() {
         let result = handle_projects(&json!({"action": "nope"}), &Config::default()).unwrap();
-        assert!(result.contains("Unknown project action"));
+        assert!(result.contains("Unknown action"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use ratatui::Frame;
 use borg_core::config::Config;
 use borg_core::migrate::{self, MigrationCategories, MigrationPlan, MigrationSource, SourceData};
 
+use super::app::{AppAction, PopupHandler};
 use super::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +499,22 @@ impl MigratePopup {
                 .alignment(Alignment::Left),
             area,
         );
+    }
+}
+
+impl PopupHandler for MigratePopup {
+    fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        _config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
+        Ok(self
+            .handle_key(key)
+            .map(|actions| AppAction::RunMigration { actions }))
     }
 }
 

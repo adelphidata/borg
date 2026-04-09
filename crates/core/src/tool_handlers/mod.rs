@@ -11,7 +11,34 @@ mod web;
 
 use anyhow::Result;
 
+use crate::db::Database;
+
 // ── Shared helpers ──
+
+/// Return an early-exit string if the feature is disabled.
+pub(crate) fn check_enabled(enabled: bool, feature: &str) -> Option<String> {
+    if enabled {
+        None
+    } else {
+        Some(format!(
+            "{feature} is disabled. Enable: {feature}.enabled = true"
+        ))
+    }
+}
+
+/// Open the database and run a callback, formatting the open error if it fails.
+pub(crate) fn with_db<F>(f: F) -> Result<String>
+where
+    F: FnOnce(&Database) -> Result<String>,
+{
+    match Database::open() {
+        Ok(db) => f(&db),
+        Err(e) => {
+            tracing::warn!("Failed to open database: {e}");
+            Ok(format!("Error opening database: {e}"))
+        }
+    }
+}
 
 pub fn require_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Result<&'a str> {
     args[name]

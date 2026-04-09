@@ -8,15 +8,12 @@ use crate::browser::{validate_browser_args, BrowserSession};
 use crate::config::Config;
 use crate::types::{ContentPart, MediaData, ToolOutput};
 
-use super::require_str_param;
+use super::{check_enabled, require_str_param};
 
 #[instrument(skip_all, fields(tool.name = "generate_image"))]
 pub async fn handle_generate_image(args: &serde_json::Value, config: &Config) -> Result<String> {
-    if !config.image_gen.enabled {
-        return Ok(
-            "Image generation is disabled. Enable it in config: image_gen.enabled = true"
-                .to_string(),
-        );
+    if let Some(msg) = check_enabled(config.image_gen.enabled, "image_gen") {
+        return Ok(msg);
     }
 
     let prompt = args
