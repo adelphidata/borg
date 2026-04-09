@@ -1233,17 +1233,17 @@ fn init_data_dir() -> Result<()> {
         Some(result) => {
             onboarding::apply_onboarding(&result)?;
 
+            // Auto-launch TUI for the first conversation (check before daemon
+            // start to avoid printing output that flashes between terminal modes)
+            let setup_path = data_dir.join("SETUP.md");
+            let will_auto_launch = setup_path.exists() && std::io::stdin().is_terminal();
+
             // Auto-start daemon service after successful onboarding (non-fatal)
             if let Err(e) = service::ensure_service_running() {
                 tracing::warn!("Auto-start service during onboarding: {e}");
             }
 
-            println!();
-
-            // Auto-launch TUI for the first conversation
-            let setup_path = data_dir.join("SETUP.md");
-            if setup_path.exists() && std::io::stdin().is_terminal() {
-                println!();
+            if will_auto_launch {
                 // The TUI will detect SETUP.md and inject it into the system prompt
                 return Ok(());
             }
