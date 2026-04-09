@@ -2,7 +2,6 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -728,163 +727,94 @@ impl LlmClient {
 
         let response = self.send_request(&request, cancel).await?;
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let chunk_timeout_secs = self.llm_config.stream_chunk_timeout_secs;
+        let stream = response.bytes_stream();
+        let provider_str = self.provider.as_str().to_string();
+        let model_str = self.llm_config.model.clone();
 
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => {
-                    if tx.send(StreamEvent::Done).await.is_err() {
-                        tracing::debug!("llm: stream receiver closed");
-                    }
-                    return Ok(());
+        crate::sse::process_sse_stream(
+            stream,
+            tx,
+            cancel,
+            self.llm_config.stream_chunk_timeout_secs,
+            MAX_SSE_BUFFER,
+            |line| Self::parse_openai_sse_line(line, &provider_str, &model_str),
+        )
+        .await
+    }
+
+    /// Parse a single SSE line from an OpenAI-compatible provider.
+    fn parse_openai_sse_line(line: &str, provider: &str, model: &str) -> crate::sse::SseAction {
+        use crate::sse::SseAction;
+
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => return SseAction::Continue,
+        };
+
+        if data.trim() == "[DONE]" {
+            return SseAction::Done(vec![StreamEvent::Done]);
+        }
+
+        match serde_json::from_str::<StreamChunk>(data) {
+            Ok(chunk) => {
+                let mut events = Vec::new();
+
+                if let Some(usage) = chunk.usage {
+                    let cached_input_tokens = usage
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens)
+                        .or(usage.cached_tokens)
+                        .unwrap_or(0);
+                    events.push(StreamEvent::Usage(UsageData {
+                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                        completion_tokens: usage.completion_tokens.unwrap_or(0),
+                        total_tokens: usage.total_tokens.unwrap_or(0),
+                        cached_input_tokens,
+                        cache_creation_tokens: 0,
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                    }));
                 }
-                maybe_chunk = async {
-                    if chunk_timeout_secs > 0 {
-                        tokio::time::timeout(
-                            Duration::from_secs(chunk_timeout_secs),
-                            stream.next(),
-                        ).await
-                    } else {
-                        Ok(stream.next().await)
-                    }
-                } => {
-                    match maybe_chunk {
-                        Ok(Some(Ok(c))) => c,
-                        Ok(Some(Err(e))) => {
-                            return Err(LlmError::Retryable {
-                                source: anyhow::anyhow!("Stream read error: {e}"),
-                                retry_after: None,
-                                reason: FailoverReason::Timeout,
-                            });
-                        }
-                        Ok(None) => {
-                            if tx.send(StreamEvent::Done).await.is_err() {
-                                tracing::debug!("llm: stream receiver closed");
+
+                if let Some(choices) = chunk.choices {
+                    for choice in choices {
+                        if let Some(delta) = choice.delta {
+                            if let Some(content) = delta.content {
+                                events.push(StreamEvent::TextDelta(content));
                             }
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            return Err(LlmError::Retryable {
-                                source: anyhow::anyhow!("No data received for {chunk_timeout_secs}s"),
-                                retry_after: None,
-                                reason: FailoverReason::Timeout,
-                            });
-                        }
-                    }
-                }
-            };
-
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            if buffer.len() > MAX_SSE_BUFFER {
-                return Err(LlmError::Retryable {
-                    source: anyhow::anyhow!("SSE buffer exceeded {MAX_SSE_BUFFER} bytes"),
-                    retry_after: None,
-                    reason: FailoverReason::Overloaded,
-                });
-            }
-
-            let mut cursor = 0;
-            while let Some(rel_end) = buffer[cursor..].find('\n') {
-                let line_end = cursor + rel_end;
-                let line = buffer[cursor..line_end].trim();
-                cursor = line_end + 1;
-
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" {
-                        if tx.send(StreamEvent::Done).await.is_err() {
-                            tracing::debug!("llm: stream receiver closed");
-                        }
-                        return Ok(());
-                    }
-
-                    match serde_json::from_str::<StreamChunk>(data) {
-                        Ok(chunk) => {
-                            // Parse usage data if present
-                            if let Some(usage) = chunk.usage {
-                                let cached_input_tokens = usage
-                                    .prompt_tokens_details
-                                    .as_ref()
-                                    .and_then(|d| d.cached_tokens)
-                                    .or(usage.cached_tokens)
-                                    .unwrap_or(0);
-                                if tx
-                                    .send(StreamEvent::Usage(UsageData {
-                                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
-                                        completion_tokens: usage.completion_tokens.unwrap_or(0),
-                                        total_tokens: usage.total_tokens.unwrap_or(0),
-                                        cached_input_tokens,
-                                        cache_creation_tokens: 0,
-                                        provider: self.provider.as_str().to_string(),
-                                        model: self.llm_config.model.clone(),
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
-                                    debug!("Stream receiver dropped, stopping SSE processing");
-                                    return Ok(());
-                                }
-                            }
-                            if let Some(choices) = chunk.choices {
-                                for choice in choices {
-                                    if let Some(delta) = choice.delta {
-                                        if let Some(content) = delta.content {
-                                            if tx
-                                                .send(StreamEvent::TextDelta(content))
-                                                .await
-                                                .is_err()
-                                            {
-                                                debug!("Stream receiver dropped, stopping SSE processing");
-                                                return Ok(());
-                                            }
-                                        }
-                                        if let Some(tool_calls) = delta.tool_calls {
-                                            for tc in tool_calls {
-                                                if tx
-                                                    .send(StreamEvent::ToolCallDelta {
-                                                        index: tc.index.unwrap_or(0),
-                                                        id: tc.id,
-                                                        name: tc
-                                                            .function
-                                                            .as_ref()
-                                                            .and_then(|f| f.name.clone()),
-                                                        arguments_delta: tc
-                                                            .function
-                                                            .as_ref()
-                                                            .and_then(|f| f.arguments.clone())
-                                                            .unwrap_or_default(),
-                                                    })
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    debug!("Stream receiver dropped, stopping SSE processing");
-                                                    return Ok(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if choice.finish_reason.is_some() {
-                                        if tx.send(StreamEvent::Done).await.is_err() {
-                                            tracing::debug!("llm: stream receiver closed");
-                                        }
-                                        return Ok(());
-                                    }
+                            if let Some(tool_calls) = delta.tool_calls {
+                                for tc in tool_calls {
+                                    events.push(StreamEvent::ToolCallDelta {
+                                        index: tc.index.unwrap_or(0),
+                                        id: tc.id,
+                                        name: tc.function.as_ref().and_then(|f| f.name.clone()),
+                                        arguments_delta: tc
+                                            .function
+                                            .as_ref()
+                                            .and_then(|f| f.arguments.clone())
+                                            .unwrap_or_default(),
+                                    });
                                 }
                             }
                         }
-                        Err(e) => {
-                            warn!("Failed to parse SSE chunk: {e}");
+                        if choice.finish_reason.is_some() {
+                            events.push(StreamEvent::Done);
+                            return SseAction::Done(events);
                         }
                     }
                 }
+
+                if events.is_empty() {
+                    SseAction::Continue
+                } else {
+                    SseAction::Emit(events)
+                }
             }
-            buffer.drain(..cursor);
+            Err(e) => {
+                warn!("Failed to parse SSE chunk: {e}");
+                SseAction::Continue
+            }
         }
     }
 
@@ -1083,272 +1013,196 @@ impl LlmClient {
 
         let response = self.send_request(&body, cancel).await?;
 
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let stream = response.bytes_stream();
+        let provider_str = self.provider.as_str().to_string();
+        let model_str = self.llm_config.model.clone();
+
+        // Mutable state for Anthropic's stateful event stream
         let mut current_tool_index: usize = 0;
         let mut current_block_is_tool = false;
         let mut current_block_is_thinking = false;
-        // Cache token counts arrive on `message_start` (cache_read_input_tokens,
-        // cache_creation_input_tokens) but the total usage lands on
-        // `message_delta`. Stash the cache values from `message_start` here so
-        // we can merge them into the eventual `StreamEvent::Usage` emission.
+        // Cache token counts arrive on `message_start` but total usage lands
+        // on `message_delta`. Stash cache values here to merge later.
         let mut pending_cached_input_tokens: u64 = 0;
         let mut pending_cache_creation_tokens: u64 = 0;
-        let chunk_timeout_secs = self.llm_config.stream_chunk_timeout_secs;
 
-        loop {
-            let chunk = tokio::select! {
-                _ = cancel.cancelled() => {
-                    if tx.send(StreamEvent::Done).await.is_err() {
-                        tracing::debug!("llm: stream receiver closed");
-                    }
-                    return Ok(());
+        crate::sse::process_sse_stream(
+            stream,
+            tx,
+            cancel,
+            self.llm_config.stream_chunk_timeout_secs,
+            MAX_SSE_BUFFER,
+            |line| {
+                Self::parse_anthropic_sse_line(
+                    line,
+                    &provider_str,
+                    &model_str,
+                    &mut current_tool_index,
+                    &mut current_block_is_tool,
+                    &mut current_block_is_thinking,
+                    &mut pending_cached_input_tokens,
+                    &mut pending_cache_creation_tokens,
+                )
+            },
+        )
+        .await
+    }
+
+    /// Parse a single SSE line from Anthropic's streaming API.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_anthropic_sse_line(
+        line: &str,
+        provider: &str,
+        model: &str,
+        current_tool_index: &mut usize,
+        current_block_is_tool: &mut bool,
+        current_block_is_thinking: &mut bool,
+        pending_cached_input_tokens: &mut u64,
+        pending_cache_creation_tokens: &mut u64,
+    ) -> crate::sse::SseAction {
+        use crate::sse::SseAction;
+
+        let data = match line.strip_prefix("data: ") {
+            Some(d) => d,
+            None => return SseAction::Continue,
+        };
+
+        let event = match serde_json::from_str::<serde_json::Value>(data) {
+            Ok(e) => e,
+            Err(_) => return SseAction::Continue,
+        };
+
+        let event_type = event["type"].as_str().unwrap_or("");
+
+        match event_type {
+            "message_start" => {
+                if let Some(usage) = event["message"]["usage"].as_object() {
+                    let (cached, created) =
+                        normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
+                    *pending_cached_input_tokens = cached;
+                    *pending_cache_creation_tokens = created;
                 }
-                maybe_chunk = async {
-                    if chunk_timeout_secs > 0 {
-                        tokio::time::timeout(
-                            Duration::from_secs(chunk_timeout_secs),
-                            stream.next(),
-                        ).await
-                    } else {
-                        Ok(stream.next().await)
+                SseAction::Continue
+            }
+            "content_block_start" => {
+                let block = &event["content_block"];
+                let block_type = block["type"].as_str().unwrap_or("");
+                *current_block_is_tool = false;
+                *current_block_is_thinking = false;
+                match block_type {
+                    "tool_use" => {
+                        *current_block_is_tool = true;
+                        let id = block["id"].as_str().map(String::from);
+                        let name = block["name"].as_str().map(String::from);
+                        SseAction::Emit(vec![StreamEvent::ToolCallDelta {
+                            index: *current_tool_index,
+                            id,
+                            name,
+                            arguments_delta: String::new(),
+                        }])
                     }
-                } => {
-                    match maybe_chunk {
-                        Ok(Some(Ok(c))) => c,
-                        Ok(Some(Err(e))) => {
-                            return Err(LlmError::Retryable {
-                                source: anyhow::anyhow!("Stream read error: {e}"),
-                                retry_after: None,
-                                reason: FailoverReason::Timeout,
-                            });
+                    "thinking" => {
+                        *current_block_is_thinking = true;
+                        SseAction::Continue
+                    }
+                    _ => SseAction::Continue,
+                }
+            }
+            "content_block_delta" => {
+                let delta = &event["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(text) = delta["text"].as_str() {
+                            SseAction::Emit(vec![StreamEvent::TextDelta(text.to_string())])
+                        } else {
+                            SseAction::Continue
                         }
-                        Ok(None) => {
-                            if tx.send(StreamEvent::Done).await.is_err() {
-                                tracing::debug!("llm: stream receiver closed");
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta["thinking"].as_str() {
+                            SseAction::Emit(vec![StreamEvent::ThinkingDelta(text.to_string())])
+                        } else {
+                            SseAction::Continue
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(json_delta) = delta["partial_json"].as_str() {
+                            SseAction::Emit(vec![StreamEvent::ToolCallDelta {
+                                index: *current_tool_index,
+                                id: None,
+                                name: None,
+                                arguments_delta: json_delta.to_string(),
+                            }])
+                        } else {
+                            SseAction::Continue
+                        }
+                    }
+                    _ => {
+                        // For thinking blocks, text comes as text_delta
+                        if *current_block_is_thinking {
+                            if let Some(text) = delta["text"].as_str() {
+                                return SseAction::Emit(vec![StreamEvent::ThinkingDelta(
+                                    text.to_string(),
+                                )]);
                             }
-                            return Ok(());
                         }
-                        Err(_) => {
-                            return Err(LlmError::Retryable {
-                                source: anyhow::anyhow!("No data received for {chunk_timeout_secs}s"),
-                                retry_after: None,
-                                reason: FailoverReason::Timeout,
-                            });
-                        }
+                        SseAction::Continue
                     }
                 }
-            };
-
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            if buffer.len() > MAX_SSE_BUFFER {
-                return Err(LlmError::Retryable {
-                    source: anyhow::anyhow!("SSE buffer exceeded {MAX_SSE_BUFFER} bytes"),
+            }
+            "content_block_stop" => {
+                if *current_block_is_tool {
+                    *current_tool_index += 1;
+                }
+                SseAction::Continue
+            }
+            "message_stop" => SseAction::Done(vec![StreamEvent::Done]),
+            "message_delta" => {
+                let mut events = Vec::new();
+                if let Some(usage) = event["usage"].as_object() {
+                    let input = usage
+                        .get("input_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let output = usage
+                        .get("output_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let (delta_cached, delta_created) =
+                        normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
+                    let cached_input_tokens = delta_cached.max(*pending_cached_input_tokens);
+                    let cache_creation_tokens = delta_created.max(*pending_cache_creation_tokens);
+                    events.push(StreamEvent::Usage(UsageData {
+                        prompt_tokens: input,
+                        completion_tokens: output,
+                        total_tokens: input + output,
+                        cached_input_tokens,
+                        cache_creation_tokens,
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                    }));
+                }
+                if event["delta"]["stop_reason"].as_str().is_some() {
+                    events.push(StreamEvent::Done);
+                    return SseAction::Done(events);
+                }
+                if events.is_empty() {
+                    SseAction::Continue
+                } else {
+                    SseAction::Emit(events)
+                }
+            }
+            "error" => {
+                let err_msg = event["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown error");
+                SseAction::Error(LlmError::Retryable {
+                    source: anyhow::anyhow!("Anthropic stream error: {err_msg}"),
                     retry_after: None,
                     reason: FailoverReason::Overloaded,
-                });
+                })
             }
-
-            let mut cursor = 0;
-            while let Some(rel_end) = buffer[cursor..].find('\n') {
-                let line_end = cursor + rel_end;
-                let line = buffer[cursor..line_end].trim();
-                cursor = line_end + 1;
-
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                // Anthropic SSE uses "event: <type>" followed by "data: <json>"
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = event["type"].as_str().unwrap_or("");
-
-                        match event_type {
-                            "message_start" => {
-                                // Anthropic surfaces cache token counts on the
-                                // initial `message_start` event. The matching
-                                // `message_delta` usage object omits them, so
-                                // we stash them here and merge when the
-                                // delta lands. See:
-                                // https://docs.anthropic.com/en/api/messages-streaming
-                                if let Some(usage) = event["message"]["usage"].as_object() {
-                                    let (cached, created) = normalize_cache_tokens(
-                                        &serde_json::Value::Object(usage.clone()),
-                                    );
-                                    pending_cached_input_tokens = cached;
-                                    pending_cache_creation_tokens = created;
-                                }
-                            }
-                            "content_block_start" => {
-                                let block = &event["content_block"];
-                                let block_type = block["type"].as_str().unwrap_or("");
-                                current_block_is_tool = false;
-                                current_block_is_thinking = false;
-                                match block_type {
-                                    "tool_use" => {
-                                        current_block_is_tool = true;
-                                        let id = block["id"].as_str().map(String::from);
-                                        let name = block["name"].as_str().map(String::from);
-                                        if tx
-                                            .send(StreamEvent::ToolCallDelta {
-                                                index: current_tool_index,
-                                                id,
-                                                name,
-                                                arguments_delta: String::new(),
-                                            })
-                                            .await
-                                            .is_err()
-                                        {
-                                            debug!(
-                                                "Stream receiver dropped, stopping SSE processing"
-                                            );
-                                            return Ok(());
-                                        }
-                                    }
-                                    "thinking" => {
-                                        current_block_is_thinking = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            "content_block_delta" => {
-                                let delta = &event["delta"];
-                                match delta["type"].as_str() {
-                                    Some("text_delta") => {
-                                        if let Some(text) = delta["text"].as_str() {
-                                            if tx
-                                                .send(StreamEvent::TextDelta(text.to_string()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                debug!("Stream receiver dropped, stopping SSE processing");
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                    Some("thinking_delta") => {
-                                        if let Some(text) = delta["thinking"].as_str() {
-                                            if tx
-                                                .send(StreamEvent::ThinkingDelta(text.to_string()))
-                                                .await
-                                                .is_err()
-                                            {
-                                                debug!("Stream receiver dropped, stopping SSE processing");
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                    Some("input_json_delta") => {
-                                        if let Some(json_delta) = delta["partial_json"].as_str() {
-                                            if tx
-                                                .send(StreamEvent::ToolCallDelta {
-                                                    index: current_tool_index,
-                                                    id: None,
-                                                    name: None,
-                                                    arguments_delta: json_delta.to_string(),
-                                                })
-                                                .await
-                                                .is_err()
-                                            {
-                                                debug!("Stream receiver dropped, stopping SSE processing");
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                    _ => {
-                                        // For thinking blocks, text comes as text_delta
-                                        if current_block_is_thinking {
-                                            if let Some(text) = delta["text"].as_str() {
-                                                if tx
-                                                    .send(StreamEvent::ThinkingDelta(
-                                                        text.to_string(),
-                                                    ))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    debug!("Stream receiver dropped, stopping SSE processing");
-                                                    return Ok(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "content_block_stop" => {
-                                if current_block_is_tool {
-                                    current_tool_index += 1;
-                                }
-                            }
-                            "message_stop" => {
-                                if tx.send(StreamEvent::Done).await.is_err() {
-                                    tracing::debug!("llm: stream receiver closed");
-                                }
-                                return Ok(());
-                            }
-                            "message_delta" => {
-                                // Parse usage from message_delta
-                                if let Some(usage) = event["usage"].as_object() {
-                                    let input = usage
-                                        .get("input_tokens")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(0);
-                                    let output = usage
-                                        .get("output_tokens")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(0);
-                                    // message_delta can also (rarely) include
-                                    // cache fields — prefer non-zero values
-                                    // from either source.
-                                    let (delta_cached, delta_created) = normalize_cache_tokens(
-                                        &serde_json::Value::Object(usage.clone()),
-                                    );
-                                    let cached_input_tokens =
-                                        delta_cached.max(pending_cached_input_tokens);
-                                    let cache_creation_tokens =
-                                        delta_created.max(pending_cache_creation_tokens);
-                                    if tx
-                                        .send(StreamEvent::Usage(UsageData {
-                                            prompt_tokens: input,
-                                            completion_tokens: output,
-                                            total_tokens: input + output,
-                                            cached_input_tokens,
-                                            cache_creation_tokens,
-                                            provider: self.provider.as_str().to_string(),
-                                            model: self.llm_config.model.clone(),
-                                        }))
-                                        .await
-                                        .is_err()
-                                    {
-                                        debug!("Stream receiver dropped, stopping SSE processing");
-                                        return Ok(());
-                                    }
-                                }
-                                // message_delta with stop_reason indicates end
-                                if event["delta"]["stop_reason"].as_str().is_some() {
-                                    if tx.send(StreamEvent::Done).await.is_err() {
-                                        tracing::debug!("llm: stream receiver closed");
-                                    }
-                                    return Ok(());
-                                }
-                            }
-                            "error" => {
-                                let err_msg = event["error"]["message"]
-                                    .as_str()
-                                    .unwrap_or("unknown error");
-                                return Err(LlmError::Retryable {
-                                    source: anyhow::anyhow!("Anthropic stream error: {err_msg}"),
-                                    retry_after: None,
-                                    reason: FailoverReason::Overloaded,
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            buffer.drain(..cursor);
+            _ => SseAction::Continue,
         }
     }
 

@@ -107,6 +107,8 @@ pub mod skill_security;
 pub mod skills;
 /// macOS sleep inhibitor to keep daemon alive.
 pub mod sleep_inhibitor;
+/// Shared SSE stream processing for LLM providers.
+pub mod sse;
 /// Scheduled task management (prompt and command jobs).
 pub mod tasks;
 /// Anonymous telemetry collection.
@@ -123,6 +125,8 @@ pub mod tool_definitions;
 pub(crate) mod tool_dispatch;
 /// Tool execution dispatch and result handling.
 pub mod tool_handlers;
+/// Centralized tool name constants and dispatch macro.
+pub mod tool_names;
 /// Tool access policy (allow/deny lists, profiles).
 pub mod tool_policy;
 /// Text truncation with head+tail preservation.
