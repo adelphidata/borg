@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::tool_names;
 use crate::types::ToolDefinition;
 
 /// Build the core tool definitions sent to the LLM.
@@ -10,25 +11,25 @@ use crate::types::ToolDefinition;
 /// an existing tool with an extra action variant.
 pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     let mut defs = vec![
-        ToolDefinition::new("write_memory", "Write or append to a memory file. Use filename 'IDENTITY.md' to update personality, 'MEMORY.md' for the index, or any other name for topic-specific memories. Use scope='local' to write to project-local memory (.borg/ in CWD).", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Name of the memory file"},"content":{"type":"string","description":"Content to write"},"append":{"type":"boolean","description":"Append instead of overwriting","default":false},"scope":{"type":"string","enum":["global","local"],"description":"Memory scope: 'global' (default, ~/.borg/) or 'local' (CWD/.borg/)","default":"global"}},"required":["filename","content"]})),
-        ToolDefinition::new("read_memory", "Read a memory file.", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Name of the memory file to read"}},"required":["filename"]})),
-        ToolDefinition::new("memory_search", "Search memory files semantically. Use before answering questions about prior work, decisions, preferences, or anything previously discussed.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Maximum results to return (default: 5)","default":5},"min_score":{"type":"number","description":"Minimum relevance score 0-1 (default: 0.2)","default":0.2}},"required":["query"]})),
-        ToolDefinition::new("list", "List resources. Specify what to list: skills, channels, or agents.", serde_json::json!({"type":"object","properties":{"what":{"type":"string","enum":["skills","channels","agents"],"description":"What to list"}},"required":["what"]})),
-        ToolDefinition::new("apply_patch", "Create, update, or delete files using the patch DSL. File paths can be relative to cwd, absolute, or use ~/. Use target to choose location: cwd (default), skills (~/.borg/skills/), channels (~/.borg/channels/).", serde_json::json!({"type":"object","properties":{"patch":{"type":"string","description":"The patch content in the patch DSL format"},"target":{"type":"string","enum":["cwd","skills","channels"],"description":"Where to apply the patch (default: cwd)","default":"cwd"}},"required":["patch"]})),
-        ToolDefinition::new("run_shell", "Execute a shell command. Requires user confirmation before execution.", serde_json::json!({"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]})),
-        ToolDefinition::new("read_file", "Read a file's contents. Returns text with line numbers for code files, renders images visually, and extracts text from PDFs. Use offset/limit to read specific line ranges of large files.", serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"File path (relative to cwd or absolute)"},"offset":{"type":"integer","description":"Start line, 1-based (default: 1)"},"limit":{"type":"integer","description":"Max lines to read (default: all, truncated at max_chars)"},"max_chars":{"type":"integer","description":"Max characters to return (default: 50000)"}},"required":["path"]})),
-        ToolDefinition::new("list_dir", "List the contents of a directory. Returns file and subdirectory names with types and sizes. Use this to explore project structure.", serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Directory path (relative to cwd or absolute). Defaults to current directory."},"depth":{"type":"integer","description":"Maximum depth to recurse (default: 1, max: 3)"},"include_hidden":{"type":"boolean","description":"Include hidden files/dirs (default: false)"}}})),
+        ToolDefinition::new(tool_names::WRITE_MEMORY, "Write or append to a memory file. Use filename 'IDENTITY.md' to update personality, 'MEMORY.md' for the index, or any other name for topic-specific memories. Use scope='local' to write to project-local memory (.borg/ in CWD).", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Name of the memory file"},"content":{"type":"string","description":"Content to write"},"append":{"type":"boolean","description":"Append instead of overwriting","default":false},"scope":{"type":"string","enum":["global","local"],"description":"Memory scope: 'global' (default, ~/.borg/) or 'local' (CWD/.borg/)","default":"global"}},"required":["filename","content"]})),
+        ToolDefinition::new(tool_names::READ_MEMORY, "Read a memory file.", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Name of the memory file to read"}},"required":["filename"]})),
+        ToolDefinition::new(tool_names::MEMORY_SEARCH, "Search memory files semantically. Use before answering questions about prior work, decisions, preferences, or anything previously discussed.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Maximum results to return (default: 5)","default":5},"min_score":{"type":"number","description":"Minimum relevance score 0-1 (default: 0.2)","default":0.2}},"required":["query"]})),
+        ToolDefinition::new(tool_names::LIST, "List resources. Specify what to list: skills, channels, or agents.", serde_json::json!({"type":"object","properties":{"what":{"type":"string","enum":["skills","channels","agents"],"description":"What to list"}},"required":["what"]})),
+        ToolDefinition::new(tool_names::APPLY_PATCH, "Create, update, or delete files using the patch DSL. File paths can be relative to cwd, absolute, or use ~/. Use target to choose location: cwd (default), skills (~/.borg/skills/), channels (~/.borg/channels/).", serde_json::json!({"type":"object","properties":{"patch":{"type":"string","description":"The patch content in the patch DSL format"},"target":{"type":"string","enum":["cwd","skills","channels"],"description":"Where to apply the patch (default: cwd)","default":"cwd"}},"required":["patch"]})),
+        ToolDefinition::new(tool_names::RUN_SHELL, "Execute a shell command. Requires user confirmation before execution.", serde_json::json!({"type":"object","properties":{"command":{"type":"string","description":"Shell command to execute"}},"required":["command"]})),
+        ToolDefinition::new(tool_names::READ_FILE, "Read a file's contents. Returns text with line numbers for code files, renders images visually, and extracts text from PDFs. Use offset/limit to read specific line ranges of large files.", serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"File path (relative to cwd or absolute)"},"offset":{"type":"integer","description":"Start line, 1-based (default: 1)"},"limit":{"type":"integer","description":"Max lines to read (default: all, truncated at max_chars)"},"max_chars":{"type":"integer","description":"Max characters to return (default: 50000)"}},"required":["path"]})),
+        ToolDefinition::new(tool_names::LIST_DIR, "List the contents of a directory. Returns file and subdirectory names with types and sizes. Use this to explore project structure.", serde_json::json!({"type":"object","properties":{"path":{"type":"string","description":"Directory path (relative to cwd or absolute). Defaults to current directory."},"depth":{"type":"integer","description":"Maximum depth to recurse (default: 1, max: 3)"},"include_hidden":{"type":"boolean","description":"Include hidden files/dirs (default: false)"}}})),
     ];
 
     if config.web.enabled {
-        defs.push(ToolDefinition::new("web_fetch", "Fetch a URL and return its text content. HTML pages are automatically converted to plain text.", serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"},"max_chars":{"type":"integer","description":"Maximum characters to return (default: 50000)","default":50000}},"required":["url"]})));
-        defs.push(ToolDefinition::new("web_search", "Search the web and return results with titles, URLs, and snippets.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})));
+        defs.push(ToolDefinition::new(tool_names::WEB_FETCH, "Fetch a URL and return its text content. HTML pages are automatically converted to plain text.", serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"},"max_chars":{"type":"integer","description":"Maximum characters to return (default: 50000)","default":50000}},"required":["url"]})));
+        defs.push(ToolDefinition::new(tool_names::WEB_SEARCH, "Search the web and return results with titles, URLs, and snippets.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})));
     }
 
     defs.push(build_schedule_tool_def(config));
 
     defs.push(ToolDefinition::new(
-        "projects",
+        tool_names::PROJECTS,
         "Manage projects. Projects group related workflows and track workstreams. Actions: create, list, get, update, archive, delete.",
         serde_json::json!({
             "type": "object",
@@ -49,7 +50,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     if config.browser.enabled {
         defs.push(ToolDefinition::new(
-            "browser",
+            tool_names::BROWSER,
             "Control a headless Chrome browser. Actions: navigate, click, type, screenshot, get_text, evaluate_js, hover, select, press, drag, fill, wait, resize, new_tab, list_tabs, switch_tab, close_tab, get_console_logs, close.",
             serde_json::json!({
                 "type": "object",
@@ -80,7 +81,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     if config.tts.enabled {
         defs.push(ToolDefinition::new(
-            "text_to_speech",
+            tool_names::TEXT_TO_SPEECH,
             "Convert text to speech audio. Returns base64-encoded audio data. Use for voice messages, audio responses, or accessibility.",
             serde_json::json!({
                 "type": "object",
@@ -106,7 +107,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     if config.image_gen.enabled {
         defs.push(ToolDefinition::new(
-            "generate_image",
+            tool_names::GENERATE_IMAGE,
             "Generate images from a text description using AI. Returns base64-encoded image data.",
             serde_json::json!({
                 "type": "object",
@@ -131,7 +132,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     // Request user input — always available (disabled at gateway level)
     defs.push(ToolDefinition::new(
-        "request_user_input",
+        tool_names::REQUEST_USER_INPUT,
         "Ask the user a question and wait for their response. Use when you need clarification or a decision before proceeding. Do not use for routine confirmations — only when genuinely blocked.",
         serde_json::json!({
             "type": "object",
@@ -194,7 +195,7 @@ fn build_schedule_tool_def(config: &Config) -> ToolDefinition {
     }
 
     ToolDefinition::new(
-        "schedule",
+        tool_names::SCHEDULE,
         description,
         serde_json::json!({"type":"object","properties": properties,"required":["action"]}),
     )

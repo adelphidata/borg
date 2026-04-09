@@ -107,10 +107,7 @@ async fn poll_loop(
     };
 
     // Track SQLite's data_version — increments on any write from any connection.
-    let mut last_data_version: i64 = db
-        .as_ref()
-        .and_then(|d| d.data_version().ok())
-        .unwrap_or(0);
+    let mut last_data_version: i64 = db.as_ref().and_then(|d| d.data_version().ok()).unwrap_or(0);
 
     let mut interval = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     // Skip the first immediate tick

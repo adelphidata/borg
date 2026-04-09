@@ -39,47 +39,55 @@ pub enum ToolGroup {
 /// `tool_group()` but are not listed as primary tools.
 const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
     // Memory
-    ("write_memory", ToolGroup::Memory, false),
-    ("read_memory", ToolGroup::Memory, false),
-    ("memory_search", ToolGroup::Memory, false),
+    (crate::tool_names::WRITE_MEMORY, ToolGroup::Memory, false),
+    (crate::tool_names::READ_MEMORY, ToolGroup::Memory, false),
+    (crate::tool_names::MEMORY_SEARCH, ToolGroup::Memory, false),
     // Filesystem
-    ("apply_patch", ToolGroup::Fs, false),
-    ("read_file", ToolGroup::Fs, false),
-    ("list_dir", ToolGroup::Fs, false),
-    ("apply_skill_patch", ToolGroup::Fs, true),
-    ("create_channel", ToolGroup::Fs, true),
+    (crate::tool_names::APPLY_PATCH, ToolGroup::Fs, false),
+    (crate::tool_names::READ_FILE, ToolGroup::Fs, false),
+    (crate::tool_names::LIST_DIR, ToolGroup::Fs, false),
+    (crate::tool_names::APPLY_SKILL_PATCH, ToolGroup::Fs, true),
+    (crate::tool_names::CREATE_CHANNEL, ToolGroup::Fs, true),
     // Runtime
-    ("run_shell", ToolGroup::Runtime, false),
+    (crate::tool_names::RUN_SHELL, ToolGroup::Runtime, false),
     // Discovery
-    ("list", ToolGroup::Discovery, false),
-    ("projects", ToolGroup::Discovery, false),
-    ("request_user_input", ToolGroup::Discovery, false),
-    ("list_skills", ToolGroup::Discovery, true),
-    ("list_channels", ToolGroup::Discovery, true),
-    ("list_agents", ToolGroup::Discovery, true),
+    (crate::tool_names::LIST, ToolGroup::Discovery, false),
+    (crate::tool_names::PROJECTS, ToolGroup::Discovery, false),
+    (
+        crate::tool_names::REQUEST_USER_INPUT,
+        ToolGroup::Discovery,
+        false,
+    ),
+    (crate::tool_names::LIST_SKILLS, ToolGroup::Discovery, true),
+    (crate::tool_names::LIST_CHANNELS, ToolGroup::Discovery, true),
+    (crate::tool_names::LIST_AGENTS, ToolGroup::Discovery, true),
     // Web
-    ("web_fetch", ToolGroup::Web, false),
-    ("web_search", ToolGroup::Web, false),
+    (crate::tool_names::WEB_FETCH, ToolGroup::Web, false),
+    (crate::tool_names::WEB_SEARCH, ToolGroup::Web, false),
     // UI
-    ("browser", ToolGroup::Ui, false),
+    (crate::tool_names::BROWSER, ToolGroup::Ui, false),
     // Scheduling
-    ("schedule", ToolGroup::Scheduling, false),
-    ("manage_tasks", ToolGroup::Scheduling, true),
-    ("manage_cron", ToolGroup::Scheduling, true),
+    (crate::tool_names::SCHEDULE, ToolGroup::Scheduling, false),
+    (crate::tool_names::MANAGE_TASKS, ToolGroup::Scheduling, true),
+    (crate::tool_names::MANAGE_CRON, ToolGroup::Scheduling, true),
     // Media
-    ("generate_image", ToolGroup::Media, false),
-    ("text_to_speech", ToolGroup::Media, false),
+    (crate::tool_names::GENERATE_IMAGE, ToolGroup::Media, false),
+    (crate::tool_names::TEXT_TO_SPEECH, ToolGroup::Media, false),
     // Integration
-    ("gmail", ToolGroup::Integration, false),
-    ("google_calendar", ToolGroup::Integration, false),
-    ("notion", ToolGroup::Integration, false),
-    ("linear", ToolGroup::Integration, false),
+    (crate::tool_names::GMAIL, ToolGroup::Integration, false),
+    (
+        crate::tool_names::GOOGLE_CALENDAR,
+        ToolGroup::Integration,
+        false,
+    ),
+    (crate::tool_names::NOTION, ToolGroup::Integration, false),
+    (crate::tool_names::LINEAR, ToolGroup::Integration, false),
     // Agents
-    ("spawn_agent", ToolGroup::Agents, false),
-    ("send_to_agent", ToolGroup::Agents, false),
-    ("wait_for_agent", ToolGroup::Agents, false),
-    ("close_agent", ToolGroup::Agents, false),
-    ("manage_roles", ToolGroup::Agents, false),
+    (crate::tool_names::SPAWN_AGENT, ToolGroup::Agents, false),
+    (crate::tool_names::SEND_TO_AGENT, ToolGroup::Agents, false),
+    (crate::tool_names::WAIT_FOR_AGENT, ToolGroup::Agents, false),
+    (crate::tool_names::CLOSE_AGENT, ToolGroup::Agents, false),
+    (crate::tool_names::MANAGE_ROLES, ToolGroup::Agents, false),
 ];
 
 impl ToolGroup {
@@ -717,5 +725,64 @@ mod tests {
             ToolDefinition::new("gmail", "Gmail", schema.clone()),
             ToolDefinition::new("spawn_agent", "Spawn agent", schema.clone()),
         ]
+    }
+
+    /// Every tool name constant in tool_names must appear in TOOL_REGISTRY.
+    #[test]
+    fn tool_name_constants_match_registry() {
+        use crate::tool_names;
+
+        let registry_names: std::collections::HashSet<&str> =
+            TOOL_REGISTRY.iter().map(|(name, _, _)| *name).collect();
+
+        let constants = [
+            tool_names::WRITE_MEMORY,
+            tool_names::READ_MEMORY,
+            tool_names::MEMORY_SEARCH,
+            tool_names::LIST,
+            tool_names::APPLY_PATCH,
+            tool_names::RUN_SHELL,
+            tool_names::READ_FILE,
+            tool_names::LIST_DIR,
+            tool_names::WEB_FETCH,
+            tool_names::WEB_SEARCH,
+            tool_names::SCHEDULE,
+            tool_names::MANAGE_TASKS,
+            tool_names::MANAGE_CRON,
+            tool_names::BROWSER,
+            tool_names::GENERATE_IMAGE,
+            tool_names::TEXT_TO_SPEECH,
+            tool_names::PROJECTS,
+            tool_names::REQUEST_USER_INPUT,
+            tool_names::APPLY_SKILL_PATCH,
+            tool_names::CREATE_CHANNEL,
+            tool_names::LIST_SKILLS,
+            tool_names::LIST_CHANNELS,
+            tool_names::LIST_AGENTS,
+            tool_names::SPAWN_AGENT,
+            tool_names::SEND_TO_AGENT,
+            tool_names::WAIT_FOR_AGENT,
+            tool_names::CLOSE_AGENT,
+            tool_names::MANAGE_ROLES,
+            tool_names::GMAIL,
+            tool_names::GOOGLE_CALENDAR,
+            tool_names::NOTION,
+            tool_names::LINEAR,
+        ];
+
+        for name in &constants {
+            assert!(
+                registry_names.contains(name),
+                "tool_names constant '{name}' not found in TOOL_REGISTRY"
+            );
+        }
+
+        // Also verify every registry entry has a matching constant
+        for name in &registry_names {
+            assert!(
+                constants.contains(name),
+                "TOOL_REGISTRY entry '{name}' has no matching tool_names constant"
+            );
+        }
     }
 }
