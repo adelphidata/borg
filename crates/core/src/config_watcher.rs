@@ -14,8 +14,7 @@ const POLL_INTERVAL_SECS: u64 = 30;
 /// Watches the settings database for changes and broadcasts validated updates.
 ///
 /// Holds a single persistent `Database` connection instead of re-opening on
-/// every poll, which avoids repeated SQLCipher key negotiation and reduces
-/// contention on the DB file.
+/// every poll, which reduces contention on the DB file.
 pub struct ConfigWatcher {
     rx: watch::Receiver<Config>,
     notify_tx: mpsc::Sender<Config>,
@@ -246,7 +245,7 @@ mod tests {
         use rusqlite::Connection;
 
         let conn = Connection::open_in_memory().unwrap();
-        let db = Database::init_connection_unencrypted(conn, 5000).unwrap();
+        let db = Database::init_connection(conn, 5000).unwrap();
         db.set_setting("temperature", "1.2").unwrap();
         db.set_setting("sandbox.enabled", "false").unwrap();
 
@@ -260,7 +259,7 @@ mod tests {
         use rusqlite::Connection;
 
         let conn = Connection::open_in_memory().unwrap();
-        let db = Database::init_connection_unencrypted(conn, 5000).unwrap();
+        let db = Database::init_connection(conn, 5000).unwrap();
         db.set_setting("temperature", "not_a_number").unwrap();
         db.set_setting("sandbox.enabled", "true").unwrap();
 

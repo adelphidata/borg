@@ -75,7 +75,6 @@ impl Default for SecurityConfig {
                 ".env".into(),
                 "credentials".into(),
                 "private_key".into(),
-                ".db_key".into(),
             ],
             allowed_paths: Vec::new(),
             host_audit: true,
@@ -94,7 +93,7 @@ mod tests {
         let cfg = SecurityConfig::default();
         assert!(cfg.secret_detection);
         assert!(cfg.host_audit);
-        assert_eq!(cfg.blocked_paths.len(), 8);
+        assert_eq!(cfg.blocked_paths.len(), 7);
         assert!(cfg.blocked_paths.contains(&".ssh".to_string()));
         assert!(cfg.blocked_paths.contains(&".aws".to_string()));
         assert!(cfg.blocked_paths.contains(&".gnupg".to_string()));
@@ -102,7 +101,6 @@ mod tests {
         assert!(cfg.blocked_paths.contains(&".env".to_string()));
         assert!(cfg.blocked_paths.contains(&"credentials".to_string()));
         assert!(cfg.blocked_paths.contains(&"private_key".to_string()));
-        assert!(cfg.blocked_paths.contains(&".db_key".to_string()));
         assert!(cfg.allowed_paths.is_empty());
     }
 

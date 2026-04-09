@@ -1,7 +1,6 @@
 use super::*;
 use crate::multi_agent::SubAgentStatus;
 use rusqlite::params;
-use tempfile::tempdir;
 
 fn test_db() -> Database {
     Database::test_db()
@@ -2945,7 +2944,7 @@ fn update_role_preserves_none_fields() {
 fn open_with_custom_timeout() {
     // Verify that a custom busy timeout is accepted
     let conn = Connection::open_in_memory().expect("open in-memory db");
-    let db = Database::init_connection_unencrypted(conn, Database::GATEWAY_BUSY_TIMEOUT_MS)
+    let db = Database::init_connection(conn, Database::GATEWAY_BUSY_TIMEOUT_MS)
         .expect("init with gateway timeout");
     // Verify the timeout was applied by reading it back
     let timeout: i64 = db
@@ -2958,7 +2957,7 @@ fn open_with_custom_timeout() {
 #[test]
 fn default_open_uses_5s_timeout() {
     let conn = Connection::open_in_memory().expect("open in-memory db");
-    let db = Database::init_connection_unencrypted(conn, 5000).expect("init with default timeout");
+    let db = Database::init_connection(conn, 5000).expect("init with default timeout");
     let timeout: i64 = db
         .conn
         .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
@@ -3964,98 +3963,4 @@ fn multiple_pending_celebrations_ordered() {
     let remaining = db.get_pending_celebrations().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].payload_json, r#"{"id":2}"#);
-}
-
-// ── Plaintext-to-encrypted migration tests ──
-
-#[test]
-fn is_plaintext_sqlite_detects_unencrypted() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("plain.db");
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
-    drop(conn);
-    assert!(super::is_plaintext_sqlite(&path));
-}
-
-#[test]
-fn is_plaintext_sqlite_returns_false_for_encrypted() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("encrypted.db");
-    let key = crate::db_key::generate_random_key_for_test();
-    let conn = Connection::open(&path).unwrap();
-    let key_pragma = crate::db_key::format_sqlcipher_key(&key);
-    conn.query_row(&format!("PRAGMA key = \"{key_pragma}\""), [], |_| Ok(()))
-        .unwrap();
-    conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
-    drop(conn);
-    assert!(!super::is_plaintext_sqlite(&path));
-}
-
-#[test]
-fn is_plaintext_sqlite_returns_false_for_nonexistent() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("nonexistent.db");
-    assert!(!super::is_plaintext_sqlite(&path));
-}
-
-#[test]
-fn migrate_plaintext_preserves_data() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let key = crate::db_key::generate_random_key_for_test();
-
-    // Create plaintext DB with data
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-             INSERT INTO users (name) VALUES ('alice');
-             INSERT INTO users (name) VALUES ('bob');",
-        )
-        .unwrap();
-    }
-
-    // Migrate
-    super::migrate_plaintext_to_encrypted(&path, &key).unwrap();
-
-    // No longer plaintext
-    assert!(!super::is_plaintext_sqlite(&path));
-
-    // Backup exists
-    assert!(path.with_extension("db.bak").exists());
-
-    // Data accessible with correct key
-    let conn = Connection::open(&path).unwrap();
-    let key_pragma = crate::db_key::format_sqlcipher_key(&key);
-    conn.query_row(&format!("PRAGMA key = \"{key_pragma}\""), [], |_| Ok(()))
-        .unwrap();
-    let count: i64 = conn
-        .query_row("SELECT count(*) FROM users", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(count, 2);
-    let name: String = conn
-        .query_row("SELECT name FROM users WHERE id = 1", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(name, "alice");
-}
-
-#[test]
-fn migrate_cleans_stale_migrating_file() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("test.db");
-    let migrating_path = path.with_extension("db.migrating");
-
-    // Create plaintext DB + stale .db.migrating
-    {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE t (id INTEGER);").unwrap();
-    }
-    std::fs::write(&migrating_path, b"stale partial").unwrap();
-
-    let key = crate::db_key::generate_random_key_for_test();
-    super::migrate_plaintext_to_encrypted(&path, &key).unwrap();
-
-    assert!(!migrating_path.exists());
-    assert!(!super::is_plaintext_sqlite(&path));
 }
