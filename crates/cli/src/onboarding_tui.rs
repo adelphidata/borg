@@ -865,6 +865,20 @@ impl OnboardingState {
                             self.update_input_mode();
                         }
                     }
+                    KeyCode::Tab if is_shift_tab(&key) => {
+                        // Cancel credential entry and go back to previous tab
+                        self.channel_items[item_idx].selected = false;
+                        self.channel_phase = ChannelPhase::Browsing;
+                        self.update_input_mode();
+                        self.prev_tab();
+                    }
+                    KeyCode::Left => {
+                        // Cancel credential entry and go back to previous tab
+                        self.channel_items[item_idx].selected = false;
+                        self.channel_phase = ChannelPhase::Browsing;
+                        self.update_input_mode();
+                        self.prev_tab();
+                    }
                     KeyCode::Backspace => {
                         if let ChannelPhase::CredentialInput { ref mut buffer, .. } =
                             self.channel_phase
