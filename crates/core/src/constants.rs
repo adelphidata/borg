@@ -203,6 +203,14 @@ pub const MAX_EMBEDDING_INPUT_CHARS: usize = 32_000;
 /// Max characters per message when building session transcripts.
 pub const MAX_SESSION_MESSAGE_CHARS: usize = 2000;
 
+// ── Agent reply tokens ────────────────────────────────────────────
+
+/// Token the agent emits when it has nothing to say (heartbeat acks, silent replies).
+pub const SILENT_REPLY_TOKEN: &str = "<SILENT>";
+
+/// Token the agent emits to acknowledge a heartbeat poll with nothing to report.
+pub const HEARTBEAT_OK_TOKEN: &str = "HEARTBEAT_OK";
+
 // ── TUI ───────────────────────────────────────────────────────────
 
 /// Lines scrolled per PageUp/PageDown press.

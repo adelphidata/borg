@@ -579,7 +579,7 @@ impl Agent {
         (self.history.len(), history_tokens(&self.history))
     }
 
-    /// Build the `<environment>` section with time, CWD, git context, and OS info.
+    /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
     async fn build_environment_section(&self) -> String {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let mut s = String::new();
@@ -595,13 +595,192 @@ impl Agent {
                 s.push_str(&formatted);
             }
         }
-        s.push_str(&format!(
-            "OS: {} {}\n",
+        // Runtime info line (model, provider, thinking, OS)
+        let mut runtime_parts: Vec<String> = Vec::new();
+        runtime_parts.push(format!(
+            "os={} ({})",
             std::env::consts::OS,
             std::env::consts::ARCH
         ));
+        if let Some(ref provider) = self.config.llm.provider {
+            runtime_parts.push(format!("provider={provider}"));
+        }
+        if !self.config.llm.model.is_empty() {
+            runtime_parts.push(format!("model={}", self.config.llm.model));
+        }
+        let thinking = if self.config.llm.thinking.is_enabled() {
+            match self.config.llm.thinking {
+                crate::config::ThinkingLevel::Low => "low",
+                crate::config::ThinkingLevel::Medium => "medium",
+                crate::config::ThinkingLevel::High => "high",
+                crate::config::ThinkingLevel::Xhigh => "xhigh",
+                crate::config::ThinkingLevel::Off => "off",
+            }
+        } else {
+            "off"
+        };
+        runtime_parts.push(format!("thinking={thinking}"));
+        if let Some(ref tz) = self.config.user.timezone {
+            runtime_parts.push(format!("timezone={tz}"));
+        }
+        s.push_str(&format!("Runtime: {}\n", runtime_parts.join(" | ")));
         s.push_str("</environment>\n");
         s
+    }
+
+    /// Build the `<tooling>` section listing available tools with summaries.
+    fn build_tooling_section(&self) -> String {
+        let tool_summaries: &[(&str, &str)] = &[
+            ("write_memory", "Write/append to memory files"),
+            ("read_memory", "Read a memory file"),
+            (
+                "memory_search",
+                "Semantic search across memory and sessions",
+            ),
+            ("list", "List resources (skills, channels, agents)"),
+            ("apply_patch", "Create/update/delete files via patch DSL"),
+            (
+                "run_shell",
+                "Execute shell commands (full system access, not sandboxed)",
+            ),
+            (
+                "read_file",
+                "Read file contents with line numbers, images, PDFs",
+            ),
+            ("list_dir", "List directory contents"),
+            ("web_fetch", "Fetch URL content"),
+            ("web_search", "Search the web"),
+            ("browser", "Control headless Chrome browser"),
+            (
+                "schedule",
+                "Manage scheduled jobs: prompt tasks, cron commands, workflows",
+            ),
+            (
+                "projects",
+                "Manage projects (create/list/get/update/archive/delete)",
+            ),
+            (
+                "request_user_input",
+                "Ask user for clarification when blocked",
+            ),
+            ("generate_image", "Generate images from text descriptions"),
+            ("text_to_speech", "Convert text to speech audio"),
+            ("spawn_agent", "Spawn an isolated sub-agent"),
+            ("send_to_agent", "Send message to a running sub-agent"),
+            ("wait_for_agent", "Wait for a sub-agent to complete"),
+            ("close_agent", "Close a running sub-agent"),
+        ];
+
+        // Build the full tool list including multi-agent tools when available
+        let mut defs = crate::tool_definitions::core_tool_definitions(&self.config);
+        if self.agent_control.is_some() {
+            defs.extend(crate::multi_agent::tools::tool_definitions(
+                self.spawn_depth,
+                self.config.agents.max_spawn_depth,
+            ));
+        }
+        let available: std::collections::HashSet<&str> =
+            defs.iter().map(|d| d.function.name.as_str()).collect();
+
+        let mut lines = vec![
+            "## Tooling".to_string(),
+            "Available tools (filtered by config):".to_string(),
+        ];
+        for &(name, summary) in tool_summaries {
+            if available.contains(name) {
+                lines.push(format!("- {name}: {summary}"));
+            }
+        }
+        // Include any tools not in the static list (e.g. integration tools)
+        for def in &defs {
+            let name = def.function.name.as_str();
+            if !tool_summaries.iter().any(|&(n, _)| n == name) {
+                let desc = def.function.description.split('.').next().unwrap_or("");
+                lines.push(format!("- {name}: {desc}"));
+            }
+        }
+        lines.push(String::new());
+        format!("\n<tooling>\n{}\n</tooling>\n", lines.join("\n"))
+    }
+
+    /// Build the tool call style guidance section.
+    fn build_tool_call_style_section() -> &'static str {
+        "\n<tool_call_style>\n\
+        Default: do not narrate routine, low-risk tool calls (just call the tool).\n\
+        Narrate only when it helps: multi-step work, complex problems, sensitive actions (e.g. deletions), or when the user explicitly asks.\n\
+        Keep narration brief and value-dense; avoid repeating obvious steps.\n\
+        When a first-class tool exists for an action, use it directly instead of asking the user to run CLI commands.\n\
+        Use apply_patch (not run_shell) to create or modify files. Use list_dir and read_file to understand code before editing.\n\
+        </tool_call_style>\n"
+    }
+
+    /// Build the silent reply protocol section.
+    fn build_silent_reply_section() -> String {
+        let token = constants::SILENT_REPLY_TOKEN;
+        format!(
+            "\n<silent_replies>\n\
+            When you have nothing to say, respond with ONLY: {token}\n\
+            Rules:\n\
+            - It must be your ENTIRE message — nothing else\n\
+            - Never append it to an actual response\n\
+            - Never wrap it in markdown or code blocks\n\
+            </silent_replies>\n"
+        )
+    }
+
+    /// Build the heartbeat ack protocol section.
+    fn build_heartbeat_section(&self) -> String {
+        let ok_token = constants::HEARTBEAT_OK_TOKEN;
+        let interval = &self.config.heartbeat.interval;
+        format!(
+            "\n<heartbeat_protocol>\n\
+            Heartbeat interval: {interval}. \
+            If you receive a heartbeat poll (*heartbeat tick*) and there is nothing that needs attention, reply exactly:\n\
+            {ok_token}\n\
+            If something needs attention, do NOT include \"{ok_token}\"; reply with the alert text instead.\n\
+            </heartbeat_protocol>\n"
+        )
+    }
+
+    /// Build the reply tags section for message threading.
+    fn build_reply_tags_section() -> &'static str {
+        "\n<reply_tags>\n\
+        To request a native reply/quote on supported messaging channels, include one tag in your reply:\n\
+        - [[reply_to_current]] replies to the triggering message. Must be the very first token (no leading text/newlines).\n\
+        - Prefer [[reply_to_current]]. Use [[reply_to:<id>]] only when an id was explicitly provided.\n\
+        Tags are stripped before sending; support depends on the channel.\n\
+        </reply_tags>\n"
+    }
+
+    /// Build the messaging/channel routing guidance section.
+    fn build_messaging_section(&self) -> String {
+        const CHANNELS: &str =
+            "Telegram, Slack, Discord, Teams, Google Chat, Signal, Twilio, iMessage";
+        format!(
+            "\n<messaging>\n\
+            - Reply in current session automatically routes to the source channel ({CHANNELS}).\n\
+            - Native integrations are compiled in; do not use run_shell/curl for messaging.\n\
+            - Gateway bindings provide per-channel/sender LLM routing overrides.\n\
+            - Thread-scoped history: each sender+thread gets its own session.\n\
+            </messaging>\n"
+        )
+    }
+
+    /// Build the reasoning format section (conditional on thinking level).
+    fn build_reasoning_section(&self) -> String {
+        let level = match self.config.llm.thinking {
+            crate::config::ThinkingLevel::Off => return String::new(),
+            crate::config::ThinkingLevel::Low => "low",
+            crate::config::ThinkingLevel::Medium => "medium",
+            crate::config::ThinkingLevel::High => "high",
+            crate::config::ThinkingLevel::Xhigh => "xhigh",
+        };
+        format!(
+            "\n<reasoning_format>\n\
+            Extended thinking is enabled (level: {level}). \
+            Internal reasoning is handled natively by the provider and hidden from the user.\n\
+            </reasoning_format>\n"
+        )
     }
 
     /// Build the `<collaboration_mode>` section from the current config.
@@ -647,15 +826,16 @@ impl Agent {
         system.push_str(&identity);
         system.push_str("\n</system_instructions>\n\n");
 
-        if !memory.is_empty() {
-            system.push_str(
-                &MEMORY_TEMPLATE
-                    .render([("memory", memory.as_str())])
-                    .context("memory template render failed")?,
-            );
-        }
+        // Tooling: list available tools with summaries
+        system.push_str(&self.build_tooling_section());
 
-        system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
+        // Tool call style guidance
+        system.push_str(Self::build_tool_call_style_section());
+
+        // Safety / security policy
+        system.push_str(&format!(
+            "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
+        ));
 
         if self.config.skills.enabled {
             let skills = match &self.cached_skills_context {
@@ -678,6 +858,31 @@ impl Agent {
             }
         }
 
+        if !memory.is_empty() {
+            system.push_str(
+                &MEMORY_TEMPLATE
+                    .render([("memory", memory.as_str())])
+                    .context("memory template render failed")?,
+            );
+        }
+
+        system.push_str("\n<memory_recall>\nWhen answering questions about prior work, past decisions, dates, people, preferences, todos, or anything previously discussed, use the memory_search tool to look up relevant context. Auto-loaded memory above may not contain all relevant information.\n</memory_recall>\n");
+
+        // Reply tags for message threading (channels)
+        system.push_str(Self::build_reply_tags_section());
+
+        // Messaging / channel routing guidance
+        system.push_str(&self.build_messaging_section());
+
+        // Silent reply protocol
+        system.push_str(&Self::build_silent_reply_section());
+
+        // Heartbeat ack protocol
+        system.push_str(&self.build_heartbeat_section());
+
+        // Reasoning format (conditional on thinking level)
+        system.push_str(&self.build_reasoning_section());
+
         // Project documentation (AGENTS.md / CLAUDE.md)
         let project_docs = match &self.cached_project_docs {
             Some(cached) => cached.clone(),
@@ -693,35 +898,7 @@ impl Agent {
             ));
         }
 
-        // Coding instructions: only include when filesystem/runtime tools are in the active profile.
-        // For messaging-only or minimal profiles, these are wasted tokens.
-        {
-            let profile =
-                crate::tool_catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
-                    .unwrap_or_default();
-            let groups = profile.groups();
-            if groups.contains(&crate::tool_catalog::ToolGroup::Fs)
-                || groups.contains(&crate::tool_catalog::ToolGroup::Runtime)
-            {
-                system.push_str("\n<coding_instructions>\n\
-                    - Use list_dir to explore project structure before making changes.\n\
-                    - Use read_file to understand code before editing. Always read what you plan to change.\n\
-                    - Use apply_patch to make file changes. Never use run_shell to write files.\n\
-                    - After making changes, verify correctness by reading the modified file or running tests.\n\
-                    - If in a git repo, prefer small, atomic changes. Do not commit unless asked.\n\
-                    - When you encounter errors, read the relevant code and error context before attempting fixes.\n\
-                    </coding_instructions>\n");
-            }
-        }
-
-        system.push_str(&format!(
-            "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
-        ));
-
         // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
-        // Collaboration mode is stable per-session but cheap; environment
-        // (time, git status) changes every turn — keep them last so they do
-        // not invalidate the cached prefix above.
         system.push_str(&self.build_collaboration_section());
         system.push_str(&self.build_workflow_guidance_section());
         system.push_str(&self.build_environment_section().await);
@@ -2046,17 +2223,17 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_environment_is_after_coding_instructions() {
+    fn build_system_prompt_environment_is_after_tooling() {
         let body = extract_build_system_prompt_body();
-        let coding_idx = body
-            .find("coding_instructions")
-            .expect("coding_instructions section must exist");
+        let tooling_idx = body
+            .find("build_tooling_section")
+            .expect("build_tooling_section call must exist");
         let env_idx = body
             .find("build_environment_section")
             .expect("build_environment_section call must exist");
         assert!(
-            env_idx > coding_idx,
-            "dynamic environment section must come after coding_instructions",
+            env_idx > tooling_idx,
+            "dynamic environment section must come after tooling",
         );
     }
 
@@ -2398,6 +2575,117 @@ mod tests {
             template.contains("Never end a turn silently"),
             "Execute collaboration mode must instruct agent to never end silently"
         );
+    }
+
+    // -- new system prompt section tests --
+
+    #[test]
+    fn build_system_prompt_has_tooling_section() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_tooling_section"),
+            "system prompt must include tooling section"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_tool_call_style() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_tool_call_style_section"),
+            "system prompt must include tool call style guidance"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_silent_reply() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_silent_reply_section"),
+            "system prompt must include silent reply protocol"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_heartbeat_protocol() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_heartbeat_section"),
+            "system prompt must include heartbeat ack protocol"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_reply_tags() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_reply_tags_section"),
+            "system prompt must include reply tags section"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_messaging() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_messaging_section"),
+            "system prompt must include messaging/channel routing"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_has_reasoning() {
+        let body = extract_build_system_prompt_body();
+        assert!(
+            body.contains("build_reasoning_section"),
+            "system prompt must include reasoning format section"
+        );
+    }
+
+    #[test]
+    fn tool_call_style_section_contains_guidance() {
+        let section = Agent::build_tool_call_style_section();
+        assert!(section.contains("do not narrate"));
+        assert!(section.contains("tool_call_style"));
+    }
+
+    #[test]
+    fn silent_reply_section_contains_token() {
+        let section = Agent::build_silent_reply_section();
+        assert!(section.contains(constants::SILENT_REPLY_TOKEN));
+        assert!(section.contains("silent_replies"));
+    }
+
+    #[test]
+    fn reply_tags_section_contains_tag() {
+        let section = Agent::build_reply_tags_section();
+        assert!(section.contains("[[reply_to_current]]"));
+        assert!(section.contains("reply_tags"));
+    }
+
+    #[test]
+    fn silent_reply_token_is_not_empty() {
+        assert!(!constants::SILENT_REPLY_TOKEN.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_ok_token_is_not_empty() {
+        assert!(!constants::HEARTBEAT_OK_TOKEN.is_empty());
+    }
+
+    #[test]
+    fn build_system_prompt_section_ordering() {
+        // Verify: tooling -> security -> memory -> silent -> heartbeat -> environment
+        let body = extract_build_system_prompt_body();
+        let tooling = body.find("build_tooling_section").unwrap();
+        let security = body.find("security_policy").unwrap();
+        let silent = body.find("build_silent_reply_section").unwrap();
+        let heartbeat = body.find("build_heartbeat_section").unwrap();
+        let env = body.find("build_environment_section").unwrap();
+        assert!(tooling < security, "tooling before security");
+        assert!(security < silent, "security before silent reply");
+        assert!(silent < heartbeat, "silent reply before heartbeat");
+        assert!(heartbeat < env, "heartbeat before environment");
     }
 }
 

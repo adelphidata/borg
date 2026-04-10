@@ -528,7 +528,6 @@ mod tests {
         assert!(identity.contains("You are Buddy"));
         assert!(identity.contains("Mike"));
         assert!(identity.contains("## Personality"));
-        assert!(identity.contains("## Capabilities"));
         assert!(identity.contains("## Communication Style"));
         assert!(identity.contains("## What Matters"));
     }
@@ -538,9 +537,8 @@ mod tests {
         let identity = generate_identity("Nova", "Alice");
         // Should have placeholder comments for the agent to fill in
         assert!(identity.contains("<!--"));
-        // Should keep factual capabilities
-        assert!(identity.contains("Memory across sessions"));
-        assert!(identity.contains("Tool creation"));
+        // Should NOT have capabilities (handled by system prompt tooling section)
+        assert!(!identity.contains("## Capabilities"));
     }
 
     #[test]
@@ -629,12 +627,11 @@ mod tests {
     }
 
     #[test]
-    fn generate_identity_has_capability_list() {
+    fn generate_identity_has_no_capabilities_section() {
         let identity = generate_identity("Nova", "Alice");
-        assert!(identity.contains("Memory across sessions"));
-        assert!(identity.contains("Tool creation"));
-        assert!(identity.contains("heartbeat"));
-        assert!(identity.contains("Channel integrations"));
+        // Capabilities are handled by the system prompt tooling section, not identity
+        assert!(!identity.contains("## Capabilities"));
+        assert!(!identity.contains("Memory across sessions"));
     }
 
     #[test]

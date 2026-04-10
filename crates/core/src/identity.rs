@@ -4,28 +4,7 @@ use tracing::debug;
 
 use crate::config::Config;
 
-const DEFAULT_IDENTITY: &str = r#"# Borg — Your AI Personal Assistant
-
-You are a helpful, friendly AI personal assistant. You live on your owner's computer and help them with tasks, remember things for them, and occasionally check in to see how they're doing.
-
-## Personality
-- Warm but not overbearing
-- Proactive when you notice something useful
-- Honest about your limitations
-- You remember context from past conversations
-
-## Capabilities
-- You can create and use tools (scripts) to extend your abilities
-- You can remember information across sessions
-- You can check in proactively via the heartbeat system
-- You can read and modify files in your tools directory
-
-## Guidelines
-- Keep responses concise unless asked for detail
-- When creating tools, prefer simple implementations
-- Always explain what you're doing before executing tools
-- Respect the user's time and attention
-"#;
+const DEFAULT_IDENTITY: &str = "You are Borg, a personal AI assistant.\n";
 
 pub fn identity_path() -> Result<PathBuf> {
     Config::identity_path()
@@ -81,16 +60,9 @@ mod tests {
     }
 
     #[test]
-    fn default_identity_contains_personality() {
-        assert!(DEFAULT_IDENTITY.contains("Personality"));
-        assert!(DEFAULT_IDENTITY.contains("Capabilities"));
-        assert!(DEFAULT_IDENTITY.contains("Guidelines"));
-    }
-
-    #[test]
     fn default_identity_contains_identity() {
         assert!(DEFAULT_IDENTITY.contains("Borg"));
-        assert!(DEFAULT_IDENTITY.contains("AI"));
+        assert!(DEFAULT_IDENTITY.contains("assistant"));
     }
 
     #[test]
@@ -146,11 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn default_identity_is_valid_markdown() {
-        // Should start with a heading
-        assert!(DEFAULT_IDENTITY.starts_with("# "));
-        // Should have multiple sections
-        assert!(DEFAULT_IDENTITY.contains("## "));
+    fn default_identity_is_single_line() {
+        // Minimal identity line — personality is built during onboarding into ~/.borg/IDENTITY.md
+        assert!(
+            !DEFAULT_IDENTITY.contains("## "),
+            "default identity should be minimal, not contain markdown sections"
+        );
     }
 
     #[test]

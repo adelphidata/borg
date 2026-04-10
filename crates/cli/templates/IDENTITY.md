@@ -10,10 +10,3 @@ You are {agent_name}, an AI personal assistant belonging to {owner_name}.
 
 ## What Matters
 <!-- What does {owner_name} need? What are you good at? Fill this in as you learn. -->
-
-## Capabilities
-- Memory across sessions
-- Tool creation and execution
-- Proactive check-ins via heartbeat
-- File and project operations
-- Channel integrations (Telegram, Slack, Discord, etc.)
