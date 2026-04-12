@@ -236,3 +236,255 @@ impl Database {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::test_db()
+    }
+
+    #[test]
+    fn test_upsert_and_list_sessions() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 200, 500, "gpt-4", "Session One")
+            .unwrap();
+        db.upsert_session("s2", 150, 300, 1000, "claude", "Session Two")
+            .unwrap();
+
+        let sessions = db.list_sessions(10).unwrap();
+        assert!(sessions.len() >= 2);
+        // Most recent updated_at first
+        let s2_idx = sessions.iter().position(|s| s.id == "s2").unwrap();
+        let s1_idx = sessions.iter().position(|s| s.id == "s1").unwrap();
+        assert!(
+            s2_idx < s1_idx,
+            "s2 (updated_at=300) should come before s1 (updated_at=200)"
+        );
+    }
+
+    #[test]
+    fn test_upsert_session_updates_existing() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 200, 500, "gpt-4", "Original")
+            .unwrap();
+        db.upsert_session("s1", 100, 300, 1000, "claude", "Updated")
+            .unwrap();
+
+        let sessions = db.list_sessions(100).unwrap();
+        let s1 = sessions.iter().find(|s| s.id == "s1").unwrap();
+        assert_eq!(s1.title, "Updated");
+        assert_eq!(s1.total_tokens, 1000);
+        assert_eq!(s1.model, "claude");
+        // Should not have duplicates
+        assert_eq!(sessions.iter().filter(|s| s.id == "s1").count(), 1);
+    }
+
+    #[test]
+    fn test_list_sessions_respects_limit() {
+        let db = test_db();
+        for i in 0..5 {
+            db.upsert_session(
+                &format!("s{i}"),
+                100 + i,
+                200 + i,
+                0,
+                "model",
+                &format!("Session {i}"),
+            )
+            .unwrap();
+        }
+        let sessions = db.list_sessions(2).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_sessions_since() {
+        let db = test_db();
+        db.upsert_session("s1", 50, 100, 0, "m", "old").unwrap();
+        db.upsert_session("s2", 50, 200, 0, "m", "mid").unwrap();
+        db.upsert_session("s3", 50, 300, 0, "m", "new").unwrap();
+
+        let recent = db.sessions_since(150).unwrap();
+        let ids: Vec<&str> = recent.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"s2"));
+        assert!(ids.contains(&"s3"));
+        assert!(!ids.contains(&"s1"));
+    }
+
+    #[test]
+    fn test_insert_and_load_messages() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+
+        db.insert_message("s1", "user", Some("hello"), None, None, None, None)
+            .unwrap();
+        db.insert_message(
+            "s1",
+            "assistant",
+            Some("hi there"),
+            Some(r#"[{"id":"tc1"}]"#),
+            None,
+            Some("2024-01-01T00:00:00Z"),
+            None,
+        )
+        .unwrap();
+        db.insert_message("s1", "tool", Some("result"), None, Some("tc1"), None, None)
+            .unwrap();
+
+        let msgs = db.load_session_messages("s1").unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[0].content.as_deref(), Some("hello"));
+        assert_eq!(msgs[1].role, "assistant");
+        assert_eq!(
+            msgs[1].tool_calls_json.as_deref(),
+            Some(r#"[{"id":"tc1"}]"#)
+        );
+        assert_eq!(msgs[1].timestamp.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(msgs[2].role, "tool");
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("tc1"));
+        // Verify ASC order by id
+        assert!(msgs[0].id < msgs[1].id);
+        assert!(msgs[1].id < msgs[2].id);
+    }
+
+    #[test]
+    fn test_delete_session_messages() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+        db.insert_message("s1", "user", Some("a"), None, None, None, None)
+            .unwrap();
+        db.insert_message("s1", "assistant", Some("b"), None, None, None, None)
+            .unwrap();
+
+        let deleted = db.delete_session_messages("s1").unwrap();
+        assert_eq!(deleted, 2);
+
+        let msgs = db.load_session_messages("s1").unwrap();
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_channel_session_creates_new() {
+        let db = test_db();
+        let sid1 = db.resolve_channel_session("telegram", "user1").unwrap();
+        let sid2 = db.resolve_channel_session("telegram", "user1").unwrap();
+        assert_eq!(sid1, sid2, "same channel+sender should return same session");
+    }
+
+    #[test]
+    fn test_resolve_channel_session_different_senders() {
+        let db = test_db();
+        let sid1 = db.resolve_channel_session("telegram", "user1").unwrap();
+        let sid2 = db.resolve_channel_session("telegram", "user2").unwrap();
+        assert_ne!(
+            sid1, sid2,
+            "different senders should get different sessions"
+        );
+    }
+
+    #[test]
+    fn test_compact_session_messages() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+        for i in 0..10 {
+            db.insert_message(
+                "s1",
+                "user",
+                Some(&format!("msg{i}")),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let deleted = db.compact_session_messages("s1", 3).unwrap();
+        assert_eq!(deleted, 7);
+
+        let remaining = db.load_session_messages("s1").unwrap();
+        assert_eq!(remaining.len(), 3);
+        // The newest 3 should remain
+        assert_eq!(remaining[0].content.as_deref(), Some("msg7"));
+        assert_eq!(remaining[1].content.as_deref(), Some("msg8"));
+        assert_eq!(remaining[2].content.as_deref(), Some("msg9"));
+    }
+
+    #[test]
+    fn test_delete_last_assistant_turn() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+        // user -> assistant -> tool -> user -> assistant -> tool
+        db.insert_message("s1", "user", Some("q1"), None, None, None, None)
+            .unwrap();
+        db.insert_message("s1", "assistant", Some("a1"), None, None, None, None)
+            .unwrap();
+        db.insert_message("s1", "tool", Some("t1"), None, Some("tc1"), None, None)
+            .unwrap();
+        db.insert_message("s1", "user", Some("q2"), None, None, None, None)
+            .unwrap();
+        db.insert_message("s1", "assistant", Some("a2"), None, None, None, None)
+            .unwrap();
+        db.insert_message("s1", "tool", Some("t2"), None, Some("tc2"), None, None)
+            .unwrap();
+
+        let deleted = db.delete_last_assistant_turn("s1").unwrap();
+        assert_eq!(deleted, 2); // assistant + tool
+
+        let msgs = db.load_session_messages("s1").unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3].role, "user");
+        assert_eq!(msgs[3].content.as_deref(), Some("q2"));
+    }
+
+    #[test]
+    fn test_delete_last_assistant_turn_only_user_messages() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+        db.insert_message("s1", "user", Some("q1"), None, None, None, None)
+            .unwrap();
+
+        let deleted = db.delete_last_assistant_turn("s1").unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_log_channel_message() {
+        let db = test_db();
+        let rowid = db
+            .log_channel_message("telegram", "user1", "inbound", Some("hello"), None, None)
+            .unwrap();
+        assert!(rowid > 0);
+    }
+
+    #[test]
+    fn test_update_channel_session_id() {
+        let db = test_db();
+        let _sid = db.resolve_channel_session("telegram", "user1").unwrap();
+
+        let updated = db
+            .update_channel_session_id("telegram", "user1", "new-session-id")
+            .unwrap();
+        assert!(updated);
+
+        // Non-existent returns false
+        let not_found = db
+            .update_channel_session_id("telegram", "nobody", "x")
+            .unwrap();
+        assert!(!not_found);
+    }
+
+    #[test]
+    fn test_count_session_messages() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+        for _ in 0..5 {
+            db.insert_message("s1", "user", Some("msg"), None, None, None, None)
+                .unwrap();
+        }
+        assert_eq!(db.count_session_messages("s1").unwrap(), 5);
+    }
+}

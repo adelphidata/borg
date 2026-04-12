@@ -340,3 +340,362 @@ impl Database {
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::test_db()
+    }
+
+    // ── Embedding Cache ──
+
+    #[test]
+    fn test_cache_and_get_embedding() {
+        let db = test_db();
+        let data = vec![1u8, 2, 3, 4];
+        db.cache_embedding("openai", "text-embedding-3", "hash1", &data, 4)
+            .unwrap();
+
+        let result = db
+            .get_cached_embedding("openai", "text-embedding-3", "hash1")
+            .unwrap();
+        assert!(result.is_some());
+        let (bytes, dim) = result.unwrap();
+        assert_eq!(bytes, data);
+        assert_eq!(dim, 4);
+    }
+
+    #[test]
+    fn test_get_cached_embedding_miss() {
+        let db = test_db();
+        let result = db
+            .get_cached_embedding("openai", "model", "nonexistent")
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_clear_embedding_cache() {
+        let db = test_db();
+        db.cache_embedding("p", "m", "h1", &[1], 1).unwrap();
+        db.cache_embedding("p", "m", "h2", &[2], 1).unwrap();
+
+        let cleared = db.clear_embedding_cache().unwrap();
+        assert_eq!(cleared, 2);
+
+        assert!(db.get_cached_embedding("p", "m", "h1").unwrap().is_none());
+    }
+
+    // ── Session Index Status ──
+
+    #[test]
+    fn test_mark_and_check_session_indexed() {
+        let db = test_db();
+        assert!(!db.is_session_indexed("s1").unwrap());
+
+        db.mark_session_indexed("s1", 42).unwrap();
+        assert!(db.is_session_indexed("s1").unwrap());
+    }
+
+    #[test]
+    fn test_get_unindexed_sessions() {
+        let db = test_db();
+        db.upsert_session("s1", 100, 100, 0, "m", "one").unwrap();
+        db.upsert_session("s2", 100, 200, 0, "m", "two").unwrap();
+        db.upsert_session("s3", 100, 300, 0, "m", "three").unwrap();
+
+        db.mark_session_indexed("s1", 10).unwrap();
+
+        let unindexed = db.get_unindexed_sessions(10).unwrap();
+        assert!(unindexed.contains(&"s2".to_string()));
+        assert!(unindexed.contains(&"s3".to_string()));
+        assert!(!unindexed.contains(&"s1".to_string()));
+    }
+
+    // ── Memory Embeddings ──
+
+    #[test]
+    fn test_upsert_and_get_embedding() {
+        let db = test_db();
+        let data = vec![10u8, 20, 30];
+        db.upsert_embedding("global", "notes.md", "hash1", &data, 3, "text-embedding-3")
+            .unwrap();
+
+        let row = db.get_embedding("global", "notes.md").unwrap().unwrap();
+        assert_eq!(row.scope, "global");
+        assert_eq!(row.filename, "notes.md");
+        assert_eq!(row.content_hash, "hash1");
+        assert_eq!(row.embedding, data);
+        assert_eq!(row.dimension, 3);
+        assert_eq!(row.model, "text-embedding-3");
+    }
+
+    #[test]
+    fn test_upsert_embedding_updates() {
+        let db = test_db();
+        db.upsert_embedding("global", "file.md", "old_hash", &[1], 1, "v1")
+            .unwrap();
+        db.upsert_embedding("global", "file.md", "new_hash", &[2, 3], 2, "v2")
+            .unwrap();
+
+        let row = db.get_embedding("global", "file.md").unwrap().unwrap();
+        assert_eq!(row.content_hash, "new_hash");
+        assert_eq!(row.embedding, vec![2, 3]);
+        assert_eq!(row.dimension, 2);
+        assert_eq!(row.model, "v2");
+
+        assert_eq!(db.count_embeddings("global").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_all_and_count_embeddings() {
+        let db = test_db();
+        for i in 0..3 {
+            db.upsert_embedding(
+                "scope1",
+                &format!("f{i}.md"),
+                &format!("h{i}"),
+                &[i as u8],
+                1,
+                "m",
+            )
+            .unwrap();
+        }
+
+        let all = db.get_all_embeddings("scope1").unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(db.count_embeddings("scope1").unwrap(), 3);
+
+        // Different scope should be empty
+        assert_eq!(db.count_embeddings("other").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_embedding() {
+        let db = test_db();
+        db.upsert_embedding("global", "file.md", "h", &[1], 1, "m")
+            .unwrap();
+
+        let deleted = db.delete_embedding("global", "file.md").unwrap();
+        assert!(deleted);
+        assert!(db.get_embedding("global", "file.md").unwrap().is_none());
+
+        let deleted_again = db.delete_embedding("global", "file.md").unwrap();
+        assert!(!deleted_again);
+    }
+
+    // ── Chunks ──
+
+    #[test]
+    fn test_upsert_and_get_chunks_for_file() {
+        let db = test_db();
+        let chunks = vec![
+            ChunkData {
+                chunk_index: 0,
+                start_line: Some(1),
+                end_line: Some(10),
+                content: "first chunk".into(),
+                content_hash: "h0".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 1,
+                start_line: Some(11),
+                end_line: Some(20),
+                content: "second chunk".into(),
+                content_hash: "h1".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 2,
+                start_line: Some(21),
+                end_line: Some(30),
+                content: "third chunk".into(),
+                content_hash: "h2".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+        ];
+        db.upsert_chunks("global", "file.md", &chunks).unwrap();
+
+        let rows = db.get_chunks_for_file("global", "file.md").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].chunk_index, 0);
+        assert_eq!(rows[0].content, "first chunk");
+        assert_eq!(rows[1].chunk_index, 1);
+        assert_eq!(rows[2].chunk_index, 2);
+    }
+
+    #[test]
+    fn test_upsert_chunks_replaces_old() {
+        let db = test_db();
+        let old_chunks = vec![
+            ChunkData {
+                chunk_index: 0,
+                start_line: None,
+                end_line: None,
+                content: "old1".into(),
+                content_hash: "h0".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 1,
+                start_line: None,
+                end_line: None,
+                content: "old2".into(),
+                content_hash: "h1".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 2,
+                start_line: None,
+                end_line: None,
+                content: "old3".into(),
+                content_hash: "h2".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+        ];
+        db.upsert_chunks("global", "file.md", &old_chunks).unwrap();
+
+        let new_chunks = vec![ChunkData {
+            chunk_index: 0,
+            start_line: None,
+            end_line: None,
+            content: "replaced".into(),
+            content_hash: "new_h".into(),
+            embedding: None,
+            dimension: None,
+            model: None,
+        }];
+        db.upsert_chunks("global", "file.md", &new_chunks).unwrap();
+
+        let rows = db.get_chunks_for_file("global", "file.md").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "replaced");
+    }
+
+    #[test]
+    fn test_get_all_chunks_with_limit() {
+        let db = test_db();
+        for file_idx in 0..2 {
+            let chunks = vec![ChunkData {
+                chunk_index: 0,
+                start_line: None,
+                end_line: None,
+                content: format!("content for file {file_idx}"),
+                content_hash: format!("h{file_idx}"),
+                embedding: None,
+                dimension: None,
+                model: None,
+            }];
+            db.upsert_chunks("scope", &format!("f{file_idx}.md"), &chunks)
+                .unwrap();
+        }
+
+        let all = db.get_all_chunks("scope", None).unwrap();
+        assert_eq!(all.len(), 2);
+
+        let limited = db.get_all_chunks("scope", Some(1)).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_chunks_for_file() {
+        let db = test_db();
+        let chunks = vec![ChunkData {
+            chunk_index: 0,
+            start_line: None,
+            end_line: None,
+            content: "data".into(),
+            content_hash: "h".into(),
+            embedding: None,
+            dimension: None,
+            model: None,
+        }];
+        db.upsert_chunks("global", "file.md", &chunks).unwrap();
+
+        let deleted = db.delete_chunks_for_file("global", "file.md").unwrap();
+        assert!(deleted);
+
+        let rows = db.get_chunks_for_file("global", "file.md").unwrap();
+        assert!(rows.is_empty());
+
+        let deleted_again = db.delete_chunks_for_file("global", "file.md").unwrap();
+        assert!(!deleted_again);
+    }
+
+    // ── FTS ──
+
+    #[test]
+    fn test_fts_search_finds_matching_content() {
+        let db = test_db();
+        let chunks = vec![
+            ChunkData {
+                chunk_index: 0,
+                start_line: None,
+                end_line: None,
+                content: "The quick brown fox jumps over the lazy dog".into(),
+                content_hash: "h0".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 1,
+                start_line: None,
+                end_line: None,
+                content: "Rust programming language is fast and safe".into(),
+                content_hash: "h1".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+        ];
+        db.upsert_chunks("global", "notes.md", &chunks).unwrap();
+
+        let results = db.fts_search("global", "fox", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0.content.contains("fox"));
+
+        let results = db.fts_search("global", "Rust programming", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0.content.contains("Rust"));
+    }
+
+    #[test]
+    fn test_fts_search_empty_query() {
+        let db = test_db();
+        let results = db.fts_search("global", "", 10).unwrap();
+        assert!(results.is_empty());
+
+        let results = db.fts_search("global", "   ", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_sanitize_fts_query() {
+        assert_eq!(
+            Database::sanitize_fts_query("hello world"),
+            "\"hello\" \"world\""
+        );
+        assert_eq!(
+            Database::sanitize_fts_query("test\"injection"),
+            "\"testinjection\""
+        );
+        assert_eq!(Database::sanitize_fts_query("  spaces  "), "\"spaces\"");
+        assert_eq!(Database::sanitize_fts_query(""), "");
+    }
+}

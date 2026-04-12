@@ -276,3 +276,141 @@ fn default_rate_limit() -> u32 {
 fn default_pairing_ttl() -> i64 {
     3600
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gateway_config_default() {
+        let cfg = GatewayConfig::default();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 7842);
+        assert_eq!(cfg.max_concurrent, 10);
+        assert_eq!(cfg.request_timeout_ms, 120_000);
+        assert_eq!(cfg.rate_limit_per_minute, 60);
+        assert!(cfg.public_url.is_none());
+        assert!(cfg.bindings.is_empty());
+        assert!(cfg.slack_channel_allowlist.is_none());
+        assert!(cfg.discord_guild_allowlist.is_none());
+        assert_eq!(cfg.pairing_ttl_secs, 3600);
+        assert!(cfg.signal_cli_host.is_none());
+        assert!(cfg.signal_cli_port.is_none());
+        assert_eq!(cfg.group_activation, ActivationMode::Mention);
+        assert_eq!(cfg.error_policy, ErrorPolicy::Once);
+        assert_eq!(cfg.error_cooldown_ms, 14_400_000);
+        assert!(cfg.channel_error_policies.is_empty());
+        assert!(cfg.channel_policies.is_empty());
+    }
+
+    #[test]
+    fn test_error_policy_from_str() {
+        assert_eq!(
+            "always".parse::<ErrorPolicy>().unwrap(),
+            ErrorPolicy::Always
+        );
+        assert_eq!("once".parse::<ErrorPolicy>().unwrap(), ErrorPolicy::Once);
+        assert_eq!(
+            "silent".parse::<ErrorPolicy>().unwrap(),
+            ErrorPolicy::Silent
+        );
+        assert_eq!(
+            "ALWAYS".parse::<ErrorPolicy>().unwrap(),
+            ErrorPolicy::Always
+        );
+        assert_eq!("Once".parse::<ErrorPolicy>().unwrap(), ErrorPolicy::Once);
+        assert!("unknown".parse::<ErrorPolicy>().is_err());
+    }
+
+    #[test]
+    fn test_error_policy_display() {
+        assert_eq!(ErrorPolicy::Always.to_string(), "always");
+        assert_eq!(ErrorPolicy::Once.to_string(), "once");
+        assert_eq!(ErrorPolicy::Silent.to_string(), "silent");
+    }
+
+    #[test]
+    fn test_error_policy_roundtrip() {
+        for policy in [ErrorPolicy::Always, ErrorPolicy::Once, ErrorPolicy::Silent] {
+            let s = policy.to_string();
+            let parsed: ErrorPolicy = s.parse().unwrap();
+            assert_eq!(parsed, policy);
+        }
+    }
+
+    #[test]
+    fn test_activation_mode_serde_roundtrip() {
+        for mode in [ActivationMode::Always, ActivationMode::Mention] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: ActivationMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+    }
+
+    #[test]
+    fn test_gateway_binding_serde() {
+        let binding = GatewayBinding {
+            channel: "telegram".into(),
+            sender: Some("user123".into()),
+            peer_kind: Some("direct".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-4".into()),
+            api_key_env: None,
+            temperature: Some(0.7),
+            max_tokens: Some(4096),
+            identity: None,
+            memory_scope: Some("private".into()),
+            fallback: Vec::new(),
+            activation: Some(ActivationMode::Always),
+            thinking: None,
+            request_timeout_ms: None,
+            gateway_timeout_ms: None,
+            stream_chunk_timeout_secs: None,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let parsed: GatewayBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.channel, "telegram");
+        assert_eq!(parsed.sender.as_deref(), Some("user123"));
+        assert_eq!(parsed.provider.as_deref(), Some("openai"));
+        assert_eq!(parsed.temperature, Some(0.7));
+        assert_eq!(parsed.max_tokens, Some(4096));
+        assert_eq!(parsed.memory_scope.as_deref(), Some("private"));
+        assert_eq!(parsed.activation, Some(ActivationMode::Always));
+        // Fields set to None with skip_serializing_if should be absent
+        assert!(!json.contains("\"api_key_env\""));
+        assert!(!json.contains("\"identity\""));
+        assert!(!json.contains("\"thinking\""));
+    }
+
+    #[test]
+    fn test_auto_reply_config_default() {
+        let cfg = AutoReplyConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.away_message.contains("away"));
+        assert!(cfg.queue_messages);
+    }
+
+    #[test]
+    fn test_link_understanding_config_default() {
+        let cfg = LinkUnderstandingConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.max_links, 3);
+        assert_eq!(cfg.max_chars_per_link, 5000);
+        assert_eq!(cfg.timeout_ms, 10_000);
+    }
+
+    #[test]
+    fn test_gateway_config_serde_roundtrip() {
+        let original = GatewayConfig::default();
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: GatewayConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.host, original.host);
+        assert_eq!(parsed.port, original.port);
+        assert_eq!(parsed.max_concurrent, original.max_concurrent);
+        assert_eq!(parsed.request_timeout_ms, original.request_timeout_ms);
+        assert_eq!(parsed.rate_limit_per_minute, original.rate_limit_per_minute);
+        assert_eq!(parsed.pairing_ttl_secs, original.pairing_ttl_secs);
+        assert_eq!(parsed.error_policy, original.error_policy);
+        assert_eq!(parsed.error_cooldown_ms, original.error_cooldown_ms);
+    }
+}

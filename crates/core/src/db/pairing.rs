@@ -262,3 +262,181 @@ impl Database {
         Ok(rows)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::test_db()
+    }
+
+    #[test]
+    fn test_create_and_find_pending_pairing() {
+        let db = test_db();
+        let id = db
+            .create_pairing_request("telegram", "user1", "ABC123", Some("Alice"), 3600)
+            .unwrap();
+        assert!(!id.is_empty());
+
+        let found = db.find_pending_pairing("telegram", "ABC123").unwrap();
+        assert!(found.is_some());
+        let req = found.unwrap();
+        assert_eq!(req.channel_name, "telegram");
+        assert_eq!(req.sender_id, "user1");
+        assert_eq!(req.code, "ABC123");
+        assert_eq!(req.status, "pending");
+        assert_eq!(req.display_name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn test_find_pending_pairing_expired() {
+        let db = test_db();
+        // TTL of 0 means it expires immediately
+        db.create_pairing_request("telegram", "user1", "EXPIRED", None, 0)
+            .unwrap();
+
+        let found = db.find_pending_pairing("telegram", "EXPIRED").unwrap();
+        assert!(found.is_none(), "expired pairing should not be found");
+    }
+
+    #[test]
+    fn test_find_pending_for_sender() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "CODE1", None, 3600)
+            .unwrap();
+
+        let found = db.find_pending_for_sender("telegram", "user1").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().code, "CODE1");
+
+        // Different sender returns None
+        let other = db.find_pending_for_sender("telegram", "nobody").unwrap();
+        assert!(other.is_none());
+    }
+
+    #[test]
+    fn test_approve_pairing() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "CODE1", Some("Alice"), 3600)
+            .unwrap();
+
+        assert!(!db.is_sender_approved("telegram", "user1").unwrap());
+
+        let approved = db.approve_pairing("telegram", "CODE1").unwrap();
+        assert_eq!(approved.status, "approved");
+        assert!(approved.approved_at.is_some());
+
+        assert!(db.is_sender_approved("telegram", "user1").unwrap());
+
+        // No longer findable as pending
+        let pending = db.find_pending_pairing("telegram", "CODE1").unwrap();
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn test_approve_pairing_not_found() {
+        let db = test_db();
+        let result = db.approve_pairing("telegram", "NONEXISTENT");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_sender_approved_false_initially() {
+        let db = test_db();
+        assert!(!db.is_sender_approved("telegram", "nobody").unwrap());
+    }
+
+    #[test]
+    fn test_revoke_sender() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "CODE1", None, 3600)
+            .unwrap();
+        db.approve_pairing("telegram", "CODE1").unwrap();
+        assert!(db.is_sender_approved("telegram", "user1").unwrap());
+
+        let revoked = db.revoke_sender("telegram", "user1").unwrap();
+        assert!(revoked);
+        assert!(!db.is_sender_approved("telegram", "user1").unwrap());
+
+        // Second revoke returns false
+        let revoked_again = db.revoke_sender("telegram", "user1").unwrap();
+        assert!(!revoked_again);
+    }
+
+    #[test]
+    fn test_cleanup_expired_pairings() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "VALID", None, 3600)
+            .unwrap();
+        db.create_pairing_request("telegram", "user2", "EXPIRED", None, 0)
+            .unwrap();
+
+        let cleaned = db.cleanup_expired_pairings().unwrap();
+        assert_eq!(cleaned, 1);
+
+        // Valid one should still be findable
+        assert!(db
+            .find_pending_pairing("telegram", "VALID")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn test_count_pairing_attempts() {
+        let db = test_db();
+        for i in 0..3 {
+            db.create_pairing_request("telegram", "user1", &format!("C{i}"), None, 3600)
+                .unwrap();
+        }
+
+        let count = db
+            .count_pairing_attempts("telegram", "user1", 3600)
+            .unwrap();
+        assert_eq!(count, 3);
+
+        // Different sender should be 0
+        let other = db
+            .count_pairing_attempts("telegram", "nobody", 3600)
+            .unwrap();
+        assert_eq!(other, 0);
+    }
+
+    #[test]
+    fn test_list_pairings_and_approved_senders() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "T1", Some("Alice"), 3600)
+            .unwrap();
+        db.create_pairing_request("slack", "user2", "S1", Some("Bob"), 3600)
+            .unwrap();
+
+        // Approve the telegram one
+        db.approve_pairing("telegram", "T1").unwrap();
+
+        // Pending pairings: only slack one remains
+        let pending = db.list_pairings(None).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].channel_name, "slack");
+
+        // Approved senders for telegram
+        let approved = db.list_approved_senders(Some("telegram")).unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].sender_id, "user1");
+
+        // Approved senders for slack: none
+        let slack_approved = db.list_approved_senders(Some("slack")).unwrap();
+        assert!(slack_approved.is_empty());
+    }
+
+    #[test]
+    fn test_find_pending_by_code() {
+        let db = test_db();
+        db.create_pairing_request("telegram", "user1", "MYCODE", None, 3600)
+            .unwrap();
+
+        // Should find by code alone (case-insensitive via uppercasing)
+        let found = db.find_pending_by_code("mycode").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().channel_name, "telegram");
+    }
+}
