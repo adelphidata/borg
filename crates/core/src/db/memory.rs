@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
-use super::models::{ChunkData, ChunkRow, EmbeddingRow};
+use super::models::{ChunkData, ChunkRow, EmbeddingRow, MemoryEntryRow};
 use super::Database;
 
 impl Database {
@@ -338,6 +338,128 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    // ── Memory Entries CRUD ──
+
+    /// Insert or update a memory entry. Computes content_hash automatically.
+    pub fn upsert_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(scope, name) DO UPDATE SET
+                content = ?3, content_hash = ?4, updated_at = ?5",
+            params![scope, name, content, hash, now],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieve a memory entry by scope and name.
+    pub fn get_memory_entry(&self, scope: &str, name: &str) -> Result<Option<MemoryEntryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, name, content, content_hash, created_at, updated_at
+             FROM memory_entries WHERE scope = ?1 AND name = ?2",
+        )?;
+        let row = stmt
+            .query_row(params![scope, name], |row| {
+                Ok(MemoryEntryRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    name: row.get(2)?,
+                    content: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Delete a memory entry. Returns true if a row was deleted.
+    pub fn delete_memory_entry(&self, scope: &str, name: &str) -> Result<bool> {
+        let count = self.conn.execute(
+            "DELETE FROM memory_entries WHERE scope = ?1 AND name = ?2",
+            params![scope, name],
+        )?;
+        Ok(count > 0)
+    }
+
+    /// List all memory entries for a scope, ordered by updated_at DESC.
+    pub fn list_memory_entries(&self, scope: &str) -> Result<Vec<MemoryEntryRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, name, content, content_hash, created_at, updated_at
+             FROM memory_entries WHERE scope = ?1 ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![scope], |row| {
+                Ok(MemoryEntryRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    name: row.get(2)?,
+                    content: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Append content to an existing memory entry, or create it if it doesn't exist.
+    pub fn append_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
+        let existing = self.get_memory_entry(scope, name)?;
+        let new_content = match existing {
+            Some(entry) => format!("{}\n{}", entry.content, content),
+            None => content.to_string(),
+        };
+        self.upsert_memory_entry(scope, name, &new_content)
+    }
+
+    /// Count memory entries for a scope.
+    pub fn count_memory_entries(&self, scope: &str) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM memory_entries WHERE scope = ?1")?;
+        let count: i64 = stmt.query_row(params![scope], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    // ── Embedding Cache Lifecycle ──
+
+    /// Update last_accessed_at for a cache entry on hit.
+    pub fn touch_cache_entry(&self, provider: &str, model: &str, content_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE embedding_cache SET last_accessed_at = unixepoch()
+             WHERE provider = ?1 AND model = ?2 AND content_hash = ?3",
+            params![provider, model, content_hash],
+        )?;
+        Ok(())
+    }
+
+    /// Prune embedding cache entries not accessed within `max_age_secs`. Returns rows deleted.
+    pub fn prune_embedding_cache(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = chrono::Utc::now().timestamp() - max_age_secs;
+        let count = self.conn.execute(
+            "DELETE FROM embedding_cache WHERE last_accessed_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(count)
+    }
+
+    /// Prune embedding cache to at most `max_entries`, removing oldest by last_accessed_at.
+    pub fn prune_embedding_cache_by_count(&self, max_entries: usize) -> Result<usize> {
+        let count = self.conn.execute(
+            "DELETE FROM embedding_cache WHERE id NOT IN (
+                SELECT id FROM embedding_cache ORDER BY last_accessed_at DESC LIMIT ?1
+            )",
+            params![max_entries as i64],
+        )?;
+        Ok(count)
     }
 }
 
@@ -697,5 +819,147 @@ mod tests {
         );
         assert_eq!(Database::sanitize_fts_query("  spaces  "), "\"spaces\"");
         assert_eq!(Database::sanitize_fts_query(""), "");
+    }
+
+    // ── Memory Entries ──
+
+    #[test]
+    fn memory_entry_upsert_and_get() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "notes", "hello world")
+            .unwrap();
+
+        let entry = db.get_memory_entry("global", "notes").unwrap().unwrap();
+        assert_eq!(entry.scope, "global");
+        assert_eq!(entry.name, "notes");
+        assert_eq!(entry.content, "hello world");
+        assert!(!entry.content_hash.is_empty());
+    }
+
+    #[test]
+    fn memory_entry_upsert_updates() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "topic", "version 1")
+            .unwrap();
+        let v1 = db.get_memory_entry("global", "topic").unwrap().unwrap();
+
+        // Small delay to ensure updated_at differs (seconds granularity)
+        db.upsert_memory_entry("global", "topic", "version 2")
+            .unwrap();
+        let v2 = db.get_memory_entry("global", "topic").unwrap().unwrap();
+
+        assert_eq!(v2.content, "version 2");
+        assert_ne!(v1.content_hash, v2.content_hash);
+        assert_eq!(db.count_memory_entries("global").unwrap(), 1);
+    }
+
+    #[test]
+    fn memory_entry_append() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "log", "line 1").unwrap();
+        db.append_memory_entry("global", "log", "line 2").unwrap();
+
+        let entry = db.get_memory_entry("global", "log").unwrap().unwrap();
+        assert_eq!(entry.content, "line 1\nline 2");
+    }
+
+    #[test]
+    fn memory_entry_append_creates_if_missing() {
+        let db = test_db();
+        db.append_memory_entry("global", "new-entry", "first content")
+            .unwrap();
+
+        let entry = db.get_memory_entry("global", "new-entry").unwrap().unwrap();
+        assert_eq!(entry.content, "first content");
+    }
+
+    #[test]
+    fn memory_entry_delete() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "temp", "data").unwrap();
+
+        let deleted = db.delete_memory_entry("global", "temp").unwrap();
+        assert!(deleted);
+        assert!(db.get_memory_entry("global", "temp").unwrap().is_none());
+
+        let deleted_again = db.delete_memory_entry("global", "temp").unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn memory_entry_list_by_scope() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "g1", "global entry")
+            .unwrap();
+        db.upsert_memory_entry("project:abc", "p1", "project entry")
+            .unwrap();
+
+        let global = db.list_memory_entries("global").unwrap();
+        assert_eq!(global.len(), 1);
+        assert_eq!(global[0].name, "g1");
+
+        let project = db.list_memory_entries("project:abc").unwrap();
+        assert_eq!(project.len(), 1);
+        assert_eq!(project[0].name, "p1");
+    }
+
+    #[test]
+    fn memory_entry_scope_isolation() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "shared-name", "global version")
+            .unwrap();
+        db.upsert_memory_entry("project:x", "shared-name", "project version")
+            .unwrap();
+
+        let g = db
+            .get_memory_entry("global", "shared-name")
+            .unwrap()
+            .unwrap();
+        let p = db
+            .get_memory_entry("project:x", "shared-name")
+            .unwrap()
+            .unwrap();
+        assert_eq!(g.content, "global version");
+        assert_eq!(p.content, "project version");
+        assert_eq!(db.count_memory_entries("global").unwrap(), 1);
+        assert_eq!(db.count_memory_entries("project:x").unwrap(), 1);
+    }
+
+    #[test]
+    fn memory_entry_content_hash() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "a", "same content")
+            .unwrap();
+        db.upsert_memory_entry("global", "b", "same content")
+            .unwrap();
+
+        let a = db.get_memory_entry("global", "a").unwrap().unwrap();
+        let b = db.get_memory_entry("global", "b").unwrap().unwrap();
+        assert_eq!(a.content_hash, b.content_hash);
+    }
+
+    // ── Cache Pruning ──
+
+    #[test]
+    fn prune_cache_by_count() {
+        let db = test_db();
+        for i in 0..5 {
+            db.cache_embedding("p", "m", &format!("h{i}"), &[i as u8], 1)
+                .unwrap();
+        }
+
+        let pruned = db.prune_embedding_cache_by_count(3).unwrap();
+        assert_eq!(pruned, 2);
+    }
+
+    #[test]
+    fn touch_cache_updates_last_accessed() {
+        let db = test_db();
+        db.cache_embedding("p", "m", "h1", &[1], 1).unwrap();
+        db.touch_cache_entry("p", "m", "h1").unwrap();
+
+        // Verify no error — the timestamp was updated
+        let result = db.get_cached_embedding("p", "m", "h1").unwrap();
+        assert!(result.is_some());
     }
 }

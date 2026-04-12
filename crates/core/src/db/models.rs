@@ -243,6 +243,25 @@ pub struct ChunkData {
     pub end_line: Option<i64>,
 }
 
+/// A persistent memory entry stored in SQLite.
+#[derive(Debug, Clone)]
+pub struct MemoryEntryRow {
+    /// Unique row identifier.
+    pub id: i64,
+    /// Memory scope (e.g. "global", "project:{id}").
+    pub scope: String,
+    /// Logical name / topic (e.g. "INDEX", "rust-patterns", "daily/2025-04-12").
+    pub name: String,
+    /// Full text content of the memory entry.
+    pub content: String,
+    /// SHA-256 hash of the content for change detection.
+    pub content_hash: String,
+    /// Unix timestamp when the entry was first created.
+    pub created_at: i64,
+    /// Unix timestamp when the entry was last modified.
+    pub updated_at: i64,
+}
+
 /// Pairing request row from SQLite.
 #[derive(Debug, Clone)]
 pub struct PairingRequestRow {

@@ -163,7 +163,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 33;
+    const CURRENT_VERSION: u32 = 34;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -235,6 +235,7 @@ impl Database {
             Database::migrate_v31,
             Database::migrate_v32,
             Database::migrate_v33,
+            Database::migrate_v34,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.

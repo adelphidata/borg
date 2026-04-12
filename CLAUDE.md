@@ -134,12 +134,26 @@ Two-tier resolution: **Database** → **compiled defaults**. `Config::load_from_
 
 ### Memory
 
-- `~/.borg/MEMORY.md` loaded every turn; `~/.borg/memory/*.md` by relevance/recency within token budget
-- Per-project: `$CWD/.borg/memory/*.md`; `write_memory` accepts `scope: "local"`
-- Semantic search: embeddings in SQLite, cosine similarity + recency. Auto-detects provider (OpenAI → OpenRouter → Gemini), falls back to recency
-- Hybrid search: vector (70%) + BM25 (30%) with adaptive weighting
-- MMR diversity re-ranking, markdown-aware chunking, embedding cache, file watcher (1.5s debounce)
-- Pre-compaction flush: `flush_before_compaction` saves durable info to `daily/{date}.md`
+Two-tier architecture: short-term (session) + long-term (persistent). All memory stored in SQLite `memory_entries` table — no filesystem memory files.
+
+**Long-term memory** (`memory_entries` table):
+- `scope` + `name` uniquely identify an entry (e.g. `global/INDEX`, `global/rust-patterns`, `project:abc/notes`)
+- Loaded every turn within token budget; INDEX entry always first, rest by semantic ranking or `updated_at` DESC
+- `write_memory` tool writes to DB with injection scanning (prompt override, exfiltration, invisible Unicode patterns rejected)
+- Hybrid search: vector (70%) + BM25 (30%) with adaptive weighting, MMR diversity re-ranking, per-term fallback
+- Embedding cache with TTL pruning (`last_accessed_at` tracking, 30-day default)
+- V34 migration imports old `~/.borg/MEMORY.md` and `memory/*.md` files into DB, renames to `.bak`
+
+**Short-term memory** (`ShortTermMemory` struct, in-memory):
+- Session-scoped working memory accumulating facts from tool calls
+- Rendered as `<working_memory>` in system prompt dynamic suffix
+- Flushed to daily log entry on session end, consolidated nightly
+
+**Consolidation** (scheduled tasks, seeded in V34):
+- Nightly (3 AM): reviews day's sessions, extracts durable info into long-term topic entries
+- Weekly (4 AM Sunday): deduplicates, merges, tightens long-term entries; prunes embedding cache
+
+**System prompt tags**: `<long_term_memory trust="stored">` (stable prefix), `<working_memory>` (dynamic suffix)
 - Token estimation via `tiktoken-rs` (cl100k_base BPE)
 
 ### Skills

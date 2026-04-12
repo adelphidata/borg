@@ -61,7 +61,7 @@ fn parse_template(source: &str) -> Template {
 }
 
 static MEMORY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
-    parse_template("\n<user_memory trust=\"stored\">\n{{ memory }}\n</user_memory>\n")
+    parse_template("\n<long_term_memory trust=\"stored\">\n{{ memory }}\n</long_term_memory>\n")
 });
 
 static SKILLS_TEMPLATE: LazyLock<Template> =
@@ -200,6 +200,8 @@ pub struct Agent {
     steer_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Tool names used in recent turns, for conditional tool loading.
     recent_tool_names: std::collections::HashSet<String>,
+    /// Short-term working memory for the current session.
+    short_term_memory: crate::short_term_memory::ShortTermMemory,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -277,6 +279,7 @@ impl Agent {
             .ok()
             .and_then(|cwd| crate::git::find_repo_root(&cwd));
         let config_arc = Arc::new(config.clone());
+        let session_id = common.session.meta.id.clone();
         Self {
             config,
             history: Vec::new(),
@@ -303,6 +306,7 @@ impl Agent {
             config_arc,
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
+            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
         }
     }
 
@@ -318,6 +322,10 @@ impl Agent {
         } else {
             None
         };
+
+        // Best-effort embedding cache pruning on startup
+        Self::prune_embedding_cache_on_startup(&config);
+
         Ok(Self::build_agent(
             config,
             common,
@@ -326,6 +334,45 @@ impl Agent {
             None,
             metrics,
         ))
+    }
+
+    /// Prune stale embedding cache entries on startup based on config.
+    fn prune_embedding_cache_on_startup(config: &Config) {
+        let ttl_days = config.memory.cache_ttl_days;
+        let max_entries = config.memory.cache_max_entries;
+
+        if ttl_days == 0 && max_entries == 0 {
+            return;
+        }
+
+        let db = match Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("Cache pruning: failed to open database: {e}");
+                return;
+            }
+        };
+
+        if ttl_days > 0 {
+            let max_age_secs = i64::from(ttl_days) * 86400;
+            match db.prune_embedding_cache(max_age_secs) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    "Pruned {n} stale embedding cache entries (>{ttl_days} days old)"
+                ),
+                Err(e) => tracing::warn!("Cache TTL pruning failed: {e}"),
+            }
+        }
+
+        if max_entries > 0 {
+            match db.prune_embedding_cache_by_count(max_entries) {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::info!("Pruned {n} embedding cache entries (over {max_entries} limit)")
+                }
+                Err(e) => tracing::warn!("Cache count pruning failed: {e}"),
+            }
+        }
     }
 
     /// Set a channel for receiving user steer messages mid-turn.
@@ -899,6 +946,13 @@ impl Agent {
         }
 
         // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
+
+        // Short-term working memory (session facts, active project)
+        let working_memory = self.short_term_memory.render();
+        if !working_memory.is_empty() {
+            system.push_str(&working_memory);
+        }
+
         system.push_str(&self.build_collaboration_section());
         system.push_str(&self.build_workflow_guidance_section());
         system.push_str(&self.build_environment_section().await);

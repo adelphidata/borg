@@ -54,8 +54,8 @@ fn create_and_list_tasks() {
     .expect("create task 2");
 
     let tasks = db.list_tasks().expect("list");
-    // +2 for seeded tasks (Monthly Security Audit + Daily Summary)
-    assert_eq!(tasks.len(), 4);
+    // +4 for seeded tasks (Monthly Security Audit + Daily Summary + Nightly Consolidation + Weekly Maintenance)
+    assert_eq!(tasks.len(), 6);
 }
 
 #[test]

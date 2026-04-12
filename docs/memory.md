@@ -1,53 +1,58 @@
 # Memory
 
-Borg has a persistent memory system that carries context across sessions. The agent can read and write memory files, and relevant memories are automatically loaded into the system prompt each turn.
+Borg has a two-tier memory system modeled on how human memory works: short-term working memory for the current session, and long-term persistent memory stored in SQLite.
 
-## Memory files
+## Architecture
 
-All memory lives in `~/.borg/` and project directories:
+| Tier | Storage | Lifetime | Loaded |
+|------|---------|----------|--------|
+| **Short-term** | In-memory (`ShortTermMemory` struct) | Current session only | Dynamic suffix of system prompt |
+| **Long-term** | SQLite `memory_entries` table | Persistent across sessions | Stable prefix of system prompt |
+| **Identity** | `~/.borg/IDENTITY.md` (file) | Persistent | Always (system prompt prefix) |
+| **Heartbeat** | `~/.borg/HEARTBEAT.md` (file) | Persistent | Heartbeat turns only |
 
-| File | Purpose | Loaded |
-|------|---------|--------|
-| `IDENTITY.md` | Personality and behavioral instructions | Always (as system prompt prefix) |
-| `MEMORY.md` | Memory index -- high-level notes | Always (first in memory context) |
-| `memory/*.md` | Topic-specific memories | By relevance (semantic search) or recency |
-| `$CWD/.borg/memory/*.md` | Per-project local memories | In addition to global memory |
-| `memory/scopes/{scope}/*.md` | Scoped memories (per-binding or per-agent) | When scope is active |
-| `HEARTBEAT.md` | Checklist for heartbeat agent | During heartbeat turns only |
+All long-term memory entries live in the `memory_entries` table with a `scope` + `name` unique key. No filesystem memory files — SQLite is the single source of truth.
 
-## How memory loading works
+## Long-term memory
 
-Each turn, the agent builds a memory context:
+### How loading works
 
-1. **MEMORY.md** is loaded first (always included if it fits the budget)
-2. **memory/*.md** files are ranked by semantic similarity to the user's query, blended with recency
-3. Files are included one by one until the token budget is exhausted
-4. **Local memory** (`$CWD/.borg/memory/*.md`) is loaded in addition to global memory when present
-5. **Scoped memory** is loaded when `memory.memory_scope` or a gateway binding `memory_scope` is set
+Each turn, the agent builds a memory context within a token budget:
+
+1. The **INDEX** entry is loaded first (always included if it fits)
+2. Remaining entries are ranked by semantic similarity to the user's query, blended with recency
+3. Entries are included one by one until the token budget is exhausted
+4. Rendered as `<long_term_memory trust="stored">` in the system prompt stable prefix
 
 ### Semantic search
 
-Embeddings are generated on `write_memory` and stored in SQLite. Memory files are ranked by cosine similarity to the user's query, blended with recency. The system uses hybrid search combining BM25 keyword matching with vector similarity.
+Embeddings are generated on `write_memory` and stored in SQLite. Entries are ranked by cosine similarity to the user's query, blended with recency. The system uses hybrid search combining BM25 keyword matching (30%) with vector similarity (70%).
 
-Auto-detects embedding provider from API keys (OpenAI -> OpenRouter -> Gemini). Silently falls back to recency-only ranking when no embedding provider is available (e.g., Anthropic-only users).
+When no results match a multi-word query, the search falls back to individual term matching (with a 0.7x score discount so term-level hits rank below phrase hits).
 
-Configure via `borg settings set`:
-
-```sh
-borg settings set memory.embeddings.enabled true
-borg settings set memory.embeddings.recency_weight 0.2    # 0.0=pure similarity, 1.0=pure recency
-borg settings set memory.embeddings.bm25_weight 0.3       # BM25 keyword weight
-borg settings set memory.embeddings.vector_weight 0.7     # vector similarity weight
-```
-
-Token estimation uses tiktoken-rs (cl100k_base BPE tokenizer).
+Auto-detects embedding provider from API keys (OpenAI -> OpenRouter -> Gemini). Falls back to recency-only ranking when no provider is available.
 
 ### Configuration
 
 ```sh
 borg settings set memory.max_context_tokens 8000
-borg settings set memory.memory_scope "my-project"   # optional: namespace for scoped memory
+borg settings set memory.embeddings.enabled true
+borg settings set memory.embeddings.recency_weight 0.2    # 0.0=pure similarity, 1.0=pure recency
+borg settings set memory.embeddings.bm25_weight 0.3
+borg settings set memory.embeddings.vector_weight 0.7
 ```
+
+## Short-term memory
+
+Session-scoped working memory that accumulates facts during the conversation:
+
+- **Fact categories**: Decision, Preference, TaskOutcome, CodeFact, Correction
+- **Budget-aware**: Evicts oldest facts when token limit exceeded (default: 2000 tokens)
+- **Active project**: Tracks the current project context from the projects tool
+- Rendered as `<working_memory>` in the system prompt dynamic suffix
+- Omitted entirely when empty (zero token cost)
+
+Short-term memory is never written directly to long-term storage. Instead, it flushes to a daily log entry on session end, which the nightly consolidation job processes.
 
 ## Writing memory
 
@@ -55,22 +60,27 @@ The agent uses the `write_memory` tool:
 
 ```json
 {
-  "filename": "user_preferences.md",
+  "filename": "user-preferences",
   "content": "# User Preferences\n\n- Prefers concise answers\n- Timezone: PST",
   "append": false,
   "scope": "global"
 }
 ```
 
-- `filename`: target file (`IDENTITY.md`, `MEMORY.md`, or any name for a topic file)
+- `filename`: entry name (`.md` suffix stripped automatically for backward compatibility)
 - `content`: text to write
-- `append`: if `true`, appends to existing content instead of overwriting
-- `scope`: `"global"` (default, writes to `~/.borg/memory/`) or `"local"` (writes to `$CWD/.borg/memory/`)
+- `append`: if `true`, appends to existing content
+- `scope`: `"global"` (default) or `"project:{id}"` for project-scoped memory
 
-Special filenames:
-- `IDENTITY.md` -- writes to `~/.borg/IDENTITY.md` (personality)
-- `MEMORY.md` -- writes to `~/.borg/MEMORY.md` (index)
-- Anything else -- writes to `~/.borg/memory/<filename>` (or `$CWD/.borg/memory/<filename>` if scope is local)
+### Injection scanning
+
+All memory writes are scanned for prompt injection patterns before persisting:
+
+- **Prompt override**: "ignore previous instructions", "you are now", "system prompt override"
+- **Exfiltration**: curl/wget with secrets, credential harvesting
+- **Invisible Unicode**: zero-width spaces (U+200B), RTL overrides (U+202E), BOM (U+FEFF)
+
+Writes containing these patterns are rejected with an error.
 
 ## Reading memory
 
@@ -78,58 +88,45 @@ The agent uses the `read_memory` tool:
 
 ```json
 {
-  "filename": "user_preferences.md"
+  "filename": "user-preferences"
 }
 ```
 
-Returns the file contents, or a "not found" message if the file doesn't exist.
+Returns the entry content, or a "not found" message.
 
-## Security
+## Consolidation
 
-Memory filenames are validated to prevent path traversal:
-- No `..` sequences allowed
-- No `/` or `\` separators allowed
-- Empty filenames are rejected
+Memory consolidation runs as scheduled tasks (seeded on first migration to V34):
 
-Secrets in tool output are automatically redacted when `security.secret_detection` is enabled (default: true).
+### Nightly (3 AM)
+
+Reviews the day's sessions, extracts durable information, and either appends to existing long-term entries, creates new topic entries, or skips if already captured. Never duplicates existing information.
+
+### Weekly (4 AM Sunday)
+
+Reviews all long-term entries for duplicates, outdated info, entries to merge, and verbose entries to tighten. Also prunes the embedding cache (entries not accessed in 30 days).
 
 ## IDENTITY.md
 
-The personality file is special -- it's loaded as the first part of the system prompt (before memory context). The agent can modify its own personality by writing to `IDENTITY.md`. Changes persist across sessions.
+The personality file is the only memory that stays as a filesystem file — it's loaded as the first part of the system prompt. The agent can modify its own personality by writing to `IDENTITY.md`. Changes persist across sessions.
 
-The default `IDENTITY.md` is created by `borg init` based on the chosen personality style (Professional, Casual, Snarky, Nurturing, or Minimal).
+Created by `borg init` based on the chosen personality style.
 
 ## HEARTBEAT.md
 
-Optional checklist at `~/.borg/HEARTBEAT.md`. When present, it is injected into heartbeat agent turns so the agent can check email, calendar, or other periodic tasks. See [Heartbeat](heartbeat.md).
+Optional checklist at `~/.borg/HEARTBEAT.md`. When present, it is injected into heartbeat agent turns. See [Heartbeat](heartbeat.md).
 
 ## Session persistence
 
-Conversations are automatically saved to the SQLite database (`borg.db`). Each message is written immediately when added to history, enabling crash recovery. Sessions track:
+Conversations are saved to the SQLite database (`borg.db`). Each message is written immediately (crash recovery). Sessions track full message history, token usage, model, and auto-generated title.
 
-- Full message history (with timestamps)
-- Token usage
-- Model used
-- Auto-generated title
+## Migration from filesystem memory
 
-The most recent session can be automatically loaded on startup.
-
-## Conversation compaction
-
-When conversation history exceeds the token budget (`conversation.max_history_tokens`, default 32000), the agent can compact history by summarizing older messages while preserving recent context. This can also be triggered manually via the `/compact` slash command.
-
-## Atomic rollback
-
-The `/undo` command rolls back the last agent turn (both the assistant response and the preceding user message), allowing you to retry or rephrase.
-
-## Memory cleanup
-
-The `/memory cleanup` command helps manage memory files by identifying and removing stale or redundant entries.
+V34 migration automatically imports existing `~/.borg/MEMORY.md` and `~/.borg/memory/*.md` files into the `memory_entries` table. Original files are renamed to `.bak`. The `memory/daily/` directory files are also imported.
 
 ## Tips
 
-- Keep `MEMORY.md` as a concise index of what the agent knows
-- Use topic-specific files (`memory/project-x.md`, `memory/meeting-notes.md`) for detailed context
-- The agent will naturally learn to use memory as you interact with it
+- Keep the INDEX entry as a concise index of what the agent knows
+- The agent will naturally organize topic entries as you interact with it
 - With embeddings enabled, the most relevant memories are loaded regardless of recency
-- Use `scope: "local"` to keep project-specific memories separate from global ones
+- Use project-scoped memory to keep project-specific context separate

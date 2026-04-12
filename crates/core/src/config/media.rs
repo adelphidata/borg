@@ -355,6 +355,12 @@ pub struct MemoryConfig {
     /// parts are relevant. Default: false (opt-in due to higher risk of missing context).
     #[serde(default)]
     pub chunk_level_selection: bool,
+    /// Maximum age (in days) for embedding cache entries. Entries not accessed within
+    /// this period are pruned on startup. 0 = no TTL pruning.
+    pub cache_ttl_days: u32,
+    /// Maximum number of entries in the embedding cache. Oldest entries by
+    /// last_accessed_at are pruned on startup. 0 = unlimited.
+    pub cache_max_entries: usize,
 }
 
 impl Default for MemoryConfig {
@@ -368,6 +374,8 @@ impl Default for MemoryConfig {
             flush_min_messages: 4,
             extra_paths: Vec::new(),
             chunk_level_selection: false,
+            cache_ttl_days: 30,
+            cache_max_entries: 10_000,
         }
     }
 }

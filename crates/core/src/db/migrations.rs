@@ -931,4 +931,200 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// V34: DB-only memory — `memory_entries` table replaces filesystem markdown files.
+    /// Also adds `last_accessed_at` to embedding_cache for TTL pruning and seeds
+    /// nightly/weekly memory consolidation scheduled tasks.
+    pub(super) fn migrate_v34(&self) -> Result<()> {
+        // 1. Create memory_entries table
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL DEFAULT 'global',
+                name TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(scope, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
+                ON memory_entries(scope);
+            CREATE INDEX IF NOT EXISTS idx_memory_entries_updated
+                ON memory_entries(updated_at);",
+        )?;
+
+        // 2. Add last_accessed_at to embedding_cache for TTL pruning
+        if !Self::has_column(&self.conn, "embedding_cache", "last_accessed_at") {
+            self.conn.execute_batch(
+                "ALTER TABLE embedding_cache ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch());",
+            )?;
+        }
+
+        // 3. Migrate existing markdown memory files into DB
+        self.migrate_memory_files_to_db();
+
+        // 4. Seed consolidation scheduled tasks
+        self.seed_consolidation_tasks()?;
+
+        Ok(())
+    }
+
+    /// Best-effort migration of existing `~/.borg/MEMORY.md` and `~/.borg/memory/*.md`
+    /// files into the `memory_entries` table. Renames migrated files to `.bak`.
+    /// Logs warnings on failure — never blocks the migration.
+    fn migrate_memory_files_to_db(&self) {
+        use sha2::{Digest, Sha256};
+
+        let data_dir = match crate::config::Config::data_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("V34 migration: cannot resolve data dir: {e}");
+                return;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+
+        let insert = |scope: &str, name: &str, content: &str| {
+            let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
+            if let Err(e) = self.conn.execute(
+                "INSERT OR IGNORE INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                params![scope, name, content, hash, now],
+            ) {
+                tracing::warn!("V34 migration: failed to import {name}: {e}");
+            }
+        };
+
+        let rename_to_bak = |path: &std::path::Path| {
+            let bak = path.with_extension("md.bak");
+            if let Err(e) = std::fs::rename(path, &bak) {
+                tracing::warn!(
+                    "V34 migration: could not rename {} to .bak: {e}",
+                    path.display()
+                );
+            }
+        };
+
+        // Import MEMORY.md → name="INDEX"
+        let memory_md = data_dir.join("MEMORY.md");
+        if memory_md.exists() {
+            if let Ok(content) = std::fs::read_to_string(&memory_md) {
+                if !content.trim().is_empty() {
+                    insert("global", "INDEX", &content);
+                    rename_to_bak(&memory_md);
+                }
+            }
+        }
+
+        // Import memory/*.md → name=stem (read_dir is non-recursive, skips subdirectories)
+        let mem_dir = data_dir.join("memory");
+        if mem_dir.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&mem_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+                        let name = path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if !content.trim().is_empty() {
+                                insert("global", &name, &content);
+                                rename_to_bak(&path);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Import memory/daily/*.md → name="daily/YYYY-MM-DD"
+            let daily_dir = mem_dir.join("daily");
+            if daily_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&daily_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+                            let stem = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            let name = format!("daily/{stem}");
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if !content.trim().is_empty() {
+                                    insert("global", &name, &content);
+                                    rename_to_bak(&path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Warn about scopes/ if it exists
+            if mem_dir.join("scopes").is_dir() {
+                tracing::warn!(
+                    "V34 migration: memory/scopes/ exists — these files were not auto-migrated. \
+                     Use write_memory with scope parameter to migrate manually."
+                );
+            }
+        }
+    }
+
+    /// Seed nightly and weekly memory consolidation scheduled tasks.
+    fn seed_consolidation_tasks(&self) -> Result<()> {
+        const NIGHTLY_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0001";
+        const WEEKLY_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0002";
+
+        let now = chrono::Utc::now().timestamp();
+
+        // Nightly consolidation: 3 AM daily
+        const NIGHTLY_CRON: &str = "0 0 3 * * *";
+        let next_nightly = crate::tasks::calculate_next_run("cron", NIGHTLY_CRON)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO scheduled_tasks
+             (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
+            params![
+                NIGHTLY_TASK_ID,
+                "Nightly Memory Consolidation",
+                "Review today's sessions and extract durable information into long-term memory. \
+                 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
+                 Never duplicate information already in existing memory entries. When in doubt, keep the information.",
+                "cron",
+                NIGHTLY_CRON,
+                "local",
+                next_nightly,
+                now,
+                "write_memory,read_memory,memory_search",
+            ],
+        )?;
+
+        // Weekly consolidation: 4 AM Sunday
+        const WEEKLY_CRON: &str = "0 0 4 * * 7";
+        let next_weekly = crate::tasks::calculate_next_run("cron", WEEKLY_CRON)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO scheduled_tasks
+             (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
+            params![
+                WEEKLY_TASK_ID,
+                "Weekly Memory Maintenance",
+                "Review all long-term memory for: (a) duplicate information across entries, \
+                 (b) outdated information superseded by newer entries, (c) entries that should be merged, \
+                 (d) overly verbose entries that can be tightened. \
+                 Never delete information unless it is provably superseded. When in doubt, keep it.",
+                "cron",
+                WEEKLY_CRON,
+                "local",
+                next_weekly,
+                now,
+                "write_memory,read_memory,memory_search",
+            ],
+        )?;
+
+        Ok(())
+    }
 }

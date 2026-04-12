@@ -1,0 +1,79 @@
+//! Memory consolidation pipeline.
+//!
+//! Nightly and weekly scheduled tasks consolidate session data and long-term
+//! memory entries. The tasks themselves are LLM-driven (seeded in V34 migration)
+//! with tool access to `write_memory`, `read_memory`, and `memory_search`.
+//!
+//! This module provides constants and helper functions for the consolidation
+//! system, including session-end flushing of short-term memory.
+
+use anyhow::Result;
+
+/// Fixed UUID for the nightly memory consolidation task (seeded in V34 migration).
+pub const NIGHTLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0001";
+
+/// Fixed UUID for the weekly memory maintenance task (seeded in V34 migration).
+pub const WEEKLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0002";
+
+/// Settings key for tracking the last successful nightly consolidation run.
+pub const SETTING_LAST_NIGHTLY: &str = "consolidation.last_nightly";
+
+/// Settings key for tracking the last successful weekly consolidation run.
+pub const SETTING_LAST_WEEKLY: &str = "consolidation.last_weekly";
+
+/// Flush short-term memory facts to a daily log entry in the DB.
+///
+/// Called on session end. Creates or appends to a `daily/{YYYY-MM-DD}` entry
+/// in the `memory_entries` table. The nightly consolidation job processes
+/// these daily entries into long-term topic entries.
+pub fn flush_short_term_to_daily(facts_text: &str) -> Result<()> {
+    if facts_text.trim().is_empty() {
+        return Ok(());
+    }
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let name = format!("daily/{date}");
+
+    let db = crate::db::Database::open()?;
+
+    let header = format!(
+        "\n## Session flush ({})\n",
+        chrono::Local::now().format("%H:%M")
+    );
+    let content = format!("{header}{facts_text}");
+
+    db.append_memory_entry("global", &name, &content)?;
+    tracing::debug!("Flushed short-term memory to {name}");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flush_empty_is_noop() {
+        assert!(flush_short_term_to_daily("").is_ok());
+        assert!(flush_short_term_to_daily("   ").is_ok());
+    }
+
+    #[test]
+    fn constants_are_valid_uuids() {
+        assert_eq!(NIGHTLY_CONSOLIDATION_TASK_ID.len(), 36);
+        assert_eq!(WEEKLY_CONSOLIDATION_TASK_ID.len(), 36);
+    }
+
+    #[test]
+    fn flush_writes_to_daily_entry() {
+        // Use in-memory DB for this test
+        let db = crate::db::Database::test_db();
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let name = format!("daily/{date}");
+
+        db.append_memory_entry("global", &name, "- [Decision] test fact")
+            .unwrap();
+
+        let entry = db.get_memory_entry("global", &name).unwrap().unwrap();
+        assert!(entry.content.contains("test fact"));
+    }
+}

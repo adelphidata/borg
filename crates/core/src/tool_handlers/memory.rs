@@ -4,7 +4,7 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::db::Database;
 use crate::embeddings;
-use crate::memory::{read_memory, write_memory_scoped, WriteMode};
+use crate::memory::{read_memory_db, write_memory_db, WriteMode};
 use crate::mmr;
 
 use super::{
@@ -21,12 +21,16 @@ pub fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
         WriteMode::Overwrite
     };
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    write_memory_scoped(filename, content, mode, scope)
+    // Strip .md extension for DB entry names (backward compat with old tool calls)
+    let name = filename.strip_suffix(".md").unwrap_or(filename);
+    write_memory_db(name, content, mode, scope)
 }
 
 pub fn handle_read_memory(args: &serde_json::Value) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
-    read_memory(filename)
+    let name = filename.strip_suffix(".md").unwrap_or(filename);
+    let scope = optional_str_param(args, "scope").unwrap_or("global");
+    read_memory_db(name, scope)
 }
 
 /// Chunk metadata: (snippet, start_line, end_line).
@@ -187,14 +191,17 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
                         }
                     };
                     for (c, score) in fts_rows {
+                        // Discount individual term scores so they rank below phrase matches
+                        const TERM_FALLBACK_DISCOUNT: f32 = 0.7;
+                        let adjusted = score * TERM_FALLBACK_DISCOUNT;
                         let key = (c.filename.clone(), c.chunk_index);
-                        if score >= min_score && seen.insert(key) {
+                        if adjusted >= min_score && seen.insert(key) {
                             all_results.push(embeddings::SearchResult {
                                 filename: c.filename,
                                 chunk_index: c.chunk_index,
                                 start_line: c.start_line,
                                 end_line: c.end_line,
-                                score,
+                                score: adjusted,
                                 snippet: c.content,
                             });
                         }

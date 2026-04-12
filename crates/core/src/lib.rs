@@ -19,6 +19,8 @@ pub mod claude_cli;
 pub mod config;
 /// File watcher for live config reloading.
 pub mod config_watcher;
+/// Memory consolidation pipeline (nightly/weekly scheduled tasks).
+pub mod consolidation;
 /// Global constants (token limits, timeouts, etc.).
 pub mod constants;
 /// Conversation context management and compaction.
@@ -65,8 +67,6 @@ pub mod media;
 pub mod media_understanding;
 /// Memory loading with token budget and semantic search.
 pub mod memory;
-/// File watcher for auto-re-indexing memory files.
-pub mod memory_watcher;
 /// Migration utilities for importing from other assistants.
 pub mod migrate;
 /// MMR diversity re-ranking (Jaccard similarity, greedy selection).
@@ -101,6 +101,8 @@ pub mod session;
 pub mod session_indexer;
 /// Settings resolver: DB → TOML → compiled defaults.
 pub mod settings;
+/// Short-term (working) memory for the current session.
+pub mod short_term_memory;
 /// Security validation for user-defined skills.
 pub mod skill_security;
 /// Skills loading, parsing, and progressive token budgeting.
