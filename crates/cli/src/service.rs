@@ -1066,6 +1066,55 @@ fn parse_delivery_target(target: &str) -> DeliveryTarget {
     }
 }
 
+/// Send a message to a specific sender on a channel, creating the appropriate client.
+///
+/// Supports Telegram, Slack, and Discord. For Telegram, `thread_id` maps to
+/// `message_thread_id` (forum topics). For Discord, `thread_id` is used as the
+/// channel_id (threads are first-class channels). For Slack, `thread_id` is passed
+/// as `thread_ts`.
+async fn send_to_channel(
+    config: &Config,
+    channel: &str,
+    sender_id: &str,
+    text: &str,
+    thread_id: Option<&str>,
+) -> anyhow::Result<()> {
+    match channel {
+        "telegram" => {
+            let token = config
+                .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
+            let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
+            let chat_id: i64 = sender_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
+            let message_thread_id: Option<i64> = thread_id.and_then(|s| s.parse().ok());
+            client
+                .send_message(chat_id, text, None, None, message_thread_id)
+                .await
+        }
+        "slack" => {
+            let token = config
+                .resolve_credential_or_env("SLACK_BOT_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("SLACK_BOT_TOKEN not configured"))?;
+            let client = borg_gateway::slack::api::SlackClient::new(&token)?;
+            client
+                .post_message(sender_id, text, thread_id)
+                .await
+                .map(|_| ())
+        }
+        "discord" => {
+            let token = config
+                .resolve_credential_or_env("DISCORD_BOT_TOKEN")
+                .ok_or_else(|| anyhow::anyhow!("DISCORD_BOT_TOKEN not configured"))?;
+            let client = borg_gateway::discord::api::DiscordClient::new(&token)?;
+            let channel_id = thread_id.unwrap_or(sender_id);
+            client.send_message(channel_id, text).await
+        }
+        other => anyhow::bail!("Channel '{other}' not supported for delivery"),
+    }
+}
+
 async fn deliver_task_result(
     channel: &str,
     target: &str,
@@ -1082,57 +1131,17 @@ async fn deliver_task_result(
     }
     let parsed = parse_delivery_target(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    let result = match channel {
-        "telegram" => send_telegram(config, &parsed, &msg).await,
-        "slack" => send_slack(config, &parsed, &msg).await,
-        "discord" => send_discord(config, &parsed, &msg).await,
-        _ => {
-            tracing::warn!("Unknown delivery channel: {channel}");
-            return;
-        }
-    };
-    if let Err(e) = result {
+    if let Err(e) = send_to_channel(
+        config,
+        channel,
+        &parsed.sender,
+        &msg,
+        parsed.thread_id.as_deref(),
+    )
+    .await
+    {
         tracing::warn!("Failed to deliver task result via {channel}: {e}");
     }
-}
-
-async fn send_telegram(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
-    let token = config
-        .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("missing TELEGRAM_BOT_TOKEN"))?;
-    let chat_id: i64 = target
-        .sender
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid chat_id: {}", target.sender))?;
-    // Telegram forum topics use message_thread_id (i32); our string thread_id
-    // carries that value when the task was spawned from a forum topic.
-    let message_thread_id: Option<i64> = target.thread_id.as_deref().and_then(|s| s.parse().ok());
-    let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
-    client
-        .send_message(chat_id, msg, None, None, message_thread_id)
-        .await
-}
-
-async fn send_slack(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
-    let token = config
-        .resolve_credential_or_env("SLACK_BOT_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("missing SLACK_BOT_TOKEN"))?;
-    let client = borg_gateway::slack::api::SlackClient::new(&token)?;
-    client
-        .post_message(&target.sender, msg, target.thread_id.as_deref())
-        .await
-        .map(|_| ())
-}
-
-async fn send_discord(config: &Config, target: &DeliveryTarget, msg: &str) -> anyhow::Result<()> {
-    let token = config
-        .resolve_credential_or_env("DISCORD_BOT_TOKEN")
-        .ok_or_else(|| anyhow::anyhow!("missing DISCORD_BOT_TOKEN"))?;
-    let client = borg_gateway::discord::api::DiscordClient::new(&token)?;
-    // Discord threads are first-class channels with their own channel_id; if
-    // the task captured a thread_id, post directly into the thread channel.
-    let channel_id = target.thread_id.as_deref().unwrap_or(&target.sender);
-    client.send_message(channel_id, msg).await
 }
 
 /// Returns true if the response hash is a duplicate within the dedup time window.
@@ -1481,83 +1490,37 @@ async fn deliver_to_sender(
         }
     };
 
-    match channel_name {
-        "telegram" => {
-            let token = config
-                .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
-                .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
-            let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
-            let chat_id: i64 = sender_id
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
-            client.send_message(chat_id, text, None, None, None).await?;
-            tracing::info!("Heartbeat delivered to telegram:{sender_id}");
+    match send_to_channel(config, channel_name, sender_id, text, None).await {
+        Ok(()) => {
+            tracing::info!("Heartbeat delivered to {channel_name}:{sender_id}");
             if let Ok(adb) = borg_core::db::Database::open() {
                 borg_core::activity_log::log_activity(
                     &adb,
                     "info",
                     "heartbeat",
-                    &format!("Heartbeat delivered to telegram:{sender_id}"),
+                    &format!("Heartbeat delivered to {channel_name}:{sender_id}"),
                 );
             }
         }
-        "slack" => {
-            let token = config
-                .resolve_credential_or_env("SLACK_BOT_TOKEN")
-                .ok_or_else(|| anyhow::anyhow!("SLACK_BOT_TOKEN not configured"))?;
-            let client = borg_gateway::slack::api::SlackClient::new(&token)?;
-            client.post_message(sender_id, text, None).await?;
-            tracing::info!("Heartbeat delivered to slack:{sender_id}");
-            if let Ok(adb) = borg_core::db::Database::open() {
-                borg_core::activity_log::log_activity(
-                    &adb,
-                    "info",
-                    "heartbeat",
-                    &format!("Heartbeat delivered to slack:{sender_id}"),
-                );
-            }
+        Err(e) if e.to_string().contains("not supported for delivery") => {
+            tracing::debug!(
+                "Heartbeat: channel '{channel_name}' not supported for native delivery"
+            );
         }
-        other => {
-            tracing::debug!("Heartbeat: channel '{other}' not supported for native delivery");
-        }
+        Err(e) => return Err(e),
     }
 
     Ok(())
 }
 
 /// Send a plain text message to a specific sender on a specific channel.
-///
-/// Supports Telegram and Slack native clients. Returns an error for
-/// unsupported channels or missing credentials.
 async fn deliver_message_to_sender(
     config: &Config,
     channel_name: &str,
     sender_id: &str,
     text: &str,
 ) -> Result<()> {
-    match channel_name {
-        "telegram" => {
-            let token = config
-                .resolve_credential_or_env("TELEGRAM_BOT_TOKEN")
-                .ok_or_else(|| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not configured"))?;
-            let client = borg_gateway::telegram::api::TelegramClient::new(&token)?;
-            let chat_id: i64 = sender_id
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid Telegram chat_id: {sender_id}"))?;
-            client.send_message(chat_id, text, None, None, None).await?;
-        }
-        "slack" => {
-            let token = config
-                .resolve_credential_or_env("SLACK_BOT_TOKEN")
-                .ok_or_else(|| anyhow::anyhow!("SLACK_BOT_TOKEN not configured"))?;
-            let client = borg_gateway::slack::api::SlackClient::new(&token)?;
-            client.post_message(sender_id, text, None).await?;
-        }
-        other => {
-            anyhow::bail!("Channel '{other}' not supported for message delivery");
-        }
-    }
-    Ok(())
+    send_to_channel(config, channel_name, sender_id, text, None).await
 }
 
 /// Deliver an evolution celebration message to all configured heartbeat channels.

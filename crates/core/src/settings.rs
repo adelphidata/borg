@@ -135,7 +135,7 @@ impl SettingsResolver {
 }
 
 /// Extract the current string value of a config key.
-fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
+pub fn config_value_for_key(config: &Config, key: &str) -> Option<String> {
     SETTING_REGISTRY
         .iter()
         .find(|(k, _)| *k == key)

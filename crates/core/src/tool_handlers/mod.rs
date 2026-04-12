@@ -40,30 +40,60 @@ where
     }
 }
 
+/// Typed wrapper for tool call arguments, providing chainable parameter extraction.
+pub struct ToolArgs<'a>(pub &'a serde_json::Value);
+
+impl<'a> ToolArgs<'a> {
+    pub fn require_str(&self, name: &str) -> Result<&'a str> {
+        self.0[name]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter '{name}'."))
+    }
+
+    pub fn opt_str(&self, name: &str) -> Option<&'a str> {
+        self.0[name].as_str()
+    }
+
+    pub fn opt_u64(&self, name: &str, default: u64) -> u64 {
+        self.0[name].as_u64().unwrap_or(default)
+    }
+
+    pub fn opt_bool(&self, name: &str, default: bool) -> bool {
+        self.0[name].as_bool().unwrap_or(default)
+    }
+
+    pub fn opt_i64(&self, name: &str) -> Option<i64> {
+        self.0[name].as_i64()
+    }
+
+    pub fn opt_f64(&self, name: &str, default: f64) -> f64 {
+        self.0[name].as_f64().unwrap_or(default)
+    }
+}
+
+// Legacy free-function API — delegates to ToolArgs.
 pub fn require_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Result<&'a str> {
-    args[name]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing required parameter '{name}'."))
+    ToolArgs(args).require_str(name)
 }
 
 pub fn optional_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Option<&'a str> {
-    args[name].as_str()
+    ToolArgs(args).opt_str(name)
 }
 
 pub fn optional_u64_param(args: &serde_json::Value, name: &str, default: u64) -> u64 {
-    args[name].as_u64().unwrap_or(default)
+    ToolArgs(args).opt_u64(name, default)
 }
 
 pub fn optional_bool_param(args: &serde_json::Value, name: &str, default: bool) -> bool {
-    args[name].as_bool().unwrap_or(default)
+    ToolArgs(args).opt_bool(name, default)
 }
 
 pub fn optional_i64_param(args: &serde_json::Value, name: &str) -> Option<i64> {
-    args[name].as_i64()
+    ToolArgs(args).opt_i64(name)
 }
 
 pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) -> f64 {
-    args[name].as_f64().unwrap_or(default)
+    ToolArgs(args).opt_f64(name, default)
 }
 
 // ── Re-exports ──

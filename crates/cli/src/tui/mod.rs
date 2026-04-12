@@ -1646,12 +1646,16 @@ mod tests {
 
     #[test]
     fn app_rs_code_contains_no_forbidden_mouse_modes() {
-        let src = include_str!("app.rs");
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
         let code = strip_tests_and_comments(src);
         for mode in FORBIDDEN_MODES {
             assert!(
                 !code.contains(mode),
-                "crates/cli/src/tui/app.rs code contains forbidden mouse mode {mode}. \
+                "crates/cli/src/tui/app/ code contains forbidden mouse mode {mode}. \
                  No mouse tracking mode may be referenced from app code — mouse events \
                  are not delivered to the app at all (wheel → arrow keys via ?1007h)."
             );
@@ -1677,17 +1681,21 @@ mod tests {
 
     #[test]
     fn app_rs_has_no_event_mouse_match_arm() {
-        let src = include_str!("app.rs");
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
         let code = strip_tests_and_comments(src);
         assert!(
             !code.contains("Event::Mouse("),
-            "app.rs must not match Event::Mouse — we do not enable mouse \
+            "app/ must not match Event::Mouse — we do not enable mouse \
              tracking, and adding such a handler would require enabling a \
              forbidden mode."
         );
         assert!(
             !code.contains("fn handle_mouse"),
-            "app.rs must not define handle_mouse — there is no mouse event \
+            "app/ must not define handle_mouse — there is no mouse event \
              source. Wheel is routed as KeyCode::Up/Down via ?1007h and \
              handled in handle_key."
         );
@@ -1695,11 +1703,15 @@ mod tests {
 
     #[test]
     fn app_rs_has_no_mouse_event_kind_references() {
-        let src = include_str!("app.rs");
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
         let code = strip_tests_and_comments(src);
         assert!(
             !code.contains("MouseEventKind"),
-            "app.rs must not reference crossterm::event::MouseEventKind — \
+            "app/ must not reference crossterm::event::MouseEventKind — \
              mouse events are not delivered to this crate."
         );
     }

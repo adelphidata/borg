@@ -232,50 +232,8 @@ impl SettingsPopup {
                     .map(|(_, display)| display.to_string())
                     .unwrap_or_else(|| config.llm.model.clone())
             }
-            "temperature" => format!("{}", config.llm.temperature),
-            "max_tokens" => format!("{}", config.llm.max_tokens),
-            "sandbox.enabled" => format!("{}", config.sandbox.enabled),
-            "sandbox.mode" => config.sandbox.mode.clone(),
-            "memory.max_context_tokens" => format!("{}", config.memory.max_context_tokens),
-            "skills.enabled" => format!("{}", config.skills.enabled),
-            "skills.max_context_tokens" => format!("{}", config.skills.max_context_tokens),
-            "conversation.max_iterations" => format!("{}", config.conversation.max_iterations),
-            "conversation.show_thinking" => format!("{}", config.conversation.show_thinking),
-            "conversation.tool_output_max_tokens" => {
-                format!("{}", config.conversation.tool_output_max_tokens)
-            }
-            "conversation.compaction_marker_tokens" => {
-                format!("{}", config.conversation.compaction_marker_tokens)
-            }
-            "conversation.max_transcript_chars" => {
-                format!("{}", config.conversation.max_transcript_chars)
-            }
-            "security.secret_detection" => format!("{}", config.security.secret_detection),
-            "budget.monthly_token_limit" => format!("{}", config.budget.monthly_token_limit),
-            "budget.warning_threshold" => format!("{}", config.budget.warning_threshold),
-            "gateway.max_body_size" => format!("{}", config.gateway.max_body_size),
-            "gateway.telegram_poll_timeout_secs" => {
-                format!("{}", config.gateway.telegram_poll_timeout_secs)
-            }
-            "gateway.telegram_circuit_failure_threshold" => {
-                format!("{}", config.gateway.telegram_circuit_failure_threshold)
-            }
-            "gateway.telegram_circuit_suspension_secs" => {
-                format!("{}", config.gateway.telegram_circuit_suspension_secs)
-            }
-            "gateway.telegram_dedup_capacity" => {
-                format!("{}", config.gateway.telegram_dedup_capacity)
-            }
-            "tts.enabled" => format!("{}", config.tts.enabled),
-            "tts.auto_mode" => format!("{}", config.tts.auto_mode),
-            "tts.default_voice" => config.tts.default_voice.clone(),
-            "tts.default_format" => config.tts.default_format.clone(),
-            "conversation.collaboration_mode" => {
-                format!("{}", config.conversation.collaboration_mode)
-            }
-            "evolution.enabled" => format!("{}", config.evolution.enabled),
-            "workflow.enabled" => config.workflow.enabled.clone(),
-            _ => "?".to_string(),
+            _ => borg_core::settings::config_value_for_key(config, key)
+                .unwrap_or_else(|| "?".to_string()),
         }
     }
 
