@@ -315,6 +315,10 @@ pub async fn generate_embedding_cached(
             db.get_cached_embedding(&provider.endpoint, &provider.model, &hash)
         {
             debug!("Embedding cache hit for hash {}", &hash[..8]);
+            // Best-effort: update last_accessed_at so TTL pruning reflects actual usage.
+            if let Err(e) = db.touch_cache_entry(&provider.endpoint, &provider.model, &hash) {
+                tracing::debug!("touch_cache_entry failed: {e}");
+            }
             return bytes_to_embedding(&cached_bytes);
         }
     }

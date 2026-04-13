@@ -343,17 +343,37 @@ impl Database {
     // ── Memory Entries CRUD ──
 
     /// Insert or update a memory entry. Computes content_hash automatically.
+    ///
+    /// Also invalidates stale embeddings and chunks for the replaced entry so
+    /// search results don't surface outdated content. Runs in an immediate
+    /// transaction to keep the entry row and its index entries consistent.
     pub fn upsert_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
         use sha2::{Digest, Sha256};
+        debug_assert!(
+            self.conn.is_autocommit(),
+            "upsert_memory_entry must not be called from within another transaction"
+        );
         let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(scope, name) DO UPDATE SET
                 content = ?3, content_hash = ?4, updated_at = ?5",
             params![scope, name, content, hash, now],
         )?;
+        // Stale search-index cleanup: embeddings and chunks will be regenerated
+        // by the caller's background embedding task after this returns.
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -379,12 +399,27 @@ impl Database {
         Ok(row)
     }
 
-    /// Delete a memory entry. Returns true if a row was deleted.
+    /// Delete a memory entry along with its embeddings and chunks.
+    /// Returns true if the entry row was deleted.
     pub fn delete_memory_entry(&self, scope: &str, name: &str) -> Result<bool> {
-        let count = self.conn.execute(
+        debug_assert!(
+            self.conn.is_autocommit(),
+            "delete_memory_entry must not be called from within another transaction"
+        );
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let count = tx.execute(
             "DELETE FROM memory_entries WHERE scope = ?1 AND name = ?2",
             params![scope, name],
         )?;
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.commit()?;
         Ok(count > 0)
     }
 
@@ -411,13 +446,50 @@ impl Database {
     }
 
     /// Append content to an existing memory entry, or create it if it doesn't exist.
+    ///
+    /// Runs in an immediate transaction so concurrent appenders don't interleave a
+    /// read-modify-write and drop one another's writes. Also invalidates stale
+    /// embeddings/chunks so the background re-embedder produces a fresh index.
     pub fn append_memory_entry(&self, scope: &str, name: &str, content: &str) -> Result<()> {
-        let existing = self.get_memory_entry(scope, name)?;
+        use sha2::{Digest, Sha256};
+        debug_assert!(
+            self.conn.is_autocommit(),
+            "append_memory_entry must not be called from within another transaction"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT content FROM memory_entries WHERE scope = ?1 AND name = ?2",
+                params![scope, name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
         let new_content = match existing {
-            Some(entry) => format!("{}\n{}", entry.content, content),
+            Some(prev) => {
+                let sep = if prev.ends_with('\n') { "" } else { "\n" };
+                format!("{prev}{sep}{content}")
+            }
             None => content.to_string(),
         };
-        self.upsert_memory_entry(scope, name, &new_content)
+        let hash = format!("{:x}", Sha256::digest(new_content.as_bytes()));
+        tx.execute(
+            "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+             ON CONFLICT(scope, name) DO UPDATE SET
+                content = ?3, content_hash = ?4, updated_at = ?5",
+            params![scope, name, new_content, hash, now],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_embeddings WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.execute(
+            "DELETE FROM memory_chunks WHERE scope = ?1 AND filename = ?2",
+            params![scope, name],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Count memory entries for a scope.
@@ -961,5 +1033,96 @@ mod tests {
         // Verify no error — the timestamp was updated
         let result = db.get_cached_embedding("p", "m", "h1").unwrap();
         assert!(result.is_some());
+    }
+
+    // ── Orphan cleanup on upsert/delete ──
+
+    #[test]
+    fn delete_memory_entry_clears_embeddings_and_chunks() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "notes", "body").unwrap();
+        db.upsert_embedding("global", "notes", "h", &[1, 2], 2, "m")
+            .unwrap();
+        let chunks = vec![ChunkData {
+            chunk_index: 0,
+            start_line: None,
+            end_line: None,
+            content: "body".into(),
+            content_hash: "h".into(),
+            embedding: None,
+            dimension: None,
+            model: None,
+        }];
+        db.upsert_chunks("global", "notes", &chunks).unwrap();
+
+        assert!(db.get_embedding("global", "notes").unwrap().is_some());
+        assert!(!db
+            .get_chunks_for_file("global", "notes")
+            .unwrap()
+            .is_empty());
+
+        let deleted = db.delete_memory_entry("global", "notes").unwrap();
+        assert!(deleted);
+        assert!(db.get_memory_entry("global", "notes").unwrap().is_none());
+        assert!(
+            db.get_embedding("global", "notes").unwrap().is_none(),
+            "embedding row should be removed when entry is deleted"
+        );
+        assert!(
+            db.get_chunks_for_file("global", "notes")
+                .unwrap()
+                .is_empty(),
+            "chunks should be removed when entry is deleted"
+        );
+    }
+
+    #[test]
+    fn upsert_memory_entry_invalidates_stale_search_index() {
+        let db = test_db();
+        db.upsert_memory_entry("global", "notes", "v1").unwrap();
+        db.upsert_embedding("global", "notes", "old-hash", &[9], 1, "m")
+            .unwrap();
+
+        // Rewriting the entry should invalidate the stale embedding so the
+        // re-embedding pipeline can rebuild it from the new content.
+        db.upsert_memory_entry("global", "notes", "v2-new-content")
+            .unwrap();
+        assert!(
+            db.get_embedding("global", "notes").unwrap().is_none(),
+            "stale embedding should be purged on content update"
+        );
+    }
+
+    #[test]
+    fn append_memory_entry_avoids_double_newline() {
+        let db = test_db();
+        // Pre-seed an entry that already ends in a newline.
+        db.upsert_memory_entry("global", "log", "line 1\n").unwrap();
+        db.append_memory_entry("global", "log", "line 2").unwrap();
+
+        let entry = db.get_memory_entry("global", "log").unwrap().unwrap();
+        // No blank line between the existing trailing newline and the new content.
+        assert_eq!(entry.content, "line 1\nline 2");
+    }
+
+    #[test]
+    fn append_memory_entry_is_single_transaction() {
+        // Regression guard: the append path should complete an entire
+        // read-modify-write under one Immediate transaction rather than two
+        // separate statements (which the prior implementation did and which
+        // allowed concurrent appenders to clobber each other).
+        let db = test_db();
+        db.append_memory_entry("global", "t", "a").unwrap();
+        db.append_memory_entry("global", "t", "b").unwrap();
+        db.append_memory_entry("global", "t", "c").unwrap();
+
+        let entry = db.get_memory_entry("global", "t").unwrap().unwrap();
+        assert!(entry.content.contains("a"));
+        assert!(entry.content.contains("b"));
+        assert!(entry.content.contains("c"));
+        // Content hash should reflect final text.
+        use sha2::{Digest, Sha256};
+        let expected = format!("{:x}", Sha256::digest(entry.content.as_bytes()));
+        assert_eq!(entry.content_hash, expected);
     }
 }

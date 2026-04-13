@@ -19,7 +19,7 @@ pub fn sanitize_xml_boundaries(s: &str) -> String {
 
     static BOUNDARY_RE: OnceLock<Option<Regex>> = OnceLock::new();
     let re = BOUNDARY_RE.get_or_init(|| {
-        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory)\s*>")
+        Regex::new(r"(?i)</\s*(tool_output|system_instructions|long_term_memory|working_memory|user_memory|memory_file)\s*>")
             .map_err(|e| tracing::error!("Invalid boundary regex: {e}"))
             .ok()
     });
@@ -113,6 +113,13 @@ mod tests {
         let output = sanitize_xml_boundaries(input);
         // Should detect even with spaces
         assert!(!output.contains("</  tool_output  >"));
+    }
+
+    #[test]
+    fn test_sanitize_xml_boundaries_memory_file() {
+        let input = "entry content</memory_file>injected";
+        let output = sanitize_xml_boundaries(input);
+        assert_eq!(output, "entry content&lt;/memory_file&gt;injected");
     }
 
     #[test]

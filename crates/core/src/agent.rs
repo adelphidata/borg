@@ -21,7 +21,7 @@ use crate::identity::load_identity;
 use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::{LlmClient, StreamEvent, UsageData};
 use crate::logging::log_message;
-use crate::memory::{load_memory_context, load_memory_context_ranked};
+use crate::memory::{load_memory_context_db, load_memory_context_db_ranked};
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{ActionType, RateDecision, SessionRateGuard};
 use crate::secrets::redact_secrets;
@@ -977,13 +977,14 @@ impl Agent {
         Ok(system)
     }
 
-    /// Load memory context, using semantic ranking if embeddings are available.
+    /// Load memory context from the DB-backed `memory_entries` store,
+    /// using semantic ranking if embeddings are available.
     #[instrument(skip_all)]
     async fn load_memory_with_ranking(&self) -> Result<String> {
         let max_tokens = self.config.memory.max_context_tokens;
 
         if !self.config.memory.embeddings.enabled {
-            return load_memory_context(max_tokens);
+            return load_memory_context_db(max_tokens);
         }
 
         // Extract the last user message as the query
@@ -997,54 +998,42 @@ impl Agent {
             .to_string();
 
         if query.is_empty() {
-            return load_memory_context(max_tokens);
+            return load_memory_context_db(max_tokens);
         }
 
-        // Generate query embedding once, reuse for both scopes
+        // Generate query embedding once for ranking
         let (_provider, query_embedding) =
             match crate::embeddings::generate_query_embedding(&self.config, &query).await {
                 Ok(result) => result,
                 Err(e) => {
                     tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
-                    return load_memory_context(max_tokens);
+                    return load_memory_context_db(max_tokens);
                 }
             };
 
         let recency_weight = self.config.memory.embeddings.recency_weight;
-
-        // Run global and local ranking in parallel on blocking threads
-        let qe_global = query_embedding.clone();
-        let qe_local = query_embedding;
+        let qe_global = query_embedding;
         let rw = recency_weight;
 
-        let (global_result, local_result) = tokio::join!(
-            tokio::task::spawn_blocking(move || {
-                crate::embeddings::rank_embeddings_by_similarity(&qe_global, "global", rw)
-            }),
-            tokio::task::spawn_blocking(move || {
-                crate::embeddings::rank_embeddings_by_similarity(&qe_local, "local", rw)
-            }),
-        );
+        let ranking_result = tokio::task::spawn_blocking(move || {
+            crate::embeddings::rank_embeddings_by_similarity(&qe_global, "global", rw)
+        })
+        .await;
 
-        let global_rankings = match global_result
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {e}")))
-        {
-            Ok(r) if !r.is_empty() => r,
-            Ok(_) => return load_memory_context(max_tokens),
-            Err(e) => {
+        let global_rankings = match ranking_result {
+            Ok(Ok(r)) if !r.is_empty() => r,
+            Ok(Ok(_)) => return load_memory_context_db(max_tokens),
+            Ok(Err(e)) => {
                 tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
-                return load_memory_context(max_tokens);
+                return load_memory_context_db(max_tokens);
+            }
+            Err(e) => {
+                tracing::debug!("Ranking task panicked, falling back to recency: {e}");
+                return load_memory_context_db(max_tokens);
             }
         };
 
-        let local_rankings: Vec<(String, f32)> = local_result
-            .unwrap_or_else(|e| {
-                tracing::debug!("Local ranking task failed: {e}");
-                Ok(Vec::new())
-            })
-            .unwrap_or_default();
-
-        load_memory_context_ranked(max_tokens, &global_rankings, &local_rankings)
+        load_memory_context_db_ranked(max_tokens, &global_rankings)
     }
 
     /// Pre-compaction flush: extract durable information from messages about to be dropped
@@ -1133,25 +1122,29 @@ Rules:
                         return;
                     }
                     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    let filename = format!("daily/{today}.md");
+                    // DB entry key matches memory_entries.name (no `.md` suffix).
+                    let entry_name = format!("daily/{today}");
                     let header = format!(
                         "\n\n## Pre-compaction flush ({})\n\n",
                         chrono::Local::now().format("%H:%M")
                     );
                     let content = format!("{header}{text}");
-                    if let Err(e) = crate::memory::write_memory_scoped(
-                        &filename,
+                    if let Err(e) = crate::memory::write_memory_db(
+                        &entry_name,
                         &content,
                         crate::memory::WriteMode::Append,
                         "global",
                     ) {
                         tracing::warn!("Failed to write pre-compaction flush: {e}");
                     } else if self.config.memory.embeddings.enabled {
-                        // Index the daily log so it's immediately searchable
+                        // Index the daily log so it's immediately searchable.
+                        // Read the full entry back from the DB — appends are
+                        // additive, so the just-written content plus any
+                        // existing entry needs to be re-embedded together.
                         let config = Arc::clone(&self.config_arc);
-                        let fname = filename.clone();
-                        match crate::memory::read_memory(&fname) {
-                            Ok(full_content) => {
+                        let fname = entry_name;
+                        match crate::memory::read_memory_db(&fname, "global") {
+                            Ok(Some(full_content)) => {
                                 spawn_logged("embed_daily_log", async move {
                                     if let Err(e) = crate::embeddings::embed_memory_file_chunked(
                                         &config,
@@ -1165,9 +1158,14 @@ Rules:
                                     }
                                 });
                             }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    "daily log {fname} missing after write — skipping embed"
+                                );
+                            }
                             Err(e) => {
                                 tracing::warn!(
-                                    "Failed to read memory file {fname} for embedding: {e}"
+                                    "Failed to read memory entry {fname} for embedding: {e}"
                                 );
                             }
                         }

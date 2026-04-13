@@ -34,6 +34,10 @@ pub struct Database {
     /// Per-installation HMAC salt for event chain keys.
     /// Derived keys prevent cross-installation HMAC forgery.
     hmac_salt: Vec<u8>,
+    /// Filesystem renames deferred until after the migration transaction commits.
+    /// Keeps schema changes and filesystem moves atomic: if the migration rolls
+    /// back, the files stay in place and the next run can retry cleanly.
+    pending_post_migration_renames: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
 }
 
 impl Database {
@@ -99,6 +103,7 @@ impl Database {
         let db = Self {
             conn,
             hmac_salt: Vec::new(),
+            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
         };
         db.run_migrations()?;
         // Seed all SETTING_REGISTRY defaults into the settings table.
@@ -109,7 +114,16 @@ impl Database {
         Ok(Self {
             conn: db.conn,
             hmac_salt: salt,
+            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
         })
+    }
+
+    /// Queue a filesystem rename to execute after the migration transaction commits.
+    /// Used by migrations that need to mutate external state atomically with schema changes.
+    pub(crate) fn queue_post_migration_rename(&self, src: PathBuf, dst: PathBuf) {
+        self.pending_post_migration_renames
+            .borrow_mut()
+            .push((src, dst));
     }
 
     /// Get or create a per-installation random salt for HMAC key derivation.
@@ -253,6 +267,25 @@ impl Database {
 
         self.set_meta("schema_version", &Self::CURRENT_VERSION.to_string())?;
         tx.commit().context("Failed to commit migrations")?;
+
+        // Transaction committed: now perform any filesystem renames queued by
+        // migrations. Doing this after commit guarantees that if the DB
+        // rolls back, the source files remain untouched for a retry.
+        let renames = std::mem::take(&mut *self.pending_post_migration_renames.borrow_mut());
+        for (src, dst) in renames {
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => tracing::debug!(
+                    "post-migration rename: {} -> {}",
+                    src.display(),
+                    dst.display()
+                ),
+                Err(e) => tracing::warn!(
+                    "post-migration rename of {} -> {} failed: {e}",
+                    src.display(),
+                    dst.display()
+                ),
+            }
+        }
 
         // Run incremental vacuum after migrations to reclaim freed pages.
         self.conn.execute_batch("PRAGMA incremental_vacuum;")?;

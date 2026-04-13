@@ -4,7 +4,7 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::db::Database;
 use crate::embeddings;
-use crate::memory::{read_memory_db, write_memory_db, WriteMode};
+use crate::memory::{read_memory_db_or_not_found, write_memory_db, WriteMode};
 use crate::mmr;
 
 use super::{
@@ -30,7 +30,7 @@ pub fn handle_read_memory(args: &serde_json::Value) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let name = filename.strip_suffix(".md").unwrap_or(filename);
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    read_memory_db(name, scope)
+    read_memory_db_or_not_found(name, scope)
 }
 
 /// Chunk metadata: (snippet, start_line, end_line).

@@ -492,7 +492,7 @@ async fn spawn_workflow_step(
 
         // Execute via LLM (same pattern as execute_prompt_task)
         let identity = borg_core::identity::load_identity().unwrap_or_default();
-        let memory = borg_core::memory::load_memory_context(4000).unwrap_or_default();
+        let memory = borg_core::memory::load_memory_context_db(4000).unwrap_or_default();
         let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
         let system = format!("{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n{context}");
@@ -871,7 +871,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         config,
     } = ctx;
     let identity = borg_core::identity::load_identity().unwrap_or_default();
-    let memory = borg_core::memory::load_memory_context(4000).unwrap_or_default();
+    let memory = borg_core::memory::load_memory_context_db(4000).unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
     let system = format!(

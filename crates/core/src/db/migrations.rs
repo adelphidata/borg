@@ -971,8 +971,9 @@ impl Database {
     }
 
     /// Best-effort migration of existing `~/.borg/MEMORY.md` and `~/.borg/memory/*.md`
-    /// files into the `memory_entries` table. Renames migrated files to `.bak`.
-    /// Logs warnings on failure — never blocks the migration.
+    /// files into the `memory_entries` table. Queues `.bak` renames to be executed
+    /// after the migration transaction commits — if the DB rolls back, the source
+    /// files are left untouched for a clean retry on the next startup.
     fn migrate_memory_files_to_db(&self) {
         use sha2::{Digest, Sha256};
 
@@ -985,34 +986,41 @@ impl Database {
         };
         let now = chrono::Utc::now().timestamp();
 
-        let insert = |scope: &str, name: &str, content: &str| {
+        // Insert content into memory_entries AND queue the source file for a
+        // post-commit rename to `.bak`. Scans content for injection patterns
+        // first so migrated files are held to the same policy as new writes.
+        let import = |scope: &str, name: &str, content: &str, path: &std::path::Path| {
+            if let Err(e) = crate::memory::scan_for_injection(content) {
+                tracing::warn!(
+                    "V34 migration: skipping {} ({name}) — injection scan rejected: {e}",
+                    path.display()
+                );
+                return;
+            }
             let hash = format!("{:x}", Sha256::digest(content.as_bytes()));
-            if let Err(e) = self.conn.execute(
+            match self.conn.execute(
                 "INSERT OR IGNORE INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
                 params![scope, name, content, hash, now],
             ) {
-                tracing::warn!("V34 migration: failed to import {name}: {e}");
-            }
-        };
-
-        let rename_to_bak = |path: &std::path::Path| {
-            let bak = path.with_extension("md.bak");
-            if let Err(e) = std::fs::rename(path, &bak) {
-                tracing::warn!(
-                    "V34 migration: could not rename {} to .bak: {e}",
-                    path.display()
-                );
+                Ok(_) => {
+                    let bak = path.with_extension("md.bak");
+                    self.queue_post_migration_rename(path.to_path_buf(), bak);
+                }
+                Err(e) => tracing::warn!("V34 migration: failed to import {name}: {e}"),
             }
         };
 
         // Import MEMORY.md → name="INDEX"
         let memory_md = data_dir.join("MEMORY.md");
         if memory_md.exists() {
-            if let Ok(content) = std::fs::read_to_string(&memory_md) {
-                if !content.trim().is_empty() {
-                    insert("global", "INDEX", &content);
-                    rename_to_bak(&memory_md);
+            match std::fs::read_to_string(&memory_md) {
+                Ok(content) if !content.trim().is_empty() => {
+                    import("global", "INDEX", &content, &memory_md);
+                }
+                Ok(_) => tracing::debug!("V34 migration: MEMORY.md empty, skipping"),
+                Err(e) => {
+                    tracing::warn!("V34 migration: failed to read {}: {e}", memory_md.display())
                 }
             }
         }
@@ -1020,63 +1028,164 @@ impl Database {
         // Import memory/*.md → name=stem (read_dir is non-recursive, skips subdirectories)
         let mem_dir = data_dir.join("memory");
         if mem_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&mem_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
-                        let name = path
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if !content.trim().is_empty() {
-                                insert("global", &name, &content);
-                                rename_to_bak(&path);
+            match std::fs::read_dir(&mem_dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "V34 migration: read_dir entry error in {}: {e}",
+                                    mem_dir.display()
+                                );
+                                continue;
+                            }
+                        };
+                        let path = entry.path();
+                        if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
+                            let name = path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            match std::fs::read_to_string(&path) {
+                                Ok(content) if !content.trim().is_empty() => {
+                                    import("global", &name, &content, &path);
+                                }
+                                Ok(_) => tracing::debug!(
+                                    "V34 migration: {} empty, skipping",
+                                    path.display()
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "V34 migration: failed to read {}: {e}",
+                                    path.display()
+                                ),
                             }
                         }
                     }
                 }
+                Err(e) => tracing::warn!(
+                    "V34 migration: failed to read_dir {}: {e}",
+                    mem_dir.display()
+                ),
             }
 
             // Import memory/daily/*.md → name="daily/YYYY-MM-DD"
             let daily_dir = mem_dir.join("daily");
             if daily_dir.is_dir() {
-                if let Ok(entries) = std::fs::read_dir(&daily_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() && path.extension().map(|e| e == "md").unwrap_or(false) {
-                            let stem = path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string();
-                            let name = format!("daily/{stem}");
-                            if let Ok(content) = std::fs::read_to_string(&path) {
-                                if !content.trim().is_empty() {
-                                    insert("global", &name, &content);
-                                    rename_to_bak(&path);
+                match std::fs::read_dir(&daily_dir) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let entry = match entry {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "V34 migration: read_dir entry error in {}: {e}",
+                                        daily_dir.display()
+                                    );
+                                    continue;
+                                }
+                            };
+                            let path = entry.path();
+                            if path.is_file()
+                                && path.extension().map(|e| e == "md").unwrap_or(false)
+                            {
+                                let stem = path
+                                    .file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                let name = format!("daily/{stem}");
+                                match std::fs::read_to_string(&path) {
+                                    Ok(content) if !content.trim().is_empty() => {
+                                        import("global", &name, &content, &path);
+                                    }
+                                    Ok(_) => tracing::debug!(
+                                        "V34 migration: {} empty, skipping",
+                                        path.display()
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        "V34 migration: failed to read {}: {e}",
+                                        path.display()
+                                    ),
                                 }
                             }
                         }
                     }
+                    Err(e) => tracing::warn!(
+                        "V34 migration: failed to read_dir {}: {e}",
+                        daily_dir.display()
+                    ),
                 }
             }
 
-            // Warn about scopes/ if it exists
-            if mem_dir.join("scopes").is_dir() {
-                tracing::warn!(
-                    "V34 migration: memory/scopes/ exists — these files were not auto-migrated. \
-                     Use write_memory with scope parameter to migrate manually."
-                );
+            // Import memory/scopes/<scope>/*.md → scope=<scope>, name=stem
+            let scopes_dir = mem_dir.join("scopes");
+            if scopes_dir.is_dir() {
+                match std::fs::read_dir(&scopes_dir) {
+                    Ok(scope_entries) => {
+                        for scope_entry in scope_entries.flatten() {
+                            let scope_path = scope_entry.path();
+                            if !scope_path.is_dir() {
+                                continue;
+                            }
+                            let scope_name = scope_path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string();
+                            if scope_name.is_empty() {
+                                continue;
+                            }
+                            match std::fs::read_dir(&scope_path) {
+                                Ok(files) => {
+                                    for file in files.flatten() {
+                                        let path = file.path();
+                                        if path.is_file()
+                                            && path.extension().map(|e| e == "md").unwrap_or(false)
+                                        {
+                                            let name = path
+                                                .file_stem()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string();
+                                            match std::fs::read_to_string(&path) {
+                                                Ok(content) if !content.trim().is_empty() => {
+                                                    import(&scope_name, &name, &content, &path);
+                                                }
+                                                Ok(_) => tracing::debug!(
+                                                    "V34 migration: {} empty, skipping",
+                                                    path.display()
+                                                ),
+                                                Err(e) => tracing::warn!(
+                                                    "V34 migration: failed to read {}: {e}",
+                                                    path.display()
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    "V34 migration: failed to read_dir {}: {e}",
+                                    scope_path.display()
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        "V34 migration: failed to read_dir {}: {e}",
+                        scopes_dir.display()
+                    ),
+                }
             }
         }
     }
 
     /// Seed nightly and weekly memory consolidation scheduled tasks.
     fn seed_consolidation_tasks(&self) -> Result<()> {
-        const NIGHTLY_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0001";
-        const WEEKLY_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0002";
+        // Single source of truth for these UUIDs lives in crate::consolidation.
+        let nightly_task_id = crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
+        let weekly_task_id = crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
 
         let now = chrono::Utc::now().timestamp();
 
@@ -1088,7 +1197,7 @@ impl Database {
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
             params![
-                NIGHTLY_TASK_ID,
+                nightly_task_id,
                 "Nightly Memory Consolidation",
                 "Review today's sessions and extract durable information into long-term memory. \
                  For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
@@ -1110,7 +1219,7 @@ impl Database {
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
             params![
-                WEEKLY_TASK_ID,
+                weekly_task_id,
                 "Weekly Memory Maintenance",
                 "Review all long-term memory for: (a) duplicate information across entries, \
                  (b) outdated information superseded by newer entries, (c) entries that should be merged, \

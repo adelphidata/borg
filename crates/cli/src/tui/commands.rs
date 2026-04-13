@@ -216,7 +216,8 @@ impl App<'_> {
     }
 
     fn cmd_memory(&mut self) -> Result<AppAction> {
-        let memory = borg_core::memory::load_memory_context(self.config.memory.max_context_tokens)?;
+        let memory =
+            borg_core::memory::load_memory_context_db(self.config.memory.max_context_tokens)?;
         let text = if memory.is_empty() {
             "No memories loaded.".to_string()
         } else {
