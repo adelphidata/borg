@@ -13,10 +13,11 @@ const TIMESTAMP_REPLAY_WINDOW_SECS: u64 = crate::constants::SLACK_REPLAY_WINDOW_
 /// The signature is in the `X-Slack-Signature` header, and the timestamp is in
 /// `X-Slack-Request-Timestamp`.
 pub fn verify_slack_signature(headers: &HeaderMap, body: &str, signing_secret: &str) -> Result<()> {
-    let timestamp = headers
-        .get("x-slack-request-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing X-Slack-Request-Timestamp header"))?;
+    let timestamp = crate::verify_common::required_header(
+        headers,
+        "x-slack-request-timestamp",
+        "X-Slack-Request-Timestamp",
+    )?;
 
     // Replay protection: reject non-numeric or stale timestamps
     let ts: i64 = timestamp
@@ -27,10 +28,8 @@ pub fn verify_slack_signature(headers: &HeaderMap, body: &str, signing_secret: &
         bail!("Slack request timestamp too old (replay protection)");
     }
 
-    let expected_sig = headers
-        .get("x-slack-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing X-Slack-Signature header"))?;
+    let expected_sig =
+        crate::verify_common::required_header(headers, "x-slack-signature", "X-Slack-Signature")?;
 
     let sig_basestring = format!("v0:{timestamp}:{body}");
 

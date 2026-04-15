@@ -40,60 +40,42 @@ where
     }
 }
 
-/// Typed wrapper for tool call arguments, providing chainable parameter extraction.
-pub struct ToolArgs<'a>(pub &'a serde_json::Value);
+// ── Tool-call argument extraction ──
+//
+// The canonical API for reading tool-call arguments. All handlers use these
+// free functions; a prior `ToolArgs` wrapper struct had no callers and was
+// removed.
 
-impl<'a> ToolArgs<'a> {
-    pub fn require_str(&self, name: &str) -> Result<&'a str> {
-        self.0[name]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Missing required parameter '{name}'."))
-    }
-
-    pub fn opt_str(&self, name: &str) -> Option<&'a str> {
-        self.0[name].as_str()
-    }
-
-    pub fn opt_u64(&self, name: &str, default: u64) -> u64 {
-        self.0[name].as_u64().unwrap_or(default)
-    }
-
-    pub fn opt_bool(&self, name: &str, default: bool) -> bool {
-        self.0[name].as_bool().unwrap_or(default)
-    }
-
-    pub fn opt_i64(&self, name: &str) -> Option<i64> {
-        self.0[name].as_i64()
-    }
-
-    pub fn opt_f64(&self, name: &str, default: f64) -> f64 {
-        self.0[name].as_f64().unwrap_or(default)
-    }
-}
-
-// Legacy free-function API — delegates to ToolArgs.
+/// Return the value of a required string parameter, or an error naming it.
 pub fn require_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Result<&'a str> {
-    ToolArgs(args).require_str(name)
+    args[name]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Missing required parameter '{name}'."))
 }
 
+/// Return the value of an optional string parameter, if present.
 pub fn optional_str_param<'a>(args: &'a serde_json::Value, name: &str) -> Option<&'a str> {
-    ToolArgs(args).opt_str(name)
+    args[name].as_str()
 }
 
+/// Return the value of an optional u64 parameter, falling back to `default`.
 pub fn optional_u64_param(args: &serde_json::Value, name: &str, default: u64) -> u64 {
-    ToolArgs(args).opt_u64(name, default)
+    args[name].as_u64().unwrap_or(default)
 }
 
+/// Return the value of an optional bool parameter, falling back to `default`.
 pub fn optional_bool_param(args: &serde_json::Value, name: &str, default: bool) -> bool {
-    ToolArgs(args).opt_bool(name, default)
+    args[name].as_bool().unwrap_or(default)
 }
 
+/// Return the value of an optional i64 parameter, if present and integral.
 pub fn optional_i64_param(args: &serde_json::Value, name: &str) -> Option<i64> {
-    ToolArgs(args).opt_i64(name)
+    args[name].as_i64()
 }
 
+/// Return the value of an optional f64 parameter, falling back to `default`.
 pub fn optional_f64_param(args: &serde_json::Value, name: &str, default: f64) -> f64 {
-    ToolArgs(args).opt_f64(name, default)
+    args[name].as_f64().unwrap_or(default)
 }
 
 // ── Re-exports ──

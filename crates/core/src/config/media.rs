@@ -113,14 +113,14 @@ impl Default for BrowserConfig {
             enabled: true,
             headless: true,
             executable: None,
-            cdp_port: 9222,
+            cdp_port: constants::BROWSER_DEFAULT_CDP_PORT,
             no_sandbox: false,
-            timeout_ms: 30000,
-            startup_timeout_ms: 15000,
-            console_buffer_size: 500,
-            error_buffer_size: 200,
-            network_buffer_size: 500,
-            js_eval_timeout_ms: 10000,
+            timeout_ms: constants::BROWSER_DEFAULT_TIMEOUT_MS,
+            startup_timeout_ms: constants::BROWSER_STARTUP_TIMEOUT_MS,
+            console_buffer_size: constants::BROWSER_CONSOLE_BUFFER_SIZE,
+            error_buffer_size: constants::BROWSER_ERROR_BUFFER_SIZE,
+            network_buffer_size: constants::BROWSER_NETWORK_BUFFER_SIZE,
+            js_eval_timeout_ms: constants::BROWSER_JS_EVAL_TIMEOUT_MS,
         }
     }
 }
@@ -279,7 +279,7 @@ impl Default for ImageGenConfig {
             provider: None,
             model: None,
             api_key_env: None,
-            default_size: "1024x1024".into(),
+            default_size: constants::IMAGE_GEN_DEFAULT_SIZE.into(),
         }
     }
 }

@@ -4,13 +4,13 @@
 //! in-memory SQLite. Validates set/get/unset lifecycle, type validation,
 //! and config application.
 
-use borg_core::db::Database;
 use borg_core::settings::{SettingSource, SettingsResolver, ALL_SETTING_KEYS};
 
+mod common;
+use common::test_db;
+
 fn test_resolver() -> SettingsResolver {
-    let conn = rusqlite::Connection::open_in_memory().expect("open in-memory db");
-    let db = Database::from_connection(conn).expect("init db");
-    SettingsResolver::new(db)
+    SettingsResolver::new(test_db())
 }
 
 // ── Test: defaults resolve without DB overrides ──

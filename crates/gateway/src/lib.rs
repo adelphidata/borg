@@ -71,6 +71,8 @@ pub mod telegram;
 /// Native Twilio integration (WhatsApp + SMS).
 pub mod twilio;
 pub(crate) mod typing_keepalive;
+/// Shared helpers for channel webhook verification.
+pub mod verify_common;
 
 pub use registry::ChannelRegistry;
 pub use server::GatewayServer;

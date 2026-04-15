@@ -259,22 +259,22 @@ impl Default for LinkUnderstandingConfig {
         Self {
             enabled: false,
             max_links: 3,
-            max_chars_per_link: 5000,
+            max_chars_per_link: constants::LINK_UNDERSTANDING_MAX_CHARS,
             timeout_ms: 10_000,
         }
     }
 }
 
 fn default_error_cooldown_ms() -> u64 {
-    14_400_000 // 4 hours
+    constants::ERROR_POLICY_COOLDOWN_MS
 }
 
 fn default_rate_limit() -> u32 {
-    60
+    constants::GATEWAY_RATE_LIMIT_PER_MINUTE_DEFAULT
 }
 
 fn default_pairing_ttl() -> i64 {
-    3600
+    constants::PAIRING_CODE_TTL_SECS
 }
 
 #[cfg(test)]

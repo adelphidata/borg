@@ -12,10 +12,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// base64-decoded shared secret. The signature is sent in the `Authorization`
 /// header as `HMAC <base64-signature>`.
 pub fn verify_teams_signature(headers: &HeaderMap, body: &[u8], secret: &str) -> Result<()> {
-    let auth_header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing Authorization header"))?;
+    let auth_header =
+        crate::verify_common::required_header(headers, "authorization", "Authorization")?;
 
     let signature_b64 = auth_header
         .strip_prefix("HMAC ")

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::config::ImageGenConfig;
+use crate::constants;
 
 /// Supported image generation providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +135,7 @@ async fn generate_openai(
     count: u32,
 ) -> Result<Vec<ImageResult>> {
     let client = Client::new();
-    let size = size.unwrap_or("1024x1024");
+    let size = size.unwrap_or(constants::IMAGE_GEN_DEFAULT_SIZE);
 
     let body = serde_json::json!({
         "model": provider.model,
@@ -247,7 +248,7 @@ async fn generate_fal(
         .build()?;
 
     // Parse size to width/height
-    let (width, height) = parse_size(size.unwrap_or("1024x1024"));
+    let (width, height) = parse_size(size.unwrap_or(constants::IMAGE_GEN_DEFAULT_SIZE));
 
     let body = serde_json::json!({
         "prompt": prompt,

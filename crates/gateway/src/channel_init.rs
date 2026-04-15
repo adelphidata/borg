@@ -270,7 +270,10 @@ pub(crate) async fn init_signal(config: &Config) -> Option<Arc<SignalClient>> {
                 .signal_cli_host
                 .as_deref()
                 .unwrap_or("localhost");
-            let port = config.gateway.signal_cli_port.unwrap_or(8080);
+            let port = config
+                .gateway
+                .signal_cli_port
+                .unwrap_or(borg_core::constants::SIGNAL_CLI_PORT_DEFAULT);
             let base_url = format!("http://{host}:{port}");
             match SignalClient::new(&base_url, account) {
                 Ok(client) => match client.probe().await {

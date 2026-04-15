@@ -25,15 +25,17 @@ pub fn verify_discord_signature(
         .map_err(|e| anyhow::anyhow!("Invalid Discord public key: {e}"))?;
 
     // Extract headers
-    let signature_hex = headers
-        .get("x-signature-ed25519")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing X-Signature-Ed25519 header"))?;
+    let signature_hex = crate::verify_common::required_header(
+        headers,
+        "x-signature-ed25519",
+        "X-Signature-Ed25519",
+    )?;
 
-    let timestamp = headers
-        .get("x-signature-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing X-Signature-Timestamp header"))?;
+    let timestamp = crate::verify_common::required_header(
+        headers,
+        "x-signature-timestamp",
+        "X-Signature-Timestamp",
+    )?;
 
     // Parse the signature from hex
     let sig_bytes =

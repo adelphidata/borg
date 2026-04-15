@@ -345,7 +345,10 @@ fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                 checks.push(DiagnosticCheck::warn(
                     "Provider",
                     "Ollama server",
-                    "not reachable at localhost:11434 — run `ollama serve`",
+                    format!(
+                        "not reachable at localhost:{} — run `ollama serve`",
+                        crate::constants::OLLAMA_PORT_DEFAULT
+                    ),
                 ));
             }
             checks.push(DiagnosticCheck::pass(

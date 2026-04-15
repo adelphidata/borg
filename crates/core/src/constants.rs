@@ -369,6 +369,61 @@ pub const SECS_PER_HOUR: i64 = 3600;
 /// Maximum pairing code generation attempts per sender per hour.
 pub const PAIRING_MAX_ATTEMPTS_PER_HOUR: u32 = 20;
 
+// ── Browser (CDP) defaults ────────────────────────────────────────
+
+/// Default CDP page-level operation timeout in milliseconds.
+pub const BROWSER_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default CDP startup/connect timeout in milliseconds.
+pub const BROWSER_STARTUP_TIMEOUT_MS: u64 = 15_000;
+
+/// Default inner JS evaluation timeout (ms) for Promise.race wrapper.
+pub const BROWSER_JS_EVAL_TIMEOUT_MS: u64 = 10_000;
+
+/// Default capacity of the console log ring buffer.
+pub const BROWSER_CONSOLE_BUFFER_SIZE: usize = 500;
+
+/// Default capacity of the page error ring buffer.
+pub const BROWSER_ERROR_BUFFER_SIZE: usize = 200;
+
+/// Default capacity of the network request ring buffer.
+pub const BROWSER_NETWORK_BUFFER_SIZE: usize = 500;
+
+/// Default Chrome DevTools Protocol port.
+pub const BROWSER_DEFAULT_CDP_PORT: u16 = 9222;
+
+// ── Gateway defaults ──────────────────────────────────────────────
+
+/// Per-sender error notification cooldown (ms). Default: 4 hours.
+pub const ERROR_POLICY_COOLDOWN_MS: u64 = 14_400_000;
+
+/// Default rate limit, per-minute, for gateway inbound messages.
+pub const GATEWAY_RATE_LIMIT_PER_MINUTE_DEFAULT: u32 = 60;
+
+/// Default TTL (seconds) for sender pairing codes.
+pub const PAIRING_CODE_TTL_SECS: i64 = 3600;
+
+/// Default max characters to extract per link in link-understanding.
+pub const LINK_UNDERSTANDING_MAX_CHARS: usize = 5000;
+
+// ── Image generation ──────────────────────────────────────────────
+
+/// Default image generation output dimensions (e.g. "1024x1024").
+pub const IMAGE_GEN_DEFAULT_SIZE: &str = "1024x1024";
+
+// ── Multi-agent ───────────────────────────────────────────────────
+
+/// Buffered capacity of the sub-agent event channel.
+pub const AGENT_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+// ── External service defaults ─────────────────────────────────────
+
+/// Default port for a locally-running Ollama server.
+pub const OLLAMA_PORT_DEFAULT: u16 = 11434;
+
+/// Default port for a locally-running signal-cli JSON-RPC server.
+pub const SIGNAL_CLI_PORT_DEFAULT: u16 = 8080;
+
 #[cfg(test)]
 mod tests {
     use super::*;

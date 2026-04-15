@@ -253,205 +253,244 @@ impl SettingsPopup {
         key: crossterm::event::KeyEvent,
         config: &mut Config,
     ) -> anyhow::Result<Option<AppAction>> {
+        // Dispatch to a per-mode handler. Each handler owns its own key map;
+        // cross-mode transitions are done by assigning to `self.mode`.
+        match self.mode {
+            EditMode::Browsing => self.handle_key_browsing(key, config),
+            EditMode::ConfirmReset => self.handle_key_confirm_reset(key, config),
+            EditMode::Editing { .. } => self.handle_key_editing(key, config),
+            EditMode::SelectingModel { .. } => self.handle_key_selecting_model(key, config),
+        }
+    }
+
+    fn handle_key_browsing(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
         use crossterm::event::KeyCode;
 
-        match &mut self.mode {
-            EditMode::Browsing => match key.code {
-                KeyCode::Esc => {
-                    self.dismiss();
-                    Ok(None)
+        match key.code {
+            KeyCode::Esc => {
+                self.dismiss();
+                Ok(None)
+            }
+            KeyCode::Up => {
+                if self.selected == 0 {
+                    self.selected = self.entries.len() - 1;
+                } else {
+                    self.selected -= 1;
                 }
-                KeyCode::Up => {
-                    if self.selected == 0 {
-                        self.selected = self.entries.len() - 1;
-                    } else {
-                        self.selected -= 1;
-                    }
-                    self.status_message = None;
-                    Ok(None)
+                self.status_message = None;
+                Ok(None)
+            }
+            KeyCode::Down => {
+                self.selected = (self.selected + 1) % self.entries.len();
+                self.status_message = None;
+                Ok(None)
+            }
+            KeyCode::Char(' ') => {
+                let entry = &self.entries[self.selected];
+                if entry.kind == SettingKind::Bool {
+                    return self.toggle_bool(config);
                 }
-                KeyCode::Down => {
-                    self.selected = (self.selected + 1) % self.entries.len();
-                    self.status_message = None;
-                    Ok(None)
+                Ok(None)
+            }
+            KeyCode::Left => {
+                let entry = &self.entries[self.selected];
+                if entry.key == "model" {
+                    return self.open_model_selection();
                 }
-                KeyCode::Char(' ') => {
-                    let entry = &self.entries[self.selected];
-                    if entry.kind == SettingKind::Bool {
-                        return self.toggle_bool(config);
-                    }
-                    Ok(None)
+                match entry.kind {
+                    SettingKind::Select => self.cycle_select(config, false),
+                    SettingKind::Float => self.step_float(config, false),
+                    _ => Ok(None),
                 }
-                KeyCode::Left => {
-                    let entry = &self.entries[self.selected];
-                    if entry.key == "model" {
-                        return self.open_model_selection();
+            }
+            KeyCode::Right => {
+                let entry = &self.entries[self.selected];
+                if entry.key == "model" {
+                    return self.open_model_selection();
+                }
+                match entry.kind {
+                    SettingKind::Select => self.cycle_select(config, true),
+                    SettingKind::Float => self.step_float(config, true),
+                    _ => Ok(None),
+                }
+            }
+            KeyCode::Enter => {
+                let entry = &self.entries[self.selected];
+                if entry.key == "model" {
+                    return self.open_model_selection();
+                }
+                match entry.kind {
+                    SettingKind::Bool | SettingKind::Select => {
+                        self.dismiss();
+                        Ok(None)
                     }
-                    match entry.kind {
-                        SettingKind::Select => self.cycle_select(config, false),
-                        SettingKind::Float => self.step_float(config, false),
-                        _ => Ok(None),
+                    _ => {
+                        let current = self.current_value(config, entry.key);
+                        self.mode = EditMode::Editing { buffer: current };
+                        self.status_message = None;
+                        Ok(None)
                     }
                 }
-                KeyCode::Right => {
-                    let entry = &self.entries[self.selected];
-                    if entry.key == "model" {
-                        return self.open_model_selection();
-                    }
-                    match entry.kind {
-                        SettingKind::Select => self.cycle_select(config, true),
-                        SettingKind::Float => self.step_float(config, true),
-                        _ => Ok(None),
-                    }
-                }
-                KeyCode::Enter => {
-                    let entry = &self.entries[self.selected];
-                    if entry.key == "model" {
-                        return self.open_model_selection();
-                    }
-                    match entry.kind {
-                        SettingKind::Bool | SettingKind::Select => {
-                            self.dismiss();
-                            Ok(None)
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.mode = EditMode::ConfirmReset;
+                self.status_message = None;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn handle_key_confirm_reset(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let result = self.reset_all_to_defaults(config);
+                self.mode = EditMode::Browsing;
+                result
+            }
+            _ => {
+                self.mode = EditMode::Browsing;
+                self.status_message = None;
+                Ok(None)
+            }
+        }
+    }
+
+    fn handle_key_editing(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        let EditMode::Editing { ref mut buffer } = self.mode else {
+            return Ok(None);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = EditMode::Browsing;
+                self.status_message = None;
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                let value = buffer.clone();
+                let entry = &self.entries[self.selected];
+                let key_str = entry.key;
+                match config.apply_setting(key_str, &value) {
+                    Ok(confirmation) => {
+                        if let Err(e) = self.save_setting(key_str, &value) {
+                            self.status_message = Some((format!("Save failed: {e}"), false));
+                            self.mode = EditMode::Browsing;
+                            return Ok(None);
                         }
-                        _ => {
-                            let current = self.current_value(config, entry.key);
-                            self.mode = EditMode::Editing { buffer: current };
-                            self.status_message = None;
-                            Ok(None)
-                        }
+                        self.status_message = Some((format!("Updated: {confirmation}"), true));
+                        self.mode = EditMode::Browsing;
+                        Ok(Some(AppAction::UpdateSetting {
+                            key: key_str.to_string(),
+                            value,
+                        }))
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Error: {e}"), false));
+                        self.mode = EditMode::Browsing;
+                        Ok(None)
                     }
                 }
-                KeyCode::Char('r') | KeyCode::Char('R') => {
-                    self.mode = EditMode::ConfirmReset;
-                    self.status_message = None;
-                    Ok(None)
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+                Ok(None)
+            }
+            KeyCode::Char(c) => {
+                buffer.push(c);
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn handle_key_selecting_model(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        config: &mut Config,
+    ) -> anyhow::Result<Option<AppAction>> {
+        use crossterm::event::KeyCode;
+
+        let EditMode::SelectingModel {
+            ref mut selected,
+            ref mut scroll_offset,
+        } = self.mode
+        else {
+            return Ok(None);
+        };
+
+        let provider_id = PROVIDERS
+            .get(self.provider_index)
+            .map(|(id, _, _)| *id)
+            .unwrap_or("openrouter");
+
+        match key.code {
+            KeyCode::Up => {
+                let count = models_for_provider(provider_id).len();
+                *selected = if *selected == 0 {
+                    count - 1
+                } else {
+                    *selected - 1
+                };
+                if *selected < *scroll_offset {
+                    *scroll_offset = *selected;
                 }
-                _ => Ok(None),
-            },
-            EditMode::ConfirmReset => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let result = self.reset_all_to_defaults(config);
-                    self.mode = EditMode::Browsing;
-                    result
-                }
-                _ => {
-                    self.mode = EditMode::Browsing;
-                    self.status_message = None;
-                    Ok(None)
-                }
-            },
-            EditMode::Editing { buffer } => match key.code {
-                KeyCode::Esc => {
-                    self.mode = EditMode::Browsing;
-                    self.status_message = None;
-                    Ok(None)
-                }
-                KeyCode::Enter => {
-                    let value = buffer.clone();
-                    let entry = &self.entries[self.selected];
-                    let key_str = entry.key;
-                    match config.apply_setting(key_str, &value) {
+                Ok(None)
+            }
+            KeyCode::Down => {
+                let count = models_for_provider(provider_id).len();
+                *selected = (*selected + 1) % count;
+                Ok(None)
+            }
+            KeyCode::Enter => {
+                let sel = *selected;
+                let models = models_for_provider(provider_id);
+                if let Some((model_id, _)) = models.get(sel) {
+                    match config.apply_setting("model", model_id) {
                         Ok(confirmation) => {
-                            if let Err(e) = self.save_setting(key_str, &value) {
+                            if let Err(e) = self.save_setting("model", model_id) {
                                 self.status_message = Some((format!("Save failed: {e}"), false));
                                 self.mode = EditMode::Browsing;
                                 return Ok(None);
                             }
+                            self.model_index = sel;
                             self.status_message = Some((format!("Updated: {confirmation}"), true));
                             self.mode = EditMode::Browsing;
-                            Ok(Some(AppAction::UpdateSetting {
-                                key: key_str.to_string(),
-                                value,
-                            }))
+                            return Ok(Some(AppAction::UpdateSetting {
+                                key: "model".to_string(),
+                                value: model_id.to_string(),
+                            }));
                         }
                         Err(e) => {
                             self.status_message = Some((format!("Error: {e}"), false));
                             self.mode = EditMode::Browsing;
-                            Ok(None)
                         }
                     }
                 }
-                KeyCode::Backspace => {
-                    buffer.pop();
-                    Ok(None)
-                }
-                KeyCode::Char(c) => {
-                    buffer.push(c);
-                    Ok(None)
-                }
-                _ => Ok(None),
-            },
-            EditMode::SelectingModel {
-                ref mut selected,
-                ref mut scroll_offset,
-            } => match key.code {
-                KeyCode::Up => {
-                    let provider_id = PROVIDERS
-                        .get(self.provider_index)
-                        .map(|(id, _, _)| *id)
-                        .unwrap_or("openrouter");
-                    let count = models_for_provider(provider_id).len();
-                    *selected = if *selected == 0 {
-                        count - 1
-                    } else {
-                        *selected - 1
-                    };
-                    // Adjust scroll
-                    if *selected < *scroll_offset {
-                        *scroll_offset = *selected;
-                    }
-                    Ok(None)
-                }
-                KeyCode::Down => {
-                    let provider_id = PROVIDERS
-                        .get(self.provider_index)
-                        .map(|(id, _, _)| *id)
-                        .unwrap_or("openrouter");
-                    let count = models_for_provider(provider_id).len();
-                    *selected = (*selected + 1) % count;
-                    Ok(None)
-                }
-                KeyCode::Enter => {
-                    let sel = *selected;
-                    let provider_id = PROVIDERS
-                        .get(self.provider_index)
-                        .map(|(id, _, _)| *id)
-                        .unwrap_or("openrouter");
-                    let models = models_for_provider(provider_id);
-                    if let Some((model_id, _)) = models.get(sel) {
-                        match config.apply_setting("model", model_id) {
-                            Ok(confirmation) => {
-                                if let Err(e) = self.save_setting("model", model_id) {
-                                    self.status_message =
-                                        Some((format!("Save failed: {e}"), false));
-                                    self.mode = EditMode::Browsing;
-                                    return Ok(None);
-                                }
-                                self.model_index = sel;
-                                self.status_message =
-                                    Some((format!("Updated: {confirmation}"), true));
-                                self.mode = EditMode::Browsing;
-                                return Ok(Some(AppAction::UpdateSetting {
-                                    key: "model".to_string(),
-                                    value: model_id.to_string(),
-                                }));
-                            }
-                            Err(e) => {
-                                self.status_message = Some((format!("Error: {e}"), false));
-                                self.mode = EditMode::Browsing;
-                            }
-                        }
-                    }
-                    Ok(None)
-                }
-                KeyCode::Esc => {
-                    self.mode = EditMode::Browsing;
-                    self.status_message = None;
-                    Ok(None)
-                }
-                _ => Ok(None),
-            },
+                Ok(None)
+            }
+            KeyCode::Esc => {
+                self.mode = EditMode::Browsing;
+                self.status_message = None;
+                Ok(None)
+            }
+            _ => Ok(None),
         }
     }
 

@@ -12,12 +12,14 @@ use std::fs;
 use borg_core::memory;
 use borg_core::memory::WriteMode;
 
+mod common;
+
 // ── Test: full memory lifecycle ──
 // Combined into one test to avoid BORG_DATA_DIR race conditions.
 
 #[test]
 fn memory_lifecycle() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let mem_dir = tmp.path().join("memory");
     fs::create_dir_all(&mem_dir).expect("create memory dir");
     std::env::set_var("BORG_DATA_DIR", tmp.path());
@@ -93,7 +95,7 @@ fn memory_lifecycle() {
 
 #[test]
 fn scan_extra_paths_finds_files() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let safe_dir = tmp.path().join("notes");
     fs::create_dir_all(&safe_dir).expect("create safe dir");
     fs::write(safe_dir.join("note.md"), "safe note").expect("write safe");
@@ -115,7 +117,7 @@ fn scan_extra_paths_finds_files() {
 
 #[test]
 fn scan_extra_paths_blocked_dir() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let blocked_dir = tmp.path().join(".ssh");
     fs::create_dir_all(&blocked_dir).expect("create blocked dir");
     fs::write(blocked_dir.join("keys.md"), "secret keys").expect("write");

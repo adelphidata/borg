@@ -645,7 +645,8 @@ fn run_sub_agent(
             }
         }
 
-        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+        let (event_tx, mut event_rx) =
+            mpsc::channel::<AgentEvent>(crate::constants::AGENT_EVENT_CHANNEL_CAPACITY);
         let cancel_clone = cancel.clone();
 
         // Send initial message in a spawned task

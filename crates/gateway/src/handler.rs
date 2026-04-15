@@ -16,6 +16,7 @@ use borg_core::sanitize::{
 
 use crate::challenge_throttle::ChallengeThrottle;
 use crate::chunker;
+use crate::constants::PEER_KIND_GROUP;
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
 use crate::registry::RegisteredChannel;
@@ -221,7 +222,7 @@ pub fn check_activation(
     config: &Config,
     bot_identifier: Option<&str>,
 ) -> (bool, String) {
-    let is_group = peer_kind == Some("group");
+    let is_group = peer_kind == Some(PEER_KIND_GROUP);
 
     // DMs always activate
     if !is_group {

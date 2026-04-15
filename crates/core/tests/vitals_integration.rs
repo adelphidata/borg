@@ -3,15 +3,10 @@
 //! Tests the full vitals pipeline: recording events via DB, replaying with
 //! HMAC verification, decay over time, and drift detection.
 
-use rusqlite::Connection;
-
-use borg_core::db::Database;
 use borg_core::vitals::{self, EventCategory, StatDeltas};
 
-fn test_db() -> Database {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    Database::from_connection(conn).expect("init test db")
-}
+mod common;
+use common::test_db;
 
 // ── Test: record and retrieve vitals events ──
 

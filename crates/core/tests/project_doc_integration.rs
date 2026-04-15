@@ -8,9 +8,11 @@ use std::process::Command;
 
 use borg_core::project_doc::discover_project_docs;
 
+mod common;
+
 /// Create a temporary git repo for testing project doc discovery.
 fn setup_git_repo() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     Command::new("git")
         .args(["init", "--initial-branch=main"])
         .current_dir(tmp.path())

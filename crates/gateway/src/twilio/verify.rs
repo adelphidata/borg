@@ -19,10 +19,8 @@ pub fn verify_twilio_signature(
     body: &str,
     auth_token: &str,
 ) -> Result<()> {
-    let signature = headers
-        .get("x-twilio-signature")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| anyhow::anyhow!("Missing X-Twilio-Signature header"))?;
+    let signature =
+        crate::verify_common::required_header(headers, "x-twilio-signature", "X-Twilio-Signature")?;
 
     let expected = compute_signature(webhook_url, body, auth_token)?;
 

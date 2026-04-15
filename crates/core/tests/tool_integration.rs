@@ -9,11 +9,13 @@ use borg_core::config::Config;
 use borg_core::tool_handlers;
 use borg_core::types::ToolOutput;
 
+mod common;
+
 // ── Test: apply_patch creates and modifies files ──
 
 #[test]
 fn apply_patch_creates_and_modifies() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let dir = tmp.path();
 
     // Create a file via patch using the unified handler with cwd target
@@ -39,7 +41,7 @@ fn apply_patch_creates_and_modifies() {
 
 #[test]
 fn apply_patch_delete_file() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let dir = tmp.path();
 
     // Create a file first
@@ -83,7 +85,7 @@ fn blocked_path_rejects_sensitive_dirs() {
 
 #[test]
 fn read_file_with_line_numbers() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let file = tmp.path().join("test.txt");
     fs::write(&file, "line one\nline two\nline three\n").expect("write file");
 
@@ -112,7 +114,7 @@ fn read_file_with_line_numbers() {
 
 #[test]
 fn list_dir_not_a_directory() {
-    let tmp = tempfile::tempdir().expect("create temp dir");
+    let tmp = common::test_tempdir();
     let file = tmp.path().join("just_a_file.txt");
     fs::write(&file, "content").expect("write file");
 

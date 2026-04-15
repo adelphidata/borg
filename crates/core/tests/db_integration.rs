@@ -8,10 +8,8 @@ use rusqlite::Connection;
 
 use borg_core::db::{Database, NewTask};
 
-fn test_db() -> Database {
-    let conn = Connection::open_in_memory().expect("open in-memory db");
-    Database::from_connection(conn).expect("init test db")
-}
+mod common;
+use common::test_db;
 
 // ── Test: session lifecycle ──
 

@@ -250,7 +250,8 @@ impl Provider {
 
     /// Check if Ollama is reachable (sync, short timeout).
     pub fn ollama_available() -> bool {
-        let default_addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 11434));
+        let default_addr: SocketAddr =
+            SocketAddr::from(([127, 0, 0, 1], crate::constants::OLLAMA_PORT_DEFAULT));
         let addr: SocketAddr = std::env::var("OLLAMA_HOST")
             .ok()
             .and_then(|h| {

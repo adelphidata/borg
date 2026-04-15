@@ -19,6 +19,15 @@ pub const RUN_STATUS_RUNNING: &str = "running";
 pub const RUN_STATUS_SUCCESS: &str = "success";
 pub const RUN_STATUS_FAILED: &str = "failed";
 
+// ── Schedule type constants ──
+
+/// One-shot task: runs once at `next_run`, then marked completed.
+pub const SCHEDULE_TYPE_ONCE: &str = "once";
+/// Cron-scheduled task: recurring, driven by a cron expression.
+pub const SCHEDULE_TYPE_CRON: &str = "cron";
+/// Interval-scheduled task: recurring, every N duration.
+pub const SCHEDULE_TYPE_INTERVAL: &str = "interval";
+
 /// Format a run status for CLI/tool display.
 pub fn format_run_status(status: &str) -> &str {
     match status {
@@ -33,13 +42,13 @@ pub fn format_run_status(status: &str) -> &str {
 /// Returns Ok(()) on success.
 pub fn advance_next_run_raw(conn: &rusqlite::Connection, task: &ScheduledTaskRow) -> Result<()> {
     match task.schedule_type.as_str() {
-        "once" => {
+        SCHEDULE_TYPE_ONCE => {
             conn.execute(
                 "UPDATE scheduled_tasks SET status = ?1, next_run = NULL WHERE id = ?2",
                 params![TASK_STATUS_COMPLETED, task.id],
             )?;
         }
-        "cron" | "interval" => {
+        SCHEDULE_TYPE_CRON | SCHEDULE_TYPE_INTERVAL => {
             let next = calculate_next_run(&task.schedule_type, &task.schedule_expr).unwrap_or(None);
             conn.execute(
                 "UPDATE scheduled_tasks SET next_run = ?1 WHERE id = ?2",
@@ -54,18 +63,18 @@ pub fn advance_next_run_raw(conn: &rusqlite::Connection, task: &ScheduledTaskRow
 /// Calculate the next run time for a task based on its schedule.
 pub fn calculate_next_run(schedule_type: &str, schedule_expr: &str) -> Result<Option<i64>> {
     match schedule_type {
-        "cron" => {
+        SCHEDULE_TYPE_CRON => {
             let schedule = Schedule::from_str(schedule_expr)
                 .with_context(|| format!("Invalid cron expression: {schedule_expr}"))?;
             let next = schedule.upcoming(Utc).next();
             Ok(next.map(|t| t.timestamp()))
         }
-        "interval" => {
+        SCHEDULE_TYPE_INTERVAL => {
             let duration = parse_interval(schedule_expr)
                 .with_context(|| format!("Invalid interval: {schedule_expr}"))?;
             Ok(Some(Utc::now().timestamp() + duration.as_secs() as i64))
         }
-        "once" => {
+        SCHEDULE_TYPE_ONCE => {
             // For one-shot tasks, next_run is set at creation time
             Ok(Some(Utc::now().timestamp()))
         }
@@ -121,17 +130,17 @@ fn truncate_str(s: &str, max: usize) -> String {
 /// Validate a schedule expression without computing the next run time.
 pub fn validate_schedule(schedule_type: &str, schedule_expr: &str) -> Result<()> {
     match schedule_type {
-        "cron" => {
+        SCHEDULE_TYPE_CRON => {
             Schedule::from_str(schedule_expr)
                 .with_context(|| format!("Invalid cron expression: {schedule_expr}"))?;
             Ok(())
         }
-        "interval" => {
+        SCHEDULE_TYPE_INTERVAL => {
             parse_interval(schedule_expr)
                 .ok_or_else(|| anyhow::anyhow!("Invalid interval: {schedule_expr}"))?;
             Ok(())
         }
-        "once" => Ok(()),
+        SCHEDULE_TYPE_ONCE => Ok(()),
         other => {
             anyhow::bail!("Unknown schedule type: {other}. Use 'cron', 'interval', or 'once'.")
         }
