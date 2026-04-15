@@ -34,6 +34,24 @@ pub fn flush_short_term_to_daily(facts_text: &str) -> Result<()> {
     flush_short_term_to_daily_with_db(&db, facts_text)
 }
 
+/// Flush using the caller's existing DB handle when one is available,
+/// otherwise open a fresh connection. Intended as the single entry point from
+/// `Agent::flush_short_term_memory` so session-end flushes reuse the agent's
+/// already-open database instead of racing a new connection against any
+/// in-progress writes on the agent's handle.
+pub fn flush_short_term_to_daily_with_optional_db(
+    db: Option<&crate::db::Database>,
+    facts_text: &str,
+) -> Result<()> {
+    if facts_text.trim().is_empty() {
+        return Ok(());
+    }
+    match db {
+        Some(db) => flush_short_term_to_daily_with_db(db, facts_text),
+        None => flush_short_term_to_daily(facts_text),
+    }
+}
+
 /// Same as [`flush_short_term_to_daily`] but uses a caller-provided database
 /// handle. Split out primarily so tests can run against an in-memory DB.
 pub fn flush_short_term_to_daily_with_db(db: &crate::db::Database, facts_text: &str) -> Result<()> {
@@ -115,6 +133,37 @@ mod tests {
             "second flush must grow the entry (len {} vs {})",
             second.content.len(),
             first.content.len(),
+        );
+    }
+
+    #[test]
+    fn optional_db_routes_through_provided_handle() {
+        // When the agent has an open DB handle, the flush must use it — not
+        // open a fresh `Database::open()` that would race against the agent's
+        // in-flight writes and (in tests) miss the in-memory DB entirely.
+        let db = crate::db::Database::test_db();
+        flush_short_term_to_daily_with_optional_db(Some(&db), "- [Decision] use Rust").unwrap();
+
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let entry = db
+            .get_memory_entry("global", &format!("daily/{date}"))
+            .unwrap()
+            .expect("entry must be written through the injected db handle");
+        assert!(entry.content.contains("use Rust"));
+    }
+
+    #[test]
+    fn optional_db_empty_facts_are_noop_with_or_without_db() {
+        let db = crate::db::Database::test_db();
+        assert!(flush_short_term_to_daily_with_optional_db(Some(&db), "").is_ok());
+        assert!(flush_short_term_to_daily_with_optional_db(Some(&db), "   \n").is_ok());
+        assert!(flush_short_term_to_daily_with_optional_db(None, "").is_ok());
+        let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert!(
+            db.get_memory_entry("global", &format!("daily/{date}"))
+                .unwrap()
+                .is_none(),
+            "empty facts must not create a daily entry"
         );
     }
 

@@ -481,6 +481,11 @@ impl Agent {
     /// the session are promoted into long-term memory (via nightly
     /// consolidation).
     ///
+    /// Reuses the agent's open DB handle when available so a session-end
+    /// flush doesn't race a fresh `Database::open()` against the agent's own
+    /// writes (and, in tests, so the flush hits the same in-memory DB the
+    /// caller is inspecting).
+    ///
     /// Fire-and-forget: background shutdown must not crash on a storage error.
     /// Any failure is logged but otherwise ignored.
     pub fn flush_short_term_memory(&self) {
@@ -488,7 +493,10 @@ impl Agent {
         if facts.trim().is_empty() {
             return;
         }
-        if let Err(e) = crate::consolidation::flush_short_term_to_daily(&facts) {
+        let guard = self.db_guard();
+        if let Err(e) =
+            crate::consolidation::flush_short_term_to_daily_with_optional_db(guard.as_ref(), &facts)
+        {
             warn!("flush_short_term_memory failed: {e}");
         }
     }

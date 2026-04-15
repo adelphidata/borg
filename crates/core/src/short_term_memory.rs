@@ -93,7 +93,12 @@ impl ShortTermMemory {
 
     /// Add a fact to working memory. Drops the oldest fact if over budget.
     pub fn add_fact(&mut self, category: FactCategory, content: String, turn: u32) {
-        let tokens = estimate_tokens(&content) + 5; // overhead for "- [Category] "
+        // Overhead must match what `facts_as_text()` / `render()` emit per fact:
+        // `"- [<Category>] "` prefix + trailing newline. Using a static `+5`
+        // undersells longer categories (`TaskOutcome`) and lets the tracked
+        // `facts_tokens` drift below the real rendered size.
+        let overhead = estimate_tokens(&format!("- [{category}] ")) + 1;
+        let tokens = estimate_tokens(&content) + overhead;
         self.facts.push(MemoryFact {
             category,
             content,
@@ -279,6 +284,61 @@ mod tests {
     fn facts_as_text_empty() {
         let stm = ShortTermMemory::new("sess-1".into(), 2000);
         assert_eq!(stm.facts_as_text(), "");
+    }
+
+    #[test]
+    fn facts_tokens_covers_rendered_text_size() {
+        // `facts_tokens` must not *undersell* the real rendered size — that
+        // was the `+5`-hardcoded-overhead bug: eviction kicked in too late
+        // and `<working_memory>` overran its budget. Per-fact estimation is
+        // allowed to overshoot slightly (subword packing across facts makes
+        // the concatenated string tokenize tighter than the sum-of-prefixes),
+        // but it must never undershoot.
+        let mut stm = ShortTermMemory::new("s".into(), 10_000);
+        stm.add_fact(FactCategory::Decision, "use rust".into(), 0);
+        stm.add_fact(FactCategory::TaskOutcome, "migration shipped".into(), 1);
+        stm.add_fact(FactCategory::Preference, "dark mode".into(), 2);
+        stm.add_fact(FactCategory::CodeFact, "tokio runtime".into(), 3);
+        stm.add_fact(FactCategory::Correction, "use snake_case".into(), 4);
+
+        let rendered_tokens = estimate_tokens(&stm.facts_as_text());
+        let tracked = stm.facts_tokens;
+
+        assert!(
+            tracked >= rendered_tokens,
+            "tracked facts_tokens ({tracked}) must not undershoot rendered \
+             size ({rendered_tokens}) — that lets eviction run too late"
+        );
+        // Sanity: shouldn't grossly overshoot either (>2× would mean the
+        // overhead accounting is wildly wrong and would evict too aggressively).
+        assert!(
+            tracked <= rendered_tokens * 2,
+            "tracked facts_tokens ({tracked}) is more than 2× rendered \
+             size ({rendered_tokens}) — overhead estimate is broken"
+        );
+    }
+
+    #[test]
+    fn tight_budget_keeps_rendered_size_within_bound() {
+        // With a tight budget and long-category facts, eviction must leave the
+        // rendered output at or below the configured budget. Regression guard
+        // for the old `+5` overhead that let `facts_tokens` understate reality
+        // (so eviction fired too late and rendered text exceeded max_tokens).
+        let mut stm = ShortTermMemory::new("s".into(), 30);
+        for i in 0..20 {
+            stm.add_fact(
+                FactCategory::TaskOutcome,
+                format!("outcome number {i} with some padding text"),
+                i,
+            );
+        }
+        let rendered = stm.facts_as_text();
+        let rendered_tokens = estimate_tokens(&rendered);
+        assert!(
+            rendered_tokens <= 30 + 2,
+            "rendered size {rendered_tokens} must not exceed budget 30 \
+             (plus 2-token tolerance for estimator granularity)"
+        );
     }
 
     #[test]

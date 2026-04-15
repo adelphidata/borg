@@ -28,6 +28,10 @@ impl Database {
     }
 
     /// Cache an embedding result.
+    ///
+    /// Writes `last_accessed_at` explicitly so TTL pruning stays correct even
+    /// if the schema's column default is changed or a future helper drops it.
+    /// The column exists from V34 onward.
     pub fn cache_embedding(
         &self,
         provider: &str,
@@ -36,11 +40,12 @@ impl Database {
         embedding: &[u8],
         dimension: usize,
     ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
         self.conn.execute(
             "INSERT OR REPLACE INTO embedding_cache
-             (provider, model, content_hash, embedding, dimension)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![provider, model, content_hash, embedding, dimension],
+             (provider, model, content_hash, embedding, dimension, last_accessed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![provider, model, content_hash, embedding, dimension, now],
         )?;
         Ok(())
     }
@@ -627,6 +632,32 @@ mod tests {
             .get_cached_embedding("openai", "model", "nonexistent")
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn cache_embedding_sets_last_accessed_at_explicitly() {
+        // Regression guard: `cache_embedding` must populate `last_accessed_at`
+        // from the helper itself, not rely on the schema column default. If a
+        // future refactor drops the timestamp from the INSERT, TTL pruning
+        // silently stops working for freshly cached entries.
+        let db = test_db();
+        let before = chrono::Utc::now().timestamp();
+        db.cache_embedding("p", "m", "h_explicit", &[1, 2, 3], 3)
+            .unwrap();
+        let after = chrono::Utc::now().timestamp();
+
+        let ts: i64 = db
+            .conn
+            .query_row(
+                "SELECT last_accessed_at FROM embedding_cache WHERE content_hash = 'h_explicit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ts >= before && ts <= after,
+            "last_accessed_at ({ts}) must fall between before ({before}) and after ({after})"
+        );
     }
 
     #[test]
