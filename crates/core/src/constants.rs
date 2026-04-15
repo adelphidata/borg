@@ -203,6 +203,20 @@ pub const MAX_EMBEDDING_INPUT_CHARS: usize = 32_000;
 /// Max characters per message when building session transcripts.
 pub const MAX_SESSION_MESSAGE_CHARS: usize = 2000;
 
+// ── Filenames in ~/.borg/ ─────────────────────────────────────────
+
+/// SQLite database filename under the data directory.
+pub const DB_FILE: &str = "borg.db";
+
+/// Agent identity / persona filename under the data directory.
+pub const IDENTITY_FILE: &str = "IDENTITY.md";
+
+/// Memory index filename under the data directory.
+pub const MEMORY_INDEX_FILE: &str = "MEMORY.md";
+
+/// Heartbeat checklist filename under the data directory.
+pub const HEARTBEAT_FILE: &str = "HEARTBEAT.md";
+
 // ── Agent reply tokens ────────────────────────────────────────────
 
 /// Token the agent emits when it has nothing to say (heartbeat acks, silent replies).
@@ -255,6 +269,36 @@ pub const MAX_TOOL_ARGS_LEN: usize = 1_000_000;
 pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 50;
 
 // ── LLM / Agent ───────────────────────────────────────────────────
+
+/// Default sampling temperature for LLM requests.
+pub const DEFAULT_LLM_TEMPERATURE: f32 = 0.7;
+
+/// Default maximum tokens in an LLM response.
+pub const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
+
+/// Default number of retry attempts on transient LLM errors.
+pub const DEFAULT_LLM_MAX_RETRIES: u32 = 3;
+
+/// Default initial retry delay (ms) for LLM requests.
+pub const DEFAULT_LLM_INITIAL_RETRY_DELAY_MS: u64 = 200;
+
+/// Default total request timeout (ms) for LLM requests (2 minutes).
+pub const DEFAULT_LLM_REQUEST_TIMEOUT_MS: u64 = 120_000;
+
+/// Default per-chunk SSE timeout (seconds) while streaming.
+pub const DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS: u64 = 30;
+
+/// Default LLM provider env var name (OpenRouter has the broadest model coverage).
+pub const DEFAULT_LLM_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Default heartbeat check-in interval.
+pub const DEFAULT_HEARTBEAT_INTERVAL: &str = "30m";
+
+/// Default heartbeat quiet-hours window start (HH:MM, local time).
+pub const DEFAULT_HEARTBEAT_QUIET_START: &str = "00:00";
+
+/// Default heartbeat quiet-hours window end (HH:MM, local time).
+pub const DEFAULT_HEARTBEAT_QUIET_END: &str = "06:00";
 
 /// Default timeout (seconds) when waiting for a sub-agent to complete.
 pub const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 300;

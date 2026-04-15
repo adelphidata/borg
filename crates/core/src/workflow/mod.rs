@@ -13,32 +13,117 @@ mod tests;
 use crate::config::Config;
 use tier::model_needs_workflows;
 
-/// Workflow status values stored in the database.
-pub mod status {
+/// Lifecycle status of a workflow.
+///
+/// Stored as a lowercase string in the `workflows.status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowStatus {
     /// Workflow has been created but not yet started.
-    pub const PENDING: &str = "pending";
+    Pending,
     /// Workflow is actively executing steps.
-    pub const RUNNING: &str = "running";
+    Running,
     /// All steps completed successfully.
-    pub const COMPLETED: &str = "completed";
+    Completed,
     /// A step failed after exhausting retries, workflow aborted.
-    pub const FAILED: &str = "failed";
+    Failed,
     /// Workflow was cancelled by the user or system.
-    pub const CANCELLED: &str = "cancelled";
+    Cancelled,
+}
+
+impl WorkflowStatus {
+    /// SQLite/JSON string form of this status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifecycle status of a single workflow step.
+///
+/// Stored as a lowercase string in the `workflow_steps.status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowStepStatus {
+    /// Step has not yet started.
+    Pending,
+    /// Step is currently executing.
+    Running,
+    /// Step completed successfully.
+    Completed,
+    /// Step failed (may be retried or terminal).
+    Failed,
+    /// Step was skipped (workflow cancelled before reaching it).
+    Skipped,
+}
+
+impl WorkflowStepStatus {
+    /// SQLite/JSON string form of this status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowStepStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Workflow status values stored in the database.
+///
+/// These constants mirror the variants of [`WorkflowStatus`] so existing call
+/// sites that pass a `&str` into parameterized SQL continue to work. New code
+/// should prefer the enum for type safety.
+pub mod status {
+    use super::WorkflowStatus;
+
+    /// Workflow has been created but not yet started.
+    pub const PENDING: &str = WorkflowStatus::Pending.as_str();
+    /// Workflow is actively executing steps.
+    pub const RUNNING: &str = WorkflowStatus::Running.as_str();
+    /// All steps completed successfully.
+    pub const COMPLETED: &str = WorkflowStatus::Completed.as_str();
+    /// A step failed after exhausting retries, workflow aborted.
+    pub const FAILED: &str = WorkflowStatus::Failed.as_str();
+    /// Workflow was cancelled by the user or system.
+    pub const CANCELLED: &str = WorkflowStatus::Cancelled.as_str();
 }
 
 /// Step status values stored in the database.
+///
+/// These constants mirror the variants of [`WorkflowStepStatus`]. New code
+/// should prefer the enum for type safety.
 pub mod step_status {
+    use super::WorkflowStepStatus;
+
     /// Step has not yet started.
-    pub const PENDING: &str = "pending";
+    pub const PENDING: &str = WorkflowStepStatus::Pending.as_str();
     /// Step is currently executing.
-    pub const RUNNING: &str = "running";
+    pub const RUNNING: &str = WorkflowStepStatus::Running.as_str();
     /// Step completed successfully.
-    pub const COMPLETED: &str = "completed";
+    pub const COMPLETED: &str = WorkflowStepStatus::Completed.as_str();
     /// Step failed (may be retried or terminal).
-    pub const FAILED: &str = "failed";
+    pub const FAILED: &str = WorkflowStepStatus::Failed.as_str();
     /// Step was skipped (workflow cancelled before reaching it).
-    pub const SKIPPED: &str = "skipped";
+    pub const SKIPPED: &str = WorkflowStepStatus::Skipped.as_str();
 }
 
 /// Check whether workflow orchestration should be active for the current config.

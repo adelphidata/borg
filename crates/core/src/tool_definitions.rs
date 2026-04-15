@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::db::ProjectStatus;
 use crate::tool_names;
 use crate::types::ToolDefinition;
 
@@ -28,6 +29,8 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     defs.push(build_schedule_tool_def(config));
 
+    let project_status_values: Vec<&'static str> =
+        ProjectStatus::ALL.iter().map(|s| s.as_str()).collect();
     defs.push(ToolDefinition::new(
         tool_names::PROJECTS,
         "Manage projects. Projects group related workflows and track workstreams. Actions: create, list, get, update, archive, delete.",
@@ -42,7 +45,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                 "id": { "type": "string", "description": "Project ID (required for get/update/archive/delete)" },
                 "name": { "type": "string", "description": "Project name (required for create, optional for update)" },
                 "description": { "type": "string", "description": "Project description" },
-                "status": { "type": "string", "enum": ["active", "archived"], "description": "Filter by status (for list) or set status (for update)" }
+                "status": { "type": "string", "enum": project_status_values, "description": "Filter by status (for list) or set status (for update)" }
             },
             "required": ["action"]
         }),

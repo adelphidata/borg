@@ -8,6 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::config::Config;
+use crate::constants::IDENTITY_FILE;
 use crate::tool_handlers;
 
 /// Handle `write_memory` with side effects: identity cache invalidation and
@@ -25,7 +26,7 @@ pub(crate) fn handle_write_memory_with_effects(
 
     if result.is_ok() {
         let target = args["filename"].as_str().unwrap_or_default();
-        if target == "IDENTITY.md" {
+        if target == IDENTITY_FILE {
             *cached_identity = None;
         }
     }

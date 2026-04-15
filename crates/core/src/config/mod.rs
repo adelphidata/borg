@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::warn;
 
+use crate::constants::{DB_FILE, IDENTITY_FILE, MEMORY_INDEX_FILE};
 use crate::policy::ExecutionPolicy;
 use crate::provider::Provider;
 
@@ -243,17 +244,17 @@ impl Config {
 
     /// Returns the database file path (`~/.borg/borg.db`).
     pub fn db_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("borg.db"))
+        Ok(Self::data_dir()?.join(DB_FILE))
     }
 
     /// Returns the identity file path (`~/.borg/IDENTITY.md`).
     pub fn identity_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("IDENTITY.md"))
+        Ok(Self::data_dir()?.join(IDENTITY_FILE))
     }
 
     /// Returns the memory index file path (`~/.borg/MEMORY.md`).
     pub fn memory_index_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("MEMORY.md"))
+        Ok(Self::data_dir()?.join(MEMORY_INDEX_FILE))
     }
 
     /// Load config from the database (DB overrides + compiled defaults).

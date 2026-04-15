@@ -1,11 +1,13 @@
 //! Tool handler for project CRUD operations.
 
+use std::str::FromStr;
+
 use anyhow::Result;
 use serde_json::Value;
 
 use super::{optional_str_param, require_str_param, with_db};
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{Database, ProjectStatus};
 
 /// Handle the `projects` tool. Dispatches by action.
 pub fn handle_projects(args: &Value, _config: &Config) -> Result<String> {
@@ -119,8 +121,8 @@ fn project_update(args: &Value, db: &Database) -> Result<String> {
     }
 
     if let Some(s) = status {
-        if !matches!(s, "active" | "archived") {
-            return Ok(format!("Invalid status: {s}. Use 'active' or 'archived'."));
+        if let Err(msg) = ProjectStatus::from_str(s) {
+            return Ok(msg);
         }
     }
 
@@ -139,7 +141,7 @@ fn project_archive(args: &Value, db: &Database) -> Result<String> {
     // Disambiguate "not found" vs "already archived"
     match db.get_project(id)? {
         None => Ok(format!("Project not found: {id}")),
-        Some(p) if p.status == "archived" => {
+        Some(p) if p.status == ProjectStatus::Archived.as_str() => {
             let short = &id[..8.min(id.len())];
             Ok(format!("Project {short} is already archived."))
         }

@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use tracing::{debug, instrument};
 
 use crate::config::Config;
+use crate::constants::{HEARTBEAT_FILE, IDENTITY_FILE, MEMORY_INDEX_FILE};
 use crate::tokenizer::estimate_tokens;
 use crate::xml_util::escape_xml_attr;
 
@@ -285,7 +286,7 @@ pub fn memory_index_path() -> Result<PathBuf> {
 
 /// Load the HEARTBEAT.md checklist if it exists and is non-empty.
 pub fn load_heartbeat_checklist() -> Option<String> {
-    let path = Config::data_dir().ok()?.join("HEARTBEAT.md");
+    let path = Config::data_dir().ok()?.join(HEARTBEAT_FILE);
     std::fs::read_to_string(&path)
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -337,7 +338,7 @@ fn load_memory_core(max_tokens: usize, mem_dir: &std::path::Path, label: &str) -
     let index_path = memory_index_path()?;
     try_load_index_file(
         &index_path,
-        "MEMORY.md",
+        MEMORY_INDEX_FILE,
         max_tokens,
         &mut estimated_tokens,
         &mut parts,
@@ -393,7 +394,7 @@ fn load_local_memory(
     if let Ok(cwd) = std::env::current_dir() {
         let local_mem_dir = cwd.join(".borg").join("memory");
         if local_mem_dir.exists() {
-            let local_index = cwd.join(".borg").join("MEMORY.md");
+            let local_index = cwd.join(".borg").join(MEMORY_INDEX_FILE);
             try_load_index_file(
                 &local_index,
                 "Local MEMORY.md",
@@ -495,7 +496,7 @@ pub fn load_memory_context_ranked(
     let index_path = memory_index_path()?;
     try_load_index_file(
         &index_path,
-        "MEMORY.md",
+        MEMORY_INDEX_FILE,
         max_tokens,
         &mut estimated_tokens,
         &mut parts,
@@ -516,7 +517,7 @@ pub fn load_memory_context_ranked(
     if let Ok(cwd) = std::env::current_dir() {
         let local_mem_dir = cwd.join(".borg").join("memory");
         if local_mem_dir.exists() {
-            let local_index = cwd.join(".borg").join("MEMORY.md");
+            let local_index = cwd.join(".borg").join(MEMORY_INDEX_FILE);
             try_load_index_file(
                 &local_index,
                 "Local MEMORY.md",
@@ -624,8 +625,8 @@ fn validate_memory_filename(filename: &str) -> Result<()> {
 fn resolve_memory_path(filename: &str) -> Result<PathBuf> {
     validate_memory_filename(filename)?;
     match filename {
-        "IDENTITY.md" => Config::identity_path(),
-        "MEMORY.md" => memory_index_path(),
+        IDENTITY_FILE => Config::identity_path(),
+        MEMORY_INDEX_FILE => memory_index_path(),
         _ => {
             let base = memory_dir()?;
             Ok(base.join(filename))
@@ -648,7 +649,7 @@ pub fn write_memory_scoped(
         let local_dir = cwd.join(".borg");
         validate_memory_filename(filename)?;
         match filename {
-            "MEMORY.md" => local_dir.join("MEMORY.md"),
+            MEMORY_INDEX_FILE => local_dir.join(MEMORY_INDEX_FILE),
             _ => local_dir.join("memory").join(filename),
         }
     } else {
@@ -697,7 +698,7 @@ pub fn list_memory_files() -> Result<Vec<MemoryFileInfo>> {
             .map(chrono::DateTime::<chrono::Local>::from);
         let size = meta.len();
         files.push(MemoryFileInfo {
-            filename: "MEMORY.md".to_string(),
+            filename: MEMORY_INDEX_FILE.to_string(),
             size_bytes: size,
             modified_at: modified,
         });

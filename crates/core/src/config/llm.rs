@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_QUIET_END, DEFAULT_HEARTBEAT_QUIET_START,
+    DEFAULT_LLM_API_KEY_ENV, DEFAULT_LLM_INITIAL_RETRY_DELAY_MS, DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_LLM_MAX_TOKENS, DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
+    DEFAULT_LLM_TEMPERATURE,
+};
 use crate::secrets_resolve::SecretRef;
 
 /// Extended thinking level for supported LLM providers.
@@ -193,16 +199,16 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             provider: None,
-            api_key_env: "OPENROUTER_API_KEY".into(),
+            api_key_env: DEFAULT_LLM_API_KEY_ENV.into(),
             api_key: None,
             api_keys: Vec::new(),
             model: String::new(),
-            temperature: 0.7,
-            max_tokens: 4096,
-            max_retries: 3,
-            initial_retry_delay_ms: 200,
-            request_timeout_ms: 120_000,
-            stream_chunk_timeout_secs: 30,
+            temperature: DEFAULT_LLM_TEMPERATURE,
+            max_tokens: DEFAULT_LLM_MAX_TOKENS,
+            max_retries: DEFAULT_LLM_MAX_RETRIES,
+            initial_retry_delay_ms: DEFAULT_LLM_INITIAL_RETRY_DELAY_MS,
+            request_timeout_ms: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+            stream_chunk_timeout_secs: DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
             base_url: None,
             fallback: Vec::new(),
             thinking: ThinkingLevel::Off,
@@ -303,9 +309,9 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            interval: "30m".into(),
-            quiet_hours_start: Some("00:00".into()),
-            quiet_hours_end: Some("06:00".into()),
+            interval: DEFAULT_HEARTBEAT_INTERVAL.into(),
+            quiet_hours_start: Some(DEFAULT_HEARTBEAT_QUIET_START.into()),
+            quiet_hours_end: Some(DEFAULT_HEARTBEAT_QUIET_END.into()),
             cron: None,
             channels: Vec::new(),
             recipients: std::collections::BTreeMap::new(),

@@ -498,6 +498,52 @@ pub struct NewScript<'a> {
     pub updated_at: i64,
 }
 
+/// Lifecycle status of a project.
+///
+/// Stored as a lowercase string in the `projects.status` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectStatus {
+    /// Project is open; new workflows may target it.
+    Active,
+    /// Project is closed; hidden from the default `list` and not acceptable as a
+    /// target for new workflows.
+    Archived,
+}
+
+impl ProjectStatus {
+    /// All variants, in the order they should appear in JSON schemas.
+    pub const ALL: &'static [Self] = &[Self::Active, Self::Archived];
+
+    /// SQLite/JSON string form of this status.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Archived => "archived",
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProjectStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Self::Active),
+            "archived" => Ok(Self::Archived),
+            other => Err(format!(
+                "Invalid status: {other}. Use 'active' or 'archived'."
+            )),
+        }
+    }
+}
+
 /// Project row from SQLite — groups related workflows.
 #[derive(Debug, Clone)]
 pub struct ProjectRow {

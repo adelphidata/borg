@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use std::str::FromStr;
 
 use borg_core::config::Config;
+use borg_core::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
 use borg_core::provider::Provider;
 
 /// Standard subdirectories created under the Borg data directory.
@@ -336,7 +337,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     }
 
     // Write IDENTITY.md (skip if already exists)
-    let identity_path = data_dir.join("IDENTITY.md");
+    let identity_path = data_dir.join(IDENTITY_FILE);
     if !identity_path.exists() {
         let identity_content = generate_identity(&result.agent_name, &result.user_name);
         if let Err(e) = atomic_write(&identity_path, &identity_content) {
@@ -346,7 +347,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     }
 
     // Write MEMORY.md with owner name seeded (skip if already exists)
-    let memory_path = data_dir.join("MEMORY.md");
+    let memory_path = data_dir.join(MEMORY_INDEX_FILE);
     if !memory_path.exists() {
         let memory_content = format!(
             "# Memory Index\n\n## Owner\n- Name: {}\n- Agent: {}\n",

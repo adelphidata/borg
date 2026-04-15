@@ -772,6 +772,8 @@ fn harden_data_dir(_data_dir: &std::path::Path) {
 
 /// Non-interactive fallback: write default config files without the wizard.
 fn init_data_dir_defaults(data_dir: &std::path::Path) -> Result<()> {
+    use borg_core::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
+
     for sub in crate::onboarding::BORG_SUBDIRS {
         std::fs::create_dir_all(data_dir.join(sub))?;
     }
@@ -786,19 +788,19 @@ fn init_data_dir_defaults(data_dir: &std::path::Path) -> Result<()> {
 
     // Migrate SOUL.md → IDENTITY.md for existing users
     let old_identity = data_dir.join("SOUL.md");
-    let new_identity = data_dir.join("IDENTITY.md");
+    let new_identity = data_dir.join(IDENTITY_FILE);
     if old_identity.exists() && !new_identity.exists() {
         std::fs::rename(&old_identity, &new_identity)?;
     }
 
-    let identity_path = data_dir.join("IDENTITY.md");
+    let identity_path = data_dir.join(IDENTITY_FILE);
     if !identity_path.exists() {
         let identity = borg_core::identity::load_identity()?;
         borg_core::identity::save_identity(&identity)?;
         println!("  Created {}", identity_path.display());
     }
 
-    let memory_path = data_dir.join("MEMORY.md");
+    let memory_path = data_dir.join(MEMORY_INDEX_FILE);
     if !memory_path.exists() {
         std::fs::write(&memory_path, "# Memory Index\n\nNo memories yet.\n")?;
         println!("  Created {}", memory_path.display());
