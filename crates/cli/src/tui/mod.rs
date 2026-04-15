@@ -273,8 +273,9 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         }
     }
 
-    // Resume logic: explicit --resume <id> picks a specific session; otherwise
-    // auto-resume the most recently updated non-empty session (existing behavior).
+    // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
+    // <id>` inside the TUI. Launching the TUI with no args always starts a
+    // fresh session.
     let mut resumed_info: Option<(String, usize)> = None;
     if let Some(prefix) = resume.as_deref() {
         match borg_core::session::resolve_session_id(prefix) {
@@ -290,14 +291,6 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
             Err(e) => {
                 eprintln!("borg: {e}");
                 return Ok(None);
-            }
-        }
-    } else if let Ok(Some(session)) = borg_core::session::load_last_session() {
-        if !session.messages.is_empty() {
-            let title = session.meta.title.clone();
-            let count = session.meta.message_count;
-            if agent.load_session(&session.meta.id).is_ok() {
-                resumed_info = Some((title, count));
             }
         }
     }

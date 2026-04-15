@@ -71,7 +71,28 @@ impl App<'_> {
             }
             "/save" => return Some(Ok(AppAction::SaveSession)),
             "/new" => return Some(self.cmd_new()),
+            "/resume" => {
+                self.push_system_message(
+                    "Usage: /resume <session-id>\nUse /sessions to browse saved sessions."
+                        .to_string(),
+                );
+                return Some(Ok(AppAction::Continue));
+            }
             _ => {}
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/resume ") {
+            let id = rest.trim();
+            if id.is_empty() {
+                self.push_system_message(
+                    "Usage: /resume <session-id>\nUse /sessions to browse saved sessions."
+                        .to_string(),
+                );
+                return Some(Ok(AppAction::Continue));
+            }
+            self.cells.clear();
+            self.queued_messages.clear();
+            return Some(Ok(AppAction::LoadSession { id: id.to_string() }));
         }
 
         // Prefix commands
@@ -183,7 +204,8 @@ impl App<'_> {
              \n  \
              /sessions  - Browse and load saved sessions\n  \
              /save      - Save current session\n  \
-             /new       - Start new session\n\
+             /new       - Start new session\n  \
+             /resume <id> - Resume a saved session by id (prefix ok)\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
              /projects  - List projects\n  \
