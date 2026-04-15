@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, BRAILLE_EIGHT};
 
@@ -124,6 +124,38 @@ impl<'a> App<'a> {
                 &mut scrollbar_state,
             );
         }
+
+        self.render_autoscroll_hint(frame, area);
+    }
+
+    /// Overlay a "press End to follow" hint at the bottom-right of the transcript
+    /// when streaming content is arriving while the user is scrolled up.
+    fn render_autoscroll_hint(&self, frame: &mut Frame, area: Rect) {
+        let show_hint = !self.auto_scroll
+            && self.scroll_offset > 0
+            && matches!(self.state, AppState::Streaming { .. });
+        if !show_hint || area.height == 0 {
+            return;
+        }
+        let hint = " ↓ new output — End to follow ";
+        let hint_width = hint.chars().count() as u16;
+        if hint_width + 1 >= area.width {
+            return;
+        }
+        let hint_area = Rect {
+            x: area.x + area.width.saturating_sub(hint_width + 1),
+            y: area.y + area.height - 1,
+            width: hint_width,
+            height: 1,
+        };
+        let hint_para = Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default()
+                .fg(theme::CYAN)
+                .add_modifier(Modifier::REVERSED),
+        )));
+        frame.render_widget(Clear, hint_area);
+        frame.render_widget(hint_para, hint_area);
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect) {
@@ -289,5 +321,117 @@ impl<'a> App<'a> {
         )));
 
         frame.render_widget(Paragraph::new(lines), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::history::HistoryCell;
+    use borg_core::config::Config;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::time::Instant;
+
+    fn make_app() -> App<'static> {
+        App::new(Config::default(), None, None, None)
+    }
+
+    /// Populate the transcript with enough cells so that `total_lines > area.height`,
+    /// making `max_scroll > 0` so `scroll_offset` isn't clamped to 0 on render.
+    fn with_scrollable_content(app: &mut App<'static>) {
+        for i in 0..40 {
+            app.cells.push(HistoryCell::User {
+                text: format!("user message {i}"),
+            });
+        }
+    }
+
+    fn render_transcript_to_string(app: &mut App<'static>, w: u16, h: u16) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, w, h);
+                app.render_transcript(frame, area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    const HINT_SUBSTR: &str = "End to follow";
+
+    #[test]
+    fn paused_indicator_visible_while_streaming_and_scrolled_up() {
+        let mut app = make_app();
+        with_scrollable_content(&mut app);
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.auto_scroll = false;
+        app.scroll_offset = 5;
+
+        let rendered = render_transcript_to_string(&mut app, 80, 20);
+        assert!(
+            rendered.contains(HINT_SUBSTR),
+            "expected hint '{HINT_SUBSTR}' in transcript, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn paused_indicator_hidden_when_autoscroll_enabled() {
+        let mut app = make_app();
+        with_scrollable_content(&mut app);
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.auto_scroll = true;
+        app.scroll_offset = 5;
+
+        let rendered = render_transcript_to_string(&mut app, 80, 20);
+        assert!(
+            !rendered.contains(HINT_SUBSTR),
+            "hint must not appear when autoscroll is enabled"
+        );
+    }
+
+    #[test]
+    fn paused_indicator_hidden_when_not_streaming() {
+        let mut app = make_app();
+        with_scrollable_content(&mut app);
+        app.state = AppState::Idle;
+        app.auto_scroll = false;
+        app.scroll_offset = 5;
+
+        let rendered = render_transcript_to_string(&mut app, 80, 20);
+        assert!(
+            !rendered.contains(HINT_SUBSTR),
+            "hint must not appear when idle (no streaming)"
+        );
+    }
+
+    #[test]
+    fn paused_indicator_hidden_when_at_bottom() {
+        let mut app = make_app();
+        with_scrollable_content(&mut app);
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.auto_scroll = false;
+        app.scroll_offset = 0;
+
+        let rendered = render_transcript_to_string(&mut app, 80, 20);
+        assert!(
+            !rendered.contains(HINT_SUBSTR),
+            "hint must not appear when already at bottom"
+        );
     }
 }

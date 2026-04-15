@@ -891,6 +891,21 @@ impl<'a> App<'a> {
         //   - PageUp / PageDown always scroll the transcript.
         // ------------------------------------------------------------
         match key.code {
+            KeyCode::End => {
+                self.scroll_offset = 0;
+                self.auto_scroll = true;
+                return Ok(AppAction::Continue);
+            }
+            KeyCode::Home => {
+                let max_scroll = self
+                    .total_lines
+                    .saturating_sub(self.transcript_area.height as usize);
+                if max_scroll > 0 {
+                    self.scroll_offset = max_scroll;
+                    self.auto_scroll = false;
+                }
+                return Ok(AppAction::Continue);
+            }
             KeyCode::PageUp => {
                 self.scroll_offset = self
                     .scroll_offset
@@ -1225,6 +1240,11 @@ impl<'a> App<'a> {
             return result;
         }
 
+        // New user turn: force-jump to bottom and re-engage follow mode
+        // so streamed output is always visible even if the user was scrolled up.
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+
         // Separator between turns
         if !self.cells.is_empty() {
             self.cells.push(HistoryCell::Separator);
@@ -1308,6 +1328,10 @@ impl<'a> App<'a> {
     /// The user message was already shown in the transcript when it was queued,
     /// so we skip the User cell push and only add Separator + Assistant cell.
     pub fn handle_queued_submit(&mut self, qm: QueuedMessage) -> Result<AppAction> {
+        // New user turn: force-jump to bottom so streamed output is visible.
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
+
         // Add separator between turns (User cell was already shown when queued)
         if !self.cells.is_empty() {
             self.cells.push(HistoryCell::Separator);
@@ -1825,6 +1849,85 @@ mod tests {
         app.auto_scroll = false;
 
         app.handle_key(key(KeyCode::PageDown)).unwrap();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    // --- End / Home (opencode-style jump shortcuts) ---
+
+    #[test]
+    fn end_key_scrolls_to_bottom_and_enables_autoscroll() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 5;
+        app.auto_scroll = false;
+
+        app.handle_key(key(KeyCode::End)).unwrap();
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn home_key_scrolls_to_top_and_disables_autoscroll() {
+        let mut app = app_with_scrollable_transcript();
+        let max_scroll = app
+            .total_lines
+            .saturating_sub(app.transcript_area.height as usize);
+        assert!(max_scroll > 0);
+
+        app.handle_key(key(KeyCode::Home)).unwrap();
+
+        assert_eq!(app.scroll_offset, max_scroll);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn home_key_is_noop_when_no_scrollable_backlog() {
+        let mut app = make_app();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+
+        app.handle_key(key(KeyCode::Home)).unwrap();
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    // --- Force-jump on new user turn (matches opencode forceScrollToBottom) ---
+
+    #[test]
+    fn handle_submit_force_jumps_to_bottom() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 10;
+        app.auto_scroll = false;
+
+        app.handle_submit("hello agent").unwrap();
+
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn slash_command_does_not_disturb_scroll() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 10;
+        app.auto_scroll = false;
+
+        // `/status` is a pure UI command — should not reset scroll state.
+        app.handle_submit("/status").unwrap();
+
+        assert_eq!(app.scroll_offset, 10);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn handle_queued_submit_force_jumps_to_bottom() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 7;
+        app.auto_scroll = false;
+
+        app.handle_queued_submit(qm("queued")).unwrap();
+
         assert_eq!(app.scroll_offset, 0);
         assert!(app.auto_scroll);
     }
