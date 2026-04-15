@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -216,13 +217,45 @@ pub struct LlmClient {
     prompt_cache_key: Option<String>,
 }
 
+/// Normalize a Gemini OpenAI-compat base URL by ensuring it resolves to the
+/// chat-completions endpoint.
+///
+/// Users commonly paste shorter roots (`https://generativelanguage.googleapis.com`,
+/// `…/v1beta`, `…/v1beta/openai`) expecting them to "just work". Without
+/// normalization the POST lands on a non-completions path and fails. Only
+/// applies to Google's own host — proxy deployments keep their URL verbatim.
+fn normalize_gemini_base(url: &str) -> Cow<'_, str> {
+    const GOOGLE_HOST: &str = "generativelanguage.googleapis.com";
+    const CANONICAL_SUFFIX: &str = "/v1beta/openai/chat/completions";
+
+    if !url.contains(GOOGLE_HOST) {
+        return Cow::Borrowed(url);
+    }
+    if url.ends_with(CANONICAL_SUFFIX) {
+        return Cow::Borrowed(url);
+    }
+
+    let trimmed = url.trim_end_matches('/');
+    let stripped = ["/v1beta/openai", "/openai", "/v1beta", "/v1"]
+        .iter()
+        .find_map(|s| trimmed.strip_suffix(s))
+        .unwrap_or(trimmed);
+    Cow::Owned(format!("{stripped}{CANONICAL_SUFFIX}"))
+}
+
 impl LlmClient {
-    /// Effective API URL: config override → provider default.
-    fn effective_base_url(&self) -> &str {
-        self.llm_config
+    /// Effective API URL: config override → provider default, with provider-
+    /// specific normalization (e.g. Gemini base-URL suffix correction).
+    fn effective_base_url(&self) -> Cow<'_, str> {
+        let raw = self
+            .llm_config
             .base_url
             .as_deref()
-            .unwrap_or_else(|| self.provider.base_url())
+            .unwrap_or_else(|| self.provider.base_url());
+        match self.provider {
+            Provider::Gemini => normalize_gemini_base(raw),
+            _ => Cow::Borrowed(raw),
+        }
     }
 
     /// Create a new LLM client from config (resolves provider and API keys).
@@ -600,7 +633,7 @@ impl LlmClient {
 
         let fut =
             self.client
-                .post(self.effective_base_url())
+                .post(self.effective_base_url().as_ref())
                 .headers(self.provider.build_headers(&self.api_key).map_err(|e| {
                     LlmError::Fatal {
                         source: e,
@@ -1900,7 +1933,7 @@ mod tests {
         config.llm.base_url = Some("http://custom:8080/v1/chat/completions".to_string());
         let client = LlmClient::new(&config).expect("should create client");
         assert_eq!(
-            client.effective_base_url(),
+            client.effective_base_url().as_ref(),
             "http://custom:8080/v1/chat/completions"
         );
     }
@@ -1912,9 +1945,74 @@ mod tests {
         config.llm.model = "llama3.3".to_string();
         let client = LlmClient::new(&config).expect("should create client");
         assert_eq!(
-            client.effective_base_url(),
+            client.effective_base_url().as_ref(),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn normalize_gemini_base_leaves_canonical_url_untouched() {
+        let canonical = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+        let got = normalize_gemini_base(canonical);
+        assert_eq!(got.as_ref(), canonical);
+        assert!(matches!(got, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn normalize_gemini_base_appends_completions_to_bare_origin() {
+        assert_eq!(
+            normalize_gemini_base("https://generativelanguage.googleapis.com").as_ref(),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        assert_eq!(
+            normalize_gemini_base("https://generativelanguage.googleapis.com/").as_ref(),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_gemini_base_strips_partial_suffixes() {
+        for input in [
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "https://generativelanguage.googleapis.com/openai",
+            "https://generativelanguage.googleapis.com/v1",
+        ] {
+            assert_eq!(
+                normalize_gemini_base(input).as_ref(),
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                "input {input} did not normalize",
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_gemini_base_leaves_non_gemini_hosts_alone() {
+        // OpenAI-compatible proxies using /v1 must not be truncated.
+        let proxy = "https://my-proxy.example.com/v1";
+        assert_eq!(normalize_gemini_base(proxy).as_ref(), proxy);
+
+        let openai = "https://api.openai.com/v1/chat/completions";
+        assert_eq!(normalize_gemini_base(openai).as_ref(), openai);
+    }
+
+    #[test]
+    fn effective_base_url_normalizes_gemini_override() {
+        let mut config = Config::default();
+        config.llm.provider = Some("gemini".to_string());
+        config.llm.api_key_env = "GEMINI_API_KEY".to_string();
+        config.llm.model = "gemini-2.5-flash".to_string();
+        config.llm.base_url =
+            Some("https://generativelanguage.googleapis.com/v1beta/openai".to_string());
+        std::env::set_var("GEMINI_API_KEY", "test-key");
+        let client = LlmClient::new(&config).expect("should create client");
+        assert_eq!(
+            client.effective_base_url().as_ref(),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        );
+        std::env::remove_var("GEMINI_API_KEY");
     }
 
     #[test]
