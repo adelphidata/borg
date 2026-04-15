@@ -1,7 +1,8 @@
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use super::highlight;
 use super::theme;
 
 /// Convert a markdown string into styled ratatui Lines.
@@ -13,6 +14,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
     let mut in_code_block = false;
+    let mut code_block_lang: Option<String> = None;
     let mut list_depth: usize = 0;
     let mut ordered_index: Option<u64> = None;
     let mut in_blockquote = false;
@@ -38,9 +40,27 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 Tag::Paragraph => {
                     flush_line(&mut current_spans, &mut lines);
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     flush_line(&mut current_spans, &mut lines);
                     in_code_block = true;
+                    code_block_lang = match kind {
+                        CodeBlockKind::Fenced(info) => {
+                            let s = info.trim().to_string();
+                            if s.is_empty() {
+                                None
+                            } else {
+                                // info-string may include attributes after the lang
+                                // (e.g. "rust,ignore") — take the first token.
+                                Some(
+                                    s.split(|c: char| c == ',' || c.is_whitespace())
+                                        .next()
+                                        .unwrap_or("")
+                                        .to_string(),
+                                )
+                            }
+                        }
+                        CodeBlockKind::Indented => None,
+                    };
                 }
                 Tag::Emphasis => {
                     let base = current_style(&style_stack);
@@ -96,6 +116,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 }
                 TagEnd::CodeBlock => {
                     in_code_block = false;
+                    code_block_lang = None;
                     flush_line(&mut current_spans, &mut lines);
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
@@ -124,10 +145,20 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                     current_spans.push(Span::styled("│ ", theme::success_style()));
                 }
                 if in_code_block {
-                    // Code blocks: no wrapping, use code style
-                    for line in text.lines() {
-                        current_spans.push(Span::styled(line.to_string(), theme::code_style()));
-                        flush_line(&mut current_spans, &mut lines);
+                    // Fenced code blocks with a known language get syntax
+                    // highlighted; indented blocks and unknown langs fall
+                    // back to the existing cyan code-style treatment.
+                    if let Some(lang) = code_block_lang.as_deref() {
+                        let highlighted = highlight::highlight_code_block(&text, lang);
+                        if !highlighted.is_empty() {
+                            flush_line(&mut current_spans, &mut lines);
+                            lines.extend(highlighted);
+                        }
+                    } else {
+                        for line in text.lines() {
+                            current_spans.push(Span::styled(line.to_string(), theme::code_style()));
+                            flush_line(&mut current_spans, &mut lines);
+                        }
                     }
                 } else {
                     // Wrap text

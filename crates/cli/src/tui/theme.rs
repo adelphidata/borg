@@ -96,6 +96,38 @@ pub fn thinking_border_style() -> Style {
     Style::default().fg(Color::Rgb(80, 80, 80))
 }
 
+pub fn diff_add_style() -> Style {
+    Style::default().fg(TOOL_ACTIVE_GREEN)
+}
+
+pub fn diff_remove_style() -> Style {
+    Style::default().fg(RED)
+}
+
+pub fn diff_header_style() -> Style {
+    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+}
+
+pub fn diff_hunk_style() -> Style {
+    Style::default().fg(Color::Rgb(140, 140, 140))
+}
+
+pub fn toast_info_border() -> Style {
+    Style::default().fg(CYAN)
+}
+
+pub fn toast_success_border() -> Style {
+    Style::default().fg(TOOL_ACTIVE_GREEN)
+}
+
+pub fn toast_warning_border() -> Style {
+    Style::default().fg(AMBER)
+}
+
+pub fn toast_error_border() -> Style {
+    Style::default().fg(RED)
+}
+
 pub fn format_elapsed(secs: u64) -> String {
     if secs < 60 {
         format!("{secs}s")
@@ -252,5 +284,30 @@ mod tests {
     fn thinking_border_has_gray_fg() {
         let style = thinking_border_style();
         assert_eq!(style.fg, Some(Color::Rgb(80, 80, 80)));
+    }
+
+    #[test]
+    fn diff_add_style_is_green() {
+        assert_eq!(diff_add_style().fg, Some(TOOL_ACTIVE_GREEN));
+    }
+
+    #[test]
+    fn diff_remove_style_is_red() {
+        assert_eq!(diff_remove_style().fg, Some(RED));
+    }
+
+    #[test]
+    fn diff_header_style_is_bold_cyan() {
+        let style = diff_header_style();
+        assert_eq!(style.fg, Some(CYAN));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn toast_variant_borders_distinct() {
+        assert_ne!(toast_info_border().fg, toast_success_border().fg);
+        assert_ne!(toast_warning_border().fg, toast_error_border().fg);
+        assert_eq!(toast_error_border().fg, Some(RED));
+        assert_eq!(toast_success_border().fg, Some(TOOL_ACTIVE_GREEN));
     }
 }

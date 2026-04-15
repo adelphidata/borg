@@ -38,6 +38,10 @@ impl<'a> App<'a> {
         self.schedule_popup.render(frame);
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);
+
+        // Toasts are drawn last so they float above every other overlay.
+        self.toasts.prune_expired();
+        self.toasts.render(frame, area);
     }
 
     pub(super) fn compute_context_pct(&self) -> u8 {

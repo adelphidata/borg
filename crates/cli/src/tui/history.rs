@@ -2,8 +2,15 @@ use borg_core::types::{PlanStep, PlanStepStatus};
 use ratatui::text::{Line, Span};
 use throbber_widgets_tui::ThrobberState;
 
+use super::diff_render;
 use super::markdown;
 use super::theme;
+
+/// Lines of tool output shown before collapsing; results with more lines than
+/// this render with a "+N more lines" footer and can be toggled with Ctrl+E.
+pub const COLLAPSE_THRESHOLD: usize = 10;
+/// Lines shown as the preview when a tool result is in the collapsed state.
+pub const COLLAPSE_PREVIEW_LINES: usize = 8;
 
 #[derive(Clone)]
 pub enum ApprovalStatus {
@@ -32,6 +39,17 @@ pub enum HistoryCell {
         is_error: bool,
         duration_ms: Option<u64>,
         display_label: String,
+        /// Name of the tool that produced this result. Enables contextual
+        /// rendering (e.g. colored diff for `apply_patch`).
+        tool_name: String,
+        /// Raw args JSON from the originating tool call, when available.
+        /// Populated from the matching `ToolStart` so render paths can pull
+        /// in data that isn't in `output` (e.g. the patch text).
+        args_json: Option<String>,
+        /// When true, the rendered output is shown in collapsed form
+        /// (first `COLLAPSE_PREVIEW_LINES` lines + "more" footer). Toggled
+        /// by Ctrl+E in the App event handler.
+        collapsed: bool,
     },
     ShellApproval {
         command: String,
@@ -263,6 +281,48 @@ impl HistoryCell {
         )
     }
 
+    /// Flip the collapsed state on a `ToolResult` cell. No-op for other cells.
+    pub fn toggle_collapsed(&mut self) -> bool {
+        if let HistoryCell::ToolResult { collapsed, .. } = self {
+            *collapsed = !*collapsed;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True when this is a `ToolResult` whose body exceeds the collapse
+    /// threshold (i.e. would benefit from expand/collapse).
+    pub fn is_collapsible_result(&self) -> bool {
+        match self {
+            HistoryCell::ToolResult {
+                output,
+                tool_name,
+                args_json,
+                is_error,
+                ..
+            } => {
+                // apply_patch uses the patch DSL line count; everything else
+                // uses raw output lines.
+                let line_count = if !*is_error && tool_name == "apply_patch" {
+                    args_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .and_then(|v| {
+                            v.get("patch")
+                                .and_then(|p| p.as_str())
+                                .map(|s| s.lines().count())
+                        })
+                        .unwrap_or_else(|| output.lines().count())
+                } else {
+                    output.lines().count()
+                };
+                line_count > COLLAPSE_THRESHOLD
+            }
+            _ => false,
+        }
+    }
+
     pub fn render(
         &self,
         width: u16,
@@ -359,40 +419,81 @@ impl HistoryCell {
                 is_error,
                 duration_ms,
                 display_label,
-                ..
+                tool_name,
+                args_json,
+                collapsed,
             } => {
-                let style = if *is_error {
-                    theme::error_style()
-                } else {
-                    theme::dim()
-                };
-                let preview_lines: Vec<&str> = output.lines().take(5).collect();
-                let total_count = output.lines().count();
-                let truncated = total_count > 5;
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                for (i, pl) in preview_lines.iter().enumerate() {
+
+                // Contextual: apply_patch renders the raw patch as a colored diff
+                // instead of the plain success-text output. Only on success —
+                // errors show the usual dim preview so the error text is visible.
+                let rendered_body = if !*is_error
+                    && tool_name == "apply_patch"
+                    && args_json.is_some()
+                {
+                    args_json
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .and_then(|v| v.get("patch").and_then(|p| p.as_str()).map(str::to_string))
+                        .map(|patch| diff_render::render_patch(&patch))
+                } else {
+                    None
+                };
+
+                let (body_lines, body_style) = match rendered_body {
+                    Some(diff_lines) => (diff_lines, theme::dim()),
+                    None => {
+                        let style = if *is_error {
+                            theme::error_style()
+                        } else {
+                            theme::dim()
+                        };
+                        let raw_lines: Vec<Line<'static>> = output
+                            .lines()
+                            .map(|l| {
+                                let text = if l.len() > 200 {
+                                    format!("{}...", truncate_str(l, 197))
+                                } else {
+                                    l.to_string()
+                                };
+                                Line::from(Span::styled(text, style))
+                            })
+                            .collect();
+                        (raw_lines, style)
+                    }
+                };
+
+                let total = body_lines.len();
+                let should_collapse = *collapsed && total > COLLAPSE_THRESHOLD;
+                let visible_end = if should_collapse {
+                    COLLAPSE_PREVIEW_LINES
+                } else {
+                    total
+                };
+
+                for (i, line) in body_lines.into_iter().take(visible_end).enumerate() {
                     let prefix = if i == 0 {
                         format!("  {} ", theme::TREE_END)
                     } else {
                         "    ".to_string()
                     };
-                    let text = if pl.len() > 200 {
-                        format!("{}...", truncate_str(pl, 197))
-                    } else {
-                        pl.to_string()
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, style),
-                        Span::styled(text, style),
-                    ]));
+                    let mut spans = vec![Span::styled(prefix, body_style)];
+                    spans.extend(line.spans);
+                    lines.push(Line::from(spans));
                 }
-                if truncated {
-                    let extra = total_count - 5;
+
+                if should_collapse {
+                    let extra = total - visible_end;
                     lines.push(Line::from(Span::styled(
-                        format!("    {} +{extra} more lines", theme::ELLIPSIS),
+                        format!(
+                            "    {} +{extra} more lines — Ctrl+E to expand",
+                            theme::ELLIPSIS
+                        ),
                         theme::dim(),
                     )));
                 }
+
                 // Status line with check/cross and duration
                 let (indicator, ind_style) = if *is_error {
                     (theme::CROSS, theme::cross_style())
@@ -742,6 +843,9 @@ mod tests {
             is_error: false,
             duration_ms: Some(10),
             display_label: "run_shell".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
         };
         assert!(tool_result.is_stream_continuation());
 
@@ -845,8 +949,8 @@ mod tests {
     }
 
     #[test]
-    fn render_tool_result_truncates_output() {
-        let output = (0..10)
+    fn render_tool_result_collapsed_shows_footer() {
+        let output = (0..20)
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -855,6 +959,9 @@ mod tests {
             is_error: false,
             duration_ms: Some(1500),
             display_label: "Ran test".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: true,
         };
         let lines = cell.render(80, None);
         let all_text: String = lines
@@ -862,8 +969,177 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(all_text.contains("+5 more lines"));
+        // 20 lines total, 8 preview → 12 hidden
+        assert!(all_text.contains("+12 more lines"), "got: {all_text}");
+        assert!(all_text.contains("Ctrl+E"), "footer should mention Ctrl+E");
         assert!(all_text.contains("1.5s"));
+    }
+
+    #[test]
+    fn render_tool_result_expanded_shows_all_lines() {
+        let output = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cell = HistoryCell::ToolResult {
+            output,
+            is_error: false,
+            duration_ms: Some(1500),
+            display_label: "Ran test".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        let lines = cell.render(80, None);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!all_text.contains("more lines"), "should not collapse");
+        // All 20 lines should appear
+        assert!(all_text.contains("line 0"));
+        assert!(all_text.contains("line 19"));
+    }
+
+    #[test]
+    fn render_tool_result_short_output_not_collapsed() {
+        // Under threshold — no footer even with collapsed=true
+        let cell = HistoryCell::ToolResult {
+            output: "one\ntwo\nthree".to_string(),
+            is_error: false,
+            duration_ms: Some(100),
+            display_label: "Ran".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: true,
+        };
+        let lines = cell.render(80, None);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!all_text.contains("more lines"));
+    }
+
+    #[test]
+    fn toggle_collapsed_flips_state() {
+        let mut cell = HistoryCell::ToolResult {
+            output: (0..20)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+            duration_ms: None,
+            display_label: "ran".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: true,
+        };
+        assert!(cell.toggle_collapsed());
+        // Should no longer show "more lines" footer
+        let all_text: String = cell
+            .render(80, None)
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(!all_text.contains("more lines"));
+        // Toggle back
+        assert!(cell.toggle_collapsed());
+        let all_text2: String = cell
+            .render(80, None)
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(all_text2.contains("more lines"));
+    }
+
+    #[test]
+    fn toggle_collapsed_noop_on_non_result() {
+        let mut cell = HistoryCell::Separator;
+        assert!(!cell.toggle_collapsed());
+    }
+
+    #[test]
+    fn is_collapsible_result_true_when_over_threshold() {
+        let cell = HistoryCell::ToolResult {
+            output: (0..20)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            is_error: false,
+            duration_ms: None,
+            display_label: "ran".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: true,
+        };
+        assert!(cell.is_collapsible_result());
+    }
+
+    #[test]
+    fn is_collapsible_result_false_when_under_threshold() {
+        let cell = HistoryCell::ToolResult {
+            output: "one\ntwo".to_string(),
+            is_error: false,
+            duration_ms: None,
+            display_label: "ran".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        assert!(!cell.is_collapsible_result());
+    }
+
+    #[test]
+    fn render_tool_result_apply_patch_uses_diff() {
+        let patch = "*** Begin Patch\n*** Add File: x.rs\n+fn foo() {}\n*** End Patch";
+        let args_json = serde_json::json!({ "patch": patch }).to_string();
+        let cell = HistoryCell::ToolResult {
+            output: "Patch applied successfully.".to_string(),
+            is_error: false,
+            duration_ms: Some(50),
+            display_label: "Edited 1 file".to_string(),
+            tool_name: "apply_patch".to_string(),
+            args_json: Some(args_json),
+            collapsed: false,
+        };
+        let lines = cell.render(80, None);
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Diff header + body rendered from args, NOT the output text
+        assert!(
+            all_text.contains("Add:"),
+            "expected diff header in: {all_text}"
+        );
+        assert!(all_text.contains("fn foo()"));
+    }
+
+    #[test]
+    fn render_tool_result_apply_patch_error_falls_back_to_output() {
+        let cell = HistoryCell::ToolResult {
+            output: "Error: patch rejected at line 3".to_string(),
+            is_error: true,
+            duration_ms: Some(10),
+            display_label: "Edited".to_string(),
+            tool_name: "apply_patch".to_string(),
+            args_json: Some(r#"{"patch":"*** Begin Patch\n*** End Patch"}"#.to_string()),
+            collapsed: false,
+        };
+        let all_text: String = cell
+            .render(80, None)
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        // Error should keep the raw output visible, not swap for an empty diff
+        assert!(all_text.contains("Error: patch rejected"));
     }
 
     #[test]
@@ -873,6 +1149,9 @@ mod tests {
             is_error: false,
             duration_ms: Some(200),
             display_label: "Ran `ls`".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
         };
         let lines = cell.render(80, None);
         let all_text: String = lines

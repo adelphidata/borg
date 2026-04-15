@@ -183,11 +183,16 @@ impl<'a> App<'a> {
             format!("Ran {name}")
         };
         let is_error = result.starts_with("Error:");
+        let line_count = result.lines().count();
+        let collapsed = line_count > super::super::history::COLLAPSE_THRESHOLD;
         self.cells.push(HistoryCell::ToolResult {
             output: result,
             is_error,
             duration_ms,
             display_label,
+            tool_name: name,
+            args_json: matched_args,
+            collapsed,
         });
         if self.auto_scroll {
             self.scroll_offset = 0;

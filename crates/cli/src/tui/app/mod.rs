@@ -209,6 +209,8 @@ pub struct App<'a> {
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
     /// Sender for notifying the config watcher of in-process changes.
     pub config_notify_tx: Option<tokio::sync::mpsc::Sender<Config>>,
+    /// Transient corner notifications; auto-expire.
+    pub toasts: super::toast::ToastStack,
 }
 
 impl<'a> App<'a> {
@@ -264,7 +266,31 @@ impl<'a> App<'a> {
             status_popup: StatusPopup::new(),
             doctor_rx: None,
             config_notify_tx: None,
+            toasts: super::toast::ToastStack::new(),
         }
+    }
+
+    /// Push a short-lived info toast into the corner overlay.
+    pub fn toast_info(&mut self, text: impl Into<String>) {
+        self.toasts.push(text, super::toast::ToastVariant::Info);
+    }
+
+    /// Push a short-lived success toast into the corner overlay.
+    #[allow(dead_code)] // Awaiting call sites (skill install, session save, etc).
+    pub fn toast_success(&mut self, text: impl Into<String>) {
+        self.toasts.push(text, super::toast::ToastVariant::Success);
+    }
+
+    /// Push a short-lived warning toast into the corner overlay.
+    #[allow(dead_code)]
+    pub fn toast_warning(&mut self, text: impl Into<String>) {
+        self.toasts.push(text, super::toast::ToastVariant::Warning);
+    }
+
+    /// Push a short-lived error toast into the corner overlay.
+    #[allow(dead_code)]
+    pub fn toast_error(&mut self, text: impl Into<String>) {
+        self.toasts.push(text, super::toast::ToastVariant::Error);
     }
 
     pub fn tick_throbber(&mut self) {
@@ -308,6 +334,17 @@ impl<'a> App<'a> {
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
+    }
+
+    /// Toggle the collapsed state on the most recent collapsible tool result.
+    /// Returns `true` when a cell was flipped, `false` when nothing qualified.
+    pub fn toggle_last_collapsible(&mut self) -> bool {
+        for cell in self.cells.iter_mut().rev() {
+            if cell.is_collapsible_result() {
+                return cell.toggle_collapsed();
+            }
+        }
+        false
     }
 
     /// Route a paste event to the first visible popup that accepts paste input.
@@ -706,6 +743,8 @@ impl<'a> App<'a> {
                 self.composer.set_text("");
                 self.auto_scroll = true;
             }
+        } else if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.toggle_last_collapsible();
         } else if key.code == KeyCode::Tab {
             // No-op during streaming
         } else if self.any_popup_visible() {
@@ -793,6 +832,7 @@ impl<'a> App<'a> {
             self.cells.clear();
             self.scroll_offset = 0;
             self.auto_scroll = true;
+            self.toast_info("Transcript cleared");
             return Ok(AppAction::Continue);
         }
 
@@ -807,6 +847,14 @@ impl<'a> App<'a> {
         // Ctrl+G — launch external editor
         if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(AppAction::LaunchExternalEditor);
+        }
+
+        // Ctrl+E — toggle collapse on the most recent expandable tool result
+        if key.code == KeyCode::Char('e')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.toggle_last_collapsible()
+        {
+            return Ok(AppAction::Continue);
         }
 
         // Ctrl+V — paste clipboard image (fall through to normal paste if no image)
@@ -834,6 +882,7 @@ impl<'a> App<'a> {
             }
             self.config.conversation.collaboration_mode = next;
             self.push_system_message(format!("[mode: {next}]"));
+            self.toast_info(format!("Mode → {next}"));
             return Ok(AppAction::Continue);
         }
 

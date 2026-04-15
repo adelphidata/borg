@@ -112,6 +112,26 @@ const COMMANDS: &[SlashCommandDef] = &[
     },
 ];
 
+/// True when every char of `needle` appears in `haystack` in order
+/// (not necessarily contiguously). Both inputs are expected lowercase.
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut n = needle.chars();
+    let mut curr = n.next();
+    for hc in haystack.chars() {
+        match curr {
+            Some(nc) if nc == hc => curr = n.next(),
+            _ => {}
+        }
+        if curr.is_none() {
+            return true;
+        }
+    }
+    curr.is_none()
+}
+
 pub struct CommandPopup {
     visible: bool,
     filter: String,
@@ -150,20 +170,27 @@ impl CommandPopup {
 
         let filter_lower = self.filter.to_lowercase();
 
-        // Collect matches: exact first, then prefix
+        // Three-tier ranking: exact match > prefix match > subsequence match.
+        // Within each tier, preserve the declaration order of COMMANDS so
+        // related commands stay grouped (e.g. /settings near /status).
         let mut exact = Vec::new();
         let mut prefix = Vec::new();
+        let mut fuzzy = Vec::new();
 
         for cmd in COMMANDS {
             let cmd_name = &cmd.name[1..]; // strip leading '/'
-            if cmd_name == filter_lower {
+            let cmd_lower = cmd_name.to_lowercase();
+            if cmd_lower == filter_lower {
                 exact.push(cmd);
-            } else if cmd_name.starts_with(&filter_lower) {
+            } else if cmd_lower.starts_with(&filter_lower) {
                 prefix.push(cmd);
+            } else if is_subsequence(&filter_lower, &cmd_lower) {
+                fuzzy.push(cmd);
             }
         }
 
         exact.extend(prefix);
+        exact.extend(fuzzy);
         exact
     }
 
@@ -273,12 +300,17 @@ mod tests {
     }
 
     #[test]
-    fn prefix_filtering() {
+    fn prefix_filtering_ranks_prefix_before_fuzzy() {
         let mut popup = CommandPopup::new();
         popup.update_filter("/he");
         let items = popup.filtered();
-        assert!(items.iter().all(|c| c.name.starts_with("/he")));
         assert!(!items.is_empty());
+        // The top result must be a prefix match (/help, /history), not fuzzy.
+        let first = items[0].name;
+        assert!(
+            first.starts_with("/he"),
+            "top match for /he should be a prefix match, got {first}"
+        );
     }
 
     #[test]
@@ -372,16 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn filter_st_matches_stats_and_schedule() {
+    fn filter_st_ranks_prefix_before_fuzzy() {
         let mut popup = CommandPopup::new();
         popup.update_filter("/st");
         let items = popup.filtered();
         let names: Vec<&str> = items.iter().map(|c| c.name).collect();
-        assert!(names.contains(&"/stats"), "should match /stats");
-        // /settings starts with /se, not /st — so it should NOT match
+        // /stats has the prefix; /settings is a fuzzy subsequence (s…t) —
+        // prefix matches must rank ahead of fuzzy matches.
+        let stats_pos = names.iter().position(|n| *n == "/stats").unwrap();
+        let settings_pos = names.iter().position(|n| *n == "/settings");
+        assert!(settings_pos.is_some(), "fuzzy should include /settings");
         assert!(
-            !names.contains(&"/settings"),
-            "/settings should not match /st"
+            stats_pos < settings_pos.unwrap(),
+            "prefix /stats must outrank fuzzy /settings, got names: {names:?}"
         );
     }
 
@@ -392,5 +427,57 @@ mod tests {
         let items = popup.filtered();
         let names: Vec<&str> = items.iter().map(|c| c.name).collect();
         assert!(names.contains(&"/logs"), "should match /logs");
+    }
+
+    #[test]
+    fn fuzzy_matches_subsequence() {
+        let mut popup = CommandPopup::new();
+        popup.update_filter("/stg");
+        let items = popup.filtered();
+        let names: Vec<&str> = items.iter().map(|c| c.name).collect();
+        assert!(
+            names.contains(&"/settings"),
+            "subsequence 'stg' should match /settings, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_is_case_insensitive() {
+        let mut popup = CommandPopup::new();
+        popup.update_filter("/STG");
+        let items = popup.filtered();
+        assert!(items.iter().any(|c| c.name == "/settings"));
+    }
+
+    #[test]
+    fn fuzzy_ranks_exact_above_prefix_above_fuzzy() {
+        let mut popup = CommandPopup::new();
+        // "hlp" matches /help as subsequence, /plugins as subsequence, and has no exact or prefix.
+        popup.update_filter("/hlp");
+        let items = popup.filtered();
+        assert!(
+            items.iter().any(|c| c.name == "/help"),
+            "fuzzy 'hlp' should match /help"
+        );
+    }
+
+    #[test]
+    fn is_subsequence_basic() {
+        assert!(is_subsequence("", "anything"));
+        assert!(is_subsequence("abc", "aabbcc"));
+        assert!(is_subsequence("stg", "settings"));
+        assert!(!is_subsequence("xyz", "settings"));
+        assert!(!is_subsequence("ts", "st"));
+    }
+
+    #[test]
+    fn nonsense_filter_still_empty() {
+        let mut popup = CommandPopup::new();
+        // Pick a string with no possible subsequence match anywhere.
+        popup.update_filter("/zqxj");
+        assert!(
+            popup.filtered().is_empty(),
+            "expected empty results for /zqxj"
+        );
     }
 }
