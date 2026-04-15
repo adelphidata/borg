@@ -47,7 +47,6 @@ fn search_scope(
     min_score: f32,
     vector_weight: f32,
     bm25_weight: f32,
-    vector_threshold_factor: f32,
 ) -> Vec<embeddings::SearchResult> {
     // FTS search
     let fts_rows = match db.fts_search(scope, query, max_results * 4) {
@@ -92,7 +91,8 @@ fn search_scope(
                     Some((c.filename.clone(), c.chunk_index, sim))
                 })
             })
-            .filter(|(_f, _ci, sim)| *sim >= min_score * vector_threshold_factor)
+            // Vector threshold is halved: cosine similarity scores tend to be lower than BM25-normalized scores
+            .filter(|(_f, _ci, sim)| *sim >= min_score * 0.5)
             .collect()
     } else {
         Vec::new()
@@ -141,31 +141,7 @@ fn search_scope(
         .collect()
 }
 
-/// Default scope set used when the DB contains no memory entries yet.
-const DEFAULT_SEARCH_SCOPES: &[&str] = &["global", "local", "extra", "sessions"];
-
-/// Resolve the set of scopes to search. Prefers the scopes that actually have
-/// entries in the DB (so custom scopes written via `write_memory scope="foo"`
-/// surface through search) and falls back to the default list when the DB is
-/// empty or the query fails.
-fn resolve_search_scopes(db: &Database) -> Vec<String> {
-    match db.list_memory_scopes() {
-        Ok(scopes) if !scopes.is_empty() => scopes,
-        Ok(_) => DEFAULT_SEARCH_SCOPES
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        Err(e) => {
-            tracing::warn!("list_memory_scopes failed, falling back to defaults: {e}");
-            DEFAULT_SEARCH_SCOPES
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        }
-    }
-}
-
-/// Execute hybrid memory search (FTS + vector) across all known scopes.
+/// Execute hybrid memory search (FTS + vector) across global and local scopes.
 #[instrument(skip_all, fields(tool.name = "memory_search"))]
 pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> Result<String> {
     let query = require_str_param(args, "query")?;
@@ -173,7 +149,6 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     let min_score = optional_f64_param(args, "min_score", 0.2) as f32;
     let vector_weight = config.memory.embeddings.vector_weight;
     let bm25_weight = config.memory.embeddings.bm25_weight;
-    let vector_threshold_factor = config.memory.embeddings.vector_threshold_factor;
     let db = Database::open()?;
     let mut all_results = Vec::new();
 
@@ -187,8 +162,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         tracing::debug!("memory_search: no embedding provider, falling back to FTS-only");
     }
 
-    let scopes = resolve_search_scopes(&db);
-    for scope in &scopes {
+    for scope in &["global", "local", "extra", "sessions"] {
         all_results.extend(search_scope(
             &db,
             scope,
@@ -198,7 +172,6 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
             min_score,
             vector_weight,
             bm25_weight,
-            vector_threshold_factor,
         ));
     }
 
@@ -208,7 +181,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         if terms.len() > 1 {
             let mut seen: std::collections::HashSet<(String, i64)> =
                 std::collections::HashSet::new();
-            for scope in &scopes {
+            for scope in &["global", "local", "extra", "sessions"] {
                 for term in &terms {
                     let fts_rows = match db.fts_search(scope, term, max_results) {
                         Ok(rows) => rows,
@@ -358,9 +331,9 @@ mod tests {
             "content": "alpha",
         });
         let msg = handle_write_memory(&args).expect("write global");
-        // handle_write_memory strips the .md suffix for DB entry names, so the
-        // success message echoes the stripped name.
-        assert!(msg.contains("note"));
+        // `.md` is stripped before storage (backward compat with old tool calls),
+        // so the confirmation message echoes the bare entry name.
+        assert!(msg.contains("note"), "got: {msg}");
 
         let read =
             handle_read_memory(&serde_json::json!({"filename": "note.md"})).expect("read global");
@@ -385,122 +358,5 @@ mod tests {
         assert!(missing.contains("not found"), "got: {missing}");
 
         std::env::remove_var("BORG_DATA_DIR");
-    }
-
-    // ── F4: vector_threshold_factor ──
-
-    #[test]
-    fn embeddings_config_default_threshold_factor() {
-        let cfg = crate::config::media::EmbeddingsConfig::default();
-        assert!(
-            (cfg.vector_threshold_factor - 0.5).abs() < f32::EPSILON,
-            "default factor should be 0.5"
-        );
-    }
-
-    #[test]
-    fn vector_threshold_factor_changes_filter_results() {
-        use crate::db::ChunkData;
-        // Three chunks with cosine similarities 0.9, 0.4, 0.2 against the
-        // query. With a strict factor the weakest two get pre-filtered out,
-        // so the middle chunk never participates in min-max normalization.
-        // With a loose factor all three enter the pre-filter, normalization
-        // spreads them across [0,1], and the middle chunk survives the final
-        // `min_score` gate. This exercises the exact behavior the 0.5 magic
-        // number controlled prior to F4.
-        let db = Database::test_db();
-        let query_emb = vec![1.0f32, 0.0];
-        let chunks = vec![
-            ChunkData {
-                chunk_index: 0,
-                start_line: None,
-                end_line: None,
-                content: "alpha".into(),
-                content_hash: "ha".into(),
-                embedding: Some(embeddings::embedding_to_bytes(&[0.9, 0.436])),
-                dimension: Some(2),
-                model: Some("test".into()),
-            },
-            ChunkData {
-                chunk_index: 1,
-                start_line: None,
-                end_line: None,
-                content: "beta".into(),
-                content_hash: "hb".into(),
-                embedding: Some(embeddings::embedding_to_bytes(&[0.4, 0.917])),
-                dimension: Some(2),
-                model: Some("test".into()),
-            },
-            ChunkData {
-                chunk_index: 2,
-                start_line: None,
-                end_line: None,
-                content: "gamma".into(),
-                content_hash: "hc".into(),
-                embedding: Some(embeddings::embedding_to_bytes(&[0.2, 0.980])),
-                dimension: Some(2),
-                model: Some("test".into()),
-            },
-        ];
-        db.upsert_chunks("global", "e.md", &chunks).unwrap();
-
-        let run = |factor: f32| -> std::collections::HashSet<i64> {
-            search_scope(
-                &db,
-                "global",
-                "zzzzzzz", // no FTS match → vector-only path
-                Some(&query_emb),
-                10,
-                0.1,
-                0.0,
-                1.0,
-                factor,
-            )
-            .iter()
-            .map(|r| r.chunk_index)
-            .collect()
-        };
-
-        let strict = run(3.0);
-        let loose = run(0.1);
-        assert_eq!(
-            strict,
-            [0].into_iter().collect(),
-            "strict factor must leave only the strongest match: got {strict:?}"
-        );
-        assert!(
-            loose.contains(&0) && loose.contains(&1),
-            "loose factor must surface the middle chunk too: got {loose:?}"
-        );
-    }
-
-    // ── F6: scope auto-discovery ──
-
-    #[test]
-    fn resolve_search_scopes_returns_defaults_for_empty_db() {
-        let db = Database::test_db();
-        let scopes = resolve_search_scopes(&db);
-        assert_eq!(
-            scopes,
-            DEFAULT_SEARCH_SCOPES
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn resolve_search_scopes_surfaces_custom_scope() {
-        let db = Database::test_db();
-        db.upsert_memory_entry("project:abc", "notes", "hello")
-            .unwrap();
-        db.upsert_memory_entry("global", "INDEX", "- idx").unwrap();
-        let scopes = resolve_search_scopes(&db);
-        // Custom scope must be present so a later search hits it.
-        assert!(scopes.contains(&"project:abc".to_string()));
-        assert!(scopes.contains(&"global".to_string()));
-        // And the default hard-coded list must NOT be applied over the top —
-        // if the DB has scopes, that's what we use.
-        assert!(!scopes.contains(&"sessions".to_string()));
     }
 }

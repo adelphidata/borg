@@ -1438,11 +1438,24 @@ base_url = "https://proxy.example.com/v1/chat/completions"
     );
 }
 
-/// Combined to avoid env-var races between parallel tests that toggle
-/// `TELEGRAM_BOT_TOKEN` and friends. Running these assertions sequentially
-/// inside a single test keeps the env state consistent for the duration.
+/// Serializes env-var-mutating channel tests so they don't race each other
+/// when cargo test runs them in parallel.
+static CHANNEL_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
-fn has_any_native_channel_env_detection() {
+fn has_any_native_channel_detects_telegram_env() {
+    let _lock = CHANNEL_ENV_MUTEX.lock().unwrap();
+    // Use a unique env var name to avoid conflicts with real credentials
+    std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-for-unit-test");
+    let cfg = Config::default();
+    assert!(cfg.has_any_native_channel());
+    std::env::remove_var("TELEGRAM_BOT_TOKEN");
+}
+
+#[test]
+fn has_any_native_channel_false_when_no_creds() {
+    let _lock = CHANNEL_ENV_MUTEX.lock().unwrap();
+    // Temporarily clear all native channel env vars
     let keys = [
         "TELEGRAM_BOT_TOKEN",
         "SLACK_BOT_TOKEN",
@@ -1455,19 +1468,11 @@ fn has_any_native_channel_env_detection() {
     for k in &keys {
         std::env::remove_var(k);
     }
-
-    // -- false when all native-channel env vars are cleared --
     let cfg = Config::default();
+    // Skip assertion if the OS keychain has real credentials (e.g. dev machine with installed plugins)
     if cfg.detected_native_channels().is_empty() {
         assert!(!cfg.has_any_native_channel());
     }
-
-    // -- true when a known env var is present --
-    std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token-for-unit-test");
-    let cfg = Config::default();
-    assert!(cfg.has_any_native_channel());
-    std::env::remove_var("TELEGRAM_BOT_TOKEN");
-
     // Restore
     for (k, v) in saved {
         if let Some(val) = v {
