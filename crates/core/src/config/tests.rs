@@ -502,6 +502,35 @@ fn resolve_provider_prefers_secret_ref() {
 }
 
 #[test]
+fn resolve_api_keys_overrides_openai_to_openrouter_when_key_is_openrouter() {
+    let env = "BORG_TEST_MISMATCHED_KEY";
+    std::env::set_var(env, "sk-or-v1-mismatched-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".to_string());
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env.to_string(),
+    }];
+    let (provider, keys) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::OpenRouter);
+    assert_eq!(keys[0], "sk-or-v1-mismatched-key");
+    std::env::remove_var(env);
+}
+
+#[test]
+fn resolve_api_keys_keeps_provider_when_key_prefix_is_ambiguous() {
+    let env = "BORG_TEST_AMBIGUOUS_KEY";
+    std::env::set_var(env, "sk-some-openai-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".to_string());
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env.to_string(),
+    }];
+    let (provider, _) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::OpenAi);
+    std::env::remove_var(env);
+}
+
+#[test]
 fn resolve_api_keys_multi() {
     let env1 = "BORG_TEST_MULTI_KEY_1";
     let env2 = "BORG_TEST_MULTI_KEY_2";

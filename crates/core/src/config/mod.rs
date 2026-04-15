@@ -493,12 +493,14 @@ impl Config {
                         Provider::OpenRouter
                     })
                 };
+                let provider = correct_provider_from_key(provider, &keys[0]);
                 return Ok((provider, keys));
             }
         }
 
         // Fall back to single key via resolve_provider
         let (provider, key) = self.resolve_provider()?;
+        let provider = correct_provider_from_key(provider, &key);
         Ok((provider, vec![key]))
     }
 
@@ -636,5 +638,23 @@ impl Config {
             .filter(|(_, _, key)| self.resolve_credential_or_env(key).is_some())
             .map(|(name, desc, _)| (*name, *desc))
             .collect()
+    }
+}
+
+/// Override the configured provider when the API key's prefix points to a
+/// different, unambiguous provider (e.g. `sk-or-*` is always OpenRouter).
+///
+/// Prevents the surprising "Authentication with OpenAI failed" flow when an
+/// OpenRouter key ends up stored under `provider = "openai"`.
+fn correct_provider_from_key(configured: Provider, key: &str) -> Provider {
+    match Provider::from_api_key_prefix(key) {
+        Some(detected) if detected != configured => {
+            warn!(
+                "API key prefix indicates {detected}, but provider is set to {configured}. \
+                 Routing through {detected}."
+            );
+            detected
+        }
+        _ => configured,
     }
 }

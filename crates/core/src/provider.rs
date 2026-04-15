@@ -248,6 +248,22 @@ impl Provider {
         }
     }
 
+    /// Infer the provider from an API key's distinctive prefix.
+    ///
+    /// Returns `Some(provider)` only when the prefix is unambiguous
+    /// (OpenRouter `sk-or-`, Anthropic `sk-ant-`). Plain `sk-` is intentionally
+    /// not classified — too many providers use that format.
+    pub fn from_api_key_prefix(key: &str) -> Option<Provider> {
+        let trimmed = key.trim();
+        if trimmed.starts_with("sk-or-") {
+            Some(Provider::OpenRouter)
+        } else if trimmed.starts_with("sk-ant-") {
+            Some(Provider::Anthropic)
+        } else {
+            None
+        }
+    }
+
     /// Check if Ollama is reachable (sync, short timeout).
     pub fn ollama_available() -> bool {
         let default_addr: SocketAddr =
@@ -634,5 +650,42 @@ mod tests {
             Provider::from_env_var_name("CLAUDE_CLI_PATH"),
             Some(Provider::ClaudeCli)
         );
+    }
+
+    #[test]
+    fn from_api_key_prefix_openrouter() {
+        assert_eq!(
+            Provider::from_api_key_prefix("sk-or-v1-abc123"),
+            Some(Provider::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn from_api_key_prefix_anthropic() {
+        assert_eq!(
+            Provider::from_api_key_prefix("sk-ant-api03-xyz"),
+            Some(Provider::Anthropic)
+        );
+    }
+
+    #[test]
+    fn from_api_key_prefix_trims_whitespace() {
+        assert_eq!(
+            Provider::from_api_key_prefix("  sk-or-v1-key  "),
+            Some(Provider::OpenRouter)
+        );
+    }
+
+    #[test]
+    fn from_api_key_prefix_plain_sk_is_ambiguous() {
+        // `sk-` alone is used by OpenAI, DeepSeek, Groq, etc. — not classified.
+        assert_eq!(Provider::from_api_key_prefix("sk-abc123"), None);
+    }
+
+    #[test]
+    fn from_api_key_prefix_unknown() {
+        assert_eq!(Provider::from_api_key_prefix(""), None);
+        assert_eq!(Provider::from_api_key_prefix("AIzaFakeGemini"), None);
+        assert_eq!(Provider::from_api_key_prefix("random-key"), None);
     }
 }
