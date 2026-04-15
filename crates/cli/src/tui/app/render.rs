@@ -203,6 +203,33 @@ impl<'a> App<'a> {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
+        // Search overlay takes over the footer, matching bash/zsh's
+        // `(reverse-i-search)` prompt convention.
+        if self.composer.is_searching() {
+            let query = self.composer.search_query().unwrap_or("");
+            let failing = !self.composer.search_has_match() && !query.is_empty();
+            let label = if failing {
+                " failing reverse-i-search: "
+            } else {
+                " reverse-i-search: "
+            };
+            let style = if failing {
+                theme::error_style()
+            } else {
+                theme::tool_style()
+            };
+            let line = Line::from(vec![
+                Span::styled(label, style),
+                Span::styled(format!("`{query}`"), theme::dim()),
+                Span::styled(
+                    "  •  Ctrl+R back  •  Ctrl+S forward  •  Enter accept  •  Esc cancel",
+                    theme::dim(),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
+
         let left = match &self.state {
             AppState::Idle if matches!(self.backtrack, BacktrackPhase::Selecting { .. }) => {
                 "↑/↓ select message  •  enter to rewind  •  esc to cancel".to_string()
@@ -240,7 +267,19 @@ impl<'a> App<'a> {
             }
             AppState::ConfirmingUninstall => "y to uninstall  •  N / enter to cancel".to_string(),
         };
-        let line = Line::from(Span::styled(format!(" {left}"), theme::dim()));
+
+        let pct = self.compute_context_pct();
+        let pct_style = if pct >= 95 {
+            theme::error_style()
+        } else if pct >= 80 {
+            theme::warning_style()
+        } else {
+            theme::dim()
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" ctx {pct}%"), pct_style),
+            Span::styled(format!("  •  {left}"), theme::dim()),
+        ]);
         frame.render_widget(Paragraph::new(line), area);
     }
 

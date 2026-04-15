@@ -44,6 +44,42 @@ impl InputHistory {
         self.draft.clear();
     }
 
+    /// Find the newest entry at or before `start` containing `query`.
+    /// Empty query matches the entry at `start` (or newest if clamped).
+    fn find_backward(&self, query: &str, start: usize) -> Option<usize> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let start = start.min(self.entries.len() - 1);
+        if query.is_empty() {
+            return Some(start);
+        }
+        (0..=start).rev().find(|&i| self.entries[i].contains(query))
+    }
+
+    /// Find the oldest entry at or after `start` containing `query`.
+    fn find_forward(&self, query: &str, start: usize) -> Option<usize> {
+        if self.entries.is_empty() || start >= self.entries.len() {
+            return None;
+        }
+        if query.is_empty() {
+            return Some(start);
+        }
+        (start..self.entries.len()).find(|&i| self.entries[i].contains(query))
+    }
+
+    fn get(&self, index: usize) -> Option<&str> {
+        self.entries.get(index).map(String::as_str)
+    }
+
+    fn newest_index(&self) -> Option<usize> {
+        if self.entries.is_empty() {
+            None
+        } else {
+            Some(self.entries.len() - 1)
+        }
+    }
+
     fn up(&mut self, current_text: &str) -> Option<&str> {
         if self.entries.is_empty() {
             return None;
@@ -95,9 +131,21 @@ impl InputHistory {
     }
 }
 
+/// Active reverse-incremental search state.
+///
+/// Tracks the user's query, the draft snapshot to restore on cancel, and
+/// the currently-matched history index. When `match_index` is `None`, the
+/// search has no match for the current query (the "failing" state in bash).
+struct HistorySearch {
+    query: String,
+    original_draft: String,
+    match_index: Option<usize>,
+}
+
 pub struct Composer<'a> {
     textarea: TextArea<'a>,
     history: InputHistory,
+    search: Option<HistorySearch>,
     file_refs: Vec<FileRef>,
     image_attachments: Vec<ImageAttachment>,
     paste_burst: PasteBurst,
@@ -116,6 +164,7 @@ impl<'a> Composer<'a> {
         Self {
             textarea,
             history: InputHistory::new(),
+            search: None,
             file_refs: Vec::new(),
             image_attachments: Vec::new(),
             paste_burst: PasteBurst::new(),
@@ -137,6 +186,20 @@ impl<'a> Composer<'a> {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<String> {
         use crossterm::event::{KeyCode, KeyModifiers};
+
+        // While an incremental search is active, intercept keys before any
+        // other composer routing. Returns `Some(text)` only if the user
+        // accepts+submits with Enter (currently we treat Enter as "accept
+        // match, keep in composer"; user presses Enter again to submit).
+        if self.search.is_some() {
+            return self.handle_search_key(key);
+        }
+
+        // Ctrl+R enters reverse-incremental search.
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.begin_history_search();
+            return None;
+        }
 
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::NONE) => {
@@ -256,6 +319,174 @@ impl<'a> Composer<'a> {
                 None
             }
         }
+    }
+
+    // ----- Reverse-incremental history search -----
+
+    fn begin_history_search(&mut self) {
+        let original_draft = self.text();
+        let match_index = self.history.newest_index();
+        let preview = match_index.and_then(|i| self.history.get(i).map(str::to_string));
+        self.search = Some(HistorySearch {
+            query: String::new(),
+            original_draft,
+            match_index,
+        });
+        if let Some(text) = preview {
+            self.set_text(&text);
+        } else {
+            self.set_text("");
+        }
+    }
+
+    /// Cancel the search: restore the original draft and clear search state.
+    fn cancel_history_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            self.set_text(&search.original_draft);
+        }
+    }
+
+    /// Accept the current match: keep the matched text as the composer draft
+    /// and clear search state. If there is no match, restore the draft.
+    fn accept_history_search(&mut self) {
+        if let Some(search) = self.search.take() {
+            if search.match_index.is_none() {
+                self.set_text(&search.original_draft);
+            }
+            // Preview text is already in the textarea.
+            self.history.reset();
+        }
+    }
+
+    /// Refresh the match after the query changes, starting from the current
+    /// match position (or newest entry if no active match).
+    fn refresh_search_match(&mut self) {
+        let Some(ref mut search) = self.search else {
+            return;
+        };
+        let start = search
+            .match_index
+            .or_else(|| self.history.newest_index())
+            .unwrap_or(0);
+        search.match_index = self.history.find_backward(&search.query, start);
+        let preview = search
+            .match_index
+            .and_then(|i| self.history.get(i).map(str::to_string));
+        if let Some(text) = preview {
+            self.set_text(&text);
+        } else {
+            self.set_text("");
+        }
+    }
+
+    /// Step to the next older match. If none, stay put.
+    fn step_search_backward(&mut self) {
+        let Some(ref mut search) = self.search else {
+            return;
+        };
+        let start = match search.match_index {
+            Some(i) if i > 0 => i - 1,
+            Some(_) => return, // already at oldest match
+            None => self.history.newest_index().unwrap_or(0),
+        };
+        let next = self.history.find_backward(&search.query, start);
+        if let Some(i) = next {
+            search.match_index = Some(i);
+            if let Some(text) = self.history.get(i).map(str::to_string) {
+                self.set_text(&text);
+            }
+        }
+    }
+
+    /// Step to the next newer match. If none, stay put.
+    fn step_search_forward(&mut self) {
+        let Some(ref mut search) = self.search else {
+            return;
+        };
+        let Some(current) = search.match_index else {
+            return;
+        };
+        let start = current + 1;
+        let next = self.history.find_forward(&search.query, start);
+        if let Some(i) = next {
+            search.match_index = Some(i);
+            if let Some(text) = self.history.get(i).map(str::to_string) {
+                self.set_text(&text);
+            }
+        }
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> Option<String> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        match (key.code, key.modifiers) {
+            // Ctrl+R — step to next older match (repeated reverse search).
+            (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.step_search_backward();
+                None
+            }
+            // Ctrl+S — step to next newer match (forward search).
+            (KeyCode::Char('s'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.step_search_forward();
+                None
+            }
+            // Enter — accept current match, stay in composer.
+            (KeyCode::Enter, _) => {
+                self.accept_history_search();
+                None
+            }
+            // Esc — cancel search, restore draft.
+            (KeyCode::Esc, _) => {
+                self.cancel_history_search();
+                None
+            }
+            // Backspace — shorten query and re-resolve match.
+            (KeyCode::Backspace, _) => {
+                if let Some(ref mut search) = self.search {
+                    search.query.pop();
+                    // Reset match_index so the new match is found from the newest.
+                    search.match_index = self.history.newest_index();
+                }
+                self.refresh_search_match();
+                None
+            }
+            // Printable characters — extend the query.
+            (KeyCode::Char(ch), m)
+                if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(ref mut search) = self.search {
+                    search.query.push(ch);
+                    // Always search from the newest on query extension, so
+                    // new keystrokes land on the most-recent match.
+                    search.match_index = self.history.newest_index();
+                }
+                self.refresh_search_match();
+                None
+            }
+            // Any other key: accept current match and exit search silently.
+            _ => {
+                self.accept_history_search();
+                None
+            }
+        }
+    }
+
+    /// Whether the composer is currently in reverse-incremental search mode.
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Current search query (empty string when search was just opened).
+    pub fn search_query(&self) -> Option<&str> {
+        self.search.as_ref().map(|s| s.query.as_str())
+    }
+
+    /// Whether the current search query has a match. `false` means the
+    /// search is in the "failing" state (bash renders `failing reverse-i-search`).
+    pub fn search_has_match(&self) -> bool {
+        self.search
+            .as_ref()
+            .is_some_and(|s| s.match_index.is_some())
     }
 
     pub fn text(&self) -> String {
@@ -538,5 +769,182 @@ mod tests {
         let large_text = "fn main() {\n    println!(\"Hello, world!\");\n    let x = 42;\n    let y = x * 2;\n}\n";
         c.handle_paste(large_text);
         assert_eq!(c.text(), large_text);
+    }
+
+    // -------------- Reverse-incremental history search --------------
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    fn plain(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn seed_history(c: &mut Composer, entries: &[&str]) {
+        for e in entries {
+            c.type_and_submit(e);
+        }
+    }
+
+    #[test]
+    fn test_search_ctrl_r_opens_mode() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["alpha"]);
+        c.handle_key(ctrl('r'));
+        assert!(c.is_searching());
+        assert_eq!(c.search_query(), Some(""));
+        // With empty query, preview shows newest entry.
+        assert_eq!(c.text(), "alpha");
+    }
+
+    #[test]
+    fn test_search_query_finds_newest_match() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["cargo build", "git status", "cargo test"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('c')));
+        c.handle_key(plain(KeyCode::Char('a')));
+
+        assert!(c.is_searching());
+        assert_eq!(c.search_query(), Some("ca"));
+        // Newest match for "ca" is "cargo test".
+        assert_eq!(c.text(), "cargo test");
+        assert!(c.search_has_match());
+    }
+
+    #[test]
+    fn test_search_ctrl_r_steps_to_older_match() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["cargo build", "git status", "cargo test"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('c')));
+        assert_eq!(c.text(), "cargo test");
+
+        // Ctrl+R again steps to the next older match.
+        c.handle_key(ctrl('r'));
+        assert_eq!(c.text(), "cargo build");
+
+        // Once at oldest, Ctrl+R is a no-op (stays put).
+        c.handle_key(ctrl('r'));
+        assert_eq!(c.text(), "cargo build");
+    }
+
+    #[test]
+    fn test_search_ctrl_s_steps_forward() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["cargo build", "git status", "cargo test"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('c')));
+        c.handle_key(ctrl('r')); // -> cargo build
+        assert_eq!(c.text(), "cargo build");
+
+        c.handle_key(ctrl('s')); // -> cargo test (newer)
+        assert_eq!(c.text(), "cargo test");
+    }
+
+    #[test]
+    fn test_search_enter_accepts_match() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["git commit"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('g')));
+        assert!(c.is_searching());
+
+        // Enter accepts: search closes, preview stays as the composer text.
+        c.handle_key(plain(KeyCode::Enter));
+        assert!(!c.is_searching());
+        assert_eq!(c.text(), "git commit");
+    }
+
+    #[test]
+    fn test_search_esc_cancels_and_restores_draft() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["git status"]);
+        c.type_text("work in progress");
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('g')));
+        // Preview overwrote the draft.
+        assert_eq!(c.text(), "git status");
+
+        c.handle_key(plain(KeyCode::Esc));
+        assert!(!c.is_searching());
+        assert_eq!(c.text(), "work in progress");
+    }
+
+    #[test]
+    fn test_search_no_match_renders_failing_state() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["alpha"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('z')));
+        assert!(c.is_searching());
+        assert_eq!(c.search_query(), Some("z"));
+        assert!(!c.search_has_match());
+        assert_eq!(c.text(), ""); // preview empty when no match
+    }
+
+    #[test]
+    fn test_search_backspace_resolves_match() {
+        let mut c = Composer::new();
+        seed_history(&mut c, &["grep", "ls", "cat"]);
+
+        c.handle_key(ctrl('r'));
+        c.handle_key(plain(KeyCode::Char('g'))); // -> "grep"
+        assert_eq!(c.text(), "grep");
+        c.handle_key(plain(KeyCode::Char('z'))); // "gz" fails
+        assert!(!c.search_has_match());
+
+        c.handle_key(plain(KeyCode::Backspace)); // back to "g"
+        assert_eq!(c.search_query(), Some("g"));
+        assert!(c.search_has_match());
+        assert_eq!(c.text(), "grep");
+    }
+
+    #[test]
+    fn test_search_begin_with_empty_history_has_no_match() {
+        let mut c = Composer::new();
+        c.handle_key(ctrl('r'));
+        assert!(c.is_searching());
+        assert!(!c.search_has_match());
+        assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn test_find_backward_finds_newest_containing_query() {
+        let mut h = InputHistory::new();
+        h.push("cargo build");
+        h.push("git status");
+        h.push("cargo test");
+        // Search from the newest entry (index 2).
+        assert_eq!(h.find_backward("cargo", 2), Some(2));
+        // Search from index 1 (git status): should find cargo build at 0.
+        assert_eq!(h.find_backward("cargo", 1), Some(0));
+        // Query that matches nothing.
+        assert_eq!(h.find_backward("nope", 2), None);
+        // Empty query returns the start index.
+        assert_eq!(h.find_backward("", 2), Some(2));
+    }
+
+    #[test]
+    fn test_find_forward_finds_oldest_containing_query() {
+        let mut h = InputHistory::new();
+        h.push("cargo build");
+        h.push("git status");
+        h.push("cargo test");
+        // From index 1, forward: cargo test at 2.
+        assert_eq!(h.find_forward("cargo", 1), Some(2));
+        // From start, forward: cargo build at 0.
+        assert_eq!(h.find_forward("cargo", 0), Some(0));
+        // Past end returns None.
+        assert_eq!(h.find_forward("cargo", 3), None);
     }
 }

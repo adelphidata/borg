@@ -733,6 +733,16 @@ impl<'a> App<'a> {
             return Ok(action);
         }
 
+        // Reverse-incremental history search owns every key while active,
+        // ahead of Esc/scroll/shortcut routing. Ctrl+C still quits because
+        // it was already matched above.
+        if self.composer.is_searching() {
+            if let Some(text) = self.composer.handle_key(key) {
+                return self.handle_submit(&text);
+            }
+            return Ok(AppAction::Continue);
+        }
+
         // Handle backtrack mode (selecting a past user message to rewind to)
         if let Some(action) = self.handle_backtrack_key(key)? {
             return Ok(action);
@@ -978,14 +988,18 @@ impl<'a> App<'a> {
         if let Some(text) = self.composer.handle_key(key) {
             return self.handle_submit(&text);
         }
-        // Update popup filters after normal key input
-        let text = self.composer.text();
-        self.command_popup.update_filter(&text);
-        if !self.command_popup.is_visible() {
-            if let Some(q) = extract_at_query(&text) {
-                self.file_popup.update_query(&q);
-            } else {
-                self.file_popup.dismiss();
+        // Update popup filters after normal key input, unless a history
+        // search is now active — the preview text isn't a user query and
+        // shouldn't open `/` or `@` popups.
+        if !self.composer.is_searching() {
+            let text = self.composer.text();
+            self.command_popup.update_filter(&text);
+            if !self.command_popup.is_visible() {
+                if let Some(q) = extract_at_query(&text) {
+                    self.file_popup.update_query(&q);
+                } else {
+                    self.file_popup.dismiss();
+                }
             }
         }
         Ok(AppAction::Continue)
@@ -1930,6 +1944,109 @@ mod tests {
 
         assert_eq!(app.scroll_offset, 0);
         assert!(app.auto_scroll);
+    }
+
+    // --- Reverse-incremental history search (Ctrl+R) routing ---
+
+    fn ctrl(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_r_enters_history_search_mode() {
+        let mut app = make_app();
+        app.composer.set_text("prev");
+        app.composer.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl('r')).unwrap();
+        assert!(app.composer.is_searching());
+        // Empty query yields preview of newest entry.
+        assert_eq!(app.composer.text(), "prev");
+    }
+
+    #[test]
+    fn search_mode_captures_keys_before_scroll_routing() {
+        // With a scrollable transcript + no scroll_offset, Rule B would
+        // normally hijack arrow keys. While searching, arrow keys must
+        // still reach the composer (in our impl they accept+exit search).
+        let mut app = app_with_scrollable_transcript();
+        app.composer.set_text("hello");
+        app.composer.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl('r')).unwrap();
+        assert!(app.composer.is_searching());
+        // Up arrow in search mode: accepts+exits (not scroll).
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert!(!app.composer.is_searching());
+        assert_eq!(
+            app.scroll_offset, 0,
+            "search must block Rule B scroll hijack"
+        );
+    }
+
+    #[test]
+    fn ctrl_p_escape_hatch_preserved_after_cancel() {
+        // Regression guard: after canceling search, Ctrl+P must still
+        // navigate composer history (existing invariant).
+        let mut app = make_app();
+        app.composer.set_text("recalled");
+        app.composer.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl('r')).unwrap();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(!app.composer.is_searching());
+
+        app.handle_key(ctrl('p')).unwrap();
+        assert_eq!(app.composer.text(), "recalled");
+        assert!(app.composer.is_browsing_history());
+    }
+
+    #[test]
+    fn search_enter_accepts_then_next_enter_submits() {
+        let mut app = make_app();
+        app.composer.set_text("prev cmd");
+        app.composer.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(ctrl('r')).unwrap();
+        app.handle_key(key(KeyCode::Char('p'))).unwrap();
+        assert_eq!(app.composer.text(), "prev cmd");
+        // First Enter accepts and exits search, keeps text in composer.
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(!app.composer.is_searching());
+        assert_eq!(app.composer.text(), "prev cmd");
+    }
+
+    // --- Context-usage % (surfaced in footer) ---
+
+    #[test]
+    fn compute_context_pct_zero_by_default() {
+        let app = make_app();
+        assert_eq!(app.compute_context_pct(), 0);
+    }
+
+    #[test]
+    fn compute_context_pct_scales_with_usage() {
+        let mut app = make_app();
+        let max = app.config.conversation.max_history_tokens.max(1) as u64;
+        app.session_prompt_tokens = max / 2;
+        app.session_completion_tokens = 0;
+        assert_eq!(app.compute_context_pct(), 50);
+
+        app.session_prompt_tokens = max;
+        app.session_completion_tokens = max; // overflow: should clamp to 100
+        assert_eq!(app.compute_context_pct(), 100);
+    }
+
+    #[test]
+    fn compute_context_pct_crosses_warning_thresholds() {
+        let mut app = make_app();
+        let max = app.config.conversation.max_history_tokens.max(1) as u64;
+        // 80% → warning zone
+        app.session_prompt_tokens = (max * 80) / 100;
+        assert!(app.compute_context_pct() >= 80);
+        // 95% → error zone
+        app.session_prompt_tokens = (max * 95) / 100;
+        assert!(app.compute_context_pct() >= 95);
     }
 
     fn qm(text: &str) -> QueuedMessage {
