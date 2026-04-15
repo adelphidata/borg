@@ -275,24 +275,6 @@ impl<'a> App<'a> {
         self.toasts.push(text, super::toast::ToastVariant::Info);
     }
 
-    /// Push a short-lived success toast into the corner overlay.
-    #[allow(dead_code)] // Awaiting call sites (skill install, session save, etc).
-    pub fn toast_success(&mut self, text: impl Into<String>) {
-        self.toasts.push(text, super::toast::ToastVariant::Success);
-    }
-
-    /// Push a short-lived warning toast into the corner overlay.
-    #[allow(dead_code)]
-    pub fn toast_warning(&mut self, text: impl Into<String>) {
-        self.toasts.push(text, super::toast::ToastVariant::Warning);
-    }
-
-    /// Push a short-lived error toast into the corner overlay.
-    #[allow(dead_code)]
-    pub fn toast_error(&mut self, text: impl Into<String>) {
-        self.toasts.push(text, super::toast::ToastVariant::Error);
-    }
-
     pub fn tick_throbber(&mut self) {
         if !matches!(self.state, AppState::Idle) {
             self.throbber_state.calc_next();
@@ -2536,7 +2518,7 @@ mod tests {
     #[test]
     fn settings_prefix_not_rejected() {
         let mut app = make_app();
-        let result = app.handle_submit("/settings temperature 0.5").unwrap();
+        let _ = app.handle_submit("/settings temperature 0.5").unwrap();
         // Should either update or error, not "Unknown command"
         let has_unknown = app.cells.iter().any(|c| {
             matches!(

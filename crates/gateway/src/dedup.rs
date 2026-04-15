@@ -62,6 +62,7 @@ macro_rules! dedup_wrapper {
             }
 
             #[cfg(test)]
+            #[allow(dead_code)]
             pub(crate) fn with_capacity(capacity: usize) -> Self {
                 Self($crate::dedup::BoundedDedup::new(capacity))
             }

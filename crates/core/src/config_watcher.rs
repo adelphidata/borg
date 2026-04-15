@@ -213,7 +213,7 @@ mod tests {
     async fn notify_no_change_does_not_trigger_update() {
         let initial = Config::default();
         let watcher = ConfigWatcher::start(initial.clone()).unwrap();
-        let mut rx = watcher.subscribe();
+        let rx = watcher.subscribe();
 
         // Send identical config — should not trigger a change notification
         watcher.notify(initial);

@@ -20,7 +20,7 @@ const MIN_WIDTH: u16 = 18;
 const MAX_WIDTH: u16 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants are part of the public toast API; future call sites will opt in.
+#[allow(dead_code)] // Success/Warning/Error only constructed in tests; variants kept for border styling coverage.
 pub enum ToastVariant {
     Info,
     Success,
@@ -78,12 +78,12 @@ impl ToastStack {
         Self::default()
     }
 
-    #[allow(dead_code)] // Exposed for future keyboard-driven dismiss/status readouts.
+    #[allow(dead_code)] // used in tests
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in tests
     pub fn len(&self) -> usize {
         self.items.len()
     }

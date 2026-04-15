@@ -299,7 +299,7 @@ mod tests {
     fn nearest_xterm256_gray() {
         // Mid-gray should map to grayscale ramp
         let idx = nearest_xterm256(128, 128, 128);
-        assert!(idx >= 232 && idx <= 255);
+        assert!(idx >= 232);
     }
 
     #[test]

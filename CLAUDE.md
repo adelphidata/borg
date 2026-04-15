@@ -224,7 +224,7 @@ Logs at `~/.borg/logs/`: `tui.log` (TUI session), `daemon.log`/`daemon.err` (dae
 2. **`crates/core/src/settings.rs`** — Add entry to `SETTING_REGISTRY` (key + extractor fn)
 3. **`crates/cli/src/tui/settings_popup.rs`** — Add `SettingEntry` to `SETTINGS` array (key, label, kind, category)
 
-`SettingKind` options: Bool (Space toggles), Float (arrows ±0.1), Uint (Enter to edit), Text (Enter to edit), Select (Left/Right cycle).
+`SettingKind` options: Bool (Space toggles), Float (arrows ±0.1), Uint (Enter to edit), Select (Left/Right cycle).
 
 ### New Tool
 

@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn every_registry_key_has_working_extractor() {
         let config = Config::default();
-        for &(key, extractor) in SETTING_REGISTRY.iter() {
+        for &(_key, extractor) in SETTING_REGISTRY.iter() {
             // Should not panic
             let _value = extractor(&config);
         }

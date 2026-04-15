@@ -14,10 +14,8 @@ use super::popup_utils;
 use super::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum SettingKind {
     Bool,
-    Text,
     Float,
     Uint,
     Select,
