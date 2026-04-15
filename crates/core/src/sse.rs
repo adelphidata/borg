@@ -70,6 +70,27 @@ where
                         });
                     }
                     Ok(None) => {
+                        // EOF: a provider may close the stream without a trailing
+                        // newline on the final data line. Feed any remaining buffered
+                        // content through parse_line once so we don't drop the last
+                        // delta or the sentinel `[DONE]`.
+                        let tail = buffer.trim();
+                        if !tail.is_empty() && !tail.starts_with(':') {
+                            match parse_line(tail) {
+                                SseAction::Continue => {}
+                                SseAction::Emit(events) | SseAction::Done(events) => {
+                                    for event in events {
+                                        if tx.send(event).await.is_err() {
+                                            tracing::debug!(
+                                                "SSE: stream receiver closed during EOF flush"
+                                            );
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                SseAction::Error(e) => return Err(e),
+                            }
+                        }
                         let _ = tx.send(StreamEvent::Done).await;
                         return Ok(());
                     }
@@ -284,5 +305,102 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(LlmError::Retryable { .. })));
+    }
+
+    /// Provider closes the connection right after the final delta with no
+    /// trailing newline. The previous behaviour silently dropped that line;
+    /// the EOF-flush path must surface it before sending Done.
+    #[tokio::test]
+    async fn eof_flushes_trailing_line_without_newline() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        // Note: NO trailing \n on the final line.
+        let stream = make_stream(vec!["data: first\n", "data: last"]);
+
+        let result = process_sse_stream(stream, &tx, &cancel, 0, 1024 * 1024, |line| {
+            if let Some(data) = line.strip_prefix("data: ") {
+                SseAction::Emit(vec![StreamEvent::TextDelta(data.to_string())])
+            } else {
+                SseAction::Continue
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "first"));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "last"));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
+    }
+
+    /// Sentinel `[DONE]` arriving without a trailing newline must still
+    /// terminate the stream cleanly. This used to be lost on EOF.
+    #[tokio::test]
+    async fn eof_flush_handles_done_sentinel_without_newline() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let stream = make_stream(vec!["data: hello\n", "data: [DONE]"]);
+
+        let result = process_sse_stream(stream, &tx, &cancel, 0, 1024 * 1024, |line| {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data.trim() == "[DONE]" {
+                    SseAction::Done(vec![StreamEvent::Done])
+                } else {
+                    SseAction::Emit(vec![StreamEvent::TextDelta(data.to_string())])
+                }
+            } else {
+                SseAction::Continue
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "hello"));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
+    }
+
+    /// An EOF-flushed line whose parser returns an `Error` must propagate that
+    /// error rather than masking it with `Done`.
+    #[tokio::test]
+    async fn eof_flush_propagates_parse_error_on_trailing_line() {
+        let (tx, _rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let stream = make_stream(vec!["data: oops"]);
+
+        let result = process_sse_stream(stream, &tx, &cancel, 0, 1024 * 1024, |_| {
+            SseAction::Error(LlmError::Retryable {
+                source: anyhow::anyhow!("bad final line"),
+                retry_after: None,
+                reason: FailoverReason::Overloaded,
+            })
+        })
+        .await;
+
+        assert!(matches!(result, Err(LlmError::Retryable { .. })));
+    }
+
+    /// Trailing whitespace/blank only — no parse_line call, no extra event
+    /// before `Done`. Guards against double-emitting on benign EOF.
+    #[tokio::test]
+    async fn eof_with_only_blank_trailing_buffer_emits_done_once() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let cancel = CancellationToken::new();
+        let stream = make_stream(vec!["data: only\n", "   "]);
+
+        let result = process_sse_stream(stream, &tx, &cancel, 0, 1024 * 1024, |line| {
+            if let Some(data) = line.strip_prefix("data: ") {
+                SseAction::Emit(vec![StreamEvent::TextDelta(data.to_string())])
+            } else {
+                SseAction::Continue
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(ref s)) if s == "only"));
+        assert!(matches!(rx.recv().await, Some(StreamEvent::Done)));
+        // Drop the sender so rx.recv() can return None instead of blocking on
+        // the still-live Sender held by this scope.
+        drop(tx);
+        assert!(rx.recv().await.is_none());
     }
 }

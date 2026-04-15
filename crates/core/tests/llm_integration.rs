@@ -391,3 +391,45 @@ async fn server_error_500() {
         assert!(events.iter().any(|e| e.starts_with("error:")));
     }
 }
+
+// ── Test: provider closes connection without trailing newline ──
+//
+// Some providers (notably OpenAI-compatible gateways behind CORS/HTTP-2
+// intermediaries) drop the final `\n\n` before the socket closes. The SSE flush
+// path must emit the last delta instead of silently discarding it. Exercises
+// `sse.rs`'s EOF-flush through the full LlmClient → process_sse_stream
+// integration.
+#[tokio::test]
+async fn eof_without_trailing_newline_flushes_last_delta() {
+    let server = MockServer::start().await;
+
+    // Raw body — NOT using sse_body(), because that helper appends \n\n.
+    // The final `[DONE]` has no trailing newline, simulating a truncated socket.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\" last\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]",
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let config = test_config(&server.uri());
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+
+    client
+        .stream_chat(&user_message("hi"), None, tx)
+        .await
+        .expect("stream_chat");
+
+    let events = collect_events(rx).await;
+    assert_eq!(
+        events,
+        vec!["text:first", "text: last", "done"],
+        "EOF-flush path must surface the final delta and terminate cleanly"
+    );
+}

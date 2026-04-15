@@ -1527,6 +1527,7 @@ Rules:
             let mut tag_filter = InternalTagFilter::new();
             let mut tool_calls: Vec<PartialToolCall> = Vec::new();
             let mut received_terminal = false;
+            let mut stream_error: Option<String> = None;
 
             loop {
                 tokio::select! {
@@ -1571,32 +1572,7 @@ Rules:
                                 }
                             }
                             Some(StreamEvent::Usage(usage)) => {
-                                let total = usage.prompt_tokens + usage.completion_tokens;
-                                if total > 0 {
-                                    self.metrics.llm_tokens.add(total, &[]);
-                                    {
-                                        let guard = self.db_guard();
-                                        if let Some(ref db) = *guard {
-                                            let cost = crate::pricing::estimate_cost(
-                                                &usage.model,
-                                                usage.prompt_tokens,
-                                                usage.completion_tokens,
-                                            );
-                                            if let Err(e) = db.log_token_usage_with_cache(
-                                                usage.prompt_tokens,
-                                                usage.completion_tokens,
-                                                total,
-                                                usage.cached_input_tokens,
-                                                usage.cache_creation_tokens,
-                                                &usage.provider,
-                                                &usage.model,
-                                                cost,
-                                            ) {
-                                                warn!("Failed to log token usage: {e}");
-                                            }
-                                        }
-                                    }
-                                }
+                                self.record_usage(&usage);
                                 let _ = event_tx.send(AgentEvent::Usage(usage)).await;
                             }
                             Some(StreamEvent::Done) => {
@@ -1605,6 +1581,8 @@ Rules:
                             }
                             Some(StreamEvent::Error(e)) => {
                                 received_terminal = true;
+                                warn!("LLM stream emitted error mid-response: {e}");
+                                stream_error = Some(e.clone());
                                 if event_tx.send(AgentEvent::Error(e)).await.is_err() {
                                     trace!("Event channel closed, could not deliver stream error");
                                 }
@@ -1668,6 +1646,21 @@ Rules:
             self.hook_registry.dispatch(&hook_ctx);
 
             if tool_calls.is_empty() {
+                // Stream errored out *and* there are no tool calls to recover —
+                // persist whatever text arrived with an interruption marker so the
+                // next turn (and any later resume) sees that the response was cut
+                // short, not a normal completion.
+                if let Some(err) = stream_error.take() {
+                    let content = if text_content.trim().is_empty() {
+                        format!("[stream interrupted: {err}]")
+                    } else {
+                        format!("{text_content}\n\n[stream interrupted: {err}]")
+                    };
+                    self.log_and_persist(Message::assistant(&content));
+                    let _ = event_tx.send(AgentEvent::TurnComplete).await;
+                    return Ok(());
+                }
+
                 if should_nudge_for_response(&text_content, needs_response, nudged_for_response) {
                     nudged_for_response = true;
                     self.log_and_persist(Message::system(
@@ -1683,10 +1676,16 @@ Rules:
             let tc = validate_tool_calls(&tool_calls);
 
             if tc.is_empty() {
+                let trailer = match stream_error.take() {
+                    Some(err) => {
+                        format!("[stream interrupted: {err}; incomplete tool calls discarded]")
+                    }
+                    None => "[incomplete tool calls discarded]".to_string(),
+                };
                 let content = if text_content.is_empty() {
-                    "[response interrupted — incomplete tool calls discarded]".to_string()
+                    format!("[response interrupted — {trailer}]")
                 } else {
-                    format!("{text_content}\n\n[incomplete tool calls discarded]")
+                    format!("{text_content}\n\n{trailer}")
                 };
                 self.log_and_persist(Message::assistant(&content));
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
@@ -1704,6 +1703,36 @@ Rules:
 
             // Drain any steer messages from the user at the tool boundary
             self.drain_steers(&event_tx).await;
+        }
+    }
+
+    /// Account for one `StreamEvent::Usage`: increment counters and persist to the
+    /// token-usage table. Extracted from `run_agent_loop` to keep the outer future's
+    /// frame small (the inner DB lock + pricing call captures a wide scope).
+    fn record_usage(&self, usage: &UsageData) {
+        let total = usage.prompt_tokens + usage.completion_tokens;
+        if total == 0 {
+            return;
+        }
+        self.metrics.llm_tokens.add(total, &[]);
+        let guard = self.db_guard();
+        let Some(ref db) = *guard else { return };
+        let cost = crate::pricing::estimate_cost(
+            &usage.model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+        );
+        if let Err(e) = db.log_token_usage_with_cache(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            total,
+            usage.cached_input_tokens,
+            usage.cache_creation_tokens,
+            &usage.provider,
+            &usage.model,
+            cost,
+        ) {
+            warn!("Failed to log token usage: {e}");
         }
     }
 
@@ -2373,6 +2402,59 @@ mod tests {
         assert!(
             wf_idx < env_idx,
             "workflow guidance must come before environment section",
+        );
+    }
+
+    // ── Stream error-recovery guards ──
+    //
+    // `run_agent_loop` preserves partial assistant text *and* includes the
+    // upstream error reason in the persisted message when the LLM stream
+    // errors mid-response, so a resumed/replayed conversation can see that
+    // the turn was cut short rather than appearing as a silent completion.
+    // These guards assert the source-level structure so regressions surface
+    // in CI instead of in a support ticket six months later.
+
+    #[test]
+    fn run_agent_loop_captures_stream_error_reason() {
+        assert!(
+            AGENT_RS_SRC.contains("let mut stream_error: Option<String> = None;"),
+            "run_agent_loop must declare a `stream_error` local — the handler for \
+             StreamEvent::Error stores the reason there so the persisted message \
+             can name the failure"
+        );
+        assert!(
+            AGENT_RS_SRC.contains("stream_error = Some(e.clone());"),
+            "StreamEvent::Error arm must clone the error into `stream_error` before \
+             forwarding to the TUI; otherwise the error string is lost by the time \
+             we persist the partial message"
+        );
+    }
+
+    #[test]
+    fn run_agent_loop_persists_interruption_marker() {
+        assert!(
+            AGENT_RS_SRC.contains("[stream interrupted:"),
+            "run_agent_loop must embed a `[stream interrupted: …]` marker in the \
+             persisted assistant message when a mid-stream error happens, so the \
+             next turn (and any later conversation replay) can tell a truncated \
+             response from a completed one"
+        );
+    }
+
+    #[test]
+    fn record_usage_is_the_only_usage_persistence_path() {
+        // If the match arm regains an inline db.log_token_usage_with_cache(...)
+        // call, the outer future's frame grows again and the record_usage
+        // extraction loses its purpose.
+        let loop_start = AGENT_RS_SRC
+            .find("Some(StreamEvent::Usage(usage))")
+            .expect("Usage arm must exist in run_agent_loop");
+        let loop_tail_idx = loop_start + 400;
+        let loop_tail = &AGENT_RS_SRC[loop_start..loop_tail_idx.min(AGENT_RS_SRC.len())];
+        assert!(
+            !loop_tail.contains("log_token_usage_with_cache"),
+            "StreamEvent::Usage arm must delegate to self.record_usage; do not \
+             inline the DB + pricing call back into the tokio::select! body"
         );
     }
 

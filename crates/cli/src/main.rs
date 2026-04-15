@@ -424,8 +424,25 @@ enum ProjectsAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Runtime worker thread stack size.
+///
+/// Rust futures can grow large frames along the agent-loop → tool-handler → sub-agent
+/// call chain. The tokio default (2 MiB on Linux/macOS) has been sufficient so far but
+/// leaves little headroom; codex reports stack overflows in CI on equivalent paths and
+/// addresses them by raising the thread stack (codex `2bfa62761`). Borg preemptively
+/// matches that posture with 4 MiB for all worker and blocking threads.
+const RUNTIME_STACK_SIZE: usize = 4 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(RUNTIME_STACK_SIZE)
+        .thread_name("borg-worker")
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let _ = dotenvy::dotenv();
     // Also load .env from the data directory (~/.borg/.env)
     if let Ok(data_dir) = borg_core::config::Config::data_dir() {
