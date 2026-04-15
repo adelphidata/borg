@@ -26,6 +26,18 @@ pub struct TelegramParsed {
     pub photo: Option<TelegramPhotoRef>,
 }
 
+/// Detect non-printable control characters that indicate raw binary payload
+/// leaked into a text field. Binary documents (.mobi, .epub, PDFs) can spill
+/// into `message.caption` or `document.file_name`; left unsanitized they cause
+/// catastrophic token inflation (~460K tokens) when forwarded to the LLM.
+///
+/// Returns true when the string contains any byte in `0x00..=0x08` or
+/// `0x0E..=0x1F`. Tab (`0x09`), newline (`0x0A`), and carriage return (`0x0D`)
+/// are allowed so legitimate multiline captions pass through.
+fn is_binary_content(s: &str) -> bool {
+    s.bytes().any(|b| matches!(b, 0x00..=0x08 | 0x0E..=0x1F))
+}
+
 /// Extract an `InboundMessage` and optional media references from a Telegram update.
 ///
 /// Handles text messages, media messages (photo, document, video, audio, voice, sticker),
@@ -61,18 +73,18 @@ pub fn parse_update(update: &Update) -> Option<TelegramParsed> {
         }
 
         let text = if let Some(ref t) = msg.text {
-            if t.is_empty() {
+            if t.is_empty() || is_binary_content(t) {
                 return None;
             }
             t.clone()
-        } else if let Some(ref caption) = msg.caption {
-            caption.clone()
+        } else if let Some(caption) = msg.caption.as_deref().filter(|c| !is_binary_content(c)) {
+            caption.to_string()
         } else if msg.photo.is_some() {
             "[Photo]".to_string()
         } else if let Some(ref doc) = msg.document {
-            match &doc.file_name {
-                Some(name) => format!("[Document: {name}]"),
-                None => "[Document]".to_string(),
+            match doc.file_name.as_deref() {
+                Some(name) if !is_binary_content(name) => format!("[Document: {name}]"),
+                _ => "[Document]".to_string(),
             }
         } else if msg.video.is_some() {
             "[Video]".to_string()
@@ -523,6 +535,107 @@ mod tests {
 
         let msg = parse_update(&update).unwrap().inbound;
         assert_eq!(msg.peer_kind.as_deref(), Some("group"));
+    }
+
+    #[test]
+    fn binary_caption_dropped_photo_falls_back_to_placeholder() {
+        // Caption contains 0x01 (SOH) — raw byte leaked from a binary document.
+        // Expect: caption discarded, photo placeholder shown instead.
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 30,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "photo": [{ "file_id": "abc", "file_unique_id": "u1", "width": 100, "height": 100 }],
+                    "caption": "hello\u0001world"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let p = parse_update(&update).unwrap();
+        assert_eq!(p.inbound.text, "[Photo]");
+        assert!(p.photo.is_some());
+    }
+
+    #[test]
+    fn binary_document_filename_falls_back_to_placeholder() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 31,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "document": { "file_id": "abc", "file_unique_id": "u1", "file_name": "junk\u0000\u0001.bin" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "[Document]");
+    }
+
+    #[test]
+    fn multibyte_utf8_caption_is_not_flagged_as_binary() {
+        // Emojis, accents, and newlines must pass through untouched.
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 32,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "photo": [{ "file_id": "abc", "file_unique_id": "u1", "width": 100, "height": 100 }],
+                    "caption": "café 🎉\nline two\tindented"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let msg = parse_update(&update).unwrap().inbound;
+        assert_eq!(msg.text, "café 🎉\nline two\tindented");
+    }
+
+    #[test]
+    fn binary_text_message_returns_none() {
+        let update: Update = serde_json::from_str(
+            r#"{
+                "update_id": 33,
+                "message": {
+                    "message_id": 1,
+                    "from": { "id": 42, "first_name": "Alice", "is_bot": false },
+                    "chat": { "id": 42, "type": "private" },
+                    "date": 1700000000,
+                    "text": "\u0002\u0003\u0004"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(parse_update(&update).is_none());
+    }
+
+    #[test]
+    fn is_binary_content_boundaries() {
+        assert!(!is_binary_content(""));
+        assert!(!is_binary_content("plain text"));
+        assert!(!is_binary_content("tab\there\nnewline\rreturn"));
+        assert!(is_binary_content("nul\0"));
+        assert!(is_binary_content("\u{0008}backspace"));
+        assert!(is_binary_content("\u{000E}so"));
+        assert!(is_binary_content("\u{001F}us"));
+        // 0x0B, 0x0C are in the forbidden range 0x0E..=0x1F? No, they're 0x0B/0x0C.
+        // 0x0B (vertical tab) and 0x0C (form feed) are in 0x00..=0x08? No — they're between.
+        // Actually 0x0B and 0x0C fall in neither range → should be allowed.
+        assert!(!is_binary_content("\u{000B}vtab"));
+        assert!(!is_binary_content("\u{000C}formfeed"));
     }
 
     #[test]
