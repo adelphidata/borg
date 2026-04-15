@@ -27,6 +27,20 @@ pub struct EmbeddingProvider {
     pub model: String,
     /// Dimensionality of the output embedding vectors.
     pub dimension: usize,
+    /// Short provider name ("openai", "openrouter", "gemini") — distinct from
+    /// the raw endpoint URL so cache keys stay stable under URL rotation
+    /// (load balancers, CNAME swaps) and don't collide when two providers
+    /// share a model id (e.g. OpenAI direct vs. an OpenRouter proxy both
+    /// serving `text-embedding-3-small`).
+    pub provider_tag: String,
+}
+
+impl EmbeddingProvider {
+    /// Composite cache key: `"{provider_tag}:{model}"`. Prevents cross-provider
+    /// collisions on shared model names and survives endpoint rotation.
+    pub fn cache_model_key(&self) -> String {
+        format!("{}:{}", self.provider_tag, self.model)
+    }
 }
 
 /// Static metadata for each supported embedding provider.
@@ -141,6 +155,7 @@ impl EmbeddingProvider {
             api_key,
             model,
             dimension,
+            provider_tag: meta.name.to_string(),
         })
     }
 }
@@ -309,14 +324,16 @@ pub async fn generate_embedding_cached(
         }
     };
 
+    let cache_model = provider.cache_model_key();
+
     // Check cache
     if let Some(ref db) = db {
         if let Ok(Some((cached_bytes, _dim))) =
-            db.get_cached_embedding(&provider.endpoint, &provider.model, &hash)
+            db.get_cached_embedding(&provider.endpoint, &cache_model, &hash)
         {
             debug!("Embedding cache hit for hash {}", &hash[..8]);
             // Best-effort: update last_accessed_at so TTL pruning reflects actual usage.
-            if let Err(e) = db.touch_cache_entry(&provider.endpoint, &provider.model, &hash) {
+            if let Err(e) = db.touch_cache_entry(&provider.endpoint, &cache_model, &hash) {
                 tracing::debug!("touch_cache_entry failed: {e}");
             }
             return bytes_to_embedding(&cached_bytes);
@@ -331,7 +348,7 @@ pub async fn generate_embedding_cached(
         let bytes = embedding_to_bytes(&embedding);
         if let Err(e) = db.cache_embedding(
             &provider.endpoint,
-            &provider.model,
+            &cache_model,
             &hash,
             &bytes,
             provider.dimension,
@@ -845,6 +862,125 @@ mod tests {
             ..Default::default()
         };
         assert!(EmbeddingProvider::from_config(&config).is_none());
+    }
+
+    // -- provider_tag / cache_model_key --
+
+    #[test]
+    fn from_config_populates_provider_tag() {
+        std::env::set_var("OPENAI_API_KEY", "test-key-provider-tag");
+        let config = EmbeddingsConfig {
+            enabled: true,
+            provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let resolved = EmbeddingProvider::from_config(&config).expect("should resolve");
+        assert_eq!(resolved.provider_tag, "openai");
+        assert_eq!(
+            resolved.cache_model_key(),
+            format!("openai:{}", resolved.model)
+        );
+        std::env::remove_var("OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn cache_model_key_namespaces_by_provider() {
+        let openai = EmbeddingProvider {
+            endpoint: "https://api.openai.com/v1/embeddings".to_string(),
+            api_key: "k".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimension: 1536,
+            provider_tag: "openai".to_string(),
+        };
+        let openrouter = EmbeddingProvider {
+            endpoint: "https://openrouter.ai/api/v1/embeddings".to_string(),
+            api_key: "k".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimension: 1536,
+            provider_tag: "openrouter".to_string(),
+        };
+
+        assert_ne!(
+            openai.cache_model_key(),
+            openrouter.cache_model_key(),
+            "same model id from different providers must not share a cache key"
+        );
+        assert_eq!(openai.cache_model_key(), "openai:text-embedding-3-small");
+        assert_eq!(
+            openrouter.cache_model_key(),
+            "openrouter:text-embedding-3-small"
+        );
+    }
+
+    #[test]
+    fn cache_model_key_survives_endpoint_change() {
+        let provider_a = EmbeddingProvider {
+            endpoint: "https://api.openai.com/v1/embeddings".to_string(),
+            api_key: "k".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            dimension: 1536,
+            provider_tag: "openai".to_string(),
+        };
+        let provider_b = EmbeddingProvider {
+            endpoint: "https://openai-proxy.example/v1/embeddings".to_string(),
+            ..provider_a.clone()
+        };
+        // Same provider + model → composite key is stable regardless of
+        // endpoint rotation, so long-lived caches survive CNAME/proxy swaps.
+        assert_eq!(provider_a.cache_model_key(), provider_b.cache_model_key());
+    }
+
+    #[test]
+    fn cross_provider_cache_entries_are_isolated_at_db_layer() {
+        // End-to-end check that using the composite cache key writes two
+        // distinct rows in the embedding cache when two providers share a
+        // model id. Without `provider_tag` these would collide.
+        let db = Database::test_db();
+        let shared_model = "text-embedding-3-small";
+        let hash = "h1";
+
+        let openai = EmbeddingProvider {
+            endpoint: "https://api.openai.com/v1/embeddings".to_string(),
+            api_key: "k".to_string(),
+            model: shared_model.to_string(),
+            dimension: 2,
+            provider_tag: "openai".to_string(),
+        };
+        let openrouter = EmbeddingProvider {
+            endpoint: "https://openrouter.ai/api/v1/embeddings".to_string(),
+            api_key: "k".to_string(),
+            model: shared_model.to_string(),
+            dimension: 2,
+            provider_tag: "openrouter".to_string(),
+        };
+
+        db.cache_embedding(
+            &openai.endpoint,
+            &openai.cache_model_key(),
+            hash,
+            &[1, 2],
+            2,
+        )
+        .unwrap();
+        db.cache_embedding(
+            &openrouter.endpoint,
+            &openrouter.cache_model_key(),
+            hash,
+            &[9, 9],
+            2,
+        )
+        .unwrap();
+
+        let (bytes_a, _) = db
+            .get_cached_embedding(&openai.endpoint, &openai.cache_model_key(), hash)
+            .unwrap()
+            .expect("openai entry");
+        let (bytes_b, _) = db
+            .get_cached_embedding(&openrouter.endpoint, &openrouter.cache_model_key(), hash)
+            .unwrap()
+            .expect("openrouter entry");
+        assert_eq!(bytes_a, vec![1, 2]);
+        assert_eq!(bytes_b, vec![9, 9]);
     }
 
     // -- find_provider_meta --
