@@ -408,6 +408,11 @@ pub struct EmbeddingsConfig {
     pub mmr_enabled: bool,
     /// MMR lambda: 1.0 = pure relevance, 0.0 = pure diversity (default 0.7).
     pub mmr_lambda: f32,
+    /// Multiplier applied to `min_score` before filtering vector-similarity
+    /// candidates. Cosine-similarity scores skew lower than BM25-normalized
+    /// scores so the vector threshold is softer than the hybrid threshold.
+    /// Default: 0.5.
+    pub vector_threshold_factor: f32,
 }
 
 impl Default for EmbeddingsConfig {
@@ -425,6 +430,7 @@ impl Default for EmbeddingsConfig {
             vector_weight: 0.7,
             mmr_enabled: true,
             mmr_lambda: 0.7,
+            vector_threshold_factor: 0.5,
         }
     }
 }

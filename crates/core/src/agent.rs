@@ -458,10 +458,13 @@ impl Agent {
                 },
             );
             self.hook_registry.dispatch(&hook_ctx);
+            self.flush_short_term_memory();
         }
 
         self.history.clear();
         self.session = Session::new();
+        self.short_term_memory =
+            crate::short_term_memory::ShortTermMemory::new(self.session.meta.id.clone(), 2000);
 
         // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(
@@ -471,6 +474,44 @@ impl Agent {
             },
         );
         self.hook_registry.dispatch(&hook_ctx);
+    }
+
+    /// Flush accumulated short-term memory facts to the daily log entry in
+    /// the database. Called on session end so facts the agent collected during
+    /// the session are promoted into long-term memory (via nightly
+    /// consolidation).
+    ///
+    /// Fire-and-forget: background shutdown must not crash on a storage error.
+    /// Any failure is logged but otherwise ignored.
+    pub fn flush_short_term_memory(&self) {
+        let facts = self.short_term_memory.facts_as_text();
+        if facts.trim().is_empty() {
+            return;
+        }
+        if let Err(e) = crate::consolidation::flush_short_term_to_daily(&facts) {
+            warn!("flush_short_term_memory failed: {e}");
+        }
+    }
+
+    /// Signal that this agent's owning context is ending (e.g. CLI shutdown,
+    /// gateway handler finishing). Fires SessionEnd and flushes short-term
+    /// memory even when no `new_session()` call follows. Safe to call multiple
+    /// times; a no-op if no turns were executed.
+    pub fn end_session(&mut self) {
+        if self.turn_count == 0 {
+            return;
+        }
+        let hook_ctx = self.hook_ctx(
+            HookPoint::SessionEnd,
+            HookData::SessionEnd {
+                session_id: self.session.meta.id.clone(),
+                total_turns: self.turn_count,
+            },
+        );
+        self.hook_registry.dispatch(&hook_ctx);
+        self.flush_short_term_memory();
+        // Clear turn_count so a repeat end_session() is a no-op.
+        self.turn_count = 0;
     }
 
     /// Auto-save current session state.

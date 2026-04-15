@@ -285,14 +285,58 @@ impl Database {
     }
 
     /// Sanitize a query string for FTS5 MATCH syntax.
-    /// Wraps each word in double quotes to prevent FTS5 operator injection.
+    ///
+    /// - `"quoted phrases"` are preserved as single FTS5 phrase tokens so the
+    ///   user can run proximity/phrase searches.
+    /// - Unquoted words are each wrapped in double quotes (implicit AND match).
+    /// - Unterminated quotes are treated as unquoted text (defensive fallback
+    ///   against malformed input / FTS5 operator injection).
     fn sanitize_fts_query(query: &str) -> String {
-        query
-            .split_whitespace()
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("\"{}\"", w.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ")
+        let mut tokens: Vec<String> = Vec::new();
+        let mut chars = query.chars().peekable();
+        loop {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            let Some(&c) = chars.peek() else { break };
+            if c == '"' {
+                chars.next();
+                let mut phrase = String::new();
+                let mut closed = false;
+                while let Some(&pc) = chars.peek() {
+                    if pc == '"' {
+                        chars.next();
+                        closed = true;
+                        break;
+                    }
+                    phrase.push(pc);
+                    chars.next();
+                }
+                if closed {
+                    let trimmed = phrase.trim();
+                    if !trimmed.is_empty() {
+                        tokens.push(format!("\"{trimmed}\""));
+                    }
+                } else {
+                    for w in phrase.split_whitespace() {
+                        tokens.push(format!("\"{w}\""));
+                    }
+                }
+            } else {
+                let mut word = String::new();
+                while let Some(&wc) = chars.peek() {
+                    if wc.is_whitespace() || wc == '"' {
+                        break;
+                    }
+                    word.push(wc);
+                    chars.next();
+                }
+                if !word.is_empty() {
+                    tokens.push(format!("\"{word}\""));
+                }
+            }
+        }
+        tokens.join(" ")
     }
 
     /// Full-text search over chunk content within a scope.
@@ -490,6 +534,21 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// List all distinct scopes that have at least one memory entry.
+    ///
+    /// Used by `memory_search` to avoid hard-coding a scope list: a write to
+    /// `scope="project:abc"` is visible to future searches without the caller
+    /// needing to know the scope ahead of time.
+    pub fn list_memory_scopes(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT scope FROM memory_entries ORDER BY scope")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Count memory entries for a scope.
@@ -881,16 +940,77 @@ mod tests {
 
     #[test]
     fn test_sanitize_fts_query() {
+        // Unquoted words are each wrapped (implicit AND).
         assert_eq!(
             Database::sanitize_fts_query("hello world"),
             "\"hello\" \"world\""
         );
+        // Stray quote acts as a token boundary (defensive against FTS5 injection).
         assert_eq!(
             Database::sanitize_fts_query("test\"injection"),
-            "\"testinjection\""
+            "\"test\" \"injection\""
         );
         assert_eq!(Database::sanitize_fts_query("  spaces  "), "\"spaces\"");
         assert_eq!(Database::sanitize_fts_query(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_fts_query_preserves_phrases() {
+        // Quoted phrase stays as a single FTS5 phrase token.
+        assert_eq!(
+            Database::sanitize_fts_query("\"error handling\""),
+            "\"error handling\""
+        );
+        // Mixed: phrase, plain words, phrase — each becomes its own token.
+        assert_eq!(
+            Database::sanitize_fts_query("\"error handling\" in rust \"tokio runtime\""),
+            "\"error handling\" \"in\" \"rust\" \"tokio runtime\""
+        );
+        // Unterminated quote falls back to per-word tokenization.
+        assert_eq!(
+            Database::sanitize_fts_query("\"never closed"),
+            "\"never\" \"closed\""
+        );
+        // Empty phrase is dropped.
+        assert_eq!(Database::sanitize_fts_query("\"\""), "");
+        // Leading/trailing whitespace inside a phrase is trimmed.
+        assert_eq!(
+            Database::sanitize_fts_query("\"  spaced phrase  \""),
+            "\"spaced phrase\""
+        );
+    }
+
+    #[test]
+    fn test_fts_search_finds_quoted_phrase() {
+        let db = test_db();
+        let chunks = vec![
+            ChunkData {
+                chunk_index: 0,
+                start_line: Some(1),
+                end_line: Some(1),
+                content: "The quick error handling path is critical".into(),
+                content_hash: "h1".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+            ChunkData {
+                chunk_index: 1,
+                start_line: Some(2),
+                end_line: Some(2),
+                content: "Unrelated: handling errors asynchronously".into(),
+                content_hash: "h2".into(),
+                embedding: None,
+                dimension: None,
+                model: None,
+            },
+        ];
+        db.upsert_chunks("global", "notes.md", &chunks).unwrap();
+
+        // Phrase-matching: only the chunk with "error handling" adjacent should rank top.
+        let results = db.fts_search("global", "\"error handling\"", 10).unwrap();
+        assert!(!results.is_empty(), "phrase query must return matches");
+        assert_eq!(results[0].0.chunk_index, 0);
     }
 
     // ── Memory Entries ──
@@ -1103,6 +1223,153 @@ mod tests {
         let entry = db.get_memory_entry("global", "log").unwrap().unwrap();
         // No blank line between the existing trailing newline and the new content.
         assert_eq!(entry.content, "line 1\nline 2");
+    }
+
+    #[test]
+    fn append_memory_entry_parallel_appenders_preserve_all_writes() {
+        // T1 — true concurrency guard. Multiple DB handles writing to the
+        // same on-disk SQLite file must all land in the final entry; none
+        // should be silently clobbered by the read-modify-write window.
+        // busy_timeout + IMMEDIATE txn are what make this safe.
+        use rusqlite::Connection;
+        use std::sync::Arc;
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concur.db");
+
+        // Seed schema via one handle.
+        {
+            let _db = Database::from_connection(Connection::open(&path).unwrap()).unwrap();
+        }
+
+        let path = Arc::new(path);
+        const N: usize = 12;
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let path = Arc::clone(&path);
+                thread::spawn(move || {
+                    let conn = Connection::open(path.as_path()).unwrap();
+                    let db = Database::from_connection(conn).unwrap();
+                    db.append_memory_entry("global", "concurrent", &format!("line-{i}"))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = Connection::open(path.as_path()).unwrap();
+        let db = Database::from_connection(conn).unwrap();
+        let entry = db
+            .get_memory_entry("global", "concurrent")
+            .unwrap()
+            .unwrap();
+        for i in 0..N {
+            assert!(
+                entry.content.contains(&format!("line-{i}")),
+                "line-{i} missing after {N} concurrent appends — got:\n{}",
+                entry.content
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_memory_entry_invalidates_chunks_too() {
+        // T2 — extends the existing invalidate-embedding test to also cover
+        // chunk-row cascade. Without this, a search could surface stale
+        // chunk text after the parent entry was overwritten.
+        let db = test_db();
+        db.upsert_memory_entry("global", "doc", "v1 original content")
+            .unwrap();
+        let chunks = vec![ChunkData {
+            chunk_index: 0,
+            start_line: Some(1),
+            end_line: Some(1),
+            content: "v1 original content".into(),
+            content_hash: "hv1".into(),
+            embedding: None,
+            dimension: None,
+            model: None,
+        }];
+        db.upsert_chunks("global", "doc", &chunks).unwrap();
+        assert!(!db.get_chunks_for_file("global", "doc").unwrap().is_empty());
+
+        db.upsert_memory_entry("global", "doc", "v2 new content")
+            .unwrap();
+        assert!(
+            db.get_chunks_for_file("global", "doc").unwrap().is_empty(),
+            "stale chunks must be purged on content update"
+        );
+    }
+
+    #[test]
+    fn write_then_fts_search_end_to_end() {
+        // T3 — happy-path integration: content landed via chunks is visible
+        // to FTS. The existing FTS tests use the upsert_chunks path; this
+        // pins that write → chunk → FTS still returns the original tokens.
+        let db = test_db();
+        db.upsert_memory_entry(
+            "global",
+            "notes",
+            "Quokkas on Rottnest Island are friendly.",
+        )
+        .unwrap();
+        let chunks = vec![ChunkData {
+            chunk_index: 0,
+            start_line: Some(1),
+            end_line: Some(1),
+            content: "Quokkas on Rottnest Island are friendly.".into(),
+            content_hash: "hquokka".into(),
+            embedding: None,
+            dimension: None,
+            model: None,
+        }];
+        db.upsert_chunks("global", "notes", &chunks).unwrap();
+
+        let results = db.fts_search("global", "Quokkas", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0.content.contains("Quokkas"));
+    }
+
+    #[test]
+    fn prune_embedding_cache_by_ttl() {
+        // T4 — TTL prune. Seed two entries, backdate one past the cutoff,
+        // verify only the stale one is removed.
+        let db = test_db();
+        db.cache_embedding("p", "m", "fresh", &[1], 1).unwrap();
+        db.cache_embedding("p", "m", "stale", &[2], 1).unwrap();
+        // Backdate the "stale" row far in the past.
+        db.conn
+            .execute(
+                "UPDATE embedding_cache SET last_accessed_at = ?1 WHERE content_hash = 'stale'",
+                rusqlite::params![0_i64],
+            )
+            .unwrap();
+
+        let pruned = db.prune_embedding_cache(60).unwrap();
+        assert_eq!(pruned, 1, "only the stale row should have been pruned");
+        assert!(db
+            .get_cached_embedding("p", "m", "fresh")
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_cached_embedding("p", "m", "stale")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn list_memory_scopes_returns_distinct_ordered() {
+        // T14 — scope discovery covers entries across scopes without
+        // duplicates, in a stable order.
+        let db = test_db();
+        db.upsert_memory_entry("global", "a", "x").unwrap();
+        db.upsert_memory_entry("global", "b", "y").unwrap();
+        db.upsert_memory_entry("project:abc", "notes", "z").unwrap();
+        db.upsert_memory_entry("local", "n", "w").unwrap();
+        let scopes = db.list_memory_scopes().unwrap();
+        assert_eq!(scopes, vec!["global", "local", "project:abc"]);
     }
 
     #[test]

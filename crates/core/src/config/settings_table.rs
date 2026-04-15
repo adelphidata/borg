@@ -44,6 +44,7 @@ define_settings! {
         "memory.embeddings.recency_weight" => memory.embeddings.recency_weight, range(f32, 0.0_f32, 1.0);
         "memory.embeddings.bm25_weight" => memory.embeddings.bm25_weight, range(f32, 0.0_f32, 1.0);
         "memory.embeddings.vector_weight" => memory.embeddings.vector_weight, range(f32, 0.0_f32, 1.0);
+        "memory.embeddings.vector_threshold_factor" => memory.embeddings.vector_threshold_factor, range(f32, 0.0_f32, 2.0);
         "memory.embeddings.chunk_size_tokens" => memory.embeddings.chunk_size_tokens, parsed(usize);
         "memory.embeddings.chunk_overlap_tokens" => memory.embeddings.chunk_overlap_tokens, parsed(usize);
 

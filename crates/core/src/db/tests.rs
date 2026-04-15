@@ -3964,3 +3964,52 @@ fn multiple_pending_celebrations_ordered() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].payload_json, r#"{"id":2}"#);
 }
+
+#[test]
+fn v34_seeds_memory_consolidation_tasks() {
+    // T7 — running migrations on a fresh DB must seed the nightly and weekly
+    // memory consolidation tasks with their fixed UUIDs and correct cron
+    // expressions. Without this regression guard, a migration reorder could
+    // silently disable nightly consolidation.
+    let db = test_db();
+    let nightly_id = crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
+    let weekly_id = crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
+
+    let (name, schedule_type, schedule_expr, allowed_tools): (String, String, String, String) = db
+        .conn()
+        .query_row(
+            "SELECT name, schedule_type, schedule_expr, allowed_tools
+             FROM scheduled_tasks WHERE id = ?1",
+            params![nightly_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("nightly consolidation task must be seeded by V34");
+    assert_eq!(schedule_type, "cron");
+    assert_eq!(schedule_expr, "0 0 3 * * *");
+    assert!(
+        name.to_lowercase().contains("nightly"),
+        "unexpected nightly task name: {name}"
+    );
+    assert!(
+        allowed_tools.contains("write_memory")
+            && allowed_tools.contains("read_memory")
+            && allowed_tools.contains("memory_search"),
+        "consolidation task must allow memory tools: got {allowed_tools}"
+    );
+
+    let (weekly_name, weekly_type, weekly_expr): (String, String, String) = db
+        .conn()
+        .query_row(
+            "SELECT name, schedule_type, schedule_expr
+             FROM scheduled_tasks WHERE id = ?1",
+            params![weekly_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("weekly consolidation task must be seeded by V34");
+    assert_eq!(weekly_type, "cron");
+    assert_eq!(weekly_expr, "0 0 4 * * 7");
+    assert!(
+        weekly_name.to_lowercase().contains("weekly"),
+        "unexpected weekly task name: {weekly_name}"
+    );
+}
