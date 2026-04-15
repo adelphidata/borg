@@ -350,4 +350,75 @@ mod tests {
             "expected 'required' in: {result}"
         );
     }
+
+    #[tokio::test]
+    async fn handle_generate_image_no_provider_configured() {
+        // image_gen enabled but no provider env vars / config → reports missing provider.
+        let mut config = Config::default();
+        config.image_gen.enabled = true;
+        let result = handle_generate_image(&json!({"prompt": "a cat"}), &config)
+            .await
+            .unwrap();
+        // Either a provider was found in the env (rare in test) or we get the
+        // "No image generation provider available" message. Only assert the
+        // disabled-provider branch when no provider is configured.
+        if crate::image_gen::ImageGenProvider::from_config(&config.image_gen).is_none() {
+            assert!(
+                result.contains("No image generation provider"),
+                "got: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_browser_disabled_short_circuits() {
+        let mut config = Config::default();
+        config.browser.enabled = false;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(
+            &json!({"action": "navigate", "url": "x"}),
+            &config,
+            &mut session,
+        )
+        .await
+        .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("disabled"), "got: {msg}");
+        } else {
+            panic!("expected text output when browser disabled");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_browser_close_without_session() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(&json!({"action": "close"}), &config, &mut session)
+            .await
+            .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("No browser session"), "got: {msg}");
+        } else {
+            panic!("expected text output for close-without-session");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_browser_invalid_action_args_returns_error() {
+        // "navigate" without a "url" argument fails validate_browser_args early
+        // (before any browser launch), so we can exercise the validation branch
+        // without actually launching Chrome.
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let mut session: Option<BrowserSession> = None;
+        let out = handle_browser(&json!({"action": "navigate"}), &config, &mut session)
+            .await
+            .expect("ok");
+        if let ToolOutput::Text(msg) = out {
+            assert!(msg.contains("Error"), "got: {msg}");
+        } else {
+            panic!("expected text output on validation error");
+        }
+    }
 }

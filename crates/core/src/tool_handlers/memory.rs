@@ -297,4 +297,64 @@ mod tests {
         let output = format_search_results(&results);
         assert!(output.contains("No matching memories found"));
     }
+
+    #[test]
+    fn handle_write_memory_missing_filename_errors() {
+        let args = serde_json::json!({"content": "hi"});
+        let err = handle_write_memory(&args).unwrap_err().to_string();
+        assert!(err.contains("filename"), "got: {err}");
+    }
+
+    #[test]
+    fn handle_write_memory_missing_content_errors() {
+        let args = serde_json::json!({"filename": "x.md"});
+        let err = handle_write_memory(&args).unwrap_err().to_string();
+        assert!(err.contains("content"), "got: {err}");
+    }
+
+    #[test]
+    fn handle_read_memory_missing_filename_errors() {
+        let args = serde_json::json!({});
+        let err = handle_read_memory(&args).unwrap_err().to_string();
+        assert!(err.contains("filename"), "got: {err}");
+    }
+
+    /// Combined lifecycle test: uses BORG_DATA_DIR, so kept as a single test to
+    /// avoid env-var races with other tests in this crate.
+    #[test]
+    fn handle_write_and_read_roundtrip_global() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("BORG_DATA_DIR", tmp.path());
+
+        let args = serde_json::json!({
+            "filename": "note.md",
+            "content": "alpha",
+        });
+        let msg = handle_write_memory(&args).expect("write global");
+        assert!(msg.contains("note.md"));
+
+        let read =
+            handle_read_memory(&serde_json::json!({"filename": "note.md"})).expect("read global");
+        assert_eq!(read.trim(), "alpha");
+
+        // Append mode accumulates.
+        handle_write_memory(&serde_json::json!({
+            "filename": "note.md",
+            "content": "beta",
+            "append": true,
+        }))
+        .expect("append global");
+        let read2 = handle_read_memory(&serde_json::json!({"filename": "note.md"}))
+            .expect("read after append");
+        assert!(read2.contains("alpha"));
+        assert!(read2.contains("beta"));
+
+        // Reading a missing file returns a friendly "not found" message rather
+        // than an error.
+        let missing = handle_read_memory(&serde_json::json!({"filename": "missing.md"}))
+            .expect("read missing");
+        assert!(missing.contains("not found"), "got: {missing}");
+
+        std::env::remove_var("BORG_DATA_DIR");
+    }
 }

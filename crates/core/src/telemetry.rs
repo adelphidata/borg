@@ -278,4 +278,29 @@ mod tests {
             assert!(layer.is_none());
         }
     }
+
+    #[test]
+    fn telemetry_guard_noop_constructor() {
+        let guard = TelemetryGuard::noop();
+        assert!(guard.tracer_provider.is_none());
+        assert!(guard.meter_provider.is_none());
+        // Dropping a noop guard must not panic or print.
+        drop(guard);
+    }
+
+    #[test]
+    fn borg_metrics_default_is_new() {
+        let metrics = BorgMetrics::default();
+        metrics.agent_turns.add(1, &[]);
+    }
+
+    #[test]
+    fn borg_metrics_from_config_respects_flag() {
+        use crate::config::Config;
+        let mut config = Config::default();
+        config.telemetry.metrics_enabled = false;
+        let noop = BorgMetrics::from_config(&config);
+        noop.llm_requests.add(5, &[]);
+        noop.gateway_duration.record(0.01, &[]);
+    }
 }

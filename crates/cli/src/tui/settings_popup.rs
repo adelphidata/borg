@@ -1578,24 +1578,21 @@ mod tests {
         assert!(!popup.handle_paste("anything"));
     }
 
-    /// Helper: create a SettingsPopup backed by a read-only SQLite DB so all
-    /// writes fail.  Uses a temp file that is opened normally (so migrations
-    /// run), then re-opened as read-only.
+    /// Helper: create a SettingsPopup backed by a SQLite DB that rejects
+    /// writes. We initialize a normal on-disk DB (so migrations succeed), then
+    /// flip `PRAGMA query_only = 1` to force subsequent writes to fail at the
+    /// SQLite layer.
     fn popup_with_readonly_db() -> SettingsPopup {
         use borg_core::db::Database;
 
         let dir = tempfile::tempdir().expect("create temp dir");
         let path = dir.path().join("readonly.db");
 
-        // Create & migrate normally
-        {
-            let conn = rusqlite::Connection::open(&path).expect("create db");
-            let _db = Database::from_connection(conn).expect("init db");
-        }
-        // Re-open read-only
-        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
-        let conn = rusqlite::Connection::open_with_flags(&path, flags).expect("open ro");
-        let db = Database::from_connection(conn).expect("wrap ro db");
+        let conn = rusqlite::Connection::open(&path).expect("create db");
+        let db = Database::from_connection(conn).expect("init db");
+        db.conn()
+            .execute_batch("PRAGMA query_only = 1;")
+            .expect("set query_only");
 
         let mut popup = SettingsPopup::new();
         popup.db = Some(db);

@@ -143,4 +143,22 @@ mod tests {
         let result = handle_security_audit(&json!({"category": "invalid"}), &config).unwrap();
         assert!(result.contains("Unknown audit category"));
     }
+
+    #[test]
+    fn handle_manage_scripts_disabled_short_circuits() {
+        let mut config = Config::default();
+        config.scripts.enabled = false;
+        let result = handle_manage_scripts(&json!({"action": "list"}), &config).unwrap();
+        assert!(result.contains("disabled"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn handle_run_script_disabled_short_circuits() {
+        let mut config = Config::default();
+        config.scripts.enabled = false;
+        let result = handle_run_script(&json!({"name": "x"}), &config)
+            .await
+            .unwrap();
+        assert!(result.contains("disabled"), "got: {result}");
+    }
 }

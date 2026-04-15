@@ -116,4 +116,39 @@ mod tests {
         let addr: IpAddr = "192.168.1.1".parse().unwrap();
         assert!(!SlidingWindowLimiter::is_exempt(&addr));
     }
+
+    #[test]
+    fn rejects_new_keys_when_capacity_exhausted() {
+        let mut limiter = SlidingWindowLimiter::new(10, Duration::from_secs(60));
+        limiter.max_keys = 2;
+        assert!(limiter.check("a"));
+        assert!(limiter.check("b"));
+        // Third distinct key exceeds capacity; must be rejected.
+        assert!(!limiter.check("c"));
+        // Existing keys can still be counted.
+        assert!(limiter.check("a"));
+    }
+
+    #[test]
+    fn sliding_window_expires_old_entries() {
+        let mut limiter = SlidingWindowLimiter::new(2, Duration::from_millis(50));
+        assert!(limiter.check("x"));
+        assert!(limiter.check("x"));
+        assert!(!limiter.check("x"));
+        std::thread::sleep(Duration::from_millis(80));
+        // After expiry, the window is empty again.
+        assert!(limiter.check("x"));
+    }
+
+    #[test]
+    fn prune_stale_drops_empty_windows() {
+        let mut limiter = SlidingWindowLimiter::new(5, Duration::from_millis(20));
+        for _ in 0..3 {
+            assert!(limiter.check("ephemeral"));
+        }
+        assert!(limiter.windows.contains_key("ephemeral"));
+        std::thread::sleep(Duration::from_millis(40));
+        limiter.prune_stale();
+        assert!(!limiter.windows.contains_key("ephemeral"));
+    }
 }

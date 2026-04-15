@@ -819,4 +819,80 @@ mod tests {
         // This will try to open DB; we're just verifying dispatch doesn't panic
         let _ = handle_schedule(&args, &Config::default());
     }
+
+    #[test]
+    fn handle_schedule_create_without_type_errors() {
+        let args = json!({"action": "create", "name": "x"});
+        let result = handle_schedule(&args, &Config::default()).unwrap();
+        assert!(result.contains("'type' is required"), "got: {result}");
+    }
+
+    #[test]
+    fn handle_schedule_unknown_type_errors() {
+        let args = json!({"action": "list", "type": "bogus"});
+        let result = handle_schedule(&args, &Config::default()).unwrap();
+        assert!(result.contains("Unknown type"), "got: {result}");
+    }
+
+    #[test]
+    fn handle_manage_cron_unknown_action() {
+        let result = handle_manage_cron(&json!({"action": "nope"}), &Config::default()).unwrap();
+        assert!(result.contains("Unknown action"), "got: {result}");
+    }
+
+    #[test]
+    fn handle_manage_cron_missing_action() {
+        let result = handle_manage_cron(&json!({}), &Config::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_manage_cron_create_invalid_schedule() {
+        let args = json!({
+            "action": "create",
+            "schedule": "not a cron expression at all",
+            "command": "echo hi",
+        });
+        let result = handle_manage_cron(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("Invalid schedule") || result.contains("Error"),
+            "expected schedule error in: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_cron_create_missing_command() {
+        let args = json!({"action": "create", "schedule": "* * * * *"});
+        let result = handle_manage_cron(&args, &Config::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_manage_tasks_get_missing_task_id() {
+        let args = json!({"action": "get"});
+        let result = handle_manage_tasks(&args, &Config::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_manage_tasks_delete_missing_task_id() {
+        let args = json!({"action": "delete"});
+        let result = handle_manage_tasks(&args, &Config::default());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn handle_manage_tasks_update_invalid_schedule() {
+        let args = json!({
+            "action": "update",
+            "task_id": "fake-id",
+            "schedule_type": "cron",
+            "schedule_expr": "not-a-cron",
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("Invalid schedule") || result.contains("Error"),
+            "expected schedule error in: {result}"
+        );
+    }
 }
