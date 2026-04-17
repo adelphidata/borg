@@ -225,11 +225,6 @@ pub const SILENT_REPLY_TOKEN: &str = "<SILENT>";
 /// Token the agent emits to acknowledge a heartbeat poll with nothing to report.
 pub const HEARTBEAT_OK_TOKEN: &str = "HEARTBEAT_OK";
 
-// ── TUI ───────────────────────────────────────────────────────────
-
-/// Lines scrolled per PageUp/PageDown press.
-pub const PAGE_SCROLL_LINES: usize = 20;
-
 // ── Typing indicator ──────────────────────────────────────────────
 
 /// Maximum duration (seconds) before auto-stopping a typing indicator.

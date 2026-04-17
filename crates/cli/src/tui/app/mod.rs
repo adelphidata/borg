@@ -818,6 +818,55 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
+        // Ctrl+B / Ctrl+F — full-page scroll (codex parity).
+        if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let page = (self.transcript_area.height as usize).max(1);
+            let max_scroll = self
+                .total_lines
+                .saturating_sub(self.transcript_area.height as usize);
+            if max_scroll > 0 {
+                self.scroll_offset = self.scroll_offset.saturating_add(page).min(max_scroll);
+                self.auto_scroll = false;
+            }
+            return Ok(AppAction::Continue);
+        }
+        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let page = (self.transcript_area.height as usize).max(1);
+            self.scroll_offset = self.scroll_offset.saturating_sub(page);
+            if self.scroll_offset == 0 {
+                self.auto_scroll = true;
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        // Ctrl+U — half-page up (codex parity).
+        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let half = ((self.transcript_area.height as usize).saturating_add(1) / 2).max(1);
+            let max_scroll = self
+                .total_lines
+                .saturating_sub(self.transcript_area.height as usize);
+            if max_scroll > 0 {
+                self.scroll_offset = self.scroll_offset.saturating_add(half).min(max_scroll);
+                self.auto_scroll = false;
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        // Ctrl+D — half-page down ONLY while scrolled up (codex parity).
+        // When at bottom, fall through to the "quit when composer empty" handler
+        // below so the shell-style EOF shortcut is preserved.
+        if key.code == KeyCode::Char('d')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.scroll_offset > 0
+        {
+            let half = ((self.transcript_area.height as usize).saturating_add(1) / 2).max(1);
+            self.scroll_offset = self.scroll_offset.saturating_sub(half);
+            if self.scroll_offset == 0 {
+                self.auto_scroll = true;
+            }
+            return Ok(AppAction::Continue);
+        }
+
         // Ctrl+D — quit when composer is empty (EOF)
         if key.code == KeyCode::Char('d')
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -888,13 +937,16 @@ impl<'a> App<'a> {
                  Down / Ctrl+N — Next history entry\n  \
                  Esc          — Clear input / Rewind (when empty)\n  \
                  Ctrl+L       — Clear screen\n  \
-                 Ctrl+D       — Quit (when empty)\n  \
+                 Ctrl+D       — Half-page down (scrolled) / Quit (at bottom, empty)\n  \
                  Ctrl+G       — Open external editor ($EDITOR)\n  \
                  Enter        — Queue message while streaming\n  \
                  Alt+Up       — Edit last queued message\n  \
                  Ctrl+C       — Cancel / Quit\n  \
                  Shift+Tab    — Cycle mode (default/execute/plan)\n  \
-                 PageUp/Down  — Scroll transcript\n  \
+                 PageUp/Down  — Scroll transcript (viewport height)\n  \
+                 Ctrl+B / Ctrl+F — Full-page up / down\n  \
+                 Ctrl+U / Ctrl+D — Half-page up / down\n  \
+                 Home / End   — Jump to top / bottom\n  \
                  Mouse wheel  — Scroll transcript\n  \
                  /            — Show command menu"
                     .to_string(),
@@ -948,16 +1000,19 @@ impl<'a> App<'a> {
                 return Ok(AppAction::Continue);
             }
             KeyCode::PageUp => {
-                self.scroll_offset = self
-                    .scroll_offset
-                    .saturating_add(borg_core::constants::PAGE_SCROLL_LINES);
-                self.auto_scroll = false;
+                let page = (self.transcript_area.height as usize).max(1);
+                let max_scroll = self
+                    .total_lines
+                    .saturating_sub(self.transcript_area.height as usize);
+                if max_scroll > 0 {
+                    self.scroll_offset = self.scroll_offset.saturating_add(page).min(max_scroll);
+                    self.auto_scroll = false;
+                }
                 return Ok(AppAction::Continue);
             }
             KeyCode::PageDown => {
-                self.scroll_offset = self
-                    .scroll_offset
-                    .saturating_sub(borg_core::constants::PAGE_SCROLL_LINES);
+                let page = (self.transcript_area.height as usize).max(1);
+                self.scroll_offset = self.scroll_offset.saturating_sub(page);
                 if self.scroll_offset == 0 {
                     self.auto_scroll = true;
                 }
@@ -1865,37 +1920,218 @@ mod tests {
         assert_eq!(app.scroll_offset, 5, "typing must not move scroll");
     }
 
-    // --- PageUp / PageDown ---
+    // --- PageUp / PageDown (viewport height, codex parity) ---
 
     #[test]
-    fn page_up_scrolls_by_20() {
-        let mut app = make_app();
+    fn page_up_scrolls_by_viewport_height() {
+        let mut app = app_with_scrollable_transcript(); // viewport=40
 
         app.handle_key(key(KeyCode::PageUp)).unwrap();
-        assert_eq!(app.scroll_offset, 20);
+        assert_eq!(app.scroll_offset, 40);
         assert!(!app.auto_scroll);
     }
 
     #[test]
-    fn page_down_scrolls_by_20() {
-        let mut app = make_app();
-        app.scroll_offset = 40;
+    fn page_down_scrolls_by_viewport_height() {
+        let mut app = app_with_scrollable_transcript(); // viewport=40
+        app.scroll_offset = 80;
         app.auto_scroll = false;
 
         app.handle_key(key(KeyCode::PageDown)).unwrap();
-        assert_eq!(app.scroll_offset, 20);
+        assert_eq!(app.scroll_offset, 40);
         assert!(!app.auto_scroll);
     }
 
     #[test]
     fn page_down_restores_auto_scroll_at_zero() {
-        let mut app = make_app();
+        let mut app = app_with_scrollable_transcript();
         app.scroll_offset = 10;
         app.auto_scroll = false;
 
         app.handle_key(key(KeyCode::PageDown)).unwrap();
         assert_eq!(app.scroll_offset, 0);
         assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn page_up_clamps_to_max_scroll() {
+        let mut app = app_with_scrollable_transcript(); // total=200, viewport=40, max=160
+
+        for _ in 0..10 {
+            app.handle_key(key(KeyCode::PageUp)).unwrap();
+        }
+        assert_eq!(app.scroll_offset, 160, "must clamp to max_scroll");
+    }
+
+    #[test]
+    fn page_up_is_noop_when_no_scrollable_content() {
+        let mut app = make_app(); // transcript_area=0, total_lines=0
+        app.handle_key(key(KeyCode::PageUp)).unwrap();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(
+            app.auto_scroll,
+            "auto_scroll must not flip off when there's nothing to scroll"
+        );
+    }
+
+    // --- Ctrl+B / Ctrl+F — full-page scroll (codex parity) ---
+
+    #[test]
+    fn ctrl_b_scrolls_up_by_viewport_height() {
+        let mut app = app_with_scrollable_transcript(); // viewport=40
+
+        app.handle_key(ctrl('b')).unwrap();
+        assert_eq!(app.scroll_offset, 40);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn ctrl_f_scrolls_down_by_viewport_height() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 80;
+        app.auto_scroll = false;
+
+        app.handle_key(ctrl('f')).unwrap();
+        assert_eq!(app.scroll_offset, 40);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn ctrl_f_restores_auto_scroll_at_zero() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 10;
+        app.auto_scroll = false;
+
+        app.handle_key(ctrl('f')).unwrap();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    #[test]
+    fn ctrl_b_clamps_to_max_scroll() {
+        let mut app = app_with_scrollable_transcript();
+        for _ in 0..10 {
+            app.handle_key(ctrl('b')).unwrap();
+        }
+        assert_eq!(app.scroll_offset, 160);
+    }
+
+    // --- Ctrl+U / Ctrl+D — half-page scroll (codex parity) ---
+
+    #[test]
+    fn ctrl_u_scrolls_up_by_half_viewport_even_height() {
+        let mut app = app_with_scrollable_transcript(); // viewport=40 → half=(40+1)/2=20
+
+        app.handle_key(ctrl('u')).unwrap();
+        assert_eq!(app.scroll_offset, 20);
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn ctrl_u_scrolls_up_by_half_viewport_odd_height_ceiling() {
+        let mut app = make_app();
+        app.transcript_area = Rect::new(0, 0, 80, 41); // half=(41+1)/2=21
+        app.total_lines = 200;
+
+        app.handle_key(ctrl('u')).unwrap();
+        assert_eq!(app.scroll_offset, 21, "half-page must ceil for odd heights");
+    }
+
+    #[test]
+    fn ctrl_d_scrolls_down_by_half_viewport_when_scrolled_up() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 30;
+        app.auto_scroll = false;
+
+        app.handle_key(ctrl('d')).unwrap();
+        assert_eq!(
+            app.scroll_offset, 10,
+            "half-page down from 30 with viewport=40"
+        );
+        assert!(!app.auto_scroll);
+    }
+
+    #[test]
+    fn ctrl_d_restores_auto_scroll_at_zero() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 15; // half-page=20 → saturates to 0
+        app.auto_scroll = false;
+
+        app.handle_key(ctrl('d')).unwrap();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.auto_scroll);
+    }
+
+    // REGRESSION GUARD: Ctrl+D must still quit when at bottom with empty
+    // composer. The half-page-down handler is gated by scroll_offset > 0.
+    #[test]
+    fn ctrl_d_quits_when_at_bottom_and_composer_empty() {
+        let mut app = app_with_scrollable_transcript();
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.composer.is_empty());
+
+        let action = app.handle_key(ctrl('d')).unwrap();
+        assert!(matches!(action, AppAction::Quit));
+    }
+
+    #[test]
+    fn ctrl_u_viewport_height_1_scrolls_at_least_1_line() {
+        let mut app = make_app();
+        app.transcript_area = Rect::new(0, 0, 80, 1); // half=(1+1)/2=1
+        app.total_lines = 100;
+
+        app.handle_key(ctrl('u')).unwrap();
+        assert_eq!(app.scroll_offset, 1, "must scroll at least 1 line");
+    }
+
+    #[test]
+    fn ctrl_u_viewport_height_zero_scrolls_at_least_1_line() {
+        // Guard: .max(1) prevents zero-scroll when transcript_area unset.
+        let mut app = make_app();
+        app.total_lines = 100; // transcript_area still default 0x0
+
+        app.handle_key(ctrl('u')).unwrap();
+        assert_eq!(
+            app.scroll_offset, 1,
+            ".max(1) must prevent zero-scroll at height=0"
+        );
+    }
+
+    // REGRESSION GUARD: Ctrl+D at bottom with non-empty composer must NOT
+    // quit and must NOT scroll. Behavior falls through harmlessly (composer
+    // should not gain a stray \x04 or similar).
+    #[test]
+    fn ctrl_d_does_not_quit_when_composer_nonempty_at_bottom() {
+        let mut app = app_with_scrollable_transcript();
+        app.handle_key(key(KeyCode::Char('h'))).unwrap();
+        app.handle_key(key(KeyCode::Char('i'))).unwrap();
+        assert_eq!(app.composer.text(), "hi");
+        assert_eq!(app.scroll_offset, 0);
+
+        let action = app.handle_key(ctrl('d')).unwrap();
+        assert!(
+            matches!(action, AppAction::Continue),
+            "Ctrl+D must not quit when composer is non-empty"
+        );
+        assert_eq!(app.scroll_offset, 0, "must not scroll when at bottom");
+        assert_eq!(
+            app.composer.text(),
+            "hi",
+            "Ctrl+D must not inject a control char into the composer"
+        );
+    }
+
+    // REGRESSION GUARD: wheel events (KeyCode::Up via ?1007h) must still
+    // scroll 1 line per tick when already scrolled up (Rule A). This is
+    // independent of the new vim-style keys.
+    #[test]
+    fn wheel_still_one_line_per_tick_when_scrolled() {
+        let mut app = app_with_scrollable_transcript();
+        app.scroll_offset = 5;
+        app.auto_scroll = false;
+
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        assert_eq!(app.scroll_offset, 6, "wheel/arrow must stay at 1 line/tick");
     }
 
     // --- End / Home (opencode-style jump shortcuts) ---
