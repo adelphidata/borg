@@ -3,6 +3,28 @@
 //! Tests the injection detection and content wrapping pipeline with
 //! realistic multi-layer scenarios that cross module boundaries.
 
+#![allow(
+    clippy::approx_constant,
+    clippy::assertions_on_constants,
+    clippy::const_is_empty,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::identity_op,
+    clippy::items_after_test_module,
+    clippy::len_zero,
+    clippy::manual_range_contains,
+    clippy::needless_borrow,
+    clippy::needless_collect,
+    clippy::redundant_clone,
+    clippy::redundant_closure_for_method_calls,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_map_or,
+    clippy::unwrap_used,
+    clippy::useless_format,
+    clippy::useless_vec
+)]
+
 use borg_core::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };

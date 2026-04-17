@@ -3,6 +3,33 @@
 //! Provides the agent loop, multi-provider LLM client, memory system, identity,
 //! configuration, skills, tools, and all supporting infrastructure.
 
+// Test code is held to looser standards than production: unwrap/expect failures
+// are loud test signals, and stylistic lints add noise without catching bugs.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::approx_constant,
+        clippy::assertions_on_constants,
+        clippy::const_is_empty,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::identity_op,
+        clippy::items_after_test_module,
+        clippy::len_zero,
+        clippy::manual_range_contains,
+        clippy::needless_borrow,
+        clippy::needless_collect,
+        clippy::redundant_clone,
+        clippy::redundant_closure_for_method_calls,
+        clippy::uninlined_format_args,
+        clippy::unnecessary_cast,
+        clippy::unnecessary_map_or,
+        clippy::unwrap_used,
+        clippy::useless_format,
+        clippy::useless_vec
+    )
+)]
+
 /// Activity logging for session history.
 pub mod activity_log;
 /// Agent conversation loop and tool dispatch.

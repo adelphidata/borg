@@ -4,6 +4,28 @@
 //! points `LlmClient` at it via `Config.llm.base_url`, and verifies the
 //! `StreamEvent` sequence produced by `stream_chat`.
 
+#![allow(
+    clippy::approx_constant,
+    clippy::assertions_on_constants,
+    clippy::const_is_empty,
+    clippy::expect_used,
+    clippy::field_reassign_with_default,
+    clippy::identity_op,
+    clippy::items_after_test_module,
+    clippy::len_zero,
+    clippy::manual_range_contains,
+    clippy::needless_borrow,
+    clippy::needless_collect,
+    clippy::redundant_clone,
+    clippy::redundant_closure_for_method_calls,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_cast,
+    clippy::unnecessary_map_or,
+    clippy::unwrap_used,
+    clippy::useless_format,
+    clippy::useless_vec
+)]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::mpsc;

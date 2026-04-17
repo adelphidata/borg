@@ -3,6 +3,30 @@
 //! Provides a simple text-based patch format for creating, updating, and deleting files.
 //! Used by the `apply_patch` tool to modify files in the workspace.
 #![warn(missing_docs)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::approx_constant,
+        clippy::assertions_on_constants,
+        clippy::const_is_empty,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::identity_op,
+        clippy::items_after_test_module,
+        clippy::len_zero,
+        clippy::manual_range_contains,
+        clippy::needless_borrow,
+        clippy::needless_collect,
+        clippy::redundant_clone,
+        clippy::redundant_closure_for_method_calls,
+        clippy::uninlined_format_args,
+        clippy::unnecessary_cast,
+        clippy::unnecessary_map_or,
+        clippy::unwrap_used,
+        clippy::useless_format,
+        clippy::useless_vec
+    )
+)]
 
 pub mod apply;
 pub mod parser;
