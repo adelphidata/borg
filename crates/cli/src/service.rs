@@ -1199,6 +1199,26 @@ pub fn is_zero_info_heartbeat(response: &str) -> bool {
     })
 }
 
+enum HeartbeatActivity<'a> {
+    Fired { duration_ms: u64 },
+    EmptyResponse { duration_ms: u64 },
+    DuplicateSuppressed,
+    Failed(&'a str),
+}
+
+impl HeartbeatActivity<'_> {
+    fn message(&self) -> String {
+        match self {
+            Self::Fired { duration_ms } => format!("Heartbeat tick: fired ({duration_ms}ms)"),
+            Self::EmptyResponse { duration_ms } => {
+                format!("Heartbeat tick: empty response ({duration_ms}ms)")
+            }
+            Self::DuplicateSuppressed => "Heartbeat tick: duplicate response suppressed".into(),
+            Self::Failed(error) => format!("Heartbeat tick: failed ({error})"),
+        }
+    }
+}
+
 /// Shared heartbeat turn: creates a temporary agent, sends the heartbeat message
 /// (with HEARTBEAT.md checklist if present), deduplicates, and returns a structured result.
 pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
@@ -1223,9 +1243,9 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
             if let Ok(adb) = borg_core::db::Database::open() {
                 borg_core::activity_log::log_activity(
                     &adb,
-                    "warn",
+                    "info",
                     "heartbeat",
-                    &format!("Failed: {error}"),
+                    &HeartbeatActivity::Failed(&error).message(),
                 );
             }
             return HeartbeatResult::Failed { error };
@@ -1269,9 +1289,9 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
         if let Ok(adb) = borg_core::db::Database::open() {
             borg_core::activity_log::log_activity(
                 &adb,
-                "warn",
+                "info",
                 "heartbeat",
-                &format!("Failed: {error}"),
+                &HeartbeatActivity::Failed(&error).message(),
             );
         }
         return HeartbeatResult::Failed { error };
@@ -1295,9 +1315,9 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
         if let Ok(adb) = borg_core::db::Database::open() {
             borg_core::activity_log::log_activity(
                 &adb,
-                "debug",
+                "info",
                 "heartbeat",
-                "Heartbeat fired but response carried no actionable info",
+                &HeartbeatActivity::EmptyResponse { duration_ms }.message(),
             );
         }
         return HeartbeatResult::Skipped {
@@ -1332,9 +1352,9 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
         if let Ok(adb) = borg_core::db::Database::open() {
             borg_core::activity_log::log_activity(
                 &adb,
-                "debug",
+                "info",
                 "heartbeat",
-                "Duplicate response suppressed",
+                &HeartbeatActivity::DuplicateSuppressed.message(),
             );
         }
         return HeartbeatResult::Skipped {
@@ -1343,7 +1363,12 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
     }
 
     if let Ok(adb) = borg_core::db::Database::open() {
-        borg_core::activity_log::log_activity(&adb, "info", "heartbeat", "Heartbeat fired");
+        borg_core::activity_log::log_activity(
+            &adb,
+            "info",
+            "heartbeat",
+            &HeartbeatActivity::Fired { duration_ms }.message(),
+        );
     }
 
     HeartbeatResult::Ran {
@@ -2239,6 +2264,60 @@ mod tests {
         assert!(is_zero_info_heartbeat(""));
         assert!(is_zero_info_heartbeat("   "));
         assert!(is_zero_info_heartbeat("\n\n\t"));
+    }
+
+    #[test]
+    fn heartbeat_activity_fired_format() {
+        assert_eq!(
+            HeartbeatActivity::Fired { duration_ms: 123 }.message(),
+            "Heartbeat tick: fired (123ms)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_activity_empty_response_format() {
+        assert_eq!(
+            HeartbeatActivity::EmptyResponse { duration_ms: 456 }.message(),
+            "Heartbeat tick: empty response (456ms)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_activity_duplicate_format() {
+        assert_eq!(
+            HeartbeatActivity::DuplicateSuppressed.message(),
+            "Heartbeat tick: duplicate response suppressed"
+        );
+    }
+
+    #[test]
+    fn heartbeat_activity_failed_format() {
+        assert_eq!(
+            HeartbeatActivity::Failed("agent creation: Connection refused").message(),
+            "Heartbeat tick: failed (agent creation: Connection refused)"
+        );
+        assert_eq!(
+            HeartbeatActivity::Failed("agent error: stream closed").message(),
+            "Heartbeat tick: failed (agent error: stream closed)"
+        );
+    }
+
+    #[test]
+    fn heartbeat_activity_messages_share_prefix() {
+        // Every outcome must start with "Heartbeat tick: " so /logs stays greppable
+        // and visually groups a single row per tick.
+        let samples = [
+            HeartbeatActivity::Fired { duration_ms: 0 }.message(),
+            HeartbeatActivity::EmptyResponse { duration_ms: 0 }.message(),
+            HeartbeatActivity::DuplicateSuppressed.message(),
+            HeartbeatActivity::Failed("x").message(),
+        ];
+        for msg in &samples {
+            assert!(
+                msg.starts_with("Heartbeat tick: "),
+                "outcome message missing prefix: {msg}"
+            );
+        }
     }
 
     #[test]
