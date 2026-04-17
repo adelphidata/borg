@@ -273,6 +273,11 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         }
     }
 
+    // Register user-authored script hooks loaded from ~/.borg/hooks.json
+    for hook in borg_core::hooks::ScriptHook::load_all(config.hooks.enabled) {
+        agent.hook_registry_mut().register(Box::new(hook));
+    }
+
     // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
     // <id>` inside the TUI. Launching the TUI with no args always starts a
     // fresh session.

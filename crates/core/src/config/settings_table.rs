@@ -160,6 +160,9 @@ define_settings! {
         "scripts.enabled" => scripts.enabled, parsed(bool);
         "scripts.default_timeout_ms" => scripts.default_timeout_ms, parsed(u64);
 
+        // ── Hooks ──
+        "hooks.enabled" => hooks.enabled, parsed(bool);
+
         // ── Compaction ──
         "compaction.provider" => compaction.provider, opt_string;
         "compaction.model" => compaction.model, opt_string;

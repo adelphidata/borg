@@ -45,6 +45,11 @@ pub async fn one_shot(
         }
     }
 
+    // Register user-authored script hooks loaded from ~/.borg/hooks.json
+    for hook in borg_core::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
+        agent.hook_registry_mut().register(Box::new(hook));
+    }
+
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
     let send_future = agent.send_message(message, event_tx);

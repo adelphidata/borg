@@ -103,6 +103,9 @@ pub struct Config {
     /// User-created script management.
     #[serde(default)]
     pub scripts: ScriptsConfig,
+    /// User-authored lifecycle hooks loaded from `~/.borg/hooks.json`.
+    #[serde(default)]
+    pub hooks: HooksConfig,
     /// Compaction model overrides (use cheaper model for context compaction).
     #[serde(default)]
     pub compaction: CompactionConfig,

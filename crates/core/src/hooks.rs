@@ -1,5 +1,8 @@
 use tracing::debug;
 
+mod script;
+pub use script::ScriptHook;
+
 /// Points in the agent lifecycle where hooks can intercept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HookPoint {

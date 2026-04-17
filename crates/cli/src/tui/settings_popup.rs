@@ -112,6 +112,12 @@ const SETTINGS: &[SettingEntry] = &[
         category: "Security",
     },
     SettingEntry {
+        key: "hooks.enabled",
+        label: "Allow user hooks",
+        kind: SettingKind::Bool,
+        category: "Security",
+    },
+    SettingEntry {
         key: "security.secret_detection",
         label: "Secret detection",
         kind: SettingKind::Bool,
@@ -1090,7 +1096,7 @@ mod tests {
     #[test]
     fn all_settings_covered() {
         let popup = SettingsPopup::new();
-        assert_eq!(popup.entries.len(), 16);
+        assert_eq!(popup.entries.len(), 17);
 
         let cfg = Config::default();
         for entry in popup.entries {

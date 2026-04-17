@@ -717,6 +717,20 @@ impl Default for ScriptsConfig {
     }
 }
 
+/// Configuration for user-authored lifecycle hooks loaded from `~/.borg/hooks.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Enable loading hooks from `~/.borg/hooks.json` (default: true).
+    pub enabled: bool,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

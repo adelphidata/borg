@@ -204,6 +204,13 @@ macOS: `sandbox-exec` with Seatbelt profiles (deny-all default). Linux: `bwrap` 
 
 Event-sourced agent health: 5 stats (stability, focus, sync, growth, happiness) computed by replaying HMAC-verified events. `VitalsHook` listens on SessionStart, BeforeAgentStart, AfterToolCall. `borg status` / `/status`.
 
+### Lifecycle Hooks
+
+Two layers share one `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/core/src/hooks.rs`:
+
+- **Compiled-in hooks** — `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook` registered in `crates/cli/src/repl.rs` and `crates/cli/src/tui/mod.rs`.
+- **User script hooks** — `ScriptHook` loaded from `~/.borg/hooks.json` (Claude Code / codex schema). Events: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`. Runs `sh -c <command>` with a JSON payload as `$1`, bounded by `timeout` (default 60s, clamped to `[1,600]`). `PreToolUse` non-zero exit / timeout returns `HookAction::Skip` and aborts the tool call. All other failure modes (parse error, spawn failure, non-zero exit, panic) log a `tracing::warn!` and return `Continue` — **hooks can never break the agent**. Gated on `hooks.enabled` (default true). See `docs/hooks.md`.
+
 ### Prompt Injection Defense
 
 5 layers: input sanitization (scoring-based, flags rather than strips), context segregation (XML trust boundaries), prompt hardening, rate limiting (per-session action caps), secret redaction.
