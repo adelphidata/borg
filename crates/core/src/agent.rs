@@ -757,7 +757,7 @@ impl Agent {
             ),
             (
                 "request_user_input",
-                "Ask user for clarification when blocked",
+                "Last-resort prompt for information no other tool can obtain (personal preference, credential, external decision). Do not use for questions answerable by reading files or running commands.",
             ),
             ("generate_image", "Generate images from text descriptions"),
             ("text_to_speech", "Convert text to speech audio"),
@@ -2746,7 +2746,7 @@ mod tests {
     fn default_mode_requires_task_confirmation() {
         let template = include_str!("../templates/collaboration_mode/default.md");
         assert!(
-            template.contains("always provide a brief text response"),
+            template.contains("briefly confirm what changed"),
             "Default collaboration mode must instruct agent to confirm task completion"
         );
     }
