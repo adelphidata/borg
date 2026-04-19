@@ -105,7 +105,7 @@ pub enum DoctorEvent {
 }
 
 /// Cached ambient-status snapshot rendered in the TUI header as the
-/// `class: {name_level} — {Mood} — {Archetype} — {hint}` line.
+/// `class: {name_level} — {Archetype} ({mood})` line.
 ///
 /// Computed by `App::refresh_ambient_status` off the evolution + vitals +
 /// bond DB state. Kept as a cache so `render()` never hits the DB.
@@ -117,8 +117,6 @@ pub struct AmbientStatus {
     pub mood: borg_core::evolution::Mood,
     /// Current dominant archetype, if any.
     pub archetype: Option<borg_core::evolution::Archetype>,
-    /// First `next_step_hints` entry, else empty.
-    pub hint: String,
 }
 
 /// Load the current ambient-status snapshot from the DB. Errors propagate to
@@ -135,16 +133,11 @@ fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
     let bond = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
 
     let mood = evolution::compute_mood(&evo, &vitals, &bond);
-    let hint = evolution::next_step_hints(&evo, &vitals, &bond)
-        .into_iter()
-        .next()
-        .unwrap_or_default();
     let name = evo.evolution_name.as_deref().unwrap_or("Base Borg");
     Ok(AmbientStatus {
         name_level: format!("{name} Lv.{}", evo.level),
         mood,
         archetype: evo.dominant_archetype,
-        hint,
     })
 }
 

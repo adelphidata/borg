@@ -42,7 +42,7 @@ impl StatusTab {
         match self {
             StatusTab::Overview => "Overview",
             StatusTab::Evolution => "Evolution",
-            StatusTab::Xp => "Xp",
+            StatusTab::Xp => "XP",
             StatusTab::ArchetypeScores => "Archetypes",
             StatusTab::History => "History",
         }
