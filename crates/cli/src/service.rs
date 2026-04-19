@@ -1219,9 +1219,21 @@ impl HeartbeatActivity<'_> {
     }
 }
 
+/// Why a heartbeat turn is running. Drives prompt flavor: scheduled ticks use
+/// the terse checklist; session-start greetings use a warmer, activity-aware
+/// greeting. Scheduler poke and interval Fire events both count as Scheduled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatSource {
+    /// Scheduler fire — interval, cron, or `/poke`.
+    Scheduled,
+    /// TUI opened post-onboarding — proactive greeting with recent-activity
+    /// context and time-of-day awareness.
+    SessionStart,
+}
+
 /// Shared heartbeat turn: creates a temporary agent, sends the heartbeat message
 /// (with HEARTBEAT.md checklist if present), deduplicates, and returns a structured result.
-pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
+pub async fn execute_heartbeat_turn(config: &Config, source: HeartbeatSource) -> HeartbeatResult {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1252,30 +1264,10 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
         }
     };
 
-    let checklist = borg_core::memory::load_heartbeat_checklist();
-    let mut user_msg = "*heartbeat tick*".to_string();
-    if let Some(ref cl) = checklist {
-        user_msg.push_str("\n\n# Heartbeat Checklist\n");
-        user_msg.push_str(cl);
-    }
-
-    // Proactive nudges: append LLM directives for heartbeat-only conditions
-    // (e.g. no messaging channels configured). Rate-limited via the `meta`
-    // table so each nudge fires at most once per its declared cooldown.
-    // See `crates/cli/src/heartbeat_augmenters.rs` for how to add one.
-    let augmenter_db = borg_core::db::Database::open().ok();
-    let nudges = crate::heartbeat_augmenters::collect(&config, augmenter_db.as_ref());
-    if !nudges.is_empty() {
-        user_msg.push_str("\n\n<proactive_nudges>\n");
-        for n in &nudges {
-            user_msg.push_str("- ");
-            user_msg.push_str(n);
-            user_msg.push('\n');
-        }
-        user_msg.push_str("</proactive_nudges>");
-        tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
-    }
-    drop(augmenter_db);
+    let user_msg = match source {
+        HeartbeatSource::Scheduled => build_scheduled_heartbeat_prompt(&config),
+        HeartbeatSource::SessionStart => build_session_start_prompt(&config),
+    };
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
     let cancel = CancellationToken::new();
@@ -1369,6 +1361,11 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
             "heartbeat",
             &HeartbeatActivity::Fired { duration_ms }.message(),
         );
+        // Persist last-fired timestamp so the session-start greeting throttle
+        // is shared across all heartbeat sources and survives process restarts.
+        if let Err(e) = adb.set_setting("heartbeat.last_fired_at", &now_secs.to_string()) {
+            tracing::warn!("Heartbeat: failed to persist last_fired_at: {e}");
+        }
     }
 
     HeartbeatResult::Ran {
@@ -1377,9 +1374,125 @@ pub async fn execute_heartbeat_turn(config: &Config) -> HeartbeatResult {
     }
 }
 
+/// Assemble the scheduled/poke heartbeat prompt: `*heartbeat tick*` plus the
+/// optional `HEARTBEAT.md` checklist and any rate-limited proactive nudges.
+fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
+    let mut user_msg = "*heartbeat tick*".to_string();
+    if let Some(cl) = borg_core::memory::load_heartbeat_checklist() {
+        user_msg.push_str("\n\n# Heartbeat Checklist\n");
+        user_msg.push_str(&cl);
+    }
+
+    // Proactive nudges: append LLM directives for heartbeat-only conditions
+    // (e.g. no messaging channels configured). Rate-limited via the `meta`
+    // table so each nudge fires at most once per its declared cooldown.
+    // See `crates/cli/src/heartbeat_augmenters.rs` for how to add one.
+    let augmenter_db = borg_core::db::Database::open().ok();
+    let nudges = crate::heartbeat_augmenters::collect(config, augmenter_db.as_ref());
+    if !nudges.is_empty() {
+        user_msg.push_str("\n\n<proactive_nudges>\n");
+        for n in &nudges {
+            user_msg.push_str("- ");
+            user_msg.push_str(n);
+            user_msg.push('\n');
+        }
+        user_msg.push_str("</proactive_nudges>");
+        tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
+    }
+    user_msg
+}
+
+/// Assemble the session-start greeting prompt. Includes the recent-activity
+/// digest from `gather_daily_context`, time-of-day context, and instructions
+/// that nudge the agent to greet the user like a coworker who remembers the
+/// last thread. Ignores quiet hours but surfaces the hour so the agent can
+/// react to unusual times ("burning the midnight oil?").
+fn build_session_start_prompt(config: &Config) -> String {
+    use chrono::{TimeZone, Timelike, Utc};
+
+    let tz = config.user_timezone();
+    let now_utc = Utc::now();
+    let now_local = tz.from_utc_datetime(&now_utc.naive_utc());
+
+    let hour = now_local.hour();
+    let weekday = now_local.format("%A").to_string();
+    let is_quiet = in_configured_quiet_hours(config, hour);
+
+    // Recent activity + gap-since-last-session — both pulled from the same
+    // database so a single failure (e.g. db locked) degrades gracefully to a
+    // bare greeting rather than aborting the turn.
+    let (recent_activity, hours_since_last) = match borg_core::db::Database::open() {
+        Ok(db) => {
+            let ctx = borg_core::daily_summary::gather_daily_context(&db).unwrap_or_default();
+            let gap = db
+                .sessions_since(0)
+                .ok()
+                .and_then(|rows| rows.first().map(|s| s.updated_at))
+                .map(|ts| (now_utc.timestamp() - ts).max(0) / 3600);
+            (ctx, gap)
+        }
+        Err(e) => {
+            tracing::warn!("SessionStart: failed to open db for recent activity: {e}");
+            (String::new(), None)
+        }
+    };
+
+    let mut msg = String::from("*session start greeting*\n\n<time_context>\n");
+    msg.push_str(&format!("hour={hour:02} weekday={weekday}"));
+    if is_quiet {
+        msg.push_str(" note=unusual_hours");
+    }
+    if let Some(h) = hours_since_last {
+        msg.push_str(&format!(" hours_since_last_session={h}"));
+    } else {
+        msg.push_str(" hours_since_last_session=none");
+    }
+    msg.push_str("\n</time_context>\n\n<recent_activity>\n");
+    if recent_activity.trim().is_empty() {
+        msg.push_str("(none)\n");
+    } else {
+        msg.push_str(&recent_activity);
+    }
+    msg.push_str("</recent_activity>\n\n<instructions>\n");
+    msg.push_str(
+        "The user just opened the TUI. Greet them briefly and warmly — like a coworker who \
+         remembers what you were both working on. If recent_activity names a concrete thread, \
+         reference it specifically and offer to continue. If the hour is unusual for typical \
+         working time, acknowledge it playfully (not forced). If there's no recent activity, \
+         keep it short — greeting plus an open invitation. One or two sentences. No \
+         <proactive_nudges>, no checklists.\n",
+    );
+    msg.push_str("</instructions>");
+    msg
+}
+
+/// Whether the given local hour falls inside the configured quiet-hours
+/// window. Used only as a *signal* to the session-start prompt so the agent
+/// can phrase the greeting appropriately — does NOT suppress the greeting.
+fn in_configured_quiet_hours(config: &Config, hour: u32) -> bool {
+    fn parse_hour(s: &str) -> Option<u32> {
+        s.split(':').next()?.parse().ok()
+    }
+    let start = config
+        .heartbeat
+        .quiet_hours_start
+        .as_deref()
+        .and_then(parse_hour);
+    let end = config
+        .heartbeat
+        .quiet_hours_end
+        .as_deref()
+        .and_then(parse_hour);
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => hour >= s && hour < e,
+        (Some(s), Some(e)) => hour >= s || hour < e, // wraps midnight
+        _ => false,
+    }
+}
+
 /// Run a heartbeat turn in the daemon and deliver to configured channels.
 async fn daemon_heartbeat_turn(config: Config) {
-    let result = execute_heartbeat_turn(&config).await;
+    let result = execute_heartbeat_turn(&config, HeartbeatSource::Scheduled).await;
     match &result {
         HeartbeatResult::Ran {
             message,
@@ -1493,7 +1606,7 @@ async fn deliver_to_sender(
             "Heartbeat: running per-channel turn for {channel_name}:{sender_id} with binding {}",
             route.binding_id
         );
-        match execute_heartbeat_turn(&route.config).await {
+        match execute_heartbeat_turn(&route.config, HeartbeatSource::Scheduled).await {
             HeartbeatResult::Ran { message, .. } => {
                 text_owned = message;
                 &text_owned

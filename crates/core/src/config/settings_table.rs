@@ -109,6 +109,9 @@ define_settings! {
         "heartbeat.cron" => heartbeat.cron, opt_string;
         "heartbeat.channels" => heartbeat.channels, json;
         "heartbeat.recipients" => heartbeat.recipients, json_set;
+        "heartbeat.session_start_enabled" => heartbeat.session_start_enabled, parsed(bool);
+        "heartbeat.session_start_throttle_minutes" => heartbeat.session_start_throttle_minutes, parsed(u32);
+        "heartbeat.last_fired_at" => heartbeat.last_fired_at, parsed(i64);
 
         // ── User ──
         "user.name" => user.name, opt_string;

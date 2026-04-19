@@ -199,6 +199,19 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Bool,
         category: "Evolution",
     },
+    // — Heartbeat —
+    SettingEntry {
+        key: "heartbeat.session_start_enabled",
+        label: "Greet on TUI open",
+        kind: SettingKind::Bool,
+        category: "Heartbeat",
+    },
+    SettingEntry {
+        key: "heartbeat.session_start_throttle_minutes",
+        label: "Greeting throttle (min)",
+        kind: SettingKind::Uint,
+        category: "Heartbeat",
+    },
     // — Workflow —
     SettingEntry {
         key: "workflow.enabled",

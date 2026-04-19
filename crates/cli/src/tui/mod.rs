@@ -384,15 +384,28 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
             }
         }
     }
-    // Auto-trigger first conversation if SETUP.md exists (fresh onboarding)
-    if let Ok(data_dir) = Config::data_dir() {
-        let setup_path = data_dir.join("SETUP.md");
-        if setup_path.exists() {
-            app.queued_messages.push_back(app::QueuedMessage {
-                text: "Hello! I just finished onboarding.".to_string(),
-                images: Vec::new(),
-            });
-        }
+    // Auto-trigger first conversation if SETUP.md exists (fresh onboarding),
+    // otherwise fire a throttled proactive greeting that reuses the heartbeat
+    // pipeline. Throttle is shared with the scheduled heartbeat via the
+    // persisted `heartbeat.last_fired_at` setting so we don't double-nudge.
+    let setup_exists = Config::data_dir()
+        .map(|d| d.join("SETUP.md").exists())
+        .unwrap_or(false);
+    if setup_exists {
+        app.queued_messages.push_back(app::QueuedMessage {
+            text: "Hello! I just finished onboarding.".to_string(),
+            images: Vec::new(),
+        });
+    } else if should_fire_session_start_greeting(&app.config) {
+        let hb_config = app.config.clone();
+        let hb_tx_clone = app.heartbeat_event_tx.clone();
+        tokio::spawn(async move {
+            let result =
+                run_heartbeat_turn(&hb_config, crate::service::HeartbeatSource::SessionStart).await;
+            if let Some(tx) = hb_tx_clone {
+                let _ = tx.send(HeartbeatEvent::Result(result)).await;
+            }
+        });
     }
 
     let mut event_stream = EventStream::new();
@@ -411,8 +424,27 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
 }
 
 /// Delegate to the shared heartbeat turn implementation.
-async fn run_heartbeat_turn(config: &Config) -> HeartbeatResult {
-    crate::service::execute_heartbeat_turn(config).await
+async fn run_heartbeat_turn(
+    config: &Config,
+    source: crate::service::HeartbeatSource,
+) -> HeartbeatResult {
+    crate::service::execute_heartbeat_turn(config, source).await
+}
+
+/// Gate for the TUI-open proactive greeting: respects the user's enable flag
+/// and the shared `heartbeat.last_fired_at` throttle so scheduled heartbeats
+/// and TUI-open greetings can't nudge within the same window.
+fn should_fire_session_start_greeting(config: &Config) -> bool {
+    if !config.heartbeat.session_start_enabled {
+        return false;
+    }
+    let throttle_secs = i64::from(config.heartbeat.session_start_throttle_minutes) * 60;
+    if throttle_secs <= 0 {
+        return true;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = config.heartbeat.last_fired_at;
+    last <= 0 || now - last >= throttle_secs
 }
 
 /// If the app just became idle and has queued messages, auto-submit the next one.
@@ -493,7 +525,11 @@ async fn run_event_loop(
                         let hb_config = app.config.clone();
                         let hb_tx_clone = app.heartbeat_event_tx.clone();
                         tokio::spawn(async move {
-                            let result = run_heartbeat_turn(&hb_config).await;
+                            let result = run_heartbeat_turn(
+                                &hb_config,
+                                crate::service::HeartbeatSource::Scheduled,
+                            )
+                            .await;
                             if let Some(tx) = hb_tx_clone {
                                 let _ = tx.send(HeartbeatEvent::Result(result)).await;
                             }
@@ -1509,6 +1545,56 @@ mod tests {
     // ------------------------------------------------------------------------
     // Escape-sequence correctness
     // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // Session-start greeting throttle gate
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn session_start_disabled_never_fires() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = false;
+        config.heartbeat.last_fired_at = 0;
+        assert!(!should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_fires_when_never_fired() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        config.heartbeat.last_fired_at = 0;
+        assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_suppressed_inside_throttle_window() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        // Fired 5 minutes ago — inside the 30-minute window.
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp() - 5 * 60;
+        assert!(!should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_fires_after_throttle_window() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        // Fired 45 minutes ago — past the 30-minute window.
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp() - 45 * 60;
+        assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_zero_throttle_always_fires() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 0;
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp();
+        assert!(should_fire_session_start_greeting(&config));
+    }
 
     #[test]
     fn enable_alternate_scroll_emits_exactly_1007h() {

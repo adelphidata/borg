@@ -344,6 +344,16 @@ pub struct HeartbeatConfig {
     /// listed in `channels` but absent from `recipients`, heartbeat delivery
     /// defaults to the first approved sender (legacy behavior).
     pub recipients: std::collections::BTreeMap<String, Vec<String>>,
+    /// Fire a proactive greeting when the TUI opens post-onboarding.
+    pub session_start_enabled: bool,
+    /// Minimum minutes between any heartbeat (scheduled, poke, session-start)
+    /// and the next session-start greeting. Shared with the scheduled
+    /// heartbeat so the user doesn't get double-nudged.
+    pub session_start_throttle_minutes: u32,
+    /// Last heartbeat fire timestamp (unix seconds). Persisted state used to
+    /// share the throttle across scheduled, poke, and session-start sources.
+    /// Not user-facing — managed internally by `execute_heartbeat_turn`.
+    pub last_fired_at: i64,
 }
 
 impl Default for HeartbeatConfig {
@@ -355,6 +365,9 @@ impl Default for HeartbeatConfig {
             cron: None,
             channels: Vec::new(),
             recipients: std::collections::BTreeMap::new(),
+            session_start_enabled: true,
+            session_start_throttle_minutes: 30,
+            last_fired_at: 0,
         }
     }
 }
