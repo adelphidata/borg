@@ -297,6 +297,19 @@ impl LlmClient {
         self
     }
 
+    /// Practical context window of the active model in tokens. Resolves through
+    /// the model registry; falls back to a conservative default for unknown
+    /// models so downstream budget calculations always have a non-zero value.
+    pub fn context_window(&self) -> u32 {
+        crate::model_registry::context_window_for(&self.llm_config.model)
+    }
+
+    /// Hard-cap context window of the active model (≥ `context_window` for
+    /// tiered models like GPT-5).
+    pub fn max_context_window(&self) -> u32 {
+        crate::model_registry::max_context_window_for(&self.llm_config.model)
+    }
+
     /// Resolve a fallback config into a ProviderSlot.
     fn resolve_fallback_slot(
         fb: &crate::config::LlmFallback,

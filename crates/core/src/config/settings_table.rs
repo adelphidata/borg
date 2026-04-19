@@ -52,6 +52,7 @@ define_settings! {
         // ── Skills ──
         "skills.enabled" => skills.enabled, parsed(bool);
         "skills.max_context_tokens" => skills.max_context_tokens, parsed(usize);
+        // skills.budget_pct is custom — see `custom_apply` block below.
 
         // ── Conversation ──
         "conversation.max_iterations" => conversation.max_iterations, parsed(u32);
@@ -277,6 +278,18 @@ define_settings! {
             s.gateway.error_policy = value.parse()?;
             Ok(format!("{key} = {value}"))
         };
+
+        // skills.budget_pct: Option<f32> in [0.0, 1.0]; empty string clears to None
+        "skills.budget_pct" => |s, key, value| {
+            if value.trim().is_empty() {
+                s.skills.budget_pct = None;
+                Ok(format!("{key} = (none)"))
+            } else {
+                let pct = crate::config::parse_range::<f32>(value, key, 0.0, 1.0)?;
+                s.skills.budget_pct = Some(pct);
+                Ok(format!("{key} = {pct}"))
+            }
+        };
     }
 
     custom_extract {
@@ -297,5 +310,9 @@ define_settings! {
         "tts.default_format" => |c| c.tts.default_format.clone();
         "workflow.enabled" => |c| c.workflow.enabled.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
+        "skills.budget_pct" => |c| match c.skills.budget_pct {
+            Some(pct) => format!("{pct}"),
+            None => "(none)".to_string(),
+        };
     }
 }

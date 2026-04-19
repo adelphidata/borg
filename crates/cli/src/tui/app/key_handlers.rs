@@ -18,6 +18,7 @@ use borg_core::config::CollaborationMode;
 
 use super::super::history::{ApprovalStatus, HistoryCell};
 use super::super::plan_overlay::PlanOption;
+use super::super::transcript_pager::PagerAction;
 use super::{
     extract_at_query, try_paste_clipboard_image, App, AppAction, AppState, BacktrackPhase,
     QueuedMessage,
@@ -178,6 +179,7 @@ impl<'a> App<'a> {
             AppState::AwaitingApproval { .. } => self.handle_key_awaiting_approval(key),
             AppState::AwaitingInput { .. } => self.handle_key_awaiting_input(key),
             AppState::PlanReview => self.handle_key_plan_review(key),
+            AppState::TranscriptPager => self.handle_key_transcript_pager(key),
             AppState::Streaming { .. } => self.handle_key_streaming(key),
             AppState::Idle => self.handle_key_idle(key),
         }
@@ -327,6 +329,20 @@ impl<'a> App<'a> {
                 self.state = AppState::Idle;
             }
             _ => {}
+        }
+        Ok(AppAction::Continue)
+    }
+
+    fn handle_key_transcript_pager(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<AppAction> {
+        match self.transcript_pager.handle_key(key) {
+            PagerAction::Dismiss => {
+                self.transcript_pager.dismiss();
+                self.state = AppState::Idle;
+            }
+            PagerAction::None => {}
         }
         Ok(AppAction::Continue)
     }
@@ -536,6 +552,13 @@ impl<'a> App<'a> {
             self.cells.clear();
             self.scroll_to_bottom();
             self.toast_info("Transcript cleared");
+            return Ok(AppAction::Continue);
+        }
+
+        // Ctrl+T — open full-screen transcript pager (scrollable + searchable)
+        if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.transcript_pager.show();
+            self.state = AppState::TranscriptPager;
             return Ok(AppAction::Continue);
         }
 

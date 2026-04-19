@@ -29,6 +29,7 @@ use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
+use super::transcript_pager::TranscriptPager;
 
 /// Trait for popup windows that handle keyboard and paste events.
 /// Each popup converts its domain-specific actions into `AppAction` variants internally.
@@ -62,6 +63,8 @@ pub enum AppState {
         respond: Option<oneshot::Sender<String>>,
     },
     PlanReview,
+    /// Full-screen transcript pager open (Ctrl+T). All keys route to the pager.
+    TranscriptPager,
     ConfirmingUninstall,
 }
 
@@ -186,6 +189,7 @@ pub struct App<'a> {
     /// Conversation backtrack state machine
     pub backtrack: BacktrackPhase,
     pub plan_overlay: PlanOverlay,
+    pub transcript_pager: TranscriptPager,
     /// When the user enters Plan collaboration mode, the previous mode is stashed here
     /// so the post-turn review overlay can restore it on "Proceed". `None` when the
     /// user is not currently in a transient Plan-then-execute flow.
@@ -245,6 +249,7 @@ impl<'a> App<'a> {
             queue_pause_notified: false,
             backtrack: BacktrackPhase::Inactive,
             plan_overlay: PlanOverlay::new(),
+            transcript_pager: TranscriptPager::new(),
             previous_collab_mode: None,
             pairing_popup: PairingPopup::new(),
             projects_popup: ProjectsPopup::new(),
@@ -713,6 +718,63 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // ========================================================================
+    // Transcript pager (Ctrl+T) — opening, routing, dismissal.
+    // ========================================================================
+
+    #[test]
+    fn ctrl_t_opens_transcript_pager_from_idle() {
+        let mut app = make_app();
+        assert!(matches!(app.state, AppState::Idle));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(app.state, AppState::TranscriptPager));
+        assert!(app.transcript_pager.visible);
+    }
+
+    #[test]
+    fn keys_route_to_pager_while_open_and_skip_composer() {
+        let mut app = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        // While the pager is open, typing 'q' must dismiss the pager rather
+        // than appearing in the composer (which would happen if dispatch leaked).
+        app.handle_key(key(KeyCode::Char('q'))).unwrap();
+        assert!(matches!(app.state, AppState::Idle));
+        assert!(!app.transcript_pager.visible);
+        assert!(app.composer.is_empty(), "composer must not receive 'q'");
+    }
+
+    #[test]
+    fn esc_in_pager_dismisses_back_to_idle() {
+        let mut app = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.state, AppState::Idle));
+        assert!(!app.transcript_pager.visible);
+    }
+
+    #[test]
+    fn ctrl_t_in_pager_dismisses_back_to_idle() {
+        let mut app = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(matches!(app.state, AppState::Idle));
+    }
+
+    #[test]
+    fn slash_in_pager_enters_search_mode_not_composer() {
+        let mut app = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char('/'))).unwrap();
+        assert!(app.transcript_pager.is_searching());
+        assert!(app.composer.is_empty(), "composer must not receive '/'");
     }
 
     // ========================================================================

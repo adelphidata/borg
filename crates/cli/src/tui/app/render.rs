@@ -39,6 +39,12 @@ impl<'a> App<'a> {
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);
 
+        // Transcript pager (Ctrl+T) takes the full frame when active. Drawn
+        // after popups so it covers them; before toasts so toasts still float on top.
+        if matches!(self.state, AppState::TranscriptPager) {
+            self.transcript_pager.render(frame, area, &self.cells);
+        }
+
         // Toasts are drawn last so they float above every other overlay.
         self.toasts.prune_expired();
         self.toasts.render(frame, area);
@@ -201,6 +207,7 @@ impl<'a> App<'a> {
                 format!(" {} Confirm uninstall — press y or N", theme::BULLET),
                 theme::error_style(),
             )]),
+            AppState::TranscriptPager => Line::default(),
             AppState::Idle => Line::default(),
         };
         frame.render_widget(Paragraph::new(line), area);
@@ -270,6 +277,10 @@ impl<'a> App<'a> {
                 "shift+tab: cycle  •  1-3: jump  •  enter: confirm  •  esc: dismiss".to_string()
             }
             AppState::ConfirmingUninstall => "y to uninstall  •  N / enter to cancel".to_string(),
+            AppState::TranscriptPager => {
+                "↑/↓ scroll  •  pgup/pgdn jump  •  / search  •  n/N navigate  •  q close"
+                    .to_string()
+            }
         };
 
         let pct = self.compute_context_pct();

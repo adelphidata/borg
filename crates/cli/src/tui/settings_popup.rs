@@ -155,6 +155,12 @@ const SETTINGS: &[SettingEntry] = &[
         category: "Security",
     },
     SettingEntry {
+        key: "skills.budget_pct",
+        label: "Skills budget (% ctx)",
+        kind: SettingKind::Float,
+        category: "Security",
+    },
+    SettingEntry {
         key: "security.secret_detection",
         label: "Secret detection",
         kind: SettingKind::Bool,
@@ -606,6 +612,7 @@ impl SettingsPopup {
 
         let (step, min, max) = match key {
             "budget.warning_threshold" => (0.01, 0.0, 1.0),
+            "skills.budget_pct" => (0.01, 0.0, 1.0),
             _ => (0.1, 0.0, 2.0), // temperature
         };
 
@@ -619,7 +626,16 @@ impl SettingsPopup {
         let decimals = if step < 0.1 { 2 } else { 1 };
         let formatted = format!("{new_val:.decimals$}");
 
-        Ok(self.apply_and_save(config, key, &formatted))
+        // For Option<f32> settings, treat decreasing to zero as "clear to None"
+        // so the popup can return to the (none) display rather than getting
+        // stuck at "0.00". The custom apply_setting arm interprets an empty
+        // string as None.
+        let payload = if key == "skills.budget_pct" && new_val == 0.0 {
+            ""
+        } else {
+            formatted.as_str()
+        };
+        Ok(self.apply_and_save(config, key, payload))
     }
 
     fn toggle_bool(&mut self, config: &mut Config) -> anyhow::Result<Option<AppAction>> {
@@ -1065,8 +1081,9 @@ mod tests {
     #[test]
     fn all_settings_covered() {
         let popup = SettingsPopup::new();
+        // Main grew to 18 (added skills.budget_pct alongside main's hooks.enabled).
         assert!(
-            popup.entries.len() >= 17,
+            popup.entries.len() >= 18,
             "entries list should not shrink — found {} entries",
             popup.entries.len()
         );

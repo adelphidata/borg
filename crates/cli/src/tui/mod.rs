@@ -26,6 +26,7 @@ mod status_popup;
 pub(crate) mod theme;
 mod toast;
 mod tool_display;
+mod transcript_pager;
 
 use std::io::stdout;
 use std::panic;
@@ -1666,6 +1667,33 @@ mod tests {
              source. Wheel is routed as KeyCode::Up/Down via ?1007h and \
              handled in handle_key."
         );
+    }
+
+    #[test]
+    fn transcript_pager_source_does_not_enable_mouse() {
+        // The pager is a new full-screen overlay; verify it doesn't reintroduce
+        // any of the forbidden mouse-tracking patterns. If this fails, the
+        // pager's text-selection ergonomics will silently break.
+        let src = include_str!("transcript_pager.rs");
+        let code = strip_tests_and_comments(src);
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !code.contains(mode),
+                "transcript_pager.rs contains forbidden mouse mode {mode}"
+            );
+        }
+        for forbidden in [
+            "EnableMouseCapture",
+            "DisableMouseCapture",
+            "Event::Mouse(",
+            "MouseEventKind",
+            "fn handle_mouse",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "transcript_pager.rs must not reference {forbidden}"
+            );
+        }
     }
 
     #[test]

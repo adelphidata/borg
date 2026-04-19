@@ -615,17 +615,66 @@ pub fn load_all_skills(
     Ok(skills)
 }
 
+/// Diagnostic report from `load_skills_context` describing what fit, what was
+/// downgraded, and what was dropped entirely. The agent loop logs and surfaces
+/// non-empty drops to the user so silent loss of skill context is visible.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkillBudgetReport {
+    /// Available skills downgraded from full body to metadata-only because
+    /// the full body would have exceeded the budget.
+    pub dropped_full_body: Vec<String>,
+    /// Skills whose even metadata didn't fit and were omitted entirely.
+    /// Previously this was a silent loss path.
+    pub omitted_entirely: Vec<String>,
+    /// Effective budget actually applied (after `budget_pct` clamping).
+    pub budget_tokens: usize,
+    /// Estimated tokens consumed by the rendered skills section.
+    pub used_tokens: usize,
+}
+
+impl SkillBudgetReport {
+    /// True if anything had to be dropped or downgraded — caller should warn.
+    pub fn is_lossy(&self) -> bool {
+        !self.dropped_full_body.is_empty() || !self.omitted_entirely.is_empty()
+    }
+}
+
+/// Resolve the effective skill budget for a model with the given context window.
+/// `context_window` is in tokens (e.g. 200_000 for Claude Sonnet 4); pass `None`
+/// to skip percentage clamping and use only the absolute cap.
+pub fn effective_skill_budget(skills_config: &SkillsConfig, context_window: Option<u32>) -> usize {
+    let absolute = skills_config.max_context_tokens;
+    match (skills_config.budget_pct, context_window) {
+        (Some(pct), Some(window)) if pct > 0.0 && window > 0 => {
+            // Use f64 with explicit rounding so f32→f64 conversion artifacts
+            // (e.g. 0.02_f32 → 0.0199999...) don't silently shrink the budget.
+            let pct_budget = ((window as f64) * (pct as f64)).round() as usize;
+            absolute.min(pct_budget.max(1))
+        }
+        _ => absolute,
+    }
+}
+
 /// Build the skills section for system prompt injection within a token budget.
+///
+/// Returns the rendered string and a [`SkillBudgetReport`] capturing which
+/// skills were downgraded or omitted so callers can surface a non-fatal warning
+/// to the user. Earlier the omission path was silent.
 #[instrument(skip_all)]
 pub fn load_skills_context(
     max_tokens: usize,
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
-) -> Result<String> {
+) -> Result<(String, SkillBudgetReport)> {
+    let mut report = SkillBudgetReport {
+        budget_tokens: max_tokens,
+        ..Default::default()
+    };
+
     let skills = load_all_skills(resolved_creds, skills_config)?;
 
     if skills.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), report));
     }
 
     // Exclude disabled skills from context injection entirely
@@ -635,18 +684,27 @@ pub fn load_skills_context(
     let mut sorted_skills = skills;
     sorted_skills.sort_by_key(|s| !s.available);
 
-    // Phase 1: Include metadata for ALL skills
-    let mut metadata_parts = Vec::new();
-    let mut estimated_tokens = 0;
+    // Phase 1: Include metadata for as many skills as fit; track omissions.
+    let mut metadata_parts: Vec<Option<String>> = Vec::with_capacity(sorted_skills.len());
+    let mut estimated_tokens: usize = 0;
 
     for skill in &sorted_skills {
         let meta = skill.format_at_level(SkillLoadLevel::Metadata);
         let tokens = estimate_tokens(&meta);
-        metadata_parts.push(meta);
+        if estimated_tokens.saturating_add(tokens) > max_tokens {
+            debug!(
+                "Skipping skill '{}' entirely — metadata exceeds budget",
+                skill.manifest.name
+            );
+            report.omitted_entirely.push(skill.manifest.name.clone());
+            metadata_parts.push(None);
+            continue;
+        }
         estimated_tokens += tokens;
+        metadata_parts.push(Some(meta));
     }
 
-    // Phase 2: With remaining budget, upgrade available skills to full body
+    // Phase 2: With remaining budget, upgrade available skills to full body.
     let mut full_overrides: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
 
@@ -654,9 +712,13 @@ pub fn load_skills_context(
         if !skill.available {
             continue;
         }
+        let Some(meta) = metadata_parts[i].as_ref() else {
+            // Skill was omitted in phase 1 — can't upgrade.
+            continue;
+        };
         let full = skill.format_at_level(SkillLoadLevel::Full);
         let full_tokens = estimate_tokens(&full);
-        let meta_tokens = estimate_tokens(&metadata_parts[i]);
+        let meta_tokens = estimate_tokens(meta);
         let additional = full_tokens.saturating_sub(meta_tokens);
 
         if estimated_tokens + additional > max_tokens {
@@ -664,6 +726,7 @@ pub fn load_skills_context(
                 "Skipping full body for skill '{}' (would exceed token budget)",
                 skill.manifest.name
             );
+            report.dropped_full_body.push(skill.manifest.name.clone());
             continue;
         }
 
@@ -675,18 +738,22 @@ pub fn load_skills_context(
         full_overrides.insert(i, full);
     }
 
-    // Build final output: full body for upgraded skills, metadata for the rest
+    // Build final output: full body for upgraded skills, metadata for the rest,
+    // skipping omitted entries.
     let parts: Vec<String> = metadata_parts
         .into_iter()
         .enumerate()
-        .map(|(i, meta)| full_overrides.remove(&i).unwrap_or(meta))
+        .filter_map(|(i, maybe_meta)| full_overrides.remove(&i).or(maybe_meta))
         .collect();
 
-    if parts.is_empty() {
-        Ok(String::new())
+    report.used_tokens = estimated_tokens;
+
+    let rendered = if parts.is_empty() {
+        String::new()
     } else {
-        Ok(format!("# Skills\n\n{}\n", parts.join("\n---\n\n")))
-    }
+        format!("# Skills\n\n{}\n", parts.join("\n---\n\n"))
+    };
+    Ok((rendered, report))
 }
 
 /// Collect per-skill env vars from config entries for injection into run_shell.
@@ -1010,7 +1077,7 @@ Short body.
     #[test]
     fn skill_context_respects_token_budget() {
         // With a very small budget, not all skills should fit
-        let context = load_skills_context(
+        let (context, _report) = load_skills_context(
             100,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
@@ -1020,6 +1087,145 @@ Short body.
         if !context.is_empty() {
             assert!(context.starts_with("# Skills"));
         }
+    }
+
+    #[test]
+    fn budget_report_empty_when_everything_fits() {
+        // Generous budget — no skill should be downgraded or omitted.
+        let (rendered, report) = load_skills_context(
+            100_000,
+            &std::collections::HashMap::new(),
+            &SkillsConfig::default(),
+        )
+        .unwrap();
+        assert!(!report.is_lossy(), "report should not be lossy: {report:?}");
+        assert!(report.dropped_full_body.is_empty());
+        assert!(report.omitted_entirely.is_empty());
+        assert_eq!(report.budget_tokens, 100_000);
+        assert!(report.used_tokens > 0);
+        assert!(rendered.starts_with("# Skills"));
+    }
+
+    #[test]
+    fn budget_report_tracks_dropped_full_body() {
+        // Tight budget — at least one available skill should get downgraded
+        // from full body to metadata-only.
+        let (_rendered, report) = load_skills_context(
+            500,
+            &std::collections::HashMap::new(),
+            &SkillsConfig::default(),
+        )
+        .unwrap();
+        assert!(report.is_lossy(), "report should reflect drops: {report:?}");
+        assert!(report.used_tokens <= report.budget_tokens);
+    }
+
+    #[test]
+    fn budget_report_tracks_omitted_entirely() {
+        // Budget too small to even fit metadata for every skill — some entries
+        // must be omitted entirely (previously a silent loss path).
+        let (_rendered, report) = load_skills_context(
+            50,
+            &std::collections::HashMap::new(),
+            &SkillsConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            !report.omitted_entirely.is_empty(),
+            "expected at least one fully omitted skill: {report:?}"
+        );
+        assert!(report.used_tokens <= report.budget_tokens);
+    }
+
+    #[test]
+    fn budget_report_used_tokens_within_budget() {
+        for budget in [200, 1_000, 4_000, 16_000] {
+            let (_, report) = load_skills_context(
+                budget,
+                &std::collections::HashMap::new(),
+                &SkillsConfig::default(),
+            )
+            .unwrap();
+            assert!(
+                report.used_tokens <= budget,
+                "used {} > budget {} ({:?})",
+                report.used_tokens,
+                budget,
+                report
+            );
+        }
+    }
+
+    #[test]
+    fn effective_budget_clamps_to_pct_of_window() {
+        let cfg = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 100_000,
+            budget_pct: Some(0.02),
+            entries: Default::default(),
+        };
+        // 2% of 200K = 4000 — well below the 100K absolute cap, so pct wins.
+        assert_eq!(effective_skill_budget(&cfg, Some(200_000)), 4_000);
+        // 2% of 64K = 1280 — pct still wins.
+        assert_eq!(effective_skill_budget(&cfg, Some(64_000)), 1_280);
+    }
+
+    #[test]
+    fn effective_budget_uses_absolute_when_pct_none() {
+        let cfg = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 4_000,
+            budget_pct: None,
+            entries: Default::default(),
+        };
+        assert_eq!(effective_skill_budget(&cfg, Some(2_000_000)), 4_000);
+        assert_eq!(effective_skill_budget(&cfg, None), 4_000);
+    }
+
+    #[test]
+    fn effective_budget_uses_absolute_when_window_unknown() {
+        let cfg = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 4_000,
+            budget_pct: Some(0.02),
+            entries: Default::default(),
+        };
+        assert_eq!(effective_skill_budget(&cfg, None), 4_000);
+    }
+
+    #[test]
+    fn effective_budget_uses_absolute_when_pct_yields_larger_value() {
+        let cfg = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 1_000,
+            budget_pct: Some(0.5),
+            entries: Default::default(),
+        };
+        // 50% of 200K = 100K, but absolute cap is 1000 → cap wins.
+        assert_eq!(effective_skill_budget(&cfg, Some(200_000)), 1_000);
+    }
+
+    #[test]
+    fn effective_budget_zero_pct_falls_back_to_absolute() {
+        let cfg = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 4_000,
+            budget_pct: Some(0.0),
+            entries: Default::default(),
+        };
+        // pct == 0 disables the percentage path entirely.
+        assert_eq!(effective_skill_budget(&cfg, Some(200_000)), 4_000);
+    }
+
+    #[test]
+    fn skill_budget_report_signature_stable_for_same_inputs() {
+        // Two consecutive calls with identical inputs must yield identical reports
+        // — that's what enables the agent's per-session de-dup of warnings.
+        let cfg = SkillsConfig::default();
+        let (_, r1) = load_skills_context(800, &std::collections::HashMap::new(), &cfg).unwrap();
+        let (_, r2) = load_skills_context(800, &std::collections::HashMap::new(), &cfg).unwrap();
+        assert_eq!(r1.dropped_full_body, r2.dropped_full_body);
+        assert_eq!(r1.omitted_entirely, r2.omitted_entirely);
     }
 
     #[test]
@@ -1209,7 +1415,7 @@ Short body.
     #[test]
     fn progressive_loading_prioritizes_available() {
         // load_skills_context should include full body for available skills first
-        let context = load_skills_context(
+        let (context, _report) = load_skills_context(
             2000,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
@@ -1237,9 +1443,10 @@ Short body.
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
+            budget_pct: None,
             entries,
         };
-        let context =
+        let (context, _report) =
             load_skills_context(4000, &std::collections::HashMap::new(), &config).unwrap();
         // The slack skill header should not appear (other skills may mention "slack" in their body)
         assert!(!context.contains("Skill: slack ["));
@@ -1260,6 +1467,7 @@ Short body.
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
+            budget_pct: None,
             entries,
         };
         let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
@@ -1321,6 +1529,7 @@ Short body.
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
+            budget_pct: None,
             entries,
         };
         let skills = load_all_skills(&std::collections::HashMap::new(), &config).unwrap();
@@ -1576,6 +1785,7 @@ Use docker commands.
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
+            budget_pct: None,
             entries,
         };
         let env = collect_skill_env(&config);
@@ -1809,9 +2019,10 @@ Use docker commands.
         let config = SkillsConfig {
             enabled: true,
             max_context_tokens: 4000,
+            budget_pct: None,
             entries,
         };
-        let context =
+        let (context, _report) =
             load_skills_context(4000, &std::collections::HashMap::new(), &config).unwrap();
         assert!(
             context.is_empty(),

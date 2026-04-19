@@ -466,8 +466,15 @@ impl Default for SkillEntryConfig {
 pub struct SkillsConfig {
     /// Whether the skills system is enabled.
     pub enabled: bool,
-    /// Maximum tokens allocated for skill instructions in the system prompt.
+    /// Absolute cap on tokens for skill instructions in the system prompt.
+    /// Always enforced; combined with `budget_pct` via `min(...)`.
     pub max_context_tokens: usize,
+    /// Optional fraction of the active model's context window to allocate for
+    /// skills (e.g. `0.02` = 2%). When `Some` and a context window is known,
+    /// the effective skill budget is `min(max_context_tokens, window * pct)`.
+    /// `None` falls back to `max_context_tokens` only.
+    #[serde(default)]
+    pub budget_pct: Option<f32>,
     /// Per-skill overrides keyed by skill name.
     #[serde(default)]
     pub entries: HashMap<String, SkillEntryConfig>,
@@ -478,6 +485,7 @@ impl Default for SkillsConfig {
         Self {
             enabled: true,
             max_context_tokens: constants::SKILLS_MAX_CONTEXT_TOKENS,
+            budget_pct: Some(0.02),
             entries: HashMap::new(),
         }
     }

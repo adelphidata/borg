@@ -98,6 +98,8 @@ pub mod memory;
 pub mod migrate;
 /// MMR diversity re-ranking (Jaccard similarity, greedy selection).
 pub mod mmr;
+/// Static metadata for known LLM models — context windows and capability flags.
+pub mod model_registry;
 /// Multi-agent orchestration.
 pub mod multi_agent;
 /// Sender pairing and access control for gateway channels.

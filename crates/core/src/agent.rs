@@ -207,6 +207,9 @@ pub struct Agent {
     db: Mutex<Option<Database>>,
     /// Cached skills context string, invalidated on config reload.
     cached_skills_context: Option<String>,
+    /// Sorted set of skill names dropped/omitted on the last budget pass.
+    /// Used to suppress duplicate warnings when the dropped set hasn't changed.
+    last_skill_drop_signature: Option<Vec<String>>,
     /// Ghost commit created at session start for atomic undo (coding agent).
     ghost_commit: Option<crate::git::GhostCommit>,
     /// Git repo root (if CWD is inside a git repo).
@@ -340,6 +343,7 @@ impl Agent {
             config_rx: None,
             db: Mutex::new(common.db),
             cached_skills_context: None,
+            last_skill_drop_signature: None,
             ghost_commit: None,
             git_repo_root,
             cached_project_docs: None,
@@ -434,6 +438,7 @@ impl Agent {
         self.rate_guard
             .update_limits(new_config.security.action_limits.clone());
         self.cached_skills_context = None; // invalidate on config change
+        self.last_skill_drop_signature = None; // re-warn on next budget pass
         let resolved_creds = new_config.resolve_credentials();
         self.cached_credentials = Some(resolved_creds.clone());
         self.skill_env_allowlist =
@@ -993,11 +998,18 @@ impl Agent {
                 Some(cached) => cached.clone(),
                 None => {
                     let resolved_creds = self.resolve_credentials_cached();
-                    load_skills_context(
-                        self.config.skills.max_context_tokens,
-                        &resolved_creds,
+                    let budget = crate::skills::effective_skill_budget(
                         &self.config.skills,
-                    )?
+                        Some(self.active_context_window()),
+                    );
+                    let (rendered, report) =
+                        load_skills_context(budget, &resolved_creds, &self.config.skills)?;
+                    self.warn_skill_budget_loss(&report);
+                    // Populate the cache so subsequent turns reuse this work.
+                    // Previously this branch dropped the result on the floor,
+                    // forcing every cache-miss path to re-parse SKILL.md files.
+                    self.cached_skills_context = Some(rendered.clone());
+                    rendered
                 }
             };
             if !skills.is_empty() {
@@ -1929,15 +1941,55 @@ Rules:
     fn warm_skills_cache(&mut self) {
         if self.cached_skills_context.is_none() && self.config.skills.enabled {
             let resolved_creds = self.resolve_credentials_cached();
-            match load_skills_context(
-                self.config.skills.max_context_tokens,
-                &resolved_creds,
+            let budget = crate::skills::effective_skill_budget(
                 &self.config.skills,
-            ) {
-                Ok(ctx) => self.cached_skills_context = Some(ctx),
+                Some(self.active_context_window()),
+            );
+            match load_skills_context(budget, &resolved_creds, &self.config.skills) {
+                Ok((ctx, report)) => {
+                    self.warn_skill_budget_loss(&report);
+                    self.cached_skills_context = Some(ctx);
+                }
                 Err(e) => warn!("Failed to load skills context: {e}"),
             }
         }
+    }
+
+    /// Active model's practical context window in tokens. Resolves through the
+    /// model registry; falls back to `DEFAULT_CONTEXT_WINDOW` for unknown models.
+    fn active_context_window(&self) -> u32 {
+        crate::model_registry::context_window_for(&self.config.llm.model)
+    }
+
+    /// Emit a per-session toast/log warning when the skill budget had to drop
+    /// or downgrade skills. Re-warns only when the dropped-set actually changes
+    /// so a stable budget doesn't spam users every turn.
+    fn warn_skill_budget_loss(&mut self, report: &crate::skills::SkillBudgetReport) {
+        if !report.is_lossy() {
+            return;
+        }
+        let mut signature: Vec<String> = report
+            .dropped_full_body
+            .iter()
+            .chain(report.omitted_entirely.iter())
+            .cloned()
+            .collect();
+        signature.sort();
+        if self
+            .last_skill_drop_signature
+            .as_ref()
+            .is_some_and(|prev| prev == &signature)
+        {
+            return;
+        }
+        self.last_skill_drop_signature = Some(signature);
+        warn!(
+            budget_tokens = report.budget_tokens,
+            used_tokens = report.used_tokens,
+            dropped_full_body = ?report.dropped_full_body,
+            omitted_entirely = ?report.omitted_entirely,
+            "Skill budget exceeded — some skills were downgraded or omitted from the system prompt"
+        );
     }
 
     /// Build system prompt, tool definitions, fire pre-LLM hooks, and assemble
