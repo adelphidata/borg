@@ -1,4 +1,43 @@
 use anyhow::Result;
+use clap::Subcommand;
+
+#[derive(Subcommand)]
+pub(crate) enum MigrateSubcommand {
+    /// Migrate from Hermes Agent (~/.hermes/)
+    Hermes,
+    /// Migrate from OpenClaw (~/.openclaw/)
+    Claw,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ServiceAction {
+    /// Uninstall the daemon service
+    Uninstall,
+    /// Show the daemon service status
+    Status,
+}
+
+/// Dispatch for `borg migrate ...` — either the interactive TUI or a direct
+/// migration from the named source.
+pub(crate) fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Result<()> {
+    match action {
+        None => crate::migrate_tui::run(),
+        Some(MigrateSubcommand::Hermes) => {
+            run_migrate_direct(borg_core::migrate::MigrationSource::Hermes)
+        }
+        Some(MigrateSubcommand::Claw) => {
+            run_migrate_direct(borg_core::migrate::MigrationSource::OpenClaw)
+        }
+    }
+}
+
+/// Dispatch for `borg service ...`.
+pub(crate) fn dispatch_service(action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Uninstall => crate::service::uninstall_service(),
+        ServiceAction::Status => crate::service::service_status(),
+    }
+}
 
 pub(crate) fn run_doctor() -> Result<()> {
     let config = borg_core::config::Config::load_from_db().unwrap_or_default();

@@ -368,3 +368,28 @@ define_settings! {
         "workflow.enabled" => "Workflows", Select, "Advanced";
     }
 }
+
+/// Static choice lists for `Select`-kind TUI settings. Drives
+/// `cycle_select` in the settings popup so choice arrays do not have to be
+/// restated per-key. `provider` and `model` are dynamic (sourced from the
+/// onboarding provider/model catalog) and are handled separately.
+pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
+    (
+        "conversation.collaboration_mode",
+        &["default", "execute", "plan"],
+    ),
+    (
+        "llm.cache.strategy",
+        &["tools_system_and_2", "system_and_3"],
+    ),
+    ("workflow.enabled", &["auto", "on", "off"]),
+];
+
+/// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in
+/// the settings popup. Entries mirror the `range(..)` bounds in the
+/// `registry_and_apply` block above; the extra `step` is TUI-only.
+pub const TUI_FLOAT_RANGES: &[(&str, f64, f64, f64)] = &[
+    ("temperature", 0.0, 2.0, 0.1),
+    ("budget.warning_threshold", 0.0, 1.0, 0.01),
+    ("skills.budget_pct", 0.0, 1.0, 0.01),
+];

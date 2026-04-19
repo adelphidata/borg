@@ -32,6 +32,15 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+// Action enums and their dispatch live in `commands/<name>.rs`; the `Cli`
+// `Subcommand` enum below just refers to them.
+use crate::commands::misc::{MigrateSubcommand, ServiceAction};
+use crate::commands::pairing::PairingAction;
+use crate::commands::projects::ProjectsAction;
+use crate::commands::settings::SettingsAction;
+use crate::commands::status::{BondAction, StatusAction};
+use crate::commands::tasks::{CronAction, TasksAction};
+
 mod api_key_store;
 mod commands;
 mod credentials;
@@ -197,269 +206,6 @@ enum Commands {
     Uninstall,
 }
 
-#[derive(Subcommand)]
-enum MigrateSubcommand {
-    /// Migrate from Hermes Agent (~/.hermes/)
-    Hermes,
-    /// Migrate from OpenClaw (~/.openclaw/)
-    Claw,
-}
-
-#[derive(Subcommand)]
-enum BondAction {
-    /// Show recent bond event history
-    History {
-        /// Number of events to show
-        #[arg(long, short, default_value_t = 20)]
-        count: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum StatusAction {
-    /// Show evolution history timeline
-    History,
-    /// Show archetype score breakdown
-    Archetypes,
-    /// Show XP summary and recent feed
-    Xp,
-    /// Show compact evolution overview with readiness and momentum
-    Evolution,
-    /// Print an ASCII share card (--out writes to a file instead of stdout)
-    Card {
-        /// Output path. Omit to print to stdout.
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-    },
-}
-
-#[derive(Subcommand)]
-enum SettingsAction {
-    /// Update a configuration setting (writes to DB, not config.toml)
-    Set {
-        /// Setting key (e.g. temperature, model, sandbox.enabled)
-        key: String,
-        /// New value
-        value: String,
-    },
-    /// Show the effective value and source for a setting
-    Get {
-        /// Setting key
-        key: String,
-    },
-    /// Remove a DB override, reverting to config.toml or default
-    Unset {
-        /// Setting key
-        key: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum TasksAction {
-    /// List all scheduled tasks
-    List,
-    /// Create a new scheduled task
-    Create {
-        /// Task name
-        #[arg(long, short)]
-        name: String,
-        /// Prompt to send to the agent
-        #[arg(long, short)]
-        prompt: String,
-        /// Schedule expression (cron or interval)
-        #[arg(long, short)]
-        schedule: String,
-        /// Schedule type: cron, interval, or once
-        #[arg(long, short = 't', default_value = "cron")]
-        r#type: String,
-        /// Max retry attempts for transient failures (default: 3)
-        #[arg(long)]
-        max_retries: Option<i32>,
-        /// Timeout in seconds (default: 300)
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Delivery channel for results (telegram, slack, discord)
-        #[arg(long)]
-        delivery_channel: Option<String>,
-        /// Delivery target (chat_id or channel_id)
-        #[arg(long)]
-        delivery_target: Option<String>,
-    },
-    /// Delete a scheduled task
-    Delete {
-        /// Task ID (or prefix)
-        id: String,
-    },
-    /// Pause a scheduled task
-    Pause {
-        /// Task ID (or prefix)
-        id: String,
-    },
-    /// Resume a paused task
-    Resume {
-        /// Task ID (or prefix)
-        id: String,
-    },
-    /// Trigger a task to run immediately
-    Run {
-        /// Task ID (or prefix)
-        id: String,
-    },
-    /// Show execution history for a task
-    Runs {
-        /// Task ID (or prefix)
-        id: String,
-        /// Number of runs to show
-        #[arg(long, short, default_value_t = 10)]
-        count: usize,
-    },
-    /// Show detailed task status
-    Status {
-        /// Task ID (or prefix)
-        id: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ServiceAction {
-    /// Uninstall the daemon service
-    Uninstall,
-    /// Show the daemon service status
-    Status,
-}
-
-#[derive(Subcommand)]
-enum PairingAction {
-    /// List pending pairing requests
-    List {
-        /// Filter by channel name
-        channel: Option<String>,
-    },
-    /// Approve a pairing request by code
-    Approve {
-        /// Pairing code with channel prefix (e.g. TG_H4BRWMRW)
-        code: String,
-    },
-    /// Revoke an approved sender
-    Revoke {
-        /// Channel name
-        channel: String,
-        /// Sender ID to revoke
-        sender_id: String,
-    },
-    /// List all approved senders
-    Approved {
-        /// Filter by channel name
-        channel: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum CronAction {
-    /// List all cron jobs
-    List,
-    /// Add a cron job. Use combined format: "*/5 * * * * echo hello"
-    /// or separate flags: -s "*/5 * * * *" -c "echo hello"
-    Add {
-        /// Combined crontab line: "*/5 * * * * command args..."
-        line: Option<String>,
-        /// Cron schedule (5-field Linux format, e.g. "*/5 * * * *")
-        #[arg(long, short)]
-        schedule: Option<String>,
-        /// Shell command to execute
-        #[arg(long, short)]
-        command: Option<String>,
-        /// Job name (auto-generated from command if omitted)
-        #[arg(long, short)]
-        name: Option<String>,
-        /// Timeout in seconds (default: 300)
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Delivery channel for output (telegram, slack, discord)
-        #[arg(long)]
-        delivery_channel: Option<String>,
-        /// Delivery target (chat_id or channel_id)
-        #[arg(long)]
-        delivery_target: Option<String>,
-    },
-    /// Remove a cron job
-    Remove {
-        /// Job ID (or prefix)
-        id: String,
-    },
-    /// Pause a cron job
-    Pause {
-        /// Job ID (or prefix)
-        id: String,
-    },
-    /// Resume a paused cron job
-    Resume {
-        /// Job ID (or prefix)
-        id: String,
-    },
-    /// Trigger a cron job to run immediately
-    Run {
-        /// Job ID (or prefix)
-        id: String,
-    },
-    /// Show execution history for a cron job
-    Runs {
-        /// Job ID (or prefix)
-        id: String,
-        /// Number of runs to show
-        #[arg(long, short, default_value_t = 10)]
-        count: usize,
-    },
-}
-
-#[derive(Subcommand)]
-enum ProjectsAction {
-    /// List all projects
-    List {
-        /// Filter by status (active, archived)
-        #[arg(long, short)]
-        status: Option<String>,
-    },
-    /// Create a new project
-    Create {
-        /// Project name
-        #[arg(long, short)]
-        name: String,
-        /// Project description
-        #[arg(long, short)]
-        description: Option<String>,
-    },
-    /// Show project details and associated workflows
-    Get {
-        /// Project ID (or prefix)
-        id: String,
-    },
-    /// Update a project's fields
-    Update {
-        /// Project ID (or prefix)
-        id: String,
-        /// New project name
-        #[arg(long, short)]
-        name: Option<String>,
-        /// New project description
-        #[arg(long, short)]
-        description: Option<String>,
-        /// New status (active, archived)
-        #[arg(long, short)]
-        status: Option<String>,
-    },
-    /// Archive a project
-    Archive {
-        /// Project ID (or prefix)
-        id: String,
-    },
-    /// Delete a project
-    Delete {
-        /// Project ID (or prefix)
-        id: String,
-    },
-}
-
 /// Runtime worker thread stack size.
 ///
 /// Rust futures can grow large frames along the agent-loop → tool-handler → sub-agent
@@ -609,155 +355,38 @@ async fn async_main() -> Result<()> {
             json,
             mode,
         }) => repl::one_shot(&message, yes, json, mode.as_deref()).await?,
-        Some(Commands::Status { action }) => match action {
-            None => commands::status::run_status()?,
-            Some(StatusAction::History) => commands::status::run_status_history()?,
-            Some(StatusAction::Archetypes) => commands::status::run_status_archetypes()?,
-            Some(StatusAction::Xp) => commands::status::run_status_xp()?,
-            Some(StatusAction::Evolution) => commands::status::run_status_evolution()?,
-            Some(StatusAction::Card { out }) => commands::status::run_status_card(out)?,
-        },
-        Some(Commands::Bond { action }) => match action {
-            Some(BondAction::History { count }) => commands::status::run_bond_history(count)?,
-            None => commands::status::run_bond_status()?,
-        },
+        Some(Commands::Status { action }) => commands::status::dispatch_status(action)?,
+        Some(Commands::Bond { action }) => commands::status::dispatch_bond(action)?,
         Some(Commands::Doctor) => commands::misc::run_doctor()?,
         Some(Commands::Daemon) => service::run_daemon(shutdown).await?,
-        Some(Commands::Service { action }) => match action {
-            ServiceAction::Uninstall => service::uninstall_service()?,
-            ServiceAction::Status => service::service_status()?,
-        },
+        Some(Commands::Service { action }) => commands::misc::dispatch_service(action)?,
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
         Some(Commands::Plugins) => plugins::list_plugins()?,
-        Some(Commands::Settings { action }) => match action {
-            Some(SettingsAction::Set { key, value }) => {
-                commands::settings::run_settings_set(&key, &value)?
-            }
-            Some(SettingsAction::Get { key }) => commands::settings::run_settings_get(&key)?,
-            Some(SettingsAction::Unset { key }) => commands::settings::run_settings_unset(&key)?,
-            None => commands::settings::run_settings_show()?,
-        },
+        Some(Commands::Settings { action }) => commands::settings::dispatch_settings(action)?,
         Some(Commands::Logs {
             count,
             verbose,
             activity,
             level,
             category,
-        }) => {
-            if activity {
-                commands::settings::run_activity_logs(count, &level, category.as_deref())?;
-            } else {
-                commands::settings::run_logs(count, verbose)?;
-            }
-        }
-        Some(Commands::Tasks { action }) => match action {
-            Some(TasksAction::List) | None => commands::tasks::run_tasks_list()?,
-            Some(TasksAction::Create {
-                name,
-                prompt,
-                schedule,
-                r#type,
-                max_retries,
-                timeout,
-                delivery_channel,
-                delivery_target,
-            }) => commands::tasks::run_tasks_create(
-                &name,
-                &prompt,
-                &schedule,
-                &r#type,
-                max_retries,
-                timeout.map(|s| s as i64 * 1000),
-                delivery_channel.as_deref(),
-                delivery_target.as_deref(),
-            )?,
-            Some(TasksAction::Delete { id }) => commands::tasks::run_tasks_delete(&id)?,
-            Some(TasksAction::Pause { id }) => {
-                commands::tasks::run_tasks_update_status(&id, "paused")?
-            }
-            Some(TasksAction::Resume { id }) => {
-                commands::tasks::run_tasks_update_status(&id, "active")?
-            }
-            Some(TasksAction::Run { id }) => commands::tasks::run_tasks_run(&id)?,
-            Some(TasksAction::Runs { id, count }) => commands::tasks::run_tasks_runs(&id, count)?,
-            Some(TasksAction::Status { id }) => commands::tasks::run_tasks_status(&id)?,
-        },
-        Some(Commands::Cron { action }) => match action {
-            Some(CronAction::List) | None => commands::tasks::run_cron_list()?,
-            Some(CronAction::Add {
-                line,
-                schedule,
-                command,
-                name,
-                timeout,
-                delivery_channel,
-                delivery_target,
-            }) => commands::tasks::run_cron_add(
-                line.as_deref(),
-                schedule.as_deref(),
-                command.as_deref(),
-                name.as_deref(),
-                timeout.map(|s| s as i64 * 1000),
-                delivery_channel.as_deref(),
-                delivery_target.as_deref(),
-            )?,
-            Some(CronAction::Remove { id }) => commands::tasks::run_cron_mutate(&id, "delete")?,
-            Some(CronAction::Pause { id }) => commands::tasks::run_cron_mutate(&id, "pause")?,
-            Some(CronAction::Resume { id }) => commands::tasks::run_cron_mutate(&id, "resume")?,
-            Some(CronAction::Run { id }) => commands::tasks::run_cron_mutate(&id, "run")?,
-            Some(CronAction::Runs { id, count }) => commands::tasks::run_tasks_runs(&id, count)?,
-        },
-        Some(Commands::Projects { action }) => match action {
-            Some(ProjectsAction::List { status }) => {
-                commands::projects::run_projects_list(status.as_deref())?
-            }
-            None => commands::projects::run_projects_list(None)?,
-            Some(ProjectsAction::Create { name, description }) => {
-                commands::projects::run_projects_create(&name, description.as_deref())?
-            }
-            Some(ProjectsAction::Get { id }) => commands::projects::run_projects_get(&id)?,
-            Some(ProjectsAction::Update {
-                id,
-                name,
-                description,
-                status,
-            }) => commands::projects::run_projects_update(
-                &id,
-                name.as_deref(),
-                description.as_deref(),
-                status.as_deref(),
-            )?,
-            Some(ProjectsAction::Archive { id }) => commands::projects::run_projects_archive(&id)?,
-            Some(ProjectsAction::Delete { id }) => commands::projects::run_projects_delete(&id)?,
-        },
+        }) => commands::settings::dispatch_logs(
+            count,
+            verbose,
+            activity,
+            &level,
+            category.as_deref(),
+        )?,
+        Some(Commands::Tasks { action }) => commands::tasks::dispatch_tasks(action)?,
+        Some(Commands::Cron { action }) => commands::tasks::dispatch_cron(action)?,
+        Some(Commands::Projects { action }) => commands::projects::dispatch_projects(action)?,
         Some(Commands::Usage) => commands::status::run_usage()?,
-        Some(Commands::Pairing { action }) => match action {
-            Some(PairingAction::List { channel }) => {
-                commands::pairing::run_pairing_list(channel.as_deref())?
-            }
-            Some(PairingAction::Approve { code }) => commands::pairing::run_pairing_approve(&code)?,
-            Some(PairingAction::Revoke { channel, sender_id }) => {
-                commands::pairing::run_pairing_revoke(&channel, &sender_id)?
-            }
-            Some(PairingAction::Approved { channel }) => {
-                commands::pairing::run_pairing_approved(channel.as_deref())?
-            }
-            None => commands::pairing::run_pairing_list(None)?,
-        },
+        Some(Commands::Pairing { action }) => commands::pairing::dispatch_pairing(action)?,
         Some(Commands::Poke) => commands::misc::run_poke().await?,
         Some(Commands::Cancel { session }) => commands::misc::run_cancel(session).await?,
         Some(Commands::Away { message }) => commands::misc::run_away(message).await?,
         Some(Commands::Available) => commands::misc::run_available().await?,
-        Some(Commands::Migrate { action }) => match action {
-            None => migrate_tui::run()?,
-            Some(MigrateSubcommand::Hermes) => {
-                commands::misc::run_migrate_direct(borg_core::migrate::MigrationSource::Hermes)?
-            }
-            Some(MigrateSubcommand::Claw) => {
-                commands::misc::run_migrate_direct(borg_core::migrate::MigrationSource::OpenClaw)?
-            }
-        },
+        Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action)?,
         Some(Commands::Update { dev, check }) => commands::misc::run_update(dev, check).await?,
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
     }

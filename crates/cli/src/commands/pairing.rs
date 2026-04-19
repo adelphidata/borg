@@ -1,6 +1,46 @@
 use anyhow::Result;
+use clap::Subcommand;
 
 use super::format_ts;
+
+#[derive(Subcommand)]
+pub(crate) enum PairingAction {
+    /// List pending pairing requests
+    List {
+        /// Filter by channel name
+        channel: Option<String>,
+    },
+    /// Approve a pairing request by code
+    Approve {
+        /// Pairing code with channel prefix (e.g. TG_H4BRWMRW)
+        code: String,
+    },
+    /// Revoke an approved sender
+    Revoke {
+        /// Channel name
+        channel: String,
+        /// Sender ID to revoke
+        sender_id: String,
+    },
+    /// List all approved senders
+    Approved {
+        /// Filter by channel name
+        channel: Option<String>,
+    },
+}
+
+/// Dispatch for `borg pairing ...`.
+pub(crate) fn dispatch_pairing(action: Option<PairingAction>) -> Result<()> {
+    match action {
+        Some(PairingAction::List { channel }) => run_pairing_list(channel.as_deref()),
+        Some(PairingAction::Approve { code }) => run_pairing_approve(&code),
+        Some(PairingAction::Revoke { channel, sender_id }) => {
+            run_pairing_revoke(&channel, &sender_id)
+        }
+        Some(PairingAction::Approved { channel }) => run_pairing_approved(channel.as_deref()),
+        None => run_pairing_list(None),
+    }
+}
 
 pub(crate) fn run_pairing_list(channel: Option<&str>) -> Result<()> {
     let db = borg_core::db::Database::open()?;

@@ -5,7 +5,10 @@ use ratatui::Frame;
 
 use borg_core::config::Config;
 use borg_core::db::Database;
-use borg_core::settings::{SettingSource, TuiSettingDecl, TuiSettingKind, TUI_SETTINGS};
+use borg_core::settings::{
+    tui_float_range, tui_select_choices, SettingSource, TuiSettingDecl, TuiSettingKind,
+    TUI_SETTINGS,
+};
 
 use crate::api_key_store::{self, ApiKeySaveOutcome};
 use crate::onboarding::{models_for_provider, PROVIDERS};
@@ -415,78 +418,53 @@ impl SettingsPopup {
         config: &mut Config,
         forward: bool,
     ) -> anyhow::Result<Option<AppAction>> {
-        let entry = &self.entries[self.selected];
-        let mut actions: Vec<AppAction> = Vec::new();
+        let key = self.entries[self.selected].key;
 
-        match entry.key {
-            "provider" => {
-                let count = PROVIDERS.len();
-                self.provider_index = if forward {
-                    (self.provider_index + 1) % count
-                } else {
-                    (self.provider_index + count - 1) % count
-                };
-                let (id, _, _) = PROVIDERS[self.provider_index];
-                match self.apply_and_save(config, "provider", id) {
-                    Some(action) => actions.push(action),
-                    None => return Ok(None),
-                }
-                // Reset model to first option for new provider. Best-effort:
-                // we keep the "Updated: provider=..." status and only log on save failure.
-                self.model_index = 0;
-                let models = models_for_provider(id);
-                if let Some((model_id, _)) = models.first() {
-                    if config.apply_setting("model", model_id).is_ok() {
-                        if let Err(e) = self.save_setting("model", model_id) {
-                            tracing::warn!("Failed to persist model reset: {e}");
-                        }
-                        actions.push(AppAction::UpdateSetting {
-                            key: "model".to_string(),
-                            value: model_id.to_string(),
-                        });
-                    }
-                }
-            }
-            "conversation.collaboration_mode" => {
-                const MODES: &[&str] = &["default", "execute", "plan"];
-                let current = format!("{}", config.conversation.collaboration_mode);
-                let new_mode = cycle_option(MODES, &current, forward);
-                if let Some(action) =
-                    self.apply_and_save(config, "conversation.collaboration_mode", new_mode)
-                {
-                    actions.push(action);
-                } else {
-                    return Ok(None);
-                }
-            }
-            "llm.cache.strategy" => {
-                const MODES: &[&str] = &["tools_system_and_2", "system_and_3"];
-                // The generated reader serializes via serde_json, which wraps the
-                // enum tag in quotes (e.g. `"system_and_3"`). Strip them so the
-                // current value lines up with the unquoted cycle options.
-                let current = serde_json::to_string(&config.llm.cache.strategy).unwrap_or_default();
-                let new_val = cycle_option(MODES, current.trim_matches('"'), forward);
-                if let Some(action) = self.apply_and_save(config, "llm.cache.strategy", new_val) {
-                    actions.push(action);
-                } else {
-                    return Ok(None);
-                }
-            }
-            "workflow.enabled" => {
-                const MODES: &[&str] = &["auto", "on", "off"];
-                let current = config.workflow.enabled.clone();
-                let new_val = cycle_option(MODES, &current, forward);
-                if let Some(action) = self.apply_and_save(config, "workflow.enabled", new_val) {
-                    actions.push(action);
-                } else {
-                    return Ok(None);
-                }
-            }
-            _ => return Ok(None),
+        // `provider` is dynamic (PROVIDERS catalog) and also cascades into a
+        // model reset; it does not live in TUI_SELECT_CHOICES.
+        if key == "provider" {
+            return self.cycle_provider(config, forward);
         }
 
-        // Return the first action (provider change is the primary one)
-        Ok(actions.into_iter().next())
+        let Some(options) = tui_select_choices(key) else {
+            return Ok(None);
+        };
+        let current = self.current_value(config, key);
+        let new_val = cycle_option(options, &current, forward);
+        Ok(self.apply_and_save(config, key, new_val))
+    }
+
+    /// Cycle the `provider` setting and reset `model` to the first model for
+    /// the new provider. Split from `cycle_select` because of the model
+    /// cascade — the rest of Select-kind settings are uniform.
+    fn cycle_provider(
+        &mut self,
+        config: &mut Config,
+        forward: bool,
+    ) -> anyhow::Result<Option<AppAction>> {
+        let count = PROVIDERS.len();
+        self.provider_index = if forward {
+            (self.provider_index + 1) % count
+        } else {
+            (self.provider_index + count - 1) % count
+        };
+        let (id, _, _) = PROVIDERS[self.provider_index];
+        let Some(action) = self.apply_and_save(config, "provider", id) else {
+            return Ok(None);
+        };
+
+        // Best-effort: reset model to the first option for the new provider.
+        // We keep the "Updated: provider=..." status and only log on save failure.
+        self.model_index = 0;
+        let models = models_for_provider(id);
+        if let Some((model_id, _)) = models.first() {
+            if config.apply_setting("model", model_id).is_ok() {
+                if let Err(e) = self.save_setting("model", model_id) {
+                    tracing::warn!("Failed to persist model reset: {e}");
+                }
+            }
+        }
+        Ok(Some(action))
     }
 
     fn step_float(
@@ -494,16 +472,19 @@ impl SettingsPopup {
         config: &mut Config,
         increase: bool,
     ) -> anyhow::Result<Option<AppAction>> {
-        let entry = &self.entries[self.selected];
-        let key = entry.key;
+        let key = self.entries[self.selected].key;
+        // Every Float-kind TUI setting must have a TUI_FLOAT_RANGES entry;
+        // `every_float_tui_setting_has_range` in `borg_core::settings::tests`
+        // enforces this at compile time. A missing entry at runtime means a
+        // developer added a Float setting and skipped the table — surface it
+        // loudly rather than silently clamping with a default.
+        let Some((min, max, step)) = tui_float_range(key) else {
+            tracing::warn!("Float setting '{key}' has no TUI_FLOAT_RANGES entry; ignoring step");
+            return Ok(None);
+        };
+
         let current = self.current_value(config, key);
         let val: f64 = current.parse().unwrap_or(0.0);
-
-        let (step, min, max) = match key {
-            "budget.warning_threshold" => (0.01, 0.0, 1.0),
-            "skills.budget_pct" => (0.01, 0.0, 1.0),
-            _ => (0.1, 0.0, 2.0), // temperature
-        };
 
         let new_val = if increase {
             (val + step).min(max)

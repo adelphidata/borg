@@ -1,7 +1,81 @@
 use anyhow::Result;
+use clap::Subcommand;
 use uuid::Uuid;
 
 use super::{format_ts, short_id, truncate_str};
+
+#[derive(Subcommand)]
+pub(crate) enum ProjectsAction {
+    /// List all projects
+    List {
+        /// Filter by status (active, archived)
+        #[arg(long, short)]
+        status: Option<String>,
+    },
+    /// Create a new project
+    Create {
+        /// Project name
+        #[arg(long, short)]
+        name: String,
+        /// Project description
+        #[arg(long, short)]
+        description: Option<String>,
+    },
+    /// Show project details and associated workflows
+    Get {
+        /// Project ID (or prefix)
+        id: String,
+    },
+    /// Update a project's fields
+    Update {
+        /// Project ID (or prefix)
+        id: String,
+        /// New project name
+        #[arg(long, short)]
+        name: Option<String>,
+        /// New project description
+        #[arg(long, short)]
+        description: Option<String>,
+        /// New status (active, archived)
+        #[arg(long, short)]
+        status: Option<String>,
+    },
+    /// Archive a project
+    Archive {
+        /// Project ID (or prefix)
+        id: String,
+    },
+    /// Delete a project
+    Delete {
+        /// Project ID (or prefix)
+        id: String,
+    },
+}
+
+/// Dispatch for `borg projects ...`.
+pub(crate) fn dispatch_projects(action: Option<ProjectsAction>) -> Result<()> {
+    match action {
+        Some(ProjectsAction::List { status }) => run_projects_list(status.as_deref()),
+        None => run_projects_list(None),
+        Some(ProjectsAction::Create { name, description }) => {
+            run_projects_create(&name, description.as_deref())
+        }
+        Some(ProjectsAction::Get { id }) => run_projects_get(&id),
+        Some(ProjectsAction::Update {
+            id,
+            name,
+            description,
+            status,
+        }) => run_projects_update(
+            &id,
+            name.as_deref(),
+            description.as_deref(),
+            status.as_deref(),
+        ),
+        Some(ProjectsAction::Archive { id }) => run_projects_archive(&id),
+        Some(ProjectsAction::Delete { id }) => run_projects_delete(&id),
+    }
+}
 
 pub(crate) fn run_projects_list(status_filter: Option<&str>) -> Result<()> {
     let db = borg_core::db::Database::open()?;

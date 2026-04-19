@@ -8,9 +8,232 @@
 //! [`format_xp_feed`], which owns the relative-time clock).
 
 use super::{
-    capitalize_first, format_status_section, render_bar, Archetype, BlockingGate, EvolutionState,
-    FeedEntry, ReadinessReport, XpSummary,
+    capitalize_first, render_bar, xp_for_level, Archetype, BlockingGate, EvolutionEvent,
+    EvolutionState, FeedEntry, ReadinessReport, Stage, XpSummary,
 };
+
+// ── `borg status` / status-popup renderers (moved from evolution/mod.rs) ──
+
+/// Compact one-line status used by ambient headers and `/status`.
+pub fn format_compact(state: &EvolutionState) -> String {
+    match (&state.evolution_name, &state.dominant_archetype) {
+        (Some(name), Some(arch)) => {
+            let arch_display = format!("{arch}");
+            let capitalized = capitalize_first(&arch_display);
+            format!("{name} Lvl.{} | {capitalized}", state.level)
+        }
+        (Some(name), None) => format!("{name} Lvl.{}", state.level),
+        (None, Some(arch)) => {
+            let arch_display = format!("{arch}");
+            let capitalized = capitalize_first(&arch_display);
+            format!("Base Borg Lvl.{} | {capitalized}", state.level)
+        }
+        (None, None) => format!("Base Borg Lvl.{}", state.level),
+    }
+}
+
+/// Full status section for `borg status` output (default width).
+pub fn format_status_section(state: &EvolutionState) -> String {
+    format_status_section_with_width(state, 48)
+}
+
+/// Full status section with configurable card width.
+///
+/// `card_width` is the total width of the tip card including borders (minimum 34).
+pub fn format_status_section_with_width(state: &EvolutionState, card_width: usize) -> String {
+    let card_width = card_width.max(34);
+    let mut out = String::new();
+
+    // Header: name + level
+    match &state.evolution_name {
+        Some(name) => out.push_str(&format!("  {name} Lvl.{}\n", state.level)),
+        None => out.push_str(&format!("  Base Borg Lvl.{}\n", state.level)),
+    }
+
+    // Description
+    match &state.evolution_description {
+        Some(desc) => out.push_str(&format!("  \"{desc}\"\n")),
+        None => {
+            let inner = card_width - 2; // space between │ and │
+            let title = " How Evolution Works ";
+            let title_len = title.len(); // 21
+            let left_dashes = 3;
+            let right_dashes = inner.saturating_sub(left_dashes + title_len);
+
+            out.push('\n');
+            // Top border
+            let left = "\u{2500}".repeat(left_dashes);
+            let right = "\u{2500}".repeat(right_dashes);
+            out.push_str(&format!("  \u{256D}{left}{title}{right}\u{256E}\n"));
+
+            let lines = [
+                "",
+                "Your borg is learning how you use it.",
+                "Every tool call, shell command, and task",
+                "shapes what it becomes.",
+                "",
+                "Evolution is permanent -- earned through",
+                "sustained usage, not toggled. Your usage",
+                "patterns determine your borg's archetype",
+                "and unlock a unique evolution name.",
+                "",
+                "Keep using borg the way you imagine.",
+                "",
+            ];
+            for line in &lines {
+                if line.is_empty() {
+                    out.push_str(&format!("  \u{2502}{}\u{2502}\n", " ".repeat(inner)));
+                } else {
+                    // inner >= 32 because card_width >= 34
+                    let padded = format!("  {:<width$}", line, width = inner - 2);
+                    // Truncate if content is wider than available space
+                    let padded: String = padded.chars().take(inner).collect();
+                    out.push_str(&format!("  \u{2502}{padded}\u{2502}\n"));
+                }
+            }
+
+            // Bottom border
+            out.push_str(&format!("  \u{2570}{}\u{256F}\n", "\u{2500}".repeat(inner)));
+        }
+    }
+
+    out.push('\n');
+
+    // Stage progress bar — scale bar to fit card width
+    let bar_width = (card_width - 2).min(30); // bar portion, max 30
+    let stage_label = match state.stage {
+        Stage::Base => "Base (1/3)",
+        Stage::Evolved => "Evolved (2/3)",
+        Stage::Final => "Final (3/3)",
+    };
+    let stage_fill = match state.stage {
+        Stage::Base => bar_width / 3,
+        Stage::Evolved => bar_width * 2 / 3,
+        Stage::Final => bar_width,
+    };
+    let stage_bar = format!(
+        "{}{}",
+        "\u{2588}".repeat(stage_fill),
+        "\u{2591}".repeat(bar_width - stage_fill)
+    );
+    out.push_str(&format!("  Stage        {stage_bar}  {stage_label}\n"));
+
+    // XP progress
+    if state.level < 99 {
+        let xp_needed = xp_for_level(&state.stage, state.level);
+        let xp_into_level = xp_needed.saturating_sub(state.xp_to_next_level);
+        out.push_str(&format!(
+            "  XP           {xp_into_level} / {xp_needed} to Lvl.{}\n",
+            state.level + 1
+        ));
+    } else {
+        out.push_str("  XP           MAX LEVEL\n");
+    }
+
+    out
+}
+
+/// Format archetype scores for `borg status archetypes`.
+pub fn format_archetype_scores(state: &EvolutionState) -> String {
+    let mut out =
+        String::from("Archetype Scores\n  (how you use borg shapes its identity; * = dominant)\n");
+
+    let mut sorted: Vec<(Archetype, u32)> = Archetype::ALL
+        .iter()
+        .map(|a| (*a, *state.archetype_scores.get(a).unwrap_or(&0)))
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let max_score = sorted.first().map(|(_, s)| *s).unwrap_or(1).max(1);
+
+    for (arch, score) in &sorted {
+        let arch_display = format!("{arch}");
+        let capitalized = capitalize_first(&arch_display);
+        let bar_len = (*score as usize * 10) / max_score as usize;
+        let bar = format!(
+            "{}{}",
+            "\u{2588}".repeat(bar_len),
+            "\u{2591}".repeat(10 - bar_len)
+        );
+        let marker = if Some(*arch) == state.dominant_archetype {
+            " *"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  {capitalized:<15} {score:>5}  {bar}{marker}\n"));
+    }
+
+    out
+}
+
+/// Format evolution history timeline.
+pub fn format_history(events: &[EvolutionEvent]) -> String {
+    let evolution_events: Vec<&EvolutionEvent> = events
+        .iter()
+        .filter(|e| e.event_type == "evolution")
+        .collect();
+
+    if evolution_events.is_empty() {
+        return "Evolution History\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  No evolutions yet. Keep using Borg!\n".to_string();
+    }
+
+    let mut out = String::from("Evolution History\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n");
+
+    for event in &evolution_events {
+        let ts = chrono::DateTime::from_timestamp(event.created_at, 0)
+            .map(|dt| dt.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let mut name = String::new();
+        let mut desc = String::new();
+        if let Some(ref meta) = event.metadata_json {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta) {
+                if let Some(n) = parsed.get("name").and_then(|v| v.as_str()) {
+                    name = n.to_string();
+                }
+                if let Some(d) = parsed.get("description").and_then(|v| v.as_str()) {
+                    desc = d.to_string();
+                }
+            }
+        }
+
+        let stage_label = if name.is_empty() {
+            "Evolved".to_string()
+        } else {
+            name.clone()
+        };
+
+        out.push_str(&format!("  {ts}  → {stage_label}\n"));
+        if !desc.is_empty() {
+            out.push_str(&format!("           \"{desc}\"\n"));
+        }
+    }
+
+    out
+}
+
+/// XML evolution context for system prompt injection.
+pub fn format_evolution_context(state: &EvolutionState) -> String {
+    let name = state.evolution_name.as_deref().unwrap_or("Base Borg");
+    let stage = match state.stage {
+        Stage::Base => "Base",
+        Stage::Evolved => "Evolved",
+        Stage::Final => "Final",
+    };
+    let arch = state
+        .dominant_archetype
+        .map(|a| {
+            let s = format!("{a}");
+            let score = state.archetype_scores.get(&a).unwrap_or(&0);
+            format!("\nArchetype: {} (score: {score})", capitalize_first(&s))
+        })
+        .unwrap_or_default();
+
+    format!(
+        "<evolution_context>\nStage: {stage} | {name} Lvl.{}{arch}\n</evolution_context>",
+        state.level
+    )
+}
 
 /// Width used for the archetype breakdown bars in the XP summary.
 const BAR_WIDTH: usize = 10;

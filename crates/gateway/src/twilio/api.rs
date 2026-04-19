@@ -3,9 +3,7 @@ use base64::Engine;
 use reqwest::Client;
 use std::time::Duration;
 
-use crate::constants::GATEWAY_HTTP_TIMEOUT;
-
-const TWILIO_API_BASE: &str = "https://api.twilio.com/2010-04-01";
+use crate::constants::{GATEWAY_HTTP_TIMEOUT, TWILIO_API_BASE};
 
 /// Client for sending messages via the Twilio REST API.
 pub struct TwilioClient {

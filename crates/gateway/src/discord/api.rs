@@ -11,11 +11,8 @@ use super::types::{
 };
 use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
-use crate::constants::GATEWAY_HTTP_TIMEOUT;
+use crate::constants::{DISCORD_API_BASE, DISCORD_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
 use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
-
-const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-const DISCORD_MESSAGE_CHUNK_SIZE: usize = 2000;
 
 /// Validate that a Discord snowflake ID is numeric (prevents path traversal in URL interpolation).
 fn validate_snowflake(id: &str, label: &str) -> Result<()> {

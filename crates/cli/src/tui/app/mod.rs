@@ -32,9 +32,35 @@ use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
 use super::transcript_pager::TranscriptPager;
 
+/// Single source of truth for the list of popups that participate in
+/// key/paste/visibility routing. Every dispatch site in this file uses this
+/// macro, so adding a popup is a one-line change.
+///
+/// `$body!($self, $popup)` is invoked once per popup field. Callers define
+/// an inner `macro_rules!` for the per-popup step and pass its name.
+macro_rules! for_each_routed_popup {
+    ($self:ident, $body:ident) => {
+        $body!($self, settings_popup);
+        $body!($self, model_popup);
+        $body!($self, plugins_popup);
+        $body!($self, pairing_popup);
+        $body!($self, projects_popup);
+        $body!($self, sessions_popup);
+        $body!($self, schedule_popup);
+        $body!($self, migrate_popup);
+        $body!($self, status_popup);
+    };
+}
+
 /// Trait for popup windows that handle keyboard and paste events.
 /// Each popup converts its domain-specific actions into `AppAction` variants internally.
+///
+/// Dispatch is currently macro-driven on concrete types (see
+/// `for_each_routed_popup!`), so the trait is not invoked through `dyn`; it
+/// documents the shared contract and makes accidental drift at the signature
+/// level a compile error.
 pub(super) trait PopupHandler {
+    #[allow(dead_code)]
     fn is_visible(&self) -> bool;
     /// Handle a key event. `config` is provided for popups that need to mutate settings.
     /// Returns `Ok(Some(action))` if an action should be dispatched, `Ok(None)` to absorb
@@ -351,36 +377,21 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Collect mutable references to all popups for trait-based dispatch.
-    fn popups_mut(&mut self) -> [&mut dyn PopupHandler; 9] {
-        [
-            &mut self.settings_popup,
-            &mut self.model_popup,
-            &mut self.plugins_popup,
-            &mut self.pairing_popup,
-            &mut self.projects_popup,
-            &mut self.sessions_popup,
-            &mut self.schedule_popup,
-            &mut self.migrate_popup,
-            &mut self.status_popup,
-        ]
-    }
-
     /// Returns `true` if any popup overlay is currently visible.
     ///
     /// Used to suppress input routing to the composer and to prevent
     /// `drain_queued_if_idle` from starting a new streaming turn while the
     /// user is interacting with a popup.
     pub fn any_popup_visible(&self) -> bool {
-        self.settings_popup.is_visible()
-            || self.model_popup.is_visible()
-            || self.plugins_popup.is_visible()
-            || self.pairing_popup.is_visible()
-            || self.projects_popup.is_visible()
-            || self.sessions_popup.is_visible()
-            || self.schedule_popup.is_visible()
-            || self.migrate_popup.is_visible()
-            || self.status_popup.is_visible()
+        macro_rules! check {
+            ($self:ident, $popup:ident) => {
+                if $self.$popup.is_visible() {
+                    return true;
+                }
+            };
+        }
+        for_each_routed_popup!(self, check);
+        false
     }
 
     /// Toggle the collapsed state on the most recent collapsible tool result.
@@ -397,12 +408,15 @@ impl<'a> App<'a> {
     /// Route a paste event to the first visible popup that accepts paste input.
     /// Returns `true` if a popup consumed the paste (caller should return Continue).
     fn dispatch_paste_to_popup(&mut self, text: &str) -> bool {
-        for popup in self.popups_mut() {
-            if popup.is_visible() {
-                popup.handle_paste_event(text);
-                return true;
-            }
+        macro_rules! route {
+            ($self:ident, $popup:ident) => {
+                if $self.$popup.is_visible() {
+                    $self.$popup.handle_paste_event(text);
+                    return true;
+                }
+            };
         }
+        for_each_routed_popup!(self, route);
         false
     }
 
@@ -412,49 +426,20 @@ impl<'a> App<'a> {
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Result<Option<AppAction>> {
-        // We can't iterate popups_mut() because handle_key_event needs &mut config,
-        // and popups_mut() borrows &mut self. Instead, check visibility first, then dispatch.
-        let visible_idx = {
-            let popups: [&dyn PopupHandler; 9] = [
-                &self.settings_popup,
-                &self.model_popup,
-                &self.plugins_popup,
-                &self.pairing_popup,
-                &self.projects_popup,
-                &self.sessions_popup,
-                &self.schedule_popup,
-                &self.migrate_popup,
-                &self.status_popup,
-            ];
-            popups.iter().position(|p| p.is_visible())
-        };
-
-        let Some(idx) = visible_idx else {
-            return Ok(None);
-        };
-
-        let action = match idx {
-            0 => self
-                .settings_popup
-                .handle_key_event(key, &mut self.config)?,
-            1 => self.model_popup.handle_key_event(key, &mut self.config)?,
-            2 => self.plugins_popup.handle_key_event(key, &mut self.config)?,
-            3 => self.pairing_popup.handle_key_event(key, &mut self.config)?,
-            4 => self
-                .projects_popup
-                .handle_key_event(key, &mut self.config)?,
-            5 => self
-                .sessions_popup
-                .handle_key_event(key, &mut self.config)?,
-            6 => self
-                .schedule_popup
-                .handle_key_event(key, &mut self.config)?,
-            7 => self.migrate_popup.handle_key_event(key, &mut self.config)?,
-            8 => self.status_popup.handle_key_event(key, &mut self.config)?,
-            _ => unreachable!(),
-        };
-
-        Ok(Some(action.unwrap_or(AppAction::Continue)))
+        // The macro expands to a chain of `if popup.is_visible() { return ... }`
+        // blocks — one per popup. Writing it this way avoids the split-borrow
+        // problem that blocks iterating an `&mut dyn PopupHandler` array when
+        // `handle_key_event` also needs `&mut self.config`.
+        macro_rules! route {
+            ($self:ident, $popup:ident) => {
+                if $self.$popup.is_visible() {
+                    let action = $self.$popup.handle_key_event(key, &mut $self.config)?;
+                    return Ok(Some(action.unwrap_or(AppAction::Continue)));
+                }
+            };
+        }
+        for_each_routed_popup!(self, route);
+        Ok(None)
     }
 
     /// Handle a bracketed paste event (entire pasted text as a single string).

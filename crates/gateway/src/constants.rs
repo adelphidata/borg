@@ -39,3 +39,24 @@ pub const SLACK_TYPING_CB_FAILURE_THRESHOLD: u32 = 2;
 
 /// Slack typing indicator circuit breaker: suspension duration in seconds.
 pub const SLACK_TYPING_CB_SUSPENSION_SECS: u64 = 60;
+
+// ── Discord ───────────────────────────────────────────────────────
+
+/// Discord REST API base URL.
+pub const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+
+/// Discord message max length.
+pub const DISCORD_MESSAGE_CHUNK_SIZE: usize = 2000;
+
+// ── Twilio ────────────────────────────────────────────────────────
+
+/// Twilio REST API base URL (2010-04-01 API version).
+pub const TWILIO_API_BASE: &str = "https://api.twilio.com/2010-04-01";
+
+// ── Google Chat ───────────────────────────────────────────────────
+
+/// Google Chat API base URL.
+pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
+
+/// Google Chat max message length (4096 chars).
+pub const GOOGLE_CHAT_MESSAGE_CHUNK_SIZE: usize = 4096;

@@ -1,7 +1,193 @@
 use anyhow::Result;
+use clap::Subcommand;
 use uuid::Uuid;
 
 use super::{format_ts, short_id, truncate_str};
+
+#[derive(Subcommand)]
+pub(crate) enum TasksAction {
+    /// List all scheduled tasks
+    List,
+    /// Create a new scheduled task
+    Create {
+        /// Task name
+        #[arg(long, short)]
+        name: String,
+        /// Prompt to send to the agent
+        #[arg(long, short)]
+        prompt: String,
+        /// Schedule expression (cron or interval)
+        #[arg(long, short)]
+        schedule: String,
+        /// Schedule type: cron, interval, or once
+        #[arg(long, short = 't', default_value = "cron")]
+        r#type: String,
+        /// Max retry attempts for transient failures (default: 3)
+        #[arg(long)]
+        max_retries: Option<i32>,
+        /// Timeout in seconds (default: 300)
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Delivery channel for results (telegram, slack, discord)
+        #[arg(long)]
+        delivery_channel: Option<String>,
+        /// Delivery target (chat_id or channel_id)
+        #[arg(long)]
+        delivery_target: Option<String>,
+    },
+    /// Delete a scheduled task
+    Delete {
+        /// Task ID (or prefix)
+        id: String,
+    },
+    /// Pause a scheduled task
+    Pause {
+        /// Task ID (or prefix)
+        id: String,
+    },
+    /// Resume a paused task
+    Resume {
+        /// Task ID (or prefix)
+        id: String,
+    },
+    /// Trigger a task to run immediately
+    Run {
+        /// Task ID (or prefix)
+        id: String,
+    },
+    /// Show execution history for a task
+    Runs {
+        /// Task ID (or prefix)
+        id: String,
+        /// Number of runs to show
+        #[arg(long, short, default_value_t = 10)]
+        count: usize,
+    },
+    /// Show detailed task status
+    Status {
+        /// Task ID (or prefix)
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CronAction {
+    /// List all cron jobs
+    List,
+    /// Add a cron job. Use combined format: "*/5 * * * * echo hello"
+    /// or separate flags: -s "*/5 * * * *" -c "echo hello"
+    Add {
+        /// Combined crontab line: "*/5 * * * * command args..."
+        line: Option<String>,
+        /// Cron schedule (5-field Linux format, e.g. "*/5 * * * *")
+        #[arg(long, short)]
+        schedule: Option<String>,
+        /// Shell command to execute
+        #[arg(long, short)]
+        command: Option<String>,
+        /// Job name (auto-generated from command if omitted)
+        #[arg(long, short)]
+        name: Option<String>,
+        /// Timeout in seconds (default: 300)
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Delivery channel for output (telegram, slack, discord)
+        #[arg(long)]
+        delivery_channel: Option<String>,
+        /// Delivery target (chat_id or channel_id)
+        #[arg(long)]
+        delivery_target: Option<String>,
+    },
+    /// Remove a cron job
+    Remove {
+        /// Job ID (or prefix)
+        id: String,
+    },
+    /// Pause a cron job
+    Pause {
+        /// Job ID (or prefix)
+        id: String,
+    },
+    /// Resume a paused cron job
+    Resume {
+        /// Job ID (or prefix)
+        id: String,
+    },
+    /// Trigger a cron job to run immediately
+    Run {
+        /// Job ID (or prefix)
+        id: String,
+    },
+    /// Show execution history for a cron job
+    Runs {
+        /// Job ID (or prefix)
+        id: String,
+        /// Number of runs to show
+        #[arg(long, short, default_value_t = 10)]
+        count: usize,
+    },
+}
+
+/// Dispatch for `borg tasks ...`.
+pub(crate) fn dispatch_tasks(action: Option<TasksAction>) -> Result<()> {
+    match action {
+        Some(TasksAction::List) | None => run_tasks_list(),
+        Some(TasksAction::Create {
+            name,
+            prompt,
+            schedule,
+            r#type,
+            max_retries,
+            timeout,
+            delivery_channel,
+            delivery_target,
+        }) => run_tasks_create(
+            &name,
+            &prompt,
+            &schedule,
+            &r#type,
+            max_retries,
+            timeout.map(|s| s as i64 * 1000),
+            delivery_channel.as_deref(),
+            delivery_target.as_deref(),
+        ),
+        Some(TasksAction::Delete { id }) => run_tasks_delete(&id),
+        Some(TasksAction::Pause { id }) => run_tasks_update_status(&id, "paused"),
+        Some(TasksAction::Resume { id }) => run_tasks_update_status(&id, "active"),
+        Some(TasksAction::Run { id }) => run_tasks_run(&id),
+        Some(TasksAction::Runs { id, count }) => run_tasks_runs(&id, count),
+        Some(TasksAction::Status { id }) => run_tasks_status(&id),
+    }
+}
+
+/// Dispatch for `borg cron ...`.
+pub(crate) fn dispatch_cron(action: Option<CronAction>) -> Result<()> {
+    match action {
+        Some(CronAction::List) | None => run_cron_list(),
+        Some(CronAction::Add {
+            line,
+            schedule,
+            command,
+            name,
+            timeout,
+            delivery_channel,
+            delivery_target,
+        }) => run_cron_add(
+            line.as_deref(),
+            schedule.as_deref(),
+            command.as_deref(),
+            name.as_deref(),
+            timeout.map(|s| s as i64 * 1000),
+            delivery_channel.as_deref(),
+            delivery_target.as_deref(),
+        ),
+        Some(CronAction::Remove { id }) => run_cron_mutate(&id, "delete"),
+        Some(CronAction::Pause { id }) => run_cron_mutate(&id, "pause"),
+        Some(CronAction::Resume { id }) => run_cron_mutate(&id, "resume"),
+        Some(CronAction::Run { id }) => run_cron_mutate(&id, "run"),
+        Some(CronAction::Runs { id, count }) => run_tasks_runs(&id, count),
+    }
+}
 
 pub(crate) fn run_tasks_list() -> Result<()> {
     let db = borg_core::db::Database::open()?;

@@ -14,9 +14,14 @@ pub mod commands;
 mod feed;
 mod format;
 mod helpers;
+mod hmac;
 mod milestones;
 mod replay;
 pub mod share_card;
+
+pub(crate) use hmac::{compute_event_hmac, verify_event_hmac, EVOLUTION_HMAC_DOMAIN};
+#[cfg(test)]
+pub(crate) use hmac::{compute_event_hmac_legacy, EVOLUTION_HMAC_LEGACY};
 
 pub use celebration::{
     celebration_art, format_celebration, format_celebration_message, CelebrationArt,
@@ -26,8 +31,10 @@ pub use classification::*;
 pub use commands::{dispatch, parse, CommandOutput, EvolutionCommand};
 pub use feed::{recent_xp_feed, xp_summary, FeedEntry, FeedKind, XpSummary};
 pub use format::{
-    format_archetype_scores_with_momentum, format_evolution_overview, format_next_step_hints,
-    format_readiness, format_xp_feed, format_xp_summary,
+    format_archetype_scores, format_archetype_scores_with_momentum, format_compact,
+    format_evolution_context, format_evolution_overview, format_history, format_next_step_hints,
+    format_readiness, format_status_section, format_status_section_with_width, format_xp_feed,
+    format_xp_summary,
 };
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
 pub use milestones::{check_milestones, Milestone};
@@ -38,110 +45,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::db::Database;
-use crate::hmac_chain;
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
-
-// ── HMAC ──
-
-/// Domain string for HMAC key derivation. Combined with per-installation salt.
-pub(crate) const EVOLUTION_HMAC_DOMAIN: &[u8] = b"borg-evolution-chain-v1";
-
-/// Legacy compiled-in secret for installations without per-install salt.
-#[cfg(test)]
-const EVOLUTION_HMAC_LEGACY: &[u8] = b"borg-evolution-chain-v1";
-
-/// Compute HMAC for an evolution event (v2: includes metadata).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn compute_event_hmac(
-    key: &[u8],
-    prev_hmac: &str,
-    event_type: &str,
-    xp_delta: i32,
-    archetype: &str,
-    source: &str,
-    metadata: &str,
-    created_at: i64,
-) -> String {
-    hmac_chain::compute_hmac(
-        key,
-        &[
-            prev_hmac.as_bytes(),
-            event_type.as_bytes(),
-            &xp_delta.to_le_bytes(),
-            archetype.as_bytes(),
-            source.as_bytes(),
-            metadata.as_bytes(),
-            &created_at.to_le_bytes(),
-        ],
-    )
-}
-
-/// Legacy HMAC computation (v1: without metadata). Used for backward-compat verification.
-fn compute_event_hmac_legacy(
-    key: &[u8],
-    prev_hmac: &str,
-    event_type: &str,
-    xp_delta: i32,
-    archetype: &str,
-    source: &str,
-    created_at: i64,
-) -> String {
-    hmac_chain::compute_hmac(
-        key,
-        &[
-            prev_hmac.as_bytes(),
-            event_type.as_bytes(),
-            &xp_delta.to_le_bytes(),
-            archetype.as_bytes(),
-            source.as_bytes(),
-            &created_at.to_le_bytes(),
-        ],
-    )
-}
-
-/// Verify an event's HMAC against the expected chain.
-/// Tries v2 (with metadata) first, falls back to v1 (legacy) for existing events.
-fn verify_event_hmac(key: &[u8], event: &EvolutionEvent, expected_prev_hmac: &str) -> bool {
-    let meta = event.metadata_json.as_deref().unwrap_or("");
-    let archetype = event.archetype.as_deref().unwrap_or("");
-
-    // Try v2 HMAC (includes metadata)
-    let recomputed_v2 = compute_event_hmac(
-        key,
-        &event.prev_hmac,
-        &event.event_type,
-        event.xp_delta,
-        archetype,
-        &event.source,
-        meta,
-        event.created_at,
-    );
-    if hmac_chain::verify_chain_link(
-        &event.hmac,
-        &event.prev_hmac,
-        expected_prev_hmac,
-        &recomputed_v2,
-    ) {
-        return true;
-    }
-
-    // Fall back to v1 HMAC (legacy, without metadata)
-    let recomputed_v1 = compute_event_hmac_legacy(
-        key,
-        &event.prev_hmac,
-        &event.event_type,
-        event.xp_delta,
-        archetype,
-        &event.source,
-        event.created_at,
-    );
-    hmac_chain::verify_chain_link(
-        &event.hmac,
-        &event.prev_hmac,
-        expected_prev_hmac,
-        &recomputed_v1,
-    )
-}
 
 // ── Rate Limiting ──
 
@@ -588,228 +492,9 @@ pub fn compute_archetype_stable_days(db: &Database) -> u32 {
     (seconds / 86400) as u32
 }
 
-// ── Formatting ──
-
-/// Compact one-liner for TUI session header.
-pub fn format_compact(state: &EvolutionState) -> String {
-    match (&state.evolution_name, &state.dominant_archetype) {
-        (Some(name), Some(arch)) => {
-            let arch_display = format!("{arch}");
-            let capitalized = capitalize_first(&arch_display);
-            format!("{name} Lvl.{} | {capitalized}", state.level)
-        }
-        (Some(name), None) => format!("{name} Lvl.{}", state.level),
-        (None, Some(arch)) => {
-            let arch_display = format!("{arch}");
-            let capitalized = capitalize_first(&arch_display);
-            format!("Base Borg Lvl.{} | {capitalized}", state.level)
-        }
-        (None, None) => format!("Base Borg Lvl.{}", state.level),
-    }
-}
-
-/// Full status section for `borg status` output (default width).
-pub fn format_status_section(state: &EvolutionState) -> String {
-    format_status_section_with_width(state, 48)
-}
-
-/// Full status section with configurable card width.
-///
-/// `card_width` is the total width of the tip card including borders (minimum 34).
-pub fn format_status_section_with_width(state: &EvolutionState, card_width: usize) -> String {
-    let card_width = card_width.max(34);
-    let mut out = String::new();
-
-    // Header: name + level
-    match &state.evolution_name {
-        Some(name) => out.push_str(&format!("  {name} Lvl.{}\n", state.level)),
-        None => out.push_str(&format!("  Base Borg Lvl.{}\n", state.level)),
-    }
-
-    // Description
-    match &state.evolution_description {
-        Some(desc) => out.push_str(&format!("  \"{desc}\"\n")),
-        None => {
-            let inner = card_width - 2; // space between │ and │
-            let title = " How Evolution Works ";
-            let title_len = title.len(); // 21
-            let left_dashes = 3;
-            let right_dashes = inner.saturating_sub(left_dashes + title_len);
-
-            out.push('\n');
-            // Top border
-            let left = "\u{2500}".repeat(left_dashes);
-            let right = "\u{2500}".repeat(right_dashes);
-            out.push_str(&format!("  \u{256D}{left}{title}{right}\u{256E}\n"));
-
-            let lines = [
-                "",
-                "Your borg is learning how you use it.",
-                "Every tool call, shell command, and task",
-                "shapes what it becomes.",
-                "",
-                "Evolution is permanent -- earned through",
-                "sustained usage, not toggled. Your usage",
-                "patterns determine your borg's archetype",
-                "and unlock a unique evolution name.",
-                "",
-                "Keep using borg the way you imagine.",
-                "",
-            ];
-            for line in &lines {
-                if line.is_empty() {
-                    out.push_str(&format!("  \u{2502}{}\u{2502}\n", " ".repeat(inner)));
-                } else {
-                    // inner >= 32 because card_width >= 34
-                    let padded = format!("  {:<width$}", line, width = inner - 2);
-                    // Truncate if content is wider than available space
-                    let padded: String = padded.chars().take(inner).collect();
-                    out.push_str(&format!("  \u{2502}{padded}\u{2502}\n"));
-                }
-            }
-
-            // Bottom border
-            out.push_str(&format!("  \u{2570}{}\u{256F}\n", "\u{2500}".repeat(inner)));
-        }
-    }
-
-    out.push('\n');
-
-    // Stage progress bar — scale bar to fit card width
-    let bar_width = (card_width - 2).min(30); // bar portion, max 30
-    let stage_label = match state.stage {
-        Stage::Base => "Base (1/3)",
-        Stage::Evolved => "Evolved (2/3)",
-        Stage::Final => "Final (3/3)",
-    };
-    let stage_fill = match state.stage {
-        Stage::Base => bar_width / 3,
-        Stage::Evolved => bar_width * 2 / 3,
-        Stage::Final => bar_width,
-    };
-    let stage_bar = format!(
-        "{}{}",
-        "\u{2588}".repeat(stage_fill),
-        "\u{2591}".repeat(bar_width - stage_fill)
-    );
-    out.push_str(&format!("  Stage        {stage_bar}  {stage_label}\n"));
-
-    // XP progress
-    if state.level < 99 {
-        let xp_needed = xp_for_level(&state.stage, state.level);
-        let xp_into_level = xp_needed.saturating_sub(state.xp_to_next_level);
-        out.push_str(&format!(
-            "  XP           {xp_into_level} / {xp_needed} to Lvl.{}\n",
-            state.level + 1
-        ));
-    } else {
-        out.push_str("  XP           MAX LEVEL\n");
-    }
-
-    out
-}
-
-/// Format archetype scores for `borg status archetypes`.
-pub fn format_archetype_scores(state: &EvolutionState) -> String {
-    let mut out =
-        String::from("Archetype Scores\n  (how you use borg shapes its identity; * = dominant)\n");
-
-    let mut sorted: Vec<(Archetype, u32)> = Archetype::ALL
-        .iter()
-        .map(|a| (*a, *state.archetype_scores.get(a).unwrap_or(&0)))
-        .collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let max_score = sorted.first().map(|(_, s)| *s).unwrap_or(1).max(1);
-
-    for (arch, score) in &sorted {
-        let arch_display = format!("{arch}");
-        let capitalized = capitalize_first(&arch_display);
-        let bar_len = (*score as usize * 10) / max_score as usize;
-        let bar = format!(
-            "{}{}",
-            "\u{2588}".repeat(bar_len),
-            "\u{2591}".repeat(10 - bar_len)
-        );
-        let marker = if Some(*arch) == state.dominant_archetype {
-            " *"
-        } else {
-            ""
-        };
-        out.push_str(&format!("  {capitalized:<15} {score:>5}  {bar}{marker}\n"));
-    }
-
-    out
-}
-
-/// Format evolution history timeline.
-pub fn format_history(events: &[EvolutionEvent]) -> String {
-    let evolution_events: Vec<&EvolutionEvent> = events
-        .iter()
-        .filter(|e| e.event_type == "evolution")
-        .collect();
-
-    if evolution_events.is_empty() {
-        return "Evolution History\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  No evolutions yet. Keep using Borg!\n".to_string();
-    }
-
-    let mut out = String::from("Evolution History\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n");
-
-    for event in &evolution_events {
-        let ts = chrono::DateTime::from_timestamp(event.created_at, 0)
-            .map(|dt| dt.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let mut name = String::new();
-        let mut desc = String::new();
-        if let Some(ref meta) = event.metadata_json {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta) {
-                if let Some(n) = parsed.get("name").and_then(|v| v.as_str()) {
-                    name = n.to_string();
-                }
-                if let Some(d) = parsed.get("description").and_then(|v| v.as_str()) {
-                    desc = d.to_string();
-                }
-            }
-        }
-
-        let stage_label = if name.is_empty() {
-            "Evolved".to_string()
-        } else {
-            name.clone()
-        };
-
-        out.push_str(&format!("  {ts}  → {stage_label}\n"));
-        if !desc.is_empty() {
-            out.push_str(&format!("           \"{desc}\"\n"));
-        }
-    }
-
-    out
-}
-
-/// XML evolution context for system prompt injection.
-pub fn format_evolution_context(state: &EvolutionState) -> String {
-    let name = state.evolution_name.as_deref().unwrap_or("Base Borg");
-    let stage = match state.stage {
-        Stage::Base => "Base",
-        Stage::Evolved => "Evolved",
-        Stage::Final => "Final",
-    };
-    let arch = state
-        .dominant_archetype
-        .map(|a| {
-            let s = format!("{a}");
-            let score = state.archetype_scores.get(&a).unwrap_or(&0);
-            format!("\nArchetype: {} (score: {score})", capitalize_first(&s))
-        })
-        .unwrap_or_default();
-
-    format!(
-        "<evolution_context>\nStage: {stage} | {name} Lvl.{}{arch}\n</evolution_context>",
-        state.level
-    )
-}
+// Status/history/context renderers live in `evolution::format`. The
+// `pub use format::{…}` at the top of this file re-exports them so the
+// public API is unchanged.
 
 pub(super) fn capitalize_first(s: &str) -> String {
     let mut c = s.chars();

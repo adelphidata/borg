@@ -1,4 +1,53 @@
 use anyhow::Result;
+use clap::Subcommand;
+
+#[derive(Subcommand)]
+pub(crate) enum StatusAction {
+    /// Show evolution history timeline
+    History,
+    /// Show archetype score breakdown
+    Archetypes,
+    /// Show XP summary and recent feed
+    Xp,
+    /// Show compact evolution overview with readiness and momentum
+    Evolution,
+    /// Print an ASCII share card (--out writes to a file instead of stdout)
+    Card {
+        /// Output path. Omit to print to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum BondAction {
+    /// Show recent bond event history
+    History {
+        /// Number of events to show
+        #[arg(long, short, default_value_t = 20)]
+        count: usize,
+    },
+}
+
+/// Dispatch for `borg status ...`.
+pub(crate) fn dispatch_status(action: Option<StatusAction>) -> Result<()> {
+    match action {
+        None => run_status(),
+        Some(StatusAction::History) => run_status_history(),
+        Some(StatusAction::Archetypes) => run_status_archetypes(),
+        Some(StatusAction::Xp) => run_status_xp(),
+        Some(StatusAction::Evolution) => run_status_evolution(),
+        Some(StatusAction::Card { out }) => run_status_card(out),
+    }
+}
+
+/// Dispatch for `borg bond ...`.
+pub(crate) fn dispatch_bond(action: Option<BondAction>) -> Result<()> {
+    match action {
+        Some(BondAction::History { count }) => run_bond_history(count),
+        None => run_bond_status(),
+    }
+}
 
 pub(crate) fn run_status() -> Result<()> {
     let now = chrono::Utc::now();

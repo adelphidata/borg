@@ -3,11 +3,10 @@ use reqwest::Client;
 
 use super::types::CreateMessageRequest;
 use crate::chunker;
-use crate::constants::GATEWAY_HTTP_TIMEOUT;
+use crate::constants::{
+    GATEWAY_HTTP_TIMEOUT, GOOGLE_CHAT_API_BASE, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE,
+};
 use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
-
-const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
-const MESSAGE_CHUNK_SIZE: usize = 4096;
 
 /// A client for the Google Chat API.
 #[derive(Clone)]
@@ -35,7 +34,7 @@ impl GoogleChatClient {
         text: &str,
         thread_name: Option<&str>,
     ) -> Result<()> {
-        let chunks = chunker::chunk_text_nonempty(text, MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunk_text_nonempty(text, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE);
 
         for chunk in &chunks {
             self.send_single_message(space_name, chunk, thread_name)
@@ -148,7 +147,7 @@ mod tests {
     #[test]
     fn chunking_integration() {
         let long_text: String = "a".repeat(9000);
-        let chunks = chunker::chunk_text(&long_text, MESSAGE_CHUNK_SIZE);
+        let chunks = chunker::chunk_text(&long_text, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].len(), 4096);
         assert_eq!(chunks[1].len(), 4096);
