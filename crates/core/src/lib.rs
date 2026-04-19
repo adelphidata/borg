@@ -38,6 +38,8 @@ pub mod agent;
 pub mod bond;
 /// Headless Chrome automation via CDP.
 pub mod browser;
+/// Centralized channel name constants and `ChannelName` enum.
+pub mod channel_names;
 /// Markdown-aware content chunking with code fence preservation.
 pub mod chunker;
 /// Claude Code CLI subprocess backend for subscription-based access.

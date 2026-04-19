@@ -50,6 +50,9 @@ pub const DISCORD_DEDUP_CAPACITY: usize = 5000;
 /// retries deliveries on 5xx responses, so we dedup by activity ID.
 pub const TEAMS_DEDUP_CAPACITY: usize = 2000;
 
+/// Capacity of the Signal SSE message deduplicator.
+pub const SIGNAL_DEDUP_CAPACITY: usize = 1000;
+
 /// Capacity of the Slack echo cache (recently sent message hashes).
 pub const SLACK_ECHO_CACHE_CAPACITY: usize = 100;
 
@@ -66,6 +69,28 @@ pub const CHANNEL_DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
 /// Default max concurrent channel handlers.
 pub const CHANNEL_DEFAULT_MAX_CONCURRENT: usize = 5;
+
+/// Default timeout for tool execution (30s).
+pub const TOOLS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default timeout for user script execution (60s).
+pub const SCRIPTS_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+/// Default timeout for audio transcription requests (60s).
+pub const AUDIO_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+/// Default timeout for text-to-speech synthesis requests (30s).
+pub const TTS_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default per-task / per-workflow-step execution timeout (5m).
+/// Used by `scheduled_tasks.timeout_ms` and workflow step defaults.
+pub const SCHEDULED_TASK_DEFAULT_TIMEOUT_MS: u64 = 300_000;
+
+/// Default timeout for seeded nightly/weekly workflows (10m).
+pub const SEEDED_WORKFLOW_TIMEOUT_MS: u64 = 600_000;
+
+/// SQLite `busy_timeout` for gateway DB opens (30s).
+pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = 30_000;
 
 /// Minimum allowed heartbeat interval in seconds.
 pub const MIN_HEARTBEAT_INTERVAL_SECS: u64 = 60;

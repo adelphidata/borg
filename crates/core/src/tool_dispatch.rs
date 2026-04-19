@@ -10,6 +10,7 @@ use anyhow::Result;
 use crate::config::Config;
 use crate::constants::IDENTITY_FILE;
 use crate::tool_handlers;
+use crate::tool_names as tn;
 
 /// Handle `write_memory` with side effects: identity cache invalidation and
 /// background embedding generation.
@@ -97,7 +98,7 @@ pub(crate) async fn try_handle_multi_agent_tool(
     history: &[crate::types::Message],
 ) -> Option<Result<String>> {
     Some(match name {
-        "spawn_agent" => {
+        tn::SPAWN_AGENT => {
             if let Some(ref mut ctrl) = agent_control {
                 let hist = if args["fork_context"].as_bool().unwrap_or(false) {
                     Some(history)
@@ -109,29 +110,29 @@ pub(crate) async fn try_handle_multi_agent_tool(
                 Ok(MULTI_AGENT_DISABLED.to_string())
             }
         }
-        "send_to_agent" => Err(anyhow::anyhow!("send_to_agent is not yet implemented")),
-        "wait_for_agent" => {
+        tn::SEND_TO_AGENT => Err(anyhow::anyhow!("send_to_agent is not yet implemented")),
+        tn::WAIT_FOR_AGENT => {
             if let Some(ref mut ctrl) = agent_control {
                 crate::multi_agent::tools::handle_wait_for_agent(args, ctrl).await
             } else {
                 Ok(MULTI_AGENT_DISABLED.to_string())
             }
         }
-        "list_agents" => {
+        tn::LIST_AGENTS => {
             if let Some(ref ctrl) = agent_control {
                 crate::multi_agent::tools::handle_list_agents(ctrl)
             } else {
                 Ok(MULTI_AGENT_DISABLED.to_string())
             }
         }
-        "close_agent" => {
+        tn::CLOSE_AGENT => {
             if let Some(ref mut ctrl) = agent_control {
                 crate::multi_agent::tools::handle_close_agent(args, ctrl)
             } else {
                 Ok(MULTI_AGENT_DISABLED.to_string())
             }
         }
-        "manage_roles" => crate::multi_agent::tools::handle_manage_roles(args),
+        tn::MANAGE_ROLES => crate::multi_agent::tools::handle_manage_roles(args),
         _ => return None,
     })
 }

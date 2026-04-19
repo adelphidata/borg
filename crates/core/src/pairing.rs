@@ -57,19 +57,19 @@ pub fn parse_prefixed_code(code: &str) -> Option<(&'static str, &str)> {
 }
 
 /// Display name for a channel (capitalized).
+///
+/// Recognized built-in channels come from `ChannelName`. Unknown strings
+/// (custom script-based channels, legacy aliases like "whatsapp"/"sms")
+/// fall back to specific mappings or the raw string.
 pub fn channel_display_name(channel_name: &str) -> String {
-    match channel_name.to_lowercase().as_str() {
-        "telegram" => "Telegram".to_string(),
-        "slack" => "Slack".to_string(),
-        "discord" => "Discord".to_string(),
-        "teams" => "Teams".to_string(),
-        "google_chat" => "Google Chat".to_string(),
-        "signal" => "Signal".to_string(),
-        "twilio" => "Twilio".to_string(),
+    let lower = channel_name.to_ascii_lowercase();
+    if let Ok(known) = lower.parse::<crate::channel_names::ChannelName>() {
+        return known.display_name().to_string();
+    }
+    match lower.as_str() {
         "whatsapp" => "WhatsApp".to_string(),
         "sms" => "SMS".to_string(),
-        "imessage" => "iMessage".to_string(),
-        other => other.to_string(),
+        _ => channel_name.to_string(),
     }
 }
 

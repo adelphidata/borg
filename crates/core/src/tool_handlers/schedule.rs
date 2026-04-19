@@ -507,7 +507,7 @@ fn workflow_create(args: &serde_json::Value) -> Result<String> {
         let timeout_ms = step_val
             .get("timeout_ms")
             .and_then(serde_json::Value::as_i64)
-            .unwrap_or(300_000)
+            .unwrap_or(crate::constants::SCHEDULED_TASK_DEFAULT_TIMEOUT_MS as i64)
             .max(1000); // minimum 1 second
 
         steps.push(crate::db::NewWorkflowStep {

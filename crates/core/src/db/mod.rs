@@ -49,7 +49,7 @@ impl Database {
     /// Default busy timeout for CLI usage (5 seconds).
     const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5000;
     /// Recommended busy timeout for gateway/concurrent workloads (30 seconds).
-    pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = 30000;
+    pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = crate::constants::GATEWAY_BUSY_TIMEOUT_MS;
 
     /// Open (or create) the database at `~/.borg/borg.db` with default busy timeout.
     #[instrument(skip_all)]

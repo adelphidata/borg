@@ -12,7 +12,9 @@ impl Database {
     pub fn create_task(&self, task: &NewTask<'_>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let max_retries = task.max_retries.unwrap_or(3);
-        let timeout_ms = task.timeout_ms.unwrap_or(300_000);
+        let timeout_ms = task
+            .timeout_ms
+            .unwrap_or(crate::constants::SCHEDULED_TASK_DEFAULT_TIMEOUT_MS as i64);
         self.conn.execute(
             "INSERT INTO scheduled_tasks (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",

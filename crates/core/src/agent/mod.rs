@@ -23,17 +23,23 @@ use crate::llm::{LlmClient, StreamEvent, UsageData};
 use crate::logging::log_message;
 use crate::memory::{load_memory_context_db, load_memory_context_db_ranked};
 use crate::policy::ExecutionPolicy;
-use crate::rate_guard::{ActionType, RateDecision, SessionRateGuard};
+use crate::rate_guard::{RateDecision, SessionRateGuard};
 use crate::secrets::redact_secrets;
 use crate::session::Session;
 use crate::skills::load_skills_context;
 use crate::telemetry::BorgMetrics;
 use crate::template::Template;
 use crate::tool_handlers;
+use crate::tool_names as tn;
 use crate::truncate::truncate_output;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition, ToolOutput};
 
 use std::sync::LazyLock;
+
+mod tool_classification;
+
+pub use tool_classification::mutating_tool_names;
+use tool_classification::{classify_action, is_mutating_tool};
 
 /// Spawn a background task that logs panics instead of silently swallowing them.
 pub(crate) fn spawn_logged(
@@ -72,18 +78,18 @@ static SETUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 });
 
 // Collaboration mode templates
-const COLLAB_MODE_DEFAULT: &str = include_str!("../templates/collaboration_mode/default.md");
-const COLLAB_MODE_EXECUTE: &str = include_str!("../templates/collaboration_mode/execute.md");
-const COLLAB_MODE_PLAN: &str = include_str!("../templates/collaboration_mode/plan.md");
+const COLLAB_MODE_DEFAULT: &str = include_str!("../../templates/collaboration_mode/default.md");
+const COLLAB_MODE_EXECUTE: &str = include_str!("../../templates/collaboration_mode/execute.md");
+const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
 
 // Workflow guidance template (injected when workflows are active for current model)
-const WORKFLOW_GUIDANCE: &str = include_str!("../templates/workflow_guidance.md");
+const WORKFLOW_GUIDANCE: &str = include_str!("../../templates/workflow_guidance.md");
 
 /// Maximum number of parallel tool calls allowed in a single LLM response.
 /// Prevents OOM from malformed stream events with huge indices.
 const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
 
-const SECURITY_POLICY: &str = include_str!("../templates/security_policy.md");
+const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
 /// Result of monthly token budget check.
 enum BudgetCheck {
@@ -2524,8 +2530,8 @@ Rules:
 
         // Tools that return ToolOutput directly (may contain multimodal content)
         match name {
-            "read_file" => return tool_handlers::handle_read_file(&args, &self.config),
-            "browser" => {
+            tn::READ_FILE => return tool_handlers::handle_read_file(&args, &self.config),
+            tn::BROWSER => {
                 return tool_handlers::handle_browser(
                     &args,
                     &self.config,
@@ -2533,7 +2539,7 @@ Rules:
                 )
                 .await;
             }
-            "text_to_speech" => {
+            tn::TEXT_TO_SPEECH => {
                 if let Some(ref synth) = self.tts_synthesizer {
                     return Ok(tool_handlers::handle_text_to_speech(&args, synth).await);
                 }
@@ -2542,7 +2548,7 @@ Rules:
                         .into(),
                 ));
             }
-            "request_user_input" => {
+            tn::REQUEST_USER_INPUT => {
                 return tool_handlers::handle_request_user_input(&args, event_tx).await;
             }
             _ => {}
@@ -2551,25 +2557,27 @@ Rules:
         // Tools that return Result<String> (wrapped to ToolOutput::Text below)
         let text_result: Result<String> = match name {
             // Memory
-            "write_memory" => crate::tool_dispatch::handle_write_memory_with_effects(
+            tn::WRITE_MEMORY => crate::tool_dispatch::handle_write_memory_with_effects(
                 &args,
                 &self.config,
                 &self.config_arc,
                 &mut self.cached_identity,
             ),
-            "read_memory" => tool_handlers::handle_read_memory(&args),
-            "memory_search" => tool_handlers::handle_memory_search(&args, &self.config).await,
+            tn::READ_MEMORY => tool_handlers::handle_read_memory(&args),
+            tn::MEMORY_SEARCH => tool_handlers::handle_memory_search(&args, &self.config).await,
             // Resource listing
-            "list" => tool_handlers::handle_list(&args, &self.config, self.agent_control.as_ref()),
-            "list_skills" => tool_handlers::handle_list_skills(&self.config),
-            "list_channels" => tool_handlers::handle_list_channels(&self.config),
+            tn::LIST => {
+                tool_handlers::handle_list(&args, &self.config, self.agent_control.as_ref())
+            }
+            tn::LIST_SKILLS => tool_handlers::handle_list_skills(&self.config),
+            tn::LIST_CHANNELS => tool_handlers::handle_list_channels(&self.config),
             // File operations
-            "apply_patch" => tool_handlers::handle_apply_patch_unified(&args, &self.config),
-            "apply_skill_patch" => tool_handlers::handle_apply_skill_patch(&args),
-            "create_channel" => tool_handlers::handle_create_channel(&args),
-            "list_dir" => tool_handlers::handle_list_dir(&args, &self.config),
+            tn::APPLY_PATCH => tool_handlers::handle_apply_patch_unified(&args, &self.config),
+            tn::APPLY_SKILL_PATCH => tool_handlers::handle_apply_skill_patch(&args),
+            tn::CREATE_CHANNEL => tool_handlers::handle_create_channel(&args),
+            tn::LIST_DIR => tool_handlers::handle_list_dir(&args, &self.config),
             // Shell & web
-            "run_shell" => {
+            tn::RUN_SHELL => {
                 tool_handlers::handle_run_shell(
                     &args,
                     &self.config,
@@ -2579,18 +2587,22 @@ Rules:
                 )
                 .await
             }
-            "web_fetch" => tool_handlers::handle_web_fetch(&args, &self.config).await,
-            "web_search" => tool_handlers::handle_web_search(&args, &self.config).await,
+            tn::WEB_FETCH => tool_handlers::handle_web_fetch(&args, &self.config).await,
+            tn::WEB_SEARCH => tool_handlers::handle_web_search(&args, &self.config).await,
             // Scheduling & projects
-            "schedule" | "manage_tasks" | "manage_cron" => {
+            tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON => {
                 tool_handlers::handle_schedule(&args, &self.config)
             }
-            "projects" => tool_handlers::handle_projects(&args, &self.config),
+            tn::PROJECTS => tool_handlers::handle_projects(&args, &self.config),
             // Media
-            "generate_image" => tool_handlers::handle_generate_image(&args, &self.config).await,
+            tn::GENERATE_IMAGE => tool_handlers::handle_generate_image(&args, &self.config).await,
             // Multi-agent tools
-            name @ ("spawn_agent" | "send_to_agent" | "wait_for_agent" | "list_agents"
-            | "close_agent" | "manage_roles") => {
+            name @ (tn::SPAWN_AGENT
+            | tn::SEND_TO_AGENT
+            | tn::WAIT_FOR_AGENT
+            | tn::LIST_AGENTS
+            | tn::CLOSE_AGENT
+            | tn::MANAGE_ROLES) => {
                 match crate::tool_dispatch::try_handle_multi_agent_tool(
                     name,
                     &args,
@@ -2672,24 +2684,26 @@ async fn dispatch_parallel_safe_tool(
     };
 
     match name {
-        "read_file" => tool_handlers::handle_read_file(&args, config),
-        "read_memory" => tool_handlers::handle_read_memory(&args).map(ToolOutput::Text),
-        "memory_search" => tool_handlers::handle_memory_search(&args, config)
+        tn::READ_FILE => tool_handlers::handle_read_file(&args, config),
+        tn::READ_MEMORY => tool_handlers::handle_read_memory(&args).map(ToolOutput::Text),
+        tn::MEMORY_SEARCH => tool_handlers::handle_memory_search(&args, config)
             .await
             .map(ToolOutput::Text),
-        "list_skills" => tool_handlers::handle_list_skills(config).map(ToolOutput::Text),
-        "list_channels" => tool_handlers::handle_list_channels(config).map(ToolOutput::Text),
-        "list_dir" => tool_handlers::handle_list_dir(&args, config).map(ToolOutput::Text),
-        "web_fetch" => tool_handlers::handle_web_fetch(&args, config)
+        tn::LIST_SKILLS => tool_handlers::handle_list_skills(config).map(ToolOutput::Text),
+        tn::LIST_CHANNELS => tool_handlers::handle_list_channels(config).map(ToolOutput::Text),
+        tn::LIST_DIR => tool_handlers::handle_list_dir(&args, config).map(ToolOutput::Text),
+        tn::WEB_FETCH => tool_handlers::handle_web_fetch(&args, config)
             .await
             .map(ToolOutput::Text),
-        "web_search" => tool_handlers::handle_web_search(&args, config)
+        tn::WEB_SEARCH => tool_handlers::handle_web_search(&args, config)
             .await
             .map(ToolOutput::Text),
-        "apply_patch" => {
+        tn::APPLY_PATCH => {
             tool_handlers::handle_apply_patch_unified(&args, config).map(ToolOutput::Text)
         }
-        "apply_skill_patch" => tool_handlers::handle_apply_skill_patch(&args).map(ToolOutput::Text),
+        tn::APPLY_SKILL_PATCH => {
+            tool_handlers::handle_apply_skill_patch(&args).map(ToolOutput::Text)
+        }
         other => {
             // Planner bug — fall back loudly rather than running sequentially
             // via a different code path.
@@ -2757,6 +2771,7 @@ struct PartialToolCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rate_guard::ActionType;
 
     // ── Prompt cache: stable prefix ordering ──
     //
@@ -2767,7 +2782,7 @@ mod tests {
     // perturbed. The full end-to-end behavior is exercised indirectly
     // through the Anthropic request tests in `llm.rs`.
 
-    const AGENT_RS_SRC: &str = include_str!("agent.rs");
+    const AGENT_RS_SRC: &str = include_str!("mod.rs");
 
     fn extract_build_system_prompt_body() -> &'static str {
         let start = AGENT_RS_SRC
@@ -3258,7 +3273,7 @@ mod tests {
 
     #[test]
     fn default_mode_requires_task_confirmation() {
-        let template = include_str!("../templates/collaboration_mode/default.md");
+        let template = include_str!("../../templates/collaboration_mode/default.md");
         assert!(
             template.contains("briefly confirm what changed"),
             "Default collaboration mode must instruct agent to confirm task completion"
@@ -3267,7 +3282,7 @@ mod tests {
 
     #[test]
     fn execute_mode_requires_task_confirmation() {
-        let template = include_str!("../templates/collaboration_mode/execute.md");
+        let template = include_str!("../../templates/collaboration_mode/execute.md");
         assert!(
             template.contains("Never end a turn silently"),
             "Execute collaboration mode must instruct agent to never end silently"
@@ -3383,68 +3398,5 @@ mod tests {
         assert!(security < silent, "security before silent reply");
         assert!(silent < heartbeat, "silent reply before heartbeat");
         assert!(heartbeat < env, "heartbeat before environment");
-    }
-}
-
-/// Map a tool name to an action type for rate limiting.
-/// Returns true if the tool performs mutations (file writes, shell commands, etc.).
-/// Used to block mutating tools in Plan mode.
-///
-/// Uses an allowlist of known-safe tools so that new tools default to blocked,
-/// preventing accidental mutation in plan mode.
-fn is_mutating_tool(name: &str) -> bool {
-    !matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "list"
-            | "list_skills"
-            | "list_channels"
-            | "list_agents"
-            | "read_memory"
-            | "memory_search"
-            | "web_fetch"
-            | "web_search"
-    )
-}
-
-/// Names of every tool that [`is_mutating_tool`] considers mutating.
-///
-/// Kept in sync with that function so callers (e.g. sub-agent delegation in
-/// Plan mode) can union this list into a child's tool blocklist without
-/// having to iterate every possible tool name themselves.
-pub fn mutating_tool_names() -> &'static [&'static str] {
-    &[
-        "apply_patch",
-        "apply_skill_patch",
-        "browser",
-        "close_agent",
-        "create_channel",
-        "generate_image",
-        "manage_cron",
-        "manage_roles",
-        "manage_tasks",
-        "projects",
-        "request_user_input",
-        "run_shell",
-        "schedule",
-        "send_to_agent",
-        "spawn_agent",
-        "text_to_speech",
-        "wait_for_agent",
-        "write_memory",
-    ]
-}
-
-fn classify_action(tool_name: &str) -> ActionType {
-    match tool_name {
-        "run_shell" => ActionType::ShellCommand,
-        "apply_patch" | "apply_skill_patch" | "create_channel" => ActionType::FileWrite,
-        "write_memory" => ActionType::MemoryWrite,
-        "memory_search" | "read_memory" => ActionType::ToolCall,
-        "web_fetch" | "web_search" | "browser" | "text_to_speech" | "generate_image" => {
-            ActionType::WebRequest
-        }
-        _ => ActionType::ToolCall,
     }
 }

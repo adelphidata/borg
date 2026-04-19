@@ -22,9 +22,6 @@ const STALL_TIMEOUT: Duration = constants::SIGNAL_SSE_STALL_TIMEOUT;
 /// Maximum SSE buffer size before we drop and reconnect (1 MB).
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 
-/// Capacity for the inbound message deduplicator.
-const DEDUP_CAPACITY: usize = 1000;
-
 /// Callback invoked for each parsed inbound message from the SSE stream.
 /// Arguments: (inbound message, recipient string for replies, optional group_id).
 pub type SseCallback = Arc<
@@ -47,7 +44,7 @@ pub async fn run_sse_loop(
     shutdown: CancellationToken,
 ) {
     let mut consecutive_errors: u32 = 0;
-    let mut dedup = MessageDeduplicator::new(DEDUP_CAPACITY);
+    let mut dedup = MessageDeduplicator::new();
 
     loop {
         if shutdown.is_cancelled() {
@@ -164,7 +161,7 @@ pub async fn run_sse_loop(
                                 .as_deref()
                                 .and_then(|id| id.parse::<i64>().ok())
                                 .unwrap_or(0);
-                            if dedup.is_duplicate(&inbound.sender_id, ts) {
+                            if dedup.seen(&inbound.sender_id, ts) {
                                 continue;
                             }
                             callback(inbound, recipient, group_id).await;

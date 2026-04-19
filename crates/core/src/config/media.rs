@@ -174,7 +174,7 @@ impl Default for AudioConfig {
             max_file_size: 20 * 1024 * 1024,
             min_file_size: 1024,
             language: None,
-            timeout_ms: 60_000,
+            timeout_ms: constants::AUDIO_DEFAULT_TIMEOUT_MS,
             echo_transcript: false,
         }
     }
@@ -228,7 +228,7 @@ impl Default for TtsConfig {
             default_voice: "alloy".into(),
             default_format: "mp3".into(),
             max_text_length: 4096,
-            timeout_ms: 30_000,
+            timeout_ms: constants::TTS_DEFAULT_TIMEOUT_MS,
             auto_mode: false,
         }
     }
@@ -320,7 +320,7 @@ pub struct ToolsConfig {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            default_timeout_ms: 30000,
+            default_timeout_ms: constants::TOOLS_DEFAULT_TIMEOUT_MS,
             policy: super::security::ToolPolicyConfig::default(),
             conditional_loading: true,
             compact_schemas: true,
@@ -757,7 +757,7 @@ impl Default for ScriptsConfig {
             default_sandbox_profile: "default".to_string(),
             ephemeral_ttl_secs: 86400,
             max_scripts: 100,
-            default_timeout_ms: 60000,
+            default_timeout_ms: constants::SCRIPTS_DEFAULT_TIMEOUT_MS,
         }
     }
 }

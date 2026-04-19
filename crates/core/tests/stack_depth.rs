@@ -66,7 +66,7 @@ fn run_sub_agent_still_box_pins_future() {
 /// commit 2bfa62761 "stack overflow fix").
 #[test]
 fn agent_loop_usage_arm_is_extracted() {
-    let src = include_str!("../src/agent.rs");
+    let src = include_str!("../src/agent/mod.rs");
     assert!(
         src.contains("fn record_usage("),
         "record_usage helper has been inlined back into run_agent_loop — re-extract it \
