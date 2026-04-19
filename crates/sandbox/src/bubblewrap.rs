@@ -203,52 +203,43 @@ mod tests {
     // --- Version detection tests ---
 
     #[test]
-    fn parse_version_standard() {
-        let v = parse_bwrap_version("bubblewrap 0.4.1").unwrap();
-        assert_eq!(
-            v,
-            BwrapVersion {
-                major: 0,
-                minor: 4,
-                patch: 1
-            }
-        );
-    }
-
-    #[test]
-    fn parse_version_bare() {
-        let v = parse_bwrap_version("0.6.2").unwrap();
-        assert_eq!(
-            v,
-            BwrapVersion {
-                major: 0,
-                minor: 6,
-                patch: 2
-            }
-        );
-    }
-
-    #[test]
-    fn parse_version_no_patch() {
-        let v = parse_bwrap_version("bubblewrap 0.2").unwrap();
-        assert_eq!(
-            v,
-            BwrapVersion {
-                major: 0,
-                minor: 2,
-                patch: 0
-            }
-        );
-    }
-
-    #[test]
-    fn parse_version_garbage() {
-        assert!(parse_bwrap_version("not a version").is_none());
-    }
-
-    #[test]
-    fn parse_version_empty() {
-        assert!(parse_bwrap_version("").is_none());
+    fn parse_version_table() {
+        // (input, expected) — None means parse must fail.
+        let cases: &[(&str, Option<BwrapVersion>)] = &[
+            (
+                "bubblewrap 0.4.1",
+                Some(BwrapVersion {
+                    major: 0,
+                    minor: 4,
+                    patch: 1,
+                }),
+            ),
+            (
+                "0.6.2",
+                Some(BwrapVersion {
+                    major: 0,
+                    minor: 6,
+                    patch: 2,
+                }),
+            ),
+            (
+                "bubblewrap 0.2",
+                Some(BwrapVersion {
+                    major: 0,
+                    minor: 2,
+                    patch: 0,
+                }),
+            ),
+            ("not a version", None),
+            ("", None),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                parse_bwrap_version(input),
+                *expected,
+                "parse_bwrap_version({input:?})"
+            );
+        }
     }
 
     #[test]

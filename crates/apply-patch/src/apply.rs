@@ -676,6 +676,32 @@ mod tests {
     }
 
     #[test]
+    fn move_only_patch_renames_preserving_content() {
+        // Pure rename via the public string-based API: parse + apply with
+        // only `*** Move to:` and zero hunks. Catches regressions where
+        // empty-hunks paths silently no-op or where content is mangled.
+        let dir = TempDir::new().unwrap();
+        let original = "line one\nline two\nline three\n";
+        std::fs::write(dir.path().join("old.txt"), original).unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: old.txt
+*** Move to: new.txt
+*** End Patch";
+
+        let affected = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
+        assert_eq!(
+            affected.moved,
+            vec![("old.txt".to_string(), "new.txt".to_string())]
+        );
+        assert!(affected.modified.is_empty(), "rename must not also modify");
+        assert!(!dir.path().join("old.txt").exists());
+        let content = std::fs::read_to_string(dir.path().join("new.txt")).unwrap();
+        assert_eq!(content, original, "content must be preserved byte-for-byte");
+    }
+
+    #[test]
     fn move_file_path_traversal_blocked() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("src.txt"), "data").unwrap();

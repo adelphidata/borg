@@ -336,6 +336,42 @@ mod tests {
     }
 
     #[test]
+    fn peer_kind_reflects_guild_id_presence() {
+        // peer_kind drives downstream dm_policy enforcement: a DM (guild_id=None)
+        // must be classified as `direct` so the gateway gates unknown senders
+        // through pairing. If this conditional inverts, DMs get treated as
+        // group messages and dm_policy never applies → unknown senders bypass.
+        let mut group = make_interaction(InteractionType::ApplicationCommand);
+        group.guild_id = Some("g1".into());
+        group.data = Some(InteractionData {
+            id: Some("cmd1".into()),
+            name: Some("hello".into()),
+            options: None,
+            custom_id: None,
+        });
+        let group_msg = parse_interaction(&group).unwrap();
+        assert_eq!(group_msg.peer_kind.as_deref(), Some(PEER_KIND_GROUP));
+
+        let mut dm = make_interaction(InteractionType::ApplicationCommand);
+        dm.guild_id = None;
+        dm.member = None;
+        dm.user = Some(DiscordUser {
+            id: "u_dm".into(),
+            username: "dm_user".into(),
+            bot: Some(false),
+        });
+        dm.data = Some(InteractionData {
+            id: Some("cmd1".into()),
+            name: Some("hello".into()),
+            options: None,
+            custom_id: None,
+        });
+        let dm_msg = parse_interaction(&dm).unwrap();
+        assert_eq!(dm_msg.peer_kind.as_deref(), Some(PEER_KIND_DIRECT));
+        assert_eq!(dm_msg.sender_id, "u_dm");
+    }
+
+    #[test]
     fn message_component_no_custom_id_returns_none() {
         let mut interaction = make_interaction(InteractionType::MessageComponent);
         interaction.data = Some(InteractionData {

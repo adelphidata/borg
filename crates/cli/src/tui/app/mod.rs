@@ -2120,6 +2120,48 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_cycles_modes_and_manages_previous_collab_mode() {
+        // Shift+Tab (BackTab) is the only keyboard path through
+        // `cycle_collaboration_mode`. Existing tests cover `/plan` and
+        // `/mode <name>` but not the cycle path. Invariant from
+        // key_handlers.rs:120-124: stash previous mode when *entering* Plan;
+        // clear when leaving Plan.
+        let mut app = make_app();
+        let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        // Default → Execute. Not entering Plan, so no stash.
+        app.handle_key(back_tab).unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Execute
+        );
+        assert_eq!(app.previous_collab_mode, None);
+
+        // Execute → Plan. Entering Plan from non-Plan stashes Execute.
+        app.handle_key(back_tab).unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Plan
+        );
+        assert_eq!(
+            app.previous_collab_mode,
+            Some(CollaborationMode::Execute),
+            "entering Plan must stash the prior mode for restore"
+        );
+
+        // Plan → Default. Leaving Plan must clear the stash.
+        app.handle_key(back_tab).unwrap();
+        assert_eq!(
+            app.config.conversation.collaboration_mode,
+            CollaborationMode::Default
+        );
+        assert_eq!(
+            app.previous_collab_mode, None,
+            "leaving Plan via cycle must clear the stashed mode"
+        );
+    }
+
+    #[test]
     fn turn_complete_in_plan_mode_opens_review_overlay() {
         let mut app = make_app();
         app.config.conversation.collaboration_mode = CollaborationMode::Plan;

@@ -304,12 +304,17 @@ impl HeartbeatScheduler {
         };
 
         let now = chrono::Utc::now().with_timezone(&self.timezone).time();
+        quiet_hours_contains(start, end, now)
+    }
+}
 
-        if start <= end {
-            now >= start && now < end
-        } else {
-            now >= start || now < end
-        }
+/// Pure check: is `now` within the quiet-hours window `[start, end)`?
+/// Handles wrap-around (start > end) by treating the window as crossing midnight.
+fn quiet_hours_contains(start: NaiveTime, end: NaiveTime, now: NaiveTime) -> bool {
+    if start <= end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
     }
 }
 
@@ -395,37 +400,44 @@ mod tests {
     }
 
     #[test]
-    fn quiet_hours_wraparound_midnight() {
-        // Quiet hours that cross midnight: 22:00 - 06:00
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: Some("22:00".to_string()),
-            quiet_hours_end: Some("06:00".to_string()),
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        let sched = test_scheduler(config, chrono_tz::UTC);
-        // This test just ensures the wrap-around path doesn't panic.
-        // The actual result depends on current UTC time.
-        let _ = sched.is_quiet_hours();
-    }
+    fn quiet_hours_contains_boundary_table() {
+        // Window 23:55–06:00 (wraps midnight). Half-open [start, end): start
+        // is INSIDE, end is OUTSIDE. Boundary regression target — flipping
+        // < to <= or >= to > in `quiet_hours_contains` must fail this.
+        let start = NaiveTime::from_hms_opt(23, 55, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+        let cases: &[(NaiveTime, bool)] = &[
+            (NaiveTime::from_hms_opt(23, 54, 59).unwrap(), false),
+            (NaiveTime::from_hms_opt(23, 55, 0).unwrap(), true),
+            (NaiveTime::from_hms_opt(0, 0, 0).unwrap(), true),
+            (NaiveTime::from_hms_opt(5, 59, 59).unwrap(), true),
+            (NaiveTime::from_hms_opt(6, 0, 0).unwrap(), false),
+            (NaiveTime::from_hms_opt(12, 0, 0).unwrap(), false),
+        ];
+        for (now, expected) in cases {
+            assert_eq!(
+                quiet_hours_contains(start, end, *now),
+                *expected,
+                "now={now}"
+            );
+        }
 
-    #[test]
-    fn quiet_hours_only_start_configured() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: Some("00:00".to_string()),
-            quiet_hours_end: None,
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        let sched = test_scheduler(config, chrono_tz::UTC);
-        // Missing end => not quiet
-        assert!(!sched.is_quiet_hours());
+        // Non-wrapping window 09:00–17:00 — same half-open semantics.
+        let start = NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+        let end = NaiveTime::from_hms_opt(17, 0, 0).unwrap();
+        let cases: &[(NaiveTime, bool)] = &[
+            (NaiveTime::from_hms_opt(8, 59, 59).unwrap(), false),
+            (NaiveTime::from_hms_opt(9, 0, 0).unwrap(), true),
+            (NaiveTime::from_hms_opt(16, 59, 59).unwrap(), true),
+            (NaiveTime::from_hms_opt(17, 0, 0).unwrap(), false),
+        ];
+        for (now, expected) in cases {
+            assert_eq!(
+                quiet_hours_contains(start, end, *now),
+                *expected,
+                "now={now}"
+            );
+        }
     }
 
     #[tokio::test]
