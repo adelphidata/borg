@@ -7,6 +7,7 @@ use borg_core::config::Config;
 use borg_core::db::Database;
 use borg_core::settings::{SettingSource, TuiSettingDecl, TuiSettingKind, TUI_SETTINGS};
 
+use crate::api_key_store::{self, ApiKeySaveOutcome};
 use crate::onboarding::{models_for_provider, PROVIDERS};
 
 use super::app::{AppAction, PopupHandler};
@@ -115,6 +116,16 @@ impl SettingsPopup {
     }
 
     fn current_value(&self, config: &Config, key: &str) -> String {
+        // Secret entries must never echo the raw value to the UI.
+        if self.entry_for_key(key).map(|e| e.kind) == Some(SettingKind::Secret) {
+            let raw = borg_core::settings::config_value_for_key(config, key).unwrap_or_default();
+            return if raw.trim().is_empty() {
+                "(not set)".to_string()
+            } else {
+                "(set)".to_string()
+            };
+        }
+
         match key {
             "provider" => {
                 let (_, display, _) = PROVIDERS.get(self.provider_index).unwrap_or(&PROVIDERS[0]);
@@ -134,6 +145,10 @@ impl SettingsPopup {
             _ => borg_core::settings::config_value_for_key(config, key)
                 .unwrap_or_else(|| "?".to_string()),
         }
+    }
+
+    fn entry_for_key(&self, key: &str) -> Option<&'static SettingEntry> {
+        self.entries.iter().find(|e| e.key == key)
     }
 
     /// Handle a bracketed paste event. Returns `true` if the paste was consumed
@@ -229,9 +244,25 @@ impl SettingsPopup {
                         self.dismiss();
                         Ok(None)
                     }
+                    SettingKind::Secret => {
+                        // Don't seed the buffer with the current masked value —
+                        // start empty so users type a fresh key.
+                        self.mode = EditMode::Editing {
+                            buffer: String::new(),
+                        };
+                        self.status_message = None;
+                        Ok(None)
+                    }
                     _ => {
                         let current = self.current_value(config, entry.key);
-                        self.mode = EditMode::Editing { buffer: current };
+                        // Don't prepopulate with the masked label; use raw value for Text.
+                        let buffer = if entry.kind == SettingKind::Text {
+                            borg_core::settings::config_value_for_key(config, entry.key)
+                                .unwrap_or_default()
+                        } else {
+                            current
+                        };
+                        self.mode = EditMode::Editing { buffer };
                         self.status_message = None;
                         Ok(None)
                     }
@@ -286,8 +317,14 @@ impl SettingsPopup {
             }
             KeyCode::Enter => {
                 let value = buffer.clone();
-                let key_str = self.entries[self.selected].key;
-                let action = self.apply_and_save(config, key_str, &value);
+                let entry = &self.entries[self.selected];
+                let key_str = entry.key;
+                let kind = entry.kind;
+                let action = if kind == SettingKind::Secret {
+                    self.save_secret(config, key_str, &value)
+                } else {
+                    self.apply_and_save(config, key_str, &value)
+                };
                 self.mode = EditMode::Browsing;
                 Ok(action)
             }
@@ -508,6 +545,48 @@ impl SettingsPopup {
         Ok(())
     }
 
+    /// Save a Secret setting (currently only `llm.api_key`) via the keychain
+    /// helper. On success the config's `llm.api_key` is updated so the new key
+    /// takes effect without a restart. On `KeychainUnavailable` the user sees
+    /// an env-var fallback hint.
+    fn save_secret(&mut self, config: &mut Config, key: &str, value: &str) -> Option<AppAction> {
+        if key != "llm.api_key" {
+            self.status_message = Some((format!("Secret save not wired for {key}"), false));
+            return None;
+        }
+
+        let Some(ref db) = self.db else {
+            self.status_message = Some(("No database connection".to_string(), false));
+            return None;
+        };
+
+        let provider_id = config
+            .llm
+            .provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+
+        match api_key_store::save_api_key(db, config, &provider_id, value) {
+            Ok(ApiKeySaveOutcome::StoredInKeychain) => {
+                self.status_message =
+                    Some((format!("API key saved to keychain for {provider_id}"), true));
+                Some(AppAction::ConfigReloaded)
+            }
+            Ok(ApiKeySaveOutcome::KeychainUnavailable) => {
+                self.status_message = Some((api_key_store::env_var_hint(&provider_id), false));
+                None
+            }
+            Ok(ApiKeySaveOutcome::EmptyInput) => {
+                self.status_message = Some(("Enter a non-empty key".to_string(), false));
+                None
+            }
+            Err(e) => {
+                self.status_message = Some((format!("Save failed: {e}"), false));
+                None
+            }
+        }
+    }
+
     /// Apply a setting to config, persist to DB, and update `status_message` in one go.
     /// Returns `Some(AppAction::UpdateSetting)` on success, `None` on error.
     fn apply_and_save(&mut self, config: &mut Config, key: &str, value: &str) -> Option<AppAction> {
@@ -673,7 +752,12 @@ impl SettingsPopup {
 
             let display_value = if is_selected {
                 if let EditMode::Editing { ref buffer } = self.mode {
-                    format!("{buffer}_")
+                    if entry.kind == SettingKind::Secret {
+                        let masked: String = buffer.chars().map(|_| '\u{2022}').collect();
+                        format!("{masked}_")
+                    } else {
+                        format!("{buffer}_")
+                    }
                 } else if entry.kind == SettingKind::Bool {
                     let icon = if value == "true" {
                         theme::CHECK
@@ -874,9 +958,11 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Select temperature (index 2)
-        popup.selected = 2;
-        assert_eq!(popup.entries[2].key, "temperature");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "temperature")
+            .expect("temperature entry");
 
         let mut cfg = Config::default();
 
@@ -906,8 +992,11 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Select temperature (index 2)
-        popup.selected = 2;
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "temperature")
+            .expect("temperature entry");
         let mut cfg = Config::default();
         let original_temp = cfg.llm.temperature;
 
@@ -1053,8 +1142,11 @@ mod tests {
         let mut cfg = Config::default();
         popup.show(&cfg);
 
-        // Temperature is entry 2
-        popup.selected = 2;
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "temperature")
+            .expect("temperature entry");
         let original = cfg.llm.temperature;
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1070,7 +1162,11 @@ mod tests {
         let mut cfg = Config::default();
         popup.show(&cfg);
 
-        popup.selected = 2;
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "temperature")
+            .expect("temperature entry");
         let original = cfg.llm.temperature;
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1575,8 +1671,11 @@ mod tests {
         let mut cfg = Config::default();
         popup.show(&cfg);
 
-        popup.selected = 2; // temperature
-        assert_eq!(popup.entries[2].key, "temperature");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "temperature")
+            .expect("temperature entry");
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -1602,5 +1701,101 @@ mod tests {
         let (msg, is_success) = popup.status_message.as_ref().expect("status message set");
         assert!(!is_success, "should report failures");
         assert!(msg.contains("failed to clear"), "unexpected: {msg}");
+    }
+
+    // ── Secret / Text row tests ──
+
+    #[test]
+    fn secret_row_renders_masked_label_in_current_value() {
+        let popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        // No api_key configured → (not set)
+        let value = popup.current_value(&cfg, "llm.api_key");
+        assert_eq!(value, "(not set)");
+
+        // With an api_key SecretRef configured → (set), still never leaks raw value
+        cfg.llm.api_key = Some(borg_core::secrets_resolve::SecretRef::Env {
+            var: "FAKE_KEY_VAR".to_string(),
+        });
+        let value = popup.current_value(&cfg, "llm.api_key");
+        assert_eq!(value, "(set)");
+        assert!(!value.contains("FAKE_KEY_VAR"));
+    }
+
+    #[test]
+    fn secret_enter_starts_with_empty_buffer() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        cfg.llm.api_key = Some(borg_core::secrets_resolve::SecretRef::Env {
+            var: "FAKE_KEY_VAR".to_string(),
+        });
+        popup.show(&cfg);
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "llm.api_key")
+            .expect("llm.api_key entry");
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        popup.handle_key(enter, &mut cfg).unwrap();
+        match &popup.mode {
+            EditMode::Editing { buffer } => {
+                assert!(
+                    buffer.is_empty(),
+                    "secret edit should start with empty buffer, got: {buffer}"
+                );
+            }
+            other => panic!("expected Editing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_buffer_retains_literal_chars_while_editing() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "llm.api_key")
+            .expect("llm.api_key entry");
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        popup.handle_key(enter, &mut cfg).unwrap();
+        for c in "sk-test".chars() {
+            let ev = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            popup.handle_key(ev, &mut cfg).unwrap();
+        }
+        match &popup.mode {
+            EditMode::Editing { buffer } => {
+                // Buffer holds the literal key; masking happens only in render.
+                assert_eq!(buffer, "sk-test");
+            }
+            other => panic!("expected Editing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_row_enter_seeds_buffer_with_raw_value() {
+        let mut popup = SettingsPopup::new();
+        let mut cfg = Config::default();
+        popup.show(&cfg);
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "llm.api_key_env")
+            .expect("llm.api_key_env entry");
+
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        popup.handle_key(enter, &mut cfg).unwrap();
+        match &popup.mode {
+            EditMode::Editing { buffer } => {
+                assert_eq!(buffer, "OPENROUTER_API_KEY");
+            }
+            other => panic!("expected Editing, got {other:?}"),
+        }
     }
 }

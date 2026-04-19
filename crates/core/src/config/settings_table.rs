@@ -327,6 +327,8 @@ define_settings! {
         // — Essentials — what every user sees first
         "provider" => "Provider", Select, "Essentials";
         "model" => "Model", Select, "Essentials";
+        "llm.api_key" => "API key", Secret, "Essentials";
+        "llm.api_key_env" => "API key env var", Text, "Essentials";
         "temperature" => "Temperature", Float, "Essentials";
         "conversation.collaboration_mode" => "Mode", Select, "Essentials";
         "budget.monthly_token_limit" => "Monthly token limit", Uint, "Essentials";

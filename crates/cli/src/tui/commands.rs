@@ -63,6 +63,10 @@ impl App<'_> {
                 self.settings_popup.show(&self.config);
                 return Some(Ok(AppAction::Continue));
             }
+            "/model" => {
+                self.model_popup.show(&self.config);
+                return Some(Ok(AppAction::Continue));
+            }
             "/plugins" => return Some(self.cmd_plugins()),
             "/projects" => {
                 self.projects_popup.show();
@@ -142,6 +146,10 @@ impl App<'_> {
 
         if let Some(rest) = trimmed.strip_prefix("/settings ") {
             return Some(self.cmd_settings_set(rest));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/model ") {
+            return Some(self.cmd_model_set(rest.trim()));
         }
 
         if trimmed == "/update --dev" || trimmed == "/update dev" {
@@ -475,6 +483,45 @@ impl App<'_> {
             );
             Ok(AppAction::Continue)
         }
+    }
+
+    /// `/model <provider-id>/<model-id>` — set both provider and model in one shot.
+    /// Splits on the first `/` so OpenRouter model IDs like
+    /// `openrouter/anthropic/claude-sonnet-4` parse as provider=`openrouter`,
+    /// model=`anthropic/claude-sonnet-4`.
+    fn cmd_model_set(&mut self, rest: &str) -> Result<AppAction> {
+        let (provider, model) = match rest.split_once('/') {
+            Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.trim(), m.trim()),
+            _ => {
+                self.push_system_message(
+                    "Usage: /model <provider-id>/<model-id>\nOr /model to open the picker."
+                        .to_string(),
+                );
+                return Ok(AppAction::Continue);
+            }
+        };
+
+        if let Err(e) = self.config.apply_setting("provider", provider) {
+            self.push_system_message(format!("Error: {e}"));
+            return Ok(AppAction::Continue);
+        }
+        if let Err(e) = self.config.apply_setting("model", model) {
+            self.push_system_message(format!("Error: {e}"));
+            return Ok(AppAction::Continue);
+        }
+
+        // Persist to DB if available; log but don't fail the command if it's unavailable.
+        if let Ok(db) = borg_core::db::Database::open() {
+            if let Err(e) = db.set_setting("provider", provider) {
+                tracing::warn!("cmd_model_set: failed to persist provider: {e}");
+            }
+            if let Err(e) = db.set_setting("model", model) {
+                tracing::warn!("cmd_model_set: failed to persist model: {e}");
+            }
+        }
+
+        self.push_system_message(format!("Updated: provider = {provider}, model = {model}"));
+        Ok(AppAction::ConfigReloaded)
     }
 
     fn cmd_poke(&mut self) -> Result<AppAction> {

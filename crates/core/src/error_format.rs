@@ -288,7 +288,7 @@ const ACTION_HINTS: &[ActionHint] = &[
     ActionHint {
         category: ErrorCategory::RateLimit,
         context: ErrorContext::Tui,
-        hint: "Use /settings to switch models.",
+        hint: "Use /model to switch models.",
     },
     ActionHint {
         category: ErrorCategory::RateLimit,
@@ -298,12 +298,12 @@ const ACTION_HINTS: &[ActionHint] = &[
     ActionHint {
         category: ErrorCategory::Auth,
         context: ErrorContext::Tui,
-        hint: "Check your API key in /settings.",
+        hint: "Update your API key via /model or /settings → API key.",
     },
     ActionHint {
         category: ErrorCategory::Billing,
         context: ErrorContext::Tui,
-        hint: "Check billing or switch providers in /settings.",
+        hint: "Check billing or switch providers in /model or /settings.",
     },
 ];
 
@@ -836,12 +836,12 @@ mod tests {
     // ── format_error_with_context tests ──
 
     #[test]
-    fn context_tui_rate_limit_suggests_settings() {
+    fn context_tui_rate_limit_suggests_model_switch() {
         let msg = format_error_with_context(
             "openrouter returned 429 (rate limited): too many requests",
             ErrorContext::Tui,
         );
-        assert!(msg.contains("/settings"));
+        assert!(msg.contains("/model"));
         assert!(msg.contains("switch models"));
     }
 
@@ -853,23 +853,24 @@ mod tests {
         );
         assert!(msg.contains("switching to a different model"));
         assert!(!msg.contains("/settings"));
+        assert!(!msg.contains("/model"));
     }
 
     #[test]
-    fn context_tui_auth_suggests_settings() {
+    fn context_tui_auth_suggests_key_edit() {
         let msg = format_error_with_context(
             "Anthropic returned 401 (auth error): invalid key",
             ErrorContext::Tui,
         );
-        assert!(msg.contains("/settings"));
+        assert!(msg.contains("/model") || msg.contains("/settings"));
         assert!(msg.contains("API key"));
     }
 
     #[test]
-    fn context_tui_billing_suggests_settings() {
+    fn context_tui_billing_suggests_provider_switch() {
         let msg =
             format_error_with_context("OpenAI returned 402: payment required", ErrorContext::Tui);
-        assert!(msg.contains("/settings"));
+        assert!(msg.contains("/model") || msg.contains("/settings"));
     }
 
     #[test]
@@ -893,7 +894,7 @@ mod tests {
 
         let tui_msg = format_error_with_context(raw, ErrorContext::Tui);
         assert!(tui_msg.contains("rate-limited"));
-        assert!(tui_msg.contains("/settings"));
+        assert!(tui_msg.contains("/model"));
         assert!(!tui_msg.contains(r#"{"error"#));
 
         let gw_msg = format_error_with_context(raw, ErrorContext::Gateway);

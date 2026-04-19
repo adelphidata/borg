@@ -21,6 +21,7 @@ use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
 use super::history::HistoryCell;
 use super::migrate_popup::{MigrateAction, MigratePopup};
+use super::model_popup::ModelPopup;
 use super::pairing_popup::{PairingAction, PairingPopup};
 use super::plan_overlay::PlanOverlay;
 use super::plugins_popup::{PluginAction, PluginsPopup};
@@ -105,17 +106,22 @@ pub enum DoctorEvent {
 }
 
 /// Cached ambient-status snapshot rendered in the TUI header as the
-/// `class: {name_level} — {Archetype} ({mood})` line.
+/// `class: {name} [the {Archetype}] Lv.{n} ({mood})` line.
 ///
 /// Computed by `App::refresh_ambient_status` off the evolution + vitals +
 /// bond DB state. Kept as a cache so `render()` never hits the DB.
 #[derive(Debug, Clone)]
 pub struct AmbientStatus {
-    /// `{evolution_name or "Base Borg"} Lv.{level}`.
-    pub name_level: String,
+    /// Evolved custom name; `None` means the agent is still the unnamed
+    /// placeholder and the formatter renders `"Base Borg"` instead.
+    pub evolution_name: Option<String>,
+    /// Current evolution level.
+    pub level: u8,
     /// Mood derived from vitals/bond/evolution via `compute_mood`.
     pub mood: borg_core::evolution::Mood,
-    /// Current dominant archetype, if any.
+    /// Current dominant archetype, if any. Only rendered once
+    /// `evolution_name` is `Some` (archetype attaches as an epithet to a
+    /// real proper noun).
     pub archetype: Option<borg_core::evolution::Archetype>,
 }
 
@@ -133,9 +139,9 @@ fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
     let bond = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
 
     let mood = evolution::compute_mood(&evo, &vitals, &bond);
-    let name = evo.evolution_name.as_deref().unwrap_or("Base Borg");
     Ok(AmbientStatus {
-        name_level: format!("{name} Lv.{}", evo.level),
+        evolution_name: evo.evolution_name.clone(),
+        level: evo.level,
         mood,
         archetype: evo.dominant_archetype,
     })
@@ -204,6 +210,7 @@ pub struct App<'a> {
     pub composer: Composer<'a>,
     pub command_popup: CommandPopup,
     pub settings_popup: SettingsPopup,
+    pub model_popup: ModelPopup,
     pub plugins_popup: PluginsPopup,
     pub scroll_offset: usize,
     pub total_lines: usize,
@@ -269,6 +276,7 @@ impl<'a> App<'a> {
             composer: Composer::new(),
             command_popup: CommandPopup::new(),
             settings_popup: SettingsPopup::new(),
+            model_popup: ModelPopup::new(),
             plugins_popup: PluginsPopup::new(),
             scroll_offset: 0,
             total_lines: 0,
@@ -344,9 +352,10 @@ impl<'a> App<'a> {
     }
 
     /// Collect mutable references to all popups for trait-based dispatch.
-    fn popups_mut(&mut self) -> [&mut dyn PopupHandler; 8] {
+    fn popups_mut(&mut self) -> [&mut dyn PopupHandler; 9] {
         [
             &mut self.settings_popup,
+            &mut self.model_popup,
             &mut self.plugins_popup,
             &mut self.pairing_popup,
             &mut self.projects_popup,
@@ -364,6 +373,7 @@ impl<'a> App<'a> {
     /// user is interacting with a popup.
     pub fn any_popup_visible(&self) -> bool {
         self.settings_popup.is_visible()
+            || self.model_popup.is_visible()
             || self.plugins_popup.is_visible()
             || self.pairing_popup.is_visible()
             || self.projects_popup.is_visible()
@@ -405,8 +415,9 @@ impl<'a> App<'a> {
         // We can't iterate popups_mut() because handle_key_event needs &mut config,
         // and popups_mut() borrows &mut self. Instead, check visibility first, then dispatch.
         let visible_idx = {
-            let popups: [&dyn PopupHandler; 8] = [
+            let popups: [&dyn PopupHandler; 9] = [
                 &self.settings_popup,
+                &self.model_popup,
                 &self.plugins_popup,
                 &self.pairing_popup,
                 &self.projects_popup,
@@ -426,19 +437,20 @@ impl<'a> App<'a> {
             0 => self
                 .settings_popup
                 .handle_key_event(key, &mut self.config)?,
-            1 => self.plugins_popup.handle_key_event(key, &mut self.config)?,
-            2 => self.pairing_popup.handle_key_event(key, &mut self.config)?,
-            3 => self
+            1 => self.model_popup.handle_key_event(key, &mut self.config)?,
+            2 => self.plugins_popup.handle_key_event(key, &mut self.config)?,
+            3 => self.pairing_popup.handle_key_event(key, &mut self.config)?,
+            4 => self
                 .projects_popup
                 .handle_key_event(key, &mut self.config)?,
-            4 => self
+            5 => self
                 .sessions_popup
                 .handle_key_event(key, &mut self.config)?,
-            5 => self
+            6 => self
                 .schedule_popup
                 .handle_key_event(key, &mut self.config)?,
-            6 => self.migrate_popup.handle_key_event(key, &mut self.config)?,
-            7 => self.status_popup.handle_key_event(key, &mut self.config)?,
+            7 => self.migrate_popup.handle_key_event(key, &mut self.config)?,
+            8 => self.status_popup.handle_key_event(key, &mut self.config)?,
             _ => unreachable!(),
         };
 
@@ -2377,5 +2389,48 @@ mod tests {
         app.handle_key(key(KeyCode::Char('c'))).unwrap();
 
         assert!(app.composer.text().is_empty());
+    }
+
+    #[test]
+    fn model_exact_opens_popup() {
+        let mut app = make_app();
+        assert!(!app.model_popup.is_visible());
+        let _ = app.handle_submit("/model").unwrap();
+        assert!(app.model_popup.is_visible(), "/model should open the popup");
+        let has_unknown = app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::System { text } if text.contains("Unknown command")));
+        assert!(!has_unknown, "/model should not be treated as unknown");
+    }
+
+    #[test]
+    fn model_prefix_sets_provider_and_model() {
+        let mut app = make_app();
+        let _ = app
+            .handle_submit("/model openrouter/anthropic/claude-sonnet-4")
+            .unwrap();
+        assert_eq!(app.config.llm.provider.as_deref(), Some("openrouter"));
+        assert_eq!(app.config.llm.model, "anthropic/claude-sonnet-4");
+        let has_unknown = app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::System { text } if text.contains("Unknown command")));
+        assert!(!has_unknown);
+    }
+
+    #[test]
+    fn model_prefix_rejects_malformed() {
+        let mut app = make_app();
+        let original_provider = app.config.llm.provider.clone();
+        let original_model = app.config.llm.model.clone();
+        let _ = app.handle_submit("/model no-slash-here").unwrap();
+        assert_eq!(app.config.llm.provider, original_provider);
+        assert_eq!(app.config.llm.model, original_model);
+        let has_usage = app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::System { text } if text.contains("Usage: /model")));
+        assert!(has_usage, "malformed /model should show usage hint");
     }
 }

@@ -32,6 +32,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+mod api_key_store;
 mod commands;
 mod credentials;
 mod heartbeat_augmenters;

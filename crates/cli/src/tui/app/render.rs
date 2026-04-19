@@ -31,6 +31,7 @@ impl<'a> App<'a> {
         self.command_popup.render(frame, app_layout.composer);
         self.file_popup.render(frame, app_layout.composer);
         self.settings_popup.render(frame, &self.config);
+        self.model_popup.render(frame);
         self.plugins_popup.render(frame);
         self.pairing_popup.render(frame);
         self.projects_popup.render(frame);

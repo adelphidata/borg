@@ -45,6 +45,11 @@ pub enum TuiSettingKind {
     Uint,
     /// Select from an enum/provider list (Left/Right cycles).
     Select,
+    /// Free-form string (Enter opens plain-text edit buffer).
+    Text,
+    /// Secret value (Enter opens masked edit buffer; list row shows `(set)`/`(not set)`,
+    /// never the raw value). Persisted via keychain-backed save path.
+    Secret,
 }
 
 /// Display metadata for a TUI-visible setting. Emitted by the `tui_settings`

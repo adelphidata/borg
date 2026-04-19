@@ -12,6 +12,7 @@ mod history;
 mod layout;
 mod markdown;
 pub(crate) mod migrate_popup;
+mod model_popup;
 mod pairing_popup;
 mod paste_burst;
 mod plan_overlay;
