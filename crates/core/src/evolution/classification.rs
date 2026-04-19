@@ -654,4 +654,15 @@ mod tests {
         let (n, _) = parse_name_response(raw).unwrap();
         assert_eq!(n, "n\"q");
     }
+
+    /// Smoke test: `generate_evolution_name` always returns a non-empty pair,
+    /// regardless of whether an LLM provider is actually reachable. On
+    /// failure/timeout it falls back to the deterministic table.
+    #[tokio::test(flavor = "current_thread")]
+    async fn generate_evolution_name_always_returns_nonempty() {
+        let (name, desc) =
+            generate_evolution_name(Some(Archetype::Builder), Stage::Evolved, &[]).await;
+        assert!(!name.is_empty(), "name should never be empty");
+        assert!(!desc.is_empty(), "description should never be empty");
+    }
 }
