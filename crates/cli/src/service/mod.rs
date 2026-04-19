@@ -1623,22 +1623,42 @@ async fn deliver_message_to_sender(
     send_to_channel(config, channel_name, sender_id, text, None).await
 }
 
-/// Deliver an evolution celebration message to all configured heartbeat channels.
-/// Returns `true` if at least one delivery succeeded.
+/// Deliver an evolution or milestone celebration message to all configured
+/// heartbeat channels. Returns `true` if at least one delivery succeeded.
 async fn deliver_celebration_to_channels(
     config: &Config,
     celebration: &borg_core::db::PendingCelebration,
 ) -> bool {
-    let payload: borg_core::evolution::CelebrationPayload =
-        match serde_json::from_str(&celebration.payload_json) {
-            Ok(p) => p,
+    let kind = match celebration.celebration_type.as_str() {
+        "evolution" => match serde_json::from_str::<borg_core::evolution::CelebrationPayload>(
+            &celebration.payload_json,
+        ) {
+            Ok(p) => borg_core::evolution::CelebrationKind::Evolution(p),
             Err(e) => {
-                tracing::warn!("Failed to deserialize celebration payload: {e}");
+                tracing::warn!("Failed to deserialize evolution celebration payload: {e}");
                 return false;
             }
-        };
+        },
+        "milestone" => match serde_json::from_str::<borg_core::evolution::MilestonePayload>(
+            &celebration.payload_json,
+        ) {
+            Ok(p) => borg_core::evolution::CelebrationKind::Milestone(p),
+            Err(e) => {
+                tracing::warn!("Failed to deserialize milestone celebration payload: {e}");
+                return false;
+            }
+        },
+        other => {
+            tracing::warn!("Unknown celebration_type {other}");
+            return false;
+        }
+    };
 
-    let message = borg_core::evolution::format_celebration_message(&payload);
+    let activity_source = match kind {
+        borg_core::evolution::CelebrationKind::Evolution(_) => "evolution",
+        borg_core::evolution::CelebrationKind::Milestone(_) => "milestone",
+    };
+    let message = borg_core::evolution::format_celebration(&kind);
     let mut any_delivered = false;
 
     for channel_name in &config.heartbeat.channels {
@@ -1649,20 +1669,20 @@ async fn deliver_celebration_to_channels(
                         deliver_message_to_sender(config, channel_name, sender_id, &message).await
                     {
                         tracing::warn!(
-                            "Evolution celebration delivery to {channel_name}:{sender_id} failed: {e}"
+                            "Celebration delivery ({activity_source}) to {channel_name}:{sender_id} failed: {e}"
                         );
                     } else {
                         any_delivered = true;
                         tracing::info!(
-                            "Evolution celebration delivered to {channel_name}:{sender_id}"
+                            "Celebration ({activity_source}) delivered to {channel_name}:{sender_id}"
                         );
                         if let Ok(adb) = borg_core::db::Database::open() {
                             borg_core::activity_log::log_activity(
                                 &adb,
                                 "info",
-                                "evolution",
+                                activity_source,
                                 &format!(
-                                    "Evolution celebration delivered to {channel_name}:{sender_id}"
+                                    "Celebration ({activity_source}) delivered to {channel_name}:{sender_id}"
                                 ),
                             );
                         }
@@ -2005,5 +2025,83 @@ mod tests {
         let config = Config::default();
         send_approval_greeting(&config, "unsupported_channel", "12345").await;
         // If we get here without panic, the fallback path worked.
+    }
+
+    #[tokio::test]
+    async fn deliver_celebration_handles_evolution_and_milestone_types() {
+        // With no heartbeat channels configured, both celebration types should
+        // deserialize cleanly and report success without panicking. Unknown
+        // types and malformed JSON must fail closed (return false).
+        let config = Config::default();
+
+        let evo = borg_core::evolution::CelebrationPayload {
+            from_stage: "base".into(),
+            to_stage: "evolved".into(),
+            evolution_name: Some("Pipeline Warden".into()),
+            evolution_description: Some("A vigilant guardian".into()),
+            dominant_archetype: Some("guardian".into()),
+            bond_score: 30,
+            stability: 50,
+            focus: 50,
+            sync_stat: 50,
+            growth: 50,
+            happiness: 50,
+        };
+        let evo_row = borg_core::db::PendingCelebration {
+            id: 1,
+            celebration_type: "evolution".into(),
+            payload_json: serde_json::to_string(&evo).unwrap(),
+            created_at: 0,
+        };
+        assert!(deliver_celebration_to_channels(&config, &evo_row).await);
+
+        let milestone = borg_core::evolution::MilestonePayload {
+            milestone_id: "level_10_base".into(),
+            title: "Lvl.10".into(),
+            level: 10,
+            stage: "base".into(),
+            archetype: Some("ops".into()),
+        };
+        let milestone_row = borg_core::db::PendingCelebration {
+            id: 2,
+            celebration_type: "milestone".into(),
+            payload_json: serde_json::to_string(&milestone).unwrap(),
+            created_at: 0,
+        };
+        assert!(deliver_celebration_to_channels(&config, &milestone_row).await);
+
+        // Unknown type fails closed.
+        let bogus = borg_core::db::PendingCelebration {
+            id: 3,
+            celebration_type: "mystery".into(),
+            payload_json: "{}".into(),
+            created_at: 0,
+        };
+        assert!(!deliver_celebration_to_channels(&config, &bogus).await);
+
+        // Malformed milestone JSON fails closed rather than crashing.
+        let malformed = borg_core::db::PendingCelebration {
+            id: 4,
+            celebration_type: "milestone".into(),
+            payload_json: "{not-json}".into(),
+            created_at: 0,
+        };
+        assert!(!deliver_celebration_to_channels(&config, &malformed).await);
+    }
+
+    #[test]
+    fn format_milestone_renders_nonempty_with_title() {
+        let kind = borg_core::evolution::CelebrationKind::Milestone(
+            borg_core::evolution::MilestonePayload {
+                milestone_id: "first_evolution".into(),
+                title: "First Evolution".into(),
+                level: 0,
+                stage: "evolved".into(),
+                archetype: None,
+            },
+        );
+        let out = borg_core::evolution::format_celebration(&kind);
+        assert!(!out.is_empty());
+        assert!(out.contains("First Evolution"), "got: {out}");
     }
 }

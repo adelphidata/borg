@@ -4,6 +4,10 @@
 //! an evolution event: the data payload captured when a stage transition
 //! fires, the ASCII art templates, and the boxed message formatter used by
 //! the CLI and service delivery paths.
+//!
+//! Also hosts the `milestone` celebration surface — a compact box emitted for
+//! sub-evolution events (level boundaries, bond thresholds, archetype
+//! stabilization, etc.).
 
 use super::capitalize_first;
 
@@ -181,4 +185,117 @@ pub fn format_celebration_message(payload: &CelebrationPayload) -> String {
     out.push_str(&format!("\u{255A}{border}\u{255D}\n"));
 
     out
+}
+
+// ── Milestone celebrations ──
+
+/// Compact payload emitted for sub-evolution milestones.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MilestonePayload {
+    /// Stable milestone identifier (e.g. `"level_10_base"`, `"first_evolution"`).
+    pub milestone_id: String,
+    /// User-facing title.
+    pub title: String,
+    /// Current level at time of unlock.
+    pub level: u8,
+    /// Stage string (base/evolved/final).
+    pub stage: String,
+    /// Associated archetype, if any.
+    pub archetype: Option<String>,
+}
+
+/// Unified celebration surface — evolution stage transitions or sub-evolution
+/// milestones. Callers pick the variant and `format_celebration` renders.
+pub enum CelebrationKind {
+    /// Full stage-transition celebration.
+    Evolution(CelebrationPayload),
+    /// Sub-evolution milestone (level, bond, archetype, streak).
+    Milestone(MilestonePayload),
+}
+
+/// Render a celebration regardless of kind.
+pub fn format_celebration(kind: &CelebrationKind) -> String {
+    match kind {
+        CelebrationKind::Evolution(p) => format_celebration_message(p),
+        CelebrationKind::Milestone(p) => format_milestone(p),
+    }
+}
+
+/// Compact ASCII box for a milestone unlock. Intentionally smaller than the
+/// full evolution art — milestones fire frequently and shouldn't dominate
+/// the transcript.
+fn format_milestone(p: &MilestonePayload) -> String {
+    let inner = 36; // inner width between borders
+    let border = "\u{2500}".repeat(inner);
+
+    let line = |text: &str| -> String {
+        // Truncate/pad to `inner - 2` so the two side spaces keep the box aligned.
+        let max = inner.saturating_sub(2);
+        let body: String = text.chars().take(max).collect();
+        format!("\u{2502} {body:<max$} \u{2502}\n")
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("\u{256D}{border}\u{256E}\n"));
+    out.push_str(&line("MILESTONE UNLOCKED"));
+    out.push_str(&line(""));
+    out.push_str(&line(&p.title));
+
+    let stage_cap = capitalize_first(&p.stage);
+    out.push_str(&line(&format!("Lvl.{} | {}", p.level, stage_cap)));
+
+    if let Some(ref arch) = p.archetype {
+        out.push_str(&line(&format!("Archetype: {}", capitalize_first(arch))));
+    }
+    out.push_str(&format!("\u{2570}{border}\u{256F}\n"));
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_milestone_contains_title() {
+        let p = MilestonePayload {
+            milestone_id: "level_10_base".into(),
+            title: "Lvl.10".into(),
+            level: 10,
+            stage: "base".into(),
+            archetype: Some("ops".into()),
+        };
+        let s = format_milestone(&p);
+        assert!(s.contains("Lvl.10"), "expected title in output: {s}");
+        assert!(s.contains("Base"), "expected capitalized stage: {s}");
+        assert!(s.contains("Ops"), "expected archetype in output: {s}");
+        assert!(s.contains("MILESTONE UNLOCKED"));
+    }
+
+    #[test]
+    fn format_celebration_dispatches_variants() {
+        let milestone = CelebrationKind::Milestone(MilestonePayload {
+            milestone_id: "first_evolution".into(),
+            title: "First Evolution".into(),
+            level: 0,
+            stage: "evolved".into(),
+            archetype: None,
+        });
+        assert!(format_celebration(&milestone).contains("First Evolution"));
+
+        let evolution = CelebrationKind::Evolution(CelebrationPayload {
+            from_stage: "base".into(),
+            to_stage: "evolved".into(),
+            evolution_name: Some("Pipeline Warden".into()),
+            evolution_description: Some("A vigilant guardian".into()),
+            dominant_archetype: Some("guardian".into()),
+            bond_score: 30,
+            stability: 50,
+            focus: 50,
+            sync_stat: 50,
+            growth: 50,
+            happiness: 50,
+        });
+        assert!(format_celebration(&evolution).contains("Pipeline Warden"));
+    }
 }

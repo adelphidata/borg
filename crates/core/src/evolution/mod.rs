@@ -14,11 +14,13 @@ pub mod commands;
 mod feed;
 mod format;
 mod helpers;
+mod milestones;
 mod replay;
 pub mod share_card;
 
 pub use celebration::{
-    celebration_art, format_celebration_message, CelebrationArt, CelebrationPayload,
+    celebration_art, format_celebration, format_celebration_message, CelebrationArt,
+    CelebrationKind, CelebrationPayload, MilestonePayload,
 };
 pub use classification::*;
 pub use commands::{dispatch, parse, CommandOutput, EvolutionCommand};
@@ -28,6 +30,7 @@ pub use format::{
     format_readiness, format_xp_feed, format_xp_summary,
 };
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
+pub use milestones::{check_milestones, Milestone};
 pub use replay::*;
 pub use share_card::render_ascii_card;
 
@@ -831,6 +834,108 @@ fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>> {
     Ok(sorted)
 }
 
+// ── Milestone helpers ──
+
+/// Load the current evolution + bond state as a snapshot pair. Returns
+/// `(None, 0)` for the evolution slot if the DB read fails; callers should
+/// treat that as a skip signal for the downstream milestone diff.
+fn snapshot_evolution_and_bond(db: &Database) -> (Option<EvolutionState>, u8) {
+    let evo = match db.get_evolution_state() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("evolution: failed to snapshot state for milestone diff: {e}");
+            None
+        }
+    };
+    let bond_events = match db.get_all_bond_events() {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!("evolution: failed to snapshot bond events for milestone diff: {e}");
+            return (evo, 0);
+        }
+    };
+    let bond_key = db.derive_hmac_key(crate::bond::BOND_HMAC_DOMAIN);
+    let bond = crate::bond::replay_events_with_key(&bond_key, &bond_events);
+    (evo, bond.score)
+}
+
+/// Persist a single milestone: a `level_up` row (for level thresholds), a
+/// `milestone_unlocked` row, and the paired `pending_celebration`.
+fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
+    let stage_str = next.stage.to_string();
+
+    // `level_*` ids get a paired `level_up` event so the XP feed has a row
+    // to render at the exact level boundary.
+    if milestone.id.starts_with("level_") {
+        if let Some(threshold) = parse_level_from_id(&milestone.id) {
+            let meta = serde_json::json!({
+                "from_level": threshold.saturating_sub(1),
+                "to_level": threshold,
+                "stage": stage_str,
+            })
+            .to_string();
+            if let Err(e) = db.record_evolution_event("level_up", 0, None, "hook", Some(&meta)) {
+                tracing::warn!(
+                    "evolution: failed to record level_up for {}: {e}",
+                    milestone.id
+                );
+            }
+        }
+    }
+
+    let arch_str = milestone.archetype.map(|a| a.to_string());
+    let meta = serde_json::json!({
+        "milestone_id": milestone.id,
+        "title": milestone.title,
+        "archetype": arch_str,
+    })
+    .to_string();
+    if let Err(e) = db.record_evolution_event(
+        "milestone_unlocked",
+        0,
+        arch_str.as_deref(),
+        "hook",
+        Some(&meta),
+    ) {
+        tracing::warn!(
+            "evolution: failed to record milestone_unlocked for {}: {e}",
+            milestone.id
+        );
+        return;
+    }
+
+    let payload = celebration::MilestonePayload {
+        milestone_id: milestone.id.clone(),
+        title: milestone.title.clone(),
+        level: next.level,
+        stage: stage_str,
+        archetype: arch_str,
+    };
+    match serde_json::to_string(&payload) {
+        Ok(json) => {
+            if let Err(e) = db.insert_pending_celebration("milestone", &json) {
+                tracing::warn!(
+                    "evolution: failed to insert milestone celebration for {}: {e}",
+                    milestone.id
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "evolution: failed to serialize milestone payload for {}: {e}",
+                milestone.id
+            );
+        }
+    }
+}
+
+/// Extract the numeric level from a `level_{N}_{stage}` milestone id.
+fn parse_level_from_id(id: &str) -> Option<u8> {
+    let rest = id.strip_prefix("level_")?;
+    let (num, _) = rest.split_once('_')?;
+    num.parse::<u8>().ok()
+}
+
 // ── EvolutionHook ──
 
 /// Lifecycle hook that passively records evolution XP events and injects context.
@@ -873,6 +978,10 @@ impl EvolutionHook {
             tracing::warn!("evolution: mutex poisoned, skipping event");
             return;
         };
+
+        // Snapshot pre-state so we can diff against post-state for milestones.
+        let (prev_evo, prev_bond) = snapshot_evolution_and_bond(&db);
+
         let arch_str = archetype.map(|a| a.to_string());
         if let Err(e) = db.record_evolution_event("xp_gain", xp, arch_str.as_deref(), source, None)
         {
@@ -881,6 +990,39 @@ impl EvolutionHook {
         }
         // Check if we should attempt an evolution after this XP gain
         self.attempt_evolution(&db);
+
+        // Detect sub-evolution milestones against the post-state. Runs after
+        // evolution attempt so a stage transition feeds into the diff.
+        let (next_evo, next_bond) = snapshot_evolution_and_bond(&db);
+        if let (Some(prev), Some(next)) = (prev_evo, next_evo) {
+            self.detect_milestones(&db, &prev, &next, prev_bond, next_bond);
+        }
+    }
+
+    /// Compare pre/post evolution + bond snapshots and emit `level_up` /
+    /// `milestone_unlocked` events plus mini-celebration rows for any newly
+    /// unlocked milestones. Wrapped as a helper so sibling detection passes
+    /// (e.g. mood) can sequence cleanly alongside.
+    fn detect_milestones(
+        &self,
+        db: &Database,
+        prev: &EvolutionState,
+        next: &EvolutionState,
+        bond_prev: u8,
+        bond_next: u8,
+    ) {
+        let events = match db.load_all_evolution_events() {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!("evolution: failed to load events for milestone check: {e}");
+                return;
+            }
+        };
+        let now = chrono::Utc::now().timestamp();
+        let unlocked = check_milestones(prev, next, bond_prev, bond_next, &events, now);
+        for milestone in unlocked {
+            emit_milestone(db, &milestone, next);
+        }
     }
 
     /// Check evolution gates and record an evolution event if all prerequisites are met.
@@ -3264,6 +3406,113 @@ mod tests {
         hook.execute(&ctx);
         let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
         assert!(events.is_empty(), "error tool calls must not record XP");
+    }
+
+    // ── Milestone emission via emit_milestone helper ──
+
+    #[test]
+    fn emit_milestone_inserts_level_up_and_celebration() {
+        let db = Database::test_db();
+        let next = EvolutionState {
+            stage: Stage::Base,
+            level: 10,
+            total_xp: 0,
+            xp_to_next_level: 0,
+            dominant_archetype: Some(Archetype::Ops),
+            evolution_name: None,
+            evolution_description: None,
+            archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
+            total_events: 0,
+            chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
+        };
+        let m = Milestone {
+            id: "level_10_base".to_string(),
+            title: "Lvl.10".to_string(),
+            archetype: Some(Archetype::Ops),
+        };
+        emit_milestone(&db, &m, &next);
+
+        let events = db.load_all_evolution_events().unwrap();
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert!(
+            types.contains(&"level_up"),
+            "expected level_up event; got: {types:?}"
+        );
+        assert!(
+            types.contains(&"milestone_unlocked"),
+            "expected milestone_unlocked event; got: {types:?}"
+        );
+
+        let pending = db.get_pending_celebrations().unwrap();
+        assert_eq!(pending.len(), 1, "expected one pending celebration");
+        assert_eq!(pending[0].celebration_type, "milestone");
+        // Payload should deserialize cleanly back into a MilestonePayload.
+        let payload: celebration::MilestonePayload =
+            serde_json::from_str(&pending[0].payload_json).unwrap();
+        assert_eq!(payload.milestone_id, "level_10_base");
+        assert_eq!(payload.level, 10);
+        assert_eq!(payload.stage, "base");
+        assert_eq!(payload.archetype.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn emit_milestone_non_level_skips_level_up_event() {
+        let db = Database::test_db();
+        let next = EvolutionState {
+            stage: Stage::Base,
+            level: 5,
+            total_xp: 0,
+            xp_to_next_level: 0,
+            dominant_archetype: None,
+            evolution_name: None,
+            evolution_description: None,
+            archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
+            total_events: 0,
+            chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
+        };
+        let m = Milestone {
+            id: "first_strong_bond".to_string(),
+            title: "Strong Bond".to_string(),
+            archetype: None,
+        };
+        emit_milestone(&db, &m, &next);
+
+        let events = db.load_all_evolution_events().unwrap();
+        let level_ups: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "level_up")
+            .collect();
+        assert!(
+            level_ups.is_empty(),
+            "non-level milestone should not emit level_up"
+        );
+        let milestones: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "milestone_unlocked")
+            .collect();
+        assert_eq!(milestones.len(), 1);
+    }
+
+    #[test]
+    fn parse_level_from_id_handles_stage_suffix() {
+        assert_eq!(parse_level_from_id("level_10_base"), Some(10));
+        assert_eq!(parse_level_from_id("level_99_final"), Some(99));
+        assert_eq!(parse_level_from_id("first_evolution"), None);
+        assert_eq!(parse_level_from_id("level_abc_base"), None);
     }
 
     // ── V2: new event types (level_up, milestone_unlocked, mood_changed, share_card_created) ──
