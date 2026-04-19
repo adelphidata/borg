@@ -66,42 +66,45 @@ pub struct SettingsPopup {
     model_index: usize,
 }
 
+// Settings are grouped into categories that render top-to-bottom in the popup.
+// Order: Essentials → everyday use → power-user knobs → Advanced (esoteric).
+// Non-technical users should find what they need without scrolling past jargon.
 const SETTINGS: &[SettingEntry] = &[
-    // — LLM —
+    // — Essentials — what every user sees first
     SettingEntry {
         key: "provider",
         label: "Provider",
         kind: SettingKind::Select,
-        category: "LLM",
+        category: "Essentials",
     },
     SettingEntry {
         key: "model",
         label: "Model",
         kind: SettingKind::Select,
-        category: "LLM",
+        category: "Essentials",
     },
     SettingEntry {
         key: "temperature",
         label: "Temperature",
         kind: SettingKind::Float,
-        category: "LLM",
+        category: "Essentials",
     },
+    SettingEntry {
+        key: "conversation.collaboration_mode",
+        label: "Mode",
+        kind: SettingKind::Select,
+        category: "Essentials",
+    },
+    SettingEntry {
+        key: "budget.monthly_token_limit",
+        label: "Monthly token limit",
+        kind: SettingKind::Uint,
+        category: "Essentials",
+    },
+    // — Conversation — day-to-day tuning
     SettingEntry {
         key: "max_tokens",
         label: "Response length",
-        kind: SettingKind::Uint,
-        category: "LLM",
-    },
-    SettingEntry {
-        key: "llm.cache.strategy",
-        label: "Cache layout",
-        kind: SettingKind::Select,
-        category: "LLM",
-    },
-    // — Conversation —
-    SettingEntry {
-        key: "conversation.max_iterations",
-        label: "Max agent steps",
         kind: SettingKind::Uint,
         category: "Conversation",
     },
@@ -112,9 +115,9 @@ const SETTINGS: &[SettingEntry] = &[
         category: "Conversation",
     },
     SettingEntry {
-        key: "conversation.collaboration_mode",
-        label: "Mode",
-        kind: SettingKind::Select,
+        key: "conversation.max_iterations",
+        label: "Max agent steps",
+        kind: SettingKind::Uint,
         category: "Conversation",
     },
     SettingEntry {
@@ -123,87 +126,25 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Bool,
         category: "Conversation",
     },
-    SettingEntry {
-        key: "conversation.concurrent_tools.max_workers",
-        label: "Parallel tool workers",
-        kind: SettingKind::Uint,
-        category: "Conversation",
-    },
-    SettingEntry {
-        key: "conversation.protect_first_n",
-        label: "Protected head msgs",
-        kind: SettingKind::Uint,
-        category: "Conversation",
-    },
-    // — Security —
-    SettingEntry {
-        key: "sandbox.enabled",
-        label: "Sandbox",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
+    // — Memory & Skills —
     SettingEntry {
         key: "skills.enabled",
         label: "Allow skills",
         kind: SettingKind::Bool,
-        category: "Security",
+        category: "Memory & Skills",
     },
-    SettingEntry {
-        key: "hooks.enabled",
-        label: "Allow user hooks",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
-    SettingEntry {
-        key: "skills.budget_pct",
-        label: "Skills budget (% ctx)",
-        kind: SettingKind::Float,
-        category: "Security",
-    },
-    SettingEntry {
-        key: "security.secret_detection",
-        label: "Secret detection",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
-    // — Budget —
-    SettingEntry {
-        key: "budget.monthly_token_limit",
-        label: "Monthly limit",
-        kind: SettingKind::Uint,
-        category: "Budget",
-    },
-    SettingEntry {
-        key: "budget.warning_threshold",
-        label: "Budget warning",
-        kind: SettingKind::Float,
-        category: "Budget",
-    },
-    // — Voice —
-    SettingEntry {
-        key: "tts.enabled",
-        label: "Enabled",
-        kind: SettingKind::Bool,
-        category: "Voice",
-    },
-    SettingEntry {
-        key: "tts.auto_mode",
-        label: "Auto reply",
-        kind: SettingKind::Bool,
-        category: "Voice",
-    },
-    // — Evolution —
+    // — Personality —
     SettingEntry {
         key: "evolution.enabled",
         label: "Evolution",
         kind: SettingKind::Bool,
-        category: "Evolution",
+        category: "Personality",
     },
     SettingEntry {
         key: "evolution.ambient_header_enabled",
         label: "Ambient header",
         kind: SettingKind::Bool,
-        category: "Evolution",
+        category: "Personality",
     },
     // — Heartbeat —
     SettingEntry {
@@ -218,12 +159,74 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Uint,
         category: "Heartbeat",
     },
-    // — Workflow —
+    // — Voice —
+    SettingEntry {
+        key: "tts.enabled",
+        label: "Enabled",
+        kind: SettingKind::Bool,
+        category: "Voice",
+    },
+    SettingEntry {
+        key: "tts.auto_mode",
+        label: "Auto reply",
+        kind: SettingKind::Bool,
+        category: "Voice",
+    },
+    // — Security —
+    SettingEntry {
+        key: "sandbox.enabled",
+        label: "Sandbox",
+        kind: SettingKind::Bool,
+        category: "Security",
+    },
+    SettingEntry {
+        key: "hooks.enabled",
+        label: "Allow user hooks",
+        kind: SettingKind::Bool,
+        category: "Security",
+    },
+    SettingEntry {
+        key: "security.secret_detection",
+        label: "Secret detection",
+        kind: SettingKind::Bool,
+        category: "Security",
+    },
+    // — Advanced — power-user / esoteric knobs
+    SettingEntry {
+        key: "llm.cache.strategy",
+        label: "Cache layout",
+        kind: SettingKind::Select,
+        category: "Advanced",
+    },
+    SettingEntry {
+        key: "conversation.concurrent_tools.max_workers",
+        label: "Parallel tool workers",
+        kind: SettingKind::Uint,
+        category: "Advanced",
+    },
+    SettingEntry {
+        key: "conversation.protect_first_n",
+        label: "Protected head msgs",
+        kind: SettingKind::Uint,
+        category: "Advanced",
+    },
+    SettingEntry {
+        key: "skills.budget_pct",
+        label: "Skills budget (% ctx)",
+        kind: SettingKind::Float,
+        category: "Advanced",
+    },
+    SettingEntry {
+        key: "budget.warning_threshold",
+        label: "Budget warning",
+        kind: SettingKind::Float,
+        category: "Advanced",
+    },
     SettingEntry {
         key: "workflow.enabled",
         label: "Workflows",
         kind: SettingKind::Select,
-        category: "Conversation",
+        category: "Advanced",
     },
 ];
 
