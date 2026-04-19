@@ -92,6 +92,16 @@ pub(crate) fn run_status_evolution() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_status_card(out: Option<std::path::PathBuf>) -> Result<()> {
+    let db = borg_core::db::Database::open()?;
+    let output = borg_core::evolution::commands::dispatch(
+        borg_core::evolution::commands::EvolutionCommand::Card { out },
+        &db,
+    )?;
+    print!("{}", output.text);
+    Ok(())
+}
+
 pub(crate) fn run_status_archetypes() -> Result<()> {
     let config = borg_core::config::Config::load_from_db()?;
     if !config.evolution.enabled {

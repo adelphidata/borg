@@ -12,11 +12,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::{
-    compute_mood, compute_readiness, format_compact, format_evolution_overview,
-    format_next_step_hints, format_xp_feed, format_xp_summary, next_step_hints, recent_xp_feed,
+    compute_mood, compute_readiness, format_evolution_overview, format_next_step_hints,
+    format_xp_feed, format_xp_summary, next_step_hints, recent_xp_feed, render_ascii_card,
     xp_summary,
 };
 use crate::bond;
@@ -143,10 +143,16 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
                 image_png: None,
             })
         }
-        EvolutionCommand::Card { out: _ } => {
-            // Phase-1 stub: reuse the compact one-liner until Stream E lands
-            // the real ASCII share-card renderer.
-            let text = format!("{}\n", format_compact(&state));
+        EvolutionCommand::Card { out } => {
+            let card = render_ascii_card(&state);
+            let text = match out {
+                Some(path) => {
+                    std::fs::write(&path, &card)
+                        .with_context(|| format!("writing card to {}", path.display()))?;
+                    format!("Card written to {}\n", path.display())
+                }
+                None => card,
+            };
             Ok(CommandOutput {
                 text,
                 image_png: None,
@@ -222,5 +228,37 @@ mod tests {
         assert!(out.text.contains("XP Summary"));
         assert!(out.text.contains("Recent XP"));
         assert!(out.text.contains("no recent activity"));
+    }
+
+    #[test]
+    fn dispatch_card_stdout_returns_rendered_card() {
+        let db = Database::test_db();
+        let output = dispatch(EvolutionCommand::Card { out: None }, &db).expect("dispatch");
+        assert!(output.image_png.is_none());
+        assert!(output.text.contains('\u{256D}'));
+        assert!(output.text.contains('\u{2570}'));
+        assert!(output.text.contains("BORG"));
+        assert!(output.text.contains("Stage:"));
+        assert!(output.text.contains("Archetype:"));
+    }
+
+    #[test]
+    fn dispatch_card_with_out_writes_file() {
+        let db = Database::test_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("card.txt");
+        let output = dispatch(
+            EvolutionCommand::Card {
+                out: Some(path.clone()),
+            },
+            &db,
+        )
+        .expect("dispatch");
+        assert!(output.image_png.is_none());
+        assert!(output.text.contains("Card written to"));
+        let on_disk = std::fs::read_to_string(&path).expect("read card file");
+        assert!(on_disk.contains('\u{256D}'));
+        assert!(on_disk.contains("Stage:"));
+        assert!(on_disk.contains("Archetype:"));
     }
 }

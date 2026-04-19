@@ -35,6 +35,18 @@ impl App<'_> {
                     .show_tab(&self.config, StatusTab::Evolution);
                 return Some(Ok(AppAction::Continue));
             }
+            "/card" => {
+                match borg_core::db::Database::open().and_then(|db| {
+                    borg_core::evolution::commands::dispatch(
+                        borg_core::evolution::commands::EvolutionCommand::Card { out: None },
+                        &db,
+                    )
+                }) {
+                    Ok(output) => self.push_system_message(output.text),
+                    Err(e) => self.push_system_message(format!("card failed: {e}")),
+                }
+                return Some(Ok(AppAction::Continue));
+            }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
             "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
             "/pairing" => {

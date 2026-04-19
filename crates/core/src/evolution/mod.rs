@@ -15,6 +15,7 @@ mod feed;
 mod format;
 mod helpers;
 mod replay;
+pub mod share_card;
 
 pub use celebration::{
     celebration_art, format_celebration_message, CelebrationArt, CelebrationPayload,
@@ -28,6 +29,7 @@ pub use format::{
 };
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
 pub use replay::*;
+pub use share_card::render_ascii_card;
 
 use std::collections::HashMap;
 use std::fmt;

@@ -73,6 +73,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Show evolution overview",
     },
     SlashCommandDef {
+        name: "/card",
+        description: "Print an ASCII share card",
+    },
+    SlashCommandDef {
         name: "/pairing",
         description: "Manage sender pairing",
     },

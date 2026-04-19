@@ -224,6 +224,12 @@ enum StatusAction {
     Xp,
     /// Show compact evolution overview with readiness and momentum
     Evolution,
+    /// Print an ASCII share card (--out writes to a file instead of stdout)
+    Card {
+        /// Output path. Omit to print to stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -608,6 +614,7 @@ async fn async_main() -> Result<()> {
             Some(StatusAction::Archetypes) => commands::status::run_status_archetypes()?,
             Some(StatusAction::Xp) => commands::status::run_status_xp()?,
             Some(StatusAction::Evolution) => commands::status::run_status_evolution()?,
+            Some(StatusAction::Card { out }) => commands::status::run_status_card(out)?,
         },
         Some(Commands::Bond { action }) => match action {
             Some(BondAction::History { count }) => commands::status::run_bond_history(count)?,
