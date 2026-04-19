@@ -237,6 +237,12 @@ pub struct ResumeHint {
 }
 
 pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
+    // Kick off a background fetch of the OpenRouter model catalog so the
+    // `/model` picker reflects the live list (dropping stale IDs, tagging
+    // free models). Fire-and-forget: if it fails, the picker falls back to
+    // the hardcoded curated list.
+    crate::openrouter_catalog::spawn_prefetch();
+
     let config = Config::load_from_db()?;
     let metrics = BorgMetrics::from_config(&config);
     let mut agent = Agent::new(config.clone(), metrics.clone())?;

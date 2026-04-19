@@ -184,8 +184,8 @@ impl ModelPopup {
                 self.step = Step::PickProvider { cursor: prev };
             }
             KeyCode::Enter => {
-                let (model_id, _) = models[cursor];
-                return self.persist_selection(provider_id, Some(model_id), config);
+                let model_id = models[cursor].0.clone();
+                return self.persist_selection(provider_id, Some(&model_id), config);
             }
             _ => {}
         }
@@ -341,9 +341,10 @@ impl ModelPopup {
             }
             Step::PickModel { cursor } => {
                 let provider_id = self.provider_id().unwrap_or("openrouter");
-                let models: Vec<(&str, &str)> = models_for_provider(provider_id)
+                let live = models_for_provider(provider_id);
+                let models: Vec<(&str, &str)> = live
                     .iter()
-                    .map(|(id, label)| (*id, *label))
+                    .map(|(id, label)| (id.as_str(), label.as_str()))
                     .collect();
                 self.render_list(
                     frame,
@@ -548,7 +549,7 @@ mod tests {
         popup.show(&cfg);
         popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap(); // pick provider
         let provider_id = popup.provider_id().unwrap();
-        let expected_model = models_for_provider(provider_id)[0].0;
+        let expected_model = models_for_provider(provider_id)[0].0.clone();
         let action = popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap();
 
         assert_eq!(cfg.llm.model, expected_model);

@@ -57,6 +57,7 @@ tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 rusqlite = { workspace = true }
+wiremock = "0.5"
 
 [lints]
 workspace = true

@@ -384,10 +384,10 @@ impl SettingsPopup {
             KeyCode::Enter => {
                 let sel = *selected;
                 let models = models_for_provider(provider_id);
-                let Some((model_id, _)) = models.get(sel).copied() else {
+                let Some(model_id) = models.get(sel).map(|(id, _)| id.clone()) else {
                     return Ok(None);
                 };
-                let action = self.apply_and_save(config, "model", model_id);
+                let action = self.apply_and_save(config, "model", &model_id);
                 if action.is_some() {
                     self.model_index = sel;
                 }

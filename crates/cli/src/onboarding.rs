@@ -114,16 +114,31 @@ pub struct OnboardingResult {
 }
 
 /// Get the model list for a given provider.
-pub(crate) fn models_for_provider(provider_id: &str) -> &'static [(&'static str, &'static str)] {
-    match provider_id {
+///
+/// For `openrouter`, consults the session cache populated by
+/// [`crate::openrouter_catalog::spawn_prefetch`]; falls back to the hardcoded
+/// [`OPENROUTER_MODELS`] list when the cache is empty (cold start or fetch
+/// failure). All other providers return their hardcoded list.
+pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
+    let hardcoded: &'static [(&'static str, &'static str)] = match provider_id {
         "openai" => OPENAI_MODELS,
         "anthropic" => ANTHROPIC_MODELS,
         "gemini" => GEMINI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
         "ollama" => OLLAMA_MODELS,
+        "openrouter" => {
+            if let Some(live) = crate::openrouter_catalog::cached_models() {
+                return live;
+            }
+            OPENROUTER_MODELS
+        }
         _ => OPENROUTER_MODELS,
-    }
+    };
+    hardcoded
+        .iter()
+        .map(|(id, label)| ((*id).to_string(), (*label).to_string()))
+        .collect()
 }
 
 /// Run the interactive onboarding wizard. Returns `None` if the user cancels.

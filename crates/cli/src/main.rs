@@ -49,6 +49,7 @@ mod logo;
 mod migrate_tui;
 mod onboarding;
 mod onboarding_tui;
+mod openrouter_catalog;
 mod plugins;
 mod repl;
 mod service;
