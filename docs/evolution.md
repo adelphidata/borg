@@ -225,6 +225,36 @@ These override the defaults in `[security.action_limits]` when evolution stage i
 - **Stage 2**: Evolution name + level shown in status bar. Stage badge in `/status` output.
 - **Stage 3**: Prestige badge. Enhanced `/status` display with evolution history timeline.
 
+## Status Surfaces
+
+All status commands share a single dispatcher at `borg_core::evolution::{parse, dispatch, CommandOutput, EvolutionCommand}` so the TUI and every messaging channel render identical text.
+
+### `/evolution`
+
+Overview of current stage, level, archetype scores (with momentum arrows), readiness to the next stage, and 1–3 next-step hints. In the TUI opens the Evolution tab of the status popup; on channels replies inline.
+
+- **Momentum arrows** — `↑ ↓ =` next to each archetype score, derived from `compute_momentum` comparing the last 7d of archetype-aligned XP against the prior 7d.
+- **Readiness block** — shown when the agent is within reach of the next stage gate. Each blocking gate renders as a progress bar with a one-line hint (e.g. "Bond 48 / 55 — spend more grounded time together").
+- **Next-step hints** — short, concrete ("Use 3 more Ops-aligned actions this week").
+
+### `/xp`
+
+Today's and this week's XP totals, the top XP sources, the archetype breakdown, and the last 10 feed entries (unified `xp_gain` + `level_up` + `milestone_unlocked`). TUI opens the Xp tab; channels reply inline.
+
+### `/card`
+
+Boxed ASCII share card — name, level, stage, archetype, one-line description. CLI: `borg status card [--out <path>]`. TUI: `/card` pushes the card into the transcript. Channels: inline ASCII only; `--out` is rejected (channels cannot write to the user's filesystem). PNG rendering is deferred to a future iteration — `CommandOutput.image_png` exists in the signature but is unused today.
+
+### Ambient TUI header
+
+The TUI header's `class:` line becomes an ambient broadcast: `Pipeline Warden Lv.42 — Focused — Ops — Evolution pressure rising`. Refreshes on `AfterToolCall` via a cached `AmbientStatus` — no per-render DB hit.
+
+Gated on `evolution.ambient_header_enabled` (default `true`). Toggle via `/settings` in the TUI or `borg settings set evolution.ambient_header_enabled false`.
+
+### Channel commands
+
+`/evolution`, `/xp`, `/card` are intercepted by the gateway command registry (`crates/gateway/src/commands.rs`) in `resolve_session_and_commands` **before** the message reaches the agent loop. They are deterministic status reads, not agent decisions — no LLM turn is invoked and no `messages` row is recorded. Works across Telegram, Slack, Discord, Teams, Google Chat, Signal, Twilio, iMessage.
+
 ## Event Sourcing
 
 Like vitals and bond, evolution state is **event-sourced**. The `evolution_events` table is the single source of truth.
@@ -245,10 +275,28 @@ Current stage, level, and archetype scores are always computed by replaying all 
 
 | Event Type | XP Delta | Description |
 |------------|----------|-------------|
-| `xp_gain` | +N | Base or bonus XP from an action |
+| `xp_gain` | +N | Base or bonus XP from an action. Metadata: `archetype_aligned`, `bonus_reason`, `tool` |
 | `evolution` | 0 | Stage transition marker |
 | `classification` | 0 | LLM archetype classification result |
 | `archetype_shift` | 0 | Dominant archetype changed |
+| `level_up` | 0 | Emitted by replay when a level boundary is crossed. `metadata_json: {from_level, to_level, stage}` |
+| `milestone_unlocked` | 0 | Sub-evolution win. `metadata_json: {milestone_id, title, archetype?}` |
+| `mood_changed` | 0 | Ambient-header mood flipped. `metadata_json: {from_mood, to_mood, reason}` |
+| `share_card_created` | 0 | `/card` rendered. `metadata_json: {card_id, kind}` |
+
+### Milestone Triggers
+
+Detected by `check_milestones(prev, next)` in `crates/core/src/evolution/milestones.rs`:
+
+| Milestone ID | Trigger |
+|---|---|
+| `level_10`, `level_25`, `level_50`, `level_75`, `level_99` | Level boundary crossed within the current stage |
+| `first_evolution` | Stage 1 → Stage 2 transition |
+| `archetype_stabilized` | Dominant archetype held for 7+ days |
+| `first_strong_bond` | Bond crosses 55 for the first time |
+| `aligned_streak_7d` | 7 consecutive days of archetype-aligned XP |
+
+Milestones ride the same `pending_celebrations` outbox as stage-transition celebrations. `deliver_celebration_to_channels` branches on `celebration_type` (`"evolution"` vs `"milestone"`) and formats via `format_celebration(CelebrationKind::{Evolution, Milestone})`. Delivery honors `config.heartbeat.channels` — no new configuration surface.
 
 ## Database Tables (V24)
 
@@ -259,7 +307,7 @@ Append-only ledger with HMAC chain. This is the **only** evolution table — no 
 | Column | Type | Notes |
 |--------|------|-------|
 | id | INTEGER PRIMARY KEY | Auto-increment |
-| event_type | TEXT NOT NULL | xp_gain, evolution, classification, archetype_shift |
+| event_type | TEXT NOT NULL | xp_gain, evolution, classification, archetype_shift, level_up, milestone_unlocked, mood_changed, share_card_created |
 | xp_delta | INTEGER NOT NULL DEFAULT 0 | XP gained (0 for non-XP events) |
 | archetype | TEXT | Which archetype this event relates to |
 | source | TEXT NOT NULL | Tool name, "session_start", etc. |

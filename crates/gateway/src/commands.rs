@@ -148,6 +148,24 @@ pub const GATEWAY_COMMANDS: &[CommandDef] = &[
         accepts_args: false,
         pass_through: false,
     },
+    CommandDef {
+        name: "evolution",
+        description: "Show evolution stage, archetype, readiness",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "xp",
+        description: "Show XP totals, sources, and recent feed",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
+        name: "card",
+        description: "Show your shareable ASCII evolution card",
+        accepts_args: true,
+        pass_through: false,
+    },
 ];
 
 /// Trait for platforms that support registering slash commands in native menus.
@@ -179,6 +197,9 @@ enum Command {
     Schedule,
     Settings,
     Poke,
+    Evolution,
+    Xp,
+    Card,
 }
 
 impl Command {
@@ -214,6 +235,9 @@ impl Command {
             "/schedule" => Self::Schedule,
             "/settings" => Self::Settings,
             "/poke" => Self::Poke,
+            "/evolution" => Self::Evolution,
+            "/xp" => Self::Xp,
+            "/card" => Self::Card,
             _ => return None,
         };
         Some((cmd, args))
@@ -278,6 +302,9 @@ pub fn try_handle_command(
         Command::Settings => handle_settings(db, config, args),
         // Handled out-of-band in the caller; see `is_poke_command`.
         Command::Poke => return None,
+        Command::Evolution => handle_evolution(db),
+        Command::Xp => handle_xp(db),
+        Command::Card => handle_card(db, args),
     };
     Some(response)
 }
@@ -638,6 +665,44 @@ fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     }
 }
 
+fn handle_evolution(db: &Database) -> String {
+    match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Evolution, db) {
+        Ok(out) => out.text,
+        Err(e) => {
+            warn!("/evolution dispatch failed: {e}");
+            "Failed to render evolution.".to_string()
+        }
+    }
+}
+
+fn handle_xp(db: &Database) -> String {
+    match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Xp, db) {
+        Ok(out) => out.text,
+        Err(e) => {
+            warn!("/xp dispatch failed: {e}");
+            "Failed to render XP.".to_string()
+        }
+    }
+}
+
+/// Channels cannot write to the user's filesystem, so `--out <path>` is rejected
+/// outright rather than silently ignored. Inline ASCII card only.
+fn handle_card(db: &Database, args: &str) -> String {
+    if !args.trim().is_empty() {
+        return "/card on messaging channels does not accept arguments (no --out).".to_string();
+    }
+    match borg_core::evolution::dispatch(
+        borg_core::evolution::EvolutionCommand::Card { out: None },
+        db,
+    ) {
+        Ok(out) => out.text,
+        Err(e) => {
+            warn!("/card dispatch failed: {e}");
+            "Failed to render card.".to_string()
+        }
+    }
+}
+
 fn handle_pairing(db: &Database, channel_name: &str, sender_id: &str) -> String {
     let approved = db
         .is_sender_approved(channel_name, sender_id)
@@ -747,6 +812,31 @@ mod tests {
         assert!(is_cancel_command("/cancel"));
         assert!(crate::in_flight::GLOBAL.cancel(session_id).await);
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn parse_evolution_commands() {
+        assert!(matches!(
+            Command::parse("/evolution"),
+            Some((Command::Evolution, _))
+        ));
+        assert!(matches!(Command::parse("/xp"), Some((Command::Xp, _))));
+        assert!(matches!(Command::parse("/card"), Some((Command::Card, _))));
+        // case-insensitive
+        assert!(matches!(
+            Command::parse("/Evolution"),
+            Some((Command::Evolution, _))
+        ));
+        assert!(matches!(Command::parse("/XP"), Some((Command::Xp, _))));
+        // @botname suffix
+        assert!(matches!(
+            Command::parse("/xp@MyBorgBot"),
+            Some((Command::Xp, _))
+        ));
+        // /card forwards its args (handler rejects non-empty on channels)
+        let (cmd, args) = Command::parse("/card --out /tmp/x").unwrap();
+        assert!(matches!(cmd, Command::Card));
+        assert_eq!(args, "--out /tmp/x");
     }
 
     #[test]
