@@ -110,6 +110,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         name: "/restart",
         description: "Restart gateway server",
     },
+    SlashCommandDef {
+        name: "/xp",
+        description: "Show XP summary and feed",
+    },
 ];
 
 /// True when every char of `needle` appears in `haystack` in order

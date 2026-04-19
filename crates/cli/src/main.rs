@@ -220,6 +220,8 @@ enum StatusAction {
     History,
     /// Show archetype score breakdown
     Archetypes,
+    /// Show XP summary and recent feed
+    Xp,
 }
 
 #[derive(Subcommand)]
@@ -602,6 +604,7 @@ async fn async_main() -> Result<()> {
             None => commands::status::run_status()?,
             Some(StatusAction::History) => commands::status::run_status_history()?,
             Some(StatusAction::Archetypes) => commands::status::run_status_archetypes()?,
+            Some(StatusAction::Xp) => commands::status::run_status_xp()?,
         },
         Some(Commands::Bond { action }) => match action {
             Some(BondAction::History { count }) => commands::status::run_bond_history(count)?,

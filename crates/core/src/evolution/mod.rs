@@ -10,8 +10,9 @@
 
 mod celebration;
 mod classification;
-mod commands;
+pub mod commands;
 mod feed;
+mod format;
 mod helpers;
 mod replay;
 
@@ -21,6 +22,7 @@ pub use celebration::{
 pub use classification::*;
 pub use commands::{dispatch, parse, CommandOutput, EvolutionCommand};
 pub use feed::{recent_xp_feed, xp_summary, FeedEntry, FeedKind, XpSummary};
+pub use format::{format_xp_feed, format_xp_summary};
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
 pub use replay::*;
 
@@ -800,7 +802,7 @@ pub fn format_evolution_context(state: &EvolutionState) -> String {
     )
 }
 
-fn capitalize_first(s: &str) -> String {
+pub(super) fn capitalize_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
         None => String::new(),

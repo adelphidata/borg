@@ -14,7 +14,10 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use super::{format_archetype_scores, format_compact, format_status_section, xp_summary};
+use super::{
+    format_archetype_scores, format_compact, format_status_section, format_xp_feed,
+    format_xp_summary, recent_xp_feed, xp_summary,
+};
 use crate::db::Database;
 
 /// A slash-command recognised by the evolution surface.
@@ -98,17 +101,11 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             let events = db.load_all_evolution_events()?;
             let now = chrono::Utc::now().timestamp();
             let summary = xp_summary(&events, now);
+            let feed = recent_xp_feed(&events, 10);
             let mut text = String::new();
-            text.push_str(&format!(
-                "XP · today {} · week {}\n",
-                summary.today, summary.week
-            ));
-            if !summary.top_sources.is_empty() {
-                text.push_str("\nTop sources (7d):\n");
-                for (src, xp) in &summary.top_sources {
-                    text.push_str(&format!("  {src:<20} {xp}\n"));
-                }
-            }
+            text.push_str(&format_xp_summary(&summary));
+            text.push('\n');
+            text.push_str(&format_xp_feed(&feed));
             Ok(CommandOutput {
                 text,
                 image_png: None,
@@ -166,5 +163,32 @@ mod tests {
         assert!(parse("/mode").is_none());
         assert!(parse("hi there").is_none());
         assert!(parse("").is_none());
+    }
+
+    #[test]
+    fn dispatch_xp_renders_all_sections() {
+        let db = Database::test_db();
+        db.record_evolution_event("xp_gain", 2, Some("builder"), "apply_patch", None)
+            .expect("record xp_gain");
+        db.record_evolution_event("xp_gain", 1, Some("ops"), "run_shell", None)
+            .expect("record xp_gain");
+
+        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch xp");
+        assert!(out.image_png.is_none());
+        assert!(out.text.contains("XP Summary"), "text was: {}", out.text);
+        assert!(out.text.contains("Top sources"));
+        assert!(out.text.contains("Archetypes"));
+        assert!(out.text.contains("Recent XP"));
+        assert!(out.text.contains("apply_patch"));
+        assert!(out.text.contains("run_shell"));
+    }
+
+    #[test]
+    fn dispatch_xp_empty_db_still_renders() {
+        let db = Database::test_db();
+        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch xp");
+        assert!(out.text.contains("XP Summary"));
+        assert!(out.text.contains("Recent XP"));
+        assert!(out.text.contains("no recent activity"));
     }
 }

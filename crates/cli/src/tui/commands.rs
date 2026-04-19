@@ -25,6 +25,10 @@ impl App<'_> {
                 self.status_popup.show(&self.config);
                 return Some(Ok(AppAction::Continue));
             }
+            "/xp" => {
+                self.status_popup.show(&self.config);
+                return Some(Ok(AppAction::Continue));
+            }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
             "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
             "/pairing" => {
