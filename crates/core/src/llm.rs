@@ -961,6 +961,7 @@ impl LlmClient {
         let cache_cfg = &self.llm_config.cache;
         let cache_enabled = cache_cfg.enabled;
         let cache_marker = build_cache_control_marker(cache_cfg.ttl);
+        let (cache_system_eff, cache_tools_eff, rolling_eff) = cache_cfg.effective_layout();
 
         let mut body = if let Some(budget) = self.llm_config.thinking.budget_tokens() {
             // When thinking is enabled: omit temperature (Anthropic requirement),
@@ -985,7 +986,7 @@ impl LlmClient {
         };
 
         if let Some(sys) = system_text {
-            if cache_enabled && cache_cfg.cache_system {
+            if cache_enabled && cache_system_eff {
                 // Structured system block with cache_control so the provider can
                 // reuse the (stable) system prompt across turns.
                 body["system"] = serde_json::json!([
@@ -1002,17 +1003,13 @@ impl LlmClient {
 
         let mut anthropic_messages = anthropic_messages;
         if cache_enabled {
-            apply_message_cache_control(
-                &mut anthropic_messages,
-                cache_cfg.rolling_messages_clamped(),
-                &cache_marker,
-            );
+            apply_message_cache_control(&mut anthropic_messages, rolling_eff, &cache_marker);
         }
         body["messages"] = serde_json::json!(anthropic_messages);
         if let Some(mut tools_json) = anthropic_tools {
             // Attach a cache_control marker to the last tool definition so the
             // entire (stable) tools array becomes a single cache breakpoint.
-            if cache_enabled && cache_cfg.cache_tools {
+            if cache_enabled && cache_tools_eff {
                 if let Some(last) = tools_json.last_mut() {
                     if let Some(obj) = last.as_object_mut() {
                         obj.insert("cache_control".to_string(), cache_marker);
@@ -2568,6 +2565,138 @@ mod tests {
         std::env::remove_var(env_var);
     }
 
+    // ── Cache strategy: system_and_3 ──
+
+    #[allow(clippy::unwrap_used)]
+    fn make_system_and_3_client() -> (LlmClient, &'static str) {
+        let env_var = "BORG_TEST_ANTHROPIC_SYSTEM_AND_3";
+        std::env::set_var(env_var, "sk-test");
+        let mut config = Config::default();
+        config.llm.provider = Some("anthropic".to_string());
+        config.llm.api_key_env = env_var.to_string();
+        config.llm.model = "claude-sonnet-4".to_string();
+        config.llm.cache.strategy = crate::config::CacheStrategy::SystemAnd3;
+        (LlmClient::new(&config).unwrap(), env_var)
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn anthropic_request_system_and_3_no_tools_marker() {
+        let (client, env_var) = make_system_and_3_client();
+        let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
+        let messages = vec![Message::system("sys"), Message::user("hi")];
+        let body = client.build_anthropic_request(&messages, Some(&tools), false);
+
+        // System still cached.
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+
+        // Tools must NOT be marked — system_and_3 trades the tools breakpoint
+        // for a deeper rolling tail.
+        let tools_arr = body["tools"].as_array().unwrap();
+        for tool in tools_arr {
+            assert!(
+                tool.get("cache_control").is_none(),
+                "system_and_3 strategy must not cache tools"
+            );
+        }
+        std::env::remove_var(env_var);
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn anthropic_request_system_and_3_marks_last_three_messages() {
+        let (client, env_var) = make_system_and_3_client();
+        let messages = vec![
+            Message::system("sys"),
+            Message::user("turn 1"),
+            Message::user("turn 2"),
+            Message::user("turn 3"),
+            Message::user("turn 4"),
+            Message::user("turn 5"),
+        ];
+        let body = client.build_anthropic_request(&messages, None, false);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 5);
+
+        // Last THREE should carry cache_control (vs last 2 in the default strategy).
+        for idx in [2usize, 3, 4] {
+            let blocks = msgs[idx]["content"].as_array().unwrap();
+            let last = blocks.last().unwrap();
+            assert_eq!(
+                last["cache_control"]["type"], "ephemeral",
+                "msg[{idx}] should carry cache_control under system_and_3"
+            );
+        }
+
+        // Earlier messages must NOT carry the marker.
+        for idx in [0usize, 1] {
+            let content = &msgs[idx]["content"];
+            if let Some(blocks) = content.as_array() {
+                for block in blocks {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "msg[{idx}] should not carry cache_control"
+                    );
+                }
+            }
+        }
+        std::env::remove_var(env_var);
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn anthropic_request_system_and_3_fewer_than_three_messages() {
+        // With only 1 user message the helper must not crash; fewer breakpoints is fine.
+        let (client, env_var) = make_system_and_3_client();
+        let messages = vec![Message::system("sys"), Message::user("only one")];
+        let body = client.build_anthropic_request(&messages, None, false);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        std::env::remove_var(env_var);
+    }
+
+    #[test]
+    fn cache_strategy_roundtrips_snake_case() {
+        use crate::config::CacheStrategy;
+        let s: String = serde_json::to_string(&CacheStrategy::SystemAnd3).unwrap();
+        assert_eq!(s, "\"system_and_3\"");
+        let parsed: CacheStrategy = serde_json::from_str("\"tools_system_and_2\"").unwrap();
+        assert_eq!(parsed, CacheStrategy::ToolsSystemAnd2);
+    }
+
+    #[test]
+    fn effective_layout_default_honors_individual_flags() {
+        use crate::config::PromptCacheConfig;
+        let cfg = PromptCacheConfig {
+            cache_system: false,
+            cache_tools: true,
+            rolling_messages: 2,
+            ..Default::default()
+        };
+        let (sys, tools, rolling) = cfg.effective_layout();
+        assert!(!sys);
+        assert!(tools);
+        assert_eq!(rolling, 2);
+    }
+
+    #[test]
+    fn effective_layout_system_and_3_overrides_flags() {
+        use crate::config::{CacheStrategy, PromptCacheConfig};
+        let cfg = PromptCacheConfig {
+            cache_system: false,
+            cache_tools: true,
+            rolling_messages: 1,
+            strategy: CacheStrategy::SystemAnd3,
+            ..Default::default()
+        };
+        let (sys, tools, rolling) = cfg.effective_layout();
+        assert!(sys, "system_and_3 forces system cache");
+        assert!(!tools, "system_and_3 drops tools cache");
+        assert_eq!(rolling, 3, "system_and_3 forces rolling=3");
+    }
+
     #[test]
     fn normalize_cache_tokens_anthropic_fields() {
         let usage = serde_json::json!({
@@ -2637,6 +2766,7 @@ mod tests {
             cache_tools: false,
             cache_system: true,
             rolling_messages: 1,
+            strategy: crate::config::CacheStrategy::default(),
         };
         let toml_str = toml::to_string(&cfg).unwrap();
         let parsed: crate::config::PromptCacheConfig = toml::from_str(&toml_str).unwrap();

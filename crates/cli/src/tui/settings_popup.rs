@@ -79,6 +79,12 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Uint,
         category: "LLM",
     },
+    SettingEntry {
+        key: "llm.cache.strategy",
+        label: "Cache layout",
+        kind: SettingKind::Select,
+        category: "LLM",
+    },
     // — Conversation —
     SettingEntry {
         key: "conversation.max_iterations",
@@ -96,6 +102,24 @@ const SETTINGS: &[SettingEntry] = &[
         key: "conversation.collaboration_mode",
         label: "Mode",
         kind: SettingKind::Select,
+        category: "Conversation",
+    },
+    SettingEntry {
+        key: "conversation.concurrent_tools.enabled",
+        label: "Parallel tools",
+        kind: SettingKind::Bool,
+        category: "Conversation",
+    },
+    SettingEntry {
+        key: "conversation.concurrent_tools.max_workers",
+        label: "Parallel tool workers",
+        kind: SettingKind::Uint,
+        category: "Conversation",
+    },
+    SettingEntry {
+        key: "conversation.protect_first_n",
+        label: "Protected head msgs",
+        kind: SettingKind::Uint,
         category: "Conversation",
     },
     // — Security —
@@ -581,6 +605,35 @@ impl SettingsPopup {
                         actions.push(AppAction::UpdateSetting {
                             key: "conversation.collaboration_mode".to_string(),
                             value: new_mode.to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Error: {e}"), false));
+                        return Ok(None);
+                    }
+                }
+            }
+            "llm.cache.strategy" => {
+                const MODES: &[&str] = &["tools_system_and_2", "system_and_3"];
+                let current = serde_json::to_string(&config.llm.cache.strategy).unwrap_or_default();
+                let current = current.trim_matches('"').to_string();
+                let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
+                let next_idx = if forward {
+                    (idx + 1) % MODES.len()
+                } else {
+                    (idx + MODES.len() - 1) % MODES.len()
+                };
+                let new_val = MODES[next_idx];
+                match config.apply_setting("llm.cache.strategy", new_val) {
+                    Ok(confirmation) => {
+                        if let Err(e) = self.save_setting("llm.cache.strategy", new_val) {
+                            self.status_message = Some((format!("Save failed: {e}"), false));
+                            return Ok(None);
+                        }
+                        self.status_message = Some((format!("Updated: {confirmation}"), true));
+                        actions.push(AppAction::UpdateSetting {
+                            key: "llm.cache.strategy".to_string(),
+                            value: new_val.to_string(),
                         });
                     }
                     Err(e) => {

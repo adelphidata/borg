@@ -147,6 +147,17 @@ pub enum AgentEvent {
     Preparing,
     /// The agent turn has completed (no more tool calls).
     TurnComplete,
+    /// History was compacted to stay under the token budget.
+    HistoryCompacted {
+        /// Number of messages replaced by the summary.
+        dropped: usize,
+        /// Estimated tokens before compaction.
+        before_tokens: usize,
+        /// Estimated tokens after compaction.
+        after_tokens: usize,
+        /// `true` if an iterative update of a prior summary was used.
+        iterative: bool,
+    },
     /// An error occurred during the agent turn.
     Error(String),
 }
@@ -202,6 +213,11 @@ pub struct Agent {
     recent_tool_names: std::collections::HashSet<String>,
     /// Short-term working memory for the current session.
     short_term_memory: crate::short_term_memory::ShortTermMemory,
+    /// Most recent compaction summary text (no marker prefix). Used by
+    /// `compact_history_v2` to issue iterative-update prompts rather than
+    /// re-summarizing from scratch. Populated either by the current
+    /// session's compactions or by scanning loaded history on resume.
+    previous_summary: Option<String>,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -307,6 +323,7 @@ impl Agent {
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            previous_summary: None,
         }
     }
 
@@ -642,12 +659,24 @@ impl Agent {
             Ok(l) => l,
             Err(_) => return (before, before),
         };
-        compact_history(
-            &mut self.history,
-            self.config.conversation.max_history_tokens,
-            &llm,
-        )
-        .await;
+        let max_hist = self.config.conversation.max_history_tokens;
+        let protect_first_n = self.config.conversation.protect_first_n;
+        if protect_first_n > 0 {
+            if self.previous_summary.is_none() {
+                self.previous_summary =
+                    crate::conversation::extract_last_compaction_summary(&self.history);
+            }
+            crate::conversation::compact_history_v2(
+                &mut self.history,
+                max_hist,
+                protect_first_n,
+                &mut self.previous_summary,
+                &llm,
+            )
+            .await;
+        } else {
+            compact_history(&mut self.history, max_hist, &llm).await;
+        }
         let after = history_tokens(&self.history);
         (before, after)
     }
@@ -1489,7 +1518,7 @@ Rules:
                 let _ = event_tx.send(AgentEvent::Preparing).await;
             }
 
-            self.compact_history_if_needed().await?;
+            self.compact_history_if_needed(&event_tx).await?;
             self.warm_skills_cache();
 
             let (messages, tool_defs) = self.prepare_llm_request(iteration).await?;
@@ -1777,7 +1806,10 @@ Rules:
 
     /// Normalize history and run compaction (tool-result trimming, then LLM-based)
     /// if the token budget is exceeded.
-    async fn compact_history_if_needed(&mut self) -> Result<()> {
+    async fn compact_history_if_needed(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<()> {
         normalize_history(&mut self.history);
 
         let max_hist = self.config.conversation.max_history_tokens;
@@ -1795,6 +1827,7 @@ Rules:
         // Only run LLM-based compaction when history still exceeds the token budget
         if history_tokens(&self.history) > max_hist {
             let pre_compaction_len = self.history.len();
+            let before_tokens = history_tokens(&self.history);
 
             // Pre-compaction memory flush: save important info before messages are dropped
             if self.config.memory.flush_before_compaction {
@@ -1821,10 +1854,55 @@ Rules:
 
             let compaction_config = self.config.with_compaction_overrides();
             let compaction_llm = LlmClient::new(&compaction_config)?;
-            compact_history(&mut self.history, max_hist, &compaction_llm).await;
 
-            let dropped_count = pre_compaction_len.saturating_sub(self.history.len());
+            let protect_first_n = self.config.conversation.protect_first_n;
+            // Seed the iterative-summary state from any prior compaction
+            // marker in the loaded history (session-resume case).
+            if self.previous_summary.is_none() {
+                self.previous_summary =
+                    crate::conversation::extract_last_compaction_summary(&self.history);
+            }
+            let iterative = self.previous_summary.is_some();
+
+            let mut dropped_count = if protect_first_n > 0 {
+                crate::conversation::compact_history_v2(
+                    &mut self.history,
+                    max_hist,
+                    protect_first_n,
+                    &mut self.previous_summary,
+                    &compaction_llm,
+                )
+                .await
+            } else {
+                compact_history(&mut self.history, max_hist, &compaction_llm).await;
+                pre_compaction_len.saturating_sub(self.history.len())
+            };
+
+            // Fallback: if v2 couldn't compact (protected head consumed the
+            // budget, or head clamped out the middle) and history is still
+            // over the limit, degrade to non-head-protected compaction so we
+            // don't stall indefinitely at an over-budget history.
+            if dropped_count == 0 && history_tokens(&self.history) > max_hist {
+                let pre_fallback_len = self.history.len();
+                compact_history(&mut self.history, max_hist, &compaction_llm).await;
+                dropped_count = pre_fallback_len.saturating_sub(self.history.len());
+                if dropped_count > 0 {
+                    warn!(
+                        "v2 compaction yielded no progress; fell back to legacy compaction and dropped {dropped_count} messages"
+                    );
+                }
+            }
+
             if dropped_count > 0 {
+                let after_tokens = history_tokens(&self.history);
+                let _ = event_tx
+                    .send(AgentEvent::HistoryCompacted {
+                        dropped: dropped_count,
+                        before_tokens,
+                        after_tokens,
+                        iterative,
+                    })
+                    .await;
                 if let Ok(guard) = self.db.lock() {
                     if let Some(ref db) = *guard {
                         crate::activity_log::log_activity(
@@ -1956,12 +2034,33 @@ Rules:
         };
         self.log_and_persist(assistant_msg);
 
-        let (sequential, parallel): (Vec<_>, Vec<_>) = tc
-            .iter()
-            .partition(|t| t.function.name == "run_shell" || t.function.name == "browser");
+        // Plan concurrent tool groups. The planner guarantees every group
+        // either (a) contains a single Unknown-effect tool or (b) contains
+        // only parallel-safe tools with no conflicting file-path writes.
+        let concurrent_cfg = &self.config.conversation.concurrent_tools;
+        let max_workers = concurrent_cfg.max_workers.max(1);
+        let parallel_enabled = concurrent_cfg.enabled && max_workers > 1;
 
-        self.run_tool_calls(&parallel, event_tx, cancel).await;
-        self.run_tool_calls(&sequential, event_tx, cancel).await;
+        let groups = crate::tool_effects::plan_groups(tc);
+        for group in groups {
+            if cancel.is_cancelled() {
+                // Emit cancellation markers for the remaining calls so the LLM
+                // sees a tool_result for every tool_call it issued.
+                for idx in group {
+                    self.skip_tool_call(&tc[idx].id, "[tool call cancelled by user]");
+                }
+                continue;
+            }
+
+            if group.len() == 1 || !parallel_enabled {
+                let slice: Vec<&ToolCall> = group.iter().map(|i| &tc[*i]).collect();
+                self.run_tool_calls(&slice, event_tx, cancel).await;
+            } else {
+                let slice: Vec<&ToolCall> = group.iter().map(|i| &tc[*i]).collect();
+                self.run_tool_group_parallel(&slice, max_workers, event_tx, cancel)
+                    .await;
+            }
+        }
     }
 
     /// Drain pending steer messages from the user and inject them into history.
@@ -2078,6 +2177,193 @@ Rules:
                 &self.session.meta.id,
                 self.turn_count,
                 name,
+                &xml,
+            );
+            let _ = event_tx
+                .send(AgentEvent::ToolResult {
+                    name: name.clone(),
+                    result: redacted,
+                })
+                .await;
+            let msg = if let Some(parts) = extra_parts {
+                let mut msg_parts = vec![ContentPart::Text(xml)];
+                msg_parts.extend(
+                    parts
+                        .into_iter()
+                        .filter(|p| !matches!(p, ContentPart::Text(_))),
+                );
+                Message::tool_result_multimodal(&tool_call.id, msg_parts)
+            } else {
+                Message::tool_result(&tool_call.id, &xml)
+            };
+            self.log_and_persist(msg);
+        }
+    }
+
+    /// Execute a batch of parallel-safe tool calls concurrently, preserving
+    /// result order. Pre-spawn checks (hooks, plan-mode, rate-limit) run
+    /// sequentially on the main task; execution fans out to a bounded
+    /// `JoinSet`; post-work (hooks, persistence, events) runs sequentially
+    /// in the group's original order.
+    #[instrument(skip_all)]
+    async fn run_tool_group_parallel(
+        &mut self,
+        tool_calls: &[&ToolCall],
+        max_workers: usize,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) {
+        // Pre-spawn serial pass: dispatch hooks, check plan-mode, record
+        // rate-limit budget. For each call, build a Slot describing whether
+        // it will execute or be skipped. `ToolExecuting` events and
+        // persistence are deferred to the post-fan-out merge so they fire
+        // in original LLM-issued order regardless of interleaving.
+        enum Slot {
+            Approved { name: String, args: String },
+            Skipped { reason: String },
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(tool_calls.len());
+
+        for tool_call in tool_calls {
+            if cancel.is_cancelled() {
+                slots.push(Slot::Skipped {
+                    reason: "[tool call cancelled by user]".into(),
+                });
+                continue;
+            }
+
+            let name = tool_call.function.name.clone();
+            let args = tool_call.function.arguments.clone();
+
+            let hook_ctx = self.hook_ctx(
+                HookPoint::BeforeToolCall,
+                HookData::ToolCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                },
+            );
+            if matches!(self.hook_registry.dispatch(&hook_ctx), HookAction::Skip) {
+                slots.push(Slot::Skipped {
+                    reason: "[tool call skipped by hook]".into(),
+                });
+                continue;
+            }
+
+            if self
+                .config
+                .conversation
+                .collaboration_mode
+                .blocks_mutations()
+                && is_mutating_tool(&name)
+            {
+                slots.push(Slot::Skipped {
+                    reason: "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.".into(),
+                });
+                continue;
+            }
+
+            let action_type = classify_action(&name);
+            match self.rate_guard.record(action_type) {
+                RateDecision::Block(reason) => {
+                    warn!("Rate limit blocked tool call '{name}': {reason}");
+                    slots.push(Slot::Skipped {
+                        reason: format!("Error: {reason}"),
+                    });
+                    continue;
+                }
+                RateDecision::Warn(reason) => warn!("{reason}"),
+                RateDecision::Allow => {}
+            }
+
+            slots.push(Slot::Approved { name, args });
+        }
+
+        // Fan-out: spawn approved slots onto JoinSet. Bounded by `max_workers`.
+        let mut join_set: tokio::task::JoinSet<(usize, String, Instant, Result<ToolOutput>)> =
+            tokio::task::JoinSet::new();
+        let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(max_workers));
+
+        for (idx, slot) in slots.iter().enumerate() {
+            if let Slot::Approved { name, args } = slot {
+                let config = std::sync::Arc::clone(&self.config_arc);
+                let tx = event_tx.clone();
+                let permits = std::sync::Arc::clone(&permits);
+                let name_clone = name.clone();
+                let args_clone = args.clone();
+                join_set.spawn(async move {
+                    let _permit = permits.acquire_owned().await.ok();
+                    let start = Instant::now();
+                    let result =
+                        dispatch_parallel_safe_tool(&name_clone, &args_clone, config.as_ref(), &tx)
+                            .await;
+                    (idx, name_clone, start, result)
+                });
+            }
+        }
+
+        // Collect completed tasks into a vec indexed by `idx` so we can
+        // re-interleave with skip slots in original order.
+        let mut results: Vec<Option<(String, f64, Result<ToolOutput>)>> =
+            (0..slots.len()).map(|_| None).collect::<Vec<_>>();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((idx, name, start, result)) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    results[idx] = Some((name, elapsed, result));
+                }
+                Err(e) => {
+                    tracing::error!("parallel tool worker panicked or was cancelled: {e}");
+                }
+            }
+        }
+
+        // Single in-order pass: emit ToolExecuting, fire hooks, and persist
+        // results in the LLM's original call order. Skip slots and completed
+        // slots are interleaved at their original positions.
+        for (idx, slot) in slots.into_iter().enumerate() {
+            let tool_call = tool_calls[idx];
+            let (name, elapsed, result, args_for_event) = match slot {
+                Slot::Skipped { reason } => {
+                    self.skip_tool_call(&tool_call.id, &reason);
+                    continue;
+                }
+                Slot::Approved { name: _, args } => match results[idx].take() {
+                    Some((nm, el, res)) => (nm, el, res, args),
+                    None => {
+                        // Worker panicked — surface a placeholder error so the
+                        // LLM still sees a tool_result for this call.
+                        self.skip_tool_call(&tool_call.id, "[tool call failed — worker panicked]");
+                        continue;
+                    }
+                },
+            };
+
+            let _ = event_tx
+                .send(AgentEvent::ToolExecuting {
+                    name: name.clone(),
+                    args: args_for_event,
+                })
+                .await;
+
+            let tool_output = result.unwrap_or_else(|e| ToolOutput::Text(format!("Error: {e}")));
+            self.metrics.tool_executions.add(1, &[]);
+            self.metrics.tool_duration.record(elapsed, &[]);
+
+            let safe_name = crate::xml_util::escape_xml_attr(&name);
+            let (raw_text, extra_parts) = match tool_output {
+                ToolOutput::Text(t) => (t, None),
+                ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
+            };
+            let redacted = self.truncate_and_redact(&raw_text);
+            let sanitized = crate::xml_util::sanitize_xml_boundaries(&redacted);
+            let xml = format!(
+                "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
+            );
+            Self::fire_after_tool_hook(
+                &mut self.hook_registry,
+                &self.session.meta.id,
+                self.turn_count,
+                &name,
                 &xml,
             );
             let _ = event_tx
@@ -2239,6 +2525,59 @@ Rules:
         let mut guard = self.db_guard();
         if guard.take().is_some() {
             tracing::info!("Database connection closed for uninstall");
+        }
+    }
+}
+
+/// Execute a tool call that the planner classified as parallel-safe.
+///
+/// This mirrors the handler-selection table in `Agent::execute_tool` but is
+/// restricted to tools that (a) take `&Config` or less, (b) do not touch
+/// `&mut self`, and (c) only handle effects the planner deems safe to fan
+/// out concurrently. The set is kept in sync with `tool_effects::classify`;
+/// any mismatch is a bug — unsafe branches return a hard error so the
+/// condition is visible in tests rather than silently misbehaving.
+async fn dispatch_parallel_safe_tool(
+    name: &str,
+    args_json: &str,
+    config: &Config,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> Result<ToolOutput> {
+    let args: serde_json::Value = match serde_json::from_str(args_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(ToolOutput::Text(format!(
+                "Error: Invalid JSON arguments: {e}. Please provide valid JSON."
+            )));
+        }
+    };
+
+    match name {
+        "read_file" => tool_handlers::handle_read_file(&args, config),
+        "read_memory" => tool_handlers::handle_read_memory(&args).map(ToolOutput::Text),
+        "memory_search" => tool_handlers::handle_memory_search(&args, config)
+            .await
+            .map(ToolOutput::Text),
+        "list_skills" => tool_handlers::handle_list_skills(config).map(ToolOutput::Text),
+        "list_channels" => tool_handlers::handle_list_channels(config).map(ToolOutput::Text),
+        "list_dir" => tool_handlers::handle_list_dir(&args, config).map(ToolOutput::Text),
+        "web_fetch" => tool_handlers::handle_web_fetch(&args, config)
+            .await
+            .map(ToolOutput::Text),
+        "web_search" => tool_handlers::handle_web_search(&args, config)
+            .await
+            .map(ToolOutput::Text),
+        "apply_patch" => {
+            tool_handlers::handle_apply_patch_unified(&args, config).map(ToolOutput::Text)
+        }
+        "apply_skill_patch" => tool_handlers::handle_apply_skill_patch(&args).map(ToolOutput::Text),
+        other => {
+            // Planner bug — fall back loudly rather than running sequentially
+            // via a different code path.
+            let _ = event_tx; // silence unused warning if all arms avoid it
+            Err(anyhow::anyhow!(
+                "dispatch_parallel_safe_tool called with non-parallel-safe tool '{other}' — planner/dispatch mismatch"
+            ))
         }
     }
 }
@@ -2612,6 +2951,62 @@ mod tests {
         // Give the spawned task time to run and panic
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // If we get here, the panic was handled (not propagated)
+    }
+
+    // -- dispatch_parallel_safe_tool --
+
+    #[tokio::test]
+    async fn dispatch_parallel_safe_tool_read_file_returns_content() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"hello world")
+            .unwrap();
+
+        let config = Config::default();
+        let (tx, _rx) = mpsc::channel(8);
+
+        let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
+        let out = dispatch_parallel_safe_tool("read_file", &args, &config, &tx)
+            .await
+            .unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            ToolOutput::Multimodal { text, .. } => text,
+        };
+        assert!(text.contains("hello world"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_parallel_safe_tool_rejects_unsafe_tool_name() {
+        // Guard: the planner should never route an Unknown-effect tool here.
+        // If it does, the dispatcher surfaces a loud error rather than
+        // silently misbehaving.
+        let config = Config::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let result = dispatch_parallel_safe_tool("run_shell", "{}", &config, &tx).await;
+        assert!(result.is_err(), "unsafe tool must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("non-parallel-safe") || msg.contains("planner/dispatch mismatch"),
+            "error should name the mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parallel_safe_tool_invalid_json_returns_text() {
+        let config = Config::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let out = dispatch_parallel_safe_tool("read_file", "not json", &config, &tx)
+            .await
+            .unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            _ => panic!("expected text output"),
+        };
+        assert!(text.contains("Invalid JSON"), "got: {text}");
     }
 
     // -- New AgentEvent variants --

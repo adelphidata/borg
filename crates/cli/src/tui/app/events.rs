@@ -72,6 +72,18 @@ impl<'a> App<'a> {
             AgentEvent::ToolOutputDelta {
                 delta, is_stderr, ..
             } => self.handle_event_tool_output_delta(delta, is_stderr),
+            AgentEvent::HistoryCompacted {
+                dropped,
+                before_tokens,
+                after_tokens,
+                iterative,
+            } => {
+                let saved = before_tokens.saturating_sub(after_tokens);
+                let mode = if iterative { "updated" } else { "new" };
+                self.push_system_message(format!(
+                    "Compacted {dropped} messages ({mode} summary, saved ~{saved} tokens)"
+                ));
+            }
         }
     }
 

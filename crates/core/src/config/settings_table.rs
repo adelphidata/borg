@@ -26,6 +26,7 @@ define_settings! {
         "llm.cache.cache_tools" => llm.cache.cache_tools, parsed(bool);
         "llm.cache.cache_system" => llm.cache.cache_system, parsed(bool);
         "llm.cache.rolling_messages" => llm.cache.rolling_messages, parsed(u8);
+        "llm.cache.strategy" => llm.cache.strategy, json_quoted("Invalid cache strategy");
 
         // ── Sandbox ──
         "sandbox.enabled" => sandbox.enabled, parsed(bool);
@@ -60,6 +61,9 @@ define_settings! {
         "conversation.compaction_marker_tokens" => conversation.compaction_marker_tokens, parsed(usize);
         "conversation.max_transcript_chars" => conversation.max_transcript_chars, parsed(usize);
         "conversation.age_based_degradation" => conversation.age_based_degradation, parsed(bool);
+        "conversation.protect_first_n" => conversation.protect_first_n, parsed(usize);
+        "conversation.concurrent_tools.enabled" => conversation.concurrent_tools.enabled, parsed(bool);
+        "conversation.concurrent_tools.max_workers" => conversation.concurrent_tools.max_workers, parsed(usize);
 
         // ── Security ──
         "security.secret_detection" => security.secret_detection, parsed(bool);

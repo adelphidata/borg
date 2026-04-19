@@ -483,6 +483,28 @@ impl Default for SkillsConfig {
     }
 }
 
+/// Per-turn concurrent tool execution settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ConcurrentToolsConfig {
+    /// When true, non-conflicting tool calls in the same assistant response
+    /// are fanned out in parallel. Conflict detection uses file-path overlap
+    /// and read-only / mutating / unknown effect classification.
+    pub enabled: bool,
+    /// Upper bound on concurrent tool tasks per group. 1 effectively disables
+    /// parallelism without needing to flip `enabled`.
+    pub max_workers: usize,
+}
+
+impl Default for ConcurrentToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_workers: 8,
+        }
+    }
+}
+
 /// Configuration for conversation behavior and context management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -507,6 +529,15 @@ pub struct ConversationConfig {
     /// Saves 2K-8K tokens/turn in long conversations.
     #[serde(default = "default_true")]
     pub age_based_degradation: bool,
+    /// Number of earliest history messages to preserve verbatim across
+    /// compactions. 0 = legacy behavior (head can be dropped into the
+    /// summary). Non-zero = hermes-style head protection with iterative
+    /// summary updates.
+    #[serde(default)]
+    pub protect_first_n: usize,
+    /// Concurrent tool execution settings.
+    #[serde(default)]
+    pub concurrent_tools: ConcurrentToolsConfig,
 }
 
 impl Default for ConversationConfig {
@@ -520,6 +551,8 @@ impl Default for ConversationConfig {
             max_transcript_chars: constants::MAX_TRANSCRIPT_CHARS,
             collaboration_mode: CollaborationMode::Default,
             age_based_degradation: true,
+            protect_first_n: 3,
+            concurrent_tools: ConcurrentToolsConfig::default(),
         }
     }
 }

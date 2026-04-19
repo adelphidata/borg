@@ -149,6 +149,25 @@ impl std::fmt::Display for CacheTtl {
     }
 }
 
+/// Which cache-breakpoint layout to apply on Anthropic requests.
+///
+/// Anthropic permits up to 4 `cache_control` breakpoints per request.
+/// Different layouts trade coverage of the tool schema against how many
+/// recent messages stay cached as the conversation grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CacheStrategy {
+    /// Tools + system + last 2 messages. Best when the tool schema is large
+    /// and stable; leaves 2 breakpoints for the rolling tail.
+    #[default]
+    #[serde(rename = "tools_system_and_2")]
+    ToolsSystemAnd2,
+    /// System + last 3 messages, no tools marker. Trades the tools breakpoint
+    /// for deeper tail coverage — helpful on long conversations with a
+    /// relatively small tool list. Ported from hermes-agent.
+    #[serde(rename = "system_and_3")]
+    SystemAnd3,
+}
+
 /// Prompt caching configuration.
 ///
 /// When enabled and the provider supports it, the LLM client attaches
@@ -166,14 +185,20 @@ pub struct PromptCacheConfig {
     /// Cache TTL (`5m` default or `1h` extended).
     pub ttl: CacheTtl,
     /// Attach a cache marker to the last tool definition (caches the whole
-    /// tools array). Anthropic only; ignored by other providers.
+    /// tools array). Anthropic only; ignored by other providers. Overridden
+    /// when `strategy` is not the default.
     pub cache_tools: bool,
     /// Attach a cache marker to the system prompt block. Anthropic only.
+    /// Overridden when `strategy` is not the default.
     pub cache_system: bool,
     /// Number of trailing messages to mark with a rolling cache breakpoint.
     /// Clamped to at most 2 so tools + system + rolling stays within
-    /// Anthropic's 4-breakpoint budget.
+    /// Anthropic's 4-breakpoint budget. Overridden when `strategy` is not
+    /// the default.
     pub rolling_messages: u8,
+    /// Cache breakpoint layout. When set to a non-default variant, it
+    /// overrides `cache_tools`, `cache_system`, and `rolling_messages`.
+    pub strategy: CacheStrategy,
 }
 
 impl Default for PromptCacheConfig {
@@ -184,6 +209,7 @@ impl Default for PromptCacheConfig {
             cache_tools: true,
             cache_system: true,
             rolling_messages: 2,
+            strategy: CacheStrategy::default(),
         }
     }
 }
@@ -192,6 +218,20 @@ impl PromptCacheConfig {
     /// Returns the rolling message count, clamped to `[0, 2]`.
     pub fn rolling_messages_clamped(&self) -> usize {
         self.rolling_messages.min(2) as usize
+    }
+
+    /// Resolve the effective `(cache_system, cache_tools, rolling_messages)`
+    /// layout for this config. Non-default strategies override the individual
+    /// fields; the default strategy keeps the legacy per-flag behavior.
+    pub fn effective_layout(&self) -> (bool, bool, usize) {
+        match self.strategy {
+            CacheStrategy::ToolsSystemAnd2 => (
+                self.cache_system,
+                self.cache_tools,
+                self.rolling_messages_clamped(),
+            ),
+            CacheStrategy::SystemAnd3 => (true, false, 3),
+        }
     }
 }
 
