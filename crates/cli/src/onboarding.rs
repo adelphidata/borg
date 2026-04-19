@@ -415,7 +415,11 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     }
 
     // Install selected channel plugins
-    if !result.channels.is_empty() {
+    if result.channels.is_empty() {
+        println!(
+            "  No channels connected. Add one later with `borg add <name>` (e.g. `borg add telegram`)."
+        );
+    } else {
         let mut cfg = match Config::load_from_db() {
             Ok(c) => c,
             Err(e) => {

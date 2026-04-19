@@ -1278,6 +1278,10 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
                 "Connect messaging channels (optional)",
                 Style::default().fg(theme::CYAN),
             )));
+            lines.push(Line::from(Span::styled(
+                "  You can skip this — add any channel later with `borg add <name>`",
+                theme::dim(),
+            )));
             lines.push(Line::default());
 
             for (i, item) in state.channel_items.iter().enumerate() {
@@ -1316,7 +1320,7 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
 
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
-                "  Press Enter to finish, or Space to toggle channels",
+                "  Press Enter to finish (skips if nothing selected), or Space to toggle",
                 theme::dim(),
             )));
         }
