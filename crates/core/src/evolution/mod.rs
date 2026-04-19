@@ -711,7 +711,8 @@ pub fn format_status_section_with_width(state: &EvolutionState, card_width: usiz
 
 /// Format archetype scores for `borg status archetypes`.
 pub fn format_archetype_scores(state: &EvolutionState) -> String {
-    let mut out = String::from("Archetype Scores\n");
+    let mut out =
+        String::from("Archetype Scores\n  (how you use borg shapes its identity; * = dominant)\n");
 
     let mut sorted: Vec<(Archetype, u32)> = Archetype::ALL
         .iter()

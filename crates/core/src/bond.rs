@@ -367,7 +367,7 @@ pub fn format_status(
     recent_events: &[BondEvent],
 ) -> String {
     let mut out = String::from(
-        "Bond Status\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n",
+        "Bond Status\n\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n  (trust your borg has earned; higher score unlocks more autonomy)\n",
     );
 
     out.push_str(&format!(

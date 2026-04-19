@@ -639,6 +639,11 @@ pub fn format_status(state: &VitalsState, events: &[VitalsEvent], drift: &[Drift
         bar(state.happiness, 10),
         state.happiness
     ));
+    // Plain-English legend so these stats are legible to non-technical users
+    // without needing to read the code or docs.
+    out.push_str("\n  stability = long-term steadiness   focus = attention this session\n");
+    out.push_str("  sync = alignment with you          growth = learning rate\n");
+    out.push_str("  happiness = your sentiment\n");
 
     if !events.is_empty() {
         let mut interactions = 0u32;
