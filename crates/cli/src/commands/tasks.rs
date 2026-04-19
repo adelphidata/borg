@@ -62,7 +62,7 @@ pub(crate) fn run_tasks_create(
         timeout_ms,
         delivery_channel,
         delivery_target,
-        allowed_tools: None, // TODO: Add --tools CLI flag
+        allowed_tools: None,
         task_type: "prompt",
     })?;
 
