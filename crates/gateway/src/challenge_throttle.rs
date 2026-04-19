@@ -91,35 +91,33 @@ mod tests {
     }
 
     #[test]
-    fn first_challenge_not_suppressed() {
+    fn scope_and_cooldown() {
+        // Covers the four real branches of should_suppress:
+        //   (a) first hit → not suppressed
+        //   (b) repeat within cooldown → suppressed
+        //   (c) same channel, different sender → independent
+        //   (d) same sender, different channel → independent
         let mut throttle = make_throttle(60_000);
-        assert!(!throttle.should_suppress("telegram", "user1"));
+        assert!(!throttle.should_suppress("telegram", "user1"), "first hit");
+        assert!(
+            throttle.should_suppress("telegram", "user1"),
+            "repeat within cooldown"
+        );
+        assert!(
+            !throttle.should_suppress("telegram", "user2"),
+            "per-sender isolation"
+        );
+        assert!(
+            !throttle.should_suppress("slack", "user1"),
+            "per-channel isolation"
+        );
     }
 
     #[test]
-    fn second_challenge_suppressed() {
-        let mut throttle = make_throttle(60_000);
-        assert!(!throttle.should_suppress("telegram", "user1"));
-        assert!(throttle.should_suppress("telegram", "user1"));
-    }
-
-    #[test]
-    fn different_sender_not_suppressed() {
-        let mut throttle = make_throttle(60_000);
-        assert!(!throttle.should_suppress("telegram", "user1"));
-        assert!(!throttle.should_suppress("telegram", "user2"));
-    }
-
-    #[test]
-    fn different_channel_not_suppressed() {
-        let mut throttle = make_throttle(60_000);
-        assert!(!throttle.should_suppress("telegram", "user1"));
-        assert!(!throttle.should_suppress("slack", "user1"));
-    }
-
-    #[test]
-    fn expired_cooldown_not_suppressed() {
-        let mut throttle = make_throttle(0); // 0ms cooldown
+    fn zero_cooldown_never_suppresses() {
+        // Edge: a 0ms cooldown should mean "never suppress" — repeated hits
+        // after a tick still fire through.
+        let mut throttle = make_throttle(0);
         assert!(!throttle.should_suppress("telegram", "user1"));
         std::thread::sleep(std::time::Duration::from_millis(1));
         assert!(!throttle.should_suppress("telegram", "user1"));
@@ -154,11 +152,5 @@ mod tests {
         throttle.prune_if_needed();
         // Active entries should survive
         assert!(!throttle.entries.is_empty());
-    }
-
-    #[test]
-    fn default_has_5_minute_cooldown() {
-        let throttle = ChallengeThrottle::default();
-        assert_eq!(throttle.cooldown, Duration::from_secs(300));
     }
 }

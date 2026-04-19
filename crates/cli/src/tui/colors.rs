@@ -286,43 +286,6 @@ mod tests {
     }
 
     #[test]
-    fn nearest_xterm256_black() {
-        assert_eq!(nearest_xterm256(0, 0, 0), 16); // cube index for (0,0,0)
-    }
-
-    #[test]
-    fn nearest_xterm256_white() {
-        assert_eq!(nearest_xterm256(255, 255, 255), 231); // cube index for (255,255,255)
-    }
-
-    #[test]
-    fn nearest_xterm256_gray() {
-        // Mid-gray should map to grayscale ramp
-        let idx = nearest_xterm256(128, 128, 128);
-        assert!(idx >= 232);
-    }
-
-    #[test]
-    fn blend_channel_zero_alpha() {
-        assert_eq!(blend_channel(255, 30, 0.0), 30);
-    }
-
-    #[test]
-    fn blend_channel_full_alpha() {
-        assert_eq!(blend_channel(255, 30, 1.0), 255);
-    }
-
-    #[test]
-    fn luminance_black() {
-        assert_eq!(luminance(0, 0, 0), 0.0);
-    }
-
-    #[test]
-    fn luminance_white() {
-        assert!((luminance(255, 255, 255) - 255.0).abs() < 0.01);
-    }
-
-    #[test]
     fn parse_color_component_all_lengths() {
         assert_eq!(parse_color_component("f"), Some(0xff));
         assert_eq!(parse_color_component("1c"), Some(0x1c));

@@ -81,6 +81,21 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 **Be conservative adding new tools.** Every tool's JSON schema is sent to the LLM every turn (~5KB+ per tool). Prefer adding actions/parameters to existing tools. If achievable via `run_shell` or an existing tool action, don't create a new tool.
 
+### Test Quality — No Fluff Tests
+
+**Every test must be able to fail for a real-world reason.** A passing test with no failure mode is noise — it inflates the suite, slows CI, and provides false confidence. When writing or reviewing tests, reject these patterns:
+
+- **Tautological** — asserting on values the test itself just set, on `Default`/`Clone`/auto-derived trait output, or on compile-time constants. If the test and the code under test are both just reading the same literal, delete the test.
+- **Over-mocked** — a mock/stub returns canned data and the test asserts on that canned data. The production code path isn't exercised; the mock is. Either stand up a real fixture or delete the test.
+- **Smoke-only** — `.is_ok()` / `.is_some()` / "didn't panic" with no meaningful assertion on the result. Either add a real assertion or delete.
+- **Enum-variant-exists** — `let x = Event::Foo {}; assert!(matches!(x, Event::Foo { .. }));` is already compiler-checked. Delete.
+- **Source-grep tests** — `include_str!("mod.rs"); assert!(src.contains("fn foo"))` is brittle and re-asserts what the compiler already enforces. Only acceptable for documented invariants that can't be expressed in types (see the `build_system_prompt_*` prompt-cache guards and the TUI `include_str!` forbidden-pattern guards — these are the exceptions, not a template).
+- **Near-duplicate per-variant tests** — one test per enum variant / per config value / per provider, all with the same body. Collapse into a single table-driven test.
+
+**What a good test looks like:** exercises a real code path, sets up inputs that could realistically occur, asserts on a specific observable outcome, and would fail if the production logic broke. Prefer fewer strong tests to many weak ones.
+
+**When a regression guard looks like a fluff test, document why.** If a test is intentionally checking a constant or a source-level pattern because it enforces an invariant that types can't express (prompt cache stability, forbidden mouse-capture APIs, etc.), add a comment naming the invariant and the incident that motivated the guard. Otherwise reviewers will correctly delete it.
+
 ### Patch DSL — Every Content Line Needs a Prefix
 
 `+` for added, ` ` (space) for context, `-` for removed. Omitting the prefix is a common mistake.

@@ -2841,14 +2841,6 @@ mod tests {
     }
 
     #[test]
-    fn workflow_guidance_template_is_not_empty() {
-        assert!(
-            !WORKFLOW_GUIDANCE.trim().is_empty(),
-            "workflow_guidance.md template must not be empty",
-        );
-    }
-
-    #[test]
     fn build_system_prompt_workflow_guidance_after_collaboration() {
         let body = extract_build_system_prompt_body();
         let collab_idx = body
@@ -2958,13 +2950,6 @@ mod tests {
     }
 
     #[test]
-    fn require_str_param_empty_string() {
-        let args = serde_json::json!({"name": ""});
-        let val = tool_handlers::require_str_param(&args, "name").unwrap();
-        assert_eq!(val, "");
-    }
-
-    #[test]
     fn update_task_status_not_found() {
         let id = "test-nonexistent-00000000";
         let result = tool_handlers::update_task_status(id, "paused", "paused").unwrap();
@@ -2992,50 +2977,35 @@ mod tests {
     // ── classify_action tests ──
 
     #[test]
-    fn classify_action_run_shell() {
-        assert!(matches!(
-            classify_action("run_shell"),
-            ActionType::ShellCommand
-        ));
-    }
-
-    #[test]
-    fn classify_action_apply_patch() {
-        assert!(matches!(
-            classify_action("apply_patch"),
-            ActionType::FileWrite
-        ));
-    }
-
-    #[test]
-    fn classify_action_write_memory() {
-        assert!(matches!(
-            classify_action("write_memory"),
-            ActionType::MemoryWrite
-        ));
-    }
-
-    #[test]
-    fn classify_action_web_fetch() {
-        assert!(matches!(
-            classify_action("web_fetch"),
-            ActionType::WebRequest
-        ));
-    }
-
-    #[test]
-    fn classify_action_unknown_tool() {
-        assert!(matches!(
-            classify_action("unknown_tool"),
-            ActionType::ToolCall
-        ));
+    fn classify_action_known_and_unknown_tools() {
+        // classify_action feeds the rate-limiter and vitals events. If the
+        // mapping regresses, a shell command could be counted as a generic
+        // tool call and bypass the shell-specific rate bucket.
+        let cases: &[(&str, ActionType)] = &[
+            ("run_shell", ActionType::ShellCommand),
+            ("apply_patch", ActionType::FileWrite),
+            ("write_memory", ActionType::MemoryWrite),
+            ("web_fetch", ActionType::WebRequest),
+            // Unknowns must fall through to ToolCall (safe default).
+            ("some_unknown_tool", ActionType::ToolCall),
+            ("", ActionType::ToolCall),
+        ];
+        for (tool, expected) in cases {
+            let got = classify_action(tool);
+            assert!(
+                std::mem::discriminant(&got) == std::mem::discriminant(expected),
+                "classify_action({tool:?}) = {got:?}, expected {expected:?}"
+            );
+        }
     }
 
     // -- is_mutating_tool (allowlist-based) --
 
     #[test]
     fn mutating_tools_are_blocked_in_plan_mode() {
-        // These should be considered mutating
+        // Plan mode security boundary: these tools must be blocked. If a new
+        // mutating tool is added and someone forgets to tag it mutating, plan
+        // mode turns into execute mode silently.
         assert!(is_mutating_tool("apply_patch"));
         assert!(is_mutating_tool("apply_skill_patch"));
         assert!(is_mutating_tool("create_channel"));
@@ -3044,6 +3014,8 @@ mod tests {
         assert!(is_mutating_tool("browser"));
         assert!(is_mutating_tool("schedule"));
         assert!(is_mutating_tool("generate_image"));
+        // request_user_input blocks execution; must be gated in plan mode.
+        assert!(is_mutating_tool("request_user_input"));
     }
 
     #[test]
@@ -3143,40 +3115,6 @@ mod tests {
         assert!(text.contains("Invalid JSON"), "got: {text}");
     }
 
-    // -- New AgentEvent variants --
-
-    #[test]
-    fn steer_received_event_variant_exists() {
-        let event = AgentEvent::SteerReceived {
-            text: "adjust approach".into(),
-        };
-        assert!(matches!(event, AgentEvent::SteerReceived { .. }));
-    }
-
-    #[test]
-    fn plan_updated_event_variant_exists() {
-        let event = AgentEvent::PlanUpdated { steps: vec![] };
-        assert!(matches!(event, AgentEvent::PlanUpdated { .. }));
-    }
-
-    #[test]
-    fn user_input_request_event_variant_exists() {
-        let (tx, _rx) = tokio::sync::oneshot::channel::<String>();
-        let event = AgentEvent::UserInputRequest {
-            prompt: "Which DB?".into(),
-            respond: tx,
-        };
-        assert!(matches!(event, AgentEvent::UserInputRequest { .. }));
-    }
-
-    // -- update_plan tool in plan mode --
-
-    #[test]
-    fn request_user_input_is_mutating() {
-        // request_user_input blocks execution, so it should be blocked in plan mode
-        assert!(is_mutating_tool("request_user_input"));
-    }
-
     // -- SETUP template tests --
 
     #[test]
@@ -3246,48 +3184,28 @@ mod tests {
         assert!(std::fs::rename(&setup_path, &consumed_path).is_err());
     }
 
-    // -- should_nudge_for_response tests --
+    // -- should_nudge_for_response --
 
     #[test]
-    fn nudge_when_empty_after_tools() {
-        assert!(should_nudge_for_response("", true, false));
-        assert!(should_nudge_for_response("  \n  ", true, false));
-    }
-
-    #[test]
-    fn no_nudge_when_text_present() {
-        assert!(!should_nudge_for_response("Done!", true, false));
-    }
-
-    #[test]
-    fn no_nudge_when_no_tools_executed() {
-        assert!(!should_nudge_for_response("", false, false));
-    }
-
-    #[test]
-    fn no_nudge_when_already_retried() {
-        assert!(!should_nudge_for_response("", true, true));
+    fn should_nudge_for_response_matrix() {
+        // (text, tools_executed, already_retried, expected_nudge)
+        let cases: &[(&str, bool, bool, bool)] = &[
+            ("", true, false, true),       // empty after tools → nudge
+            ("  \n  ", true, false, true), // whitespace-only counts as empty
+            ("Done!", true, false, false), // non-empty text → no nudge
+            ("", false, false, false),     // no tools ran → no nudge
+            ("", true, true, false),       // already retried once → no nudge
+        ];
+        for (text, tools, retried, expected) in cases {
+            let got = should_nudge_for_response(text, *tools, *retried);
+            assert_eq!(
+                got, *expected,
+                "should_nudge_for_response({text:?}, tools={tools}, retried={retried}) = {got}, expected {expected}"
+            );
+        }
     }
 
     // -- collaboration mode template tests --
-
-    #[test]
-    fn default_mode_requires_task_confirmation() {
-        let template = include_str!("../../templates/collaboration_mode/default.md");
-        assert!(
-            template.contains("briefly confirm what changed"),
-            "Default collaboration mode must instruct agent to confirm task completion"
-        );
-    }
-
-    #[test]
-    fn execute_mode_requires_task_confirmation() {
-        let template = include_str!("../../templates/collaboration_mode/execute.md");
-        assert!(
-            template.contains("Never end a turn silently"),
-            "Execute collaboration mode must instruct agent to never end silently"
-        );
-    }
 
     // -- new system prompt section tests --
 

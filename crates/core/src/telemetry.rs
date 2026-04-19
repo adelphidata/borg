@@ -234,9 +234,12 @@ mod tests {
     }
 
     #[test]
-    fn test_borg_metrics_noop() {
+    fn noop_instruments_and_guard_do_not_panic() {
+        // The noop path is the production default (telemetry off). If any
+        // instrument.add / record call panicked, every user would hit it. This
+        // exercises the full set in one shot; if a new metric is added to
+        // BorgMetrics, it should be exercised here too.
         let metrics = BorgMetrics::noop();
-        // Verify noop instruments don't panic on use
         metrics.agent_turns.add(1, &[]);
         metrics.agent_iterations.add(1, &[]);
         metrics.llm_requests.add(1, &[]);
@@ -246,56 +249,15 @@ mod tests {
         metrics.tool_duration.record(0.1, &[]);
         metrics.gateway_requests.add(1, &[]);
         metrics.gateway_duration.record(0.2, &[]);
-    }
 
-    #[tokio::test]
-    async fn test_init_with_tracing_enabled() {
-        let config = TelemetryConfig {
-            tracing_enabled: true,
-            metrics_enabled: false,
-            otlp_endpoint: "http://localhost:4317".to_string(),
-            service_name: "borg-test".to_string(),
-            sampling_ratio: 1.0,
-        };
-        let result = init_telemetry(&config);
-        // This may fail if no OTLP endpoint is available, but the builder itself should succeed
-        if let Ok((layer, _guard)) = result {
-            assert!(layer.is_some());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_init_with_metrics_enabled() {
-        let config = TelemetryConfig {
-            tracing_enabled: false,
-            metrics_enabled: true,
-            otlp_endpoint: "http://localhost:4317".to_string(),
-            service_name: "borg-test".to_string(),
-            sampling_ratio: 1.0,
-        };
-        let result = init_telemetry(&config);
-        if let Ok((layer, _guard)) = result {
-            assert!(layer.is_none());
-        }
-    }
-
-    #[test]
-    fn telemetry_guard_noop_constructor() {
-        let guard = TelemetryGuard::noop();
-        assert!(guard.tracer_provider.is_none());
-        assert!(guard.meter_provider.is_none());
         // Dropping a noop guard must not panic or print.
-        drop(guard);
+        drop(TelemetryGuard::noop());
     }
 
     #[test]
-    fn borg_metrics_default_is_new() {
-        let metrics = BorgMetrics::default();
-        metrics.agent_turns.add(1, &[]);
-    }
-
-    #[test]
-    fn borg_metrics_from_config_respects_flag() {
+    fn borg_metrics_from_config_respects_metrics_flag() {
+        // Real branch: when metrics_enabled=false, from_config must return a
+        // noop (no exporter) rather than attempting to stand up an OTLP meter.
         use crate::config::Config;
         let mut config = Config::default();
         config.telemetry.metrics_enabled = false;

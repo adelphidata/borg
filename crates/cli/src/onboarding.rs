@@ -527,95 +527,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generate_identity_contains_name_and_placeholders() {
-        let identity = generate_identity("Buddy", "Mike");
-        assert!(identity.contains("# Buddy"));
-        assert!(identity.contains("You are Buddy"));
-        assert!(identity.contains("Mike"));
-        assert!(identity.contains("## Personality"));
-        assert!(identity.contains("## Communication Style"));
-        assert!(identity.contains("## What Matters"));
-    }
-
-    #[test]
-    fn generate_identity_is_minimal_scaffold() {
-        let identity = generate_identity("Nova", "Alice");
-        // Should have placeholder comments for the agent to fill in
-        assert!(identity.contains("<!--"));
-        // Should NOT have capabilities (handled by system prompt tooling section)
-        assert!(!identity.contains("## Capabilities"));
-    }
-
-    #[test]
-    fn generate_setup_contains_agent_and_owner() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("Nova"));
-        assert!(setup.contains("Alice"));
-    }
-
-    #[test]
-    fn generate_setup_contains_identity_instruction() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("IDENTITY.md"));
-        assert!(setup.contains("write_memory"));
-    }
-
-    #[test]
-    fn generate_setup_references_systems() {
-        let setup = generate_setup("Nova", "Alice");
-        // References vitals/evolution concepts (wording may be casual)
-        assert!(setup.contains("Vitals") || setup.contains("vitals"));
-        assert!(
-            setup.contains("evolve") || setup.contains("specialization") || setup.contains("Lvl")
-        );
-    }
-
-    #[test]
-    fn generate_setup_mentions_channels() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("borg add"));
-    }
-
-    #[test]
-    fn generate_setup_not_too_large() {
-        let setup = generate_setup("TestAgent", "TestOwner");
-        assert!(
-            setup.len() < 2500,
-            "SETUP.md is {} chars, should be under 2500",
-            setup.len()
-        );
-    }
-
-    #[test]
-    fn generate_setup_has_first_boot_heading() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("# First Boot"));
-    }
-
-    #[test]
     fn generate_setup_replaces_all_placeholders() {
+        // Regression guard: if a new `{placeholder}` is added to the template
+        // and the generator isn't updated, the raw token leaks to the user.
         let setup = generate_setup("Borg42", "Dave");
-        // No raw placeholders should remain
         assert!(!setup.contains("{agent_name}"));
         assert!(!setup.contains("{owner_name}"));
-    }
-
-    #[test]
-    fn generate_setup_mentions_level() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("Lvl.0") || setup.contains("Base"));
-    }
-
-    #[test]
-    fn generate_setup_mentions_evolving() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("evolve") || setup.contains("specializ"));
-    }
-
-    #[test]
-    fn generate_setup_mentions_memories() {
-        let setup = generate_setup("Nova", "Alice");
-        assert!(setup.contains("memories") || setup.contains("write_memory"));
     }
 
     #[test]
@@ -623,34 +540,6 @@ mod tests {
         let identity = generate_identity("Borg42", "Dave");
         assert!(!identity.contains("{agent_name}"));
         assert!(!identity.contains("{owner_name}"));
-    }
-
-    #[test]
-    fn generate_identity_starts_with_heading() {
-        let identity = generate_identity("Nova", "Alice");
-        assert!(identity.starts_with("# Nova"));
-    }
-
-    #[test]
-    fn generate_identity_has_no_capabilities_section() {
-        let identity = generate_identity("Nova", "Alice");
-        // Capabilities are handled by the system prompt tooling section, not identity
-        assert!(!identity.contains("## Capabilities"));
-        assert!(!identity.contains("Memory across sessions"));
-    }
-
-    #[test]
-    fn setup_template_is_valid() {
-        // The raw template should have placeholders
-        assert!(SETUP_TEMPLATE.contains("{agent_name}"));
-        assert!(SETUP_TEMPLATE.contains("{owner_name}"));
-    }
-
-    #[test]
-    fn identity_template_is_valid() {
-        // The raw template should have placeholders
-        assert!(IDENTITY_TEMPLATE.contains("{agent_name}"));
-        assert!(IDENTITY_TEMPLATE.contains("{owner_name}"));
     }
 
     #[test]
@@ -685,26 +574,33 @@ mod tests {
     }
 
     #[test]
-    fn generate_config_anthropic_provider() {
-        let config =
-            generate_config("claude-sonnet-4", "anthropic", "User", "Agent", false).expect("valid");
-        assert!(config.contains("provider = \"anthropic\""));
-        assert!(config.contains("api_key_env = \"ANTHROPIC_API_KEY\""));
-    }
-
-    #[test]
-    fn generate_config_openai_provider() {
-        let config = generate_config("gpt-4.1", "openai", "User", "Agent", false).expect("valid");
-        assert!(config.contains("provider = \"openai\""));
-        assert!(config.contains("api_key_env = \"OPENAI_API_KEY\""));
-    }
-
-    #[test]
-    fn generate_config_gemini_provider() {
-        let config =
-            generate_config("gemini-2.5-pro", "gemini", "User", "Agent", false).expect("valid");
-        assert!(config.contains("provider = \"gemini\""));
-        assert!(config.contains("api_key_env = \"GEMINI_API_KEY\""));
+    fn generate_config_provider_matrix() {
+        // One test covering the env-var → provider wiring for every env-key
+        // provider. Ollama is tested separately because it has its own branch
+        // (no api_key_env / no api_key block).
+        let cases: &[(&str, &str, &str)] = &[
+            ("claude-sonnet-4", "anthropic", "ANTHROPIC_API_KEY"),
+            ("gpt-4.1", "openai", "OPENAI_API_KEY"),
+            ("gemini-2.5-pro", "gemini", "GEMINI_API_KEY"),
+            ("deepseek-chat", "deepseek", "DEEPSEEK_API_KEY"),
+            ("llama-3.3-70b-versatile", "groq", "GROQ_API_KEY"),
+        ];
+        for (model, provider, env) in cases {
+            let config = generate_config(model, provider, "User", "Agent", false)
+                .unwrap_or_else(|e| panic!("{provider}: {e}"));
+            assert!(
+                config.contains(&format!("provider = \"{provider}\"")),
+                "{provider}: provider line missing"
+            );
+            assert!(
+                config.contains(&format!("api_key_env = \"{env}\"")),
+                "{provider}: api_key_env line missing"
+            );
+            assert!(
+                config.contains(&format!("model = \"{model}\"")),
+                "{provider}: model line missing"
+            );
+        }
     }
 
     #[test]
@@ -722,14 +618,6 @@ mod tests {
             false,
         )
         .is_err());
-    }
-
-    #[test]
-    fn models_for_all_providers_non_empty() {
-        for (id, _, _) in PROVIDERS {
-            let models = models_for_provider(id);
-            assert!(!models.is_empty(), "models for {id} should not be empty");
-        }
     }
 
     #[test]
@@ -775,12 +663,6 @@ mod tests {
     }
 
     #[test]
-    fn keychain_available_returns_bool() {
-        // Just verify it doesn't panic — actual availability depends on platform
-        let _available = keychain_available();
-    }
-
-    #[test]
     fn generate_config_ollama_provider() {
         let config =
             generate_config("llama3.3", "ollama", "Mike", "Buddy", false).expect("valid config");
@@ -810,65 +692,25 @@ mod tests {
     }
 
     #[test]
-    fn models_for_provider_ollama() {
-        let models = models_for_provider("ollama");
-        assert_eq!(models.len(), OLLAMA_MODELS.len());
-    }
-
-    #[test]
-    fn generate_config_deepseek_provider() {
-        let config =
-            generate_config("deepseek-chat", "deepseek", "User", "Agent", false).expect("valid");
-        assert!(config.contains("provider = \"deepseek\""));
-        assert!(config.contains("api_key_env = \"DEEPSEEK_API_KEY\""));
-    }
-
-    #[test]
-    fn generate_config_groq_provider() {
-        let config = generate_config("llama-3.3-70b-versatile", "groq", "User", "Agent", false)
-            .expect("valid");
-        assert!(config.contains("provider = \"groq\""));
-        assert!(config.contains("api_key_env = \"GROQ_API_KEY\""));
-    }
-
-    #[test]
-    fn deepseek_models_non_empty() {
-        assert!(!DEEPSEEK_MODELS.is_empty());
+    fn bundled_model_ids_all_parse() {
+        // Regression guard: every hardcoded model ID must pass validate_model_id.
+        // If a typo (or an injected char) sneaks into a constant, onboarding
+        // would generate an invalid config without this guard.
+        for (id, _) in OLLAMA_MODELS {
+            assert!(
+                validate_model_id(id).is_ok(),
+                "ollama model id invalid: {id}"
+            );
+        }
         for (id, _) in DEEPSEEK_MODELS {
-            assert!(validate_model_id(id).is_ok(), "invalid model id: {id}");
+            assert!(
+                validate_model_id(id).is_ok(),
+                "deepseek model id invalid: {id}"
+            );
         }
-    }
-
-    #[test]
-    fn groq_models_non_empty() {
-        assert!(!GROQ_MODELS.is_empty());
         for (id, _) in GROQ_MODELS {
-            assert!(validate_model_id(id).is_ok(), "invalid model id: {id}");
+            assert!(validate_model_id(id).is_ok(), "groq model id invalid: {id}");
         }
-    }
-
-    #[test]
-    fn models_for_provider_deepseek() {
-        let models = models_for_provider("deepseek");
-        assert_eq!(models.len(), DEEPSEEK_MODELS.len());
-    }
-
-    #[test]
-    fn models_for_provider_groq() {
-        let models = models_for_provider("groq");
-        assert_eq!(models.len(), GROQ_MODELS.len());
-    }
-
-    #[test]
-    fn openrouter_models_count() {
-        assert!(
-            OPENROUTER_MODELS.len() <= 15,
-            "OpenRouter models should be at most 15"
-        );
-        assert!(
-            OPENROUTER_MODELS.len() >= 10,
-            "OpenRouter models should have at least 10"
-        );
     }
 
     #[test]

@@ -74,47 +74,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_up_to_limit() {
-        let mut limiter = SlidingWindowLimiter::new(3, Duration::from_secs(60));
-        assert!(limiter.check("client-a"));
-        assert!(limiter.check("client-a"));
-        assert!(limiter.check("client-a"));
-    }
-
-    #[test]
-    fn blocks_at_limit_plus_one() {
-        let mut limiter = SlidingWindowLimiter::new(3, Duration::from_secs(60));
-        assert!(limiter.check("client-a"));
-        assert!(limiter.check("client-a"));
-        assert!(limiter.check("client-a"));
-        assert!(!limiter.check("client-a"));
-    }
-
-    #[test]
-    fn separate_keys_independent() {
+    fn limit_and_per_key_isolation() {
+        // Covers: (1) exactly `limit` requests pass, (2) the limit+1th blocks,
+        // (3) a different key has its own independent window.
         let mut limiter = SlidingWindowLimiter::new(2, Duration::from_secs(60));
         assert!(limiter.check("client-a"));
         assert!(limiter.check("client-a"));
-        assert!(!limiter.check("client-a"));
-        assert!(limiter.check("client-b"));
+        assert!(
+            !limiter.check("client-a"),
+            "third request for same key must be blocked"
+        );
+        assert!(
+            limiter.check("client-b"),
+            "different key must have its own window"
+        );
     }
 
     #[test]
-    fn loopback_ipv4_exempt() {
-        let addr: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(SlidingWindowLimiter::is_exempt(&addr));
-    }
-
-    #[test]
-    fn loopback_ipv6_exempt() {
-        let addr: IpAddr = "::1".parse().unwrap();
-        assert!(SlidingWindowLimiter::is_exempt(&addr));
-    }
-
-    #[test]
-    fn non_loopback_not_exempt() {
-        let addr: IpAddr = "192.168.1.1".parse().unwrap();
-        assert!(!SlidingWindowLimiter::is_exempt(&addr));
+    fn loopback_addrs_are_exempt() {
+        // Production gateway skips rate-limiting for loopback to keep local
+        // testing / health checks unthrottled. Regression here would make
+        // `borg status` flaky under load.
+        assert!(SlidingWindowLimiter::is_exempt(
+            &"127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(SlidingWindowLimiter::is_exempt(
+            &"::1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!SlidingWindowLimiter::is_exempt(
+            &"192.168.1.1".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]

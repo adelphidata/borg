@@ -1,8 +1,10 @@
 //! Gateway handler integration tests.
 //!
-//! Tests the `check_activation` function which determines whether the bot
-//! should respond to a message based on peer kind, activation mode, and
-//! bot mention.
+//! Tests the `check_activation` function — the branch point that decides
+//! whether the agent should reply to an incoming message. The real logic under
+//! test is: (a) DMs always active, (b) group + `Mention` mode requires the bot
+//! handle (case-insensitive) and strips it from the text, (c) group + `Always`
+//! bypasses the mention check, (d) group + `Mention` without a mention drops.
 
 #![allow(
     clippy::approx_constant,
@@ -30,7 +32,6 @@ use borg_core::config::{ActivationMode, Config};
 use borg_gateway::handler::check_activation;
 use borg_gateway::routing::ResolvedRoute;
 
-/// Build a minimal `ResolvedRoute` with the given activation mode override.
 fn route_with_activation(activation: Option<ActivationMode>) -> ResolvedRoute {
     ResolvedRoute {
         config: Config::default(),
@@ -42,96 +43,91 @@ fn route_with_activation(activation: Option<ActivationMode>) -> ResolvedRoute {
     }
 }
 
-// ── Test: DMs always activate ──
-
+/// Table-driven coverage of the whole (peer_kind × activation × mention)
+/// decision matrix. Each row is a full `check_activation` call with the bot
+/// handle `@BorgBot`; the expected fields describe what the gateway should
+/// forward to the agent (or not).
 #[test]
-fn activation_dm_always_true() {
-    let route = route_with_activation(None);
+fn activation_matrix() {
+    struct Case {
+        name: &'static str,
+        raw_text: &'static str,
+        peer_kind: Option<&'static str>,
+        activation: Option<ActivationMode>,
+        expect_active: bool,
+        expect_text: &'static str,
+    }
+
+    let cases: &[Case] = &[
+        Case {
+            name: "dm_without_peer_kind_activates",
+            raw_text: "hello bot",
+            peer_kind: None,
+            activation: None,
+            expect_active: true,
+            expect_text: "hello bot",
+        },
+        Case {
+            name: "dm_with_direct_peer_kind_activates",
+            raw_text: "hello",
+            peer_kind: Some("direct"),
+            activation: None,
+            expect_active: true,
+            expect_text: "hello",
+        },
+        Case {
+            name: "group_mention_activates_and_strips",
+            raw_text: "@BorgBot what's the weather?",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Mention),
+            expect_active: true,
+            expect_text: "what's the weather?",
+        },
+        Case {
+            name: "group_mention_case_insensitive",
+            raw_text: "@borgbot do something",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Mention),
+            expect_active: true,
+            expect_text: "do something",
+        },
+        Case {
+            name: "group_without_mention_does_not_activate",
+            raw_text: "hey everyone, who's around?",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Mention),
+            expect_active: false,
+            expect_text: "hey everyone, who's around?",
+        },
+        Case {
+            name: "group_always_mode_activates_without_mention",
+            raw_text: "random message",
+            peer_kind: Some("group"),
+            activation: Some(ActivationMode::Always),
+            expect_active: true,
+            expect_text: "random message",
+        },
+    ];
+
     let config = Config::default();
-
-    // peer_kind = None (DM)
-    let (active, text) = check_activation("hello bot", None, &route, &config, Some("@bot"));
-    assert!(active, "DMs should always activate");
-    assert_eq!(text, "hello bot");
-
-    // peer_kind = Some("direct")
-    let (active, text) = check_activation("hello", Some("direct"), &route, &config, Some("@bot"));
-    assert!(active, "Direct messages should always activate");
-    assert_eq!(text, "hello");
-}
-
-// ── Test: group with mention activates and strips mention ──
-
-#[test]
-fn activation_group_with_mention() {
-    let route = route_with_activation(Some(ActivationMode::Mention));
-    let config = Config::default();
-
-    let (active, text) = check_activation(
-        "@BorgBot what's the weather?",
-        Some("group"),
-        &route,
-        &config,
-        Some("@BorgBot"),
-    );
-    assert!(active, "Group message with mention should activate");
-    assert_eq!(text, "what's the weather?");
-    assert!(
-        !text.contains("@BorgBot"),
-        "Mention should be stripped from text"
-    );
-}
-
-// ── Test: group without mention does not activate ──
-
-#[test]
-fn activation_group_without_mention() {
-    let route = route_with_activation(Some(ActivationMode::Mention));
-    let config = Config::default();
-
-    let (active, text) = check_activation(
-        "hey everyone, who's around?",
-        Some("group"),
-        &route,
-        &config,
-        Some("@BorgBot"),
-    );
-    assert!(!active, "Group message without mention should not activate");
-    assert_eq!(text, "hey everyone, who's around?");
-}
-
-// ── Test: group with Always activation mode ──
-
-#[test]
-fn activation_group_always_mode() {
-    let route = route_with_activation(Some(ActivationMode::Always));
-    let config = Config::default();
-
-    let (active, text) = check_activation(
-        "random message",
-        Some("group"),
-        &route,
-        &config,
-        Some("@bot"),
-    );
-    assert!(active, "Group with Always activation should respond to all");
-    assert_eq!(text, "random message");
-}
-
-// ── Test: case-insensitive mention matching ──
-
-#[test]
-fn activation_case_insensitive_mention() {
-    let route = route_with_activation(Some(ActivationMode::Mention));
-    let config = Config::default();
-
-    let (active, text) = check_activation(
-        "@borgbot do something",
-        Some("group"),
-        &route,
-        &config,
-        Some("@BorgBot"),
-    );
-    assert!(active, "Mention matching should be case-insensitive");
-    assert_eq!(text, "do something");
+    for case in cases {
+        let route = route_with_activation(case.activation.clone());
+        let (active, text) = check_activation(
+            case.raw_text,
+            case.peer_kind,
+            &route,
+            &config,
+            Some("@BorgBot"),
+        );
+        assert_eq!(
+            active, case.expect_active,
+            "{}: active = {active}, expected {}",
+            case.name, case.expect_active
+        );
+        assert_eq!(
+            text, case.expect_text,
+            "{}: text = {text:?}, expected {:?}",
+            case.name, case.expect_text
+        );
+    }
 }

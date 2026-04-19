@@ -85,24 +85,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_seen_not_duplicate() {
+    fn basic_lifecycle() {
+        // Covers: first-seen returns false, second-seen returns true,
+        // distinct keys don't collide.
         let mut dedup = BoundedDedup::new(10);
         assert!(!dedup.is_duplicate(&1));
-    }
-
-    #[test]
-    fn second_seen_is_duplicate() {
-        let mut dedup = BoundedDedup::new(10);
-        assert!(!dedup.is_duplicate(&1));
-        assert!(dedup.is_duplicate(&1));
-    }
-
-    #[test]
-    fn different_keys_not_duplicate() {
-        let mut dedup = BoundedDedup::new(10);
-        assert!(!dedup.is_duplicate(&"a".to_string()));
-        assert!(!dedup.is_duplicate(&"b".to_string()));
-        assert!(!dedup.is_duplicate(&"c".to_string()));
+        assert!(dedup.is_duplicate(&1), "repeated key must be flagged");
+        assert!(!dedup.is_duplicate(&2), "distinct key must be fresh");
+        assert!(!dedup.is_duplicate(&3), "distinct key must be fresh");
     }
 
     #[test]

@@ -152,16 +152,6 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_values() {
-        let policy = RetryPolicy::default();
-        assert_eq!(policy.max_retries, constants::RETRY_MAX_RETRIES);
-        assert_eq!(policy.initial_delay_ms, constants::RETRY_INITIAL_DELAY_MS);
-        assert_eq!(policy.max_delay_ms, constants::RETRY_MAX_DELAY_MS);
-        assert!((policy.backoff_factor - constants::RETRY_BACKOFF_FACTOR).abs() < f64::EPSILON);
-        assert!((policy.jitter_factor - constants::RETRY_JITTER_FACTOR).abs() < f64::EPSILON);
-    }
-
-    #[test]
     fn delay_monotonically_increases_without_jitter() {
         let policy = RetryPolicy {
             initial_delay_ms: 100,

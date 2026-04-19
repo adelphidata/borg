@@ -130,49 +130,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_builtin_role_researcher() {
-        let role = builtin_role("researcher").expect("researcher should exist");
-        assert_eq!(role.name, "researcher");
-        assert!((role.temperature.unwrap() - 0.3).abs() < f32::EPSILON);
-        assert!(role
-            .tools_allowed
-            .as_ref()
-            .unwrap()
-            .contains(&"run_shell".to_string()));
-    }
-
-    #[test]
-    fn test_builtin_role_coder() {
-        let role = builtin_role("coder").expect("coder should exist");
-        assert_eq!(role.name, "coder");
-        assert!((role.temperature.unwrap() - 0.2).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_builtin_role_writer() {
-        let role = builtin_role("writer").expect("writer should exist");
-        assert_eq!(role.name, "writer");
-        assert!((role.temperature.unwrap() - 0.7).abs() < f32::EPSILON);
-    }
-
-    #[test]
     fn test_builtin_role_nonexistent() {
         assert!(builtin_role("nonexistent").is_none());
     }
 
     #[test]
-    fn test_builtin_roles_count() {
-        assert_eq!(BUILTIN_ROLES.len(), 3);
-    }
-
-    #[test]
-    fn test_builtin_roles_all_have_tools_allowed() {
+    fn builtin_roles_are_well_formed() {
+        // Every role registered in BUILTIN_ROLES must round-trip through
+        // builtin_role(), have a temperature in the sampler's valid [0, 2]
+        // range, and carry a non-empty tools_allowed list (an empty list would
+        // silently block every tool call the sub-agent tries to make).
         for (name, ..) in BUILTIN_ROLES {
-            let role = builtin_role(name).unwrap_or_else(|| panic!("{name} should exist"));
-            assert!(
-                role.tools_allowed.as_ref().map_or(false, |t| !t.is_empty()),
-                "Role '{name}' should have non-empty tools_allowed"
+            let role = builtin_role(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(
+                role.name, *name,
+                "builtin_role returned wrong name for {name}"
             );
+            let temp = role
+                .temperature
+                .unwrap_or_else(|| panic!("{name} missing temperature"));
+            assert!(
+                (0.0..=2.0).contains(&temp),
+                "{name} temperature {temp} outside [0, 2]"
+            );
+            let tools = role
+                .tools_allowed
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} missing tools_allowed"));
+            assert!(!tools.is_empty(), "{name} has empty tools_allowed");
         }
     }
 }

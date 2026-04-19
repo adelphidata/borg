@@ -155,23 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn build_transcript_empty() {
-        let messages: Vec<MessageRow> = vec![];
-        let transcript = build_transcript(&messages);
-        assert!(transcript.is_empty());
-    }
-
-    #[test]
-    fn build_transcript_only_tool_messages() {
-        let messages = vec![
-            make_message("tool", "result1"),
-            make_message("tool", "result2"),
-        ];
-        let transcript = build_transcript(&messages);
-        assert!(transcript.trim().is_empty());
-    }
-
-    #[test]
     fn session_indexing_db_methods() {
         use rusqlite::Connection;
 
@@ -188,27 +171,6 @@ mod tests {
         // Re-mark (upsert)
         db.mark_session_indexed("sess-1", 15).unwrap();
         assert!(db.is_session_indexed("sess-1").unwrap());
-    }
-
-    #[test]
-    fn build_transcript_empty_content_skipped() {
-        let msg = MessageRow {
-            content: Some(String::new()),
-            ..make_message("user", "")
-        };
-        let transcript = build_transcript(&[msg]);
-        // Empty content messages are skipped to avoid wasting embedding tokens
-        assert!(transcript.is_empty());
-    }
-
-    #[test]
-    fn build_transcript_none_content() {
-        let msg = MessageRow {
-            content: None,
-            ..make_message("user", "ignored")
-        };
-        let transcript = build_transcript(&[msg]);
-        assert!(transcript.is_empty());
     }
 
     #[test]

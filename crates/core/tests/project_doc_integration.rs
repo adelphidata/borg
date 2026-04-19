@@ -158,33 +158,6 @@ fn clean_doc_not_wrapped() {
     );
 }
 
-// ── Test: empty doc file handled gracefully ──
-
-#[test]
-fn empty_doc_file_handled() {
-    let tmp = setup_git_repo();
-    fs::write(tmp.path().join("CLAUDE.md"), "").expect("write empty");
-
-    // Should not panic — may return None or Some with just path comment
-    let result = discover_project_docs(tmp.path());
-    assert!(result.is_ok(), "Empty doc should not cause an error");
-}
-
-// ── Test: whitespace-only doc handled gracefully ──
-
-#[test]
-fn whitespace_only_doc_handled() {
-    let tmp = setup_git_repo();
-    fs::write(tmp.path().join("CLAUDE.md"), "   \n\n  \n").expect("write whitespace");
-
-    // Should not panic
-    let result = discover_project_docs(tmp.path());
-    assert!(
-        result.is_ok(),
-        "Whitespace-only doc should not cause an error"
-    );
-}
-
 // ── Test: intermediate dir without docs skipped ──
 
 #[test]
