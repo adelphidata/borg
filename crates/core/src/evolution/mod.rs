@@ -2733,6 +2733,131 @@ mod tests {
     }
 
     #[test]
+    fn replay_rate_limits_milestone_unlocked_to_three_per_hour() {
+        // milestone_unlocked caps at 3/hr. A burst of 4 in one hour (e.g. an
+        // XP import crossing multiple level thresholds at once) must drop
+        // the 4th. `level_up_events_recent` is populated from accepted rows
+        // and is the easiest way to count survivors.
+        let hour = 3_600_i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..4 {
+            let e = make_event(
+                i as i64 + 1,
+                "milestone_unlocked",
+                0,
+                None,
+                "hook",
+                hour + i as i64,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events(&events);
+        let milestones: Vec<_> = state
+            .level_up_events_recent
+            .iter()
+            .filter(|e| e.event_type == "milestone_unlocked")
+            .collect();
+        assert_eq!(
+            milestones.len(),
+            3,
+            "milestone_unlocked must cap at 3/hr, got {}",
+            milestones.len()
+        );
+    }
+
+    #[test]
+    fn replay_rate_limits_level_up_to_ten_per_hour() {
+        // level_up caps at 10/hr. Guards against a single XP gain that
+        // would otherwise emit a burst across multiple thresholds.
+        let hour = 3_600_i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..11 {
+            let e = make_event(
+                i as i64 + 1,
+                "level_up",
+                0,
+                None,
+                "hook",
+                hour + i as i64,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events(&events);
+        let ups: Vec<_> = state
+            .level_up_events_recent
+            .iter()
+            .filter(|e| e.event_type == "level_up")
+            .collect();
+        assert_eq!(
+            ups.len(),
+            10,
+            "level_up must cap at 10/hr, got {}",
+            ups.len()
+        );
+    }
+
+    #[test]
+    fn replay_rate_limits_mood_changed_to_five_per_hour() {
+        // mood_changed caps at 5/hr. Stops a per-tool-call ambient-header
+        // recompute from flooding the ledger.
+        let hour = 3_600_i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..6 {
+            let e = make_event(
+                i as i64 + 1,
+                "mood_changed",
+                0,
+                None,
+                "apply_patch",
+                hour + i as i64,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events(&events);
+        assert_eq!(
+            state.total_events, 5,
+            "mood_changed must cap at 5/hr, got {}",
+            state.total_events
+        );
+    }
+
+    #[test]
+    fn replay_rate_limits_share_card_created_to_three_per_hour() {
+        // share_card_created caps at 3/hr.
+        let hour = 3_600_i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..4 {
+            let e = make_event(
+                i as i64 + 1,
+                "share_card_created",
+                0,
+                None,
+                "hook",
+                hour + i as i64,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events(&events);
+        assert_eq!(
+            state.total_events, 3,
+            "share_card_created must cap at 3/hr, got {}",
+            state.total_events
+        );
+    }
+
+    #[test]
     fn replay_hmac_v1_v2_mixed_chain() {
         // A chain where early events use legacy v1 HMAC (no metadata) and
         // later events use v2 HMAC (with metadata). Both must verify.
@@ -3767,6 +3892,153 @@ mod tests {
         assert!(meta.contains("\"from_mood\":\"drifting\""), "got: {meta}");
         assert!(meta.contains("\"to_mood\":\"stable\""), "got: {meta}");
         assert!(meta.contains("\"reason\":\"apply_patch\""), "got: {meta}");
+    }
+
+    #[test]
+    fn hook_xp_gain_crossing_level_threshold_inserts_milestone_celebration() {
+        // End-to-end wiring test: pre-seed enough HMAC-valid xp_gain events
+        // to land just under level 10 (Stage::Base), then drive one more
+        // apply_patch call through the hook. The full `record_xp →
+        // attempt_evolution → detect_milestones → emit_milestone` chain must
+        // fire `level_up` + `milestone_unlocked` rows and insert a pending
+        // milestone celebration with a `MilestonePayload` that round-trips.
+        //
+        // Seeded events use distinct sources per (hour, source) so source
+        // decay stays at 1.0, and span multiple hours so replay's 15/hr
+        // xp_gain cap doesn't drop any.
+        use rusqlite::params;
+
+        let db = Database::test_db();
+        let evo_key = db.derive_hmac_key(EVOLUTION_HMAC_DOMAIN);
+
+        // Compute seed target: total XP to reach level 9 is a known sum from
+        // the level curve. Pick a seed XP such that `level_from_xp(Base, seed)`
+        // yields `(9, xp_to_next)` with `xp_to_next <= 3` so one more hook
+        // call (Builder alignment → 3 XP) crosses into level 10.
+        let lvl9_total: u32 = (0..9).map(|n| xp_for_level(&Stage::Base, n)).sum();
+        let lvl10_total: u32 = lvl9_total + xp_for_level(&Stage::Base, 9);
+        let seed_target = lvl10_total.saturating_sub(3);
+        assert!(seed_target >= lvl9_total, "sanity: seed within level 9");
+        let xp_per_event: u32 = (BASE_XP_CREATION + BONUS_XP_CREATION_ALIGNED) as u32;
+        let needed_events = seed_target.div_ceil(xp_per_event);
+
+        // Place seeded events far enough in the past that they don't collide
+        // with the hook's `now` hour bucket. 14 events/hr stays below the
+        // 15/hr replay cap for `xp_gain`.
+        let now_ts = chrono::Utc::now().timestamp();
+        let base_ts = now_ts - 48 * 3600;
+        let mut prev_hmac = "0".to_string();
+        let mut seeded_xp: u32 = 0;
+
+        for i in 0..needed_events {
+            let hour = (i / 14) as i64;
+            let sec = (i % 14) as i64;
+            let ts = base_ts + hour * 3600 + sec;
+            let source = format!("seed_tool_{i}");
+            let hmac = compute_event_hmac(
+                &evo_key,
+                &prev_hmac,
+                "xp_gain",
+                xp_per_event as i32,
+                "builder",
+                &source,
+                "",
+                ts,
+            );
+            db.conn()
+                .execute(
+                    "INSERT INTO evolution_events (event_type, xp_delta, archetype, source,
+                        metadata_json, created_at, hmac, prev_hmac)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        "xp_gain",
+                        xp_per_event as i32,
+                        "builder",
+                        source,
+                        Option::<String>::None,
+                        ts,
+                        hmac.clone(),
+                        prev_hmac,
+                    ],
+                )
+                .expect("seed insert");
+            prev_hmac = hmac;
+            seeded_xp += xp_per_event;
+        }
+
+        // Sanity: replay sees level 9 with Builder dominant, close enough to
+        // threshold that +3 XP will cross into level 10.
+        let pre = db.get_evolution_state().expect("pre state");
+        assert!(pre.chain_valid, "HMAC chain must verify across seeded rows");
+        assert_eq!(
+            pre.level, 9,
+            "seed must land at level 9 (seeded_xp={seeded_xp}, total_xp={})",
+            pre.total_xp
+        );
+        assert_eq!(pre.dominant_archetype, Some(Archetype::Builder));
+        assert!(
+            pre.xp_to_next_level <= xp_per_event,
+            "seed must be within one hook-call of level 10; xp_to_next={}",
+            pre.xp_to_next_level
+        );
+
+        // Trigger: a single apply_patch tool result runs the full hook path
+        // and should cross level 10.
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::AfterToolCall,
+            session_id: "test".to_string(),
+            turn_count: 1,
+            data: HookData::ToolResult {
+                name: "apply_patch".to_string(),
+                result: String::new(),
+                is_error: false,
+            },
+        };
+        hook.execute(&ctx);
+
+        let db_guard = hook.db.lock().unwrap();
+        let events = db_guard.load_all_evolution_events().unwrap();
+        let level_ups: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "level_up")
+            .collect();
+        let milestones: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "milestone_unlocked")
+            .collect();
+        assert!(
+            !level_ups.is_empty(),
+            "expected level_up event after crossing threshold"
+        );
+        assert!(
+            milestones.iter().any(|e| e
+                .metadata_json
+                .as_deref()
+                .map(|m| m.contains("\"milestone_id\":\"level_10_base\""))
+                .unwrap_or(false)),
+            "expected level_10_base milestone event; got milestones: {:?}",
+            milestones
+                .iter()
+                .map(|e| e.metadata_json.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>()
+        );
+
+        let pending = db_guard.get_pending_celebrations().unwrap();
+        let milestone_rows: Vec<_> = pending
+            .iter()
+            .filter(|c| c.celebration_type == "milestone")
+            .collect();
+        assert!(
+            !milestone_rows.is_empty(),
+            "expected pending milestone celebration row"
+        );
+        let payload: celebration::MilestonePayload =
+            serde_json::from_str(&milestone_rows[0].payload_json)
+                .expect("milestone payload round-trips");
+        assert_eq!(payload.milestone_id, "level_10_base");
+        assert_eq!(payload.level, 10);
+        assert_eq!(payload.stage, "base");
     }
 
     #[test]

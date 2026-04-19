@@ -839,6 +839,31 @@ mod tests {
         assert_eq!(args, "--out /tmp/x");
     }
 
+    fn gateway_test_db() -> Database {
+        Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn handle_card_rejects_out_argument() {
+        let db = gateway_test_db();
+        let out = handle_card(&db, "--out /tmp/x");
+        assert!(
+            out.starts_with("/card on messaging channels does not accept arguments"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn handle_card_inline_renders_ascii() {
+        let db = gateway_test_db();
+        let out = handle_card(&db, "");
+        assert!(out.contains("Stage:"), "missing Stage: in {out}");
+        assert!(
+            out.contains('\u{256D}') || out.contains('\u{2570}'),
+            "missing ASCII box border in {out}"
+        );
+    }
+
     #[test]
     fn parse_new_commands() {
         assert!(matches!(Command::parse("/mode"), Some((Command::Mode, _))));

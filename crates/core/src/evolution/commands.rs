@@ -243,6 +243,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_evolution_baseline_state_renders_header() {
+        // Empty DB → baseline "Base Borg Lvl.0" header + Archetype Scores
+        // block. No readiness block since an empty state has no archetype
+        // yet and readiness blocking gates only render through
+        // format_evolution_overview when present.
+        let db = Database::test_db();
+        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+        assert!(out.image_png.is_none());
+        assert!(
+            out.text.contains("Base Borg Lvl."),
+            "missing baseline header in: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Archetype Scores"),
+            "missing Archetype Scores in: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn dispatch_evolution_includes_hints_when_nonempty() {
+        // A baseline DB still produces next_step_hints (at minimum "Use
+        // tools to start forming an archetype identity."), so the Next
+        // Steps section must be appended to the overview.
+        let db = Database::test_db();
+        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+        assert!(
+            out.text.contains("Next Steps"),
+            "missing Next Steps block in: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn dispatch_evolution_tolerates_missing_bond_and_vitals() {
+        // A fresh in-memory DB has no bond or vitals events. Dispatch must
+        // still render cleanly rather than panic — the commands.rs fallback
+        // branches log-and-continue with baseline state.
+        let db = Database::test_db();
+        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
+        assert!(!out.text.is_empty());
+    }
+
+    #[test]
     fn dispatch_card_with_out_writes_file() {
         let db = Database::test_db();
         let tmp = tempfile::tempdir().expect("tempdir");

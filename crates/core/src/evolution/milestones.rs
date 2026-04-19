@@ -329,6 +329,47 @@ mod tests {
     }
 
     #[test]
+    fn level_thresholds_cross_multiple_in_one_call() {
+        // A single XP burst (e.g. from a batched tool run) can cross several
+        // level thresholds at once. `check_milestones` must emit a milestone
+        // per threshold, in threshold order.
+        let prev = state(Stage::Base, 9, None);
+        let next = state(Stage::Base, 26, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&"level_10_base"),
+            "missing level_10_base in {ids:?}"
+        );
+        assert!(
+            ids.contains(&"level_25_base"),
+            "missing level_25_base in {ids:?}"
+        );
+        // Thresholds walked in ascending order.
+        let pos_10 = ids.iter().position(|id| *id == "level_10_base").unwrap();
+        let pos_25 = ids.iter().position(|id| *id == "level_25_base").unwrap();
+        assert!(pos_10 < pos_25, "expected level_10 before level_25");
+    }
+
+    #[test]
+    fn aligned_streak_requires_today_xp() {
+        // Seven consecutive days ending yesterday — today (bucket 0) has no
+        // aligned XP. The streak check walks backwards from `now`, so today's
+        // miss must block the milestone.
+        let next = state(Stage::Base, 10, Some(Archetype::Ops));
+        let now = 10 * 86_400;
+        let mut events = Vec::new();
+        for d in 1..=7 {
+            events.push(xp(Archetype::Ops, now - d * 86_400));
+        }
+        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &events, now);
+        assert!(
+            out.iter().all(|m| m.id != "aligned_streak_7d"),
+            "streak should not fire without today's aligned XP; got {out:?}"
+        );
+    }
+
+    #[test]
     fn idempotent_on_repeated_calls() {
         let prev = state(Stage::Base, 9, None);
         let next = state(Stage::Base, 10, None);
