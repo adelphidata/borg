@@ -27,17 +27,31 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
 /// Model choices per provider.
 pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
     ("moonshotai/kimi-k2.5", "Kimi K2.5 (recommended)"),
-    ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
-    ("anthropic/claude-opus-4", "Claude Opus 4"),
-    ("anthropic/claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
-    ("openai/gpt-4.1", "GPT-4.1"),
-    ("openai/gpt-4.1-mini", "GPT-4.1 Mini (fast, cheap)"),
-    ("openai/gpt-4.1-nano", "GPT-4.1 Nano (fastest)"),
-    ("google/gemini-2.5-pro", "Gemini 2.5 Pro"),
-    ("google/gemini-2.5-flash", "Gemini 2.5 Flash"),
+    (
+        "moonshotai/kimi-k2-thinking",
+        "Kimi K2 Thinking (reasoning)",
+    ),
+    ("minimax/minimax-m2.7", "MiniMax M2.7"),
+    ("x-ai/grok-4.20", "Grok 4.20"),
+    ("x-ai/grok-4.20-multi-agent", "Grok 4.20 Multi-Agent"),
+    ("x-ai/grok-4.1-fast", "Grok 4.1 Fast"),
+    ("x-ai/grok-4-fast", "Grok 4 Fast"),
+    ("x-ai/grok-4", "Grok 4"),
+    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+    ("google/gemini-3-flash-preview", "Gemini 3 Flash"),
+    (
+        "google/gemini-3.1-flash-lite-preview",
+        "Gemini 3.1 Flash Lite",
+    ),
+    ("deepseek/deepseek-v3.2", "DeepSeek V3.2"),
+    ("deepseek/deepseek-v3.2-exp", "DeepSeek V3.2 Exp"),
     ("deepseek/deepseek-r1", "DeepSeek R1 (reasoning)"),
-    ("deepseek/deepseek-chat-v3", "DeepSeek V3 (chat)"),
-    ("meta-llama/llama-4-maverick", "Llama 4 Maverick"),
+    ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
+    ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
+    (
+        "anthropic/claude-haiku-4.5",
+        "Claude Haiku 4.5 (fast, cheap)",
+    ),
 ];
 
 pub(crate) const OPENAI_MODELS: &[(&str, &str)] = &[
