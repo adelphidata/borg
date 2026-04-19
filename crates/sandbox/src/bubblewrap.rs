@@ -53,52 +53,44 @@ pub fn build_bwrap_args(policy: &SandboxPolicy, tool_dir: &Path) -> Vec<String> 
     build_bwrap_args_versioned(policy, tool_dir, detect_bwrap_version().as_ref())
 }
 
+fn push_bind(args: &mut Vec<String>, flag: &str, path: &str) {
+    args.extend([flag.to_string(), path.to_string(), path.to_string()]);
+}
+
 /// Build bwrap args with an explicit version for testability.
 pub fn build_bwrap_args_versioned(
     policy: &SandboxPolicy,
     tool_dir: &Path,
     version: Option<&BwrapVersion>,
 ) -> Vec<String> {
-    let tool_dir_str = tool_dir.to_string_lossy().to_string();
     let mut args = Vec::new();
 
-    // Read-only bind mount of the tool directory
-    let tool_dir_dest = tool_dir_str.clone();
-    args.extend(["--ro-bind".to_string(), tool_dir_str, tool_dir_dest]);
+    push_bind(&mut args, "--ro-bind", &tool_dir.to_string_lossy());
 
-    // Bind standard system paths read-only
     for path in &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"] {
         if Path::new(path).exists() {
-            args.extend(["--ro-bind".to_string(), path.to_string(), path.to_string()]);
+            push_bind(&mut args, "--ro-bind", path);
         }
     }
 
-    // Tmpfs for scratch space
     args.extend(["--tmpfs".to_string(), "/tmp".to_string()]);
-
-    // Proc filesystem
     args.extend(["--proc".to_string(), "/proc".to_string()]);
-
-    // Dev filesystem
     args.extend(["--dev".to_string(), "/dev".to_string()]);
 
-    // Additional read paths
     for path in &policy.fs_read {
-        args.extend(["--ro-bind".to_string(), path.clone(), path.clone()]);
+        push_bind(&mut args, "--ro-bind", path);
     }
 
-    // Additional write paths (skip any that are in deny_write)
     for path in &policy.fs_write {
         let denied = policy.deny_write.iter().any(|d| path.starts_with(d));
         if !denied {
-            args.extend(["--bind".to_string(), path.clone(), path.clone()]);
+            push_bind(&mut args, "--bind", path);
         }
     }
 
-    // Protect deny_write paths by mounting them read-only
     for path in &policy.deny_write {
         if Path::new(path).exists() {
-            args.extend(["--ro-bind".to_string(), path.clone(), path.clone()]);
+            push_bind(&mut args, "--ro-bind", path);
         }
     }
 

@@ -1,4 +1,4 @@
-use super::types::Update;
+use super::types::{CallbackQuery, TelegramMessage, Update};
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use crate::handler::InboundMessage;
 
@@ -49,143 +49,161 @@ fn is_binary_content(s: &str) -> bool {
 /// drives downstream download + base64 attachment so vision-capable models
 /// can actually see the image instead of a `"[Photo]"` placeholder.
 pub fn parse_update(update: &Update) -> Option<TelegramParsed> {
-    // Try regular message first, then edited message
     if let Some(msg) = update.message.as_ref().or(update.edited_message.as_ref()) {
-        // Skip service messages
-        if msg.forum_topic_created.is_some() {
-            return None;
-        }
-
-        // Try text first, then caption, then generate placeholder for media
-        let mut audio_ref = None;
-        let mut photo_ref = None;
-
-        // Extract the largest photo variant (last entry) so vision-capable
-        // models can see the image. Applies for both bare photos and photos
-        // with captions.
-        if let Some(ref photos) = msg.photo {
-            if let Some(largest) = photos.last() {
-                photo_ref = Some(TelegramPhotoRef {
-                    file_id: largest.file_id.clone(),
-                    filename: format!("photo_{}.jpg", largest.file_unique_id),
-                });
-            }
-        }
-
-        let text = if let Some(ref t) = msg.text {
-            if t.is_empty() || is_binary_content(t) {
-                return None;
-            }
-            t.clone()
-        } else if let Some(caption) = msg.caption.as_deref().filter(|c| !is_binary_content(c)) {
-            caption.to_string()
-        } else if msg.photo.is_some() {
-            "[Photo]".to_string()
-        } else if let Some(ref doc) = msg.document {
-            match doc.file_name.as_deref() {
-                Some(name) if !is_binary_content(name) => format!("[Document: {name}]"),
-                _ => "[Document]".to_string(),
-            }
-        } else if msg.video.is_some() {
-            "[Video]".to_string()
-        } else if let Some(ref audio) = msg.audio {
-            audio_ref = Some(TelegramAudioRef {
-                file_id: audio.file_id.clone(),
-                mime_type: "audio/mpeg".to_string(),
-                duration: audio.duration,
-            });
-            "[Audio]".to_string()
-        } else if let Some(ref voice) = msg.voice {
-            audio_ref = Some(TelegramAudioRef {
-                file_id: voice.file_id.clone(),
-                mime_type: "audio/ogg".to_string(),
-                duration: voice.duration,
-            });
-            "[Voice message]".to_string()
-        } else if let Some(ref sticker) = msg.sticker {
-            match &sticker.emoji {
-                Some(emoji) => format!("[Sticker: {emoji}]"),
-                None => "[Sticker]".to_string(),
-            }
-        } else {
-            return None;
-        };
-
-        let sender_id = msg
-            .from
-            .as_ref()
-            .map(|u| u.id.to_string())
-            .unwrap_or_else(|| msg.chat.id.to_string());
-
-        let thread_id = msg.message_thread_id.map(|t| t.to_string());
-        let message_id = Some(msg.message_id.to_string());
-
-        let peer_kind = match msg.chat.chat_type.as_str() {
-            "private" => Some(PEER_KIND_DIRECT.to_string()),
-            "group" | "supergroup" | "channel" => Some(PEER_KIND_GROUP.to_string()),
-            _ => None,
-        };
-
-        return Some(TelegramParsed {
-            inbound: InboundMessage {
-                sender_id,
-                text,
-                channel_id: Some(msg.chat.id.to_string()),
-                thread_id,
-                message_id,
-                thread_ts: None,
-                attachments: Vec::new(),
-                reaction: None,
-                metadata: serde_json::Value::Null,
-                peer_kind,
-            },
-            audio: audio_ref,
-            photo: photo_ref,
-        });
+        return parse_message(msg);
     }
-
-    // Try callback query
-    if let Some(cb) = &update.callback_query {
-        let data = cb.data.as_deref()?;
-        if data.is_empty() {
-            return None;
-        }
-
-        let chat_id = cb.message.as_ref().map(|m| m.chat.id.to_string());
-        let thread_id = cb
-            .message
-            .as_ref()
-            .and_then(|m| m.message_thread_id)
-            .map(|t| t.to_string());
-        let message_id = cb.message.as_ref().map(|m| m.message_id.to_string());
-
-        let peer_kind = cb
-            .message
-            .as_ref()
-            .map(|m| match m.chat.chat_type.as_str() {
-                "private" => PEER_KIND_DIRECT.to_string(),
-                _ => PEER_KIND_GROUP.to_string(),
-            });
-
-        return Some(TelegramParsed {
-            inbound: InboundMessage {
-                sender_id: cb.from.id.to_string(),
-                text: data.to_string(),
-                channel_id: chat_id,
-                thread_id,
-                message_id,
-                thread_ts: None,
-                attachments: Vec::new(),
-                reaction: None,
-                metadata: serde_json::Value::Null,
-                peer_kind,
-            },
-            audio: None,
-            photo: None,
-        });
+    if let Some(cb) = update.callback_query.as_ref() {
+        return parse_callback(cb);
     }
-
     None
+}
+
+fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
+    // Skip service messages
+    if msg.forum_topic_created.is_some() {
+        return None;
+    }
+
+    // Extract the largest photo variant (last entry) so vision-capable
+    // models can see the image. Applies for both bare photos and photos
+    // with captions.
+    let photo_ref = msg
+        .photo
+        .as_ref()
+        .and_then(|photos| photos.last())
+        .map(|largest| TelegramPhotoRef {
+            file_id: largest.file_id.clone(),
+            filename: format!("photo_{}.jpg", largest.file_unique_id),
+        });
+
+    let (text, audio_ref) = derive_message_text(msg)?;
+
+    let sender_id = msg
+        .from
+        .as_ref()
+        .map(|u| u.id.to_string())
+        .unwrap_or_else(|| msg.chat.id.to_string());
+
+    let thread_id = msg.message_thread_id.map(|t| t.to_string());
+    let message_id = Some(msg.message_id.to_string());
+    let peer_kind = peer_kind_for_chat(&msg.chat.chat_type);
+
+    Some(TelegramParsed {
+        inbound: InboundMessage {
+            sender_id,
+            text,
+            channel_id: Some(msg.chat.id.to_string()),
+            thread_id,
+            message_id,
+            thread_ts: None,
+            attachments: Vec::new(),
+            reaction: None,
+            metadata: serde_json::Value::Null,
+            peer_kind,
+        },
+        audio: audio_ref,
+        photo: photo_ref,
+    })
+}
+
+/// Derive display text (and any audio ref needed for transcription) from a
+/// Telegram message. Prefers text, then caption, then a per-media-type
+/// placeholder. Returns `None` if there's nothing routable.
+fn derive_message_text(msg: &TelegramMessage) -> Option<(String, Option<TelegramAudioRef>)> {
+    if let Some(t) = msg.text.as_ref() {
+        if t.is_empty() || is_binary_content(t) {
+            return None;
+        }
+        return Some((t.clone(), None));
+    }
+    if let Some(caption) = msg.caption.as_deref().filter(|c| !is_binary_content(c)) {
+        return Some((caption.to_string(), None));
+    }
+    if msg.photo.is_some() {
+        return Some(("[Photo]".to_string(), None));
+    }
+    if let Some(doc) = msg.document.as_ref() {
+        let text = match doc.file_name.as_deref() {
+            Some(name) if !is_binary_content(name) => format!("[Document: {name}]"),
+            _ => "[Document]".to_string(),
+        };
+        return Some((text, None));
+    }
+    if msg.video.is_some() {
+        return Some(("[Video]".to_string(), None));
+    }
+    if let Some(audio) = msg.audio.as_ref() {
+        let audio_ref = TelegramAudioRef {
+            file_id: audio.file_id.clone(),
+            mime_type: "audio/mpeg".to_string(),
+            duration: audio.duration,
+        };
+        return Some(("[Audio]".to_string(), Some(audio_ref)));
+    }
+    if let Some(voice) = msg.voice.as_ref() {
+        let audio_ref = TelegramAudioRef {
+            file_id: voice.file_id.clone(),
+            mime_type: "audio/ogg".to_string(),
+            duration: voice.duration,
+        };
+        return Some(("[Voice message]".to_string(), Some(audio_ref)));
+    }
+    if let Some(sticker) = msg.sticker.as_ref() {
+        let text = match &sticker.emoji {
+            Some(emoji) => format!("[Sticker: {emoji}]"),
+            None => "[Sticker]".to_string(),
+        };
+        return Some((text, None));
+    }
+    None
+}
+
+fn parse_callback(cb: &CallbackQuery) -> Option<TelegramParsed> {
+    let data = cb.data.as_deref()?;
+    if data.is_empty() {
+        return None;
+    }
+
+    let chat_id = cb.message.as_ref().map(|m| m.chat.id.to_string());
+    let thread_id = cb
+        .message
+        .as_ref()
+        .and_then(|m| m.message_thread_id)
+        .map(|t| t.to_string());
+    let message_id = cb.message.as_ref().map(|m| m.message_id.to_string());
+
+    let peer_kind = cb
+        .message
+        .as_ref()
+        .map(|m| match m.chat.chat_type.as_str() {
+            "private" => PEER_KIND_DIRECT.to_string(),
+            _ => PEER_KIND_GROUP.to_string(),
+        });
+
+    Some(TelegramParsed {
+        inbound: InboundMessage {
+            sender_id: cb.from.id.to_string(),
+            text: data.to_string(),
+            channel_id: chat_id,
+            thread_id,
+            message_id,
+            thread_ts: None,
+            attachments: Vec::new(),
+            reaction: None,
+            metadata: serde_json::Value::Null,
+            peer_kind,
+        },
+        audio: None,
+        photo: None,
+    })
+}
+
+fn peer_kind_for_chat(chat_type: &str) -> Option<String> {
+    match chat_type {
+        "private" => Some(PEER_KIND_DIRECT.to_string()),
+        "group" | "supergroup" | "channel" => Some(PEER_KIND_GROUP.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
