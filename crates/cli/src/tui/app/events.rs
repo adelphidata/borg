@@ -209,6 +209,10 @@ impl<'a> App<'a> {
         if self.auto_scroll {
             self.scroll_offset = 0;
         }
+        // EvolutionHook ran alongside the tool result on the agent side;
+        // the cached ambient-status header may now be stale (level, mood,
+        // archetype, hint) — refresh off the updated DB state.
+        self.refresh_ambient_status();
     }
 
     fn handle_event_shell_confirmation(&mut self, command: String, respond: oneshot::Sender<bool>) {

@@ -1086,6 +1086,54 @@ impl EvolutionHook {
             Err(_) => String::new(),
         }
     }
+
+    // ── Mood transition detection (Stream C) ──
+    //
+    // Stream D also hooks into `AfterToolCall` to detect milestones. Both
+    // sit in `execute` alongside the XP recording; structure the helpers so
+    // they can run sequentially without stepping on each other:
+    //   1. XP + evolution gating (existing `record_xp` / `attempt_evolution`)
+    //   2. Mood transition detection (this helper)
+    //   3. Milestone detection (Stream D)
+
+    /// Snapshot the current `Mood` by opening the DB and replaying vitals +
+    /// bond + evolution state. Returns `None` if any load fails — callers
+    /// treat that as "no transition to emit".
+    fn snapshot_mood(&self) -> Option<Mood> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => {
+                tracing::warn!("evolution: mutex poisoned, cannot snapshot mood");
+                return None;
+            }
+        };
+        let evo = db.get_evolution_state().ok()?;
+        let vitals = db.get_vitals_state().ok()?;
+        let bond_events = db.get_all_bond_events().ok()?;
+        let bond_key = db.derive_hmac_key(crate::bond::BOND_HMAC_DOMAIN);
+        let bond = crate::bond::replay_events_with_key(&bond_key, &bond_events);
+        Some(compute_mood(&evo, &vitals, &bond))
+    }
+
+    /// Emit a `mood_changed` event when the computed mood flipped between
+    /// tool calls. `reason` names the source that triggered the transition
+    /// (typically the tool name). Rate-limited at 5/hr by `rate_limit_for`.
+    fn emit_mood_changed(&self, from: Mood, to: Mood, reason: &str) {
+        let Ok(db) = self.db.lock() else {
+            tracing::warn!("evolution: mutex poisoned, skipping mood_changed event");
+            return;
+        };
+        let metadata = serde_json::json!({
+            "from_mood": from.to_string(),
+            "to_mood": to.to_string(),
+            "reason": reason,
+        })
+        .to_string();
+        if let Err(e) = db.record_evolution_event("mood_changed", 0, None, reason, Some(&metadata))
+        {
+            tracing::warn!("evolution: failed to record mood_changed event: {e}");
+        }
+    }
 }
 
 impl Hook for EvolutionHook {
@@ -1150,7 +1198,20 @@ impl Hook for EvolutionHook {
                         };
                         BASE_XP_TOOL_SUCCESS + bonus
                     };
+
+                    // ── 1. XP + evolution gating ──
+                    let mood_before = self.snapshot_mood();
                     self.record_xp(name, archetype, xp);
+
+                    // ── 2. Mood transition detection (Stream C) ──
+                    // Stream D's milestone detection goes after this block.
+                    if let Some(before) = mood_before {
+                        if let Some(after) = self.snapshot_mood() {
+                            if before != after {
+                                self.emit_mood_changed(before, after, name);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
@@ -3182,13 +3243,20 @@ mod tests {
         };
         hook.execute(&ctx);
         let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
-        assert_eq!(events.len(), 1);
+        // Expect an xp_gain row plus a mood_changed row: fresh DB starts
+        // Drifting (no dominant archetype); after the Builder XP the
+        // archetype settles and mood flips to Stable.
+        let xp_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "xp_gain")
+            .collect();
+        assert_eq!(xp_events.len(), 1);
         // apply_patch → Builder, creation tool: BASE_XP_CREATION (2) + BONUS_XP_CREATION_ALIGNED (1).
         assert_eq!(
-            events[0].xp_delta,
+            xp_events[0].xp_delta,
             BASE_XP_CREATION + BONUS_XP_CREATION_ALIGNED
         );
-        assert_eq!(events[0].archetype.as_deref(), Some("builder"));
+        assert_eq!(xp_events[0].archetype.as_deref(), Some("builder"));
     }
 
     #[test]
@@ -3336,5 +3404,164 @@ mod tests {
             }
             other => panic!("expected InjectContext, got {other:?}"),
         }
+    }
+
+    // ── Mood transitions (Stream C) ──
+
+    fn mk_bond_for_mood(score: u8) -> crate::bond::BondState {
+        use crate::bond::{AutonomyTier, BondLevel, BondState};
+        BondState {
+            score,
+            level: BondLevel::Fragile,
+            autonomy_tier: AutonomyTier::ObserveOnly,
+            total_events: 0,
+            chain_valid: true,
+        }
+    }
+
+    fn mk_vitals_for_mood(v: u8) -> crate::vitals::VitalsState {
+        use chrono::Utc;
+        crate::vitals::VitalsState {
+            stability: v,
+            focus: v,
+            sync: v,
+            growth: v,
+            happiness: v,
+            last_interaction_at: Utc::now(),
+            updated_at: Utc::now(),
+            chain_valid: true,
+        }
+    }
+
+    fn mk_evo_for_mood(stage: Stage, level: u8, arch: Option<Archetype>) -> EvolutionState {
+        let mut scores: HashMap<Archetype, u32> = HashMap::new();
+        if let Some(a) = arch {
+            scores.insert(a, 100);
+        }
+        EvolutionState {
+            stage,
+            level,
+            total_xp: 1,
+            xp_to_next_level: 10,
+            dominant_archetype: arch,
+            evolution_name: None,
+            evolution_description: None,
+            archetype_scores: scores.clone(),
+            lifetime_scores: scores.clone(),
+            last_30d_scores: scores,
+            dominant_history: arch.map(|a| vec![(0, a)]).unwrap_or_default(),
+            total_events: 0,
+            chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
+        }
+    }
+
+    #[test]
+    fn mood_strained_to_stable_when_min_vital_recovers() {
+        let evo = mk_evo_for_mood(Stage::Base, 20, Some(Archetype::Builder));
+        let bond = mk_bond_for_mood(50);
+
+        // Below 30: Strained.
+        let low = mk_vitals_for_mood(25);
+        assert_eq!(compute_mood(&evo, &low, &bond), Mood::Strained);
+
+        // At 30: Strained gone; with focus=30 not ≥70, falls back to Stable.
+        let recovered = mk_vitals_for_mood(30);
+        assert_eq!(compute_mood(&evo, &recovered, &bond), Mood::Stable);
+    }
+
+    #[test]
+    fn mood_stable_to_focused_when_focus_and_stability_cross_threshold() {
+        use chrono::Utc;
+        let evo = mk_evo_for_mood(Stage::Evolved, 10, Some(Archetype::Ops));
+        let bond = mk_bond_for_mood(50);
+
+        // Stability=60, focus=50 → Stable (focus below 70 threshold).
+        let stable = crate::vitals::VitalsState {
+            stability: 60,
+            focus: 50,
+            sync: 50,
+            growth: 30,
+            happiness: 50,
+            last_interaction_at: Utc::now(),
+            updated_at: Utc::now(),
+            chain_valid: true,
+        };
+        assert_eq!(compute_mood(&evo, &stable, &bond), Mood::Stable);
+
+        // Focus=70 crosses → Focused.
+        let focused = crate::vitals::VitalsState {
+            focus: 70,
+            ..stable
+        };
+        assert_eq!(compute_mood(&evo, &focused, &bond), Mood::Focused);
+    }
+
+    #[test]
+    fn hook_emits_mood_changed_on_transition() {
+        // `snapshot_mood` + `emit_mood_changed` round-trip: drive a mood
+        // transition through the tool-result hook path and assert the
+        // mood_changed row is persisted with the expected metadata. A fresh
+        // DB starts at mood=Drifting (no dominant archetype); a single
+        // apply_patch call earns Builder XP which flips mood to Stable.
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+
+        let ctx = HookContext {
+            point: HookPoint::AfterToolCall,
+            session_id: "test".to_string(),
+            turn_count: 1,
+            data: HookData::ToolResult {
+                name: "apply_patch".to_string(),
+                result: String::new(),
+                is_error: false,
+            },
+        };
+        hook.execute(&ctx);
+
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        let mood_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "mood_changed")
+            .collect();
+        assert_eq!(mood_events.len(), 1, "expected 1 mood_changed event");
+        let meta = mood_events[0].metadata_json.as_deref().unwrap();
+        assert!(meta.contains("\"from_mood\":\"drifting\""), "got: {meta}");
+        assert!(meta.contains("\"to_mood\":\"stable\""), "got: {meta}");
+        assert!(meta.contains("\"reason\":\"apply_patch\""), "got: {meta}");
+    }
+
+    #[test]
+    fn hook_does_not_emit_mood_changed_when_stable() {
+        // Second apply_patch after the first: both snapshots return Stable,
+        // so no mood_changed event should be appended.
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::AfterToolCall,
+            session_id: "test".to_string(),
+            turn_count: 1,
+            data: HookData::ToolResult {
+                name: "apply_patch".to_string(),
+                result: String::new(),
+                is_error: false,
+            },
+        };
+        hook.execute(&ctx);
+        hook.execute(&ctx);
+
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        let mood_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "mood_changed")
+            .collect();
+        assert_eq!(
+            mood_events.len(),
+            1,
+            "only the first transition should emit; second call is stable→stable"
+        );
     }
 }

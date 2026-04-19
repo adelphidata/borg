@@ -199,6 +199,12 @@ const SETTINGS: &[SettingEntry] = &[
         kind: SettingKind::Bool,
         category: "Evolution",
     },
+    SettingEntry {
+        key: "evolution.ambient_header_enabled",
+        label: "Ambient header",
+        kind: SettingKind::Bool,
+        category: "Evolution",
+    },
     // — Heartbeat —
     SettingEntry {
         key: "heartbeat.session_start_enabled",

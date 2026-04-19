@@ -92,6 +92,7 @@ define_settings! {
 
         // ── Evolution ──
         "evolution.enabled" => evolution.enabled, parsed(bool);
+        "evolution.ambient_header_enabled" => evolution.ambient_header_enabled, parsed(bool);
 
         // ── Tools ──
         "tools.default_timeout_ms" => tools.default_timeout_ms, parsed(u64);

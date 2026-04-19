@@ -104,6 +104,50 @@ pub enum DoctorEvent {
     },
 }
 
+/// Cached ambient-status snapshot rendered in the TUI header as the
+/// `class: {name_level} — {Mood} — {Archetype} — {hint}` line.
+///
+/// Computed by `App::refresh_ambient_status` off the evolution + vitals +
+/// bond DB state. Kept as a cache so `render()` never hits the DB.
+#[derive(Debug, Clone)]
+pub struct AmbientStatus {
+    /// `{evolution_name or "Base Borg"} Lv.{level}`.
+    pub name_level: String,
+    /// Mood derived from vitals/bond/evolution via `compute_mood`.
+    pub mood: borg_core::evolution::Mood,
+    /// Current dominant archetype, if any.
+    pub archetype: Option<borg_core::evolution::Archetype>,
+    /// First `next_step_hints` entry, else empty.
+    pub hint: String,
+}
+
+/// Load the current ambient-status snapshot from the DB. Errors propagate to
+/// the caller so `refresh_ambient_status` can decide whether to clear the
+/// cache and log a single warning (rather than duplicate messages per step).
+fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
+    use borg_core::evolution;
+
+    let db = borg_core::db::Database::open()?;
+    let evo = db.get_evolution_state()?;
+    let vitals = db.get_vitals_state()?;
+    let bond_events = db.get_all_bond_events()?;
+    let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
+    let bond = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
+
+    let mood = evolution::compute_mood(&evo, &vitals, &bond);
+    let hint = evolution::next_step_hints(&evo, &vitals, &bond)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    let name = evo.evolution_name.as_deref().unwrap_or("Base Borg");
+    Ok(AmbientStatus {
+        name_level: format!("{name} Lv.{}", evo.level),
+        mood,
+        archetype: evo.dominant_archetype,
+        hint,
+    })
+}
+
 pub enum AppAction {
     Continue,
     Quit,
@@ -208,8 +252,8 @@ pub struct App<'a> {
     pub pending_steers: VecDeque<String>,
     /// Current plan steps displayed inline (updated by PlanUpdated events).
     pub plan_steps: Vec<borg_core::types::PlanStep>,
-    /// Cached evolution title for banner display.
-    pub evolution_title: Option<String>,
+    /// Cached ambient-status line for the banner (class: ... header).
+    pub ambient_status: Option<AmbientStatus>,
     pub status_popup: StatusPopup,
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
     /// Sender for notifying the config watcher of in-process changes.
@@ -226,7 +270,7 @@ impl<'a> App<'a> {
         poke_tx: Option<mpsc::Sender<()>>,
     ) -> Self {
         let blocked_paths = config.security.blocked_paths.clone();
-        Self {
+        let mut app = Self {
             cells: Vec::new(),
             state: AppState::Idle,
             composer: Composer::new(),
@@ -265,15 +309,27 @@ impl<'a> App<'a> {
             steer_tx: None,
             pending_steers: VecDeque::new(),
             plan_steps: Vec::new(),
-            evolution_title: borg_core::db::Database::open()
-                .ok()
-                .and_then(|db| db.get_evolution_state().ok())
-                .map(|state| borg_core::evolution::format_compact(&state)),
+            ambient_status: None,
             status_popup: StatusPopup::new(),
             doctor_rx: None,
             config_notify_tx: None,
             toasts: super::toast::ToastStack::new(),
-        }
+        };
+        app.refresh_ambient_status();
+        app
+    }
+
+    /// Refresh the cached `AmbientStatus` from the DB (evolution + vitals +
+    /// bond). Called from `App::new` and after every tool result. On any DB
+    /// error the status is cleared to `None` with a warning.
+    pub fn refresh_ambient_status(&mut self) {
+        self.ambient_status = match load_ambient_status() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("ambient_status: refresh failed: {e:#}");
+                None
+            }
+        };
     }
 
     /// Push a short-lived info toast into the corner overlay.

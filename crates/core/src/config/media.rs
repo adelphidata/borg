@@ -290,11 +290,18 @@ impl Default for ImageGenConfig {
 pub struct EvolutionConfig {
     /// Whether agent self-evolution is enabled.
     pub enabled: bool,
+    /// Whether the ambient status header (class: Name Lv.N — Mood — Archetype — hint)
+    /// is rendered in the TUI. When false, the header is omitted entirely.
+    #[serde(default = "default_true")]
+    pub ambient_header_enabled: bool,
 }
 
 impl Default for EvolutionConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            ambient_header_enabled: true,
+        }
     }
 }
 

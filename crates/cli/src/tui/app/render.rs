@@ -94,11 +94,16 @@ impl<'a> App<'a> {
             Span::from(self.config.llm.model.clone()),
         ]));
 
-        if let Some(ref evo_title) = self.evolution_title {
-            all_lines.push(Line::from(vec![
-                Span::styled("class: ", theme::dim()),
-                Span::styled(evo_title.clone(), Style::default().fg(theme::CYAN)),
-            ]));
+        if self.config.evolution.ambient_header_enabled {
+            if let Some(ref ambient) = self.ambient_status {
+                all_lines.push(Line::from(vec![
+                    Span::styled("class: ", theme::dim()),
+                    Span::styled(
+                        format_ambient_header(ambient),
+                        Style::default().fg(theme::CYAN),
+                    ),
+                ]));
+            }
         }
 
         all_lines.push(Line::default());
@@ -378,6 +383,34 @@ impl<'a> App<'a> {
     }
 }
 
+/// Format the value portion of the `class:` ambient header line.
+///
+/// Shape: `{name_level} — {Mood} — {Archetype} — {hint}`. Components are
+/// elided when absent (no archetype → no `— {Archetype}` segment; empty hint
+/// → no trailing `— {hint}`). Separator is an em-dash with surrounding
+/// spaces. The archetype is title-cased to match the existing legacy
+/// `format_compact` styling.
+pub(super) fn format_ambient_header(status: &super::AmbientStatus) -> String {
+    let mut out = status.name_level.clone();
+    out.push_str(" \u{2014} ");
+    out.push_str(&status.mood.to_string());
+    if let Some(arch) = status.archetype {
+        let arch_str = arch.to_string();
+        let mut chars = arch_str.chars();
+        let titled = match chars.next() {
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        };
+        out.push_str(" \u{2014} ");
+        out.push_str(&titled);
+    }
+    if !status.hint.is_empty() {
+        out.push_str(" \u{2014} ");
+        out.push_str(&status.hint);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,5 +520,66 @@ mod tests {
             !rendered.contains(HINT_SUBSTR),
             "hint must not appear when already at bottom"
         );
+    }
+
+    // ── Ambient header formatting (Stream C) ──
+
+    use super::super::AmbientStatus;
+    use borg_core::evolution::{Archetype, Mood};
+
+    fn mk_ambient(mood: Mood, arch: Option<Archetype>, hint: &str) -> AmbientStatus {
+        AmbientStatus {
+            name_level: "Base Borg Lv.1".to_string(),
+            mood,
+            archetype: arch,
+            hint: hint.to_string(),
+        }
+    }
+
+    #[test]
+    fn ambient_header_full_components_joined_by_em_dash() {
+        let s = mk_ambient(Mood::Focused, Some(Archetype::Builder), "2 XP to Lvl.2.");
+        assert_eq!(
+            format_ambient_header(&s),
+            "Base Borg Lv.1 \u{2014} focused \u{2014} Builder \u{2014} 2 XP to Lvl.2."
+        );
+    }
+
+    #[test]
+    fn ambient_header_omits_archetype_when_none() {
+        let s = mk_ambient(Mood::Drifting, None, "use tools to form identity.");
+        assert_eq!(
+            format_ambient_header(&s),
+            "Base Borg Lv.1 \u{2014} drifting \u{2014} use tools to form identity."
+        );
+    }
+
+    #[test]
+    fn ambient_header_omits_hint_when_empty() {
+        let s = mk_ambient(Mood::Stable, Some(Archetype::Ops), "");
+        assert_eq!(
+            format_ambient_header(&s),
+            "Base Borg Lv.1 \u{2014} stable \u{2014} Ops"
+        );
+    }
+
+    #[test]
+    fn ambient_header_covers_every_mood_variant() {
+        for mood in [
+            Mood::Stable,
+            Mood::Focused,
+            Mood::Strained,
+            Mood::Learning,
+            Mood::Drifting,
+            Mood::Ascending,
+        ] {
+            let s = mk_ambient(mood, None, "");
+            let line = format_ambient_header(&s);
+            assert!(
+                line.contains(&mood.to_string()),
+                "expected mood '{mood}' in '{line}'"
+            );
+            assert!(line.starts_with("Base Borg Lv.1"));
+        }
     }
 }
