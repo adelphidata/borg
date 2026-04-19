@@ -428,20 +428,22 @@ impl App<'_> {
         match borg_core::memory::list_memory_files() {
             Ok(files) => {
                 if files.is_empty() {
-                    self.push_system_message("No memory files found.".to_string());
+                    self.push_system_message("No memory entries found.".to_string());
                 } else {
-                    let mut text = String::from("Memory files (oldest first):\n");
+                    let mut text = String::from("Memory entries (oldest first):\n");
                     for f in &files {
                         let modified = f
                             .modified_at
                             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "unknown".to_string());
                         text.push_str(&format!(
-                            "  {} ({} bytes, modified: {modified})\n",
+                            "  {} ({} bytes, updated: {modified})\n",
                             f.filename, f.size_bytes
                         ));
                     }
-                    text.push_str("\nTo delete a memory file, ask the agent to use write_memory.");
+                    text.push_str(
+                        "\nTo delete or update an entry, ask the agent to use write_memory.",
+                    );
                     self.push_system_message(text.trim_end().to_string());
                 }
             }

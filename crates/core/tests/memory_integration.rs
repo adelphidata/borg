@@ -1,11 +1,8 @@
 //! Memory system integration tests.
 //!
-//! Tests write/read/list lifecycle, path traversal prevention, token budgeting,
-//! and extra path scanning.
-//!
-//! NOTE: Tests that depend on `BORG_DATA_DIR` are combined into a single test
-//! to avoid env var races when running in parallel. Tests that do not depend
-//! on `BORG_DATA_DIR` (like scan_extra_paths) are separate.
+//! Tests extra-path scanning (filesystem-backed, still supported for user-configured
+//! memory directories). The DB-backed memory API (`write_memory_db`, `read_memory_db`,
+//! `load_memory_context_db`, etc.) is covered by unit tests in `memory/mod.rs`.
 
 #![allow(
     clippy::approx_constant,
@@ -32,86 +29,8 @@
 use std::fs;
 
 use borg_core::memory;
-use borg_core::memory::WriteMode;
 
 mod common;
-
-// ── Test: full memory lifecycle ──
-// Combined into one test to avoid BORG_DATA_DIR race conditions.
-
-#[test]
-fn memory_lifecycle() {
-    let tmp = common::test_tempdir();
-    let mem_dir = tmp.path().join("memory");
-    fs::create_dir_all(&mem_dir).expect("create memory dir");
-    std::env::set_var("BORG_DATA_DIR", tmp.path());
-
-    // --- Write then read round-trip ---
-    let result = memory::write_memory("test_note.md", "Hello from test", WriteMode::Overwrite)
-        .expect("write memory");
-    assert!(
-        result.contains("test_note.md"),
-        "Write result should mention filename"
-    );
-    let content = memory::read_memory("test_note.md").expect("read memory");
-    assert_eq!(content.trim(), "Hello from test");
-
-    // --- Append mode accumulates ---
-    memory::write_memory("append_test.md", "Line 1\n", WriteMode::Overwrite).expect("write first");
-    memory::write_memory("append_test.md", "Line 2\n", WriteMode::Append).expect("write second");
-    let content = memory::read_memory("append_test.md").expect("read append");
-    assert!(content.contains("Line 1"));
-    assert!(content.contains("Line 2"));
-
-    // --- Overwrite replaces content ---
-    memory::write_memory("overwrite.md", "old content", WriteMode::Overwrite).expect("write old");
-    memory::write_memory("overwrite.md", "new content", WriteMode::Overwrite).expect("write new");
-    let content = memory::read_memory("overwrite.md").expect("read overwrite");
-    assert!(!content.contains("old content"));
-    assert!(content.contains("new content"));
-
-    // --- List memory files ---
-    let files = memory::list_memory_files().expect("list");
-    let names: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-    assert!(names.contains(&"test_note.md"), "Should list test_note.md");
-    assert!(
-        names.contains(&"append_test.md"),
-        "Should list append_test.md"
-    );
-    assert!(names.contains(&"overwrite.md"), "Should list overwrite.md");
-
-    // --- MemoryFileInfo has expected fields ---
-    let info = files
-        .iter()
-        .find(|f| f.filename == "test_note.md")
-        .expect("find file");
-    assert!(info.size_bytes > 0, "Size should be non-zero");
-    assert!(info.modified_at.is_some(), "Should have modification time");
-
-    // --- Read nonexistent file ---
-    let result = memory::read_memory("does_not_exist.md").expect("read nonexistent");
-    assert!(
-        result.contains("not found"),
-        "Should report not found, got: {result}"
-    );
-
-    // --- Path traversal rejected ---
-    let result = memory::write_memory("../../etc/passwd", "evil", WriteMode::Overwrite);
-    assert!(result.is_err(), "Path traversal should be rejected");
-
-    // --- Token budget ---
-    let index_path = tmp.path().join("MEMORY.md");
-    fs::write(
-        &index_path,
-        "# Memory Index\n- [test_note.md](test_note.md)\n",
-    )
-    .expect("write index");
-    let context = memory::load_memory_context(100).expect("load with small budget");
-    assert!(
-        !context.is_empty(),
-        "Should return some context even with small budget"
-    );
-}
 
 // ── Test: scan_extra_paths finds .md files ──
 

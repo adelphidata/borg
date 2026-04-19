@@ -539,20 +539,44 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
 }
 
 fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
-    match Config::memory_index_path() {
-        Ok(path) => {
-            if path.exists() {
-                checks.push(DiagnosticCheck::pass("Memory", "MEMORY.md exists"));
-            } else {
-                checks.push(DiagnosticCheck::warn(
+    match Database::open() {
+        Ok(db) => match db.list_memory_entries("global") {
+            Ok(entries) => {
+                let has_index = entries.iter().any(|e| e.name == "INDEX");
+                let total = entries.len();
+                if has_index {
+                    checks.push(DiagnosticCheck::pass(
+                        "Memory",
+                        format!("{total} memory entries (INDEX present)"),
+                    ));
+                } else if total == 0 {
+                    checks.push(DiagnosticCheck::warn(
+                        "Memory",
+                        "memory entries",
+                        "no entries in DB yet",
+                    ));
+                } else {
+                    checks.push(DiagnosticCheck::warn(
+                        "Memory",
+                        format!("{total} memory entries"),
+                        "no INDEX entry",
+                    ));
+                }
+            }
+            Err(e) => {
+                checks.push(DiagnosticCheck::fail(
                     "Memory",
-                    "MEMORY.md exists",
-                    "not found",
+                    "list memory entries",
+                    format!("{e}"),
                 ));
             }
-        }
+        },
         Err(e) => {
-            checks.push(DiagnosticCheck::fail("Memory", "MEMORY.md", format!("{e}")));
+            checks.push(DiagnosticCheck::fail(
+                "Memory",
+                "open database",
+                format!("{e}"),
+            ));
         }
     }
 
@@ -1097,27 +1121,19 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     match Database::open() {
         Ok(db) => {
             let global_count = db.count_embeddings("global").unwrap_or(0);
-
-            // Count memory files
-            let file_count = Config::memory_dir()
-                .ok()
-                .and_then(|dir| std::fs::read_dir(dir).ok())
-                .map(|entries| {
-                    entries
-                        .filter_map(std::result::Result::ok)
-                        .filter(|e| e.path().extension().map(|ext| ext == "md").unwrap_or(false))
-                        .count()
-                })
+            let entry_count = db
+                .list_memory_entries("global")
+                .map(|v| v.len())
                 .unwrap_or(0);
 
-            let name = format!("embeddings: {global_count}/{file_count} memory files indexed");
-            if file_count == 0 || global_count >= file_count {
+            let name = format!("embeddings: {global_count}/{entry_count} memory entries indexed");
+            if entry_count == 0 || global_count >= entry_count {
                 checks.push(DiagnosticCheck::pass("Embeddings", name));
             } else {
                 checks.push(DiagnosticCheck::warn(
                     "Embeddings",
                     name,
-                    "some memory files not yet embedded (will be indexed on next write)",
+                    "some memory entries not yet embedded (will be indexed on next write)",
                 ));
             }
         }

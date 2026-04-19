@@ -142,7 +142,7 @@ Two-tier architecture: short-term (session) + long-term (persistent). All memory
 - `write_memory` tool writes to DB with injection scanning (prompt override, exfiltration, invisible Unicode patterns rejected)
 - Hybrid search: vector (70%) + BM25 (30%) with adaptive weighting, MMR diversity re-ranking, per-term fallback
 - Embedding cache with TTL pruning (`last_accessed_at` tracking, 30-day default)
-- V34 migration imports old `~/.borg/MEMORY.md` and `memory/*.md` files into DB, renames to `.bak`
+- V34 migration (historical) imported old `~/.borg/MEMORY.md` and `memory/*.md` files into the DB and renamed originals to `.bak`. Filesystem read fallbacks have since been removed — the DB is the only source of truth.
 
 **Short-term memory** (`ShortTermMemory` struct, in-memory):
 - Session-scoped working memory accumulating facts from tool calls
