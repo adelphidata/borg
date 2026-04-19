@@ -10,12 +10,18 @@
 
 mod celebration;
 mod classification;
+mod commands;
+mod feed;
+mod helpers;
 mod replay;
 
 pub use celebration::{
     celebration_art, format_celebration_message, CelebrationArt, CelebrationPayload,
 };
 pub use classification::*;
+pub use commands::{dispatch, parse, CommandOutput, EvolutionCommand};
+pub use feed::{recent_xp_feed, xp_summary, FeedEntry, FeedKind, XpSummary};
+pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
 pub use replay::*;
 
 use std::collections::HashMap;
@@ -136,6 +142,10 @@ pub(crate) fn rate_limit_for(event_type: &str) -> u32 {
         "evolution" => 3,
         "classification" => 3,
         "archetype_shift" => 5,
+        "level_up" => 10,
+        "milestone_unlocked" => 3,
+        "mood_changed" => 5,
+        "share_card_created" => 3,
         _ => 10,
     }
 }
@@ -259,6 +269,97 @@ impl fmt::Display for Stage {
     }
 }
 
+/// Direction of movement for an archetype's recent effective score.
+///
+/// Computed by comparing the last 7 days of aligned XP to the prior 7 days.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trend {
+    /// Recent score strictly greater than the prior window.
+    Rising,
+    /// Recent and prior windows within a small tolerance of each other.
+    Stable,
+    /// Recent score strictly lower than the prior window.
+    Falling,
+}
+
+impl fmt::Display for Trend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rising => write!(f, "rising"),
+            Self::Stable => write!(f, "stable"),
+            Self::Falling => write!(f, "falling"),
+        }
+    }
+}
+
+impl Trend {
+    /// Compact arrow suitable for inline rendering (↑ / → / ↓).
+    pub fn arrow(&self) -> &'static str {
+        match self {
+            Self::Rising => "\u{2191}",
+            Self::Stable => "\u{2192}",
+            Self::Falling => "\u{2193}",
+        }
+    }
+}
+
+/// Companion mood derived from vitals, bond, and evolution state.
+///
+/// Mood is a lossy UX signal, not authoritative state — the underlying
+/// vitals/bond/evolution numbers remain the source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mood {
+    /// Baseline — nothing notable.
+    Stable,
+    /// Low correction rate, high focus — doing work smoothly.
+    Focused,
+    /// High correction rate or low min vital — struggling.
+    Strained,
+    /// Growth vital trending up and archetype still forming.
+    Learning,
+    /// Dominant archetype still shifting; no stable specialization yet.
+    Drifting,
+    /// Near an evolution boundary (Lvl 99 with gates close to passing).
+    Ascending,
+}
+
+impl fmt::Display for Mood {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stable => write!(f, "stable"),
+            Self::Focused => write!(f, "focused"),
+            Self::Strained => write!(f, "strained"),
+            Self::Learning => write!(f, "learning"),
+            Self::Drifting => write!(f, "drifting"),
+            Self::Ascending => write!(f, "ascending"),
+        }
+    }
+}
+
+/// One prerequisite for evolution that is not yet satisfied.
+#[derive(Debug, Clone)]
+pub struct BlockingGate {
+    /// Short name of the gate (e.g. "level", "bond", "dominance_ratio").
+    pub name: String,
+    /// Current value toward the target.
+    pub current: f64,
+    /// Target value needed to clear the gate.
+    pub target: f64,
+    /// Human-facing hint about how to move this gate toward target.
+    pub hint: String,
+}
+
+/// Overall readiness snapshot for the next stage transition.
+#[derive(Debug, Clone)]
+pub struct ReadinessReport {
+    /// True when all gates are satisfied (i.e. evolution is imminent).
+    pub ready: bool,
+    /// List of gates still blocking the transition (empty when `ready`).
+    pub blocking: Vec<BlockingGate>,
+    /// Coarse 0.0..=1.0 progress estimate across all gates.
+    pub progress: f32,
+}
+
 /// A recorded event from the evolution ledger.
 #[derive(Debug, Clone)]
 pub struct EvolutionEvent {
@@ -315,6 +416,19 @@ pub struct EvolutionState {
     pub total_events: u32,
     /// Whether the HMAC chain is intact across all replayed events.
     pub chain_valid: bool,
+    /// Per-archetype 7d-vs-7d trend. Populated at replay time from the
+    /// accepted event stream; does not persist.
+    pub momentum: HashMap<Archetype, Trend>,
+    /// Last N `level_up` + `milestone_unlocked` events, newest first.
+    /// Used to drive the `/xp` feed without re-scanning the full ledger.
+    pub level_up_events_recent: Vec<EvolutionEvent>,
+    /// Companion mood — `None` until a caller wires in vitals+bond via
+    /// [`compute_mood`]. Left empty by pure event replay.
+    pub mood: Option<Mood>,
+    /// Readiness snapshot for the next stage transition. `None` until a
+    /// caller wires in vitals+bond via [`compute_readiness`], or at Stage 3
+    /// where no transition is possible.
+    pub readiness: Option<ReadinessReport>,
 }
 
 // ── XP Curve ──
@@ -340,10 +454,24 @@ const BASE_XP_INTERACTION: i32 = 1;
 /// Maximum XP delta allowed per event.
 pub(crate) const MAX_XP_DELTA: i32 = BASE_XP_CREATION + BONUS_XP_CREATION_ALIGNED;
 /// Valid evolution event types.
-pub(crate) const VALID_EVOLUTION_EVENT_TYPES: &[&str] =
-    &["xp_gain", "evolution", "classification", "archetype_shift"];
+pub(crate) const VALID_EVOLUTION_EVENT_TYPES: &[&str] = &[
+    "xp_gain",
+    "evolution",
+    "classification",
+    "archetype_shift",
+    "level_up",
+    "milestone_unlocked",
+    "mood_changed",
+    "share_card_created",
+];
 /// Total evolution events per hour (write-time cap).
-pub(crate) const TOTAL_EVENTS_PER_HOUR: i64 = 20;
+///
+/// Per-type caps sum to well above this — the global cap is a coarse
+/// safety net against a flood across all types. Bumped from 20 → 40 when
+/// V2 added the informational types (`level_up`, `milestone_unlocked`,
+/// `mood_changed`, `share_card_created`) so bursty level-ups near a stage
+/// boundary don't starve the legitimate `evolution` row that follows.
+pub(crate) const TOTAL_EVENTS_PER_HOUR: i64 = 40;
 /// Per-source events per hour (write-time coarse gate; replay applies graduated decay).
 pub(crate) const WRITE_SOURCE_RATE_LIMIT: i64 = 5;
 
@@ -1590,6 +1718,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         }
     }
 
@@ -1677,6 +1809,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let compact = format_compact(&state);
         assert!(compact.contains("Pipeline Warden"));
@@ -1700,6 +1836,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let section = format_status_section(&state);
         assert!(section.contains("Pipeline Warden"));
@@ -1727,6 +1867,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let ctx = format_evolution_context(&state);
         assert!(ctx.contains("<evolution_context>"));
@@ -1886,6 +2030,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 10,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let section = format_status_section(&state);
         assert!(
@@ -1912,6 +2060,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let section = format_status_section(&state);
         assert!(
@@ -1939,6 +2091,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 10,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         let ctx = format_evolution_context(&state);
         // Should contain Stage name, not autonomy tier
@@ -1962,6 +2118,10 @@ mod tests {
             dominant_history: Vec::new(),
             total_events: 1,
             chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
         };
         for width in [34, 44, 48, 60, 80] {
             let section = format_status_section_with_width(&state, width);
@@ -3041,6 +3201,114 @@ mod tests {
         hook.execute(&ctx);
         let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
         assert!(events.is_empty(), "error tool calls must not record XP");
+    }
+
+    // ── V2: new event types (level_up, milestone_unlocked, mood_changed, share_card_created) ──
+
+    #[test]
+    fn replay_accepts_new_v2_event_types() {
+        // xp_gain + level_up + milestone_unlocked chain cleanly and replay
+        // ignores the informational rows without corrupting state.
+        let e1 = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", 1000, "0");
+        let e2 = {
+            let mut e = make_event(2, "level_up", 0, None, "hook", 1500, &e1.hmac);
+            e.metadata_json = Some(r#"{"from_level":0,"to_level":1,"stage":"base"}"#.to_string());
+            // Re-sign with metadata so v2 HMAC matches.
+            e.hmac = compute_event_hmac(
+                EVOLUTION_HMAC_LEGACY,
+                &e.prev_hmac,
+                &e.event_type,
+                e.xp_delta,
+                e.archetype.as_deref().unwrap_or(""),
+                &e.source,
+                e.metadata_json.as_deref().unwrap_or(""),
+                e.created_at,
+            );
+            e
+        };
+        let e3 = {
+            let mut e = make_event(3, "milestone_unlocked", 0, None, "hook", 1600, &e2.hmac);
+            e.metadata_json = Some(r#"{"milestone_id":"level_10","title":"Lvl.10"}"#.to_string());
+            e.hmac = compute_event_hmac(
+                EVOLUTION_HMAC_LEGACY,
+                &e.prev_hmac,
+                &e.event_type,
+                e.xp_delta,
+                e.archetype.as_deref().unwrap_or(""),
+                &e.source,
+                e.metadata_json.as_deref().unwrap_or(""),
+                e.created_at,
+            );
+            e
+        };
+
+        let state = replay_events(&[e1, e2, e3]);
+        assert!(
+            state.chain_valid,
+            "chain should validate across v2 event types"
+        );
+        assert_eq!(state.total_xp, 3);
+        assert_eq!(
+            state.level_up_events_recent.len(),
+            2,
+            "level_up + milestone_unlocked should populate the feed"
+        );
+        // Newest first.
+        assert_eq!(
+            state.level_up_events_recent[0].event_type,
+            "milestone_unlocked"
+        );
+    }
+
+    #[test]
+    fn hmac_tamper_detection_on_new_event_types() {
+        let meta = r#"{"from_level":9,"to_level":10,"stage":"base"}"#;
+        let hmac = compute_event_hmac(
+            EVOLUTION_HMAC_LEGACY,
+            "0",
+            "level_up",
+            0,
+            "",
+            "hook",
+            meta,
+            1000,
+        );
+        let mut event = EvolutionEvent {
+            id: 1,
+            event_type: "level_up".to_string(),
+            xp_delta: 0,
+            archetype: None,
+            source: "hook".to_string(),
+            metadata_json: Some(meta.to_string()),
+            created_at: 1000,
+            hmac,
+            prev_hmac: "0".to_string(),
+        };
+        // Pristine event verifies.
+        assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+        // Tamper with metadata — v2 HMAC must reject.
+        event.metadata_json = Some(r#"{"from_level":9,"to_level":99,"stage":"base"}"#.to_string());
+        assert!(!verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
+    }
+
+    #[test]
+    fn replay_populates_momentum_from_recent_xp() {
+        let now = chrono::Utc::now().timestamp();
+        let recent = now - 86_400;
+        let e1 = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", recent, "0");
+        let e2 = make_event(
+            2,
+            "xp_gain",
+            3,
+            Some("ops"),
+            "run_shell",
+            recent + 1,
+            &e1.hmac,
+        );
+        let state = replay_events(&[e1, e2]);
+        // At least one archetype should have a trend classification.
+        assert!(!state.momentum.is_empty());
+        assert!(state.momentum.contains_key(&Archetype::Ops));
     }
 
     #[test]

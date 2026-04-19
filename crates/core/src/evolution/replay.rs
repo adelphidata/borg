@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use crate::hmac_chain;
 
 use super::{
-    evolution_gates_verified, level_from_xp, rate_limit_for, verify_event_hmac, Archetype,
-    EvolutionEvent, EvolutionState, Stage,
+    compute_momentum, evolution_gates_verified, level_from_xp, rate_limit_for, verify_event_hmac,
+    Archetype, EvolutionEvent, EvolutionState, Stage,
 };
 
 #[cfg(test)]
@@ -56,6 +56,7 @@ pub fn replay_events_with_key_at(
     let mut dominant_history: Vec<(i64, Archetype)> = Vec::new();
     let mut last_dominant: Option<Archetype> = None;
     let cutoff_30d = now_ts - WINDOW_30D_SECS;
+    let mut accepted: Vec<EvolutionEvent> = Vec::new();
 
     for event in events {
         // Verify HMAC chain
@@ -91,6 +92,7 @@ pub fn replay_events_with_key_at(
         }
 
         accepted_events += 1;
+        accepted.push(event.clone());
 
         match event.event_type.as_str() {
             "xp_gain" => {
@@ -158,6 +160,10 @@ pub fn replay_events_with_key_at(
             "archetype_shift" => {
                 // Informational.
             }
+            "level_up" | "milestone_unlocked" | "mood_changed" | "share_card_created" => {
+                // Informational / feed-only. Consumed by higher-level helpers
+                // (e.g. `level_up_events_recent`, mood transition detection).
+            }
             _ => {}
         }
     }
@@ -165,6 +171,15 @@ pub fn replay_events_with_key_at(
     let (level, xp_to_next) = level_from_xp(&stage, total_xp);
     let effective_scores = effective_scores_map(&lifetime_scores, &last_30d_scores);
     let dominant = dominant_from_effective(&lifetime_scores, &last_30d_scores);
+    let momentum = compute_momentum(&accepted, now_ts);
+
+    let mut level_up_events_recent: Vec<EvolutionEvent> = accepted
+        .iter()
+        .filter(|e| e.event_type == "level_up" || e.event_type == "milestone_unlocked")
+        .cloned()
+        .collect();
+    level_up_events_recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    level_up_events_recent.truncate(20);
 
     EvolutionState {
         stage,
@@ -180,6 +195,10 @@ pub fn replay_events_with_key_at(
         dominant_history,
         total_events: accepted_events,
         chain_valid,
+        momentum,
+        level_up_events_recent,
+        mood: None,
+        readiness: None,
     }
 }
 
