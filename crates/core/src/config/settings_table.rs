@@ -319,4 +319,50 @@ define_settings! {
             None => "(none)".to_string(),
         };
     }
+
+    // TUI-visible settings, in render order. Category breaks produce section
+    // headers in the popup. Entries render top-to-bottom: Essentials first,
+    // Advanced last.
+    tui_settings {
+        // — Essentials — what every user sees first
+        "provider" => "Provider", Select, "Essentials";
+        "model" => "Model", Select, "Essentials";
+        "temperature" => "Temperature", Float, "Essentials";
+        "conversation.collaboration_mode" => "Mode", Select, "Essentials";
+        "budget.monthly_token_limit" => "Monthly token limit", Uint, "Essentials";
+
+        // — Conversation — day-to-day tuning
+        "max_tokens" => "Response length", Uint, "Conversation";
+        "conversation.show_thinking" => "Show reasoning", Bool, "Conversation";
+        "conversation.max_iterations" => "Max agent steps", Uint, "Conversation";
+        "conversation.concurrent_tools.enabled" => "Parallel tools", Bool, "Conversation";
+
+        // — Memory & Skills —
+        "skills.enabled" => "Allow skills", Bool, "Memory & Skills";
+
+        // — Personality —
+        "evolution.enabled" => "Evolution", Bool, "Personality";
+        "evolution.ambient_header_enabled" => "Ambient header", Bool, "Personality";
+
+        // — Heartbeat —
+        "heartbeat.session_start_enabled" => "Greet on TUI open", Bool, "Heartbeat";
+        "heartbeat.session_start_throttle_minutes" => "Greeting throttle (min)", Uint, "Heartbeat";
+
+        // — Voice —
+        "tts.enabled" => "Enabled", Bool, "Voice";
+        "tts.auto_mode" => "Auto reply", Bool, "Voice";
+
+        // — Security —
+        "sandbox.enabled" => "Sandbox", Bool, "Security";
+        "hooks.enabled" => "Allow user hooks", Bool, "Security";
+        "security.secret_detection" => "Secret detection", Bool, "Security";
+
+        // — Advanced — power-user / esoteric knobs
+        "llm.cache.strategy" => "Cache layout", Select, "Advanced";
+        "conversation.concurrent_tools.max_workers" => "Parallel tool workers", Uint, "Advanced";
+        "conversation.protect_first_n" => "Protected head msgs", Uint, "Advanced";
+        "skills.budget_pct" => "Skills budget (% ctx)", Float, "Advanced";
+        "budget.warning_threshold" => "Budget warning", Float, "Advanced";
+        "workflow.enabled" => "Workflows", Select, "Advanced";
+    }
 }

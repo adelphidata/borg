@@ -5,7 +5,7 @@ use ratatui::Frame;
 
 use borg_core::config::Config;
 use borg_core::db::Database;
-use borg_core::settings::SettingSource;
+use borg_core::settings::{SettingSource, TuiSettingDecl, TuiSettingKind, TUI_SETTINGS};
 
 use crate::onboarding::{models_for_provider, PROVIDERS};
 
@@ -13,13 +13,10 @@ use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SettingKind {
-    Bool,
-    Float,
-    Uint,
-    Select,
-}
+// TUI popup uses the core-side types directly so there's a single registry
+// describing every setting, its kind, and its display metadata.
+pub type SettingKind = TuiSettingKind;
+pub type SettingEntry = TuiSettingDecl;
 
 /// Cycle to the next/previous option in a fixed list, given the current value.
 /// Returns the first option if `current` isn't in the list.
@@ -32,14 +29,6 @@ fn cycle_option<'a>(options: &'a [&'a str], current: &str, forward: bool) -> &'a
         (idx + len - 1) % len
     };
     options[next]
-}
-
-#[derive(Clone, Copy)]
-pub struct SettingEntry {
-    pub key: &'static str,
-    pub label: &'static str,
-    pub kind: SettingKind,
-    pub category: &'static str,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,169 +55,10 @@ pub struct SettingsPopup {
     model_index: usize,
 }
 
-// Settings are grouped into categories that render top-to-bottom in the popup.
-// Order: Essentials → everyday use → power-user knobs → Advanced (esoteric).
-// Non-technical users should find what they need without scrolling past jargon.
-const SETTINGS: &[SettingEntry] = &[
-    // — Essentials — what every user sees first
-    SettingEntry {
-        key: "provider",
-        label: "Provider",
-        kind: SettingKind::Select,
-        category: "Essentials",
-    },
-    SettingEntry {
-        key: "model",
-        label: "Model",
-        kind: SettingKind::Select,
-        category: "Essentials",
-    },
-    SettingEntry {
-        key: "temperature",
-        label: "Temperature",
-        kind: SettingKind::Float,
-        category: "Essentials",
-    },
-    SettingEntry {
-        key: "conversation.collaboration_mode",
-        label: "Mode",
-        kind: SettingKind::Select,
-        category: "Essentials",
-    },
-    SettingEntry {
-        key: "budget.monthly_token_limit",
-        label: "Monthly token limit",
-        kind: SettingKind::Uint,
-        category: "Essentials",
-    },
-    // — Conversation — day-to-day tuning
-    SettingEntry {
-        key: "max_tokens",
-        label: "Response length",
-        kind: SettingKind::Uint,
-        category: "Conversation",
-    },
-    SettingEntry {
-        key: "conversation.show_thinking",
-        label: "Show reasoning",
-        kind: SettingKind::Bool,
-        category: "Conversation",
-    },
-    SettingEntry {
-        key: "conversation.max_iterations",
-        label: "Max agent steps",
-        kind: SettingKind::Uint,
-        category: "Conversation",
-    },
-    SettingEntry {
-        key: "conversation.concurrent_tools.enabled",
-        label: "Parallel tools",
-        kind: SettingKind::Bool,
-        category: "Conversation",
-    },
-    // — Memory & Skills —
-    SettingEntry {
-        key: "skills.enabled",
-        label: "Allow skills",
-        kind: SettingKind::Bool,
-        category: "Memory & Skills",
-    },
-    // — Personality —
-    SettingEntry {
-        key: "evolution.enabled",
-        label: "Evolution",
-        kind: SettingKind::Bool,
-        category: "Personality",
-    },
-    SettingEntry {
-        key: "evolution.ambient_header_enabled",
-        label: "Ambient header",
-        kind: SettingKind::Bool,
-        category: "Personality",
-    },
-    // — Heartbeat —
-    SettingEntry {
-        key: "heartbeat.session_start_enabled",
-        label: "Greet on TUI open",
-        kind: SettingKind::Bool,
-        category: "Heartbeat",
-    },
-    SettingEntry {
-        key: "heartbeat.session_start_throttle_minutes",
-        label: "Greeting throttle (min)",
-        kind: SettingKind::Uint,
-        category: "Heartbeat",
-    },
-    // — Voice —
-    SettingEntry {
-        key: "tts.enabled",
-        label: "Enabled",
-        kind: SettingKind::Bool,
-        category: "Voice",
-    },
-    SettingEntry {
-        key: "tts.auto_mode",
-        label: "Auto reply",
-        kind: SettingKind::Bool,
-        category: "Voice",
-    },
-    // — Security —
-    SettingEntry {
-        key: "sandbox.enabled",
-        label: "Sandbox",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
-    SettingEntry {
-        key: "hooks.enabled",
-        label: "Allow user hooks",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
-    SettingEntry {
-        key: "security.secret_detection",
-        label: "Secret detection",
-        kind: SettingKind::Bool,
-        category: "Security",
-    },
-    // — Advanced — power-user / esoteric knobs
-    SettingEntry {
-        key: "llm.cache.strategy",
-        label: "Cache layout",
-        kind: SettingKind::Select,
-        category: "Advanced",
-    },
-    SettingEntry {
-        key: "conversation.concurrent_tools.max_workers",
-        label: "Parallel tool workers",
-        kind: SettingKind::Uint,
-        category: "Advanced",
-    },
-    SettingEntry {
-        key: "conversation.protect_first_n",
-        label: "Protected head msgs",
-        kind: SettingKind::Uint,
-        category: "Advanced",
-    },
-    SettingEntry {
-        key: "skills.budget_pct",
-        label: "Skills budget (% ctx)",
-        kind: SettingKind::Float,
-        category: "Advanced",
-    },
-    SettingEntry {
-        key: "budget.warning_threshold",
-        label: "Budget warning",
-        kind: SettingKind::Float,
-        category: "Advanced",
-    },
-    SettingEntry {
-        key: "workflow.enabled",
-        label: "Workflows",
-        kind: SettingKind::Select,
-        category: "Advanced",
-    },
-];
+// Settings live in `borg_core::settings::TUI_SETTINGS`, generated by the
+// `define_settings!` macro in `crates/core/src/config/settings_table.rs`.
+// The popup renders entries in their declared order; category changes
+// produce section headers.
 
 impl SettingsPopup {
     pub fn new() -> Self {
@@ -241,7 +71,7 @@ impl SettingsPopup {
         };
         Self {
             visible: false,
-            entries: SETTINGS,
+            entries: TUI_SETTINGS,
             selected: 0,
             mode: EditMode::Browsing,
             status_message: None,
@@ -1513,7 +1343,7 @@ mod tests {
         // Use a popup with no DB so real user settings don't interfere
         let popup = SettingsPopup {
             visible: false,
-            entries: SETTINGS,
+            entries: TUI_SETTINGS,
             selected: 0,
             mode: EditMode::Browsing,
             status_message: None,

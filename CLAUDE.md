@@ -225,13 +225,18 @@ Logs at `~/.borg/logs/`: `tui.log` (TUI session), `daemon.log`/`daemon.err` (dae
 
 ## Adding New Things
 
-### New Setting (3 touch points)
+### New Setting (single table)
 
-1. **`crates/core/src/config/mod.rs`** — Add field to config struct + `apply_setting()` match arm
-2. **`crates/core/src/settings.rs`** — Add entry to `SETTING_REGISTRY` (key + extractor fn)
-3. **`crates/cli/src/tui/settings_popup.rs`** — Add `SettingEntry` to `SETTINGS` array (key, label, kind, category)
+1. **`crates/core/src/config/<section>.rs`** — Add the Rust field + default to the matching config struct.
+2. **`crates/core/src/config/settings_table.rs`** — Add one line to the `define_settings!` macro. The macro generates `SETTING_REGISTRY`, the `apply_setting()` match arm, and (when you include it in the `tui_settings` block) the `/settings` popup row.
 
-`SettingKind` options: Bool (Space toggles), Float (arrows ±0.1), Uint (Enter to edit), Select (Left/Right cycle).
+To show the setting in the TUI popup, append an entry to the `tui_settings { … }` block at the bottom of `settings_table.rs`:
+
+```rust
+"my.new.setting" => "Display Label", Bool, "Category";
+```
+
+`TuiSettingKind` options: `Bool` (Space toggles), `Float` (arrows ±0.1), `Uint` (Enter to edit), `Select` (Left/Right cycle). A unit test asserts every `tui_settings` key resolves in `SETTING_REGISTRY`.
 
 ### New Tool
 

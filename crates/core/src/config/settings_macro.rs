@@ -36,6 +36,16 @@ macro_rules! define_settings {
         custom_extract {
             $( $ce_key:literal => $ce_extract:expr ; )*
         }
+
+        // TUI popup metadata. Entries reference keys from any of the above
+        // blocks; a unit test validates that every key here is known to
+        // `SETTING_REGISTRY`. Lives alongside the registry so adding or
+        // reordering a TUI setting is a one-file change.
+        tui_settings {
+            $(
+                $tui_key:literal => $tui_label:literal , $tui_kind:ident , $tui_category:literal ;
+            )*
+        }
     ) => {
         impl $crate::config::Config {
             /// Apply a single key=value setting, returning a confirmation string.
@@ -81,6 +91,19 @@ macro_rules! define_settings {
             )*
             $(
                 ($ce_key, $ce_extract),
+            )*
+        ];
+
+        /// TUI-visible subset with display metadata (label, kind, category).
+        /// Rendered in the `/settings` popup in declaration order.
+        pub const TUI_SETTINGS: &[$crate::settings::TuiSettingDecl] = &[
+            $(
+                $crate::settings::TuiSettingDecl {
+                    key: $tui_key,
+                    label: $tui_label,
+                    kind: $crate::settings::TuiSettingKind::$tui_kind,
+                    category: $tui_category,
+                },
             )*
         ];
 
