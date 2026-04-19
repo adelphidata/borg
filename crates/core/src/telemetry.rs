@@ -31,12 +31,12 @@ impl Drop for TelemetryGuard {
     fn drop(&mut self) {
         if let Some(tp) = self.tracer_provider.take() {
             if let Err(e) = tp.shutdown() {
-                eprintln!("OpenTelemetry tracer shutdown error: {e}");
+                tracing::warn!("OpenTelemetry tracer shutdown error: {e}");
             }
         }
         if let Some(mp) = self.meter_provider.take() {
             if let Err(e) = mp.shutdown() {
-                eprintln!("OpenTelemetry meter shutdown error: {e}");
+                tracing::warn!("OpenTelemetry meter shutdown error: {e}");
             }
         }
     }
