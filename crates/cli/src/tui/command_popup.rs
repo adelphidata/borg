@@ -69,6 +69,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Show agent vitals",
     },
     SlashCommandDef {
+        name: "/evolution",
+        description: "Show evolution overview",
+    },
+    SlashCommandDef {
         name: "/pairing",
         description: "Manage sender pairing",
     },
@@ -390,6 +394,7 @@ mod tests {
             "/logs",
             "/doctor",
             "/stats",
+            "/evolution",
             "/pairing",
             "/update",
             "/sessions",

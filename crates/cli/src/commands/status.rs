@@ -82,6 +82,16 @@ pub(crate) fn run_status_xp() -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_status_evolution() -> Result<()> {
+    let db = borg_core::db::Database::open()?;
+    let output = borg_core::evolution::commands::dispatch(
+        borg_core::evolution::commands::EvolutionCommand::Evolution,
+        &db,
+    )?;
+    print!("{}", output.text);
+    Ok(())
+}
+
 pub(crate) fn run_status_archetypes() -> Result<()> {
     let config = borg_core::config::Config::load_from_db()?;
     if !config.evolution.enabled {

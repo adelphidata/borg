@@ -7,6 +7,7 @@ use anyhow::Result;
 use borg_core::config::CollaborationMode;
 
 use super::app::{App, AppAction, AppState};
+use super::status_popup::StatusTab;
 
 impl App<'_> {
     /// Try to handle `input` as a slash command. Returns `Some(action)` if it was a command,
@@ -26,7 +27,12 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/xp" => {
-                self.status_popup.show(&self.config);
+                self.status_popup.show_tab(&self.config, StatusTab::Xp);
+                return Some(Ok(AppAction::Continue));
+            }
+            "/evolution" => {
+                self.status_popup
+                    .show_tab(&self.config, StatusTab::Evolution);
                 return Some(Ok(AppAction::Continue));
             }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),

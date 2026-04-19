@@ -222,6 +222,8 @@ enum StatusAction {
     Archetypes,
     /// Show XP summary and recent feed
     Xp,
+    /// Show compact evolution overview with readiness and momentum
+    Evolution,
 }
 
 #[derive(Subcommand)]
@@ -605,6 +607,7 @@ async fn async_main() -> Result<()> {
             Some(StatusAction::History) => commands::status::run_status_history()?,
             Some(StatusAction::Archetypes) => commands::status::run_status_archetypes()?,
             Some(StatusAction::Xp) => commands::status::run_status_xp()?,
+            Some(StatusAction::Evolution) => commands::status::run_status_evolution()?,
         },
         Some(Commands::Bond { action }) => match action {
             Some(BondAction::History { count }) => commands::status::run_bond_history(count)?,

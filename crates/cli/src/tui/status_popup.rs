@@ -11,18 +11,75 @@ use borg_core::config::Config;
 use super::app::{AppAction, PopupHandler};
 use super::theme;
 
+/// Tabs available in the status popup.
+///
+/// Owned here because Stream B wires the tab navigation; other Phase-2
+/// streams add new tabs (already pre-declared here so cross-stream merges
+/// are additive). Each variant routes the body of the popup to a distinct
+/// content builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTab {
+    /// Combined dashboard — banner, evolution, vitals, bond, archetype, history.
+    Overview,
+    /// `/evolution` overview: stage, XP, archetype momentum, readiness, hints.
+    Evolution,
+    /// `/xp` feed and aggregates (filled in by Stream A).
+    Xp,
+    /// Standalone archetype score table.
+    ArchetypeScores,
+    /// Evolution history timeline.
+    History,
+}
+
+impl StatusTab {
+    /// Ordered tab list used for rendering and Left/Right cycling.
+    pub const ALL: [StatusTab; 5] = [
+        StatusTab::Overview,
+        StatusTab::Evolution,
+        StatusTab::Xp,
+        StatusTab::ArchetypeScores,
+        StatusTab::History,
+    ];
+
+    /// Short label shown in the tab bar.
+    fn label(self) -> &'static str {
+        match self {
+            StatusTab::Overview => "Overview",
+            StatusTab::Evolution => "Evolution",
+            StatusTab::Xp => "Xp",
+            StatusTab::ArchetypeScores => "Archetypes",
+            StatusTab::History => "History",
+        }
+    }
+
+    /// Advance one step in `ALL`, wrapping at the end.
+    fn next(self) -> StatusTab {
+        let idx = StatusTab::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        StatusTab::ALL[(idx + 1) % StatusTab::ALL.len()]
+    }
+
+    /// Retreat one step in `ALL`, wrapping at the start.
+    fn prev(self) -> StatusTab {
+        let idx = StatusTab::ALL.iter().position(|&t| t == self).unwrap_or(0);
+        let n = StatusTab::ALL.len();
+        StatusTab::ALL[(idx + n - 1) % n]
+    }
+}
+
 pub struct StatusPopup {
     visible: bool,
     scroll_offset: usize,
     lines: Vec<Line<'static>>,
-    /// Cached evolution state for rebuilding on resize.
+    /// Cached evolution state for rebuilding on resize (Overview tab only).
     evo_state: Option<borg_core::evolution::EvolutionState>,
-    /// Index in `lines` where the evolution section starts.
+    /// Index in `lines` where the evolution section starts (Overview tab only).
     evo_line_start: usize,
-    /// Number of lines the evolution section occupies.
+    /// Number of lines the evolution section occupies (Overview tab only).
     evo_line_count: usize,
     /// Last rendered inner width (for detecting resize).
     last_width: u16,
+    /// Which tab is currently displayed.
+    current_tab: StatusTab,
 }
 
 impl StatusPopup {
@@ -35,6 +92,7 @@ impl StatusPopup {
             evo_line_start: 0,
             evo_line_count: 0,
             last_width: 0,
+            current_tab: StatusTab::Overview,
         }
     }
 
@@ -42,11 +100,44 @@ impl StatusPopup {
         self.visible
     }
 
+    /// Read the currently-selected tab. Primarily for tests.
+    #[allow(dead_code)]
+    pub fn current_tab(&self) -> StatusTab {
+        self.current_tab
+    }
+
+    /// Open the popup on the default `Overview` tab.
     pub fn show(&mut self, config: &Config) {
+        self.current_tab = StatusTab::Overview;
+        self.reload(config);
+    }
+
+    /// Open the popup on a specific tab.
+    pub fn show_tab(&mut self, config: &Config, tab: StatusTab) {
+        self.current_tab = tab;
+        self.reload(config);
+    }
+
+    /// Rebuild the popup content for the current tab.
+    fn reload(&mut self, config: &Config) {
         self.visible = true;
         self.scroll_offset = 0;
         self.lines.clear();
+        self.evo_state = None;
+        self.evo_line_start = 0;
+        self.evo_line_count = 0;
+        self.last_width = 0;
 
+        match self.current_tab {
+            StatusTab::Overview => self.build_overview(config),
+            StatusTab::Evolution => self.build_evolution(),
+            StatusTab::Xp => self.build_xp(),
+            StatusTab::ArchetypeScores => self.build_archetype_scores(config),
+            StatusTab::History => self.build_history(config),
+        }
+    }
+
+    fn build_overview(&mut self, config: &Config) {
         let version = env!("CARGO_PKG_VERSION");
         let name = config.user.agent_name.as_deref().unwrap_or("Borg");
 
@@ -144,30 +235,136 @@ impl StatusPopup {
         }
     }
 
+    fn build_evolution(&mut self) {
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("status_popup: db open failed: {e}");
+                self.push_section("Database unavailable.");
+                return;
+            }
+        };
+        match borg_core::evolution::commands::dispatch(
+            borg_core::evolution::commands::EvolutionCommand::Evolution,
+            &db,
+        ) {
+            Ok(out) => self.push_section(&out.text),
+            Err(e) => {
+                tracing::warn!("status_popup: /evolution dispatch failed: {e}");
+                self.push_section("Evolution unavailable.");
+            }
+        }
+    }
+
+    fn build_xp(&mut self) {
+        // Stream A owns the XP tab renderer; until it lands, fall back to the
+        // shared dispatcher's stub output so users still see something useful.
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("status_popup: db open failed: {e}");
+                self.push_section("Database unavailable.");
+                return;
+            }
+        };
+        match borg_core::evolution::commands::dispatch(
+            borg_core::evolution::commands::EvolutionCommand::Xp,
+            &db,
+        ) {
+            Ok(out) => self.push_section(&out.text),
+            Err(e) => {
+                tracing::warn!("status_popup: /xp dispatch failed: {e}");
+                self.push_section("XP unavailable.");
+            }
+        }
+    }
+
+    fn build_archetype_scores(&mut self, config: &Config) {
+        if !config.evolution.enabled {
+            self.push_section("Evolution system is disabled.");
+            return;
+        }
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("status_popup: db open failed: {e}");
+                self.push_section("Database unavailable.");
+                return;
+            }
+        };
+        match db.get_evolution_state() {
+            Ok(state) => self.push_section(&borg_core::evolution::format_archetype_scores(&state)),
+            Err(e) => {
+                tracing::warn!("status_popup: evolution state unavailable: {e}");
+                self.push_section("Archetype scores unavailable.");
+            }
+        }
+    }
+
+    fn build_history(&mut self, config: &Config) {
+        if !config.evolution.enabled {
+            self.push_section("Evolution system is disabled.");
+            return;
+        }
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!("status_popup: db open failed: {e}");
+                self.push_section("Database unavailable.");
+                return;
+            }
+        };
+        match db.evolution_events_since(0) {
+            Ok(mut events) => {
+                events.reverse();
+                self.push_section(&borg_core::evolution::format_history(&events));
+            }
+            Err(e) => {
+                tracing::warn!("status_popup: history unavailable: {e}");
+                self.push_section("History unavailable.");
+            }
+        }
+    }
+
     pub fn dismiss(&mut self) {
         self.visible = false;
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent) {
+    pub fn handle_key(&mut self, key: KeyEvent) -> Option<StatusTab> {
         if !self.visible {
-            return;
+            return None;
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.dismiss(),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.dismiss();
+                None
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.current_tab = self.current_tab.prev();
+                Some(self.current_tab)
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.current_tab = self.current_tab.next();
+                Some(self.current_tab)
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                None
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
+                None
             }
             KeyCode::PageUp => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                None
             }
             KeyCode::PageDown => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -188,16 +385,28 @@ impl StatusPopup {
         let inner = block.inner(popup_area);
         frame.render_widget(block, popup_area);
 
-        if inner.height < 3 || inner.width < 10 {
+        if inner.height < 4 || inner.width < 10 {
             return;
         }
 
-        // Rebuild evolution card section if width changed
-        if inner.width != self.last_width {
-            self.last_width = inner.width;
+        // Tab bar along the top row of the inner area.
+        let tab_bar = Rect::new(inner.x, inner.y, inner.width, 1);
+        frame.render_widget(self.render_tab_bar(), tab_bar);
+
+        // Content area below the tab bar.
+        let content = Rect::new(
+            inner.x,
+            inner.y + 1,
+            inner.width,
+            inner.height.saturating_sub(1),
+        );
+
+        // Rebuild evolution card section if width changed (Overview only).
+        if self.current_tab == StatusTab::Overview && content.width != self.last_width {
+            self.last_width = content.width;
             let rebuilt = self.evo_state.as_ref().map(|evo| {
                 // Card width = inner width minus 2 chars indent on each side
-                let card_width = (inner.width as usize).saturating_sub(4);
+                let card_width = (content.width as usize).saturating_sub(4);
                 let section =
                     borg_core::evolution::format_status_section_with_width(evo, card_width);
                 section
@@ -214,22 +423,43 @@ impl StatusPopup {
             }
         }
 
-        let max_scroll = self.lines.len().saturating_sub(inner.height as usize);
+        let max_scroll = self.lines.len().saturating_sub(content.height as usize);
         let offset = self.scroll_offset.min(max_scroll);
 
         let paragraph = Paragraph::new(self.lines.clone()).scroll((offset as u16, 0));
 
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(paragraph, content);
 
         // Footer hint
         let footer_y = popup_area.y + popup_area.height.saturating_sub(1);
-        if popup_area.width > 20 {
-            let hint = " Esc: close  \u{2191}\u{2193}: scroll ";
+        if popup_area.width > 40 {
+            let hint = " Esc: close  \u{2190}\u{2192}: tabs  \u{2191}\u{2193}: scroll ";
             let hint_x = popup_area.x + 2;
             let hint_area = Rect::new(hint_x, footer_y, hint.len() as u16, 1);
             let hint_widget = Paragraph::new(Line::from(Span::styled(hint, theme::dim())));
             frame.render_widget(hint_widget, hint_area);
         }
+    }
+
+    /// Render the single-line tab bar with the active tab highlighted.
+    fn render_tab_bar(&self) -> Paragraph<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::styled("[ ", theme::dim()));
+        for (i, tab) in StatusTab::ALL.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" | ", theme::dim()));
+            }
+            let style = if *tab == self.current_tab {
+                Style::default()
+                    .fg(theme::CYAN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme::dim()
+            };
+            spans.push(Span::styled(tab.label().to_string(), style));
+        }
+        spans.push(Span::styled(" ]", theme::dim()));
+        Paragraph::new(Line::from(spans))
     }
 
     fn push_section(&mut self, text: &str) {
@@ -248,9 +478,12 @@ impl PopupHandler for StatusPopup {
     fn handle_key_event(
         &mut self,
         key: KeyEvent,
-        _config: &mut Config,
+        config: &mut Config,
     ) -> Result<Option<AppAction>> {
-        self.handle_key(key);
+        if let Some(_new_tab) = self.handle_key(key) {
+            // Rebuild content for the newly-selected tab.
+            self.reload(config);
+        }
         Ok(None)
     }
 }
@@ -263,6 +496,12 @@ mod tests {
     fn new_popup_not_visible() {
         let popup = StatusPopup::new();
         assert!(!popup.is_visible());
+    }
+
+    #[test]
+    fn default_tab_is_overview() {
+        let popup = StatusPopup::new();
+        assert_eq!(popup.current_tab(), StatusTab::Overview);
     }
 
     #[test]
@@ -348,5 +587,45 @@ mod tests {
         popup.handle_key(down);
         assert_eq!(popup.scroll_offset, 0);
         assert!(!popup.is_visible());
+    }
+
+    #[test]
+    fn right_arrow_cycles_tabs_forward() {
+        let mut popup = StatusPopup::new();
+        popup.visible = true;
+        assert_eq!(popup.current_tab(), StatusTab::Overview);
+        let right = KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::NONE);
+        let change = popup.handle_key(right);
+        assert_eq!(change, Some(StatusTab::Evolution));
+        assert_eq!(popup.current_tab(), StatusTab::Evolution);
+    }
+
+    #[test]
+    fn left_arrow_cycles_tabs_backward_with_wrap() {
+        let mut popup = StatusPopup::new();
+        popup.visible = true;
+        let left = KeyEvent::new(KeyCode::Left, crossterm::event::KeyModifiers::NONE);
+        let change = popup.handle_key(left);
+        // From Overview going left wraps to last tab (History).
+        assert_eq!(change, Some(StatusTab::History));
+        assert_eq!(popup.current_tab(), StatusTab::History);
+    }
+
+    #[test]
+    fn right_arrow_wraps_at_end() {
+        let mut popup = StatusPopup::new();
+        popup.visible = true;
+        popup.current_tab = StatusTab::History;
+        let right = KeyEvent::new(KeyCode::Right, crossterm::event::KeyModifiers::NONE);
+        popup.handle_key(right);
+        assert_eq!(popup.current_tab(), StatusTab::Overview);
+    }
+
+    #[test]
+    fn tab_next_prev_consistent() {
+        for tab in StatusTab::ALL {
+            assert_eq!(tab.next().prev(), tab);
+            assert_eq!(tab.prev().next(), tab);
+        }
     }
 }

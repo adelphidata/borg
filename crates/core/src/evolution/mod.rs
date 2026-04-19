@@ -22,7 +22,10 @@ pub use celebration::{
 pub use classification::*;
 pub use commands::{dispatch, parse, CommandOutput, EvolutionCommand};
 pub use feed::{recent_xp_feed, xp_summary, FeedEntry, FeedKind, XpSummary};
-pub use format::{format_xp_feed, format_xp_summary};
+pub use format::{
+    format_archetype_scores_with_momentum, format_evolution_overview, format_next_step_hints,
+    format_readiness, format_xp_feed, format_xp_summary,
+};
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
 pub use replay::*;
 

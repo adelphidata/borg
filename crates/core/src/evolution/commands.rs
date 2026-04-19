@@ -15,10 +15,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use super::{
-    format_archetype_scores, format_compact, format_status_section, format_xp_feed,
-    format_xp_summary, recent_xp_feed, xp_summary,
+    compute_mood, compute_readiness, format_compact, format_evolution_overview,
+    format_next_step_hints, format_xp_feed, format_xp_summary, next_step_hints, recent_xp_feed,
+    xp_summary,
 };
+use crate::bond;
 use crate::db::Database;
+use crate::vitals;
 
 /// A slash-command recognised by the evolution surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,10 +91,39 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
 
     match cmd {
         EvolutionCommand::Evolution => {
-            let mut text = String::new();
-            text.push_str(&format_status_section(&state));
-            text.push('\n');
-            text.push_str(&format_archetype_scores(&state));
+            // Load vitals + bond so mood, readiness, and hints can be
+            // derived. All three surfaces are lossy UX signals — fall back
+            // to baseline state on DB failure and log the reason instead of
+            // silently swallowing.
+            let now = chrono::Utc::now();
+            let vitals_state = match db.get_vitals_state() {
+                Ok(v) => vitals::apply_decay(&v, now),
+                Err(e) => {
+                    tracing::warn!("evolution: vitals unavailable, using baseline: {e}");
+                    vitals::baseline()
+                }
+            };
+            let bond_state = match db.get_all_bond_events() {
+                Ok(events) => {
+                    let key = db.derive_hmac_key(bond::BOND_HMAC_DOMAIN);
+                    bond::replay_events_with_key(&key, &events)
+                }
+                Err(e) => {
+                    tracing::warn!("evolution: bond events unavailable, using empty: {e}");
+                    bond::replay_events_with_key(&[], &[])
+                }
+            };
+
+            let mut state = state;
+            state.mood = Some(compute_mood(&state, &vitals_state, &bond_state));
+            state.readiness = compute_readiness(&state, &vitals_state, &bond_state);
+            let hints = next_step_hints(&state, &vitals_state, &bond_state);
+
+            let mut text = format_evolution_overview(&state);
+            if !hints.is_empty() {
+                text.push('\n');
+                text.push_str(&format_next_step_hints(&hints));
+            }
             Ok(CommandOutput {
                 text,
                 image_png: None,
