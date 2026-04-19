@@ -11,19 +11,15 @@ use borg_core::config::Config;
 use super::app::{AppAction, PopupHandler};
 use super::theme;
 
-/// Tabs available in the status popup.
-///
-/// Owned here because Stream B wires the tab navigation; other Phase-2
-/// streams add new tabs (already pre-declared here so cross-stream merges
-/// are additive). Each variant routes the body of the popup to a distinct
-/// content builder.
+/// Tabs available in the status popup. Each variant routes the body of the
+/// popup to a distinct content builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTab {
     /// Combined dashboard — banner, evolution, vitals, bond, archetype, history.
     Overview,
     /// `/evolution` overview: stage, XP, archetype momentum, readiness, hints.
     Evolution,
-    /// `/xp` feed and aggregates (filled in by Stream A).
+    /// `/xp` feed and aggregates.
     Xp,
     /// Standalone archetype score table.
     ArchetypeScores,
@@ -257,8 +253,6 @@ impl StatusPopup {
     }
 
     fn build_xp(&mut self) {
-        // Stream A owns the XP tab renderer; until it lands, fall back to the
-        // shared dispatcher's stub output so users still see something useful.
         let db = match borg_core::db::Database::open() {
             Ok(db) => db,
             Err(e) => {
