@@ -522,8 +522,6 @@ mod tests {
         );
     }
 
-    // ── Ambient header formatting (Stream C) ──
-
     use super::super::AmbientStatus;
     use borg_core::evolution::{Archetype, Mood};
 

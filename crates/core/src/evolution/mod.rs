@@ -1087,15 +1087,6 @@ impl EvolutionHook {
         }
     }
 
-    // ── Mood transition detection (Stream C) ──
-    //
-    // Stream D also hooks into `AfterToolCall` to detect milestones. Both
-    // sit in `execute` alongside the XP recording; structure the helpers so
-    // they can run sequentially without stepping on each other:
-    //   1. XP + evolution gating (existing `record_xp` / `attempt_evolution`)
-    //   2. Mood transition detection (this helper)
-    //   3. Milestone detection (Stream D)
-
     /// Snapshot the current `Mood` by opening the DB and replaying vitals +
     /// bond + evolution state. Returns `None` if any load fails — callers
     /// treat that as "no transition to emit".
@@ -1199,12 +1190,9 @@ impl Hook for EvolutionHook {
                         BASE_XP_TOOL_SUCCESS + bonus
                     };
 
-                    // ── 1. XP + evolution gating ──
                     let mood_before = self.snapshot_mood();
                     self.record_xp(name, archetype, xp);
 
-                    // ── 2. Mood transition detection (Stream C) ──
-                    // Stream D's milestone detection goes after this block.
                     if let Some(before) = mood_before {
                         if let Some(after) = self.snapshot_mood() {
                             if before != after {
@@ -3405,8 +3393,6 @@ mod tests {
             other => panic!("expected InjectContext, got {other:?}"),
         }
     }
-
-    // ── Mood transitions (Stream C) ──
 
     fn mk_bond_for_mood(score: u8) -> crate::bond::BondState {
         use crate::bond::{AutonomyTier, BondLevel, BondState};
