@@ -477,7 +477,7 @@ impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_context_tokens: 4000,
+            max_context_tokens: constants::SKILLS_MAX_CONTEXT_TOKENS,
             entries: HashMap::new(),
         }
     }

@@ -10,6 +10,11 @@ use std::time::Duration;
 /// Max tokens for tool output before truncation (head + tail preserved).
 pub const TOOL_OUTPUT_MAX_TOKENS: usize = 4000;
 
+/// Token budget for skill metadata + instruction context in the system
+/// prompt. Default cap for `SkillsConfig::max_context_tokens`; also the
+/// threshold asserted by the built-in skills metadata test.
+pub const SKILLS_MAX_CONTEXT_TOKENS: usize = 4000;
+
 /// Tokens reserved for the compaction summary marker.
 pub const COMPACTION_MARKER_TOKENS: usize = 200;
 

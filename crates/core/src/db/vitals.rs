@@ -577,6 +577,26 @@ impl Database {
             ));
         }
 
+        // Semantic validation: `evolution` rows drive stage transitions. Replay
+        // rejects rows without `gates_verified=true` (see replay.rs), so fail
+        // loudly at the write path instead of silently dropping later.
+        if event_type == "evolution" {
+            let meta_str = metadata.ok_or_else(|| {
+                anyhow::anyhow!("evolution event requires metadata.gates_verified = true")
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(meta_str)
+                .map_err(|e| anyhow::anyhow!("evolution event metadata is not valid JSON: {e}"))?;
+            if parsed
+                .get("gates_verified")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return Err(anyhow::anyhow!(
+                    "evolution event requires metadata.gates_verified = true"
+                ));
+            }
+        }
+
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
 
         let result = (|| -> Result<()> {

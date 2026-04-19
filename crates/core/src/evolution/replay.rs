@@ -5,31 +5,57 @@ use std::collections::HashMap;
 use crate::hmac_chain;
 
 use super::{
-    dominant_archetype, evolution_gates_verified, level_from_xp, rate_limit_for, verify_event_hmac,
-    Archetype, EvolutionEvent, EvolutionState, Stage,
+    evolution_gates_verified, level_from_xp, rate_limit_for, verify_event_hmac, Archetype,
+    EvolutionEvent, EvolutionState, Stage,
 };
 
 #[cfg(test)]
 use super::EVOLUTION_HMAC_LEGACY;
 
+/// 30-day window in seconds used for time-weighted archetype scoring.
+pub(crate) const WINDOW_30D_SECS: i64 = 30 * 86_400;
+
+/// Weighting: recent activity (last 30d) steers specialization more than lifetime sum.
+/// Matches `docs/evolution.md#archetype-scoring`.
+pub(crate) const LIFETIME_WEIGHT: f64 = 0.35;
+pub(crate) const LAST_30D_WEIGHT: f64 = 0.65;
+
 /// Replay verified events from baseline to compute current evolution state.
 /// Verifies HMAC chain and applies rate limits per event type per hour.
 #[cfg(test)]
 pub fn replay_events(events: &[EvolutionEvent]) -> EvolutionState {
-    replay_events_with_key(EVOLUTION_HMAC_LEGACY, events)
+    replay_events_with_key_at(
+        EVOLUTION_HMAC_LEGACY,
+        events,
+        chrono::Utc::now().timestamp(),
+    )
 }
 
-/// Replay events with a specific HMAC key (for per-installation derived keys).
+/// Replay events with a specific HMAC key. Uses `Utc::now()` for the 30-day window —
+/// callers that need determinism (tests) should use [`replay_events_with_key_at`].
 pub fn replay_events_with_key(key: &[u8], events: &[EvolutionEvent]) -> EvolutionState {
+    replay_events_with_key_at(key, events, chrono::Utc::now().timestamp())
+}
+
+/// Replay events with an explicit `now_ts` reference point for time-weighted scoring.
+pub fn replay_events_with_key_at(
+    key: &[u8],
+    events: &[EvolutionEvent],
+    now_ts: i64,
+) -> EvolutionState {
     let mut stage = Stage::Base;
     let mut total_xp: u32 = 0;
-    let mut archetype_scores: HashMap<Archetype, u32> = HashMap::new();
+    let mut lifetime_scores: HashMap<Archetype, u32> = HashMap::new();
+    let mut last_30d_scores: HashMap<Archetype, u32> = HashMap::new();
     let mut evolution_name: Option<String> = None;
     let mut evolution_description: Option<String> = None;
     let mut chain_valid = true;
     let mut expected_prev_hmac = "0".to_string();
     let mut accepted_events: u32 = 0;
     let mut rate_limiter = hmac_chain::HourlyRateLimiter::new(None, None);
+    let mut dominant_history: Vec<(i64, Archetype)> = Vec::new();
+    let mut last_dominant: Option<Archetype> = None;
+    let cutoff_30d = now_ts - WINDOW_30D_SECS;
 
     for event in events {
         // Verify HMAC chain
@@ -74,12 +100,23 @@ pub fn replay_events_with_key(key: &[u8], events: &[EvolutionEvent]) -> Evolutio
                 let effective_xp =
                     (event.xp_delta.max(0) as f64 * source_multiplier).floor() as u32;
                 total_xp = total_xp.saturating_add(effective_xp);
-                // Update archetype score with decayed XP
                 if let Some(ref arch_str) = event.archetype {
                     if let Some(arch) = Archetype::parse(arch_str) {
-                        let score = archetype_scores.entry(arch).or_insert(0);
-                        *score = score.saturating_add(effective_xp);
+                        let lt = lifetime_scores.entry(arch).or_insert(0);
+                        *lt = lt.saturating_add(effective_xp);
+                        if event.created_at >= cutoff_30d {
+                            let rec = last_30d_scores.entry(arch).or_insert(0);
+                            *rec = rec.saturating_add(effective_xp);
+                        }
                     }
+                }
+                // Track dominant shifts based on current *effective* scores.
+                let current_dominant = dominant_from_effective(&lifetime_scores, &last_30d_scores);
+                if current_dominant.is_some() && current_dominant != last_dominant {
+                    if let Some(arch) = current_dominant {
+                        dominant_history.push((event.created_at, arch));
+                    }
+                    last_dominant = current_dominant;
                 }
             }
             "evolution" => {
@@ -91,7 +128,6 @@ pub fn replay_events_with_key(key: &[u8], events: &[EvolutionEvent]) -> Evolutio
                     Stage::Final => Stage::Final, // already max
                 };
                 total_xp = 0;
-                // Extract name and description from metadata
                 if let Some(ref meta) = event.metadata_json {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta) {
                         if let Some(name) = parsed.get("name").and_then(|v| v.as_str()) {
@@ -103,25 +139,82 @@ pub fn replay_events_with_key(key: &[u8], events: &[EvolutionEvent]) -> Evolutio
                     }
                 }
             }
-            "classification" | "archetype_shift" => {
-                // Informational — metadata may update dominant archetype tracking
+            "classification" => {
+                // LLM-generated (or fallback) naming arrives as a follow-up
+                // `classification` event after the stage transition. It may
+                // also arrive standalone (source="llm_naming"). Metadata is
+                // strict JSON with optional `name` / `description`.
+                if let Some(ref meta) = event.metadata_json {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta) {
+                        if let Some(name) = parsed.get("name").and_then(|v| v.as_str()) {
+                            evolution_name = Some(name.to_string());
+                        }
+                        if let Some(desc) = parsed.get("description").and_then(|v| v.as_str()) {
+                            evolution_description = Some(desc.to_string());
+                        }
+                    }
+                }
+            }
+            "archetype_shift" => {
+                // Informational.
             }
             _ => {}
         }
     }
 
     let (level, xp_to_next) = level_from_xp(&stage, total_xp);
+    let effective_scores = effective_scores_map(&lifetime_scores, &last_30d_scores);
+    let dominant = dominant_from_effective(&lifetime_scores, &last_30d_scores);
 
     EvolutionState {
         stage,
         level,
         total_xp,
         xp_to_next_level: xp_to_next,
-        dominant_archetype: dominant_archetype(&archetype_scores),
+        dominant_archetype: dominant,
         evolution_name,
         evolution_description,
-        archetype_scores,
+        archetype_scores: effective_scores,
+        lifetime_scores,
+        last_30d_scores,
+        dominant_history,
         total_events: accepted_events,
         chain_valid,
     }
+}
+
+/// Combine lifetime and last-30d scores into the weighted effective map (rounded u32).
+pub(crate) fn effective_scores_map(
+    lifetime: &HashMap<Archetype, u32>,
+    last_30d: &HashMap<Archetype, u32>,
+) -> HashMap<Archetype, u32> {
+    let mut out = HashMap::new();
+    for (arch, lt) in lifetime {
+        let rec = last_30d.get(arch).copied().unwrap_or(0);
+        let eff = (*lt as f64) * LIFETIME_WEIGHT + (rec as f64) * LAST_30D_WEIGHT;
+        out.insert(*arch, eff.round() as u32);
+    }
+    // Include archetypes that appear only in last_30d (possible if lifetime overflowed,
+    // though u32::saturating_add makes this unlikely).
+    for (arch, rec) in last_30d {
+        out.entry(*arch)
+            .or_insert_with(|| ((*rec as f64) * LAST_30D_WEIGHT).round() as u32);
+    }
+    out
+}
+
+/// Pick the archetype with the highest effective score. Returns `None` if all scores are 0.
+pub(crate) fn dominant_from_effective(
+    lifetime: &HashMap<Archetype, u32>,
+    last_30d: &HashMap<Archetype, u32>,
+) -> Option<Archetype> {
+    let effective = effective_scores_map(lifetime, last_30d);
+    effective
+        .into_iter()
+        .filter(|(_, score)| *score > 0)
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+        })
+        .map(|(arch, _)| arch)
 }

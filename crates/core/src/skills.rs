@@ -1194,14 +1194,15 @@ Short body.
             });
         }
 
-        // All metadata should be under 4000 tokens
+        // All metadata should fit under the skills context budget.
         let total_meta_tokens: usize = skills
             .iter()
             .map(|s| estimate_tokens(&s.format_at_level(SkillLoadLevel::Metadata)))
             .sum();
         assert!(
-            total_meta_tokens < 4000,
-            "50 skill metadata = {total_meta_tokens} tokens"
+            total_meta_tokens < crate::constants::SKILLS_MAX_CONTEXT_TOKENS,
+            "50 skill metadata = {total_meta_tokens} tokens (budget: {})",
+            crate::constants::SKILLS_MAX_CONTEXT_TOKENS,
         );
     }
 

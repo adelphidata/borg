@@ -289,14 +289,24 @@ pub struct EvolutionState {
     pub total_xp: u32,
     /// XP remaining to reach the next level.
     pub xp_to_next_level: u32,
-    /// Archetype with the highest accumulated score.
+    /// Archetype with the highest *effective* score (see `archetype_scores`).
     pub dominant_archetype: Option<Archetype>,
     /// LLM-generated evolution name (set on stage transition).
     pub evolution_name: Option<String>,
     /// LLM-generated evolution description (set on stage transition).
     pub evolution_description: Option<String>,
-    /// Accumulated XP score per archetype.
+    /// Effective XP score per archetype, computed as
+    /// `lifetime * 0.35 + last_30d * 0.65` and rounded to u32.
+    /// This is what drives dominant-archetype selection and the 1.3× gate.
     pub archetype_scores: HashMap<Archetype, u32>,
+    /// Raw lifetime score per archetype (all verified xp_gain events).
+    pub lifetime_scores: HashMap<Archetype, u32>,
+    /// Raw score from events within the last 30 days (per `now_ts` passed at replay).
+    pub last_30d_scores: HashMap<Archetype, u32>,
+    /// Ordered log of (unix_ts, dominant_archetype) shifts observed during replay.
+    /// Last entry's timestamp is when the current dominant became dominant —
+    /// used to compute archetype-stability for Stage 2→3 gate.
+    pub dominant_history: Vec<(i64, Archetype)>,
     /// Number of verified events that were accepted during replay.
     pub total_events: u32,
     /// Whether the HMAC chain is intact across all replayed events.
@@ -345,7 +355,10 @@ fn evolution_gates_verified(event: &EvolutionEvent) -> bool {
         .unwrap_or(false)
 }
 
-/// Find the dominant archetype (highest score).
+/// Find the dominant archetype (highest score). Only used by test fixtures —
+/// production replay uses `replay::dominant_from_effective` against the
+/// time-weighted effective scores.
+#[cfg(test)]
 fn dominant_archetype(scores: &HashMap<Archetype, u32>) -> Option<Archetype> {
     scores
         .iter()
@@ -414,39 +427,22 @@ pub fn check_stage2_gates(
 
 /// Compute how many consecutive days the dominant archetype has been stable.
 pub fn compute_archetype_stable_days(db: &Database) -> u32 {
-    let events = match db.load_all_evolution_events() {
-        Ok(events) => events,
+    // Delegates to the trusted replay so the Stage 2→3 gate evaluates against
+    // the same archetype timeline that produced the dominant archetype. The
+    // previous parallel walker bypassed HMAC verification, rate-limiting, and
+    // source decay — it could disagree with `get_evolution_state()`.
+    let state = match db.get_evolution_state() {
+        Ok(s) => s,
         Err(e) => {
-            tracing::warn!("evolution: failed to load events: {e}");
+            tracing::warn!("evolution: failed to get evolution state: {e}");
             return 0;
         }
     };
-    if events.is_empty() {
+    let Some((shift_ts, _)) = state.dominant_history.last() else {
         return 0;
-    }
-
-    let mut scores: HashMap<Archetype, u32> = HashMap::new();
-    let mut last_dominant: Option<Archetype> = None;
-    let mut stable_since: i64 = events.first().map(|e| e.created_at).unwrap_or(0);
-
-    for event in &events {
-        if event.event_type == "xp_gain" {
-            if let Some(ref arch_str) = event.archetype {
-                if let Some(arch) = Archetype::parse(arch_str) {
-                    let score = scores.entry(arch).or_insert(0);
-                    *score = score.saturating_add(event.xp_delta.max(0) as u32);
-                }
-            }
-        }
-        let current_dominant = scores.iter().max_by_key(|(_, &v)| v).map(|(&k, _)| k);
-        if current_dominant != last_dominant && current_dominant.is_some() {
-            stable_since = event.created_at;
-            last_dominant = current_dominant;
-        }
-    }
-
+    };
     let now = chrono::Utc::now().timestamp();
-    let seconds = (now - stable_since).max(0) as u64;
+    let seconds = (now - shift_ts).max(0) as u64;
     (seconds / 86400) as u32
 }
 
@@ -856,20 +852,57 @@ fn capitalize_first(s: &str) -> String {
     }
 }
 
+/// Bucket recent xp_gain events by source and return the top-N descending.
+/// Used to personalize the LLM naming prompt with the tools the agent actually uses.
+fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>> {
+    let events = db.load_all_evolution_events()?;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for e in &events {
+        if e.event_type == "xp_gain" {
+            *counts.entry(e.source.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut sorted: Vec<(String, u32)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.truncate(5);
+    Ok(sorted)
+}
+
 // ── EvolutionHook ──
 
 /// Lifecycle hook that passively records evolution XP events and injects context.
 pub struct EvolutionHook {
     /// Database handle wrapped in a Mutex for thread-safety.
     db: std::sync::Mutex<Database>,
+    /// Cached `evolution.enabled` flag. Read once at construction; toggling the
+    /// setting takes effect on the next session (no hot reload).
+    enabled: bool,
+    /// Handle to the tokio runtime for spawning the async naming task, if one
+    /// is active at construction time. `None` in pure-sync contexts (some tests).
+    rt: Option<tokio::runtime::Handle>,
 }
 
 impl EvolutionHook {
     /// Create a new evolution hook, opening a database connection.
     pub fn new() -> anyhow::Result<Self> {
+        let enabled = crate::config::Config::load_from_db()
+            .map(|c| c.evolution.enabled)
+            .unwrap_or(true);
         Ok(Self {
             db: std::sync::Mutex::new(Database::open()?),
+            enabled,
+            rt: tokio::runtime::Handle::try_current().ok(),
         })
+    }
+
+    /// Construct a hook with explicit overrides — test seam.
+    #[cfg(test)]
+    pub fn new_with(db: Database, enabled: bool) -> Self {
+        Self {
+            db: std::sync::Mutex::new(db),
+            enabled,
+            rt: tokio::runtime::Handle::try_current().ok(),
+        }
     }
 
     fn record_xp(&self, source: &str, archetype: Option<Archetype>, xp: i32) {
@@ -967,43 +1000,117 @@ impl EvolutionHook {
             return;
         }
 
-        let metadata = serde_json::json!({ "gates_verified": true }).to_string();
+        let metadata =
+            serde_json::json!({ "gates_verified": true, "pending_name": true }).to_string();
         if let Err(e) =
             db.record_evolution_event("evolution", 0, None, "gate_check", Some(&metadata))
         {
             tracing::warn!("evolution: failed to record evolution event: {e}");
-        } else {
-            tracing::info!("evolution: stage transition triggered — gates verified");
+            return;
+        }
+        tracing::info!("evolution: stage transition triggered — gates verified");
 
-            // Record a pending celebration for async channel delivery
-            let to_stage = match evo_state.stage {
-                Stage::Base => "evolved",
-                Stage::Evolved => "final",
-                Stage::Final => "final",
+        // Kick off async LLM naming. The stage transition has already been
+        // recorded, so the replay reports the new stage immediately; the
+        // generated name lands later as a `classification` event that replay
+        // folds into `evolution_name` / `evolution_description`.
+        let new_stage = match evo_state.stage {
+            Stage::Base => Stage::Evolved,
+            Stage::Evolved => Stage::Final,
+            Stage::Final => Stage::Final,
+        };
+        self.spawn_evolution_naming(new_stage, evo_state.dominant_archetype);
+
+        let to_stage = match evo_state.stage {
+            Stage::Base => "evolved",
+            Stage::Evolved => "final",
+            Stage::Final => "final",
+        };
+        let celebration = CelebrationPayload {
+            from_stage: evo_state.stage.to_string(),
+            to_stage: to_stage.to_string(),
+            evolution_name: evo_state.evolution_name.clone(),
+            evolution_description: evo_state.evolution_description.clone(),
+            dominant_archetype: evo_state.dominant_archetype.map(|a| a.to_string()),
+            bond_score: bond_state.score,
+            stability: vitals_state.stability,
+            focus: vitals_state.focus,
+            sync_stat: vitals_state.sync,
+            growth: vitals_state.growth,
+            happiness: vitals_state.happiness,
+        };
+        match serde_json::to_string(&celebration) {
+            Ok(payload_json) => {
+                if let Err(e) = db.insert_pending_celebration("evolution", &payload_json) {
+                    tracing::warn!("evolution: failed to insert pending celebration: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("evolution: failed to serialize celebration payload: {e}");
+            }
+        }
+    }
+
+    /// Spawn a detached task to generate an evolution name + description.
+    /// Falls back to a deterministic name on any error. No-op if no tokio
+    /// runtime is available (e.g. pure-sync test context).
+    fn spawn_evolution_naming(&self, new_stage: Stage, archetype: Option<Archetype>) {
+        let Some(rt) = self.rt.clone() else {
+            // No runtime: record the fallback synchronously via a blocking DB call.
+            let (name, description) = classification::fallback_evolution_name(archetype, new_stage);
+            self.record_naming_event(archetype, &name, &description);
+            return;
+        };
+        // Compute top tools under the already-held DB lock would deadlock; do
+        // it lazily inside the task with a fresh Database::open().
+        let archetype_copy = archetype;
+        rt.spawn(async move {
+            let top_tools = match Database::open() {
+                Ok(db) => top_sources_from_db(&db).unwrap_or_default(),
+                Err(_) => Vec::new(),
             };
-            let celebration = CelebrationPayload {
-                from_stage: evo_state.stage.to_string(),
-                to_stage: to_stage.to_string(),
-                evolution_name: evo_state.evolution_name.clone(),
-                evolution_description: evo_state.evolution_description.clone(),
-                dominant_archetype: evo_state.dominant_archetype.map(|a| a.to_string()),
-                bond_score: bond_state.score,
-                stability: vitals_state.stability,
-                focus: vitals_state.focus,
-                sync_stat: vitals_state.sync,
-                growth: vitals_state.growth,
-                happiness: vitals_state.happiness,
-            };
-            match serde_json::to_string(&celebration) {
-                Ok(payload_json) => {
-                    if let Err(e) = db.insert_pending_celebration("evolution", &payload_json) {
-                        tracing::warn!("evolution: failed to insert pending celebration: {e}");
+            let (name, description) =
+                classification::generate_evolution_name(archetype_copy, new_stage, &top_tools)
+                    .await;
+            // Open a fresh DB handle inside the async task (original hook DB is behind a Mutex).
+            match Database::open() {
+                Ok(db) => {
+                    let arch_str = archetype_copy.map(|a| a.to_string());
+                    let metadata =
+                        serde_json::json!({ "name": name, "description": description }).to_string();
+                    if let Err(e) = db.record_evolution_event(
+                        "classification",
+                        0,
+                        arch_str.as_deref(),
+                        "llm_naming",
+                        Some(&metadata),
+                    ) {
+                        tracing::warn!("evolution: failed to record naming event: {e}");
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("evolution: failed to serialize celebration payload: {e}");
+                    tracing::warn!("evolution: failed to open DB for naming event: {e}");
                 }
             }
+        });
+    }
+
+    /// Synchronous naming record — used when no tokio runtime is available.
+    fn record_naming_event(&self, archetype: Option<Archetype>, name: &str, description: &str) {
+        let Ok(db) = self.db.lock() else {
+            tracing::warn!("evolution: mutex poisoned, skipping naming event");
+            return;
+        };
+        let arch_str = archetype.map(|a| a.to_string());
+        let metadata = serde_json::json!({ "name": name, "description": description }).to_string();
+        if let Err(e) = db.record_evolution_event(
+            "classification",
+            0,
+            arch_str.as_deref(),
+            "llm_naming",
+            Some(&metadata),
+        ) {
+            tracing::warn!("evolution: failed to record naming event: {e}");
         }
     }
 
@@ -1033,6 +1140,9 @@ impl Hook for EvolutionHook {
     }
 
     fn execute(&self, ctx: &HookContext) -> HookAction {
+        if !self.enabled {
+            return HookAction::Continue;
+        }
         match &ctx.data {
             HookData::SessionStart { .. } => {
                 // Record interaction XP
@@ -1419,7 +1529,8 @@ mod tests {
         let state = replay_events(&[e1, e2]);
         assert_eq!(state.total_xp, 6);
         assert_eq!(state.dominant_archetype, Some(Archetype::Ops));
-        assert_eq!(*state.archetype_scores.get(&Archetype::Ops).unwrap(), 6);
+        // Lifetime carries the raw accumulation independent of the 30-day window.
+        assert_eq!(*state.lifetime_scores.get(&Archetype::Ops).unwrap(), 6);
     }
 
     #[test]
@@ -1643,7 +1754,12 @@ mod tests {
             dominant_archetype: dominant_archetype(&archetype_scores),
             evolution_name: None,
             evolution_description: None,
+            // Treat the seeded scores as lifetime for gate tests; effective
+            // computation will preserve the ordering because last_30d is empty.
+            lifetime_scores: archetype_scores.clone(),
+            last_30d_scores: HashMap::new(),
             archetype_scores,
+            dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
         }
@@ -1728,6 +1844,9 @@ mod tests {
             evolution_name: Some("Pipeline Warden".to_string()),
             evolution_description: Some("A vigilant guardian".to_string()),
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
         };
@@ -1748,6 +1867,9 @@ mod tests {
             evolution_name: Some("Pipeline Warden".to_string()),
             evolution_description: Some("A vigilant guardian".to_string()),
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
         };
@@ -1772,6 +1894,9 @@ mod tests {
                 m.insert(Archetype::Ops, 74);
                 m
             },
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
         };
@@ -1928,6 +2053,9 @@ mod tests {
             evolution_name: None,
             evolution_description: None,
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 10,
             chain_valid: true,
         };
@@ -1951,6 +2079,9 @@ mod tests {
             evolution_name: Some("Pipeline Warden".to_string()),
             evolution_description: Some("A vigilant guardian".to_string()),
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 100,
             chain_valid: true,
         };
@@ -1975,6 +2106,9 @@ mod tests {
             evolution_name: Some("Test".to_string()),
             evolution_description: None,
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 10,
             chain_valid: true,
         };
@@ -1995,6 +2129,9 @@ mod tests {
             evolution_name: None,
             evolution_description: None,
             archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
             total_events: 1,
             chain_valid: true,
         };
@@ -2644,5 +2781,457 @@ mod tests {
         );
         assert_eq!(deserialized.bond_score, 45);
         assert_eq!(deserialized.stability, 85);
+    }
+
+    // ── Time-weighted scoring and dominant_history ──
+
+    /// Helper: build an xp_gain event with explicit metadata.
+    #[allow(clippy::too_many_arguments)]
+    fn make_event_with_meta(
+        id: i64,
+        event_type: &str,
+        xp_delta: i32,
+        archetype: Option<&str>,
+        source: &str,
+        created_at: i64,
+        prev_hmac: &str,
+        metadata: Option<&str>,
+    ) -> EvolutionEvent {
+        let hmac = compute_event_hmac(
+            EVOLUTION_HMAC_LEGACY,
+            prev_hmac,
+            event_type,
+            xp_delta,
+            archetype.unwrap_or(""),
+            source,
+            metadata.unwrap_or(""),
+            created_at,
+        );
+        EvolutionEvent {
+            id,
+            event_type: event_type.to_string(),
+            xp_delta,
+            archetype: archetype.map(|s| s.to_string()),
+            source: source.to_string(),
+            metadata_json: metadata.map(|s| s.to_string()),
+            created_at,
+            hmac,
+            prev_hmac: prev_hmac.to_string(),
+        }
+    }
+
+    #[test]
+    fn time_weighted_scoring_prefers_recent_when_in_window() {
+        // Ops dominates lifetime (12 old events), Builder dominates last 30d (3 recent events).
+        // With weights 0.35/0.65, effective should favor Builder.
+        let now = 1_700_000_000i64;
+        let old_ts = now - 90 * 86_400; // way outside 30d window
+        let recent_ts = now - 5 * 86_400;
+
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        // 12 Ops events with distinct sources far in the past
+        for i in 0..12 {
+            let e = make_event(
+                i + 1,
+                "xp_gain",
+                1,
+                Some("ops"),
+                &format!("op_src_{i}"),
+                old_ts + i * 60,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        // 3 Builder events recently
+        for i in 0..3 {
+            let e = make_event(
+                100 + i,
+                "xp_gain",
+                3,
+                Some("builder"),
+                &format!("bld_src_{i}"),
+                recent_ts + i * 60,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+        // Builder: lifetime=9, last_30d=9 → effective = 9*0.35 + 9*0.65 = 9
+        // Ops: lifetime=12, last_30d=0 → effective = 12*0.35 = 4.2 → 4
+        assert_eq!(state.dominant_archetype, Some(Archetype::Builder));
+        assert_eq!(*state.lifetime_scores.get(&Archetype::Ops).unwrap(), 12);
+        assert_eq!(state.last_30d_scores.get(&Archetype::Ops), None);
+        assert_eq!(*state.lifetime_scores.get(&Archetype::Builder).unwrap(), 9);
+    }
+
+    #[test]
+    fn time_weighted_scoring_reverts_when_window_shifts_out() {
+        // Same as above, but now_ts is moved forward so even the "recent" Builder events fall
+        // outside the 30-day window. Lifetime should dominate: Ops wins.
+        let original_now = 1_700_000_000i64;
+        let old_ts = original_now - 90 * 86_400;
+        let recent_ts = original_now - 5 * 86_400;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..12 {
+            let e = make_event(
+                i + 1,
+                "xp_gain",
+                1,
+                Some("ops"),
+                &format!("op_src_{i}"),
+                old_ts + i * 60,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        for i in 0..3 {
+            let e = make_event(
+                100 + i,
+                "xp_gain",
+                3,
+                Some("builder"),
+                &format!("bld_src_{i}"),
+                recent_ts + i * 60,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        // Shift forward 60 days → nothing is within last 30d
+        let future_now = original_now + 60 * 86_400;
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, future_now);
+        assert_eq!(state.dominant_archetype, Some(Archetype::Ops));
+        // last_30d is empty for both archetypes
+        assert!(state.last_30d_scores.is_empty());
+    }
+
+    #[test]
+    fn dominant_history_records_shifts() {
+        let now = 1_700_000_000i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        // 3 Ops events (becomes dominant at first event)
+        for i in 0..3 {
+            let ts = now - (60 - i as i64) * 86_400;
+            let e = make_event(
+                i + 1,
+                "xp_gain",
+                3,
+                Some("ops"),
+                &format!("op_{i}"),
+                ts,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        // Now a burst of Builder events that should eventually flip dominance
+        for i in 0..10 {
+            let ts = now - (30 - i as i64) * 86_400;
+            let e = make_event(
+                100 + i,
+                "xp_gain",
+                3,
+                Some("builder"),
+                &format!("bld_{i}"),
+                ts,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+        assert!(
+            state.dominant_history.len() >= 2,
+            "expected at least one shift, got {:?}",
+            state.dominant_history
+        );
+        assert_eq!(state.dominant_history.first().unwrap().1, Archetype::Ops);
+        assert_eq!(state.dominant_history.last().unwrap().1, Archetype::Builder);
+    }
+
+    #[test]
+    fn classification_event_sets_evolution_name() {
+        // Seed enough xp to allow the evolution event to advance stage, then
+        // follow with a classification event carrying the LLM-generated name.
+        let now = 1_700_000_000i64;
+        let e1 = make_event(1, "xp_gain", 3, Some("ops"), "run_shell", now - 86_400, "0");
+        let evo_meta = r#"{"gates_verified":true,"pending_name":true}"#;
+        let e2 = make_event_with_meta(
+            2,
+            "evolution",
+            0,
+            None,
+            "gate_check",
+            now - 86_000,
+            &e1.hmac,
+            Some(evo_meta),
+        );
+        let class_meta = r#"{"name":"Tool Forgemaster","description":"A restless builder."}"#;
+        let e3 = make_event_with_meta(
+            3,
+            "classification",
+            0,
+            Some("builder"),
+            "llm_naming",
+            now - 85_000,
+            &e2.hmac,
+            Some(class_meta),
+        );
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &[e1, e2, e3], now);
+        assert_eq!(state.stage, Stage::Evolved);
+        assert_eq!(state.evolution_name.as_deref(), Some("Tool Forgemaster"));
+        assert_eq!(
+            state.evolution_description.as_deref(),
+            Some("A restless builder.")
+        );
+    }
+
+    #[test]
+    fn classification_does_not_advance_stage() {
+        // Classification events carry names but must not trigger a stage change.
+        let now = 1_700_000_000i64;
+        let class_meta = r#"{"name":"Name","description":"Desc"}"#;
+        let e1 = make_event_with_meta(
+            1,
+            "classification",
+            0,
+            Some("ops"),
+            "llm_naming",
+            now - 1000,
+            "0",
+            Some(class_meta),
+        );
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &[e1], now);
+        assert_eq!(state.stage, Stage::Base);
+        assert_eq!(state.evolution_name.as_deref(), Some("Name"));
+    }
+
+    #[test]
+    fn source_decay_contract_holds() {
+        // 4 same-source xp_gain events with xp_delta=2 in a single hour:
+        // decay multipliers 1.0, 1.0, 0.5, 0.25 → effective = 2+2+1+0 = 5.
+        let now = 1_700_000_000i64;
+        let mut events = Vec::new();
+        let mut prev = "0".to_string();
+        for i in 0..4 {
+            let e = make_event(
+                i + 1,
+                "xp_gain",
+                2,
+                Some("ops"),
+                "same_src",
+                now - 3_000 + i * 10,
+                &prev,
+            );
+            prev = e.hmac.clone();
+            events.push(e);
+        }
+        let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
+        assert_eq!(state.total_xp, 5, "decay contract: 2+2+1+0 = 5");
+    }
+
+    // ── Archetype stability via trusted replay ──
+
+    #[test]
+    fn stable_days_reflects_last_dominant_shift() {
+        let db = test_db();
+        for i in 0..3 {
+            db.record_evolution_event("xp_gain", 3, Some("ops"), &format!("op_{i}"), None)
+                .unwrap();
+        }
+        for i in 0..10 {
+            db.record_evolution_event("xp_gain", 3, Some("builder"), &format!("bld_{i}"), None)
+                .unwrap();
+        }
+        let days = compute_archetype_stable_days(&db);
+        // Events just recorded → shift just happened → 0 days.
+        assert!(days <= 1, "expected stable_days <= 1, got {days}");
+        let state = db.get_evolution_state().unwrap();
+        assert_eq!(state.dominant_archetype, Some(Archetype::Builder));
+        assert!(state.dominant_history.len() >= 2);
+        assert_eq!(state.dominant_history.first().unwrap().1, Archetype::Ops);
+        assert_eq!(state.dominant_history.last().unwrap().1, Archetype::Builder);
+    }
+
+    #[test]
+    fn stable_days_ignores_hmac_tampered_rows() {
+        // Valid Ops events through the normal path.
+        let db = test_db();
+        for i in 0..3 {
+            db.record_evolution_event("xp_gain", 3, Some("ops"), &format!("op_{i}"), None)
+                .unwrap();
+        }
+        // Sneak in a Builder row with a bogus HMAC — bypasses record_evolution_event.
+        let now = chrono::Utc::now().timestamp();
+        db.conn()
+            .execute(
+                "INSERT INTO evolution_events (event_type, xp_delta, archetype, source,
+                    metadata_json, created_at, hmac, prev_hmac)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "xp_gain",
+                    3,
+                    "builder",
+                    "tampered_src",
+                    Option::<String>::None,
+                    now,
+                    "bogus_hmac",
+                    "bogus_prev",
+                ],
+            )
+            .unwrap();
+        let state = db.get_evolution_state().unwrap();
+        assert_eq!(state.dominant_archetype, Some(Archetype::Ops));
+        assert!(!state.chain_valid);
+        assert_eq!(state.lifetime_scores.get(&Archetype::Builder), None);
+    }
+
+    // ── Fallback naming ──
+
+    #[test]
+    fn fallback_name_per_archetype_and_stage() {
+        let (n_s2, d) =
+            classification::fallback_evolution_name(Some(Archetype::Ops), Stage::Evolved);
+        assert_eq!(n_s2, "Pipeline Warden");
+        assert!(!d.is_empty());
+        let (n_s3, _) = classification::fallback_evolution_name(Some(Archetype::Ops), Stage::Final);
+        assert_eq!(n_s3, "Infrastructure Sovereign");
+        for a in [
+            Archetype::Builder,
+            Archetype::Analyst,
+            Archetype::Communicator,
+            Archetype::Guardian,
+            Archetype::Strategist,
+            Archetype::Creator,
+            Archetype::Caretaker,
+            Archetype::Merchant,
+            Archetype::Tinkerer,
+        ] {
+            let (n2, d2) = classification::fallback_evolution_name(Some(a), Stage::Evolved);
+            let (n3, d3) = classification::fallback_evolution_name(Some(a), Stage::Final);
+            assert!(!n2.is_empty() && !d2.is_empty(), "empty for {a:?} s2");
+            assert!(!n3.is_empty() && !d3.is_empty(), "empty for {a:?} s3");
+            assert_ne!(n2, n3, "s2 and s3 names must differ for {a:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_name_no_archetype_returns_unbound() {
+        let (n, _) = classification::fallback_evolution_name(None, Stage::Evolved);
+        assert_eq!(n, "Unbound Borg");
+    }
+
+    // ── EvolutionHook disabled gating ──
+
+    #[test]
+    fn hook_disabled_writes_no_events() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ false);
+        let ctx = HookContext {
+            point: HookPoint::SessionStart,
+            session_id: "test".to_string(),
+            turn_count: 0,
+            data: HookData::SessionStart {
+                session_id: "test".to_string(),
+            },
+        };
+        let action = hook.execute(&ctx);
+        assert!(matches!(action, HookAction::Continue));
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        assert!(
+            events.is_empty(),
+            "disabled hook should write nothing; got {} events",
+            events.len()
+        );
+    }
+
+    #[test]
+    fn hook_enabled_session_start_records_xp() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::SessionStart,
+            session_id: "test".to_string(),
+            turn_count: 0,
+            data: HookData::SessionStart {
+                session_id: "test".to_string(),
+            },
+        };
+        hook.execute(&ctx);
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "xp_gain");
+        assert_eq!(events[0].source, "session_start");
+        assert_eq!(events[0].xp_delta, BASE_XP_INTERACTION);
+    }
+
+    #[test]
+    fn hook_tool_result_success_records_creation_bonus() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::AfterToolCall,
+            session_id: "test".to_string(),
+            turn_count: 1,
+            data: HookData::ToolResult {
+                name: "apply_patch".to_string(),
+                result: String::new(),
+                is_error: false,
+            },
+        };
+        hook.execute(&ctx);
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        assert_eq!(events.len(), 1);
+        // apply_patch → Builder, creation tool: BASE_XP_CREATION (2) + BONUS_XP_CREATION_ALIGNED (1).
+        assert_eq!(
+            events[0].xp_delta,
+            BASE_XP_CREATION + BONUS_XP_CREATION_ALIGNED
+        );
+        assert_eq!(events[0].archetype.as_deref(), Some("builder"));
+    }
+
+    #[test]
+    fn hook_tool_result_error_records_nothing() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::AfterToolCall,
+            session_id: "test".to_string(),
+            turn_count: 1,
+            data: HookData::ToolResult {
+                name: "apply_patch".to_string(),
+                result: "boom".to_string(),
+                is_error: true,
+            },
+        };
+        hook.execute(&ctx);
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        assert!(events.is_empty(), "error tool calls must not record XP");
+    }
+
+    #[test]
+    fn hook_agent_start_injects_context() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, /* enabled */ true);
+        let ctx = HookContext {
+            point: HookPoint::BeforeAgentStart,
+            session_id: "test".to_string(),
+            turn_count: 0,
+            data: HookData::AgentStart {
+                user_message: "hi".to_string(),
+            },
+        };
+        match hook.execute(&ctx) {
+            HookAction::InjectContext(s) => {
+                assert!(s.contains("<evolution_context>"), "got: {s}");
+            }
+            other => panic!("expected InjectContext, got {other:?}"),
+        }
     }
 }

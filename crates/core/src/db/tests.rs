@@ -3825,8 +3825,9 @@ fn evolution_accepts_valid_xp_deltas() {
         db.record_evolution_event("xp_gain", delta, Some("ops"), &format!("src{delta}"), None)
             .unwrap();
     }
-    // evolution with 0 should succeed
-    db.record_evolution_event("evolution", 0, None, "gate_check", None)
+    // evolution with 0 should succeed (gates_verified metadata is required)
+    let meta = serde_json::json!({ "gates_verified": true }).to_string();
+    db.record_evolution_event("evolution", 0, None, "gate_check", Some(&meta))
         .unwrap();
     let events = db.load_all_evolution_events().unwrap();
     assert_eq!(events.len(), 4);
@@ -3846,6 +3847,76 @@ fn evolution_source_rate_limiting_at_write_time() {
         5,
         "per-source write-time cap should limit to 5 events"
     );
+}
+
+#[test]
+fn evolution_event_requires_gates_verified_metadata() {
+    let db = test_db();
+    // None metadata → reject
+    let r = db.record_evolution_event("evolution", 0, None, "gate_check", None);
+    assert!(r.is_err(), "None metadata should fail");
+    // Invalid JSON → reject
+    let r = db.record_evolution_event("evolution", 0, None, "gate_check", Some("not json"));
+    assert!(r.is_err(), "invalid JSON metadata should fail");
+    // gates_verified=false → reject
+    let meta_false = serde_json::json!({ "gates_verified": false }).to_string();
+    let r = db.record_evolution_event("evolution", 0, None, "gate_check", Some(&meta_false));
+    assert!(r.is_err(), "gates_verified=false should fail");
+    // Missing gates_verified key → reject
+    let meta_missing = serde_json::json!({ "other": "data" }).to_string();
+    let r = db.record_evolution_event("evolution", 0, None, "gate_check", Some(&meta_missing));
+    assert!(r.is_err(), "missing gates_verified should fail");
+    // gates_verified=true → accept
+    let meta_ok = serde_json::json!({ "gates_verified": true }).to_string();
+    db.record_evolution_event("evolution", 0, None, "gate_check", Some(&meta_ok))
+        .unwrap();
+    // Non-evolution types are not subject to this rule
+    db.record_evolution_event("xp_gain", 1, Some("ops"), "run_shell", None)
+        .unwrap();
+    let class_meta = serde_json::json!({ "name": "Test", "description": "d" }).to_string();
+    db.record_evolution_event(
+        "classification",
+        0,
+        Some("ops"),
+        "llm_naming",
+        Some(&class_meta),
+    )
+    .unwrap();
+}
+
+#[test]
+fn evolution_persistence_round_trip() {
+    // Insert a mix of events via record_evolution_event, then reload and
+    // confirm EvolutionState matches what replay_events_with_key produces
+    // directly on the loaded events. This catches serialization / schema
+    // drift between write and replay paths.
+    let db = test_db();
+    db.record_evolution_event("xp_gain", 3, Some("ops"), "run_shell", None)
+        .unwrap();
+    db.record_evolution_event("xp_gain", 3, Some("builder"), "apply_patch", None)
+        .unwrap();
+    let evo_meta = serde_json::json!({ "gates_verified": true }).to_string();
+    db.record_evolution_event("evolution", 0, None, "gate_check", Some(&evo_meta))
+        .unwrap();
+    let class_meta =
+        serde_json::json!({ "name": "Tool Forgemaster", "description": "d" }).to_string();
+    db.record_evolution_event(
+        "classification",
+        0,
+        Some("builder"),
+        "llm_naming",
+        Some(&class_meta),
+    )
+    .unwrap();
+
+    let state_via_get = db.get_evolution_state().unwrap();
+    // State should reflect that Stage transitioned and naming landed
+    assert_eq!(state_via_get.stage, crate::evolution::Stage::Evolved);
+    assert_eq!(
+        state_via_get.evolution_name.as_deref(),
+        Some("Tool Forgemaster")
+    );
+    assert!(state_via_get.chain_valid);
 }
 
 #[test]

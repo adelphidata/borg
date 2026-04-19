@@ -21,6 +21,19 @@ pub enum SettingKind {
     Select,
 }
 
+/// Cycle to the next/previous option in a fixed list, given the current value.
+/// Returns the first option if `current` isn't in the list.
+fn cycle_option<'a>(options: &'a [&'a str], current: &str, forward: bool) -> &'a str {
+    let idx = options.iter().position(|&o| o == current).unwrap_or(0);
+    let len = options.len();
+    let next = if forward {
+        (idx + 1) % len
+    } else {
+        (idx + len - 1) % len
+    };
+    options[next]
+}
+
 #[derive(Clone, Copy)]
 pub struct SettingEntry {
     pub key: &'static str,
@@ -415,28 +428,10 @@ impl SettingsPopup {
             }
             KeyCode::Enter => {
                 let value = buffer.clone();
-                let entry = &self.entries[self.selected];
-                let key_str = entry.key;
-                match config.apply_setting(key_str, &value) {
-                    Ok(confirmation) => {
-                        if let Err(e) = self.save_setting(key_str, &value) {
-                            self.status_message = Some((format!("Save failed: {e}"), false));
-                            self.mode = EditMode::Browsing;
-                            return Ok(None);
-                        }
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        self.mode = EditMode::Browsing;
-                        Ok(Some(AppAction::UpdateSetting {
-                            key: key_str.to_string(),
-                            value,
-                        }))
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        self.mode = EditMode::Browsing;
-                        Ok(None)
-                    }
-                }
+                let key_str = self.entries[self.selected].key;
+                let action = self.apply_and_save(config, key_str, &value);
+                self.mode = EditMode::Browsing;
+                Ok(action)
             }
             KeyCode::Backspace => {
                 buffer.pop();
@@ -491,29 +486,15 @@ impl SettingsPopup {
             KeyCode::Enter => {
                 let sel = *selected;
                 let models = models_for_provider(provider_id);
-                if let Some((model_id, _)) = models.get(sel) {
-                    match config.apply_setting("model", model_id) {
-                        Ok(confirmation) => {
-                            if let Err(e) = self.save_setting("model", model_id) {
-                                self.status_message = Some((format!("Save failed: {e}"), false));
-                                self.mode = EditMode::Browsing;
-                                return Ok(None);
-                            }
-                            self.model_index = sel;
-                            self.status_message = Some((format!("Updated: {confirmation}"), true));
-                            self.mode = EditMode::Browsing;
-                            return Ok(Some(AppAction::UpdateSetting {
-                                key: "model".to_string(),
-                                value: model_id.to_string(),
-                            }));
-                        }
-                        Err(e) => {
-                            self.status_message = Some((format!("Error: {e}"), false));
-                            self.mode = EditMode::Browsing;
-                        }
-                    }
+                let Some((model_id, _)) = models.get(sel).copied() else {
+                    return Ok(None);
+                };
+                let action = self.apply_and_save(config, "model", model_id);
+                if action.is_some() {
+                    self.model_index = sel;
                 }
-                Ok(None)
+                self.mode = EditMode::Browsing;
+                Ok(action)
             }
             KeyCode::Esc => {
                 self.mode = EditMode::Browsing;
@@ -551,24 +532,12 @@ impl SettingsPopup {
                     (self.provider_index + count - 1) % count
                 };
                 let (id, _, _) = PROVIDERS[self.provider_index];
-                match config.apply_setting("provider", id) {
-                    Ok(confirmation) => {
-                        if let Err(e) = self.save_setting("provider", id) {
-                            self.status_message = Some((format!("Save failed: {e}"), false));
-                            return Ok(None);
-                        }
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        actions.push(AppAction::UpdateSetting {
-                            key: "provider".to_string(),
-                            value: id.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        return Ok(None);
-                    }
+                match self.apply_and_save(config, "provider", id) {
+                    Some(action) => actions.push(action),
+                    None => return Ok(None),
                 }
-                // Reset model to first option for new provider
+                // Reset model to first option for new provider. Best-effort:
+                // we keep the "Updated: provider=..." status and only log on save failure.
                 self.model_index = 0;
                 let models = models_for_provider(id);
                 if let Some((model_id, _)) = models.first() {
@@ -586,88 +555,36 @@ impl SettingsPopup {
             "conversation.collaboration_mode" => {
                 const MODES: &[&str] = &["default", "execute", "plan"];
                 let current = format!("{}", config.conversation.collaboration_mode);
-                let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
-                let next_idx = if forward {
-                    (idx + 1) % MODES.len()
+                let new_mode = cycle_option(MODES, &current, forward);
+                if let Some(action) =
+                    self.apply_and_save(config, "conversation.collaboration_mode", new_mode)
+                {
+                    actions.push(action);
                 } else {
-                    (idx + MODES.len() - 1) % MODES.len()
-                };
-                let new_mode = MODES[next_idx];
-                match config.apply_setting("conversation.collaboration_mode", new_mode) {
-                    Ok(confirmation) => {
-                        if let Err(e) =
-                            self.save_setting("conversation.collaboration_mode", new_mode)
-                        {
-                            self.status_message = Some((format!("Save failed: {e}"), false));
-                            return Ok(None);
-                        }
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        actions.push(AppAction::UpdateSetting {
-                            key: "conversation.collaboration_mode".to_string(),
-                            value: new_mode.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        return Ok(None);
-                    }
+                    return Ok(None);
                 }
             }
             "llm.cache.strategy" => {
                 const MODES: &[&str] = &["tools_system_and_2", "system_and_3"];
+                // The generated reader serializes via serde_json, which wraps the
+                // enum tag in quotes (e.g. `"system_and_3"`). Strip them so the
+                // current value lines up with the unquoted cycle options.
                 let current = serde_json::to_string(&config.llm.cache.strategy).unwrap_or_default();
-                let current = current.trim_matches('"').to_string();
-                let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
-                let next_idx = if forward {
-                    (idx + 1) % MODES.len()
+                let new_val = cycle_option(MODES, current.trim_matches('"'), forward);
+                if let Some(action) = self.apply_and_save(config, "llm.cache.strategy", new_val) {
+                    actions.push(action);
                 } else {
-                    (idx + MODES.len() - 1) % MODES.len()
-                };
-                let new_val = MODES[next_idx];
-                match config.apply_setting("llm.cache.strategy", new_val) {
-                    Ok(confirmation) => {
-                        if let Err(e) = self.save_setting("llm.cache.strategy", new_val) {
-                            self.status_message = Some((format!("Save failed: {e}"), false));
-                            return Ok(None);
-                        }
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        actions.push(AppAction::UpdateSetting {
-                            key: "llm.cache.strategy".to_string(),
-                            value: new_val.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        return Ok(None);
-                    }
+                    return Ok(None);
                 }
             }
             "workflow.enabled" => {
                 const MODES: &[&str] = &["auto", "on", "off"];
                 let current = config.workflow.enabled.clone();
-                let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
-                let next_idx = if forward {
-                    (idx + 1) % MODES.len()
+                let new_val = cycle_option(MODES, &current, forward);
+                if let Some(action) = self.apply_and_save(config, "workflow.enabled", new_val) {
+                    actions.push(action);
                 } else {
-                    (idx + MODES.len() - 1) % MODES.len()
-                };
-                let new_val = MODES[next_idx];
-                match config.apply_setting("workflow.enabled", new_val) {
-                    Ok(confirmation) => {
-                        if let Err(e) = self.save_setting("workflow.enabled", new_val) {
-                            self.status_message = Some((format!("Save failed: {e}"), false));
-                            return Ok(None);
-                        }
-                        self.status_message = Some((format!("Updated: {confirmation}"), true));
-                        actions.push(AppAction::UpdateSetting {
-                            key: "workflow.enabled".to_string(),
-                            value: new_val.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        self.status_message = Some((format!("Error: {e}"), false));
-                        return Ok(None);
-                    }
+                    return Ok(None);
                 }
             }
             _ => return Ok(None),
@@ -683,10 +600,11 @@ impl SettingsPopup {
         increase: bool,
     ) -> anyhow::Result<Option<AppAction>> {
         let entry = &self.entries[self.selected];
-        let current = self.current_value(config, entry.key);
+        let key = entry.key;
+        let current = self.current_value(config, key);
         let val: f64 = current.parse().unwrap_or(0.0);
 
-        let (step, min, max) = match entry.key {
+        let (step, min, max) = match key {
             "budget.warning_threshold" => (0.01, 0.0, 1.0),
             _ => (0.1, 0.0, 2.0), // temperature
         };
@@ -701,46 +619,15 @@ impl SettingsPopup {
         let decimals = if step < 0.1 { 2 } else { 1 };
         let formatted = format!("{new_val:.decimals$}");
 
-        match config.apply_setting(entry.key, &formatted) {
-            Ok(confirmation) => {
-                if let Err(e) = self.save_setting(entry.key, &formatted) {
-                    self.status_message = Some((format!("Save failed: {e}"), false));
-                    return Ok(None);
-                }
-                self.status_message = Some((format!("Updated: {confirmation}"), true));
-                Ok(Some(AppAction::UpdateSetting {
-                    key: entry.key.to_string(),
-                    value: formatted,
-                }))
-            }
-            Err(e) => {
-                self.status_message = Some((format!("Error: {e}"), false));
-                Ok(None)
-            }
-        }
+        Ok(self.apply_and_save(config, key, &formatted))
     }
 
     fn toggle_bool(&mut self, config: &mut Config) -> anyhow::Result<Option<AppAction>> {
         let entry = &self.entries[self.selected];
-        let current = self.current_value(config, entry.key);
+        let key = entry.key;
+        let current = self.current_value(config, key);
         let new_val = if current == "true" { "false" } else { "true" };
-        match config.apply_setting(entry.key, new_val) {
-            Ok(confirmation) => {
-                if let Err(e) = self.save_setting(entry.key, new_val) {
-                    self.status_message = Some((format!("Save failed: {e}"), false));
-                    return Ok(None);
-                }
-                self.status_message = Some((format!("Updated: {confirmation}"), true));
-                Ok(Some(AppAction::UpdateSetting {
-                    key: entry.key.to_string(),
-                    value: new_val.to_string(),
-                }))
-            }
-            Err(e) => {
-                self.status_message = Some((format!("Error: {e}"), false));
-                Ok(None)
-            }
-        }
+        Ok(self.apply_and_save(config, key, new_val))
     }
 
     /// Save a setting to DB. Returns an error if the DB connection is unavailable.
@@ -751,6 +638,30 @@ impl SettingsPopup {
             .ok_or_else(|| anyhow::anyhow!("No database connection"))?;
         db.set_setting(key, value)?;
         Ok(())
+    }
+
+    /// Apply a setting to config, persist to DB, and update `status_message` in one go.
+    /// Returns `Some(AppAction::UpdateSetting)` on success, `None` on error.
+    fn apply_and_save(&mut self, config: &mut Config, key: &str, value: &str) -> Option<AppAction> {
+        match config.apply_setting(key, value) {
+            Ok(confirmation) => match self.save_setting(key, value) {
+                Ok(()) => {
+                    self.status_message = Some((format!("Updated: {confirmation}"), true));
+                    Some(AppAction::UpdateSetting {
+                        key: key.to_string(),
+                        value: value.to_string(),
+                    })
+                }
+                Err(e) => {
+                    self.status_message = Some((format!("Save failed: {e}"), false));
+                    None
+                }
+            },
+            Err(e) => {
+                self.status_message = Some((format!("Error: {e}"), false));
+                None
+            }
+        }
     }
 
     /// Reset all settings to compiled defaults by clearing DB overrides and reloading config.
@@ -1070,9 +981,14 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Find sandbox.enabled (index 7 — under Security)
-        popup.selected = 7;
-        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+        // Find sandbox.enabled by key rather than hardcoded index so the test
+        // survives new Conversation/LLM entries being inserted above Security.
+        let sandbox_idx = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "sandbox.enabled")
+            .expect("sandbox.enabled entry");
+        popup.selected = sandbox_idx;
 
         let mut cfg = Config::default();
         assert!(cfg.sandbox.enabled);
@@ -1149,7 +1065,11 @@ mod tests {
     #[test]
     fn all_settings_covered() {
         let popup = SettingsPopup::new();
-        assert_eq!(popup.entries.len(), 17);
+        assert!(
+            popup.entries.len() >= 17,
+            "entries list should not shrink — found {} entries",
+            popup.entries.len()
+        );
 
         let cfg = Config::default();
         for entry in popup.entries {
@@ -1185,9 +1105,11 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Select sandbox.enabled (Bool at index 7)
-        popup.selected = 7;
-        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "sandbox.enabled")
+            .expect("sandbox.enabled entry");
         let mut cfg = Config::default();
         let original = cfg.sandbox.enabled;
 
@@ -1503,9 +1425,11 @@ mod tests {
         let mut cfg = Config::default();
         popup.show(&cfg);
 
-        // conversation.max_iterations is a Uint field (index 4)
-        popup.selected = 4;
-        assert_eq!(popup.entries[4].key, "conversation.max_iterations");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "conversation.max_iterations")
+            .expect("conversation.max_iterations entry");
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
@@ -1705,9 +1629,11 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Select sandbox.enabled (Bool at index 7)
-        popup.selected = 7;
-        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "sandbox.enabled")
+            .expect("sandbox.enabled entry");
 
         let mut cfg = Config::default();
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1730,9 +1656,11 @@ mod tests {
         let cfg = Config::default();
         popup.show(&cfg);
 
-        // Select sandbox.enabled (Bool at index 7)
-        popup.selected = 7;
-        assert_eq!(popup.entries[7].key, "sandbox.enabled");
+        popup.selected = popup
+            .entries
+            .iter()
+            .position(|e| e.key == "sandbox.enabled")
+            .expect("sandbox.enabled entry");
 
         let mut cfg = Config::default();
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

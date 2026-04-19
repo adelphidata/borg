@@ -172,6 +172,42 @@ impl ActionLimits {
             ActionType::WebRequest => (self.web_requests_warn, self.web_requests_block),
         }
     }
+
+    /// Raise limits to at least the evolution-stage defaults from
+    /// `docs/evolution.md#action-limits-by-stage`. Uses `max` so explicit user
+    /// configuration (set higher) is always preserved — stage progression
+    /// monotonically *unlocks* headroom, never tightens it.
+    pub fn apply_stage(&mut self, stage: EvolutionStage) {
+        let (tool_calls, shell_commands, file_writes) = match stage {
+            EvolutionStage::Base => ((50, 100), (20, 50), (15, 30)),
+            EvolutionStage::Evolved => ((75, 150), (30, 75), (25, 50)),
+            EvolutionStage::Final => ((100, 200), (50, 100), (40, 80)),
+        };
+        self.tool_calls_warn = self.tool_calls_warn.max(tool_calls.0);
+        self.tool_calls_block = self.tool_calls_block.max(tool_calls.1);
+        self.shell_commands_warn = self.shell_commands_warn.max(shell_commands.0);
+        self.shell_commands_block = self.shell_commands_block.max(shell_commands.1);
+        self.file_writes_warn = self.file_writes_warn.max(file_writes.0);
+        self.file_writes_block = self.file_writes_block.max(file_writes.1);
+    }
+
+    /// Return `self` with stage overrides applied — chainable form of `apply_stage`.
+    pub fn with_stage(mut self, stage: EvolutionStage) -> Self {
+        self.apply_stage(stage);
+        self
+    }
+}
+
+/// Evolution stage passed into [`ActionLimits::apply_stage`]. Local mirror to
+/// keep `rate_guard` free of a dependency on the `evolution` module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvolutionStage {
+    /// Pre-evolution (Lvl.0–99 at Stage 1).
+    Base,
+    /// Post first evolution.
+    Evolved,
+    /// Final form.
+    Final,
 }
 
 /// Per-session rate limiter that tracks action counts against configurable thresholds.
@@ -489,6 +525,95 @@ tool_calls_block = 10
             RateDecision::Block(_) => {}
             other => unreachable!("expected Block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_stage_base_is_noop_on_defaults() {
+        // Defaults (200/500 tool calls etc) are already above Stage 1 caps (50/100).
+        let mut limits = ActionLimits::default();
+        let before = limits.clone();
+        limits.apply_stage(EvolutionStage::Base);
+        assert_eq!(limits.tool_calls_warn, before.tool_calls_warn);
+        assert_eq!(limits.tool_calls_block, before.tool_calls_block);
+    }
+
+    #[test]
+    fn apply_stage_lifts_tight_configured_caps() {
+        let mut limits = ActionLimits {
+            tool_calls_warn: 10,
+            tool_calls_block: 20,
+            shell_commands_warn: 5,
+            shell_commands_block: 15,
+            file_writes_warn: 5,
+            file_writes_block: 10,
+            ..Default::default()
+        };
+        limits.apply_stage(EvolutionStage::Evolved);
+        assert_eq!(limits.tool_calls_warn, 75);
+        assert_eq!(limits.tool_calls_block, 150);
+        assert_eq!(limits.shell_commands_warn, 30);
+        assert_eq!(limits.shell_commands_block, 75);
+        assert_eq!(limits.file_writes_warn, 25);
+        assert_eq!(limits.file_writes_block, 50);
+    }
+
+    #[test]
+    fn apply_stage_preserves_higher_user_config() {
+        let mut limits = ActionLimits {
+            tool_calls_warn: 1000,
+            tool_calls_block: 2000,
+            ..Default::default()
+        };
+        limits.apply_stage(EvolutionStage::Final);
+        assert_eq!(limits.tool_calls_warn, 1000);
+        assert_eq!(limits.tool_calls_block, 2000);
+    }
+
+    #[test]
+    fn with_stage_chains() {
+        let limits = ActionLimits {
+            tool_calls_warn: 10,
+            tool_calls_block: 20,
+            ..Default::default()
+        }
+        .with_stage(EvolutionStage::Final);
+        assert_eq!(limits.tool_calls_warn, 100);
+        assert_eq!(limits.tool_calls_block, 200);
+    }
+
+    #[test]
+    fn apply_stage_final_unlocks_more_than_evolved() {
+        let mut a = ActionLimits {
+            tool_calls_warn: 0,
+            tool_calls_block: 0,
+            shell_commands_warn: 0,
+            shell_commands_block: 0,
+            file_writes_warn: 0,
+            file_writes_block: 0,
+            ..Default::default()
+        };
+        let mut b = a.clone();
+        a.apply_stage(EvolutionStage::Evolved);
+        b.apply_stage(EvolutionStage::Final);
+        assert!(b.tool_calls_block > a.tool_calls_block);
+        assert!(b.shell_commands_block > a.shell_commands_block);
+        assert!(b.file_writes_block > a.file_writes_block);
+    }
+
+    #[test]
+    fn stage_does_not_affect_memory_or_web_limits() {
+        let mut limits = ActionLimits {
+            memory_writes_warn: 7,
+            memory_writes_block: 11,
+            web_requests_warn: 13,
+            web_requests_block: 17,
+            ..Default::default()
+        };
+        limits.apply_stage(EvolutionStage::Final);
+        assert_eq!(limits.memory_writes_warn, 7);
+        assert_eq!(limits.memory_writes_block, 11);
+        assert_eq!(limits.web_requests_warn, 13);
+        assert_eq!(limits.web_requests_block, 17);
     }
 
     #[test]

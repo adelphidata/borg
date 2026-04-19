@@ -94,6 +94,52 @@ fn is_dsl_marker(text: &str) -> bool {
         || t == EOF_MARKER
 }
 
+/// Classification of a single line inside a diff hunk.
+enum DiffLine<'a> {
+    /// ` ` context prefix (or an empty line, which acts as empty context).
+    Context(&'a str),
+    /// `+` added line, stripped of the prefix.
+    Add(&'a str),
+    /// `-` removed line, stripped of the prefix.
+    Remove(&'a str),
+    /// `*** End of File` sentinel.
+    EndOfFile,
+    /// Anything else: the caller must stop reading diff lines.
+    Stop,
+}
+
+/// Classify a single diff line without doing any semantic checks.
+fn classify_diff_line(line: &str) -> DiffLine<'_> {
+    if line.trim() == EOF_MARKER {
+        return DiffLine::EndOfFile;
+    }
+    if let Some(removed) = line.strip_prefix('-') {
+        return DiffLine::Remove(removed);
+    }
+    if let Some(added) = line.strip_prefix('+') {
+        return DiffLine::Add(added);
+    }
+    if let Some(context) = line.strip_prefix(' ') {
+        return DiffLine::Context(context);
+    }
+    if line.is_empty() {
+        return DiffLine::Context(line);
+    }
+    DiffLine::Stop
+}
+
+/// LLM-error guard: returns `true` when `payload` looks like a DSL marker
+/// (e.g. `*** End Patch`) and no further diff line follows — a strong hint
+/// that the model erroneously prefixed the marker with `+`/`-`, and we
+/// should treat the current line as end-of-hunk rather than content.
+fn is_hijacked_marker(payload: &str, lines: &[&str], next_idx: usize) -> bool {
+    if !is_dsl_marker(payload) {
+        return false;
+    }
+    let next_is_diff = next_idx < lines.len() && is_diff_prefix(lines[next_idx]);
+    !next_is_diff
+}
+
 /// Collect diff lines starting at `lines[*i]`. Each line must start with
 /// ` ` (context), `+` (add), or `-` (remove). Empty lines are treated as
 /// empty context. Stops at a non-diff line or `*** End of File` marker.
@@ -104,42 +150,31 @@ fn collect_diff_lines<'a>(lines: &[&'a str], i: &mut usize) -> (Vec<&'a str>, Ve
     let mut is_end_of_file = false;
 
     while *i < lines.len() {
-        let l = lines[*i];
-
-        if l.trim() == EOF_MARKER {
-            is_end_of_file = true;
-            *i += 1;
-            break;
-        }
-
-        if let Some(removed) = l.strip_prefix('-') {
-            // If the stripped content is a DSL marker and no more diff lines
-            // follow, this is an LLM error — don't include it as content.
-            if is_dsl_marker(removed) {
-                let next_is_diff = *i + 1 < lines.len() && is_diff_prefix(lines[*i + 1]);
-                if !next_is_diff {
+        match classify_diff_line(lines[*i]) {
+            DiffLine::EndOfFile => {
+                is_end_of_file = true;
+                *i += 1;
+                break;
+            }
+            DiffLine::Remove(removed) => {
+                if is_hijacked_marker(removed, lines, *i + 1) {
                     *i += 1;
                     break;
                 }
+                search_lines.push(removed);
             }
-            search_lines.push(removed);
-        } else if let Some(added) = l.strip_prefix('+') {
-            if is_dsl_marker(added) {
-                let next_is_diff = *i + 1 < lines.len() && is_diff_prefix(lines[*i + 1]);
-                if !next_is_diff {
+            DiffLine::Add(added) => {
+                if is_hijacked_marker(added, lines, *i + 1) {
                     *i += 1;
                     break;
                 }
+                replace_lines.push(added);
             }
-            replace_lines.push(added);
-        } else if let Some(context) = l.strip_prefix(' ') {
-            search_lines.push(context);
-            replace_lines.push(context);
-        } else if l.is_empty() {
-            search_lines.push(l);
-            replace_lines.push(l);
-        } else {
-            break;
+            DiffLine::Context(ctx) => {
+                search_lines.push(ctx);
+                replace_lines.push(ctx);
+            }
+            DiffLine::Stop => break,
         }
         *i += 1;
     }

@@ -92,6 +92,18 @@ enum BudgetCheck {
     Exceeded(String),
 }
 
+/// Control-flow outcome when `run_agent_loop` encounters a text-only LLM
+/// response. The loop either terminates the turn or loops again with a nudge
+/// instructing the model to produce a visible response for the user.
+enum TextOnlyOutcome {
+    /// Exit `run_agent_loop` with `Ok(())`. All persistence and TurnComplete
+    /// events have already been emitted by the helper.
+    TerminateTurn,
+    /// Loop again: the helper persisted a system nudge asking for a response.
+    /// Caller must set `nudged_for_response = true` before continuing.
+    NudgeAndContinue,
+}
+
 /// Events emitted by the agent loop during a conversation turn.
 pub enum AgentEvent {
     /// Incremental text token from the LLM.
@@ -234,7 +246,6 @@ struct AgentCommon {
 fn build_common(config: &Config) -> Result<AgentCommon> {
     let _ = LlmClient::new(config)?;
     let policy = config.policy.clone();
-    let rate_guard = SessionRateGuard::new(config.security.action_limits.clone());
     let session = Session::new();
     let db = match Database::open() {
         Ok(db) => Some(db),
@@ -243,6 +254,21 @@ fn build_common(config: &Config) -> Result<AgentCommon> {
             None
         }
     };
+    // Action limits receive an evolution-stage floor: higher stages unlock
+    // additional headroom per `docs/evolution.md#action-limits-by-stage`.
+    // Explicit user config (set higher) is preserved via `max`.
+    let mut limits = config.security.action_limits.clone();
+    if let Some(ref d) = db {
+        if let Ok(state) = d.get_evolution_state() {
+            let stage = match state.stage {
+                crate::evolution::Stage::Base => crate::rate_guard::EvolutionStage::Base,
+                crate::evolution::Stage::Evolved => crate::rate_guard::EvolutionStage::Evolved,
+                crate::evolution::Stage::Final => crate::rate_guard::EvolutionStage::Final,
+            };
+            limits.apply_stage(stage);
+        }
+    }
+    let rate_guard = SessionRateGuard::new(limits);
     let resolved_creds = config.resolve_credentials();
     let skill_env_allowlist =
         crate::skills::collect_required_env_vars(&resolved_creds, &config.skills);
@@ -1675,49 +1701,29 @@ Rules:
             self.hook_registry.dispatch(&hook_ctx);
 
             if tool_calls.is_empty() {
-                // Stream errored out *and* there are no tool calls to recover —
-                // persist whatever text arrived with an interruption marker so the
-                // next turn (and any later resume) sees that the response was cut
-                // short, not a normal completion.
-                if let Some(err) = stream_error.take() {
-                    let content = if text_content.trim().is_empty() {
-                        format!("[stream interrupted: {err}]")
-                    } else {
-                        format!("{text_content}\n\n[stream interrupted: {err}]")
-                    };
-                    self.log_and_persist(Message::assistant(&content));
-                    let _ = event_tx.send(AgentEvent::TurnComplete).await;
-                    return Ok(());
+                match self
+                    .handle_text_only_response(
+                        &text_content,
+                        stream_error.take(),
+                        needs_response,
+                        nudged_for_response,
+                        &event_tx,
+                    )
+                    .await
+                {
+                    TextOnlyOutcome::TerminateTurn => return Ok(()),
+                    TextOnlyOutcome::NudgeAndContinue => {
+                        nudged_for_response = true;
+                        continue;
+                    }
                 }
-
-                if should_nudge_for_response(&text_content, needs_response, nudged_for_response) {
-                    nudged_for_response = true;
-                    self.log_and_persist(Message::system(
-                        "Respond to the user with a brief confirmation of what you just did.",
-                    ));
-                    continue;
-                }
-
-                self.finalize_text_response(&text_content, &event_tx).await;
-                return Ok(());
             }
 
             let tc = validate_tool_calls(&tool_calls);
 
             if tc.is_empty() {
-                let trailer = match stream_error.take() {
-                    Some(err) => {
-                        format!("[stream interrupted: {err}; incomplete tool calls discarded]")
-                    }
-                    None => "[incomplete tool calls discarded]".to_string(),
-                };
-                let content = if text_content.is_empty() {
-                    format!("[response interrupted — {trailer}]")
-                } else {
-                    format!("{text_content}\n\n{trailer}")
-                };
-                self.log_and_persist(Message::assistant(&content));
-                let _ = event_tx.send(AgentEvent::TurnComplete).await;
+                self.persist_discarded_tool_calls(&text_content, stream_error.take(), &event_tx)
+                    .await;
                 return Ok(());
             }
 
@@ -2008,6 +2014,67 @@ Rules:
         }
         self.auto_save();
         self.metrics.agent_turns.add(1, &[]);
+        let _ = event_tx.send(AgentEvent::TurnComplete).await;
+    }
+
+    /// Handle a text-only LLM response (no tool calls). Either terminates the
+    /// turn (by finalizing or recording a stream-interrupted marker) or signals
+    /// that the caller should nudge the model with a reminder message and loop
+    /// again. Centralizes the three exit branches that used to live inline in
+    /// `run_agent_loop`.
+    async fn handle_text_only_response(
+        &mut self,
+        text_content: &str,
+        stream_error: Option<String>,
+        needs_response: bool,
+        nudged_for_response: bool,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> TextOnlyOutcome {
+        // Stream errored out *and* there are no tool calls to recover —
+        // persist whatever text arrived with an interruption marker so the
+        // next turn (and any later resume) sees that the response was cut
+        // short, not a normal completion.
+        if let Some(err) = stream_error {
+            let content = if text_content.trim().is_empty() {
+                format!("[stream interrupted: {err}]")
+            } else {
+                format!("{text_content}\n\n[stream interrupted: {err}]")
+            };
+            self.log_and_persist(Message::assistant(&content));
+            let _ = event_tx.send(AgentEvent::TurnComplete).await;
+            return TextOnlyOutcome::TerminateTurn;
+        }
+
+        if should_nudge_for_response(text_content, needs_response, nudged_for_response) {
+            self.log_and_persist(Message::system(
+                "Respond to the user with a brief confirmation of what you just did.",
+            ));
+            return TextOnlyOutcome::NudgeAndContinue;
+        }
+
+        self.finalize_text_response(text_content, event_tx).await;
+        TextOnlyOutcome::TerminateTurn
+    }
+
+    /// Persist an interrupted-turn marker when all streamed tool calls failed
+    /// validation (names too long, bad JSON, etc.). Emitted as a single
+    /// assistant message so the next turn sees the truncation.
+    async fn persist_discarded_tool_calls(
+        &mut self,
+        text_content: &str,
+        stream_error: Option<String>,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) {
+        let trailer = match stream_error {
+            Some(err) => format!("[stream interrupted: {err}; incomplete tool calls discarded]"),
+            None => "[incomplete tool calls discarded]".to_string(),
+        };
+        let content = if text_content.is_empty() {
+            format!("[response interrupted — {trailer}]")
+        } else {
+            format!("{text_content}\n\n{trailer}")
+        };
+        self.log_and_persist(Message::assistant(&content));
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
     }
 

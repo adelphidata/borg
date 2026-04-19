@@ -1,5 +1,10 @@
 use crate::{Category, CredentialSpec, Platform, PluginKind, TemplateFile, TemplateTarget};
 
+/// Optional post-install hook run after templates and credentials are in
+/// place. Returns a list of notes (e.g. OS-permission prompts) shown to the
+/// user on completion.
+pub type PostInstallHook = fn(&std::path::Path) -> Vec<String>;
+
 /// A static plugin definition — embedded in the binary.
 #[derive(Debug, Clone)]
 pub struct PluginDef {
@@ -23,6 +28,9 @@ pub struct PluginDef {
     pub platform: Platform,
     /// Native integrations are handled in Rust (gateway crate) and only need credentials, not template files.
     pub is_native: bool,
+    /// Optional plugin-specific post-install hook (OS permission checks,
+    /// state-file seeding, etc.). Runs after templates and credentials.
+    pub post_install: Option<PostInstallHook>,
 }
 
 impl PluginDef {
@@ -77,6 +85,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/slack",
@@ -102,6 +111,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/discord",
@@ -127,6 +137,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/teams",
@@ -152,6 +163,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/google-chat",
@@ -169,6 +181,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/signal",
@@ -186,6 +199,7 @@ pub static CATALOG: &[PluginDef] = &[
         templates: &[],
         platform: Platform::All,
         is_native: true,
+        post_install: None,
     },
     // Template-based channel plugins
     PluginDef {
@@ -233,6 +247,7 @@ pub static CATALOG: &[PluginDef] = &[
         ],
         platform: Platform::All,
         is_native: false,
+        post_install: None,
     },
     PluginDef {
         id: "messaging/imessage",
@@ -271,6 +286,7 @@ pub static CATALOG: &[PluginDef] = &[
         ],
         platform: Platform::MacOS,
         is_native: false,
+        post_install: Some(crate::installer::imessage_post_install),
     },
     PluginDef {
         id: "messaging/sms",
@@ -317,6 +333,7 @@ pub static CATALOG: &[PluginDef] = &[
         ],
         platform: Platform::All,
         is_native: false,
+        post_install: None,
     },
 ];
 

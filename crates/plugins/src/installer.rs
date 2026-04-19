@@ -80,15 +80,17 @@ pub async fn install(
         })
         .collect();
 
-    // 7. Post-install hooks
-    let mut result = InstallResult {
-        notes: Vec::new(),
+    // 7. Post-install hooks (plugin-specific — e.g., iMessage seeds the
+    //    Messages-DB cursor once Full Disk Access is confirmed).
+    let notes = def
+        .post_install
+        .map(|hook| hook(data_dir))
+        .unwrap_or_default();
+    let result = InstallResult {
+        notes,
         credential_entries,
         file_hashes,
     };
-    if def.id == "messaging/imessage" {
-        result.notes = imessage_post_install(data_dir);
-    }
 
     send_event(progress_tx, InstallEvent::Complete { id }).await;
     Ok(result)
@@ -262,7 +264,7 @@ fn remove_credential(service: &str, key: &str) {
 
 /// Post-install hook for iMessage: initialize state.json with current max ROWID
 /// so only future messages are processed. Returns user-facing notes.
-fn imessage_post_install(data_dir: &std::path::Path) -> Vec<String> {
+pub(crate) fn imessage_post_install(data_dir: &std::path::Path) -> Vec<String> {
     let mut notes = Vec::new();
     let state_path = data_dir
         .join("channels")

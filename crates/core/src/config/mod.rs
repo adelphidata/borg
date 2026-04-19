@@ -399,77 +399,72 @@ impl Config {
         if let Some(ref provider_str) = self.llm.provider {
             let provider = Provider::from_str(provider_str)?;
 
-            // Keyless providers (e.g., Ollama) don't need API key resolution
+            // Keyless providers (e.g., Ollama) don't need API key resolution.
             if !provider.requires_api_key() {
                 return Ok((provider, String::new()));
             }
 
-            // Try SecretRef first
-            if let Some(ref secret_ref) = self.llm.api_key {
-                match secret_ref.resolve() {
-                    Ok(key) if !key.is_empty() => return Ok((provider, key)),
-                    Ok(_) => {
-                        warn!("api_key SecretRef resolved to empty string, falling back to api_key_env");
-                    }
-                    Err(e) => {
-                        warn!(
-                            "api_key SecretRef failed to resolve: {e}, falling back to api_key_env"
-                        );
-                    }
-                }
+            if let Some(key) = self
+                .try_resolve_api_key_secret_ref("api_key_env")
+                .or_else(|| try_resolve_env(&self.llm.api_key_env))
+                .or_else(|| try_resolve_env(provider.default_env_var()))
+            {
+                return Ok((provider, key));
             }
 
-            let key = std::env::var(&self.llm.api_key_env)
-                .or_else(|_| std::env::var(provider.default_env_var()))
-                .with_context(|| {
-                    format!(
-                        "API key not found for provider {provider}. Set {} or {} or configure api_key in config.toml.",
-                        self.llm.api_key_env,
-                        provider.default_env_var()
-                    )
-                })?;
-            return Ok((provider, key));
+            anyhow::bail!(
+                "API key not found for provider {provider}. Set {} or {} or configure api_key in config.toml.",
+                self.llm.api_key_env,
+                provider.default_env_var()
+            );
         }
 
-        // Try SecretRef with auto-detect
-        if let Some(ref secret_ref) = self.llm.api_key {
-            match secret_ref.resolve() {
-                Ok(key) if !key.is_empty() => {
-                    // Infer provider from api_key_env name
-                    let provider = Provider::from_env_var_name(&self.llm.api_key_env)
-                        .unwrap_or_else(|| {
-                            warn!("Could not infer provider from api_key_env '{}', defaulting to OpenRouter", self.llm.api_key_env);
-                            Provider::OpenRouter
-                        });
-                    return Ok((provider, key));
-                }
-                Ok(_) => {
-                    warn!(
-                        "api_key SecretRef resolved to empty string, falling back to env detection"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "api_key SecretRef failed to resolve: {e}, falling back to env detection"
-                    );
-                }
-            }
+        // Auto-detect path: no provider set. Use any resolvable SecretRef or
+        // non-default env var and infer the provider from the env var name.
+        if let Some(key) = self.try_resolve_api_key_secret_ref("env detection") {
+            return Ok((self.infer_provider_from_env_name(), key));
         }
 
         if self.llm.api_key_env != LlmConfig::default().api_key_env {
-            if let Ok(key) = std::env::var(&self.llm.api_key_env) {
-                if !key.is_empty() {
-                    let provider = Provider::from_env_var_name(&self.llm.api_key_env)
-                        .unwrap_or_else(|| {
-                            warn!("Could not infer provider from api_key_env '{}', defaulting to OpenRouter", self.llm.api_key_env);
-                            Provider::OpenRouter
-                        });
-                    return Ok((provider, key));
-                }
+            if let Some(key) = try_resolve_env(&self.llm.api_key_env) {
+                return Ok((self.infer_provider_from_env_name(), key));
             }
         }
 
         Provider::detect_from_env()
+    }
+
+    /// Try to resolve `self.llm.api_key` via its `SecretRef`. Logs a warning
+    /// with `fallback_label` naming the next resolution step when the secret
+    /// resolves to empty or fails. Returns `None` when not configured or
+    /// unusable so the caller can continue trying other sources.
+    fn try_resolve_api_key_secret_ref(&self, fallback_label: &str) -> Option<String> {
+        let secret_ref = self.llm.api_key.as_ref()?;
+        match secret_ref.resolve() {
+            Ok(key) if !key.is_empty() => Some(key),
+            Ok(_) => {
+                warn!(
+                    "api_key SecretRef resolved to empty string, falling back to {fallback_label}"
+                );
+                None
+            }
+            Err(e) => {
+                warn!("api_key SecretRef failed to resolve: {e}, falling back to {fallback_label}");
+                None
+            }
+        }
+    }
+
+    /// Best-effort provider inference from `api_key_env`, defaulting to
+    /// OpenRouter with a warning when no match is found.
+    fn infer_provider_from_env_name(&self) -> Provider {
+        Provider::from_env_var_name(&self.llm.api_key_env).unwrap_or_else(|| {
+            warn!(
+                "Could not infer provider from api_key_env '{}', defaulting to OpenRouter",
+                self.llm.api_key_env
+            );
+            Provider::OpenRouter
+        })
     }
 
     /// Resolve all available API keys for the configured provider.
@@ -642,6 +637,13 @@ impl Config {
             .map(|(name, desc, _)| (*name, *desc))
             .collect()
     }
+}
+
+/// Read an env var and return its value only when it's set AND non-empty.
+/// Centralizes the "empty env var counts as unset" rule that both explicit
+/// and auto-detect API-key resolution paths need.
+fn try_resolve_env(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|v| !v.is_empty())
 }
 
 /// Override the configured provider when the API key's prefix points to a

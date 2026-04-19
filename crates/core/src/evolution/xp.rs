@@ -23,15 +23,20 @@ pub fn total_xp_for_level(stage: &Stage, target_level: u8) -> u32 {
 }
 
 /// Given accumulated XP in current stage, compute (level, xp_remaining_to_next).
+///
+/// Level is capped at 99. Beyond Lvl.99 we report `(99, 0)` regardless of
+/// additional XP accumulated — the curve is not defined past this ceiling
+/// and the `for` bound below must stay at `0..99` to keep the saturating
+/// behavior.
 pub fn level_from_xp(stage: &Stage, xp: u32) -> (u8, u32) {
     let mut remaining = xp;
     for lvl in 0..99u8 {
         let cost = xp_for_level(stage, lvl);
+        debug_assert!(cost > 0, "xp_for_level must be positive for level < 99");
         if remaining < cost {
             return (lvl, cost - remaining);
         }
         remaining -= cost;
     }
-    // Lvl.99 — show 0 remaining
     (99, 0)
 }
