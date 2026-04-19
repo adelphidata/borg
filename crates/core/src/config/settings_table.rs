@@ -143,6 +143,7 @@ define_settings! {
         "agents.max_spawn_depth" => agents.max_spawn_depth, parsed(u32);
         "agents.max_children_per_agent" => agents.max_children_per_agent, parsed(u32);
         "agents.max_concurrent" => agents.max_concurrent, parsed(u32);
+        "agents.delegate_timeout_secs" => agents.delegate_timeout_secs, parsed(u64);
 
         // ── Debug ──
         "debug.llm_logging" => debug.llm_logging, parsed(bool);

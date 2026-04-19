@@ -64,13 +64,13 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
     if spawn_depth < max_spawn_depth {
         defs.push(ToolDefinition::new(
             "spawn_agent",
-            "Spawn a new sub-agent to work on a task concurrently. The sub-agent runs independently and returns its result when done. Use roles (researcher, coder, writer) to specialize the agent.",
+            "Spawn a sub-agent to work on a task. By default returns immediately with an agent_id you can wait on later. Set blocking=true to wait in-line and receive the child's final result in the same turn. Pass tasks=[…] to fan out N children in parallel and collect all results. Use roles (researcher, coder, writer) to specialize the child.",
             json!({
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "The task/message to send to the sub-agent"
+                        "description": "The task/message to send to the sub-agent. Required unless 'tasks' is provided."
                     },
                     "role": {
                         "type": "string",
@@ -87,9 +87,29 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
                     "fork_context": {
                         "type": "boolean",
                         "description": "If true, copies current conversation history to the sub-agent"
+                    },
+                    "blocking": {
+                        "type": "boolean",
+                        "description": "If true, wait for the child to finish and return its result in this tool call (saves a round-trip vs spawn+wait_for_agent). Default: false."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Timeout for blocking mode or batch mode. Defaults to the configured agents.delegate_timeout_secs."
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "description": "Batch mode: list of independent tasks to fan out in parallel. When set, 'message' is ignored and the call always blocks until all children finish.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string"},
+                                "role": {"type": "string"},
+                                "model": {"type": "string"}
+                            },
+                            "required": ["goal"]
+                        }
                     }
-                },
-                "required": ["message"]
+                }
             }),
         ));
 
@@ -135,24 +155,136 @@ pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefin
     defs
 }
 
+/// Compose the effective child-tool blocklist for a delegated sub-agent:
+/// the default delegate blocklist, unioned with every mutating tool when
+/// the parent is in Plan collaboration mode. Called on every `spawn_agent`
+/// dispatch so children can never bypass plan-mode safety.
+pub fn assemble_delegate_blocklist(parent_config: &crate::config::Config) -> Vec<&'static str> {
+    let mut blocklist: Vec<&'static str> = AgentControl::DELEGATE_DEFAULT_BLOCKLIST.to_vec();
+    if parent_config
+        .conversation
+        .collaboration_mode
+        .blocks_mutations()
+    {
+        for tool in crate::agent::mutating_tool_names() {
+            if !blocklist.contains(tool) {
+                blocklist.push(tool);
+            }
+        }
+    }
+    blocklist
+}
+
 /// Handle the spawn_agent tool call.
+///
+/// Dispatches to one of three modes:
+/// - **Batch** (`tasks` array present): fan out N children in parallel, wait
+///   for all, return an ordered `results` array.
+/// - **Blocking** (`blocking: true`): spawn one child, wait for it, and
+///   return its result in the same tool call.
+/// - **Fire-and-forget** (default): spawn and return an `agent_id` the
+///   parent can wait on later via `wait_for_agent`.
+///
+/// In all modes the child's tool set is filtered through
+/// [`AgentControl::DELEGATE_DEFAULT_BLOCKLIST`] so children can't delegate
+/// further, prompt the user, or mutate long-term memory behind the parent's
+/// back. When the parent is in Plan collaboration mode, the blocklist is
+/// also unioned with every mutating tool so children inherit the same
+/// read-only guarantee.
 pub async fn handle_spawn_agent(
     args: &serde_json::Value,
     agent_control: &mut AgentControl,
     parent_config: &crate::config::Config,
     parent_history: Option<&[crate::types::Message]>,
 ) -> Result<String> {
-    let message = require_str_param(args, "message")?;
     let role_name = args["role"].as_str();
     let nickname = args["nickname"].as_str();
     let model_override = args["model"].as_str();
     let fork_context = args["fork_context"].as_bool().unwrap_or(false);
+    let blocking = args["blocking"].as_bool().unwrap_or(false);
+    let timeout_secs = args["timeout_secs"]
+        .as_u64()
+        .unwrap_or(parent_config.agents.delegate_timeout_secs);
+    let batch_tasks = args.get("tasks").and_then(|v| v.as_array());
 
+    let blocklist = assemble_delegate_blocklist(parent_config);
+
+    // Batch mode — wins over single-task inputs. `blocking` is ignored here
+    // (batch always blocks until every child finishes).
+    if let Some(tasks_json) = batch_tasks {
+        if tasks_json.is_empty() {
+            anyhow::bail!(
+                "tasks array must be non-empty (got []). Use 'message' for a single task."
+            );
+        }
+        if blocking {
+            tracing::debug!("spawn_agent: 'blocking' ignored; batch mode always blocks");
+        }
+        let mut tasks: Vec<super::DelegatedTask> = Vec::with_capacity(tasks_json.len());
+        for (i, t) in tasks_json.iter().enumerate() {
+            let goal = t
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("tasks[{i}] missing required 'goal' string"))?
+                .to_string();
+            tasks.push(super::DelegatedTask {
+                goal,
+                role_name: t.get("role").and_then(|v| v.as_str()).map(str::to_string),
+                model_override: t.get("model").and_then(|v| v.as_str()).map(str::to_string),
+            });
+        }
+
+        let completions = agent_control
+            .spawn_batch_and_wait(tasks, parent_config, Some(&blocklist), timeout_secs)
+            .await?;
+        let results: Vec<serde_json::Value> = completions
+            .iter()
+            .map(|c| {
+                json!({
+                    "agent_id": c.agent_id,
+                    "nickname": c.nickname,
+                    "status": c.status.as_str(),
+                    "result": c.final_response,
+                })
+            })
+            .collect();
+        return Ok(json!({
+            "mode": "batch",
+            "count": results.len(),
+            "results": results,
+        })
+        .to_string());
+    }
+
+    let message = require_str_param(args, "message")?;
     let role = role_name.and_then(roles::load_role);
-
     let context = if fork_context { parent_history } else { None };
 
-    let (agent_id, nickname) = agent_control
+    if blocking {
+        let completion = agent_control
+            .spawn_and_wait(
+                message,
+                role,
+                nickname,
+                model_override,
+                parent_config,
+                context,
+                Some(&blocklist),
+                timeout_secs,
+            )
+            .await?;
+        return Ok(json!({
+            "mode": "blocking",
+            "agent_id": completion.agent_id,
+            "nickname": completion.nickname,
+            "status": completion.status.as_str(),
+            "result": completion.final_response,
+        })
+        .to_string());
+    }
+
+    // Fire-and-forget (default, backward-compatible).
+    let (agent_id, chosen_nickname) = agent_control
         .spawn_agent(
             message,
             role,
@@ -160,12 +292,14 @@ pub async fn handle_spawn_agent(
             model_override,
             parent_config,
             context,
+            Some(&blocklist),
         )
         .await?;
 
     Ok(json!({
+        "mode": "spawned",
         "agent_id": agent_id,
-        "nickname": nickname,
+        "nickname": chosen_nickname,
         "status": "spawned"
     })
     .to_string())
@@ -343,10 +477,12 @@ mod tests {
         assert!(spawn.is_some(), "spawn_agent should be in tool definitions");
         let spawn = spawn.unwrap();
         let params = &spawn.function.parameters;
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("message")));
+        // `message` is still the primary input and should be described, but
+        // it's no longer strictly required (tasks[] can replace it in batch
+        // mode). Runtime validation in handle_spawn_agent enforces exactly
+        // one of the two is supplied.
+        let props = &params["properties"];
+        assert!(props.get("message").is_some(), "message must be described");
     }
 
     #[test]
@@ -389,6 +525,103 @@ mod tests {
         let result = handle_spawn_agent(&args, &mut ctrl, &parent_config, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("message"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_spawn_agent_batch_missing_goal_is_error() {
+        let config = crate::config::MultiAgentConfig::default();
+        let mut ctrl = AgentControl::new(&config, "session-1", 0);
+        let parent_config = crate::config::Config::default();
+        // Batch with a task that's missing the required `goal` field.
+        let args = json!({"tasks": [{"role": "researcher"}]});
+        let result = handle_spawn_agent(&args, &mut ctrl, &parent_config, None).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("goal"), "expected 'goal' error, got: {err}");
+    }
+
+    #[test]
+    fn assemble_delegate_blocklist_default_mode_is_just_defaults() {
+        // In Default collaboration mode, only the delegate defaults apply.
+        let cfg = crate::config::Config::default();
+        let blocklist = assemble_delegate_blocklist(&cfg);
+        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
+            assert!(blocklist.contains(banned), "defaults must include {banned}");
+        }
+        // Mutating tools that aren't in the default set should NOT be present
+        // — e.g. run_shell is mutating but allowed outside Plan mode.
+        assert!(
+            !blocklist.contains(&"run_shell"),
+            "run_shell should not be blocked outside Plan mode"
+        );
+        assert!(
+            !blocklist.contains(&"apply_patch"),
+            "apply_patch should not be blocked outside Plan mode"
+        );
+    }
+
+    #[test]
+    fn assemble_delegate_blocklist_plan_mode_unions_mutating_tools() {
+        // In Plan mode, the child inherits the parent's read-only guarantee:
+        // every mutating tool is added on top of the delegate defaults.
+        let mut cfg = crate::config::Config::default();
+        cfg.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
+        let blocklist = assemble_delegate_blocklist(&cfg);
+        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
+            assert!(
+                blocklist.contains(banned),
+                "defaults must still be present in Plan mode"
+            );
+        }
+        // Pick a handful of representative mutating tools that must be added.
+        for extra in [
+            "run_shell",
+            "apply_patch",
+            "apply_skill_patch",
+            "generate_image",
+            "browser",
+        ] {
+            assert!(
+                blocklist.contains(&extra),
+                "Plan mode must block '{extra}' from children"
+            );
+        }
+        // No duplicates — the union dedupes.
+        let mut unique = blocklist.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), blocklist.len(), "blocklist has duplicates");
+    }
+
+    #[test]
+    fn test_spawn_agent_schema_exposes_blocking_and_tasks() {
+        let defs = tool_definitions(0, 1);
+        let spawn = defs
+            .iter()
+            .find(|d| d.function.name == "spawn_agent")
+            .expect("spawn_agent should exist at depth 0");
+        let props = &spawn.function.parameters["properties"];
+        assert!(
+            props.get("blocking").is_some(),
+            "spawn_agent schema must expose 'blocking' parameter"
+        );
+        assert!(
+            props.get("tasks").is_some(),
+            "spawn_agent schema must expose 'tasks' parameter for batch mode"
+        );
+        assert!(
+            props.get("timeout_secs").is_some(),
+            "spawn_agent schema must expose 'timeout_secs' parameter"
+        );
+        // `message` is now optional (tasks can replace it), so it must not
+        // appear in `required` anymore.
+        let required = spawn.function.parameters.get("required");
+        if let Some(r) = required.and_then(|v| v.as_array()) {
+            assert!(
+                !r.iter().any(|v| v == "message"),
+                "'message' must not be a required field (tasks[] can replace it)"
+            );
+        }
     }
 
     #[test]

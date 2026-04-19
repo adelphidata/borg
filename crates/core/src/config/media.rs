@@ -673,6 +673,9 @@ pub struct MultiAgentConfig {
     pub max_children_per_agent: u32,
     /// Maximum sub-agents running concurrently.
     pub max_concurrent: u32,
+    /// Default timeout (seconds) used by `spawn_agent` in blocking and batch
+    /// modes when the caller does not supply `timeout_secs`.
+    pub delegate_timeout_secs: u64,
 }
 
 impl Default for MultiAgentConfig {
@@ -682,6 +685,7 @@ impl Default for MultiAgentConfig {
             max_spawn_depth: 1,
             max_children_per_agent: 5,
             max_concurrent: 3,
+            delegate_timeout_secs: 600,
         }
     }
 }

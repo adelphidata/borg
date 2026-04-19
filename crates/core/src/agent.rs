@@ -3289,6 +3289,34 @@ fn is_mutating_tool(name: &str) -> bool {
     )
 }
 
+/// Names of every tool that [`is_mutating_tool`] considers mutating.
+///
+/// Kept in sync with that function so callers (e.g. sub-agent delegation in
+/// Plan mode) can union this list into a child's tool blocklist without
+/// having to iterate every possible tool name themselves.
+pub fn mutating_tool_names() -> &'static [&'static str] {
+    &[
+        "apply_patch",
+        "apply_skill_patch",
+        "browser",
+        "close_agent",
+        "create_channel",
+        "generate_image",
+        "manage_cron",
+        "manage_roles",
+        "manage_tasks",
+        "projects",
+        "request_user_input",
+        "run_shell",
+        "schedule",
+        "send_to_agent",
+        "spawn_agent",
+        "text_to_speech",
+        "wait_for_agent",
+        "write_memory",
+    ]
+}
+
 fn classify_action(tool_name: &str) -> ActionType {
     match tool_name {
         "run_shell" => ActionType::ShellCommand,

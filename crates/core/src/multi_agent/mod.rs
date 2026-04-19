@@ -115,6 +115,17 @@ pub struct SubAgentInfo {
     pub created_at: i64,
 }
 
+/// One unit of work for `spawn_batch_and_wait`.
+#[derive(Debug, Clone)]
+pub struct DelegatedTask {
+    /// Task description sent to the child as its initial user message.
+    pub goal: String,
+    /// Optional role name (looked up via `roles::load_role`).
+    pub role_name: Option<String>,
+    /// Optional model override for this specific child.
+    pub model_override: Option<String>,
+}
+
 /// Result delivered from a sub-agent to its parent.
 #[derive(Debug, Clone)]
 pub struct SubAgentCompletion {
@@ -278,7 +289,26 @@ impl AgentControl {
         Ok(())
     }
 
+    /// Default blocklist for tools that a delegated sub-agent should never
+    /// be given, regardless of what the role's allowlist looks like. Keeps
+    /// children from delegating further, asking the user mid-task, or
+    /// mutating long-term memory behind the parent's back.
+    pub const DELEGATE_DEFAULT_BLOCKLIST: &'static [&'static str] = &[
+        "spawn_agent",
+        "wait_for_agent",
+        "close_agent",
+        "manage_roles",
+        "request_user_input",
+        "write_memory",
+    ];
+
     /// Spawn a new sub-agent. Returns (agent_id, nickname).
+    ///
+    /// `tools_blocklist` takes precedence over any role allowlist: names in
+    /// the blocklist are stripped from the effective tool filter. When a
+    /// blocklist is provided and the role has no allowlist, the effective
+    /// filter becomes `parent_tools - blocklist`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_agent(
         &mut self,
         message: &str,
@@ -287,6 +317,7 @@ impl AgentControl {
         model_override: Option<&str>,
         parent_config: &Config,
         fork_context: Option<&[crate::types::Message]>,
+        tools_blocklist: Option<&[&str]>,
     ) -> Result<(String, String)> {
         // Validate limits
         self.validate_spawn_limits()?;
@@ -330,7 +361,7 @@ impl AgentControl {
         let fork_context_owned: Option<Vec<crate::types::Message>> =
             fork_context.map(<[crate::types::Message]>::to_vec);
         let agents_config = parent_config.agents.clone();
-        let tools_filter = role.as_ref().and_then(|r| r.tools_allowed.clone());
+        let tools_filter = compute_tools_filter(role.as_ref(), tools_blocklist, parent_config);
 
         let join_handle = tokio::spawn(async move {
             // Acquire semaphore permit
@@ -546,6 +577,106 @@ impl AgentControl {
         }
     }
 
+    /// Spawn a sub-agent, block until it finishes, and return the completion.
+    ///
+    /// Collapses the common `spawn_agent` → `wait_for_agent` pattern into a
+    /// single in-loop call so the LLM doesn't burn a round-trip to start and
+    /// then wait. Honors the same limits and tool filtering as `spawn_agent`
+    /// (including the `tools_blocklist`). Returns whatever completion the
+    /// child emits — including partial results for max-iteration/error/
+    /// shutdown cases — rather than surfacing those as Rust errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_and_wait(
+        &mut self,
+        message: &str,
+        role: Option<AgentRole>,
+        nickname: Option<&str>,
+        model_override: Option<&str>,
+        parent_config: &Config,
+        fork_context: Option<&[crate::types::Message]>,
+        tools_blocklist: Option<&[&str]>,
+        timeout_secs: u64,
+    ) -> Result<SubAgentCompletion> {
+        let (agent_id, _nickname) = self
+            .spawn_agent(
+                message,
+                role,
+                nickname,
+                model_override,
+                parent_config,
+                fork_context,
+                tools_blocklist,
+            )
+            .await?;
+        self.wait_for_agent(&agent_id, timeout_secs).await
+    }
+
+    /// Batch-spawn multiple tasks in parallel, wait for all of them, and
+    /// return completions in the same order as the input tasks.
+    ///
+    /// Parallelism is naturally bounded by the controller's semaphore
+    /// (`max_concurrent`). Completions arrive on the shared channel in
+    /// whatever order the children finish; the returned `Vec` is reordered
+    /// so index `i` matches `tasks[i]`. Tasks whose spawn fails return
+    /// `SubAgentStatus::Errored` rather than aborting the batch.
+    pub async fn spawn_batch_and_wait(
+        &mut self,
+        tasks: Vec<DelegatedTask>,
+        parent_config: &Config,
+        tools_blocklist: Option<&[&str]>,
+        timeout_secs: u64,
+    ) -> Result<Vec<SubAgentCompletion>> {
+        // Phase 1: spawn each task, remembering which index produced which
+        // agent_id (or a synthetic error completion if the spawn itself
+        // failed — e.g. the child limit was already saturated).
+        let mut agent_ids: Vec<std::result::Result<String, SubAgentCompletion>> =
+            Vec::with_capacity(tasks.len());
+        for (i, task) in tasks.iter().enumerate() {
+            let role = task.role_name.as_deref().and_then(roles::load_role);
+            match self
+                .spawn_agent(
+                    &task.goal,
+                    role,
+                    None,
+                    task.model_override.as_deref(),
+                    parent_config,
+                    None,
+                    tools_blocklist,
+                )
+                .await
+            {
+                Ok((id, _)) => agent_ids.push(Ok(id)),
+                Err(e) => agent_ids.push(Err(SubAgentCompletion {
+                    // Use diagnosable sentinels so JSON output is clearly
+                    // identifiable as a spawn-failure row rather than looking
+                    // like a real child that never started.
+                    agent_id: format!("spawn-failed-{i}"),
+                    nickname: format!("task-{i}"),
+                    status: SubAgentStatus::Errored {
+                        error: format!("spawn failed: {e}"),
+                    },
+                    final_response: None,
+                })),
+            }
+        }
+
+        // Phase 2: wait for each spawned child in turn. `wait_for_agent`
+        // drains completions from the shared channel and buffers
+        // out-of-order arrivals so iterating in spawn-order is correct.
+        let mut completions: Vec<SubAgentCompletion> = Vec::with_capacity(agent_ids.len());
+        for entry in agent_ids {
+            match entry {
+                Ok(agent_id) => {
+                    let completion = self.wait_for_agent(&agent_id, timeout_secs).await?;
+                    completions.push(completion);
+                }
+                Err(err_completion) => completions.push(err_completion),
+            }
+        }
+
+        Ok(completions)
+    }
+
     /// Returns true if no sub-agents have been spawned.
     pub fn is_empty(&self) -> bool {
         self.agents.is_empty()
@@ -585,6 +716,55 @@ impl AgentControl {
 impl Drop for AgentControl {
     fn drop(&mut self) {
         self.shutdown_all();
+    }
+}
+
+/// Compute the effective `tools_allowed` filter for a new sub-agent.
+///
+/// Rules:
+/// - If both the role's `tools_allowed` and `blocklist` are `None`, the
+///   result is `None` (inherit all parent tools).
+/// - If a `blocklist` is provided:
+///     - When the role has an allowlist, the result is
+///       `role_allowlist - blocklist` (blocklist wins on conflict).
+///     - When the role has no allowlist, the result is
+///       `parent_enabled_tools - blocklist` — this prevents the child from
+///       inheriting access to tools the parent explicitly blocked.
+/// - If only an allowlist is present, it's returned as-is.
+fn compute_tools_filter(
+    role: Option<&AgentRole>,
+    blocklist: Option<&[&str]>,
+    parent_config: &Config,
+) -> Option<Vec<String>> {
+    let allowlist = role.and_then(|r| r.tools_allowed.clone());
+    match (allowlist, blocklist) {
+        (None, None) => None,
+        (Some(allow), None) => Some(allow),
+        (Some(allow), Some(block)) => {
+            let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
+            Some(
+                allow
+                    .into_iter()
+                    .filter(|t| !block_set.contains(t.as_str()))
+                    .collect(),
+            )
+        }
+        (None, Some(block)) => {
+            // Enumerate the full parent tool surface: core tools + any
+            // multi-agent tools the parent can see at its current depth.
+            // Without unioning multi-agent here, children would silently lose
+            // access to e.g. `wait_for_agent` even if a caller deliberately
+            // removed it from the blocklist — a confusing invariant to debug.
+            let mut parent_tools = crate::tool_definitions::core_tool_definitions(parent_config);
+            parent_tools.extend(tools::tool_definitions(0, u32::MAX));
+            let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
+            let filtered: Vec<String> = parent_tools
+                .into_iter()
+                .map(|t| t.function.name)
+                .filter(|name| !block_set.contains(name.as_str()))
+                .collect();
+            Some(filtered)
+        }
     }
 }
 
@@ -717,6 +897,7 @@ mod tests {
             max_spawn_depth: 1,
             max_children_per_agent: 5,
             max_concurrent: 3,
+            delegate_timeout_secs: 60,
         }
     }
 
@@ -791,12 +972,13 @@ mod tests {
             max_spawn_depth: 1,
             max_children_per_agent: 5,
             max_concurrent: 3,
+            delegate_timeout_secs: 60,
         };
         // current_depth=1 means we're already at the limit
         let mut ctrl = AgentControl::new(&config, "session-1", 1);
         let parent_config = Config::default();
         let result = ctrl
-            .spawn_agent("test", None, None, None, &parent_config, None)
+            .spawn_agent("test", None, None, None, &parent_config, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("max spawn depth"));
@@ -809,11 +991,12 @@ mod tests {
             max_spawn_depth: 2,
             max_children_per_agent: 0, // no children allowed
             max_concurrent: 3,
+            delegate_timeout_secs: 60,
         };
         let mut ctrl = AgentControl::new(&config, "session-1", 0);
         let parent_config = Config::default();
         let result = ctrl
-            .spawn_agent("test", None, None, None, &parent_config, None)
+            .spawn_agent("test", None, None, None, &parent_config, None, None)
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("max children"));
@@ -892,6 +1075,7 @@ mod tests {
             max_spawn_depth: 2,
             max_children_per_agent: 5,
             max_concurrent: 3,
+            delegate_timeout_secs: 60,
         };
         // At depth 2 with max_spawn_depth=2, should fail
         let ctrl = AgentControl::new(&config, "session-1", 2);
@@ -1041,5 +1225,158 @@ mod tests {
         let config = test_config();
         let ctrl = AgentControl::new(&config, "session-1", 0);
         assert!(ctrl.get_status("nonexistent").is_none());
+    }
+
+    // -- delegate + batch --
+
+    #[test]
+    fn delegate_blocklist_applied_without_role_produces_filtered_allowlist() {
+        let parent = Config::default();
+        let filter = compute_tools_filter(
+            None,
+            Some(AgentControl::DELEGATE_DEFAULT_BLOCKLIST),
+            &parent,
+        );
+        let allowed = filter.expect("blocklist without role should yield a filter");
+        // Every blocklisted name must be absent.
+        for banned in AgentControl::DELEGATE_DEFAULT_BLOCKLIST {
+            assert!(
+                !allowed.iter().any(|t| t == *banned),
+                "blocked tool '{banned}' leaked into the allowlist"
+            );
+        }
+        // And we should still have a non-trivial set — at minimum read_file
+        // must survive the filter.
+        assert!(
+            allowed.iter().any(|t| t == "read_file"),
+            "read_file should survive the blocklist"
+        );
+    }
+
+    #[test]
+    fn delegate_blocklist_with_role_allowlist_intersects() {
+        let role = AgentRole {
+            name: "test".to_string(),
+            description: "".to_string(),
+            model: None,
+            provider: None,
+            temperature: None,
+            system_instructions: None,
+            tools_allowed: Some(vec![
+                "read_file".to_string(),
+                "write_memory".to_string(),
+                "run_shell".to_string(),
+            ]),
+            max_iterations: None,
+        };
+        let parent = Config::default();
+        let filter = compute_tools_filter(
+            Some(&role),
+            Some(AgentControl::DELEGATE_DEFAULT_BLOCKLIST),
+            &parent,
+        );
+        let allowed = filter.unwrap();
+        assert!(allowed.contains(&"read_file".to_string()));
+        assert!(allowed.contains(&"run_shell".to_string()));
+        assert!(
+            !allowed.contains(&"write_memory".to_string()),
+            "write_memory (blocked) must be removed even though the role allowed it"
+        );
+    }
+
+    #[test]
+    fn delegate_no_filters_returns_none() {
+        let parent = Config::default();
+        let filter = compute_tools_filter(None, None, &parent);
+        assert!(
+            filter.is_none(),
+            "no role allowlist and no blocklist = inherit all"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_agent_returns_completion_shape() {
+        // Exercises the wait-side of `spawn_and_wait` in isolation: we can't
+        // reach the full spawn_and_wait path without an LLM, but this
+        // confirms the completion the caller eventually receives carries the
+        // expected `agent_id`/`status`/`final_response` shape.
+        let config = test_config();
+        let mut ctrl = AgentControl::new(&config, "session-1", 0);
+        let tx = ctrl.test_completion_tx();
+        ctrl.insert_mock_handle("agent-x", "Atlas");
+        tx.send(SubAgentCompletion {
+            agent_id: "agent-x".to_string(),
+            nickname: "Atlas".to_string(),
+            status: SubAgentStatus::Completed {
+                result: "all done".to_string(),
+            },
+            final_response: Some("all done".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let completion = ctrl.wait_for_agent("agent-x", 5).await.unwrap();
+        assert_eq!(completion.agent_id, "agent-x");
+        assert_eq!(completion.status.as_str(), "completed");
+        assert_eq!(completion.final_response.as_deref(), Some("all done"));
+    }
+
+    #[test]
+    fn mutating_tool_names_covers_every_non_readonly_tool() {
+        // Guard: every tool surfaced to the LLM must be classified by
+        // `is_mutating_tool` (via its read-only allowlist) OR appear in
+        // `mutating_tool_names()`. If this test fails, a newly-added tool
+        // is silently escaping Plan-mode's child blocklist.
+        let parent = Config::default();
+        let mut all: Vec<String> = crate::tool_definitions::core_tool_definitions(&parent)
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        all.extend(
+            tools::tool_definitions(0, u32::MAX)
+                .into_iter()
+                .map(|t| t.function.name),
+        );
+        // `is_mutating_tool`'s read-only allowlist (kept in sync by
+        // construction — these are the names listed in agent.rs).
+        let readonly: std::collections::HashSet<&str> = [
+            "read_file",
+            "list_dir",
+            "list",
+            "list_skills",
+            "list_channels",
+            "list_agents",
+            "read_memory",
+            "memory_search",
+            "web_fetch",
+            "web_search",
+        ]
+        .into_iter()
+        .collect();
+        let mutating: std::collections::HashSet<&str> = crate::agent::mutating_tool_names()
+            .iter()
+            .copied()
+            .collect();
+        let mut missing: Vec<String> = Vec::new();
+        for name in &all {
+            if !readonly.contains(name.as_str()) && !mutating.contains(name.as_str()) {
+                missing.push(name.clone());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "mutating_tool_names() is missing: {missing:?}. Add them or classify as read-only."
+        );
+    }
+
+    #[test]
+    fn delegated_task_round_trip() {
+        let t = DelegatedTask {
+            goal: "summarize this".into(),
+            role_name: Some("researcher".into()),
+            model_override: None,
+        };
+        assert_eq!(t.goal, "summarize this");
+        assert_eq!(t.role_name.as_deref(), Some("researcher"));
     }
 }
