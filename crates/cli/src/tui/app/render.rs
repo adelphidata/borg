@@ -386,22 +386,30 @@ impl<'a> App<'a> {
 
 /// Format the value portion of the `class:` ambient header line.
 ///
-/// Shape: `{name_level} — {Archetype} ({mood})`. The `— {Archetype}` segment
-/// is elided when no dominant archetype is set. The archetype is title-cased
-/// to match the existing legacy `format_compact` styling.
+/// Shape: `{name} [the {Archetype}] Lv.{level} ({mood})`. Pre-evolution
+/// (`evolution_name` is `None`), `{name}` is the literal `"Base Borg"` and
+/// the archetype epithet is suppressed entirely — archetype only attaches
+/// to a real evolved name. Archetype is title-cased to match the legacy
+/// `format_compact` styling.
 pub(super) fn format_ambient_header(status: &super::AmbientStatus) -> String {
-    let mut out = status.name_level.clone();
-    if let Some(arch) = status.archetype {
-        let arch_str = arch.to_string();
-        let mut chars = arch_str.chars();
-        let titled = match chars.next() {
-            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-            None => String::new(),
-        };
-        out.push_str(" \u{2014} ");
-        out.push_str(&titled);
+    let mut out = String::new();
+    match status.evolution_name.as_deref() {
+        Some(name) => {
+            out.push_str(name);
+            if let Some(arch) = status.archetype {
+                let arch_str = arch.to_string();
+                let mut chars = arch_str.chars();
+                let titled = match chars.next() {
+                    Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                };
+                out.push_str(" the ");
+                out.push_str(&titled);
+            }
+        }
+        None => out.push_str("Base Borg"),
     }
-    out.push_str(&format!(" ({})", status.mood));
+    out.push_str(&format!(" Lv.{} ({})", status.level, status.mood));
     out
 }
 
@@ -519,35 +527,58 @@ mod tests {
     use super::super::AmbientStatus;
     use borg_core::evolution::{Archetype, Mood};
 
-    fn mk_ambient(mood: Mood, arch: Option<Archetype>) -> AmbientStatus {
+    fn mk_ambient(
+        name: Option<&str>,
+        level: u8,
+        mood: Mood,
+        arch: Option<Archetype>,
+    ) -> AmbientStatus {
         AmbientStatus {
-            name_level: "Base Borg Lv.1".to_string(),
+            evolution_name: name.map(String::from),
+            level,
             mood,
             archetype: arch,
         }
     }
 
     #[test]
-    fn ambient_header_with_archetype() {
-        let s = mk_ambient(Mood::Focused, Some(Archetype::Builder));
-        assert_eq!(
-            format_ambient_header(&s),
-            "Base Borg Lv.1 \u{2014} Builder (focused)"
-        );
+    fn ambient_header_pre_evolution_hides_archetype() {
+        let s = mk_ambient(None, 1, Mood::Stable, Some(Archetype::Builder));
+        assert_eq!(format_ambient_header(&s), "Base Borg Lv.1 (stable)");
     }
 
     #[test]
-    fn ambient_header_omits_archetype_when_none() {
-        let s = mk_ambient(Mood::Drifting, None);
+    fn ambient_header_pre_evolution_no_archetype() {
+        let s = mk_ambient(None, 1, Mood::Drifting, None);
         assert_eq!(format_ambient_header(&s), "Base Borg Lv.1 (drifting)");
     }
 
     #[test]
-    fn ambient_header_mood_trails_in_parens() {
-        let s = mk_ambient(Mood::Stable, Some(Archetype::Ops));
+    fn ambient_header_post_evolution_with_archetype() {
+        let s = mk_ambient(
+            Some("Oppenborger"),
+            5,
+            Mood::Focused,
+            Some(Archetype::Builder),
+        );
         assert_eq!(
             format_ambient_header(&s),
-            "Base Borg Lv.1 \u{2014} Ops (stable)"
+            "Oppenborger the Builder Lv.5 (focused)"
+        );
+    }
+
+    #[test]
+    fn ambient_header_post_evolution_no_archetype() {
+        let s = mk_ambient(Some("Oppenborger"), 5, Mood::Focused, None);
+        assert_eq!(format_ambient_header(&s), "Oppenborger Lv.5 (focused)");
+    }
+
+    #[test]
+    fn ambient_header_mood_trails_in_parens() {
+        let s = mk_ambient(Some("Oppenborger"), 2, Mood::Stable, Some(Archetype::Ops));
+        assert_eq!(
+            format_ambient_header(&s),
+            "Oppenborger the Ops Lv.2 (stable)"
         );
     }
 
@@ -561,7 +592,7 @@ mod tests {
             Mood::Drifting,
             Mood::Ascending,
         ] {
-            let s = mk_ambient(mood, None);
+            let s = mk_ambient(None, 1, mood, None);
             let line = format_ambient_header(&s);
             assert!(
                 line.contains(&mood.to_string()),
