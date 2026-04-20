@@ -3,6 +3,12 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/borganization/borg"
+homepage = "https://github.com/borganization/borg"
+readme = "README.md"
+authors = ["Borg Contributors"]
+rust-version = "1.87"
+keywords = ["ai", "assistant", "agent", "llm", "cli"]
+categories = ["command-line-utilities"]
 
 [workspace]
 resolver = "2"

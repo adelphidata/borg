@@ -23,9 +23,9 @@ Thanks for your interest in contributing! This guide will help you get set up an
    ```sh
    ./target/release/borg init
    ```
-7. Set up git hooks:
+7. Install git hooks (requires [lefthook](https://lefthook.dev/): `brew install lefthook` or `cargo install lefthook`):
    ```sh
-   git config core.hooksPath .githooks
+   lefthook install
    ```
 
 **Auto-rebuild on file changes** (install `cargo-watch` first with `cargo install cargo-watch --locked`):
@@ -35,14 +35,13 @@ cargo watch -x 'build --bin borg'
 
 ## Project Structure
 
-Borg is a Cargo workspace with 8 crates:
+Borg is a Cargo workspace with 7 crates:
 
 | Crate | Purpose |
 |-------|---------|
 | `crates/cli` | Binary: REPL, clap args, TUI, onboarding |
 | `crates/core` | Library: agent loop, LLM client, memory, config |
 | `crates/heartbeat` | Library: proactive scheduler with quiet hours |
-| `crates/tools` | Library: tool manifest parsing, registry, executor |
 | `crates/sandbox` | Library: macOS Seatbelt + Linux Bubblewrap policies |
 | `crates/apply-patch` | Library: patch DSL parser + filesystem applicator |
 | `crates/gateway` | Library: webhook gateway for messaging channels |
@@ -64,7 +63,7 @@ cargo test -p borg-plugins         # plugin tests
 
 - Run `cargo fmt` before committing
 - Run `cargo clippy -- -D warnings` and fix any warnings
-- The pre-commit hook checks both automatically
+- The lefthook `pre-commit` hook runs both in parallel; `pre-push` runs the full test suite
 
 ## Making Changes
 
