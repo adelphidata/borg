@@ -235,6 +235,72 @@ impl Database {
         let count = stmt.raw_execute()?;
         Ok(count)
     }
+
+    /// FTS5 search over past session messages. Returns matches ordered by
+    /// BM25 relevance. `MessageFtsHit` carries the session_id so the caller
+    /// can fetch surrounding context if desired.
+    ///
+    /// Query is passed through a minimal sanitizer: strips FTS5 operators
+    /// that could cause parse errors and quotes each word for phrase safety.
+    pub fn messages_fts_search(&self, query: &str, limit: usize) -> Result<Vec<MessageFtsHit>> {
+        let sanitized = sanitize_messages_fts_query(query);
+        if sanitized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.session_id, m.role, m.content, m.created_at,
+                    -bm25(messages_fts) AS score
+             FROM messages_fts
+             JOIN messages m ON m.id = messages_fts.rowid
+             WHERE messages_fts MATCH ?1
+             ORDER BY score DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![sanitized, limit as i64], |row| {
+                Ok(MessageFtsHit {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    created_at: row.get(4)?,
+                    score: row.get::<_, f64>(5)? as f32,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// A single FTS hit from `messages_fts`.
+#[derive(Debug, Clone)]
+pub struct MessageFtsHit {
+    pub id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: i64,
+    pub score: f32,
+}
+
+/// Strip FTS5 syntax characters that would cause a parse error, then quote
+/// each word to match it as a literal phrase fragment. Kept narrower than the
+/// `memory_chunks` sanitizer because session messages aren't chunked — we
+/// only need to handle arbitrary user queries safely.
+fn sanitize_messages_fts_query(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| match c {
+            '"' | '(' | ')' | ':' | '*' | '^' => ' ',
+            c => c,
+        })
+        .collect();
+    let words: Vec<String> = cleaned
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .map(|w| format!("\"{w}\""))
+        .collect();
+    words.join(" ")
 }
 
 #[cfg(test)]

@@ -1236,4 +1236,50 @@ impl Database {
 
         Ok(())
     }
+
+    /// V35: FTS5 over `messages` so the agent can search raw session transcripts
+    /// with `memory_search sources=["sessions"]`.
+    ///
+    /// Mirrors the V12 pattern for `memory_chunks_fts`: content-sourced virtual
+    /// table + INSERT/UPDATE/DELETE triggers. Backfills existing rows so pre-V35
+    /// sessions become searchable immediately.
+    pub(super) fn migrate_v35(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                session_id UNINDEXED,
+                role UNINDEXED,
+                content,
+                content='messages',
+                content_rowid='id'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, session_id, role, content)
+                VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
+                VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
+                VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
+                INSERT INTO messages_fts(rowid, session_id, role, content)
+                VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
+            END;
+            ",
+        )?;
+
+        // Backfill any rows that existed before V35 — triggers only fire on
+        // new DML. `rebuild` re-derives the full FTS index from the content
+        // table (external-content FTS5), which is idempotent and cheap on a
+        // fresh index. NULL/empty content rows harmlessly index as empty.
+        self.conn.execute(
+            "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')",
+            [],
+        )?;
+
+        Ok(())
+    }
 }

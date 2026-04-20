@@ -5,11 +5,16 @@ use crate::provider::Provider;
 
 // ── Error classification ──
 
-/// Why a provider failed — used for cooldown duration calculation.
+/// Why a provider failed — drives cooldown duration, key rotation, failover,
+/// and reactive recovery decisions (compaction, payload shrink).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailoverReason {
-    /// Authentication or authorization failure (401/403).
+    /// Authentication failure that may be a bad key — rotating to another key
+    /// in the pool could recover (401).
     Auth,
+    /// Authorization denied in a way rotating keys won't fix (403) — account
+    /// disabled, org-level policy, model gated behind entitlement.
+    AuthPermanent,
     /// Billing or quota exhaustion (402).
     Billing,
     /// Too many requests (429).
@@ -18,8 +23,17 @@ pub enum FailoverReason {
     Overloaded,
     /// Network timeout or connection failure.
     Timeout,
-    /// Malformed request (400).
+    /// Malformed request with no useful recovery path (400 without
+    /// context/payload keywords).
     Format,
+    /// Request body exceeds the model's context window — compaction before
+    /// retry is the recovery path.
+    ContextOverflow,
+    /// Request body exceeds the transport payload cap (413).
+    PayloadTooLarge,
+    /// The requested model id isn't available on this provider (404 with
+    /// "model" in the body) — fast-fail, don't retry.
+    ModelNotFound,
     /// Unclassified error.
     Unknown,
 }
@@ -28,11 +42,15 @@ impl fmt::Display for FailoverReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Auth => write!(f, "auth"),
+            Self::AuthPermanent => write!(f, "auth_permanent"),
             Self::Billing => write!(f, "billing"),
             Self::RateLimit => write!(f, "rate_limit"),
             Self::Overloaded => write!(f, "overloaded"),
             Self::Timeout => write!(f, "timeout"),
             Self::Format => write!(f, "format"),
+            Self::ContextOverflow => write!(f, "context_overflow"),
+            Self::PayloadTooLarge => write!(f, "payload_too_large"),
+            Self::ModelNotFound => write!(f, "model_not_found"),
             Self::Unknown => write!(f, "unknown"),
         }
     }
@@ -86,6 +104,45 @@ impl LlmError {
             Self::Interrupted => FailoverReason::Unknown,
         }
     }
+
+    /// True when the agent layer should compact conversation history and
+    /// retry the turn before propagating this error. Currently only set for
+    /// `ContextOverflow` — payload caps are a different recovery path.
+    pub fn should_compress(&self) -> bool {
+        matches!(self.reason(), FailoverReason::ContextOverflow)
+    }
+
+    /// True when rotating to another credential in the pool may recover.
+    /// `AuthPermanent` deliberately returns false — rotating won't help when
+    /// the account itself is denied.
+    pub fn should_rotate_credential(&self) -> bool {
+        matches!(
+            self.reason(),
+            FailoverReason::Auth | FailoverReason::RateLimit
+        )
+    }
+
+    /// True when, after retries and rotation fail, the agent should try the
+    /// next provider in the fallback chain. `ModelNotFound` and
+    /// `AuthPermanent` skip fallback — they're user-fixable, not transient.
+    pub fn should_fallback(&self) -> bool {
+        !matches!(
+            self.reason(),
+            FailoverReason::ModelNotFound | FailoverReason::AuthPermanent
+        )
+    }
+
+    /// True when the agent should surface the error immediately without
+    /// retrying or compacting — the request is structurally broken and
+    /// retrying would just burn tokens.
+    pub fn is_fast_fail(&self) -> bool {
+        matches!(
+            self.reason(),
+            FailoverReason::ModelNotFound
+                | FailoverReason::AuthPermanent
+                | FailoverReason::PayloadTooLarge
+        )
+    }
 }
 
 pub(crate) fn classify_status(
@@ -111,13 +168,29 @@ pub(crate) fn classify_status(
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
-        401 | 403 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned {status} (auth error): {body}"),
+        401 => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned 401 (auth error): {body}"),
             reason: FailoverReason::Auth,
+        },
+        403 => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {body}"),
+            reason: FailoverReason::AuthPermanent,
         },
         402 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned {status} (billing error): {body}"),
             reason: FailoverReason::Billing,
+        },
+        404 if body_mentions_model(body) => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned 404 (model not found): {body}"),
+            reason: FailoverReason::ModelNotFound,
+        },
+        413 => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned 413 (payload too large): {body}"),
+            reason: FailoverReason::PayloadTooLarge,
+        },
+        400 if body_indicates_context_overflow(body) => LlmError::Fatal {
+            source: anyhow::anyhow!("{provider} returned 400 (context overflow): {body}"),
+            reason: FailoverReason::ContextOverflow,
         },
         400 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned {status} (bad request): {body}"),
@@ -128,6 +201,81 @@ pub(crate) fn classify_status(
             reason: FailoverReason::Unknown,
         },
     }
+}
+
+/// Detect provider error bodies that signal the request exceeded the model's
+/// context window. Providers return 400 with varied phrasing; keep this
+/// conservative — a false positive would trigger an unnecessary compaction,
+/// but a false negative just degrades to the previous behavior (fatal error).
+fn body_indicates_context_overflow(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    // Common phrases across OpenAI, Anthropic, Gemini, OpenRouter, Groq.
+    const NEEDLES: &[&str] = &[
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "exceeds the maximum",
+        "exceeds context",
+        "token limit",
+    ];
+    NEEDLES.iter().any(|n| lower.contains(n))
+}
+
+/// True when a 404 body mentions the model, suggesting the model id itself is
+/// the problem rather than a generic routing 404.
+fn body_mentions_model(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("model")
+}
+
+/// Recover a `FailoverReason` from an error message string.
+///
+/// Used by the agent layer to make recovery decisions (e.g. reactive
+/// compaction) when the only available signal is the `StreamEvent::Error`
+/// payload — the typed error was already serialized by the time it crossed
+/// the stream channel.
+///
+/// Matches on both `classify_status`-produced markers (e.g. "context overflow")
+/// and raw provider phrases, for cases where the error came from outside the
+/// classifier (transport errors, upstream adapters).
+pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
+    let lower = msg.to_ascii_lowercase();
+
+    // Classifier-produced markers first — cheap exact substrings.
+    if lower.contains("(context overflow)") {
+        return Some(FailoverReason::ContextOverflow);
+    }
+    if lower.contains("(model not found)") {
+        return Some(FailoverReason::ModelNotFound);
+    }
+    if lower.contains("(payload too large)") {
+        return Some(FailoverReason::PayloadTooLarge);
+    }
+    if lower.contains("(auth permanent)") {
+        return Some(FailoverReason::AuthPermanent);
+    }
+
+    // Fallback: raw provider phrases (for errors that bypassed classify_status,
+    // e.g. Claude CLI adapter). Kept in sync with body_indicates_context_overflow.
+    const OVERFLOW_NEEDLES: &[&str] = &[
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+        "exceeds the maximum",
+        "exceeds context",
+        "token limit",
+    ];
+    if OVERFLOW_NEEDLES.iter().any(|n| lower.contains(n)) {
+        return Some(FailoverReason::ContextOverflow);
+    }
+
+    None
 }
 
 pub(crate) fn classify_network_error(err: anyhow::Error) -> LlmError {
@@ -279,14 +427,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_403_is_fatal_auth() {
+    fn classify_403_is_fatal_auth_permanent() {
         let err = classify_status(
             reqwest::StatusCode::FORBIDDEN,
             "forbidden",
             Provider::Anthropic,
         );
         assert!(!err.is_retryable());
-        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
     }
 
     #[test]
@@ -353,6 +501,192 @@ mod tests {
     }
 
     // ── classify_status with retry_after in body ──
+
+    // ── New variants: context overflow, payload too large, model not found ──
+
+    #[test]
+    fn classify_400_with_context_overflow_body() {
+        // Real-ish OpenAI-style error: "This model's maximum context length is..."
+        let body =
+            r#"{"error":{"message":"This model's maximum context length is 200000 tokens"}}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::Anthropic);
+        assert!(!err.is_retryable());
+        assert_eq!(err.reason(), FailoverReason::ContextOverflow);
+        assert!(err.should_compress());
+    }
+
+    #[test]
+    fn classify_400_anthropic_prompt_too_long() {
+        // Anthropic phrasing variant.
+        let body = r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 205000 tokens > 200000 maximum"}}"#;
+        let err = classify_status(reqwest::StatusCode::BAD_REQUEST, body, Provider::Anthropic);
+        assert_eq!(err.reason(), FailoverReason::ContextOverflow);
+        assert!(err.should_compress());
+    }
+
+    #[test]
+    fn classify_400_generic_bad_request_is_format_not_overflow() {
+        // A 400 without any context-related phrasing must NOT be misclassified —
+        // compacting on a genuine format error would silently drop history.
+        let err = classify_status(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"invalid role 'agent' in messages[0]"}}"#,
+            Provider::OpenAi,
+        );
+        assert_eq!(err.reason(), FailoverReason::Format);
+        assert!(!err.should_compress());
+    }
+
+    #[test]
+    fn classify_404_with_model_body_is_model_not_found() {
+        let body = r#"{"error":{"message":"The model 'gpt-6-ultra' does not exist"}}"#;
+        let err = classify_status(reqwest::StatusCode::NOT_FOUND, body, Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::ModelNotFound);
+        assert!(err.is_fast_fail());
+        assert!(!err.should_fallback());
+    }
+
+    #[test]
+    fn classify_404_without_model_body_is_unknown() {
+        // Generic routing 404 — not model-specific, don't fast-fail.
+        let err = classify_status(
+            reqwest::StatusCode::NOT_FOUND,
+            "not found",
+            Provider::OpenAi,
+        );
+        assert_eq!(err.reason(), FailoverReason::Unknown);
+    }
+
+    #[test]
+    fn classify_413_is_payload_too_large() {
+        let err = classify_status(reqwest::StatusCode::PAYLOAD_TOO_LARGE, "", Provider::OpenAi);
+        assert_eq!(err.reason(), FailoverReason::PayloadTooLarge);
+        assert!(err.is_fast_fail());
+    }
+
+    // ── Recovery-hint invariants ──
+    //
+    // should_compress() must be true for ContextOverflow only. Reactive
+    // compaction is destructive to history, so any drift here silently drops
+    // messages on errors that aren't really about context length.
+    #[test]
+    fn should_compress_only_for_context_overflow() {
+        for reason in ALL_REASONS {
+            let err = LlmError::Fatal {
+                source: anyhow::anyhow!("test"),
+                reason: *reason,
+            };
+            let expected = *reason == FailoverReason::ContextOverflow;
+            assert_eq!(
+                err.should_compress(),
+                expected,
+                "should_compress for {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_rotate_credential_skips_auth_permanent() {
+        // Auth (401) rotates; AuthPermanent (403) must NOT — the whole
+        // account is denied, rotating keys burns them pointlessly.
+        let auth = LlmError::Fatal {
+            source: anyhow::anyhow!("401"),
+            reason: FailoverReason::Auth,
+        };
+        let perm = LlmError::Fatal {
+            source: anyhow::anyhow!("403"),
+            reason: FailoverReason::AuthPermanent,
+        };
+        assert!(auth.should_rotate_credential());
+        assert!(!perm.should_rotate_credential());
+    }
+
+    #[test]
+    fn should_fallback_skips_model_not_found_and_auth_permanent() {
+        for reason in ALL_REASONS {
+            let err = LlmError::Fatal {
+                source: anyhow::anyhow!("test"),
+                reason: *reason,
+            };
+            let expected = !matches!(
+                reason,
+                FailoverReason::ModelNotFound | FailoverReason::AuthPermanent
+            );
+            assert_eq!(
+                err.should_fallback(),
+                expected,
+                "should_fallback for {reason:?}"
+            );
+        }
+    }
+
+    // ── classify_error_text ──
+
+    #[test]
+    fn classify_error_text_recognizes_classifier_marker() {
+        // Match the format produced by `classify_status` for 400s.
+        let msg = "anthropic returned 400 (context overflow): prompt too long";
+        assert_eq!(
+            classify_error_text(msg),
+            Some(FailoverReason::ContextOverflow)
+        );
+    }
+
+    #[test]
+    fn classify_error_text_recognizes_raw_provider_phrases() {
+        // Bypass the classifier marker — raw phrase (e.g., from a transport
+        // adapter that didn't go through classify_status).
+        assert_eq!(
+            classify_error_text("this model's maximum context length is 200k tokens"),
+            Some(FailoverReason::ContextOverflow)
+        );
+        assert_eq!(
+            classify_error_text("prompt is too long: 205k > 200k"),
+            Some(FailoverReason::ContextOverflow)
+        );
+    }
+
+    #[test]
+    fn classify_error_text_returns_none_for_unrelated() {
+        assert_eq!(classify_error_text("connection reset by peer"), None);
+        assert_eq!(
+            classify_error_text("rate limit exceeded, retry in 30s"),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_error_text_recognizes_other_markers() {
+        assert_eq!(
+            classify_error_text("openai returned 404 (model not found): gpt-6"),
+            Some(FailoverReason::ModelNotFound)
+        );
+        assert_eq!(
+            classify_error_text("openai returned 413 (payload too large): "),
+            Some(FailoverReason::PayloadTooLarge)
+        );
+        assert_eq!(
+            classify_error_text("anthropic returned 403 (auth permanent): "),
+            Some(FailoverReason::AuthPermanent)
+        );
+    }
+
+    /// Every variant of `FailoverReason`. Listed explicitly rather than derived
+    /// so adding a new variant forces an update here and in the recovery-hint
+    /// tests above — that's the compile-time guard this const provides.
+    const ALL_REASONS: &[FailoverReason] = &[
+        FailoverReason::Auth,
+        FailoverReason::AuthPermanent,
+        FailoverReason::Billing,
+        FailoverReason::RateLimit,
+        FailoverReason::Overloaded,
+        FailoverReason::Timeout,
+        FailoverReason::Format,
+        FailoverReason::ContextOverflow,
+        FailoverReason::PayloadTooLarge,
+        FailoverReason::ModelNotFound,
+        FailoverReason::Unknown,
+    ];
 
     #[test]
     fn classify_429_extracts_retry_after() {

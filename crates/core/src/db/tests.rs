@@ -4084,3 +4084,273 @@ fn v34_seeds_memory_consolidation_tasks() {
         "unexpected weekly task name: {weekly_name}"
     );
 }
+
+// ── V35: messages_fts ──
+
+/// Query `messages_fts` for matching rowids. Helper shared across FTS tests.
+fn fts_match_rowids(db: &Database, query: &str) -> Vec<i64> {
+    let mut stmt = db
+        .conn
+        .prepare("SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?1 ORDER BY rank")
+        .expect("prepare fts query");
+    stmt.query_map(params![query], |row| row.get::<_, i64>(0))
+        .expect("query fts")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect fts rows")
+}
+
+#[test]
+fn v35_fts_insert_trigger_syncs_new_messages() {
+    let db = test_db();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            Some("deploy the frontend to staging"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert");
+
+    let hits = fts_match_rowids(&db, "staging");
+    assert_eq!(
+        hits,
+        vec![id],
+        "insert trigger must mirror new row into FTS"
+    );
+}
+
+#[test]
+fn v35_fts_update_trigger_replaces_content() {
+    let db = test_db();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            Some("let's talk about apples"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert");
+
+    // Update content — old term must disappear, new term must match.
+    db.conn
+        .execute(
+            "UPDATE messages SET content = ?1 WHERE id = ?2",
+            params!["let's talk about bananas", id],
+        )
+        .expect("update");
+
+    assert!(
+        fts_match_rowids(&db, "apples").is_empty(),
+        "update trigger must remove stale content"
+    );
+    assert_eq!(fts_match_rowids(&db, "bananas"), vec![id]);
+}
+
+#[test]
+fn v35_fts_delete_trigger_removes_row() {
+    let db = test_db();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            Some("ephemeral message"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert");
+    assert_eq!(fts_match_rowids(&db, "ephemeral"), vec![id]);
+
+    db.conn
+        .execute("DELETE FROM messages WHERE id = ?1", params![id])
+        .expect("delete");
+    assert!(
+        fts_match_rowids(&db, "ephemeral").is_empty(),
+        "delete trigger must drop row from FTS"
+    );
+}
+
+#[test]
+fn v35_fts_bm25_ranks_higher_term_frequency_first() {
+    // Two sessions discuss "kubernetes" but one mentions it repeatedly. BM25
+    // should surface the repeated one first. Fails if triggers desync or the
+    // FTS table loses its content/content_rowid linkage.
+    let db = test_db();
+    let id1 = db
+        .insert_message(
+            "sparse",
+            "user",
+            Some("once we had kubernetes and moved on"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert sparse");
+    let id2 = db
+        .insert_message(
+            "dense",
+            "user",
+            Some("kubernetes kubernetes kubernetes is our stack"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert dense");
+
+    let ranked = fts_match_rowids(&db, "kubernetes");
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(ranked[0], id2, "denser match must rank first under BM25");
+    assert_eq!(ranked[1], id1);
+}
+
+#[test]
+fn v35_migration_backfills_existing_messages() {
+    // Simulate the upgrade path: messages already exist, then V35 is applied.
+    // The backfill SELECT is the fragile piece — forgetting it silently
+    // excludes every pre-migration row from search.
+    let db = test_db();
+    let id = db
+        .insert_message(
+            "s1",
+            "user",
+            Some("pre-existing legacy content about rustaceans"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert");
+
+    // Wipe FTS state as if the table didn't exist before V35. Drop triggers
+    // too so they don't auto-repopulate; re-apply the full V35 migration.
+    db.conn
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS messages_ai;
+             DROP TRIGGER IF EXISTS messages_ad;
+             DROP TRIGGER IF EXISTS messages_au;
+             DROP TABLE IF EXISTS messages_fts;",
+        )
+        .expect("reset fts state");
+
+    db.migrate_v35().expect("re-run V35");
+
+    let hits = fts_match_rowids(&db, "rustaceans");
+    assert_eq!(
+        hits,
+        vec![id],
+        "V35 must backfill pre-existing messages into FTS"
+    );
+}
+
+#[test]
+fn messages_fts_search_returns_ranked_hits_with_metadata() {
+    let db = test_db();
+    db.insert_message(
+        "session-alpha",
+        "user",
+        Some("deploy to production tomorrow morning"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert");
+    db.insert_message(
+        "session-beta",
+        "assistant",
+        Some("staging deploy verified"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert");
+    db.insert_message(
+        "session-gamma",
+        "user",
+        Some("completely unrelated cat pictures"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert");
+
+    let hits = db
+        .messages_fts_search("deploy", 10)
+        .expect("fts search succeeds");
+    // Two messages contain "deploy" as a token; the third doesn't. FTS5
+    // default tokenizer treats "deploy" and "deploying" as distinct tokens
+    // (no stemming), which is why the inputs above use the bare verb.
+    assert_eq!(hits.len(), 2);
+    // Metadata is carried through — caller needs session_id + role to render.
+    assert!(hits.iter().any(|h| h.session_id == "session-alpha"));
+    assert!(hits.iter().any(|h| h.session_id == "session-beta"));
+    assert!(hits.iter().all(|h| !h.content.is_empty()));
+    // BM25 scores are positive (negated in SQL so higher-relevance = higher score).
+    assert!(hits.iter().all(|h| h.score > 0.0));
+}
+
+#[test]
+fn messages_fts_search_sanitizes_operator_chars() {
+    // Query contains raw FTS5 operators. A naive query would error with
+    // "unknown special query term" or similar — sanitizer must strip them.
+    let db = test_db();
+    db.insert_message(
+        "s1",
+        "user",
+        Some("upgrade kubernetes cluster"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("insert");
+
+    let hits = db
+        .messages_fts_search(r#"upgrade "kubernetes": (cluster)*"#, 5)
+        .expect("sanitized query must not error");
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn messages_fts_search_empty_query_returns_empty() {
+    let db = test_db();
+    db.insert_message("s1", "user", Some("hello"), None, None, None, None)
+        .unwrap();
+    let hits = db.messages_fts_search("   ", 5).unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn v35_fts_skips_null_and_empty_content() {
+    // Tool-call-only assistant messages have NULL content — they should not
+    // appear in FTS search results (nothing to match, just noise).
+    let db = test_db();
+    let _tool_id = db
+        .insert_message("s1", "assistant", None, Some("[]"), None, None, None)
+        .expect("insert tool-call");
+    let text_id = db
+        .insert_message(
+            "s1",
+            "user",
+            Some("search for kubernetes"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert text");
+
+    let hits = fts_match_rowids(&db, "kubernetes");
+    assert_eq!(hits, vec![text_id]);
+}

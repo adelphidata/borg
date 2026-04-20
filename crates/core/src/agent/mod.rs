@@ -20,6 +20,7 @@ use crate::hooks::{HookAction, HookContext, HookData, HookPoint, HookRegistry};
 use crate::identity::load_identity;
 use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::{LlmClient, StreamEvent, UsageData};
+use crate::llm_error::{classify_error_text, FailoverReason};
 use crate::logging::log_message;
 use crate::memory::{load_memory_context_db, load_memory_context_db_ranked};
 use crate::policy::ExecutionPolicy;
@@ -1299,6 +1300,9 @@ Rules:
         let mut iteration: usize = 0;
         let mut needs_response = false;
         let mut nudged_for_response = false;
+        // One-shot reactive compaction per run — prevents a broken provider
+        // (always returns context_overflow) from looping forever.
+        let mut reactive_compacted_this_turn = false;
 
         self.prepare_loop().await;
 
@@ -1481,6 +1485,23 @@ Rules:
             self.metrics
                 .llm_duration
                 .record(llm_start.elapsed().as_secs_f64(), &[]);
+
+            // Reactive compaction: provider rejected the request because it
+            // exceeded the context window. Compact once and retry this
+            // iteration rather than surfacing the error. Tool_calls may be
+            // mid-stream garbage from the failed call — discard them.
+            if let Some(err_msg) = &stream_error {
+                if !reactive_compacted_this_turn
+                    && classify_error_text(err_msg) == Some(FailoverReason::ContextOverflow)
+                {
+                    reactive_compacted_this_turn = true;
+                    warn!("Reactive compaction triggered by provider context overflow: {err_msg}");
+                    self.reactive_compact_history(&event_tx).await?;
+                    // Discard partial stream state (stream_error, tool_calls,
+                    // tag_filter are re-bound at the top of the outer loop).
+                    continue;
+                }
+            }
 
             // Flush any remaining buffered text from the internal-tag filter
             if let Some(remaining) = tag_filter.flush() {
@@ -1719,6 +1740,89 @@ Rules:
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Force a compaction pass now, bypassing the proactive token-budget gate.
+    /// Used by the reactive-recovery path when a provider returns
+    /// `ContextOverflow` mid-turn: the agent compacts history, then retries
+    /// the same iteration. Target is 60% of `max_history_tokens` so we leave
+    /// meaningful headroom for the retry to succeed.
+    async fn reactive_compact_history(
+        &mut self,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> Result<()> {
+        normalize_history(&mut self.history);
+
+        let max_hist = self.config.conversation.max_history_tokens;
+        let target = (max_hist as f64 * 0.6) as usize;
+        let before_tokens = history_tokens(&self.history);
+        let pre_len = self.history.len();
+
+        // Try cheap tool-result pruning first — often enough.
+        compact_tool_results(&mut self.history, target);
+
+        if history_tokens(&self.history) <= target {
+            let dropped = pre_len.saturating_sub(self.history.len());
+            if dropped > 0 {
+                let _ = event_tx
+                    .send(AgentEvent::HistoryCompacted {
+                        dropped,
+                        before_tokens,
+                        after_tokens: history_tokens(&self.history),
+                        iterative: false,
+                    })
+                    .await;
+            }
+            return Ok(());
+        }
+
+        let compaction_config = self.config.with_compaction_overrides();
+        let compaction_llm = LlmClient::new(&compaction_config)?;
+        let protect_first_n = self.config.conversation.protect_first_n;
+
+        if self.previous_summary.is_none() {
+            self.previous_summary =
+                crate::conversation::extract_last_compaction_summary(&self.history);
+        }
+        let iterative = self.previous_summary.is_some();
+
+        let mut dropped = if protect_first_n > 0 {
+            crate::conversation::compact_history_v2(
+                &mut self.history,
+                target,
+                protect_first_n,
+                &mut self.previous_summary,
+                &compaction_llm,
+            )
+            .await
+        } else {
+            let before_len = self.history.len();
+            compact_history(&mut self.history, target, &compaction_llm).await;
+            before_len.saturating_sub(self.history.len())
+        };
+
+        // If v2 made no progress (protected head alone exceeds target), fall
+        // back to non-head-protected so we don't loop on the same overflow.
+        if dropped == 0 && history_tokens(&self.history) > target {
+            let before_len = self.history.len();
+            compact_history(&mut self.history, target, &compaction_llm).await;
+            dropped = before_len.saturating_sub(self.history.len());
+        }
+
+        if dropped > 0 {
+            let _ = event_tx
+                .send(AgentEvent::HistoryCompacted {
+                    dropped,
+                    before_tokens,
+                    after_tokens: history_tokens(&self.history),
+                    iterative,
+                })
+                .await;
+        } else {
+            warn!("reactive_compact_history: nothing dropped, retry will likely re-fail");
         }
 
         Ok(())

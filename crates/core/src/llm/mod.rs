@@ -174,11 +174,11 @@ impl ProviderCooldown {
         self.reason = Some(reason);
 
         let base_secs = match reason {
-            FailoverReason::Auth | FailoverReason::Billing => 300.0,
+            FailoverReason::Auth | FailoverReason::AuthPermanent | FailoverReason::Billing => 300.0,
             _ => 60.0,
         };
         let max_exp = match reason {
-            FailoverReason::Auth | FailoverReason::Billing => 3,
+            FailoverReason::Auth | FailoverReason::AuthPermanent | FailoverReason::Billing => 3,
             _ => 4,
         };
         let exp = self.error_count.saturating_sub(1).min(max_exp);
@@ -554,23 +554,28 @@ impl LlmClient {
                         return Ok(());
                     }
                     Err(e) => {
-                        // On auth failure or rate limit, try rotating to next key before retrying
-                        let is_auth_error = matches!(e.reason(), FailoverReason::Auth);
-                        let is_rate_limit = matches!(e.reason(), FailoverReason::RateLimit);
+                        // Rotate to next key only when the classifier says it
+                        // could help (Auth / RateLimit). AuthPermanent (403)
+                        // explicitly skips rotation — the account is denied.
+                        let reason = e.reason();
+                        let is_auth_error = matches!(reason, FailoverReason::Auth);
 
-                        if (is_auth_error || is_rate_limit)
+                        if e.should_rotate_credential()
                             && keys_tried < total_keys
                             && self.try_rotate_key(!is_auth_error)
                         {
                             keys_tried += 1;
-                            info!("Auth/rate-limit error, trying next API key...");
+                            info!("{reason} error, trying next API key...");
                             continue;
                         }
 
                         if !e.is_retryable() || attempt == max_retries {
-                            // Record failure and attempt provider failover
+                            // Record failure and attempt provider failover.
+                            // ModelNotFound / AuthPermanent opt out — they're
+                            // user-fixable, and pointlessly burning the whole
+                            // fallback chain just delays the real error.
                             self.record_provider_failure(e.reason());
-                            if self.try_failover_provider() {
+                            if e.should_fallback() && self.try_failover_provider() {
                                 should_failover = true;
                                 break;
                             }
