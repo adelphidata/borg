@@ -36,6 +36,26 @@ pub struct ModelMetadata {
 /// scan, so this ordering is for human readability rather than correctness.
 const REGISTRY: &[ModelMetadata] = &[
     // ── Anthropic Claude family ──
+    // Longer/more specific slugs come first so prefix matching resolves them
+    // before bare `claude-opus-4`, `claude-sonnet-4`, `claude-haiku-4`.
+    ModelMetadata {
+        slug: "claude-opus-4-7",
+        context_window: 200_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "claude-sonnet-4-6",
+        context_window: 200_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "claude-haiku-4-5",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "claude-opus-4",
         context_window: 200_000,
@@ -91,10 +111,29 @@ const REGISTRY: &[ModelMetadata] = &[
         supports_thinking: false,
     },
     // ── OpenAI GPT family ──
+    // More specific gpt-5-* slugs precede bare `gpt-5` for longest-prefix match.
+    ModelMetadata {
+        slug: "gpt-5-mini",
+        context_window: 272_000,
+        max_context_window: 400_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-5-nano",
+        context_window: 272_000,
+        max_context_window: 400_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "gpt-5",
         context_window: 272_000,
         max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "o4-mini",
+        context_window: 200_000,
+        max_context_window: 200_000,
         supports_thinking: true,
     },
     ModelMetadata {
@@ -152,6 +191,25 @@ const REGISTRY: &[ModelMetadata] = &[
         supports_thinking: true,
     },
     // ── Google Gemini family ──
+    // Gemini 3.x — longer slugs first (gemini-3-flash-lite before gemini-3-flash).
+    ModelMetadata {
+        slug: "gemini-3-flash-lite",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gemini-3-flash",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gemini-3-pro",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "gemini-2.5-pro",
         context_window: 2_000_000,
@@ -183,10 +241,11 @@ const REGISTRY: &[ModelMetadata] = &[
         supports_thinking: false,
     },
     // ── DeepSeek ──
+    // `deepseek-chat` is the stable alias — the underlying weights are V3.2 today.
     ModelMetadata {
         slug: "deepseek-reasoner",
-        context_window: 64_000,
-        max_context_window: 64_000,
+        context_window: 128_000,
+        max_context_window: 128_000,
         supports_thinking: true,
     },
     ModelMetadata {
@@ -196,12 +255,60 @@ const REGISTRY: &[ModelMetadata] = &[
         supports_thinking: true,
     },
     ModelMetadata {
-        slug: "deepseek-chat",
-        context_window: 64_000,
-        max_context_window: 64_000,
+        slug: "deepseek-v3.2",
+        context_window: 128_000,
+        max_context_window: 128_000,
         supports_thinking: false,
     },
-    // ── Groq (Llama / Mixtral / etc. hosted) ──
+    ModelMetadata {
+        slug: "deepseek-chat",
+        context_window: 128_000,
+        max_context_window: 128_000,
+        supports_thinking: false,
+    },
+    // ── Groq (Llama / Mixtral / OSS weights hosted) ──
+    ModelMetadata {
+        slug: "gpt-oss-120b",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "gpt-oss-20b",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "kimi-k2-instruct",
+        context_window: 200_000,
+        max_context_window: 200_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "llama-4-maverick",
+        context_window: 1_000_000,
+        max_context_window: 1_000_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "llama-4-scout",
+        context_window: 10_000_000,
+        max_context_window: 10_000_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "qwen3-32b",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "deepseek-r1-distill-llama-70b",
+        context_window: 128_000,
+        max_context_window: 128_000,
+        supports_thinking: true,
+    },
     ModelMetadata {
         slug: "llama-3.3-70b",
         context_window: 128_000,
@@ -240,10 +347,22 @@ const REGISTRY: &[ModelMetadata] = &[
     },
     // ── Ollama / smaller local defaults ──
     ModelMetadata {
+        slug: "qwen3",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
+    },
+    ModelMetadata {
         slug: "qwen2.5",
         context_window: 32_768,
         max_context_window: 32_768,
         supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "gpt-oss",
+        context_window: 131_072,
+        max_context_window: 131_072,
+        supports_thinking: true,
     },
     ModelMetadata {
         slug: "mistral",
@@ -348,11 +467,33 @@ mod tests {
         // gpt-5 and gpt-4.1 both start with "gpt-" — pick the more specific one
         assert_eq!(lookup("gpt-4.1-mini").unwrap().slug, "gpt-4.1");
         assert_eq!(lookup("gpt-4o-mini").unwrap().slug, "gpt-4o");
+        // gpt-5-mini is more specific than gpt-5
+        assert_eq!(lookup("gpt-5-mini").unwrap().slug, "gpt-5-mini");
+        assert_eq!(lookup("gpt-5-nano").unwrap().slug, "gpt-5-nano");
         // o1-mini is more specific than o1
         assert_eq!(lookup("o1-mini").unwrap().slug, "o1-mini");
         assert_eq!(lookup("o1-mini-2024-09-12").unwrap().slug, "o1-mini");
         // bare o1 falls through to the generic o1 entry
         assert_eq!(lookup("o1-2024-12-17").unwrap().slug, "o1");
+        // Frontier Anthropic: claude-opus-4-7 beats claude-opus-4
+        assert_eq!(lookup("claude-opus-4-7").unwrap().slug, "claude-opus-4-7");
+        assert_eq!(
+            lookup("claude-sonnet-4-6").unwrap().slug,
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(lookup("claude-haiku-4-5").unwrap().slug, "claude-haiku-4-5");
+        // Dated legacy slug still matches the generic family entry
+        assert_eq!(
+            lookup("claude-sonnet-4-20250514").unwrap().slug,
+            "claude-sonnet-4"
+        );
+        // Gemini 3 flash-lite beats gemini-3-flash
+        assert_eq!(
+            lookup("gemini-3-flash-lite").unwrap().slug,
+            "gemini-3-flash-lite"
+        );
+        assert_eq!(lookup("gemini-3-flash").unwrap().slug, "gemini-3-flash");
+        assert_eq!(lookup("gemini-3-pro").unwrap().slug, "gemini-3-pro");
     }
 
     #[test]
@@ -400,7 +541,7 @@ mod tests {
         assert_eq!(context_window_for("claude-sonnet-4-20250514"), 200_000);
         assert_eq!(context_window_for("gpt-5"), 272_000);
         assert_eq!(context_window_for("gemini-2.5-pro"), 2_000_000);
-        assert_eq!(context_window_for("deepseek-chat"), 64_000);
+        assert_eq!(context_window_for("deepseek-chat"), 128_000);
     }
 
     #[test]

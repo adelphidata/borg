@@ -1180,11 +1180,11 @@ mod tests {
         let mut popup = SettingsPopup::new();
         let mut cfg = Config::default();
         cfg.llm.provider = Some("anthropic".to_string());
-        cfg.llm.model = "claude-haiku-4".to_string();
+        cfg.llm.model = "claude-haiku-4-5".to_string();
         popup.show(&cfg);
 
         assert_eq!(popup.provider_index, 2); // anthropic is index 2
-        assert_eq!(popup.model_index, 2); // claude-haiku-4 is index 2 in ANTHROPIC_MODELS
+        assert_eq!(popup.model_index, 2); // claude-haiku-4-5 is index 2 in ANTHROPIC_MODELS
     }
 
     #[test]
@@ -1233,7 +1233,7 @@ mod tests {
 
         // Config should now have openai provider and first openai model
         assert_eq!(cfg.llm.provider.as_deref(), Some("openai"));
-        assert_eq!(cfg.llm.model, "gpt-4.1");
+        assert_eq!(cfg.llm.model, "gpt-5");
     }
 
     #[test]

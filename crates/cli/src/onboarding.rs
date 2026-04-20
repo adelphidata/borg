@@ -55,49 +55,68 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
 ];
 
 pub(crate) const OPENAI_MODELS: &[(&str, &str)] = &[
-    ("gpt-4.1", "GPT-4.1 (recommended)"),
-    ("gpt-4.1-mini", "GPT-4.1 Mini (fast, cheap)"),
-    ("gpt-4.1-nano", "GPT-4.1 Nano (fastest)"),
+    ("gpt-5", "GPT-5 (recommended)"),
+    ("gpt-5-mini", "GPT-5 Mini (fast, cheap)"),
+    ("gpt-5-nano", "GPT-5 Nano (fastest)"),
     ("o3", "o3 (reasoning)"),
-    ("o3-mini", "o3 Mini (reasoning, fast)"),
     ("o4-mini", "o4 Mini (reasoning, fast)"),
+    ("gpt-4.1", "GPT-4.1"),
+    ("gpt-4.1-mini", "GPT-4.1 Mini"),
     ("gpt-4o", "GPT-4o"),
-    ("gpt-4o-mini", "GPT-4o Mini"),
 ];
 
 pub(crate) const ANTHROPIC_MODELS: &[(&str, &str)] = &[
-    ("claude-sonnet-4", "Claude Sonnet 4 (recommended)"),
-    ("claude-opus-4", "Claude Opus 4 (most capable)"),
-    ("claude-haiku-4", "Claude Haiku 4 (fast, cheap)"),
-    ("claude-3.5-sonnet", "Claude 3.5 Sonnet"),
-    ("claude-3.5-haiku", "Claude 3.5 Haiku"),
+    ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5 (fast, cheap)"),
+    ("claude-sonnet-4", "Claude Sonnet 4"),
+    ("claude-3-5-haiku", "Claude 3.5 Haiku (legacy)"),
 ];
 
 pub(crate) const GEMINI_MODELS: &[(&str, &str)] = &[
-    ("gemini-2.5-pro", "Gemini 2.5 Pro (recommended)"),
-    ("gemini-2.5-flash", "Gemini 2.5 Flash (fast)"),
-    ("gemini-2.0-flash", "Gemini 2.0 Flash"),
+    ("gemini-3-pro", "Gemini 3 Pro (recommended)"),
+    ("gemini-3-flash", "Gemini 3 Flash (fast)"),
+    ("gemini-3-flash-lite", "Gemini 3 Flash Lite (fastest)"),
+    ("gemini-2.5-pro", "Gemini 2.5 Pro (legacy)"),
+    ("gemini-2.5-flash", "Gemini 2.5 Flash (legacy)"),
 ];
 
 pub(crate) const DEEPSEEK_MODELS: &[(&str, &str)] = &[
-    ("deepseek-chat", "DeepSeek Chat (recommended)"),
-    ("deepseek-reasoner", "DeepSeek Reasoner (reasoning)"),
+    ("deepseek-chat", "DeepSeek Chat — V3.2 (recommended)"),
+    ("deepseek-reasoner", "DeepSeek Reasoner — R1 (reasoning)"),
 ];
 
 pub(crate) const GROQ_MODELS: &[(&str, &str)] = &[
+    ("openai/gpt-oss-120b", "GPT-OSS 120B (recommended)"),
+    (
+        "moonshotai/kimi-k2-instruct",
+        "Kimi K2 Instruct (large, versatile)",
+    ),
+    (
+        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "Llama 4 Maverick 17B",
+    ),
+    (
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "Llama 4 Scout 17B",
+    ),
+    ("qwen/qwen3-32b", "Qwen3 32B"),
+    (
+        "deepseek-r1-distill-llama-70b",
+        "DeepSeek R1 Distill 70B (reasoning)",
+    ),
     (
         "llama-3.3-70b-versatile",
-        "Llama 3.3 70B Versatile (recommended)",
+        "Llama 3.3 70B Versatile (stable)",
     ),
     ("llama-3.1-8b-instant", "Llama 3.1 8B Instant (fastest)"),
-    ("gemma2-9b-it", "Gemma 2 9B IT"),
-    ("mixtral-8x7b-32768", "Mixtral 8x7B (large context)"),
 ];
 
 pub(crate) const OLLAMA_MODELS: &[(&str, &str)] = &[
     ("llama3.3", "Llama 3.3 70B (recommended)"),
-    ("qwen2.5", "Qwen 2.5 (versatile)"),
+    ("qwen3", "Qwen3 (versatile)"),
     ("deepseek-r1", "DeepSeek R1 (reasoning)"),
+    ("gpt-oss", "GPT-OSS 20B (OpenAI open-weight)"),
     ("mistral", "Mistral 7B (fast, lightweight)"),
     ("codellama", "Code Llama (coding)"),
 ];

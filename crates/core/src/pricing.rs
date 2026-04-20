@@ -1,4 +1,4 @@
-// Pricing data last updated: 2025-05-14
+// Pricing data last updated: 2026-04-19
 // Source: provider pricing pages. Update entries when prices change.
 
 use std::collections::HashMap;
@@ -32,14 +32,20 @@ fn normalize_model(model: &str) -> &str {
 
 static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(|| {
     let entries: Vec<(&str, f64, f64)> = vec![
-        // Claude
+        // Claude 4.x (frontier)
+        ("claude-opus-4-7", 15.0, 75.0),
         ("claude-opus-4-20250514", 15.0, 75.0),
         ("claude-opus-4", 15.0, 75.0),
+        ("claude-sonnet-4-6", 3.0, 15.0),
         ("claude-sonnet-4-20250514", 3.0, 15.0),
         ("claude-sonnet-4-0", 3.0, 15.0),
         ("claude-sonnet-4", 3.0, 15.0),
         ("claude-haiku-4-5-20251001", 0.80, 4.0),
         ("claude-haiku-4-5", 0.80, 4.0),
+        // GPT-5 family
+        ("gpt-5", 1.25, 10.0),
+        ("gpt-5-mini", 0.25, 2.0),
+        ("gpt-5-nano", 0.05, 0.40),
         // GPT-4o
         ("gpt-4o", 2.50, 10.0),
         ("gpt-4o-2024-08-06", 2.50, 10.0),
@@ -51,12 +57,18 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
         // o3/o4-mini
         ("o3", 10.0, 40.0),
         ("o4-mini", 1.10, 4.40),
-        // Gemini
+        // Gemini 3.x (frontier) + 2.5 legacy
+        ("gemini-3-pro", 1.25, 10.0),
+        ("gemini-3-flash", 0.15, 0.60),
+        ("gemini-3-flash-lite", 0.05, 0.30),
         ("gemini-2.5-pro", 1.25, 10.0),
         ("gemini-2.5-flash", 0.15, 0.60),
         ("gemini-2.0-flash", 0.10, 0.40),
-        // DeepSeek
+        // DeepSeek (deepseek-chat is V3.2 alias)
+        ("deepseek-chat", 0.27, 1.10),
+        ("deepseek-v3.2", 0.27, 1.10),
         ("deepseek-chat-v3", 0.27, 1.10),
+        ("deepseek-reasoner", 0.55, 2.19),
         ("deepseek-r1", 0.55, 2.19),
     ];
 
