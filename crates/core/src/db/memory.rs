@@ -409,7 +409,7 @@ impl Database {
             "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(scope, name) DO UPDATE SET
-                content = ?3, content_hash = ?4, updated_at = ?5",
+                content = ?3, content_hash = ?4, updated_at = ?5, estimated_tokens = NULL",
             params![scope, name, content, hash, now],
         )?;
         // Stale search-index cleanup: embeddings and chunks will be regenerated
@@ -526,7 +526,7 @@ impl Database {
             "INSERT INTO memory_entries (scope, name, content, content_hash, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5)
              ON CONFLICT(scope, name) DO UPDATE SET
-                content = ?3, content_hash = ?4, updated_at = ?5",
+                content = ?3, content_hash = ?4, updated_at = ?5, estimated_tokens = NULL",
             params![scope, name, new_content, hash, now],
         )?;
         tx.execute(
@@ -554,6 +554,39 @@ impl Database {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Fetch the cached estimated-token counts for all entries in a scope where
+    /// the column is non-NULL. Entries missing from the map should be re-tokenized
+    /// and persisted via [`Self::set_memory_tokens`].
+    pub fn list_memory_tokens_map(
+        &self,
+        scope: &str,
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, estimated_tokens FROM memory_entries
+             WHERE scope = ?1 AND estimated_tokens IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map(params![scope], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Persist a freshly-computed token estimate for a memory entry.
+    ///
+    /// Called by the memory loader on cache miss. Any content mutation resets
+    /// the column to NULL, so the value here is only valid against the entry's
+    /// current `content_hash`.
+    pub fn set_memory_tokens(&self, scope: &str, name: &str, tokens: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE memory_entries SET estimated_tokens = ?1
+             WHERE scope = ?2 AND name = ?3",
+            params![tokens, scope, name],
+        )?;
+        Ok(())
     }
 
     /// Count memory entries for a scope.

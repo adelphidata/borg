@@ -55,6 +55,31 @@ pub fn list_memory_entries(scope: &str) -> Result<Vec<crate::db::MemoryEntryRow>
     db.list_memory_entries(scope)
 }
 
+/// Look up `entry`'s estimated token count in `cache`, falling back to a live
+/// BPE encode + persisting the result so subsequent turns read from the cache.
+/// A persist failure is logged but never bubbles up — we'd still rather load
+/// memory than hard-fail on a UPDATE race.
+fn tokens_for_entry(
+    db: &crate::db::Database,
+    entry: &crate::db::MemoryEntryRow,
+    cache: &std::collections::HashMap<String, i64>,
+) -> usize {
+    if let Some(&cached) = cache.get(&entry.name) {
+        if cached >= 0 {
+            return cached as usize;
+        }
+    }
+    let computed = estimate_tokens(&entry.content);
+    if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed as i64) {
+        tracing::warn!(
+            "failed to cache estimated_tokens for {}/{}: {e}",
+            entry.scope,
+            entry.name
+        );
+    }
+    computed
+}
+
 /// Load memory context from DB within the given token budget.
 /// Loads INDEX entry first, then remaining entries by updated_at DESC.
 #[instrument(skip_all, fields(token_budget = max_tokens))]
@@ -65,13 +90,17 @@ pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
 
     let db = crate::db::Database::open()?;
     let entries = db.list_memory_entries("global")?;
+    let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
+        tracing::warn!("failed to load cached token estimates, will recompute: {e}");
+        std::collections::HashMap::new()
+    });
 
     let mut parts = Vec::new();
     let mut estimated_tokens = 0;
 
     // Always load INDEX first
     if let Some(index) = entries.iter().find(|e| e.name == "INDEX") {
-        let tokens = estimate_tokens(&index.content);
+        let tokens = tokens_for_entry(&db, index, &token_cache);
         if estimated_tokens + tokens <= max_tokens {
             let safe_name = escape_xml_attr("INDEX");
             parts.push(format!(
@@ -88,7 +117,7 @@ pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
         if entry.name == "INDEX" {
             continue;
         }
-        let tokens = estimate_tokens(&entry.content);
+        let tokens = tokens_for_entry(&db, entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
             debug!("Skipping {} (would exceed token budget)", entry.name);
             continue;
@@ -122,6 +151,10 @@ pub fn load_memory_context_db_ranked(
 
     let db = crate::db::Database::open()?;
     let entries = db.list_memory_entries("global")?;
+    let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
+        tracing::warn!("failed to load cached token estimates, will recompute: {e}");
+        std::collections::HashMap::new()
+    });
 
     // Build a name → index map once so ranked lookup is O(1) per name
     // instead of O(n·m) linear scan.
@@ -139,7 +172,7 @@ pub fn load_memory_context_db_ranked(
                     estimated_tokens: &mut usize,
                     parts: &mut Vec<String>,
                     loaded: &mut std::collections::HashSet<String>| {
-        let tokens = estimate_tokens(&entry.content);
+        let tokens = tokens_for_entry(&db, entry, &token_cache);
         if *estimated_tokens + tokens > max_tokens {
             return;
         }

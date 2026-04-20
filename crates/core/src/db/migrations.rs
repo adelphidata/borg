@@ -1282,4 +1282,15 @@ impl Database {
 
         Ok(())
     }
+
+    /// V36: Cache the BPE token estimate per memory entry so each turn's
+    /// memory-load doesn't re-encode every entry from scratch. NULL until
+    /// first-use lazy populate by the memory loader.
+    pub(super) fn migrate_v36(&self) -> Result<()> {
+        if !Self::has_column(&self.conn, "memory_entries", "estimated_tokens") {
+            self.conn
+                .execute_batch("ALTER TABLE memory_entries ADD COLUMN estimated_tokens INTEGER;")?;
+        }
+        Ok(())
+    }
 }

@@ -309,14 +309,21 @@ impl Agent {
     }
 
     /// Ensure credential cache is populated, resolving on first call or after config reload.
-    /// Returns a clone suitable for passing to functions that also borrow `&self`.
-    fn resolve_credentials_cached(&mut self) -> HashMap<String, String> {
-        if let Some(ref cached) = self.cached_credentials {
-            return cached.clone();
+    /// Separated from the getter so the getter can return a borrow while leaving
+    /// `&self` free for other immutable accesses.
+    fn ensure_credentials_cached(&mut self) {
+        if self.cached_credentials.is_none() {
+            self.cached_credentials = Some(self.config.resolve_credentials());
         }
-        let resolved = self.config.resolve_credentials();
-        self.cached_credentials = Some(resolved.clone());
-        resolved
+    }
+
+    /// Borrow the cached credentials, falling back to an empty map if the cache
+    /// was not populated yet. Callers inside this module always invoke
+    /// [`Self::ensure_credentials_cached`] first; the fallback keeps the
+    /// skill-loading path robust if that ordering ever regresses.
+    fn credentials_cached(&self) -> &HashMap<String, String> {
+        static EMPTY: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
+        self.cached_credentials.as_ref().unwrap_or(&EMPTY)
     }
 
     /// Assemble an `Agent` from pre-computed parts shared by all constructors.
@@ -777,21 +784,26 @@ impl Agent {
         system.push_str(Self::build_tool_call_style_section());
 
         // Safety / security policy
-        system.push_str(&format!(
+        use std::fmt::Write as _;
+        let _ = write!(
+            system,
             "\n<security_policy>\n{SECURITY_POLICY}\n</security_policy>\n"
-        ));
+        );
 
         if self.config.skills.enabled {
             let skills = match &self.cached_skills_context {
                 Some(cached) => cached.clone(),
                 None => {
-                    let resolved_creds = self.resolve_credentials_cached();
+                    self.ensure_credentials_cached();
                     let budget = crate::skills::effective_skill_budget(
                         &self.config.skills,
                         Some(self.active_context_window()),
                     );
-                    let (rendered, report) =
-                        load_skills_context(budget, &resolved_creds, &self.config.skills)?;
+                    let (rendered, report) = load_skills_context(
+                        budget,
+                        self.credentials_cached(),
+                        &self.config.skills,
+                    )?;
                     self.warn_skill_budget_loss(&report);
                     // Populate the cache so subsequent turns reuse this work.
                     // Previously this branch dropped the result on the floor,
@@ -844,9 +856,10 @@ impl Agent {
             }),
         };
         if let Some(ref docs) = project_docs {
-            system.push_str(&format!(
+            let _ = write!(
+                system,
                 "\n<project_instructions trust=\"stored\">\n{docs}\n</project_instructions>\n"
-            ));
+            );
         }
 
         // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
@@ -901,7 +914,13 @@ impl Agent {
             .unwrap_or("")
             .to_string();
 
-        if query.is_empty() {
+        // Short/trivial queries (acks like "ok", "next", "yes") won't produce
+        // meaningful semantic rankings — skip the embedding round-trip and fall
+        // back to recency ordering. Threshold picked to cover typical one-word
+        // affirmatives without suppressing real questions.
+        const MIN_QUERY_CHARS_FOR_RANKING: usize = 10;
+        let trimmed = query.trim();
+        if trimmed.len() < MIN_QUERY_CHARS_FOR_RANKING {
             return load_memory_context_db(max_tokens);
         }
 
@@ -1831,12 +1850,14 @@ Rules:
     /// Warm the skills context cache on first call (avoids re-parsing every turn).
     fn warm_skills_cache(&mut self) {
         if self.cached_skills_context.is_none() && self.config.skills.enabled {
-            let resolved_creds = self.resolve_credentials_cached();
+            self.ensure_credentials_cached();
             let budget = crate::skills::effective_skill_budget(
                 &self.config.skills,
                 Some(self.active_context_window()),
             );
-            match load_skills_context(budget, &resolved_creds, &self.config.skills) {
+            let result =
+                load_skills_context(budget, self.credentials_cached(), &self.config.skills);
+            match result {
                 Ok((ctx, report)) => {
                     self.warn_skill_budget_loss(&report);
                     self.cached_skills_context = Some(ctx);
@@ -1927,8 +1948,9 @@ Rules:
             system_prompt.push_str(&extra);
         }
 
-        let mut messages = vec![Message::system(&system_prompt)];
-        messages.extend(self.history.clone());
+        let mut messages = Vec::with_capacity(self.history.len() + 1);
+        messages.push(Message::system(&system_prompt));
+        messages.extend(self.history.iter().cloned());
 
         Ok((messages, tool_defs))
     }
