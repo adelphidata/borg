@@ -344,23 +344,36 @@ impl HistoryCell {
                 // Unstyled spacer — must NOT use `bg` or it creates a double-background
                 // band above the user message (the render loop already inserts a separator).
                 lines.push(Line::default());
-                for (i, line) in text.lines().enumerate() {
-                    let prefix = if i == 0 {
-                        Span::styled(format!("{} ", theme::CHEVRON), prefix_style)
+                // Wrap each logical line at (width - 2) so the "> " / "  " prefix
+                // column stays intact. Continuation lines hang under column 2,
+                // matching how assistant messages align under their bullet.
+                let wrap_width = w.saturating_sub(2).max(20);
+                let mut first = true;
+                for line in text.lines() {
+                    let wrapped = if line.is_empty() {
+                        vec![std::borrow::Cow::Borrowed("")]
                     } else {
-                        Span::styled("  ", bg)
+                        textwrap::wrap(line, wrap_width)
                     };
-                    let spans = parse_at_mentions(line, bg, mention_style);
-                    let mut all_spans = vec![prefix];
-                    all_spans.extend(spans);
-                    let content_width: usize = all_spans
-                        .iter()
-                        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                        .sum();
-                    if content_width < w {
-                        all_spans.push(Span::styled(" ".repeat(w - content_width), bg));
+                    for wl in wrapped.iter() {
+                        let prefix = if first {
+                            first = false;
+                            Span::styled(format!("{} ", theme::CHEVRON), prefix_style)
+                        } else {
+                            Span::styled("  ", bg)
+                        };
+                        let spans = parse_at_mentions(wl.as_ref(), bg, mention_style);
+                        let mut all_spans = vec![prefix];
+                        all_spans.extend(spans);
+                        let content_width: usize = all_spans
+                            .iter()
+                            .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                            .sum();
+                        if content_width < w {
+                            all_spans.push(Span::styled(" ".repeat(w - content_width), bg));
+                        }
+                        lines.push(Line::from(all_spans).style(bg));
                     }
-                    lines.push(Line::from(all_spans).style(bg));
                 }
                 lines
             }
@@ -803,6 +816,34 @@ mod tests {
         assert!(chevron_line_idx.is_some(), "chevron must be present");
         let idx = chevron_line_idx.unwrap();
         assert!(idx > 0, "chevron should not be on the first (spacer) line");
+    }
+
+    #[test]
+    fn render_user_cell_wraps_long_line_with_hanging_indent() {
+        // At width 30, a long single-line user message must wrap; continuation
+        // lines start with the 2-space bg-styled prefix (under the chevron's
+        // content column) instead of overflowing the terminal.
+        let cell = HistoryCell::User {
+            text: "alpha beta gamma delta epsilon zeta eta theta iota".to_string(),
+        };
+        let lines = cell.render(30, None);
+        // Find first line with chevron and first continuation after it.
+        let chev_idx = lines
+            .iter()
+            .position(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains(super::theme::CHEVRON))
+            })
+            .expect("chevron line");
+        assert!(lines.len() > chev_idx + 1, "expected wrap, got {:?}", lines);
+        let cont = &lines[chev_idx + 1];
+        // First span is the "  " continuation prefix, not another chevron.
+        assert_eq!(cont.spans[0].content.as_ref(), "  ");
+        assert!(!cont
+            .spans
+            .iter()
+            .any(|s| s.content.as_ref().contains(super::theme::CHEVRON)));
     }
 
     #[test]

@@ -2215,8 +2215,10 @@ mod tests {
     // ── Cache strategy: system_and_3 ──
 
     #[allow(clippy::unwrap_used)]
-    fn make_system_and_3_client() -> (LlmClient, &'static str) {
-        let env_var = "BORG_TEST_ANTHROPIC_SYSTEM_AND_3";
+    fn make_system_and_3_client(env_var: &'static str) -> (LlmClient, &'static str) {
+        // Each caller passes a unique env var name so parallel tests don't race
+        // on set_var / remove_var of a shared key (was causing flaky failures
+        // where one test removed the var while another was still reading it).
         std::env::set_var(env_var, "sk-test");
         let mut config = Config::default();
         config.llm.provider = Some("anthropic".to_string());
@@ -2229,7 +2231,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     #[test]
     fn anthropic_request_system_and_3_no_tools_marker() {
-        let (client, env_var) = make_system_and_3_client();
+        let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_A");
         let tools = vec![make_tool("a"), make_tool("b"), make_tool("c")];
         let messages = vec![Message::system("sys"), Message::user("hi")];
         let body = client.build_anthropic_request(&messages, Some(&tools), false);
@@ -2252,7 +2254,7 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     #[test]
     fn anthropic_request_system_and_3_marks_last_three_messages() {
-        let (client, env_var) = make_system_and_3_client();
+        let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_B");
         let messages = vec![
             Message::system("sys"),
             Message::user("turn 1"),
@@ -2294,7 +2296,7 @@ mod tests {
     #[test]
     fn anthropic_request_system_and_3_fewer_than_three_messages() {
         // With only 1 user message the helper must not crash; fewer breakpoints is fine.
-        let (client, env_var) = make_system_and_3_client();
+        let (client, env_var) = make_system_and_3_client("BORG_TEST_ANTHROPIC_SYSTEM_AND_3_C");
         let messages = vec![Message::system("sys"), Message::user("only one")];
         let body = client.build_anthropic_request(&messages, None, false);
         let msgs = body["messages"].as_array().unwrap();

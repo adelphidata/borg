@@ -18,6 +18,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
     let mut list_depth: usize = 0;
     let mut ordered_index: Option<u64> = None;
     let mut in_blockquote = false;
+    let mut list_item_indents: Vec<usize> = Vec::new();
 
     let wrap_width = width.saturating_sub(2) as usize;
 
@@ -87,14 +88,17 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 Tag::Item => {
                     flush_line(&mut current_spans, &mut lines);
                     let indent = "  ".repeat(list_depth.saturating_sub(1));
-                    if let Some(ref mut idx) = ordered_index {
-                        let bullet = format!("{indent}{idx}. ");
+                    let bullet = if let Some(ref mut idx) = ordered_index {
+                        let b = format!("{indent}{idx}. ");
                         *idx += 1;
-                        current_spans.push(Span::styled(bullet, theme::code_style()));
+                        current_spans.push(Span::styled(b.clone(), theme::code_style()));
+                        b
                     } else {
-                        let bullet = format!("{indent}- ");
-                        current_spans.push(Span::styled(bullet, current_style(&style_stack)));
+                        let b = format!("{indent}- ");
+                        current_spans.push(Span::styled(b.clone(), current_style(&style_stack)));
+                        b
                     };
+                    list_item_indents.push(bullet.chars().count());
                 }
                 Tag::Link { dest_url, .. } => {
                     let base = current_style(&style_stack);
@@ -136,6 +140,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 }
                 TagEnd::Item => {
                     flush_line(&mut current_spans, &mut lines);
+                    list_item_indents.pop();
                 }
                 _ => {}
             },
@@ -161,17 +166,22 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                         }
                     }
                 } else {
-                    // Wrap text
-                    let wrapped = textwrap::fill(&text, wrap_width.max(20));
-                    let text_lines: Vec<&str> = wrapped.lines().collect();
-                    if text_lines.len() <= 1 {
+                    // Hang-indent wrapped continuation lines under the list-item
+                    // content column (e.g. "- " → 2 cols, "1. " → 3 cols).
+                    let hang = list_item_indents.last().copied().unwrap_or(0);
+                    let effective_width = wrap_width.saturating_sub(hang).max(20);
+                    let wrapped = textwrap::wrap(&text, effective_width);
+                    if wrapped.len() <= 1 {
                         current_spans.push(Span::styled(text.to_string(), style));
                     } else {
-                        for (i, wl) in text_lines.iter().enumerate() {
-                            current_spans.push(Span::styled(wl.to_string(), style));
-                            if i < text_lines.len() - 1 {
+                        for (i, wl) in wrapped.iter().enumerate() {
+                            if i > 0 {
                                 flush_line(&mut current_spans, &mut lines);
+                                if hang > 0 {
+                                    current_spans.push(Span::raw(" ".repeat(hang)));
+                                }
                             }
+                            current_spans.push(Span::styled(wl.to_string(), style));
                         }
                     }
                 }
@@ -336,6 +346,57 @@ mod tests {
     fn empty_input() {
         let lines = render_markdown("", 80);
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn unordered_list_wraps_with_hanging_indent() {
+        // Width 30; "- " bullet = 2 cols; content wraps with 2-space hang.
+        let long = "alpha beta gamma delta epsilon zeta eta theta";
+        let lines = render_markdown(&format!("- {long}"), 30);
+        let texts = text_of(&lines);
+        // Line 1 starts with the bullet.
+        assert!(texts[0].starts_with("- "), "first line: {:?}", texts[0]);
+        // Line 2 is a continuation and hangs under column 2 (under "a" of alpha).
+        assert!(texts.len() >= 2, "expected wrap, got {:?}", texts);
+        assert!(
+            texts[1].starts_with("  ") && !texts[1].starts_with("   "),
+            "expected 2-space hang, got {:?}",
+            texts[1]
+        );
+    }
+
+    #[test]
+    fn ordered_list_wraps_with_hanging_indent() {
+        // "1. " bullet = 3 cols → continuation hangs under column 3.
+        let long = "alpha beta gamma delta epsilon zeta eta theta";
+        let lines = render_markdown(&format!("1. {long}"), 30);
+        let texts = text_of(&lines);
+        assert!(texts[0].starts_with("1. "), "first line: {:?}", texts[0]);
+        assert!(texts.len() >= 2, "expected wrap, got {:?}", texts);
+        assert!(
+            texts[1].starts_with("   ") && !texts[1].starts_with("    "),
+            "expected 3-space hang, got {:?}",
+            texts[1]
+        );
+    }
+
+    #[test]
+    fn nested_list_wraps_with_hanging_indent() {
+        // Nested unordered → "  - " = 4 cols; continuation hangs under column 4.
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota";
+        let md = format!("- outer\n  - {long}");
+        let lines = render_markdown(&md, 30);
+        let texts = text_of(&lines);
+        let nested_idx = texts
+            .iter()
+            .position(|t| t.starts_with("  - "))
+            .expect("nested bullet line present");
+        let cont = &texts[nested_idx + 1];
+        assert!(
+            cont.starts_with("    ") && !cont.starts_with("     "),
+            "expected 4-space hang on nested continuation, got {:?}",
+            cont
+        );
     }
 
     #[test]
