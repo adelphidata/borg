@@ -1,0 +1,346 @@
+use super::*;
+use crate::secrets_resolve::SecretRef;
+use std::io::Write;
+
+#[test]
+fn parse_config_with_secret_ref_env() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+api_key = { source = "env", var = "MY_SECRET_KEY" }
+model = "anthropic/claude-sonnet-4"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert!(cfg.llm.api_key.is_some());
+    if let Some(SecretRef::Env { var }) = &cfg.llm.api_key {
+        assert_eq!(var, "MY_SECRET_KEY");
+    } else {
+        panic!("expected Env variant");
+    }
+}
+
+#[test]
+fn parse_config_with_secret_ref_exec() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+api_key = { source = "exec", command = "security", args = ["find-generic-password", "-s", "borg", "-w"] }
+model = "anthropic/claude-sonnet-4"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert!(cfg.llm.api_key.is_some());
+    if let Some(SecretRef::Exec { command, args }) = &cfg.llm.api_key {
+        assert_eq!(command, "security");
+        assert_eq!(args.len(), 4);
+    } else {
+        panic!("expected Exec variant");
+    }
+}
+
+#[test]
+fn parse_config_with_api_keys_list() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[[llm.api_keys]]
+source = "env"
+var = "PRIMARY_KEY"
+
+[[llm.api_keys]]
+source = "env"
+var = "FALLBACK_KEY"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert_eq!(cfg.llm.api_keys.len(), 2);
+}
+
+#[test]
+fn parse_config_without_secret_ref_uses_defaults() {
+    let toml_str = r#"
+[llm]
+api_key_env = "MY_KEY"
+model = "test-model"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert!(cfg.llm.api_key.is_none());
+    assert!(cfg.llm.api_keys.is_empty());
+    assert_eq!(cfg.llm.api_key_env, "MY_KEY");
+}
+
+#[test]
+fn resolve_provider_prefers_secret_ref() {
+    let env_name = "BORG_TEST_SECRET_REF_RESOLVE";
+    std::env::set_var(env_name, "secret-ref-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openrouter".to_string());
+    cfg.llm.api_key = Some(SecretRef::Env {
+        var: env_name.to_string(),
+    });
+    let (provider, key) = cfg.resolve_provider().expect("should resolve");
+    assert_eq!(key, "secret-ref-key");
+    assert_eq!(provider, Provider::OpenRouter);
+    std::env::remove_var(env_name);
+}
+
+#[test]
+fn resolve_api_keys_overrides_openai_to_openrouter_when_key_is_openrouter() {
+    let env = "BORG_TEST_MISMATCHED_KEY";
+    std::env::set_var(env, "sk-or-v1-mismatched-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".to_string());
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env.to_string(),
+    }];
+    let (provider, keys) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::OpenRouter);
+    assert_eq!(keys[0], "sk-or-v1-mismatched-key");
+    std::env::remove_var(env);
+}
+
+#[test]
+fn resolve_api_keys_keeps_provider_when_key_prefix_is_ambiguous() {
+    let env = "BORG_TEST_AMBIGUOUS_KEY";
+    std::env::set_var(env, "sk-some-openai-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openai".to_string());
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env.to_string(),
+    }];
+    let (provider, _) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::OpenAi);
+    std::env::remove_var(env);
+}
+
+#[test]
+fn resolve_api_keys_multi() {
+    let env1 = "BORG_TEST_MULTI_KEY_1";
+    let env2 = "BORG_TEST_MULTI_KEY_2";
+    std::env::set_var(env1, "key-one");
+    std::env::set_var(env2, "key-two");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("openrouter".to_string());
+    cfg.llm.api_keys = vec![
+        SecretRef::Env {
+            var: env1.to_string(),
+        },
+        SecretRef::Env {
+            var: env2.to_string(),
+        },
+    ];
+    let (_, keys) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(keys.len(), 2);
+    assert_eq!(keys[0], "key-one");
+    assert_eq!(keys[1], "key-two");
+    std::env::remove_var(env1);
+    std::env::remove_var(env2);
+}
+
+// ── Feature #11: Provider Failover config tests ──
+
+#[test]
+fn parse_llm_fallback_config() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4"
+
+[[llm.fallback]]
+provider = "anthropic"
+model = "claude-sonnet-4"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[[llm.fallback]]
+provider = "openai"
+model = "gpt-4.1"
+temperature = 0.5
+max_tokens = 8192
+"#;
+    let cfg: Config = toml::from_str(toml_str).unwrap();
+    assert_eq!(cfg.llm.fallback.len(), 2);
+    assert_eq!(cfg.llm.fallback[0].provider, "anthropic");
+    assert_eq!(cfg.llm.fallback[0].model, "claude-sonnet-4");
+    assert_eq!(
+        cfg.llm.fallback[0].api_key_env.as_deref(),
+        Some("ANTHROPIC_API_KEY")
+    );
+    assert_eq!(cfg.llm.fallback[1].provider, "openai");
+    assert_eq!(cfg.llm.fallback[1].model, "gpt-4.1");
+    assert!((cfg.llm.fallback[1].temperature.unwrap() - 0.5).abs() < f32::EPSILON);
+    assert_eq!(cfg.llm.fallback[1].max_tokens, Some(8192));
+}
+
+#[test]
+fn parse_no_fallback_config() {
+    let toml_str = r#"
+[llm]
+model = "test-model"
+"#;
+    let cfg: Config = toml::from_str(toml_str).unwrap();
+    assert!(cfg.llm.fallback.is_empty());
+}
+
+#[test]
+fn parse_config_with_base_url() {
+    let toml_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.3"
+base_url = "http://my-server:11434/v1/chat/completions"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert_eq!(cfg.llm.provider.as_deref(), Some("ollama"));
+    assert_eq!(
+        cfg.llm.base_url.as_deref(),
+        Some("http://my-server:11434/v1/chat/completions")
+    );
+}
+
+#[test]
+fn parse_ollama_config_no_api_key_required() {
+    let toml_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.3"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    let (provider, key) = cfg
+        .resolve_provider()
+        .expect("should resolve ollama without key");
+    assert_eq!(provider, Provider::Ollama);
+    assert!(key.is_empty());
+}
+
+#[test]
+fn resolve_api_keys_ollama_returns_empty_key() {
+    let toml_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.3"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    let (provider, keys) = cfg.resolve_api_keys().expect("should resolve");
+    assert_eq!(provider, Provider::Ollama);
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].is_empty());
+}
+
+#[test]
+fn parse_config_with_base_url_for_cloud_provider() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "gpt-4.1"
+base_url = "https://my-azure-proxy.example.com/v1/chat/completions"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert_eq!(cfg.llm.provider.as_deref(), Some("openai"));
+    assert_eq!(
+        cfg.llm.base_url.as_deref(),
+        Some("https://my-azure-proxy.example.com/v1/chat/completions")
+    );
+}
+
+#[test]
+fn parse_realistic_ollama_config() {
+    let toml_str = r#"
+[user]
+name = "Mike"
+agent_name = "Buddy"
+
+[llm]
+provider = "ollama"
+model = "llama3.3"
+temperature = 0.7
+max_tokens = 4096
+
+[sandbox]
+enabled = true
+mode = "strict"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert_eq!(cfg.llm.provider.as_deref(), Some("ollama"));
+    assert_eq!(cfg.llm.model, "llama3.3");
+    assert!(cfg.llm.api_key.is_none());
+    assert!(cfg.llm.api_keys.is_empty());
+}
+
+#[test]
+fn parse_fallback_with_base_url() {
+    let toml_str = r#"
+[llm]
+provider = "ollama"
+model = "llama3.3"
+
+[[llm.fallback]]
+provider = "openai"
+model = "gpt-4.1-mini"
+base_url = "https://proxy.example.com/v1/chat/completions"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert_eq!(cfg.llm.fallback.len(), 1);
+    assert_eq!(
+        cfg.llm.fallback[0].base_url.as_deref(),
+        Some("https://proxy.example.com/v1/chat/completions")
+    );
+}
+
+#[test]
+fn thinking_level_defaults_to_off() {
+    let cfg = Config::default();
+    assert_eq!(cfg.llm.thinking, ThinkingLevel::Off);
+    assert!(cfg.llm.thinking.budget_tokens().is_none());
+    assert!(cfg.llm.thinking.openai_reasoning_effort().is_none());
+    assert!(!cfg.llm.thinking.is_enabled());
+}
+
+#[test]
+fn thinking_level_budget_tokens() {
+    assert_eq!(ThinkingLevel::Low.budget_tokens(), Some(1024));
+    assert_eq!(ThinkingLevel::Medium.budget_tokens(), Some(4096));
+    assert_eq!(ThinkingLevel::High.budget_tokens(), Some(16384));
+    assert_eq!(ThinkingLevel::Xhigh.budget_tokens(), Some(32768));
+}
+
+#[test]
+fn thinking_level_openai_reasoning_effort() {
+    assert_eq!(ThinkingLevel::Low.openai_reasoning_effort(), Some("low"));
+    assert_eq!(
+        ThinkingLevel::Medium.openai_reasoning_effort(),
+        Some("medium")
+    );
+    assert_eq!(ThinkingLevel::High.openai_reasoning_effort(), Some("high"));
+    assert_eq!(ThinkingLevel::Xhigh.openai_reasoning_effort(), Some("high"));
+}
+
+#[test]
+fn thinking_level_serde_roundtrip() {
+    let level: ThinkingLevel = serde_json::from_str(r#""high""#).unwrap();
+    assert_eq!(level, ThinkingLevel::High);
+    let json = serde_json::to_string(&level).unwrap();
+    assert_eq!(json, r#""high""#);
+}
+
+#[test]
+fn parse_thinking_level_in_config_toml() {
+    let toml_str = r#"
+            [llm]
+            model = "claude-sonnet-4"
+            thinking = "medium"
+        "#;
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let mut f = std::fs::File::create(&config_path).unwrap();
+    f.write_all(toml_str.as_bytes()).unwrap();
+
+    let cfg = Config::load_from(&config_path).unwrap();
+    assert_eq!(cfg.llm.thinking, ThinkingLevel::Medium);
+    assert_eq!(cfg.llm.thinking.budget_tokens(), Some(4096));
+}
+
+#[test]
+fn group_activation_defaults_to_mention() {
+    let cfg = Config::default();
+    assert_eq!(cfg.gateway.group_activation, ActivationMode::Mention);
+}
