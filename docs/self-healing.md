@@ -164,6 +164,58 @@ consolidation crons already expect.
 Append mode checks the **combined** size (existing + new), so appending
 4k tokens to a 17k-token entry fails just like writing 21k fresh.
 
+## Skill tamper audit
+
+User skills under `~/.borg/skills/<name>/SKILL.md` are hand-curated —
+borg has no plugin-system install for skills, so the directory contents
+are whatever the user put there. To catch post-install tampering, every
+`borg doctor` run (and the daily maintenance sweep) hashes each
+`SKILL.md` with SHA-256 and compares against the previous hash recorded
+in the `skill_audit` table (added in V39).
+
+Model:
+
+- **First observation** of a skill name inserts a row with no warning.
+  The user put the skill there; trusting on first use is the only
+  sensible default when there is no signed manifest to compare against.
+- **Unchanged** (same hash) updates `last_seen_at` only.
+- **Modified** (hash diverged) updates the stored hash and emits a
+  `tracing::warn!` at observation time. The doctor Skills check then
+  surfaces a `Warn` naming the affected skill(s) with the hint
+  `review content for supply-chain tampering`.
+
+Uninstalling a skill is a manual operation today (`rm -rf`); call
+`db.forget_skill_audit(name)` from a migration if you need a reinstall
+to be treated as first-seen rather than modified.
+
+The helper that drives this is
+`borg_core::skill_security::audit_user_skills(&db, &dir)` — pure function,
+takes an open DB and returns `Vec<SkillAuditFinding>`.
+
+## Persistent-warning notice on TUI open
+
+The daily maintenance sweep writes `persistent_warnings` (any Warn/Fail
+doctor check that appeared in two consecutive sweeps) to the latest
+`doctor_runs` row. On TUI startup, `App::new` queries that row and, if
+`persistent_warnings` is non-empty, pushes a one-shot `System` cell into
+the transcript right after the opening card:
+
+```
+⚠ doctor: 2 persistent warning(s) — run `borg doctor` for details
+  • Memory:Index staleness
+  • Skills:tamper audit
+```
+
+This is **intentionally not a persistent banner**. It renders once at
+session start and scrolls away with any subsequent activity. More than
+three warnings collapse into a "… and N more" footer line so chronic
+neglect doesn't turn the startup notice into a wall of text. The report
+is always available in full via `borg doctor` or by querying
+`doctor_runs.report_json` directly.
+
+Implementation: `persistent_warning_notice_from_db` in
+`crates/cli/src/tui/app/mod.rs`.
+
 ## Related systems
 
 - **Consolidation crons** (`docs/memory.md` — nightly 03:00 / weekly

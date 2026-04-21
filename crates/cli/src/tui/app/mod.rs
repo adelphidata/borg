@@ -170,6 +170,58 @@ pub struct AmbientStatus {
     pub archetype: Option<borg_core::evolution::Archetype>,
 }
 
+/// Compose a one-line notice summarizing the latest maintenance run's
+/// `persistent_warnings`, or `None` if the last run had no persistent
+/// issues (or there are no runs yet).
+///
+/// Rendered once at TUI startup, right after the opening card. This is
+/// deliberately quiet — a System cell that scrolls away, not a banner.
+/// The report is also in `doctor_runs` and surfaced via `borg doctor`;
+/// this is just a nudge when something has been stuck across sweeps.
+pub(super) fn load_persistent_warning_notice() -> Option<String> {
+    let db = match borg_core::db::Database::open() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("persistent_warning_notice: DB open failed: {e:#}");
+            return None;
+        }
+    };
+    persistent_warning_notice_from_db(&db)
+}
+
+/// Testable core of [`load_persistent_warning_notice`]. Takes an open DB
+/// and returns the same `Option<String>` based on the latest `doctor_runs`
+/// row. Extracted so tests can seed an in-memory DB.
+fn persistent_warning_notice_from_db(db: &borg_core::db::Database) -> Option<String> {
+    let report = match db.latest_doctor_run() {
+        Ok(r) => r?,
+        Err(e) => {
+            tracing::warn!("persistent_warning_notice: latest_doctor_run failed: {e:#}");
+            return None;
+        }
+    };
+    if report.persistent_warnings.is_empty() {
+        return None;
+    }
+
+    // Cap the list to keep the startup notice quiet — 3 warnings max.
+    const MAX_SHOWN: usize = 3;
+    let total = report.persistent_warnings.len();
+    let shown = total.min(MAX_SHOWN);
+    let extra = total - shown;
+    let mut lines = Vec::with_capacity(shown + 2);
+    lines.push(format!(
+        "⚠ doctor: {total} persistent warning(s) — run `borg doctor` for details"
+    ));
+    for w in report.persistent_warnings.iter().take(shown) {
+        lines.push(format!("  • {w}"));
+    }
+    if extra > 0 {
+        lines.push(format!("  … and {extra} more"));
+    }
+    Some(lines.join("\n"))
+}
+
 /// Load the current ambient-status snapshot from the DB. Errors propagate to
 /// the caller so `refresh_ambient_status` can decide whether to clear the
 /// cache and log a single warning (rather than duplicate messages per step).
@@ -380,6 +432,12 @@ impl<'a> App<'a> {
             toasts: super::toast::ToastStack::new(),
         };
         app.refresh_ambient_status();
+        // One-shot persistent-warning notice. Rendered once after the
+        // opening card on TUI startup, then scrolls away like any other
+        // System cell — intentionally *not* a pinned banner.
+        if let Some(text) = load_persistent_warning_notice() {
+            app.cells.push(super::history::HistoryCell::System { text });
+        }
         app
     }
 
@@ -797,6 +855,100 @@ mod tests {
     fn make_app() -> App<'static> {
         let config = Config::default();
         App::new(config, None, None, None)
+    }
+
+    // ========================================================================
+    // persistent_warning_notice_from_db — one-shot TUI notice on startup.
+    // Uses an in-memory test DB so these tests don't touch ~/.borg/borg.db.
+    // ========================================================================
+
+    fn test_db() -> borg_core::db::Database {
+        // `Database::test_db()` is cfg(test)-gated inside borg-core so we
+        // can't see it from the CLI crate. Build one via the public
+        // `from_connection` API using an in-memory SQLite connection —
+        // same result, just the long way round.
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        borg_core::db::Database::from_connection(conn).expect("init in-memory db")
+    }
+
+    fn seed_report(
+        db: &borg_core::db::Database,
+        persistent: Vec<&str>,
+    ) -> borg_core::maintenance::MaintenanceReport {
+        let report = borg_core::maintenance::MaintenanceReport {
+            ran_at: chrono::Utc::now().timestamp(),
+            persistent_warnings: persistent.into_iter().map(String::from).collect(),
+            ..Default::default()
+        };
+        db.record_doctor_run(&report).expect("record doctor run");
+        report
+    }
+
+    #[test]
+    fn notice_none_when_no_doctor_runs() {
+        let db = test_db();
+        assert!(persistent_warning_notice_from_db(&db).is_none());
+    }
+
+    #[test]
+    fn notice_none_when_last_run_had_no_persistent_warnings() {
+        let db = test_db();
+        seed_report(&db, vec![]);
+        assert!(persistent_warning_notice_from_db(&db).is_none());
+    }
+
+    #[test]
+    fn notice_lists_single_warning() {
+        let db = test_db();
+        seed_report(&db, vec!["Memory:Index staleness"]);
+        let notice = persistent_warning_notice_from_db(&db).expect("notice present");
+        assert!(
+            notice.contains("1 persistent warning"),
+            "expected count line, got: {notice}"
+        );
+        assert!(
+            notice.contains("Memory:Index staleness"),
+            "expected warning text, got: {notice}"
+        );
+        assert!(
+            notice.contains("borg doctor"),
+            "expected CTA mentioning `borg doctor`, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn notice_caps_long_list_and_reports_overflow() {
+        // Five persistent warnings — first three shown inline, remaining two
+        // collapsed into a single "… and N more" line so the startup notice
+        // stays quiet even after prolonged neglect.
+        let db = test_db();
+        seed_report(&db, vec!["a:one", "a:two", "a:three", "a:four", "a:five"]);
+        let notice = persistent_warning_notice_from_db(&db).expect("notice present");
+        assert!(notice.contains("5 persistent warning"));
+        assert!(notice.contains("• a:one"));
+        assert!(notice.contains("• a:two"));
+        assert!(notice.contains("• a:three"));
+        assert!(
+            !notice.contains("• a:four"),
+            "fourth warning should be collapsed, got: {notice}"
+        );
+        assert!(
+            notice.contains("… and 2 more"),
+            "expected overflow indicator, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn notice_reads_latest_run_only() {
+        // If a recent run cleared warnings, the older noisy run must not
+        // resurface — newest doctor_runs row wins.
+        let db = test_db();
+        seed_report(&db, vec!["old:warning"]);
+        // Wait a second so the second row's ran_at is strictly larger
+        // (doctor_runs orders by ran_at DESC).
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        seed_report(&db, vec![]);
+        assert!(persistent_warning_notice_from_db(&db).is_none());
     }
 
     fn key(code: KeyCode) -> KeyEvent {

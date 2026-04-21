@@ -7,23 +7,27 @@ commit that deferred the work so context isn't lost.
 
 Deferred from the "Tier 1 — core self-healing" plan (see `docs/self-healing.md`
 and commit `e666f4c`). Tier 1 shipped missed-run detection, the memory size
-cap, and the daily maintenance sweep. The following were explicitly left
-out to avoid refactor sprawl:
+cap, and the daily maintenance sweep. Tier 2 then closed the items below
+except where noted:
 
-- **Skill audit log / unknown-skill detection.** Warn when a skill appears
-  under `~/.borg/skills/` that wasn't installed via the plugin system —
-  defends against supply-chain tampering.
-- **Gateway async-blocking fixes.** Replace synchronous `std::fs::read_to_string`
-  calls inside async hot paths at `crates/gateway/src/manifest.rs:169` and
-  `crates/gateway/src/imessage/monitor.rs:282`. These can stall the event
-  loop under slow disk I/O.
-- **Persistent doctor-warning TUI banner.** Surface
-  `MaintenanceReport.persistent_warnings` as a non-dismissable banner in
-  the TUI (and/or deliver to the configured heartbeat channel). Today the
-  report is written to `doctor_runs` but the user still has to query it
-  by hand.
-- **CVE advisory integration.** Pull from rustsec / OSV on a cadence and
-  flag vulnerable dependencies from a doctor check.
+- ~~**Skill audit log / unknown-skill detection.**~~ Shipped. V39 migration
+  added `skill_audit` and the doctor Skills check compares SHA-256 of each
+  user `SKILL.md` against the stored hash, warning on divergence. TOFU on
+  first load. See `docs/self-healing.md` "Skill tamper audit".
+- ~~**Gateway async-blocking fixes.**~~ Shipped. iMessage monitor now loads
+  manifest + state with `tokio::fs` via `ChannelManifest::load_async`; the
+  sync `load()` is retained for the registry scanner.
+- ~~**Persistent doctor-warning TUI banner.**~~ Shipped as a one-shot
+  startup notice (not a persistent banner — explicit design choice to
+  avoid user fatigue). `App::new` queries `latest_doctor_run` and pushes
+  a `System` cell after the opening card when `persistent_warnings` is
+  non-empty; scrolls away like any other message.
+- **CVE advisory integration.** Deferred. Pulling rustsec / OSV advisories
+  on a cadence would mean an outbound git/HTTP fetch from a background
+  task, which is unwelcome on airgapped or locked-down deployments and
+  adds non-trivial binary weight for a feature many installs won't use.
+  Revisit if user demand materializes — a `cargo audit` wrapper around
+  `Cargo.lock` in the release binary is one safer path.
 
 ## Self-healing — known gaps worth tracking
 
