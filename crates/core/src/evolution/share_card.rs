@@ -4,7 +4,7 @@
 //! current evolution (stage, level, name, dominant archetype, description)
 //! suitable for terminal output, channel replies, or writing to a file.
 
-use super::{capitalize_first, Archetype, EvolutionState, Stage};
+use super::{capitalize_first, Archetype, EvolutionState, Mood, Stage};
 
 /// Inner width (characters between the box borders).
 const INNER_WIDTH: usize = 48;
@@ -26,11 +26,13 @@ pub fn render_ascii_card(evo: &EvolutionState) -> String {
     let name = card_display_name(evo);
     let stage_label = stage_label(evo.stage);
     let archetype_label = archetype_label(evo.dominant_archetype);
+    let mood_label = mood_label(evo.mood);
     let description = card_description(evo);
 
     let header = format!("BORG \u{00B7} {name} Lv.{}", evo.level);
     let stage_line = format!("Stage: {stage_label}");
     let archetype_line = format!("Archetype: {archetype_label}");
+    let mood_line = format!("Mood: {mood_label}");
     let desc_line = truncate_to(&description, INNER_WIDTH.saturating_sub(4));
 
     let mut out = String::new();
@@ -41,6 +43,8 @@ pub fn render_ascii_card(evo: &EvolutionState) -> String {
     out.push_str(&box_line(&stage_line));
     out.push('\n');
     out.push_str(&box_line(&archetype_line));
+    out.push('\n');
+    out.push_str(&box_line(&mood_line));
     out.push('\n');
     out.push_str(&box_line(&desc_line));
     out.push('\n');
@@ -71,6 +75,13 @@ fn stage_label(stage: Stage) -> &'static str {
 fn archetype_label(archetype: Option<Archetype>) -> String {
     match archetype {
         Some(a) => capitalize_first(&format!("{a}")),
+        None => "\u{2014}".to_string(), // em dash
+    }
+}
+
+fn mood_label(mood: Option<Mood>) -> String {
+    match mood {
+        Some(m) => capitalize_first(&format!("{m}")),
         None => "\u{2014}".to_string(), // em dash
     }
 }
@@ -132,6 +143,16 @@ mod tests {
         desc: Option<&str>,
         arch: Option<Archetype>,
     ) -> EvolutionState {
+        fixture_with_mood(stage, name, desc, arch, None)
+    }
+
+    fn fixture_with_mood(
+        stage: Stage,
+        name: Option<&str>,
+        desc: Option<&str>,
+        arch: Option<Archetype>,
+        mood: Option<Mood>,
+    ) -> EvolutionState {
         EvolutionState {
             stage,
             level: match stage {
@@ -152,7 +173,7 @@ mod tests {
             chain_valid: true,
             momentum: HashMap::new(),
             level_up_events_recent: Vec::new(),
-            mood: None,
+            mood,
             readiness: None,
         }
     }
@@ -179,22 +200,25 @@ mod tests {
         assert!(card.contains("BORG \u{00B7} Base Borg Lv.7"));
         assert!(card.contains("Stage: Base I"));
         assert!(card.contains("Archetype: \u{2014}"));
+        assert!(card.contains("Mood: \u{2014}"));
         assert!(card.contains("Still discovering"));
     }
 
     #[test]
     fn render_evolved_stage_with_name_and_archetype() {
-        let evo = fixture(
+        let evo = fixture_with_mood(
             Stage::Evolved,
             Some("Pipeline Warden"),
             Some("A vigilant guardian of pipelines."),
             Some(Archetype::Ops),
+            Some(Mood::Stable),
         );
         let card = render_ascii_card(&evo);
         assert_box_shape(&card);
         assert!(card.contains("BORG \u{00B7} Pipeline Warden Lv.42"));
         assert!(card.contains("Stage: Evolved II"));
         assert!(card.contains("Archetype: Ops"));
+        assert!(card.contains("Mood: Stable"));
         assert!(card.contains("A vigilant guardian of pipelines."));
     }
 
