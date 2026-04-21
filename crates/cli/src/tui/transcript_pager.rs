@@ -82,13 +82,6 @@ impl TranscriptPager {
         self.search = None;
     }
 
-    /// Read-only accessors for tests.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
-    }
-
     #[cfg(test)]
     pub fn search_query(&self) -> Option<&str> {
         self.search.as_ref().map(|s| s.query.as_str())
@@ -97,21 +90,6 @@ impl TranscriptPager {
     #[cfg(test)]
     pub fn is_searching(&self) -> bool {
         self.search.as_ref().is_some_and(|s| s.editing)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn current_match(&self) -> Option<usize> {
-        self.search
-            .as_ref()
-            .filter(|s| !s.matches.is_empty())
-            .map(|s| s.matches[s.current])
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn match_count(&self) -> usize {
-        self.search.as_ref().map(|s| s.matches.len()).unwrap_or(0)
     }
 
     /// Route a key event. Returns whether the pager should be dismissed.
