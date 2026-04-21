@@ -144,6 +144,31 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             })
         }
         EvolutionCommand::Card { out } => {
+            // Mirror the `/evolution` branch: derive mood from vitals + bond
+            // so the card shows a baseline (Stable) instead of an em dash
+            // when pure replay leaves `state.mood = None`.
+            let now = chrono::Utc::now();
+            let vitals_state = match db.get_vitals_state() {
+                Ok(v) => vitals::apply_decay(&v, now),
+                Err(e) => {
+                    tracing::warn!("card: vitals unavailable, using baseline: {e}");
+                    vitals::baseline()
+                }
+            };
+            let bond_state = match db.get_all_bond_events() {
+                Ok(events) => {
+                    let key = db.derive_hmac_key(bond::BOND_HMAC_DOMAIN);
+                    bond::replay_events_with_key(&key, &events)
+                }
+                Err(e) => {
+                    tracing::warn!("card: bond events unavailable, using empty: {e}");
+                    bond::replay_events_with_key(&[], &[])
+                }
+            };
+
+            let mut state = state;
+            state.mood = Some(compute_mood(&state, &vitals_state, &bond_state));
+
             let card = render_ascii_card(&state);
             let text = match out {
                 Some(path) => {
@@ -285,6 +310,34 @@ mod tests {
         let db = Database::test_db();
         let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch evolution");
         assert!(!out.text.is_empty());
+    }
+
+    #[test]
+    fn dispatch_card_populates_mood_not_em_dash() {
+        // Regression: `/card` went through pure `get_evolution_state` which
+        // leaves `state.mood = None`, so `render_ascii_card` printed
+        // `Mood: —`. Dispatch must derive mood from vitals+bond the same way
+        // `/evolution` does, so a realistic state yields a concrete label.
+        let db = Database::test_db();
+        // Seed enough archetype XP that dominant_archetype resolves — without
+        // it, baseline vitals (40/40/…) produce Mood::Drifting. With it,
+        // they produce Mood::Stable.
+        for _ in 0..10 {
+            db.record_evolution_event("xp_gain", 2, Some("builder"), "apply_patch", None)
+                .expect("record xp_gain");
+        }
+
+        let out = dispatch(EvolutionCommand::Card { out: None }, &db).expect("dispatch");
+        assert!(
+            out.text.contains("Mood: Stable"),
+            "expected Mood: Stable baseline in card, got: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("Mood: \u{2014}"),
+            "card should not render em-dash mood when state is derivable: {}",
+            out.text
+        );
     }
 
     #[test]
