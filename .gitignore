@@ -30,3 +30,6 @@ Thumbs.db
 
 # Claude Code local hooks
 /.claude/hooks/
+
+# Local scratch scripts (one-off maintenance tooling)
+/scripts/scratch/
