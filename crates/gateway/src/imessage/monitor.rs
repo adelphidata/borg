@@ -52,7 +52,7 @@ async fn monitor_loop(
 
     // Load persisted state (last_rowid)
     let state_path = channel_dir.join(STATE_FILE);
-    let mut last_rowid = load_last_rowid(&state_path);
+    let mut last_rowid = load_last_rowid(&state_path).await;
 
     // If no state, initialize to current max ROWID (only process future messages)
     if last_rowid == 0 {
@@ -62,7 +62,7 @@ async fn monitor_loop(
                 row.get::<_, Option<i64>>(0)
             })?
             .unwrap_or(0);
-        save_last_rowid(&state_path, last_rowid);
+        save_last_rowid(&state_path, last_rowid).await;
     }
 
     let poll_interval = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
@@ -71,7 +71,8 @@ async fn monitor_loop(
 
     // Load channel manifest for handler reuse
     let manifest_path = channel_dir.join("channel.toml");
-    let manifest = crate::manifest::ChannelManifest::load(&manifest_path)
+    let manifest = crate::manifest::ChannelManifest::load_async(&manifest_path)
+        .await
         .context("Failed to load imessage channel.toml")?;
     let registered_channel = RegisteredChannel {
         manifest,
@@ -153,7 +154,7 @@ async fn monitor_loop(
 
                             if rowid > last_rowid {
                                 last_rowid = rowid;
-                                save_last_rowid(&state_path, last_rowid);
+                                save_last_rowid(&state_path, last_rowid).await;
                             }
                         }
                     }
@@ -278,8 +279,8 @@ fn open_chatdb(db_uri: &str) -> Result<rusqlite::Connection> {
     .context("Failed to open chat.db (check Full Disk Access)")
 }
 
-fn load_last_rowid(state_path: &std::path::Path) -> i64 {
-    let content = match std::fs::read_to_string(state_path) {
+async fn load_last_rowid(state_path: &std::path::Path) -> i64 {
+    let content = match tokio::fs::read_to_string(state_path).await {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(e) => {
@@ -299,9 +300,9 @@ fn load_last_rowid(state_path: &std::path::Path) -> i64 {
     }
 }
 
-fn save_last_rowid(state_path: &std::path::Path, rowid: i64) {
+async fn save_last_rowid(state_path: &std::path::Path, rowid: i64) {
     let state = format!("{{\"last_rowid\": {rowid}}}");
-    if let Err(e) = std::fs::write(state_path, &state) {
+    if let Err(e) = tokio::fs::write(state_path, &state).await {
         warn!("Failed to save iMessage state: {e}");
     }
 }
@@ -312,44 +313,44 @@ mod tests {
 
     // -- load_last_rowid / save_last_rowid --
 
-    #[test]
-    fn load_last_rowid_missing_file() {
+    #[tokio::test]
+    async fn load_last_rowid_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nonexistent.json");
-        assert_eq!(load_last_rowid(&path), 0);
+        assert_eq!(load_last_rowid(&path).await, 0);
     }
 
-    #[test]
-    fn save_and_load_last_rowid() {
+    #[tokio::test]
+    async fn save_and_load_last_rowid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        save_last_rowid(&path, 42);
-        assert_eq!(load_last_rowid(&path), 42);
+        save_last_rowid(&path, 42).await;
+        assert_eq!(load_last_rowid(&path).await, 42);
     }
 
-    #[test]
-    fn load_last_rowid_corrupt_json() {
+    #[tokio::test]
+    async fn load_last_rowid_corrupt_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         std::fs::write(&path, "not json at all").unwrap();
-        assert_eq!(load_last_rowid(&path), 0);
+        assert_eq!(load_last_rowid(&path).await, 0);
     }
 
-    #[test]
-    fn load_last_rowid_missing_key() {
+    #[tokio::test]
+    async fn load_last_rowid_missing_key() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
         std::fs::write(&path, r#"{"other_key": 99}"#).unwrap();
-        assert_eq!(load_last_rowid(&path), 0);
+        assert_eq!(load_last_rowid(&path).await, 0);
     }
 
-    #[test]
-    fn save_last_rowid_overwrites() {
+    #[tokio::test]
+    async fn save_last_rowid_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
-        save_last_rowid(&path, 10);
-        save_last_rowid(&path, 20);
-        assert_eq!(load_last_rowid(&path), 20);
+        save_last_rowid(&path, 10).await;
+        save_last_rowid(&path, 20).await;
+        assert_eq!(load_last_rowid(&path).await, 20);
     }
 
     // -- evaluate_message --

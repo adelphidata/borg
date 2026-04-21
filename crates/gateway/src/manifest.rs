@@ -165,9 +165,25 @@ fn default_max_concurrent() -> usize {
 
 impl ChannelManifest {
     /// Load and validate a channel manifest from a `channel.toml` file.
+    ///
+    /// Synchronous. Called from the registry scanner during startup. For
+    /// async callers (the iMessage monitor) use [`ChannelManifest::load_async`]
+    /// so the reactor is not stalled on disk I/O.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let manifest: Self = toml::from_str(&content)?;
+        Self::parse(&content)
+    }
+
+    /// Async variant of [`ChannelManifest::load`] for callers running on a
+    /// tokio runtime (e.g. the iMessage monitor). Reads the manifest with
+    /// `tokio::fs` so a slow disk can't block other reactor tasks.
+    pub async fn load_async(path: &Path) -> anyhow::Result<Self> {
+        let content = tokio::fs::read_to_string(path).await?;
+        Self::parse(&content)
+    }
+
+    fn parse(content: &str) -> anyhow::Result<Self> {
+        let manifest: Self = toml::from_str(content)?;
         // Validate channel name to prevent path traversal in webhook routes
         if manifest.name.contains('/')
             || manifest.name.contains('\\')
@@ -303,6 +319,38 @@ description = "Discord bot"
     fn load_nonexistent_file_errors() {
         let result = ChannelManifest::load(std::path::Path::new("/tmp/nonexistent_channel.toml"));
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_async_reads_same_file_as_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channel.toml");
+        std::fs::write(&path, FULL_TOML).unwrap();
+        let sync_manifest = ChannelManifest::load(&path).unwrap();
+        let async_manifest = ChannelManifest::load_async(&path).await.unwrap();
+        assert_eq!(sync_manifest.name, async_manifest.name);
+        assert_eq!(sync_manifest.runtime, async_manifest.runtime);
+        assert_eq!(
+            sync_manifest.settings.timeout_ms,
+            async_manifest.settings.timeout_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn load_async_rejects_path_traversal_in_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channel.toml");
+        std::fs::write(
+            &path,
+            r#"
+name = "../escape"
+description = "x"
+runtime = "python"
+"#,
+        )
+        .unwrap();
+        let err = ChannelManifest::load_async(&path).await.unwrap_err();
+        assert!(err.to_string().contains("invalid characters"));
     }
 
     #[test]
