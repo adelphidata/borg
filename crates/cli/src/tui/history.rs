@@ -61,6 +61,11 @@ pub enum HistoryCell {
     System {
         text: String,
     },
+    /// Pre-rendered styled lines — used by the shared Borg card so `/card`
+    /// renders with the same teal styling as the startup header.
+    Card {
+        lines: Vec<Line<'static>>,
+    },
     Thinking {
         text: String,
     },
@@ -542,6 +547,7 @@ impl HistoryCell {
                 ])]
             }
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
+            HistoryCell::Card { lines } => lines.clone(),
             HistoryCell::Thinking { text } => {
                 // Don't render an empty thinking box
                 if text.is_empty() {

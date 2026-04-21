@@ -5,6 +5,7 @@ use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, Scroll
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, BRAILLE_EIGHT};
 
+use super::super::history::HistoryCell;
 use super::super::{layout, shimmer, theme};
 use super::{App, AppState, BacktrackPhase};
 use borg_core::config::CollaborationMode;
@@ -53,6 +54,19 @@ impl<'a> App<'a> {
         self.toasts.render(frame, area);
     }
 
+    /// Push the shared Borg card (the same one rendered at the top of the
+    /// transcript) into the cell history. Used by `/card`.
+    pub(crate) fn push_borg_card(&mut self) {
+        let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
+        let ambient = if self.config.evolution.ambient_header_enabled {
+            self.ambient_status.as_ref()
+        } else {
+            None
+        };
+        let lines = build_borg_card_lines(name, &self.config.llm.model, ambient);
+        self.cells.push(HistoryCell::Card { lines });
+    }
+
     pub(super) fn compute_context_pct(&self) -> u8 {
         let max = self.config.conversation.max_history_tokens;
         if max == 0 {
@@ -72,43 +86,14 @@ impl<'a> App<'a> {
             _ => None,
         };
 
-        // Always show branded header
-        let version = env!("CARGO_PKG_VERSION");
-        all_lines.push(Line::from(vec![
-            Span::styled(
-                "BORG",
-                Style::default()
-                    .fg(theme::CYAN)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::from(" "),
-            Span::styled(format!("v{version}"), theme::dim()),
-        ]));
-        all_lines.push(Line::default());
-
+        // Always show branded header — same component as `/card`.
         let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
-        all_lines.push(Line::from(vec![
-            Span::styled("name:  ", theme::dim()),
-            Span::from(name.to_string()),
-        ]));
-
-        all_lines.push(Line::from(vec![
-            Span::styled("model: ", theme::dim()),
-            Span::from(self.config.llm.model.clone()),
-        ]));
-
-        if self.config.evolution.ambient_header_enabled {
-            if let Some(ref ambient) = self.ambient_status {
-                all_lines.push(Line::from(vec![
-                    Span::styled("class: ", theme::dim()),
-                    Span::styled(
-                        format_ambient_header(ambient),
-                        Style::default().fg(theme::CYAN),
-                    ),
-                ]));
-            }
-        }
-
+        let ambient = if self.config.evolution.ambient_header_enabled {
+            self.ambient_status.as_ref()
+        } else {
+            None
+        };
+        all_lines.extend(build_borg_card_lines(name, &self.config.llm.model, ambient));
         all_lines.push(Line::default());
 
         for (i, cell) in self.cells.iter().enumerate() {
@@ -465,14 +450,14 @@ impl<'a> App<'a> {
     }
 }
 
-/// Format the value portion of the `class:` ambient header line.
+/// Format the value portion of the `class:` line.
 ///
-/// Shape: `{name} [the {Archetype}] Lv.{level} ({mood})`. Pre-evolution
+/// Shape: `{name} [the {Archetype}] Lv.{level}`. Pre-evolution
 /// (`evolution_name` is `None`), `{name}` is the literal `"Base Borg"` and
 /// the archetype epithet is suppressed entirely — archetype only attaches
-/// to a real evolved name. Archetype is title-cased to match the legacy
-/// `format_compact` styling.
-pub(super) fn format_ambient_header(status: &super::AmbientStatus) -> String {
+/// to a real evolved name. Mood is rendered on its own `mood:` line, not
+/// appended here.
+pub(super) fn format_class_label(status: &super::AmbientStatus) -> String {
     let mut out = String::new();
     match status.evolution_name.as_deref() {
         Some(name) => {
@@ -490,8 +475,47 @@ pub(super) fn format_ambient_header(status: &super::AmbientStatus) -> String {
         }
         None => out.push_str("Base Borg"),
     }
-    out.push_str(&format!(" Lv.{} ({})", status.level, status.mood));
+    out.push_str(&format!(" Lv.{}", status.level));
     out
+}
+
+/// Build the styled Borg card lines used by both the startup header and the
+/// `/card` slash command — a single component so the two surfaces stay in
+/// sync. `ambient` is `None` when evolution data is unavailable or the
+/// ambient header is disabled, in which case `class:` / `mood:` are omitted.
+pub(super) fn build_borg_card_lines(
+    name: &str,
+    model: &str,
+    ambient: Option<&super::AmbientStatus>,
+) -> Vec<Line<'static>> {
+    let version = env!("CARGO_PKG_VERSION");
+    let teal = Style::default().fg(theme::CYAN);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("BORG", teal.add_modifier(Modifier::BOLD)),
+        Span::from(" "),
+        Span::styled(format!("v{version}"), theme::dim()),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("name:  ", theme::dim()),
+        Span::styled(name.to_string(), teal),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("model: ", theme::dim()),
+        Span::styled(model.to_string(), teal),
+    ]));
+    if let Some(ambient) = ambient {
+        lines.push(Line::from(vec![
+            Span::styled("class: ", theme::dim()),
+            Span::styled(format_class_label(ambient), teal),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("mood:  ", theme::dim()),
+            Span::styled(ambient.mood.to_string(), teal),
+        ]));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -623,63 +647,70 @@ mod tests {
     }
 
     #[test]
-    fn ambient_header_pre_evolution_hides_archetype() {
+    fn class_label_pre_evolution_hides_archetype() {
         let s = mk_ambient(None, 1, Mood::Stable, Some(Archetype::Builder));
-        assert_eq!(format_ambient_header(&s), "Base Borg Lv.1 (stable)");
+        assert_eq!(format_class_label(&s), "Base Borg Lv.1");
     }
 
     #[test]
-    fn ambient_header_pre_evolution_no_archetype() {
+    fn class_label_pre_evolution_no_archetype() {
         let s = mk_ambient(None, 1, Mood::Drifting, None);
-        assert_eq!(format_ambient_header(&s), "Base Borg Lv.1 (drifting)");
+        assert_eq!(format_class_label(&s), "Base Borg Lv.1");
     }
 
     #[test]
-    fn ambient_header_post_evolution_with_archetype() {
+    fn class_label_post_evolution_with_archetype() {
         let s = mk_ambient(
             Some("Oppenborger"),
             5,
             Mood::Focused,
             Some(Archetype::Builder),
         );
-        assert_eq!(
-            format_ambient_header(&s),
-            "Oppenborger the Builder Lv.5 (focused)"
-        );
+        assert_eq!(format_class_label(&s), "Oppenborger the Builder Lv.5");
     }
 
     #[test]
-    fn ambient_header_post_evolution_no_archetype() {
+    fn class_label_post_evolution_no_archetype() {
         let s = mk_ambient(Some("Oppenborger"), 5, Mood::Focused, None);
-        assert_eq!(format_ambient_header(&s), "Oppenborger Lv.5 (focused)");
+        assert_eq!(format_class_label(&s), "Oppenborger Lv.5");
     }
 
     #[test]
-    fn ambient_header_mood_trails_in_parens() {
+    fn borg_card_renders_mood_on_its_own_line() {
         let s = mk_ambient(Some("Oppenborger"), 2, Mood::Stable, Some(Archetype::Ops));
-        assert_eq!(
-            format_ambient_header(&s),
-            "Oppenborger the Ops Lv.2 (stable)"
-        );
+        let lines = build_borg_card_lines("Oppenborger", "x-ai/grok", Some(&s));
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|l| l == "class: Oppenborger the Ops Lv.2"));
+        assert!(rendered.iter().any(|l| l == "mood:  stable"));
+        // Mood must NOT appear on the class line — it lives on its own.
+        assert!(rendered.iter().all(|l| !l.contains("(stable)")));
     }
 
     #[test]
-    fn ambient_header_covers_every_mood_variant() {
-        for mood in [
-            Mood::Stable,
-            Mood::Focused,
-            Mood::Strained,
-            Mood::Learning,
-            Mood::Drifting,
-            Mood::Ascending,
-        ] {
-            let s = mk_ambient(None, 1, mood, None);
-            let line = format_ambient_header(&s);
-            assert!(
-                line.contains(&mood.to_string()),
-                "expected mood '{mood}' in '{line}'"
-            );
-            assert!(line.starts_with("Base Borg Lv.1"));
-        }
+    fn borg_card_without_ambient_omits_class_and_mood() {
+        let lines = build_borg_card_lines("Borg", "x-ai/grok", None);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rendered.iter().any(|l| l.starts_with("BORG ")));
+        assert!(rendered.iter().any(|l| l == "name:  Borg"));
+        assert!(rendered.iter().all(|l| !l.starts_with("class:")));
+        assert!(rendered.iter().all(|l| !l.starts_with("mood:")));
     }
 }
