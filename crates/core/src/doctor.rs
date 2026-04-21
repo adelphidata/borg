@@ -642,6 +642,35 @@ fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
         "database accessible",
         Database::open(),
     ));
+
+    // `PRAGMA integrity_check` — surfaces SQLite-level corruption so a
+    // bad disk or aborted write stops silently rotting the DB under us.
+    // A clean DB returns the single row `"ok"`. Anything else is a
+    // concrete problem; we downgrade to Warn (not Fail) so the
+    // persistent-warning pipeline in maintenance can escalate it only
+    // after it appears on two consecutive runs.
+    // `Err` branch already surfaced by the "database accessible" check
+    // above — don't double-report. Only run integrity if we could open.
+    if let Ok(db) = Database::open() {
+        match db
+            .conn()
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        {
+            Ok(result) if result == "ok" => {
+                checks.push(DiagnosticCheck::pass("Data", "database integrity"));
+            }
+            Ok(result) => {
+                checks.push(DiagnosticCheck::warn("Data", "database integrity", result));
+            }
+            Err(e) => {
+                checks.push(DiagnosticCheck::fail(
+                    "Data",
+                    "database integrity",
+                    format!("{e}"),
+                ));
+            }
+        }
+    }
 }
 
 fn check_gateway(config: &Config, checks: &mut Vec<DiagnosticCheck>) {

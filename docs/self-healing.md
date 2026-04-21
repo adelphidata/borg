@@ -20,20 +20,37 @@ costs zero tokens.
 Each run does the following in order:
 
 1. **Headless doctor sweep.** Runs the same 17 check categories as
-   `borg doctor`, persists the full result to the `doctor_runs` table.
+   `borg doctor` (including a `PRAGMA integrity_check` under the
+   **Data** category) and persists the full result to the `doctor_runs`
+   table.
 2. **Log rotation.** Deletes `~/.borg/logs/*.jsonl` files older than
-   `maintenance.logs_retention_days` (default 30).
+   `maintenance.logs_retention_days` (default 30). In the same step,
+   head-truncates the append-only logs `daemon.log`, `daemon.err`, and
+   `tui.log` when they exceed 5 MB, keeping the last ~1 MB starting at a
+   newline. These files are never rotated by the runtime — a single
+   noisy warn loop once ballooned `daemon.log` past 20 MB in under two
+   weeks; the cap prevents recurrence. Bytes freed are reported via
+   `MaintenanceReport.log_bytes_truncated`.
 3. **Activity-log pruning.** Deletes `activity_log` rows older than
    `maintenance.activity_retention_days` (default 30).
 4. **Embedding-cache pruning.** Evicts embeddings not accessed in the
    last 30 days.
-5. **Stalled-task scan.** Recomputes `next_run` for any recurring
+5. **Workflow pruning.** Deletes `completed`/`failed`/`cancelled`
+   workflows (and their steps) whose `completed_at` is older than
+   `maintenance.workflow_retention_days` (default 7). Active workflows
+   (`pending`/`running`) are untouched regardless of age. Without this,
+   experimental test workflows accumulate indefinitely and any left in
+   `running` across a daemon restart burst-process all at once and spam
+   the activity log.
+6. **Stalled-task scan.** Recomputes `next_run` for any recurring
    scheduled task whose fire time has drifted more than one hour into
    the past (see below).
-6. **Persistent-warning surfacing.** Compares this run's Warn/Fail
+7. **Persistent-warning surfacing.** Compares this run's Warn/Fail
    checks against the previous run; any issue that appeared in both is
    added to `MaintenanceReport.persistent_warnings`. Single-run flukes
-   do not escalate — only nags that stick.
+   do not escalate — only nags that stick. Because step 1 includes the
+   SQLite integrity check, a genuinely corrupt database will surface
+   as a persistent warning after two consecutive sweeps.
 
 The run is recorded to `doctor_runs`, and the table is capped at
 `maintenance.doctor_runs_keep` (default 30) rows.
@@ -54,9 +71,10 @@ returns immediately after logging a skip message.
 | `maintenance.enabled` | `true` | Master switch for the daily sweep. |
 | `maintenance.logs_retention_days` | `30` | `~/.borg/logs/*.jsonl` files older than this are deleted. |
 | `maintenance.activity_retention_days` | `30` | `activity_log` rows older than this are deleted. |
+| `maintenance.workflow_retention_days` | `7` | Terminal-status workflows (`completed`/`failed`/`cancelled`) older than this are deleted along with their steps. |
 | `maintenance.doctor_runs_keep` | `30` | Keep at most this many `doctor_runs` history rows. |
 
-All four are wired through `/settings` under the **Maintenance**
+All five are wired through `/settings` under the **Maintenance**
 section.
 
 ## Missed-run detection for scheduled tasks

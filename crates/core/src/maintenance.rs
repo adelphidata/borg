@@ -74,13 +74,15 @@ impl MaintenanceReport {
     /// Short one-line summary suitable for the activity log.
     pub fn activity_line(&self) -> String {
         format!(
-            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s), {} activity row(s), {} embedding(s), healed {} stalled task(s)",
+            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s)",
             self.pass_count,
             self.warn_count,
             self.fail_count,
             self.log_files_deleted,
+            self.log_bytes_truncated,
             self.activity_rows_deleted,
             self.embeddings_pruned,
+            self.workflows_pruned,
             self.stalled_tasks_healed,
         )
     }
@@ -374,6 +376,8 @@ mod tests {
             warn_count: 2,
             fail_count: 0,
             log_files_deleted: 3,
+            log_bytes_truncated: 4_321,
+            workflows_pruned: 2,
             activity_rows_deleted: 120,
             embeddings_pruned: 8,
             stalled_tasks_healed: 1,
@@ -383,6 +387,136 @@ mod tests {
         assert!(line.contains("14 pass"));
         assert!(line.contains("2 warn"));
         assert!(line.contains("pruned 3 log"));
+        assert!(line.contains("4321 bytes truncated"));
+        assert!(line.contains("2 workflow"));
         assert!(line.contains("healed 1 stalled"));
+    }
+
+    /// Writes a file with predictable line content and returns `(path, size)`.
+    /// Each line is `"line N\n"` — predictable length makes assertions easy.
+    fn write_sample_log(dir: &Path, name: &str, approx_bytes: usize) -> (std::path::PathBuf, u64) {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut f = fs::File::create(&path).unwrap();
+        let mut written = 0usize;
+        let mut n = 0u64;
+        while written < approx_bytes {
+            let line = format!("line {n}\n");
+            f.write_all(line.as_bytes()).unwrap();
+            written += line.len();
+            n += 1;
+        }
+        f.sync_all().unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+        (path, size)
+    }
+
+    #[test]
+    fn truncate_oversized_logs_head_truncates_and_starts_at_newline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // 8 MB file, cap 5 MB, keep 1 MB.
+        let (path, original) = write_sample_log(dir, "daemon.log", 8 * 1024 * 1024);
+        assert!(original > 5 * 1024 * 1024);
+
+        let freed =
+            truncate_oversized_logs(dir, &["daemon.log"], 5 * 1024 * 1024, 1024 * 1024).unwrap();
+
+        let new_size = fs::metadata(&path).unwrap().len();
+        // Must be close to keep_bytes and strictly smaller than original.
+        assert!(new_size < original, "file should shrink");
+        assert!(
+            new_size <= 1024 * 1024,
+            "new size {new_size} must not exceed keep_bytes"
+        );
+        // Freed count must reflect bytes actually removed.
+        assert_eq!(freed, original - new_size);
+
+        // The retained head must be a complete line — "line " prefix, not
+        // a mid-line fragment. This is the invariant that guarantees future
+        // log parsers don't choke on a half-truncated first row.
+        let head = fs::read_to_string(&path).unwrap();
+        assert!(
+            head.starts_with("line "),
+            "retained head must start at a line boundary, got: {:?}",
+            &head[..head.len().min(40)]
+        );
+    }
+
+    #[test]
+    fn truncate_oversized_logs_noop_under_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let (path, original) = write_sample_log(dir, "tui.log", 2 * 1024 * 1024);
+
+        let freed =
+            truncate_oversized_logs(dir, &["tui.log"], 5 * 1024 * 1024, 1024 * 1024).unwrap();
+
+        assert_eq!(freed, 0);
+        let new_size = fs::metadata(&path).unwrap().len();
+        assert_eq!(new_size, original, "file under cap must not change");
+    }
+
+    #[test]
+    fn truncate_oversized_logs_tolerates_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Nothing written; list references files that don't exist.
+        let freed = truncate_oversized_logs(
+            dir,
+            &["daemon.log", "tui.log", "daemon.err"],
+            5 * 1024 * 1024,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(freed, 0);
+    }
+
+    #[test]
+    fn compute_persistent_warnings_intersects_with_previous_run() {
+        let db = crate::db::Database::test_db();
+        // Seed a prior run with two issues.
+        let prior = MaintenanceReport {
+            ran_at: 1,
+            current_issues: vec!["Data:database integrity".into(), "Gateway:reachable".into()],
+            ..Default::default()
+        };
+        db.record_doctor_run(&prior).unwrap();
+
+        // Current sweep overlaps on one issue and introduces a new one.
+        let current = vec![
+            "Data:database integrity".to_string(),
+            "Provider:reachable".to_string(),
+        ];
+        let persistent = compute_persistent_warnings(&db, &current);
+        assert_eq!(
+            persistent,
+            vec!["Data:database integrity".to_string()],
+            "only issues present in BOTH runs should be flagged as persistent"
+        );
+    }
+
+    #[test]
+    fn compute_persistent_warnings_empty_when_no_prior_run() {
+        let db = crate::db::Database::test_db();
+        let current = vec!["Data:database integrity".to_string()];
+        let persistent = compute_persistent_warnings(&db, &current);
+        assert!(
+            persistent.is_empty(),
+            "first run has nothing to compare against"
+        );
+    }
+
+    #[test]
+    fn compute_persistent_warnings_empty_when_current_is_empty() {
+        let db = crate::db::Database::test_db();
+        let prior = MaintenanceReport {
+            ran_at: 1,
+            current_issues: vec!["Data:database integrity".into()],
+            ..Default::default()
+        };
+        db.record_doctor_run(&prior).unwrap();
+        let persistent = compute_persistent_warnings(&db, &[]);
+        assert!(persistent.is_empty());
     }
 }
