@@ -42,3 +42,15 @@ Surfaced by the post-ship code review of Tier 1:
   in UTC today (the `timezone` column is display-only). If we ever want
   "02:00 in the user's local time" semantics, `calculate_next_run` needs
   to honor the column — not just expose it.
+
+## /btw — non-blocking side questions
+
+Shipped (TUI-only): `/btw <question>` spawns a tool-less, non-persistent side agent that answers using the current session's transcript snapshot. Result renders in a dismissable modal popup. See `crates/core/src/agent/btw.rs` and `crates/cli/src/tui/btw_popup.rs`.
+
+Deferred:
+
+- **Gateway / channel surface.** Mirror `run_btw` into `crates/gateway/src/handler.rs` so Telegram, Slack, Discord, iMessage, etc. can handle a `/btw ` prefix before routing to the main agent. Reply should land as a threaded follow-up so it doesn't derail the main conversation.
+- **Persisted `/btw` log.** Optionally record the side Q/A to a new `btw_entries` table, viewable via a `/btw log` subcommand. Today dismissing the popup loses the answer (matches hermes-agent behavior).
+- **Tool-enabled variant.** Allow a read-only subset (`read_file`, `memory_search`, `web_fetch`) behind a `btw.tools_enabled` config flag. Kept off by default — unpredictable latency and surprise side effects are the exact things `/btw` is supposed to avoid.
+- **Rate limiting.** Cap N `/btw`s per minute per session to stop accidental runaway loops burning tokens.
+- **Multi-answer stack.** Queue popups instead of the current single-slot cancel-in-flight behavior so rapidly fired `/btw`s don't clobber each other.

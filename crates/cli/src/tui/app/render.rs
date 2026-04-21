@@ -40,6 +40,7 @@ impl<'a> App<'a> {
         self.schedule_popup.render(frame);
         self.migrate_popup.render(frame);
         self.status_popup.render(frame);
+        self.btw_popup.render(frame);
 
         // Transcript pager (Ctrl+T) takes the full frame when active. Drawn
         // after popups so it covers them; before toasts so toasts still float on top.

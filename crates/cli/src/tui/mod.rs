@@ -1,4 +1,5 @@
 mod app;
+mod btw_popup;
 mod colors;
 mod command_popup;
 mod commands;
@@ -580,6 +581,20 @@ async fn run_event_loop(
                     app.process_doctor_event(ev);
                 } else {
                     app.doctor_rx = None;
+                }
+                AppAction::Continue
+            }
+
+            // /btw background task results
+            event = async {
+                if let Some(rx) = &mut app.btw_result_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(result) = event {
+                    app.process_btw_result(result);
                 }
                 AppAction::Continue
             }
@@ -1545,6 +1560,47 @@ async fn run_event_loop(
                     let report = borg_core::doctor::DiagnosticReport { checks: all_checks };
                     let (pass, warn, fail) = report.counts();
                     let _ = tx.blocking_send(app::DoctorEvent::Done { pass, warn, fail });
+                });
+            }
+            AppAction::StartBtw { question, snapshot } => {
+                // Cancel any previous in-flight /btw — single-slot policy.
+                // The old task's result will arrive at the popup and be
+                // discarded by process_btw_result because the popup's
+                // Loading question will have moved on.
+                if let Some(prev) = app.btw_cancel.take() {
+                    prev.cancel();
+                }
+                // Lazily create the result channel on first use. Kept on the
+                // App so subsequent /btw runs reuse the same receiver.
+                if app.btw_result_tx.is_none() {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<app::BtwResult>();
+                    app.btw_result_tx = Some(tx);
+                    app.btw_result_rx = Some(rx);
+                }
+                let tx = match app.btw_result_tx.as_ref() {
+                    Some(t) => t.clone(),
+                    None => {
+                        tracing::warn!("/btw: result channel missing — dropping request");
+                        return Ok(None);
+                    }
+                };
+                let cancel = tokio_util::sync::CancellationToken::new();
+                app.btw_cancel = Some(cancel.clone());
+                let config = app.config.clone();
+                let q = question.clone();
+                tokio::spawn(async move {
+                    let outcome = borg_core::agent::run_btw(config, q.clone(), snapshot, cancel)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    if tx
+                        .send(app::BtwResult {
+                            question: q,
+                            outcome,
+                        })
+                        .is_err()
+                    {
+                        tracing::debug!("/btw: result receiver dropped before completion");
+                    }
                 });
             }
             AppAction::Continue => {}

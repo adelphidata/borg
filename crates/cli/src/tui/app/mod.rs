@@ -16,6 +16,7 @@ use borg_core::doctor::DiagnosticCheck;
 use borg_heartbeat::scheduler::HeartbeatEvent;
 use throbber_widgets_tui::ThrobberState;
 
+use super::btw_popup::BtwPopup;
 use super::command_popup::CommandPopup;
 use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
@@ -49,6 +50,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, schedule_popup);
         $body!($self, migrate_popup);
         $body!($self, status_popup);
+        $body!($self, btw_popup);
     };
 }
 
@@ -122,6 +124,13 @@ pub enum BacktrackPhase {
         /// Cursor position within `user_message_indices` (0 = most recent, at the end).
         cursor: usize,
     },
+}
+
+/// Result of a background `/btw` run, sent from the spawned task back to the
+/// TUI event loop so it can drive the popup state machine on the main thread.
+pub struct BtwResult {
+    pub question: String,
+    pub outcome: Result<String, String>,
 }
 
 /// Events sent from the async doctor task to the TUI event loop.
@@ -238,6 +247,12 @@ pub enum AppAction {
     Uninstall,
     RunDoctor,
     Poke,
+    /// Spawn a background `/btw` side-question agent. Event loop handles the
+    /// actual `tokio::spawn`; the TUI has already set the popup to Loading.
+    StartBtw {
+        question: String,
+        snapshot: Vec<borg_core::types::Message>,
+    },
 }
 
 pub struct App<'a> {
@@ -291,6 +306,14 @@ pub struct App<'a> {
     /// Cached ambient-status line for the banner (class: ... header).
     pub ambient_status: Option<AmbientStatus>,
     pub status_popup: StatusPopup,
+    pub btw_popup: BtwPopup,
+    /// Cancel token for the currently-in-flight `/btw` background task, if
+    /// any. A new `/btw` invocation cancels the previous one.
+    pub btw_cancel: Option<CancellationToken>,
+    /// Channel the `/btw` background task posts its result onto. The TUI
+    /// event loop drains this between polls and forwards to the popup.
+    pub btw_result_rx: Option<mpsc::UnboundedReceiver<BtwResult>>,
+    pub btw_result_tx: Option<mpsc::UnboundedSender<BtwResult>>,
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
     /// Sender for notifying the config watcher of in-process changes.
     pub config_notify_tx: Option<tokio::sync::mpsc::Sender<Config>>,
@@ -348,6 +371,10 @@ impl<'a> App<'a> {
             plan_steps: Vec::new(),
             ambient_status: None,
             status_popup: StatusPopup::new(),
+            btw_popup: BtwPopup::new(),
+            btw_cancel: None,
+            btw_result_rx: None,
+            btw_result_tx: None,
             doctor_rx: None,
             config_notify_tx: None,
             toasts: super::toast::ToastStack::new(),
@@ -774,6 +801,110 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    // ========================================================================
+    // /btw routing — popup visibility does not disturb main agent state, late
+    // results against a dismissed/superseded popup are discarded.
+    // ========================================================================
+
+    #[test]
+    fn cmd_btw_empty_pushes_usage_does_not_open_popup() {
+        // Regression: /btw with no question must not fire the background task,
+        // otherwise it would spin up an LLM call (and burn tokens) on typos.
+        let mut app = make_app();
+        let action = app.handle_submit("/btw").unwrap();
+        assert!(matches!(action, AppAction::Continue));
+        assert!(!app.btw_popup.is_visible());
+    }
+
+    #[test]
+    fn cmd_btw_with_question_opens_loading_and_emits_start_action() {
+        let mut app = make_app();
+        let action = app.handle_submit("/btw what is X?").unwrap();
+        match action {
+            AppAction::StartBtw { question, .. } => assert_eq!(question, "what is X?"),
+            _ => panic!("expected StartBtw action"),
+        }
+        assert!(app.btw_popup.is_visible());
+    }
+
+    #[test]
+    fn cmd_btw_during_streaming_does_not_touch_app_state() {
+        // Hard requirement: /btw never cancels or otherwise alters the main
+        // turn. If this regresses, typing /btw mid-stream kills the user's
+        // in-progress answer.
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        let _ = app.handle_submit("/btw quick thing").unwrap();
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+        assert!(app.btw_popup.is_visible());
+    }
+
+    #[test]
+    fn btw_result_for_superseded_question_is_discarded() {
+        // A second /btw while one is in flight supersedes the first. The
+        // old result must not overwrite the new Loading state.
+        let mut app = make_app();
+        app.btw_popup.show_loading("new question".to_string());
+        app.process_btw_result(BtwResult {
+            question: "old question".to_string(),
+            outcome: Ok("stale answer".to_string()),
+        });
+        match app.btw_popup.state() {
+            super::super::btw_popup::BtwState::Loading { question } => {
+                assert_eq!(question, "new question");
+            }
+            other => panic!("expected Loading to persist, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btw_result_for_dismissed_popup_does_not_resurrect_it() {
+        // User hit Esc — don't pop the window back up when the background
+        // task finally finishes.
+        let mut app = make_app();
+        app.btw_popup.show_loading("q".to_string());
+        app.btw_popup.dismiss();
+        app.process_btw_result(BtwResult {
+            question: "q".to_string(),
+            outcome: Ok("late answer".to_string()),
+        });
+        assert!(!app.btw_popup.is_visible());
+    }
+
+    #[test]
+    fn btw_result_ok_transitions_popup_to_ready() {
+        let mut app = make_app();
+        app.btw_popup.show_loading("q".to_string());
+        app.process_btw_result(BtwResult {
+            question: "q".to_string(),
+            outcome: Ok("the answer".to_string()),
+        });
+        match app.btw_popup.state() {
+            super::super::btw_popup::BtwState::Ready { answer, .. } => {
+                assert_eq!(answer, "the answer");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btw_result_err_transitions_popup_to_error() {
+        let mut app = make_app();
+        app.btw_popup.show_loading("q".to_string());
+        app.process_btw_result(BtwResult {
+            question: "q".to_string(),
+            outcome: Err("provider down".to_string()),
+        });
+        match app.btw_popup.state() {
+            super::super::btw_popup::BtwState::Error { error, .. } => {
+                assert_eq!(error, "provider down");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     // ========================================================================

@@ -7,7 +7,7 @@ use borg_core::config::CollaborationMode;
 use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, SkipReason};
 
 use super::super::history::{ApprovalStatus, HistoryCell};
-use super::{App, AppState, DoctorEvent};
+use super::{App, AppState, BtwResult, DoctorEvent};
 
 impl<'a> App<'a> {
     pub fn push_system_message(&mut self, text: String) {
@@ -44,6 +44,28 @@ impl<'a> App<'a> {
                 self.doctor_rx = None;
             }
         }
+    }
+
+    /// Route a completed `/btw` background task back to the popup. Must not
+    /// touch `AppState` or the main agent's streaming state — `/btw` is
+    /// explicitly orthogonal to the primary turn.
+    pub fn process_btw_result(&mut self, result: BtwResult) {
+        // If the popup was already dismissed (user gave up), discard silently
+        // rather than re-opening it. Also discard if the question on the
+        // popup no longer matches — a newer `/btw` has superseded this one.
+        use super::super::btw_popup::BtwState;
+        let matches_current = match self.btw_popup.state() {
+            BtwState::Loading { question } => question == &result.question,
+            _ => false,
+        };
+        if !matches_current {
+            return;
+        }
+        match result.outcome {
+            Ok(answer) => self.btw_popup.show_ready(result.question, answer),
+            Err(err) => self.btw_popup.show_error(result.question, err),
+        }
+        self.btw_cancel = None;
     }
 
     pub fn process_agent_event(&mut self, event: AgentEvent) {

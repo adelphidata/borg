@@ -5,8 +5,10 @@
 use anyhow::Result;
 
 use borg_core::config::CollaborationMode;
+use borg_core::types::Message;
 
 use super::app::{App, AppAction, AppState};
+use super::history::HistoryCell;
 use super::status_popup::StatusTab;
 
 impl App<'_> {
@@ -140,6 +142,19 @@ impl App<'_> {
             return Some(self.cmd_plan_with_message(rest.trim()));
         }
 
+        if trimmed == "/btw" {
+            self.push_system_message(
+                "Usage: /btw <question>\n  \
+                 Ask a side question using the current session's context. \
+                 Answer appears in a dismissable popup (Esc). Not persisted."
+                    .to_string(),
+            );
+            return Some(Ok(AppAction::Continue));
+        }
+        if let Some(rest) = trimmed.strip_prefix("/btw ") {
+            return Some(self.cmd_btw(rest.trim()));
+        }
+
         if trimmed == "/memory cleanup" {
             return Some(self.cmd_memory_cleanup());
         }
@@ -216,6 +231,7 @@ impl App<'_> {
              /mode      - Switch collaboration mode (default/execute/plan)\n  \
              /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n\
              \n  \
+             /btw <q>   - Ask a side question (ephemeral, not persisted)\n  \
              /compact   - Compact conversation history\n  \
              /clear     - Clear conversation\n  \
              /cancel    - Stop the current in-progress turn\n  \
@@ -545,6 +561,22 @@ impl App<'_> {
         }
     }
 
+    /// `/btw <question>` — spawn an ephemeral, tool-less side agent that
+    /// answers using the current transcript snapshot. Does not touch
+    /// `AppState`, the main agent turn, or the DB.
+    pub(super) fn cmd_btw(&mut self, question: &str) -> Result<AppAction> {
+        if question.is_empty() {
+            self.push_system_message("Usage: /btw <question>".to_string());
+            return Ok(AppAction::Continue);
+        }
+        let snapshot = snapshot_cells_as_messages(&self.cells);
+        self.btw_popup.show_loading(question.to_string());
+        Ok(AppAction::StartBtw {
+            question: question.to_string(),
+            snapshot,
+        })
+    }
+
     fn cmd_uninstall(&mut self) -> Result<AppAction> {
         self.push_system_message(
             "⚠ WARNING: This will permanently delete all Borg data (~/.borg/)\n\
@@ -558,8 +590,34 @@ impl App<'_> {
     }
 }
 
+/// Build a best-effort `Vec<Message>` snapshot from the TUI transcript.
+///
+/// Only `User` and `Assistant` cells are included — tool calls and system
+/// notices are omitted because the ephemeral `/btw` agent has no tools and
+/// no way to act on them, so feeding them in would just waste tokens.
+/// Empty assistant cells (e.g. a still-streaming turn the user hasn't
+/// received text for yet) are also skipped.
+pub(super) fn snapshot_cells_as_messages(cells: &[HistoryCell]) -> Vec<Message> {
+    let mut out = Vec::with_capacity(cells.len());
+    for cell in cells {
+        match cell {
+            HistoryCell::User { text } if !text.is_empty() => {
+                out.push(Message::user(text.clone()));
+            }
+            HistoryCell::Assistant { text, .. } if !text.is_empty() => {
+                out.push(Message::assistant(text.clone()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use borg_core::types::Role;
+
     #[test]
     fn commands_rs_has_stats_and_status_aliases() {
         let src = include_str!("commands.rs");
@@ -576,5 +634,80 @@ mod tests {
             code.contains("\"/status\""),
             "commands.rs must handle /status"
         );
+    }
+
+    #[test]
+    fn snapshot_skips_non_conversation_cells() {
+        // /btw should only see what the user and the main agent said — not
+        // tool output, not system notices. Otherwise the snapshot bloats and
+        // the side agent gets confused about what's "real" conversation.
+        let cells = vec![
+            HistoryCell::System {
+                text: "ignore me".to_string(),
+            },
+            HistoryCell::User {
+                text: "hello".to_string(),
+            },
+            HistoryCell::Thinking {
+                text: "reasoning".to_string(),
+            },
+            HistoryCell::Assistant {
+                text: "hi there".to_string(),
+                streaming: false,
+            },
+            HistoryCell::ToolResult {
+                output: "tool output".to_string(),
+                is_error: false,
+                duration_ms: None,
+                display_label: "Ran tool".to_string(),
+                tool_name: "run_shell".to_string(),
+                args_json: None,
+                collapsed: false,
+            },
+            HistoryCell::Separator,
+            HistoryCell::User {
+                text: "".to_string(), // empty — should be skipped
+            },
+        ];
+        let msgs = snapshot_cells_as_messages(&cells);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, Role::User);
+        assert_eq!(msgs[1].role, Role::Assistant);
+        match msgs[0].content.as_ref().unwrap() {
+            borg_core::types::MessageContent::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_order() {
+        // Multi-turn conversations must preserve chronological order — if the
+        // snapshot reshuffles, the side agent will answer against a garbled
+        // transcript and give a confidently wrong answer.
+        let cells = vec![
+            HistoryCell::User {
+                text: "q1".to_string(),
+            },
+            HistoryCell::Assistant {
+                text: "a1".to_string(),
+                streaming: false,
+            },
+            HistoryCell::User {
+                text: "q2".to_string(),
+            },
+            HistoryCell::Assistant {
+                text: "a2".to_string(),
+                streaming: false,
+            },
+        ];
+        let msgs = snapshot_cells_as_messages(&cells);
+        let texts: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m.content.as_ref() {
+                Some(borg_core::types::MessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["q1", "a1", "q2", "a2"]);
     }
 }
