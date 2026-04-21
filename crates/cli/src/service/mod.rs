@@ -6,6 +6,11 @@ use tokio_util::sync::CancellationToken;
 
 use borg_core::agent::{Agent, AgentEvent};
 use borg_core::config::Config;
+use borg_core::constants::{
+    DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, GATEWAY_MAX_CRASH_RESPAWNS,
+    GATEWAY_RESPAWN_BASE_DELAY, SLEEP_DRIFT_THRESHOLD, WATCHDOG_STALL_THRESHOLD,
+    WATCHDOG_TICK_INTERVAL,
+};
 use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, HeartbeatScheduler, SkipReason};
 
 mod install;
@@ -158,7 +163,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     // Missed job catch-up: skip tasks overdue by more than 7 days
     skip_stale_tasks(&db);
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
 
     // Pin subsystem handles for monitoring in select! loop
     tokio::pin!(hb_handle);
@@ -174,7 +179,6 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     tokio::pin!(im_fut);
 
     let mut lock_refresh_failures: u32 = 0;
-    const MAX_LOCK_REFRESH_FAILURES: u32 = 3;
 
     // Watchdog: detect main loop deadlocks
     let watchdog_ts = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
@@ -182,7 +186,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
         let ts = watchdog_ts.clone();
         let wd_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            let mut wd_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut wd_interval = tokio::time::interval(WATCHDOG_TICK_INTERVAL);
             loop {
                 tokio::select! {
                     biased;
@@ -191,7 +195,7 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                 }
                 let last = ts.load(Ordering::Relaxed);
                 let now = chrono::Utc::now().timestamp();
-                if now - last > 180 {
+                if now - last > WATCHDOG_STALL_THRESHOLD.as_secs() as i64 {
                     tracing::error!(
                         "Daemon watchdog: main loop stale for {}s, exiting",
                         now - last
@@ -237,16 +241,17 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                     gw_crash_count += 1;
                     tracing::error!("Gateway server exited unexpectedly: {result:?}");
                     borg_core::activity_log::log_activity(&db, "error", "system", "Gateway crashed, respawning");
-                    if gw_crash_count >= 5 {
+                    if gw_crash_count >= GATEWAY_MAX_CRASH_RESPAWNS {
                         tracing::error!("Gateway crashed {gw_crash_count} times in rapid succession, stopping respawn");
-                        borg_core::activity_log::log_activity(&db, "error", "system", "Gateway respawn abandoned after 5 crashes");
+                        borg_core::activity_log::log_activity(&db, "error", "system", "Gateway respawn abandoned after repeated crashes");
                         continue;
                     }
                 }
 
                 // Delay to let the port be released (longer backoff on crashes)
-                let delay_ms = if is_restart { 250 } else { 250 * (1 << gw_crash_count.min(4)) };
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let base = GATEWAY_RESPAWN_BASE_DELAY;
+                let delay = if is_restart { base } else { base * (1 << gw_crash_count.min(4)) };
+                tokio::time::sleep(delay).await;
 
                 let new_shutdown = CancellationToken::new();
                 gw_handle = Box::pin(spawn_daemon_gateway(
@@ -276,10 +281,10 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
         // Update watchdog timestamp
         watchdog_ts.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
 
-        // Detect sleep/wake drift: if wall-clock elapsed >> 60s, we likely resumed from sleep
+        // Detect sleep/wake drift: if wall-clock elapsed far exceeds the loop interval, we likely resumed from sleep.
         let elapsed = last_tick_wall.elapsed();
         last_tick_wall = std::time::Instant::now();
-        if elapsed.as_secs() > 120 {
+        if elapsed > SLEEP_DRIFT_THRESHOLD {
             tracing::info!(
                 "Daemon resumed after {}s pause (likely sleep/wake), re-checking stale tasks",
                 elapsed.as_secs()
@@ -297,11 +302,11 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
             Err(e) => {
                 lock_refresh_failures += 1;
                 tracing::warn!(
-                    "Failed to refresh daemon lock ({lock_refresh_failures}/{MAX_LOCK_REFRESH_FAILURES}): {e}"
+                    "Failed to refresh daemon lock ({lock_refresh_failures}/{DAEMON_LOCK_MAX_REFRESH_FAILURES}): {e}"
                 );
-                if lock_refresh_failures >= MAX_LOCK_REFRESH_FAILURES {
+                if lock_refresh_failures >= DAEMON_LOCK_MAX_REFRESH_FAILURES {
                     tracing::error!(
-                        "Daemon lock lost after {MAX_LOCK_REFRESH_FAILURES} consecutive failures, exiting"
+                        "Daemon lock lost after {DAEMON_LOCK_MAX_REFRESH_FAILURES} consecutive failures, exiting"
                     );
                     borg_core::activity_log::log_activity(
                         &db,

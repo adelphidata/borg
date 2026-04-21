@@ -451,6 +451,31 @@ pub const OLLAMA_PORT_DEFAULT: u16 = 11434;
 /// Default port for a locally-running signal-cli JSON-RPC server.
 pub const SIGNAL_CLI_PORT_DEFAULT: u16 = 8080;
 
+// ── Daemon loop ───────────────────────────────────────────────────
+
+/// Main daemon loop tick interval.
+pub const DAEMON_LOOP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Watchdog tick interval (how often the watchdog thread checks the main loop).
+pub const WATCHDOG_TICK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// If the main loop hasn't updated its heartbeat within this window, the watchdog
+/// assumes a deadlock and exits the daemon.
+pub const WATCHDOG_STALL_THRESHOLD: Duration = Duration::from_secs(180);
+
+/// Wall-clock gap between ticks above which we assume the host slept/woke.
+/// Must be larger than `DAEMON_LOOP_INTERVAL` to avoid false positives.
+pub const SLEEP_DRIFT_THRESHOLD: Duration = Duration::from_secs(120);
+
+/// Consecutive gateway crashes in rapid succession before we stop respawning.
+pub const GATEWAY_MAX_CRASH_RESPAWNS: u32 = 5;
+
+/// Base delay after a gateway restart/crash before respawning.
+pub const GATEWAY_RESPAWN_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// Consecutive daemon-lock refresh failures before the daemon exits (lock stolen).
+pub const DAEMON_LOCK_MAX_REFRESH_FAILURES: u32 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
