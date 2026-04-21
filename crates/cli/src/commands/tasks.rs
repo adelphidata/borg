@@ -231,9 +231,9 @@ pub(crate) fn run_tasks_create(
     delivery_target: Option<&str>,
 ) -> Result<()> {
     borg_core::tasks::validate_schedule(schedule_type, schedule)?;
-    let next_run = borg_core::tasks::calculate_next_run(schedule_type, schedule)?;
+    let tz = "local";
+    let next_run = borg_core::tasks::calculate_next_run(schedule_type, schedule, tz)?;
     let id = Uuid::new_v4().to_string();
-    let tz = chrono::Local::now().offset().to_string();
 
     let db = borg_core::db::Database::open()?;
     db.create_task(&borg_core::db::NewTask {
@@ -242,7 +242,7 @@ pub(crate) fn run_tasks_create(
         prompt,
         schedule_type,
         schedule_expr: schedule,
-        timezone: &tz,
+        timezone: tz,
         next_run,
         max_retries,
         timeout_ms,
@@ -431,7 +431,7 @@ pub(crate) fn run_cron_add(
         });
 
     let id = uuid::Uuid::new_v4().to_string();
-    let next_run = borg_core::tasks::calculate_next_run("cron", &cron_7)?;
+    let next_run = borg_core::tasks::calculate_next_run("cron", &cron_7, "local")?;
 
     let db = borg_core::db::Database::open()?;
     db.create_task(&borg_core::db::NewTask {

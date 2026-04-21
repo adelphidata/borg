@@ -144,7 +144,7 @@ fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
     if let Err(e) = tasks::validate_schedule(schedule_type, schedule_expr) {
         return Ok(format!("Error: Invalid schedule: {e}"));
     }
-    let next_run = match tasks::calculate_next_run(schedule_type, schedule_expr) {
+    let next_run = match tasks::calculate_next_run(schedule_type, schedule_expr, timezone) {
         Ok(nr) => nr,
         Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
     };
@@ -400,7 +400,7 @@ fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
         return Ok(format!("Error: Invalid schedule: {e}"));
     }
 
-    let next_run = match tasks::calculate_next_run("cron", &cron_7) {
+    let next_run = match tasks::calculate_next_run("cron", &cron_7, "local") {
         Ok(nr) => nr,
         Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
     };

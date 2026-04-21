@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use cron::Schedule;
 use rusqlite::params;
 use std::str::FromStr;
@@ -55,7 +56,8 @@ pub fn advance_next_run_raw(conn: &rusqlite::Connection, task: &ScheduledTaskRow
             )?;
         }
         SCHEDULE_TYPE_CRON | SCHEDULE_TYPE_INTERVAL => {
-            let next = calculate_next_run(&task.schedule_type, &task.schedule_expr).unwrap_or(None);
+            let next = calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone)
+                .unwrap_or(None);
             conn.execute(
                 "UPDATE scheduled_tasks SET next_run = ?1 WHERE id = ?2",
                 params![next, task.id],
@@ -66,14 +68,48 @@ pub fn advance_next_run_raw(conn: &rusqlite::Connection, task: &ScheduledTaskRow
     Ok(())
 }
 
+/// Resolve a timezone string to a `chrono_tz::Tz`. Returns `None` for
+/// values that should retain the historical UTC behavior (`""`,
+/// `"local"`, `"UTC"`) and for unparseable IANA names (after logging).
+fn resolve_cron_timezone(timezone: &str) -> Option<Tz> {
+    match timezone {
+        "" | "local" | "UTC" | "utc" => None,
+        other => match Tz::from_str(other) {
+            Ok(tz) => Some(tz),
+            Err(e) => {
+                tracing::warn!(
+                    timezone = %other,
+                    error = %e,
+                    "unrecognized IANA timezone on scheduled task — falling back to UTC"
+                );
+                None
+            }
+        },
+    }
+}
+
 /// Calculate the next run time for a task based on its schedule.
-pub fn calculate_next_run(schedule_type: &str, schedule_expr: &str) -> Result<Option<i64>> {
+///
+/// `timezone` is honored only for cron schedules: an IANA zone name
+/// (e.g. `"America/New_York"`) evaluates the cron expression in that
+/// zone. The strings `""`, `"local"`, and `"UTC"` preserve the
+/// historical UTC behavior. An unparseable zone falls back to UTC with
+/// a `tracing::warn!` — a scheduled task must never fail to compute a
+/// next_run just because its timezone field got corrupted.
+pub fn calculate_next_run(
+    schedule_type: &str,
+    schedule_expr: &str,
+    timezone: &str,
+) -> Result<Option<i64>> {
     match schedule_type {
         SCHEDULE_TYPE_CRON => {
             let schedule = Schedule::from_str(schedule_expr)
                 .with_context(|| format!("Invalid cron expression: {schedule_expr}"))?;
-            let next = schedule.upcoming(Utc).next();
-            Ok(next.map(|t| t.timestamp()))
+            let next = match resolve_cron_timezone(timezone) {
+                Some(tz) => schedule.upcoming(tz).next().map(|t| t.timestamp()),
+                None => schedule.upcoming(Utc).next().map(|t| t.timestamp()),
+            };
+            Ok(next)
         }
         SCHEDULE_TYPE_INTERVAL => {
             let duration = parse_interval(schedule_expr)
@@ -137,6 +173,13 @@ pub fn advance_next_run(task: &ScheduledTaskRow, db: &Database) -> Result<()> {
     advance_next_run_raw(db.conn(), task)
 }
 
+/// When more than this many recurring tasks look stalled in a single
+/// sweep, we assume the machine just woke up from sleep (or the clock
+/// jumped forward) and collapse the audit trail into one aggregate
+/// `missed` row instead of N near-identical ones. `next_run` is still
+/// recomputed for every task — only the `task_runs` audit is aggregated.
+pub const CLOCK_JUMP_AGGREGATE_THRESHOLD: usize = 5;
+
 /// Summary of one stalled-task healing pass.
 #[derive(Debug, Default, Clone)]
 pub struct HealReport {
@@ -144,6 +187,9 @@ pub struct HealReport {
     pub detected: usize,
     /// Number of tasks for which `next_run` was successfully reset.
     pub reset: usize,
+    /// True when `detected` exceeded [`CLOCK_JUMP_AGGREGATE_THRESHOLD`]
+    /// and the audit rows were collapsed into a single aggregate entry.
+    pub aggregated: bool,
 }
 
 /// Scan `scheduled_tasks` for rows whose `next_run` is older than
@@ -158,23 +204,45 @@ pub struct HealReport {
 /// logged and the scan continues; the caller gets an aggregate report.
 pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<HealReport> {
     let stalled = db.find_stalled_tasks(now, grace_secs)?;
+    let aggregate = stalled.len() > CLOCK_JUMP_AGGREGATE_THRESHOLD;
     let mut report = HealReport {
         detected: stalled.len(),
         reset: 0,
+        aggregated: aggregate,
     };
-    for task in stalled {
-        let overdue_secs = task.next_run.map(|nr| now - nr).unwrap_or(0);
-        let note =
-            format!("self-healing: next_run drifted {overdue_secs}s into past without firing");
-        if let Err(e) = db.record_missed_run(&task.id, now, &note) {
+    if aggregate {
+        let max_overdue_secs = stalled
+            .iter()
+            .filter_map(|t| t.next_run.map(|nr| now - nr))
+            .max()
+            .unwrap_or(0);
+        let first_id = stalled[0].id.clone();
+        let note = format!(
+            "self-healing: clock-jump detected — {n} recurring tasks drifted (max {max_overdue_secs}s)",
+            n = stalled.len()
+        );
+        if let Err(e) = db.record_missed_run(&first_id, now, &note) {
             tracing::warn!(
-                task_id = %task.id,
-                task_name = %task.name,
                 error = %e,
-                "failed to record missed-run audit row"
+                "failed to record aggregate clock-jump audit row"
             );
         }
-        match calculate_next_run(&task.schedule_type, &task.schedule_expr) {
+    }
+    for task in stalled {
+        let overdue_secs = task.next_run.map(|nr| now - nr).unwrap_or(0);
+        if !aggregate {
+            let note =
+                format!("self-healing: next_run drifted {overdue_secs}s into past without firing");
+            if let Err(e) = db.record_missed_run(&task.id, now, &note) {
+                tracing::warn!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    error = %e,
+                    "failed to record missed-run audit row"
+                );
+            }
+        }
+        match calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone) {
             Ok(next) => {
                 if let Err(e) = db.update_task_next_run(&task.id, next) {
                     tracing::warn!(
@@ -218,6 +286,15 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
         }
     }
     Ok(report)
+}
+
+/// Flip `task_runs` rows stuck in `'running'` past their timeout to
+/// `'failed'`. Intended for the daemon's periodic sweep so wedged
+/// executions don't sit forever — the daemon-startup-only
+/// [`Database::recover_stale_runs`] is not enough when the daemon
+/// stays alive but a single task wedges.
+pub fn recover_wedged_runs(db: &Database, now: i64, default_grace_secs: i64) -> Result<u64> {
+    db.recover_wedged_runs(now, default_grace_secs)
 }
 
 /// Format a task row for display.
@@ -423,14 +500,14 @@ mod tests {
 
     #[test]
     fn calculate_next_run_cron() {
-        let next = calculate_next_run("cron", "0 0 9 * * * *").unwrap();
+        let next = calculate_next_run("cron", "0 0 9 * * * *", "local").unwrap();
         assert!(next.is_some());
         assert!(next.unwrap() > Utc::now().timestamp());
     }
 
     #[test]
     fn calculate_next_run_interval() {
-        let next = calculate_next_run("interval", "1h").unwrap();
+        let next = calculate_next_run("interval", "1h", "local").unwrap();
         assert!(next.is_some());
         let expected_min = Utc::now().timestamp() + 3500; // ~1h minus tolerance
         assert!(next.unwrap() > expected_min);
@@ -440,7 +517,7 @@ mod tests {
     fn calculate_next_run_once_future_iso() {
         let future = Utc::now().timestamp() + 3600;
         let iso = DateTime::from_timestamp(future, 0).unwrap().to_rfc3339();
-        let next = calculate_next_run("once", &iso).unwrap().unwrap();
+        let next = calculate_next_run("once", &iso, "local").unwrap().unwrap();
         assert!((next - future).abs() <= 1);
     }
 
@@ -448,7 +525,9 @@ mod tests {
     fn calculate_next_run_once_naive_local() {
         let future = Local::now() + chrono::Duration::hours(1);
         let naive = future.format("%Y-%m-%dT%H:%M:%S").to_string();
-        let next = calculate_next_run("once", &naive).unwrap().unwrap();
+        let next = calculate_next_run("once", &naive, "local")
+            .unwrap()
+            .unwrap();
         assert!((next - future.timestamp()).abs() <= 1);
     }
 
@@ -456,22 +535,22 @@ mod tests {
     fn calculate_next_run_once_past_rejected() {
         let past = Utc::now().timestamp() - 3600;
         let iso = DateTime::from_timestamp(past, 0).unwrap().to_rfc3339();
-        assert!(calculate_next_run("once", &iso).is_err());
+        assert!(calculate_next_run("once", &iso, "local").is_err());
     }
 
     #[test]
     fn calculate_next_run_once_empty_rejected() {
-        assert!(calculate_next_run("once", "").is_err());
+        assert!(calculate_next_run("once", "", "local").is_err());
     }
 
     #[test]
     fn calculate_next_run_once_garbage_rejected() {
-        assert!(calculate_next_run("once", "tomorrow at 9am").is_err());
+        assert!(calculate_next_run("once", "tomorrow at 9am", "local").is_err());
     }
 
     #[test]
     fn calculate_next_run_unknown_type() {
-        assert!(calculate_next_run("weekly", "").is_err());
+        assert!(calculate_next_run("weekly", "", "local").is_err());
     }
 
     #[test]

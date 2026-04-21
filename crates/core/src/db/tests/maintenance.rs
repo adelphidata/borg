@@ -2,8 +2,13 @@
 //! `doctor_runs` persistence, and the seeded maintenance task.
 
 use super::{simple_task, test_db};
+use crate::db::NewTask;
 use crate::maintenance::{MaintenanceReport, MAINTENANCE_TASK_ID};
-use crate::tasks::{heal_stalled_tasks, RUN_STATUS_MISSED};
+use crate::tasks::{
+    calculate_next_run, heal_stalled_tasks, recover_wedged_runs, RUN_STATUS_FAILED,
+    RUN_STATUS_MISSED, RUN_STATUS_RUNNING, RUN_STATUS_SUCCESS,
+};
+use rusqlite::params;
 
 #[test]
 fn maintenance_task_is_seeded_by_v37() {
@@ -210,6 +215,259 @@ fn prune_completed_workflows_only_deletes_terminal_older_than_cutoff() {
         orphan_steps.is_empty(),
         "steps of pruned workflow must be deleted too"
     );
+}
+
+// ── Wedged-run recovery (in-daemon sweep) ──
+
+/// Directly insert a `task_runs` row with a controlled `started_at` and
+/// status. The normal `start_task_run` helper stamps `now`, which makes
+/// it impossible to simulate an old wedged row without a second UPDATE.
+fn insert_run_at(db: &crate::db::Database, task_id: &str, started_at: i64, status: &str) -> i64 {
+    db.conn()
+        .execute(
+            "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+             VALUES (?1, ?2, 0, ?3)",
+            params![task_id, started_at, status],
+        )
+        .unwrap();
+    db.conn().last_insert_rowid()
+}
+
+fn task_with_timeout<'a>(
+    id: &'a str,
+    schedule_expr: &'a str,
+    timeout_ms: Option<i64>,
+) -> NewTask<'a> {
+    NewTask {
+        id,
+        name: "t",
+        prompt: "p",
+        schedule_type: "cron",
+        schedule_expr,
+        timezone: "local",
+        next_run: None,
+        max_retries: None,
+        timeout_ms,
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+    }
+}
+
+fn run_status(db: &crate::db::Database, run_id: i64) -> (String, Option<String>) {
+    db.conn()
+        .query_row(
+            "SELECT status, error FROM task_runs WHERE id = ?1",
+            params![run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn recover_wedged_runs_fails_rows_past_task_timeout() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // 1-minute task timeout — anything older than 60s is wedged.
+    db.create_task(&task_with_timeout("tight", "0 0 * * * *", Some(60_000)))
+        .unwrap();
+    let run_id = insert_run_at(&db, "tight", now - 3600, RUN_STATUS_RUNNING);
+
+    let n = recover_wedged_runs(&db, now, 3600).expect("recover");
+    assert_eq!(n, 1);
+    let (status, error) = run_status(&db, run_id);
+    assert_eq!(status, RUN_STATUS_FAILED);
+    assert!(
+        error.as_deref().unwrap_or("").contains("wedged"),
+        "error must mention wedged, got: {error:?}"
+    );
+}
+
+#[test]
+fn recover_wedged_runs_leaves_young_rows_alone() {
+    // Generous 2-hour timeout — a 30-min-old running row must not be
+    // reaped even though the default grace (1h) is smaller. Verifies
+    // the per-task timeout beats the default in the COALESCE.
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.create_task(&task_with_timeout(
+        "roomy",
+        "0 0 * * * *",
+        Some(2 * 60 * 60 * 1000),
+    ))
+    .unwrap();
+    let young = insert_run_at(&db, "roomy", now - 1800, RUN_STATUS_RUNNING);
+
+    let n = recover_wedged_runs(&db, now, 60).expect("recover");
+    assert_eq!(n, 0, "30-min-old row with 2h timeout must not be reaped");
+    assert_eq!(run_status(&db, young).0, RUN_STATUS_RUNNING);
+}
+
+#[test]
+fn recover_wedged_runs_ignores_non_running_rows() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.create_task(&task_with_timeout("done", "0 0 * * * *", Some(60_000)))
+        .unwrap();
+    let success = insert_run_at(&db, "done", now - 3600, RUN_STATUS_SUCCESS);
+    let missed = insert_run_at(&db, "done", now - 3600, RUN_STATUS_MISSED);
+
+    let n = recover_wedged_runs(&db, now, 3600).expect("recover");
+    assert_eq!(n, 0);
+    assert_eq!(run_status(&db, success).0, RUN_STATUS_SUCCESS);
+    assert_eq!(run_status(&db, missed).0, RUN_STATUS_MISSED);
+}
+
+// ── Clock-jump storm aggregation ──
+
+#[test]
+fn heal_stalled_tasks_caps_audit_rows_on_clock_jump() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    let long_ago = now - 24 * 3600;
+    // 10 > CLOCK_JUMP_AGGREGATE_THRESHOLD (5), so we expect aggregation.
+    for i in 0..10 {
+        let id = format!("storm-{i}");
+        db.create_task(&simple_task(
+            &id,
+            "s",
+            "p",
+            "cron",
+            "0 0 * * * *",
+            Some(long_ago),
+        ))
+        .unwrap();
+    }
+
+    let report = heal_stalled_tasks(&db, now, 3600).expect("heal");
+    assert_eq!(report.detected, 10);
+    assert_eq!(report.reset, 10);
+    assert!(report.aggregated, "storm above threshold must aggregate");
+
+    // Count missed audit rows across all storm-N tasks.
+    let total_missed: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE status = ?1 AND task_id LIKE 'storm-%'",
+            params![RUN_STATUS_MISSED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        total_missed, 1,
+        "aggregated sweep must write exactly one audit row, got {total_missed}"
+    );
+
+    // Every task's next_run should have been advanced past `now`.
+    for i in 0..10 {
+        let id = format!("storm-{i}");
+        let task = db.get_task_by_id(&id).unwrap().unwrap();
+        assert!(
+            task.next_run.unwrap() > now,
+            "{id} next_run must be advanced"
+        );
+    }
+
+    // Aggregate row mentions the fleet size and the clock-jump marker.
+    let (_status, error) = db
+        .conn()
+        .query_row(
+            "SELECT status, error FROM task_runs WHERE status = ?1 LIMIT 1",
+            params![RUN_STATUS_MISSED],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                ))
+            },
+        )
+        .unwrap();
+    assert!(error.contains("10"), "error must name fleet size: {error}");
+    assert!(
+        error.contains("clock-jump"),
+        "error must flag clock-jump: {error}"
+    );
+}
+
+#[test]
+fn heal_stalled_tasks_records_per_task_below_threshold() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    let long_ago = now - 24 * 3600;
+    // 3 tasks (<= threshold) — expect one row per task.
+    for i in 0..3 {
+        let id = format!("few-{i}");
+        db.create_task(&simple_task(
+            &id,
+            "s",
+            "p",
+            "cron",
+            "0 0 * * * *",
+            Some(long_ago),
+        ))
+        .unwrap();
+    }
+    let report = heal_stalled_tasks(&db, now, 3600).expect("heal");
+    assert_eq!(report.detected, 3);
+    assert!(!report.aggregated, "below-threshold must not aggregate");
+
+    let total_missed: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE status = ?1 AND task_id LIKE 'few-%'",
+            params![RUN_STATUS_MISSED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_missed, 3, "one missed row per task below threshold");
+}
+
+// ── Timezone-aware cron evaluation ──
+
+#[test]
+fn calculate_next_run_honors_iana_timezone() {
+    use chrono::{TimeZone, Timelike};
+    use chrono_tz::America::New_York;
+
+    // "02:00 every day" in New York. Regardless of current UTC time, the
+    // next firing converted back to America/New_York must land at 02:00.
+    let ts = calculate_next_run("cron", "0 0 2 * * *", "America/New_York")
+        .unwrap()
+        .expect("cron produces a next firing");
+    let ny_time = New_York.timestamp_opt(ts, 0).unwrap();
+    assert_eq!(
+        (ny_time.hour(), ny_time.minute(), ny_time.second()),
+        (2, 0, 0),
+        "next firing must be 02:00 New York local, got {ny_time}"
+    );
+}
+
+#[test]
+fn calculate_next_run_falls_back_to_utc_on_bad_tz() {
+    // Unparseable zone must not error and must match the UTC result
+    // for the same cron expression. A scheduled task with a corrupted
+    // timezone field must keep firing, not go dark.
+    let bad = calculate_next_run("cron", "0 0 9 * * *", "Not/A/Zone")
+        .unwrap()
+        .unwrap();
+    let utc = calculate_next_run("cron", "0 0 9 * * *", "UTC")
+        .unwrap()
+        .unwrap();
+    assert_eq!(bad, utc);
+}
+
+#[test]
+fn calculate_next_run_treats_local_and_empty_as_utc() {
+    // Regression guard: `"local"`, `""`, and `"UTC"` must all resolve
+    // identically so existing seeded rows (stored as "local") keep the
+    // pre-timezone-aware UTC semantics.
+    let expr = "0 0 3 * * *";
+    let local = calculate_next_run("cron", expr, "local").unwrap().unwrap();
+    let empty = calculate_next_run("cron", expr, "").unwrap().unwrap();
+    let utc = calculate_next_run("cron", expr, "UTC").unwrap().unwrap();
+    assert_eq!(local, empty);
+    assert_eq!(local, utc);
 }
 
 #[test]

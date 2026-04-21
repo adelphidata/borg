@@ -27,21 +27,21 @@ out to avoid refactor sprawl:
 
 ## Self-healing — known gaps worth tracking
 
-Surfaced by the post-ship code review of Tier 1:
+All three post-Tier-1 gaps are now shipped. See `docs/self-healing.md`
+for current behavior:
 
-- **Stuck `running` task_runs while daemon stays up.** `recover_stale_runs`
-  only fires on daemon startup. If the daemon stays alive but a single
-  task execution wedges (panic inside `spawn_blocking`, network hang past
-  the timeout), the row sits in `running` forever. Consider a
-  heartbeat/timeout sweep inside the daemon loop, not just at startup.
-- **Clock-jump storm.** After a long laptop sleep, every recurring task
-  looks stalled at once and we record one `missed` row per task. Correct
-  but noisy — consider a per-sweep cap or a single aggregate row when
-  more than N tasks drift in the same scan.
-- **Timezone drift on seeded crons.** All seeded cron schedules evaluate
-  in UTC today (the `timezone` column is display-only). If we ever want
-  "02:00 in the user's local time" semantics, `calculate_next_run` needs
-  to honor the column — not just expose it.
+- ~~**Stuck `running` task_runs while daemon stays up.**~~ The 5-min
+  daemon tick calls `recover_wedged_runs`, which fails any `running`
+  row whose `started_at` is older than the task's `timeout_ms`
+  (falling back to `STALLED_TASK_GRACE_SECS`).
+- ~~**Clock-jump storm.**~~ `heal_stalled_tasks` collapses audit rows
+  into one aggregate entry when more than
+  `CLOCK_JUMP_AGGREGATE_THRESHOLD` (5) tasks drift in a single sweep.
+- ~~**Timezone drift on seeded crons.**~~ `calculate_next_run` honors
+  IANA names on the `timezone` column via `chrono-tz`. `"local"`,
+  `""`, and `"UTC"` still map to UTC so existing seeded rows keep
+  their original semantics; unparseable zones fall back to UTC with
+  a `tracing::warn!`.
 
 ## /btw — non-blocking side questions
 
@@ -50,7 +50,3 @@ Shipped (TUI-only): `/btw <question>` spawns a tool-less, non-persistent side ag
 Deferred:
 
 - **Gateway / channel surface.** Mirror `run_btw` into `crates/gateway/src/handler.rs` so Telegram, Slack, Discord, iMessage, etc. can handle a `/btw ` prefix before routing to the main agent. Reply should land as a threaded follow-up so it doesn't derail the main conversation.
-- **Persisted `/btw` log.** Optionally record the side Q/A to a new `btw_entries` table, viewable via a `/btw log` subcommand. Today dismissing the popup loses the answer (matches hermes-agent behavior).
-- **Tool-enabled variant.** Allow a read-only subset (`read_file`, `memory_search`, `web_fetch`) behind a `btw.tools_enabled` config flag. Kept off by default — unpredictable latency and surprise side effects are the exact things `/btw` is supposed to avoid.
-- **Rate limiting.** Cap N `/btw`s per minute per session to stop accidental runaway loops burning tokens.
-- **Multi-answer stack.** Queue popups instead of the current single-slot cancel-in-flight behavior so rapidly fired `/btw`s don't clobber each other.

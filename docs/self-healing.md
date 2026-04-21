@@ -9,9 +9,13 @@ afternoons.
 
 A scheduled task with `task_type = 'maintenance'` fires at **02:00 UTC**
 every day (cron `0 0 2 * * *`, seeded in V37, id
-`00000000-0000-4000-8000-ada1ca1e0001`). All seeded cron schedules are
-evaluated in UTC regardless of the `timezone` column on the row — that
-column is display-only today.
+`00000000-0000-4000-8000-ada1ca1e0001`). Seeded rows store
+`timezone = "local"`, which `calculate_next_run` treats as UTC (along
+with `""` and `"UTC"`) to preserve the original fire-time semantics.
+Any other value is parsed as an IANA zone name (e.g.
+`America/New_York`) via `chrono-tz`; an unparseable name falls back to
+UTC with a `tracing::warn!` — a corrupted timezone field must never
+stop a task from firing.
 Unlike prompt/command tasks, it **does not invoke the LLM** — the task
 dispatcher calls `borg_core::maintenance::run_daily_maintenance` directly.
 That means it keeps running even when no provider key is configured and
@@ -44,7 +48,14 @@ Each run does the following in order:
    the activity log.
 6. **Stalled-task scan.** Recomputes `next_run` for any recurring
    scheduled task whose fire time has drifted more than one hour into
-   the past (see below).
+   the past (see below). When more than
+   `CLOCK_JUMP_AGGREGATE_THRESHOLD` (5) tasks look stalled in a single
+   sweep — the usual signature of a laptop waking from long sleep —
+   the audit trail collapses into **one** aggregate `task_runs` row
+   (`status='missed'`) instead of N near-identical ones. `next_run`
+   is still recomputed for every task; only the audit entry is
+   aggregated. `HealReport.aggregated` flags the case for the daemon
+   log.
 7. **Persistent-warning surfacing.** Compares this run's Warn/Fail
    checks against the previous run; any issue that appeared in both is
    added to `MaintenanceReport.persistent_warnings`. Single-run flukes
@@ -76,6 +87,24 @@ returns immediately after logging a skip message.
 
 All five are wired through `/settings` under the **Maintenance**
 section.
+
+## Wedged-run recovery inside the daemon loop
+
+On daemon startup, `recover_stale_runs` flips every `running` task_run
+from a crashed daemon to `failed`. That recovery is startup-only — if
+the daemon stays alive but a single task execution wedges (panic
+inside `spawn_blocking`, network hang past its timeout), the row sat
+in `running` forever until the next restart.
+
+The same 5-minute tick that runs the stalled-task scan now also calls
+`recover_wedged_runs(db, now, STALLED_TASK_GRACE_SECS)`. That marks
+any `running` task_run as `failed` when `started_at` is older than
+the task's own `timeout_ms` (in seconds), falling back to
+`default_grace_secs` (1h) when no per-task timeout is available. The
+statement is a single SQL `UPDATE ... WHERE id IN (SELECT ... LEFT
+JOIN scheduled_tasks ...)` so cost is bounded regardless of the
+number of active tasks. Recovered rows carry
+`error = 'self-healing: task_run wedged in ''running'' past timeout …'`.
 
 ## Missed-run detection for scheduled tasks
 

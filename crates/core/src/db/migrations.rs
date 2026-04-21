@@ -457,7 +457,7 @@ impl Database {
     pub(super) fn seed_default_tasks(&self) -> Result<()> {
         const SECURITY_AUDIT_TASK_ID: &str = "00000000-0000-4000-8000-5ec041700001";
         const SECURITY_AUDIT_CRON: &str = "0 0 9 1 * *";
-        let next_run = crate::tasks::calculate_next_run("cron", SECURITY_AUDIT_CRON)?;
+        let next_run = crate::tasks::calculate_next_run("cron", SECURITY_AUDIT_CRON, "local")?;
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
@@ -476,7 +476,7 @@ impl Database {
         )?;
 
         const DAILY_SUMMARY_CRON: &str = "0 0 9 * * 1-5"; // 9 AM Mon-Fri (6-field: sec min hr dom mon dow)
-        let next_run_daily = crate::tasks::calculate_next_run("cron", DAILY_SUMMARY_CRON)?;
+        let next_run_daily = crate::tasks::calculate_next_run("cron", DAILY_SUMMARY_CRON, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms)
@@ -1191,7 +1191,7 @@ impl Database {
 
         // Nightly consolidation: 3 AM daily
         const NIGHTLY_CRON: &str = "0 0 3 * * *";
-        let next_nightly = crate::tasks::calculate_next_run("cron", NIGHTLY_CRON)?;
+        let next_nightly = crate::tasks::calculate_next_run("cron", NIGHTLY_CRON, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
@@ -1213,7 +1213,7 @@ impl Database {
 
         // Weekly consolidation: 4 AM Sunday
         const WEEKLY_CRON: &str = "0 0 4 * * 7";
-        let next_weekly = crate::tasks::calculate_next_run("cron", WEEKLY_CRON)?;
+        let next_weekly = crate::tasks::calculate_next_run("cron", WEEKLY_CRON, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
@@ -1365,7 +1365,7 @@ impl Database {
         let task_id = crate::maintenance::MAINTENANCE_TASK_ID;
         const MAINTENANCE_CRON: &str = "0 0 2 * * *";
         let now = chrono::Utc::now().timestamp();
-        let next_run = crate::tasks::calculate_next_run("cron", MAINTENANCE_CRON)?;
+        let next_run = crate::tasks::calculate_next_run("cron", MAINTENANCE_CRON, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)

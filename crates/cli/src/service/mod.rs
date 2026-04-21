@@ -336,20 +336,46 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                     tracing::warn!(
                         detected = report.detected,
                         reset = report.reset,
+                        aggregated = report.aggregated,
                         "self-healing: reset next_run for stalled scheduled tasks"
                     );
+                    let suffix = if report.aggregated {
+                        " [clock-jump aggregated]"
+                    } else {
+                        ""
+                    };
                     borg_core::activity_log::log_activity(
                         &db,
                         "warn",
                         "system",
                         &format!(
-                            "Self-healing reset {} stalled scheduled task(s) (detected {})",
-                            report.reset, report.detected
+                            "Self-healing reset {} stalled scheduled task(s) (detected {}){}",
+                            report.reset, report.detected, suffix
                         ),
                     );
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("Stalled-task scan failed: {e}"),
+            }
+
+            // Recover task_runs rows wedged in 'running' past their
+            // timeout. Covers the in-daemon case the startup-only
+            // `recover_stale_runs` sweep misses.
+            match borg_core::tasks::recover_wedged_runs(&db, now, STALLED_TASK_GRACE_SECS) {
+                Ok(n) if n > 0 => {
+                    tracing::warn!(
+                        recovered = n,
+                        "self-healing: marked wedged 'running' task_runs as failed"
+                    );
+                    borg_core::activity_log::log_activity(
+                        &db,
+                        "warn",
+                        "system",
+                        &format!("Self-healing recovered {n} wedged task run(s)"),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Wedged-run sweep failed: {e}"),
             }
         }
 

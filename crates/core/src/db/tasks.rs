@@ -306,6 +306,35 @@ impl Database {
         Ok(count)
     }
 
+    /// Mark 'running' task_runs as 'failed' when their `started_at` is
+    /// older than the task's own `timeout_ms` (or `default_grace_secs`
+    /// when the task has no explicit timeout). Used by the daemon loop
+    /// to recover wedged executions without waiting for a restart.
+    /// Returns the number of rows updated.
+    pub fn recover_wedged_runs(&self, now: i64, default_grace_secs: i64) -> Result<u64> {
+        let error_msg = format!(
+            "self-healing: task_run wedged in 'running' past timeout (grace {default_grace_secs}s)"
+        );
+        let updated = self.conn.execute(
+            "UPDATE task_runs \
+             SET status = ?1, error = ?2 \
+             WHERE id IN ( \
+                 SELECT tr.id FROM task_runs tr \
+                 LEFT JOIN scheduled_tasks st ON st.id = tr.task_id \
+                 WHERE tr.status = ?3 \
+                   AND tr.started_at < ?4 - COALESCE(st.timeout_ms / 1000, ?5) \
+             )",
+            params![
+                crate::tasks::RUN_STATUS_FAILED,
+                error_msg,
+                crate::tasks::RUN_STATUS_RUNNING,
+                now,
+                default_grace_secs,
+            ],
+        )?;
+        Ok(updated as u64)
+    }
+
     /// Mark any 'running' task_runs as 'failed' (from a crashed daemon). Returns count.
     pub fn recover_stale_runs(&self, error_msg: &str) -> Result<u64> {
         let updated = self.conn.execute(
@@ -441,7 +470,7 @@ impl Database {
         let timezone = update.timezone.unwrap_or(&existing.timezone);
 
         let next_run = if update.schedule_type.is_some() || update.schedule_expr.is_some() {
-            crate::tasks::calculate_next_run(schedule_type, schedule_expr)?
+            crate::tasks::calculate_next_run(schedule_type, schedule_expr, timezone)?
         } else {
             existing.next_run
         };
