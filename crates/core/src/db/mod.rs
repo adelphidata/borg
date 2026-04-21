@@ -11,6 +11,7 @@ mod plugins;
 mod scripts;
 mod sessions;
 mod settings;
+mod skill_audit;
 mod tasks;
 mod usage;
 mod vitals;
@@ -21,6 +22,7 @@ mod tests;
 
 pub use models::*;
 pub use sessions::MessageFtsHit;
+pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
 
 use anyhow::{Context, Result};
@@ -179,7 +181,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 38;
+    const CURRENT_VERSION: u32 = 39;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -256,6 +258,7 @@ impl Database {
             Database::migrate_v36,
             Database::migrate_v37,
             Database::migrate_v38,
+            Database::migrate_v39,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.

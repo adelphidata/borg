@@ -1358,6 +1358,25 @@ impl Database {
         Ok(())
     }
 
+    /// V39: Skill audit — track SHA-256 of every user skill's `SKILL.md`
+    /// across runs so we can flag tampering (content change without a
+    /// plugin install) the next time skills are loaded.
+    ///
+    /// Trust-on-first-use: the first time a skill is seen we record its
+    /// hash with no warning (user put it there themselves). On subsequent
+    /// loads, a divergent hash is surfaced as a doctor warning.
+    pub(super) fn migrate_v39(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS skill_audit (
+                name           TEXT PRIMARY KEY,
+                sha256         TEXT NOT NULL,
+                first_seen_at  INTEGER NOT NULL,
+                last_seen_at   INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

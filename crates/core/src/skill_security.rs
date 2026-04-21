@@ -4,9 +4,11 @@
 //! environment variable requests, checks for built-in name collisions,
 //! and verifies file permissions. Inspired by OpenClaw's scan-at-load approach.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::SkillEntryConfig;
+use crate::db::{Database, SkillAuditOutcome};
+use crate::integrity::compute_sha256;
 use crate::sanitize::{self, ThreatLevel};
 use crate::skills::{self, SkillManifest};
 
@@ -175,6 +177,110 @@ pub fn validate_user_skill(
         findings,
         threat_level,
     }
+}
+
+/// One entry in the output of [`audit_user_skills`].
+#[derive(Debug, Clone)]
+pub struct SkillAuditFinding {
+    /// Skill name (directory name under `~/.borg/skills/`).
+    pub name: String,
+    /// Absolute path to the SKILL.md file that was hashed.
+    pub path: PathBuf,
+    /// Outcome of comparing the current hash against the stored one.
+    pub outcome: SkillAuditOutcome,
+}
+
+impl SkillAuditFinding {
+    /// True when the skill's content differs from the previously-stored
+    /// hash — the signal the daily doctor sweep surfaces as a warning.
+    pub fn is_modified(&self) -> bool {
+        matches!(self.outcome, SkillAuditOutcome::Modified { .. })
+    }
+}
+
+/// Walk the user skills directory, hash each `SKILL.md`, and record the
+/// observation in the `skill_audit` table. Returns one finding per skill.
+///
+/// Trust-on-first-use: the first observation of a skill name is recorded
+/// without any warning — the directory contents are assumed to reflect
+/// the user's intent on first install. Subsequent observations where the
+/// hash diverges from the stored value are flagged as `Modified` — this
+/// is the actual tamper signal the doctor check surfaces.
+///
+/// A missing or unreadable skills directory is treated as "no skills",
+/// not an error, so early-install environments don't spam warnings.
+pub fn audit_user_skills(db: &Database, skills_dir: &Path) -> Vec<SkillAuditFinding> {
+    let mut findings = Vec::new();
+    let entries = match std::fs::read_dir(skills_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return findings,
+        Err(e) => {
+            tracing::warn!(
+                dir = %skills_dir.display(),
+                error = %e,
+                "skill_audit: could not read skills directory"
+            );
+            return findings;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let skill_md = entry.path().join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        // Directory name is the canonical skill identity for audit purposes.
+        // Using the manifest-declared name would let a tampered manifest
+        // impersonate another skill on disk.
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "skill_audit: skipping non-UTF8 skill directory name"
+                );
+                continue;
+            }
+        };
+        let content = match std::fs::read(&skill_md) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %skill_md.display(),
+                    error = %e,
+                    "skill_audit: could not read SKILL.md"
+                );
+                continue;
+            }
+        };
+        let sha = compute_sha256(&content);
+        match db.record_skill_seen(&name, &sha) {
+            Ok(outcome) => {
+                if let SkillAuditOutcome::Modified { prev_sha256 } = &outcome {
+                    tracing::warn!(
+                        skill = %name,
+                        prev_sha256 = %prev_sha256,
+                        new_sha256 = %sha,
+                        "skill_audit: user skill content changed since last load"
+                    );
+                }
+                findings.push(SkillAuditFinding {
+                    name,
+                    path: skill_md,
+                    outcome,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    skill = %name,
+                    error = %e,
+                    "skill_audit: failed to record observation"
+                );
+            }
+        }
+    }
+
+    findings
 }
 
 /// Compare two threat levels and return the more severe one.
@@ -458,6 +564,79 @@ mod tests {
         let outcome =
             validate_user_skill("my-skill", &manifest, body, &[], tmp.path(), Some(&config));
         assert!(outcome.allowed);
+    }
+
+    // -- audit_user_skills --
+
+    fn write_skill(dir: &Path, name: &str, body: &str) {
+        let skill_dir = dir.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn audit_missing_dir_is_empty_not_error() {
+        let db = Database::test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let findings = audit_user_skills(&db, &missing);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn audit_empty_dir_is_empty() {
+        let db = Database::test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let findings = audit_user_skills(&db, dir.path());
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn audit_first_pass_records_all_as_first_seen() {
+        let db = Database::test_db();
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "alpha", "alpha body");
+        write_skill(dir.path(), "beta", "beta body");
+
+        let findings = audit_user_skills(&db, dir.path());
+        assert_eq!(findings.len(), 2);
+        assert!(findings
+            .iter()
+            .all(|f| matches!(f.outcome, SkillAuditOutcome::FirstSeen)));
+        assert!(findings.iter().all(|f| !f.is_modified()));
+    }
+
+    #[test]
+    fn audit_flags_modified_skill_on_second_pass() {
+        let db = Database::test_db();
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "alpha", "alpha body");
+        write_skill(dir.path(), "beta", "beta body");
+        let first = audit_user_skills(&db, dir.path());
+        assert_eq!(first.len(), 2);
+
+        // Tamper with alpha; leave beta alone.
+        write_skill(dir.path(), "alpha", "ALPHA MODIFIED");
+
+        let second = audit_user_skills(&db, dir.path());
+        let alpha = second.iter().find(|f| f.name == "alpha").unwrap();
+        let beta = second.iter().find(|f| f.name == "beta").unwrap();
+        assert!(alpha.is_modified(), "alpha should be flagged as modified");
+        assert!(!beta.is_modified(), "beta must not be flagged");
+        assert_eq!(beta.outcome, SkillAuditOutcome::Unchanged);
+    }
+
+    #[test]
+    fn audit_skips_directory_without_skill_md() {
+        let db = Database::test_db();
+        let dir = tempfile::tempdir().unwrap();
+        // Directory with no SKILL.md — e.g. leftover references/ or .git
+        std::fs::create_dir_all(dir.path().join("not-a-skill")).unwrap();
+        write_skill(dir.path(), "real-skill", "body");
+
+        let findings = audit_user_skills(&db, dir.path());
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].name, "real-skill");
     }
 
     // -- higher_threat --

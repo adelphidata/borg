@@ -536,6 +536,34 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             ));
         }
     }
+
+    // Tamper audit. Hashes every SKILL.md under ~/.borg/skills/ and
+    // compares against the stored hash in the skill_audit table.
+    // First-seen skills are recorded silently (user put them there);
+    // subsequent content changes are flagged as potential tampering.
+    match (crate::skills::skills_dir(), Database::open()) {
+        (Ok(dir), Ok(db)) => {
+            let findings = crate::skill_security::audit_user_skills(&db, &dir);
+            let modified: Vec<String> = findings
+                .iter()
+                .filter(|f| f.is_modified())
+                .map(|f| f.name.clone())
+                .collect();
+            if !modified.is_empty() {
+                checks.push(DiagnosticCheck::warn(
+                    "Skills",
+                    format!(
+                        "{n} user skill(s) modified since last load: {names}",
+                        n = modified.len(),
+                        names = modified.join(", "),
+                    ),
+                    "review content for supply-chain tampering",
+                ));
+            }
+        }
+        (Err(e), _) => tracing::warn!("doctor: cannot resolve skills dir for audit: {e}"),
+        (_, Err(e)) => tracing::warn!("doctor: cannot open DB for skill audit: {e}"),
+    }
 }
 
 fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
