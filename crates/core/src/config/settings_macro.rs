@@ -70,6 +70,11 @@ macro_rules! define_settings {
                             .ok_or_else(|| ::anyhow::anyhow!("Invalid skill entry key: {k}"))?
                             .to_string();
                         let enabled = $crate::config::parse_value::<bool>(value, k)?;
+                        if !enabled && $crate::skills::MANDATORY_SKILLS.contains(&name.as_str()) {
+                            ::anyhow::bail!(
+                                "Skill '{name}' is mandatory and cannot be disabled."
+                            );
+                        }
                         self.skills.entries.entry(name).or_default().enabled = enabled;
                         Ok(format!("{k} = {enabled}"))
                     }

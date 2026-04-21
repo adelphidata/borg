@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use cron::Schedule;
 use rusqlite::params;
 use std::str::FromStr;
@@ -75,13 +75,55 @@ pub fn calculate_next_run(schedule_type: &str, schedule_expr: &str) -> Result<Op
             Ok(Some(Utc::now().timestamp() + duration.as_secs() as i64))
         }
         SCHEDULE_TYPE_ONCE => {
-            // For one-shot tasks, next_run is set at creation time
-            Ok(Some(Utc::now().timestamp()))
+            let ts = parse_once_timestamp(schedule_expr)?;
+            Ok(Some(ts))
         }
         other => {
             anyhow::bail!("Unknown schedule type: {other}. Use 'cron', 'interval', or 'once'.")
         }
     }
+}
+
+/// Parse a one-shot schedule expression into a Unix timestamp.
+///
+/// Accepts RFC3339 (`2026-04-22T09:00:00Z`, `2026-04-22T09:00:00-07:00`) and
+/// timezone-naive forms interpreted in the system's local timezone:
+/// `2026-04-22T09:00:00`, `2026-04-22 09:00:00`, `2026-04-22 09:00`.
+///
+/// Rejects timestamps more than 60 seconds in the past.
+pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "schedule_expr required for once — pass an ISO-8601 timestamp like '2026-04-22T09:00:00'"
+        );
+    }
+
+    let ts = if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        dt.timestamp()
+    } else {
+        let naive = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]
+            .iter()
+            .find_map(|fmt| NaiveDateTime::parse_from_str(trimmed, fmt).ok())
+            .with_context(|| {
+                format!(
+                    "Invalid ISO-8601 timestamp: {trimmed}. Examples: '2026-04-22T09:00:00', '2026-04-22T09:00:00-07:00'"
+                )
+            })?;
+        match Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => dt.timestamp(),
+            chrono::LocalResult::Ambiguous(a, _) => a.timestamp(),
+            chrono::LocalResult::None => {
+                anyhow::bail!("Ambiguous local time (likely DST gap): {trimmed}")
+            }
+        }
+    };
+
+    let now = Utc::now().timestamp();
+    if ts < now - 60 {
+        anyhow::bail!("Timestamp is in the past: {trimmed}. Pass a future ISO-8601 timestamp.");
+    }
+    Ok(ts)
 }
 
 /// Advance a task's next_run after execution.
@@ -140,7 +182,10 @@ pub fn validate_schedule(schedule_type: &str, schedule_expr: &str) -> Result<()>
                 .ok_or_else(|| anyhow::anyhow!("Invalid interval: {schedule_expr}"))?;
             Ok(())
         }
-        SCHEDULE_TYPE_ONCE => Ok(()),
+        SCHEDULE_TYPE_ONCE => {
+            parse_once_timestamp(schedule_expr)?;
+            Ok(())
+        }
         other => {
             anyhow::bail!("Unknown schedule type: {other}. Use 'cron', 'interval', or 'once'.")
         }
@@ -303,9 +348,36 @@ mod tests {
     }
 
     #[test]
-    fn calculate_next_run_once() {
-        let next = calculate_next_run("once", "").unwrap();
-        assert!(next.is_some());
+    fn calculate_next_run_once_future_iso() {
+        let future = Utc::now().timestamp() + 3600;
+        let iso = DateTime::from_timestamp(future, 0).unwrap().to_rfc3339();
+        let next = calculate_next_run("once", &iso).unwrap().unwrap();
+        assert!((next - future).abs() <= 1);
+    }
+
+    #[test]
+    fn calculate_next_run_once_naive_local() {
+        let future = Local::now() + chrono::Duration::hours(1);
+        let naive = future.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let next = calculate_next_run("once", &naive).unwrap().unwrap();
+        assert!((next - future.timestamp()).abs() <= 1);
+    }
+
+    #[test]
+    fn calculate_next_run_once_past_rejected() {
+        let past = Utc::now().timestamp() - 3600;
+        let iso = DateTime::from_timestamp(past, 0).unwrap().to_rfc3339();
+        assert!(calculate_next_run("once", &iso).is_err());
+    }
+
+    #[test]
+    fn calculate_next_run_once_empty_rejected() {
+        assert!(calculate_next_run("once", "").is_err());
+    }
+
+    #[test]
+    fn calculate_next_run_once_garbage_rejected() {
+        assert!(calculate_next_run("once", "tomorrow at 9am").is_err());
     }
 
     #[test]
@@ -334,8 +406,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_schedule_once() {
-        assert!(validate_schedule("once", "").is_ok());
+    fn validate_schedule_once_future_iso() {
+        let future = Utc::now().timestamp() + 3600;
+        let iso = DateTime::from_timestamp(future, 0).unwrap().to_rfc3339();
+        assert!(validate_schedule("once", &iso).is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_once_empty() {
+        assert!(validate_schedule("once", "").is_err());
+    }
+
+    #[test]
+    fn validate_schedule_once_past() {
+        let past = Utc::now().timestamp() - 3600;
+        let iso = DateTime::from_timestamp(past, 0).unwrap().to_rfc3339();
+        assert!(validate_schedule("once", &iso).is_err());
     }
 
     #[test]

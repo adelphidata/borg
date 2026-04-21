@@ -79,6 +79,7 @@ bundled_skills! {
     "1password"      => "1password"      { category: "utilities", default_enabled: false, hidden: false },
     "browser"        => "browser"        { category: "core",      default_enabled: true,  hidden: false },
     "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
+    "scheduler"      => "scheduler"      { category: "core",      default_enabled: true,  hidden: false },
 }
 
 /// Skills enabled by default when no explicit config entry exists.
@@ -431,8 +432,17 @@ fn check_requirements(
     true
 }
 
+/// Skills that cannot be disabled — always loaded regardless of user config.
+/// Use sparingly: only for skills that teach core agent capabilities whose
+/// tools are always present (e.g. `scheduler` teaches the always-available
+/// `schedule` tool — disabling it would strand a top use case).
+pub const MANDATORY_SKILLS: &[&str] = &["scheduler"];
+
 /// Determine if a skill is disabled given config entries and the default-enabled list.
 fn is_skill_disabled(name: &str, skills_config: &SkillsConfig) -> bool {
+    if MANDATORY_SKILLS.contains(&name) {
+        return false;
+    }
     match skills_config.entries.get(name) {
         Some(entry) => !entry.enabled, // explicit config wins
         None => !DEFAULT_ENABLED_SKILLS.contains(&name), // default off unless listed
@@ -2024,10 +2034,21 @@ Use docker commands.
         };
         let (context, _report) =
             load_skills_context(4000, &std::collections::HashMap::new(), &config).unwrap();
+        // Mandatory skills (e.g. scheduler) are never disabled even if the config
+        // requests it, so context is non-empty. Non-mandatory skills must not leak.
         assert!(
-            context.is_empty(),
-            "all disabled skills should produce empty context, got: {context}"
+            !context.is_empty(),
+            "mandatory skills should still produce context when all non-mandatory are disabled"
         );
+        for &(name, _) in BUNDLED_SKILLS {
+            if !MANDATORY_SKILLS.contains(&name) {
+                let header = format!("# {name}");
+                assert!(
+                    !context.contains(&header),
+                    "disabled non-mandatory skill '{name}' leaked into context"
+                );
+            }
+        }
     }
 
     #[test]
