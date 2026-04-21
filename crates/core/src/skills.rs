@@ -80,6 +80,7 @@ bundled_skills! {
     "browser"        => "browser"        { category: "core",      default_enabled: true,  hidden: false },
     "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
     "scheduler"      => "scheduler"      { category: "core",      default_enabled: true,  hidden: false },
+    "paperclip"      => "paperclip"      { category: "developer", default_enabled: false, hidden: false },
 }
 
 /// Skills enabled by default when no explicit config entry exists.
@@ -1033,6 +1034,7 @@ Short body.
         assert!(names.contains(&"calendar"));
         assert!(names.contains(&"1password"));
         assert!(names.contains(&"browser"));
+        assert!(names.contains(&"paperclip"));
     }
 
     #[test]
