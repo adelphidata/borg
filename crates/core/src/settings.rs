@@ -92,6 +92,30 @@ pub struct TuiSettingDecl {
 pub static ALL_SETTING_KEYS: std::sync::LazyLock<Vec<&'static str>> =
     std::sync::LazyLock::new(|| SETTING_REGISTRY.iter().map(|(k, _)| *k).collect());
 
+/// Process-wide dedup set for invalid-setting warnings. The config watcher
+/// reloads every ~3 s, and each reload iterates every row in the `settings`
+/// table — without dedup, stale or unknown keys produced thousands of
+/// identical warn lines per hour (~20 MB / day of log noise). We warn once
+/// per unique `(key, error-message)` pair per process lifetime.
+static WARNED_INVALID_SETTINGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+/// Emit a `warn!` for an invalid setting, at most once per unique
+/// `(key, error)` pair over the lifetime of the process.
+pub fn warn_invalid_setting_once(key: &str, err: &anyhow::Error) {
+    let msg = format!("{err}");
+    let fingerprint = format!("{key}\0{msg}");
+    let set = WARNED_INVALID_SETTINGS.get_or_init(Default::default);
+    let mut guard = match set.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.insert(fingerprint) {
+        tracing::warn!("Ignoring invalid setting {key}: {msg}");
+    }
+}
+
 /// Merges settings from two layers: DB overrides → compiled defaults.
 pub struct SettingsResolver {
     db: Database,
@@ -115,7 +139,7 @@ impl SettingsResolver {
         let db_settings = self.db.list_settings()?;
         for (key, value, _) in &db_settings {
             if let Err(e) = config.apply_setting(key, value) {
-                tracing::warn!("Ignoring invalid setting {key}: {e}");
+                warn_invalid_setting_once(key, &e);
             }
         }
         Ok(config)

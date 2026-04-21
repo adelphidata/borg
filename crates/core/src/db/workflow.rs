@@ -452,6 +452,40 @@ impl Database {
         Ok(true)
     }
 
+    /// Delete workflows (and their steps) in a terminal status
+    /// (`completed`, `failed`, `cancelled`) whose `completed_at` is older
+    /// than `cutoff` (unix seconds). Returns the number of workflows
+    /// removed. Active workflows (pending/running) are untouched regardless
+    /// of age so that a long-running multi-step workflow is never pruned
+    /// mid-execution.
+    pub fn prune_completed_workflows(&self, cutoff: i64) -> Result<usize> {
+        let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("Failed to begin workflow prune transaction")?;
+
+        // Steps first — foreign-key relationship is workflow_id → workflows.id
+        // and we don't rely on cascade, so delete children explicitly.
+        tx.execute(
+            "DELETE FROM workflow_steps WHERE workflow_id IN (
+                SELECT id FROM workflows
+                WHERE status IN (?1, ?2, ?3)
+                  AND completed_at IS NOT NULL
+                  AND completed_at < ?4
+            )",
+            params![status::COMPLETED, status::FAILED, status::CANCELLED, cutoff,],
+        )?;
+
+        let deleted = tx.execute(
+            "DELETE FROM workflows
+             WHERE status IN (?1, ?2, ?3)
+               AND completed_at IS NOT NULL
+               AND completed_at < ?4",
+            params![status::COMPLETED, status::FAILED, status::CANCELLED, cutoff,],
+        )?;
+
+        tx.commit().context("Failed to commit workflow prune")?;
+        Ok(deleted)
+    }
+
     /// Recover stale workflow steps left in 'running' state after a crash.
     /// Only recovers steps that have been running longer than 5 minutes (grace period
     /// to avoid resetting legitimately executing steps during restart).

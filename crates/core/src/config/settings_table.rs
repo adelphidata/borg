@@ -192,6 +192,7 @@ define_settings! {
         "maintenance.logs_retention_days" => maintenance.logs_retention_days, parsed(u32);
         "maintenance.activity_retention_days" => maintenance.activity_retention_days, parsed(u32);
         "maintenance.doctor_runs_keep" => maintenance.doctor_runs_keep, parsed(u32);
+        "maintenance.workflow_retention_days" => maintenance.workflow_retention_days, parsed(u32);
     }
 
     registry_only {
@@ -373,6 +374,7 @@ define_settings! {
         "maintenance.logs_retention_days" => "Log retention (days)", Uint, "Maintenance";
         "maintenance.activity_retention_days" => "Activity retention (days)", Uint, "Maintenance";
         "maintenance.doctor_runs_keep" => "Doctor runs kept", Uint, "Maintenance";
+        "maintenance.workflow_retention_days" => "Workflow retention (days)", Uint, "Maintenance";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

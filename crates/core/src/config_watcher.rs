@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::db::Database;
+use crate::settings::warn_invalid_setting_once;
 
 /// Poll interval for cross-process change detection (e.g. CLI while TUI runs).
 /// Uses `PRAGMA data_version` (in-memory check, no disk I/O) so a short
@@ -70,7 +71,7 @@ fn load_config_from(db: &Database) -> Result<Config> {
     let mut config = Config::default();
     for (key, value, _) in db.list_settings()? {
         if let Err(e) = config.apply_setting(&key, &value) {
-            warn!("Ignoring invalid setting {key}: {e}");
+            warn_invalid_setting_once(&key, &e);
         }
     }
     config.validate()?;

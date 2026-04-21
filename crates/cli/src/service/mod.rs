@@ -528,12 +528,19 @@ async fn spawn_workflow_step(
                 if let Err(e) = db.complete_workflow_step(step_id, &result_text) {
                     tracing::warn!("Failed to complete workflow step: {e}");
                 }
-                borg_core::activity_log::log_activity(
-                    &db,
-                    "info",
-                    "workflow",
-                    &format!("Step {step_label} completed in workflow '{workflow_title}'"),
-                );
+                // For single-step workflows the per-step and per-workflow
+                // activity-log rows are redundant (and the pair scrolling
+                // past once per second makes the TUI look like a runaway
+                // loop). Only emit the per-step row when there are
+                // multiple steps to distinguish.
+                if all_steps.len() > 1 {
+                    borg_core::activity_log::log_activity(
+                        &db,
+                        "info",
+                        "workflow",
+                        &format!("Step {step_label} completed in workflow '{workflow_title}'"),
+                    );
+                }
 
                 // Check if workflow is now complete
                 if let Ok(Some(wf)) = db.get_workflow(&workflow_id) {

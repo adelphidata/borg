@@ -271,7 +271,7 @@ impl Config {
         let mut config = Self::default();
         for (key, value, _) in db.list_settings()? {
             if let Err(e) = config.apply_setting(&key, &value) {
-                tracing::warn!("Ignoring invalid setting {key}: {e}");
+                crate::settings::warn_invalid_setting_once(&key, &e);
             }
         }
         config.validate()?;

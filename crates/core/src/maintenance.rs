@@ -31,6 +31,19 @@ const SECS_PER_DAY: i64 = 86_400;
 /// maintenance sweep evicts it. Mirrors the 30-day default elsewhere.
 const EMBEDDING_CACHE_TTL_SECS: i64 = 30 * SECS_PER_DAY;
 
+/// Size threshold above which `daemon.log`, `daemon.err`, and `tui.log` are
+/// head-truncated during the daily sweep. Nothing rotates these files
+/// otherwise — a single noisy warn loop once blew them up to >40 MB.
+const LOG_FILE_SIZE_CAP_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+/// When a log file exceeds [`LOG_FILE_SIZE_CAP_BYTES`], keep this many
+/// trailing bytes (the most recent lines) and discard the rest.
+const LOG_FILE_KEEP_BYTES: u64 = 1024 * 1024; // 1 MB
+
+/// Log files the maintenance sweep is allowed to head-truncate. These are
+/// appended-to freely by the daemon and TUI with no rotation; every other
+/// file under `~/.borg/logs/` (e.g. dated `*.jsonl`) is handled separately.
+const CAPPED_LOG_FILES: &[&str] = &["daemon.log", "daemon.err", "tui.log"];
+
 /// Summary of one maintenance run, persisted to `doctor_runs` and
 /// returned to the task dispatcher for activity-log accounting.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -40,6 +53,8 @@ pub struct MaintenanceReport {
     pub warn_count: usize,
     pub fail_count: usize,
     pub log_files_deleted: usize,
+    pub log_bytes_truncated: u64,
+    pub workflows_pruned: usize,
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
@@ -106,6 +121,18 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             Ok(n) => report.log_files_deleted = n,
             Err(e) => tracing::warn!("maintenance: log pruning failed: {e}"),
         }
+        // Cap unbounded append-only logs (daemon.log, tui.log, daemon.err).
+        // These are never rotated by the runtime; a noisy warn loop can
+        // balloon them to tens of MB in days.
+        match truncate_oversized_logs(
+            &logs_dir,
+            CAPPED_LOG_FILES,
+            LOG_FILE_SIZE_CAP_BYTES,
+            LOG_FILE_KEEP_BYTES,
+        ) {
+            Ok(n) => report.log_bytes_truncated = n,
+            Err(e) => tracing::warn!("maintenance: log truncation failed: {e}"),
+        }
     }
 
     // 3. Prune activity-log rows beyond retention window.
@@ -119,6 +146,16 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS) {
         Ok(n) => report.embeddings_pruned = n,
         Err(e) => tracing::warn!("maintenance: embedding prune failed: {e}"),
+    }
+
+    // 4b. Prune old completed/failed/cancelled workflows. Without this,
+    //     experimental "test" workflows accumulate indefinitely (hundreds
+    //     seen in the wild) and, if any sit in `running` across a daemon
+    //     restart, burst-process all at once and spam the activity log.
+    let workflow_cutoff = now - (config.maintenance.workflow_retention_days as i64) * SECS_PER_DAY;
+    match db.prune_completed_workflows(workflow_cutoff) {
+        Ok(n) => report.workflows_pruned = n,
+        Err(e) => tracing::warn!("maintenance: workflow prune failed: {e}"),
     }
 
     // 5. Proactively scan for stalled scheduled tasks. This duplicates
@@ -151,6 +188,82 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
 
     tracing::info!("{}", report.activity_line());
     Ok(report)
+}
+
+/// Head-truncate append-only log files under `dir` whose size exceeds
+/// `cap_bytes`, keeping the last `keep_bytes` of each. Returns the total
+/// number of bytes freed across all affected files.
+///
+/// These logs (`daemon.log`, `tui.log`, `daemon.err`) have no runtime
+/// rotation. A single misbehaving warn! loop blew `daemon.log` past 20 MB
+/// in under two weeks; this cap prevents recurrence.
+fn truncate_oversized_logs(
+    dir: &Path,
+    names: &[&str],
+    cap_bytes: u64,
+    keep_bytes: u64,
+) -> Result<u64> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut freed: u64 = 0;
+    for name in names {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let size = meta.len();
+        if size <= cap_bytes {
+            continue;
+        }
+        match truncate_file_keeping_tail(&path, keep_bytes) {
+            Ok(new_size) => {
+                let delta = size.saturating_sub(new_size);
+                freed = freed.saturating_add(delta);
+                tracing::info!(
+                    "maintenance: truncated {} ({} MB → {} MB)",
+                    name,
+                    size / (1024 * 1024),
+                    new_size / (1024 * 1024),
+                );
+            }
+            Err(e) => tracing::warn!("maintenance: could not truncate {}: {e}", path.display()),
+        }
+    }
+    Ok(freed)
+}
+
+/// Rewrite `path` to contain only its last `keep_bytes`. Best-effort
+/// attempts to start at a newline so the new head of the file is a
+/// complete log line rather than a mid-line fragment.
+fn truncate_file_keeping_tail(path: &Path, keep_bytes: u64) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut f = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let total = f.metadata()?.len();
+    let start = total.saturating_sub(keep_bytes);
+    f.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::with_capacity(keep_bytes as usize);
+    f.read_to_end(&mut tail)?;
+    // Advance to the first newline so we don't keep a half-truncated head line.
+    let offset = tail
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let trimmed = &tail[offset..];
+
+    // Replace the file contents atomically via a sibling tempfile rename.
+    let tmp = path.with_extension("trunc.tmp");
+    {
+        let mut out = fs::File::create(&tmp)?;
+        out.write_all(trimmed)?;
+        out.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(trimmed.len() as u64)
 }
 
 /// Delete `*.jsonl` log files under `dir` whose mtime is older than

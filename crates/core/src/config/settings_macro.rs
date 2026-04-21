@@ -62,6 +62,14 @@ macro_rules! define_settings {
                             $custom_body
                         },
                     )*
+                    // `registry_only` keys are visible in SETTING_REGISTRY
+                    // (so `/settings` can display their runtime value) but
+                    // have no applicable setter. Returning Ok here avoids
+                    // a noisy "Unknown setting" warn every config reload
+                    // when the DB carries a historical row.
+                    $(
+                        $ro_key => Ok(format!("{} = {value} (read-only)", $ro_key)),
+                    )*
                     // Dynamic skill entries (pattern-matched)
                     k if k.starts_with("skills.entries.") && k.ends_with(".enabled") => {
                         let name = k
@@ -78,10 +86,7 @@ macro_rules! define_settings {
                         self.skills.entries.entry(name).or_default().enabled = enabled;
                         Ok(format!("{k} = {enabled}"))
                     }
-                    _ => ::anyhow::bail!(
-                        "Unknown setting: {key}\nAvailable: {}",
-                        $crate::settings::ALL_SETTING_KEYS.join(", ")
-                    ),
+                    _ => ::anyhow::bail!("Unknown setting: {key}"),
                 }
             }
         }

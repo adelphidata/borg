@@ -1316,6 +1316,48 @@ impl Database {
         Ok(())
     }
 
+    /// V38: Purge stale entries from the `settings` table that are no longer
+    /// recognized by the compiled-in `SETTING_REGISTRY`. Before this, renamed
+    /// or removed settings would sit in the DB and, on every config-watcher
+    /// poll (every 3 s), trigger an "Ignoring invalid setting …" warn that
+    /// ballooned `~/.borg/logs/*.log` by tens of MB over weeks.
+    ///
+    /// Dynamic keys (`skills.entries.*.enabled`) are preserved because they
+    /// are pattern-matched at apply time, not registered.
+    pub(super) fn migrate_v38(&self) -> Result<()> {
+        let known: std::collections::HashSet<&'static str> = crate::settings::SETTING_REGISTRY
+            .iter()
+            .map(|(k, _)| *k)
+            .collect();
+
+        let mut stmt = self.conn.prepare("SELECT key FROM settings")?;
+        let all_keys: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut removed = 0usize;
+        for key in all_keys {
+            if known.contains(key.as_str()) {
+                continue;
+            }
+            // Preserve dynamic skill entry keys
+            if key.starts_with("skills.entries.") && key.ends_with(".enabled") {
+                continue;
+            }
+            self.conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                rusqlite::params![key],
+            )?;
+            removed += 1;
+            tracing::info!("V38 migration: removed stale setting '{key}'");
+        }
+        if removed > 0 {
+            tracing::info!("V38 migration: purged {removed} stale setting row(s)");
+        }
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

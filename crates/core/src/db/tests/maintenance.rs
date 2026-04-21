@@ -129,6 +129,8 @@ fn record_and_latest_doctor_run_roundtrip() {
         warn_count: 2,
         fail_count: 0,
         log_files_deleted: 1,
+        log_bytes_truncated: 0,
+        workflows_pruned: 0,
         activity_rows_deleted: 5,
         embeddings_pruned: 0,
         stalled_tasks_healed: 0,
