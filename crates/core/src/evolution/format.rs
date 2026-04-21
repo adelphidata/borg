@@ -68,16 +68,16 @@ pub fn format_status_section_with_width(state: &EvolutionState, card_width: usiz
 
             let lines = [
                 "",
-                "Your borg is learning how you use it.",
+                "Your Borg is learning how you use it.",
                 "Every tool call, shell command, and task",
                 "shapes what it becomes.",
                 "",
                 "Evolution is permanent -- earned through",
                 "sustained usage, not toggled. Your usage",
-                "patterns determine your borg's archetype",
+                "patterns determine your Borg's archetype",
                 "and unlock a unique evolution name.",
                 "",
-                "Keep using borg the way you imagine.",
+                "Keep using Borg the way you imagine.",
                 "",
             ];
             for line in &lines {

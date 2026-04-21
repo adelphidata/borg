@@ -20,8 +20,25 @@ pub struct GatewayConfig {
     pub port: u16,
     /// Maximum concurrent webhook handlers.
     pub max_concurrent: usize,
-    /// Request timeout in milliseconds for agent processing.
+    /// Hard wall-clock ceiling in milliseconds for an entire agent turn.
+    /// In practice the inactivity timer (`inactivity_timeout_secs`) is the
+    /// effective limit; this only fires if the inactivity guard is disabled
+    /// or the agent loop misbehaves.
     pub request_timeout_ms: u64,
+    /// Inactivity timeout in seconds. The agent turn is cancelled if no
+    /// progress event (stream token, tool call, tool result, etc.) arrives
+    /// within this window. `0` disables. Default: 1800 (30 min). Ported
+    /// from hermes-agent's `HERMES_AGENT_TIMEOUT`.
+    #[serde(default = "default_inactivity_timeout_secs")]
+    pub inactivity_timeout_secs: u64,
+    /// Send a one-shot warning message after this many idle seconds, before
+    /// the final timeout fires. `0` disables. Default: 900 (15 min).
+    #[serde(default = "default_inactivity_warning_secs")]
+    pub inactivity_warning_secs: u64,
+    /// Send a "still working…" status message every N seconds while the
+    /// agent is busy (resets on activity). `0` disables. Default: 600 (10 min).
+    #[serde(default = "default_inactivity_notify_secs")]
+    pub inactivity_notify_secs: u64,
     /// Maximum inbound requests per minute per sender.
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_minute: u32,
@@ -90,7 +107,10 @@ impl Default for GatewayConfig {
             host: "127.0.0.1".into(),
             port: 7842,
             max_concurrent: 10,
-            request_timeout_ms: 120_000,
+            request_timeout_ms: 1_800_000,
+            inactivity_timeout_secs: default_inactivity_timeout_secs(),
+            inactivity_warning_secs: default_inactivity_warning_secs(),
+            inactivity_notify_secs: default_inactivity_notify_secs(),
             rate_limit_per_minute: default_rate_limit(),
             public_url: None,
             max_body_size: constants::GATEWAY_MAX_BODY_SIZE,
@@ -169,6 +189,15 @@ pub struct GatewayBinding {
     /// Increase for models with long thinking phases before first token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_chunk_timeout_secs: Option<u64>,
+    /// Override gateway inactivity timeout in seconds for this binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactivity_timeout_secs: Option<u64>,
+    /// Override inactivity warning threshold in seconds for this binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactivity_warning_secs: Option<u64>,
+    /// Override "still working" notify interval in seconds for this binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactivity_notify_secs: Option<u64>,
 }
 
 /// Activation mode for group chats.
@@ -265,6 +294,18 @@ impl Default for LinkUnderstandingConfig {
     }
 }
 
+fn default_inactivity_timeout_secs() -> u64 {
+    1_800
+}
+
+fn default_inactivity_warning_secs() -> u64 {
+    900
+}
+
+fn default_inactivity_notify_secs() -> u64 {
+    600
+}
+
 fn default_error_cooldown_ms() -> u64 {
     constants::ERROR_POLICY_COOLDOWN_MS
 }
@@ -287,7 +328,10 @@ mod tests {
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 7842);
         assert_eq!(cfg.max_concurrent, 10);
-        assert_eq!(cfg.request_timeout_ms, 120_000);
+        assert_eq!(cfg.request_timeout_ms, 1_800_000);
+        assert_eq!(cfg.inactivity_timeout_secs, 1_800);
+        assert_eq!(cfg.inactivity_warning_secs, 900);
+        assert_eq!(cfg.inactivity_notify_secs, 600);
         assert_eq!(cfg.rate_limit_per_minute, 60);
         assert!(cfg.public_url.is_none());
         assert!(cfg.bindings.is_empty());
@@ -366,6 +410,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         };
         let json = serde_json::to_string(&binding).unwrap();
         let parsed: GatewayBinding = serde_json::from_str(&json).unwrap();

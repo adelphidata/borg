@@ -131,6 +131,9 @@ define_settings! {
         "gateway.port" => gateway.port, parsed(u16);
         "gateway.max_concurrent" => gateway.max_concurrent, parsed(usize);
         "gateway.request_timeout_ms" => gateway.request_timeout_ms, parsed(u64);
+        "gateway.inactivity_timeout_secs" => gateway.inactivity_timeout_secs, parsed(u64);
+        "gateway.inactivity_warning_secs" => gateway.inactivity_warning_secs, parsed(u64);
+        "gateway.inactivity_notify_secs" => gateway.inactivity_notify_secs, parsed(u64);
         "gateway.rate_limit_per_minute" => gateway.rate_limit_per_minute, parsed(u32);
         "gateway.public_url" => gateway.public_url, opt_string;
         "gateway.pairing_ttl_secs" => gateway.pairing_ttl_secs, parsed(i64);

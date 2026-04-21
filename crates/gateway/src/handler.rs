@@ -280,10 +280,22 @@ pub async fn invoke_agent(
     health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
     bot_identifier: Option<&str>,
 ) -> Result<(String, String)> {
-    invoke_agent_with_auto_reply(channel_name, inbound, config, health, bot_identifier, None).await
+    invoke_agent_with_auto_reply(
+        channel_name,
+        inbound,
+        config,
+        health,
+        bot_identifier,
+        None,
+        None,
+    )
+    .await
 }
 
-/// Like `invoke_agent` but accepts an optional auto-reply state for away-mode checks.
+/// Like `invoke_agent` but accepts an optional auto-reply state for away-mode
+/// checks and an optional progress sender. When `progress_tx` is provided,
+/// the gateway will deliver "still working…" / inactivity-warning messages
+/// to the user via that channel during long agent turns.
 #[instrument(skip_all, fields(channel = %channel_name))]
 pub async fn invoke_agent_with_auto_reply(
     channel_name: &str,
@@ -292,6 +304,7 @@ pub async fn invoke_agent_with_auto_reply(
     health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
     bot_identifier: Option<&str>,
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
+    progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
     // Expose the originating (channel, sender, thread) to tool handlers via a
     // task-local so e.g. the `schedule` tool can resolve `delivery="origin"`.
@@ -309,6 +322,7 @@ pub async fn invoke_agent_with_auto_reply(
             health,
             bot_identifier,
             auto_reply_state,
+            progress_tx,
         ),
     )
     .await
@@ -565,7 +579,17 @@ async fn prepare_message_text(
     (message_text, has_image_attachments)
 }
 
-/// Collect the full agent response from the event channel, with timeout.
+/// Collect the full agent response from the event channel.
+///
+/// Uses an **inactivity-based** timeout (ported from hermes-agent): the
+/// timer resets every time the agent emits a meaningful progress event
+/// (stream tokens, tool calls, tool results, etc.). A long-but-active
+/// turn never times out. A separate hard wall-clock ceiling
+/// (`gateway.request_timeout_ms`) guards against a runaway agent loop.
+///
+/// While the agent is busy, the function periodically emits "still working…"
+/// progress messages to `progress_tx` (if provided) and a one-shot warning
+/// before the final inactivity cancellation fires.
 ///
 /// Returns the final response text.
 async fn collect_agent_response(
@@ -573,80 +597,210 @@ async fn collect_agent_response(
     config: &Config,
     event_rx: &mut mpsc::Receiver<AgentEvent>,
     agent_cancel: &CancellationToken,
+    progress_tx: Option<&mpsc::UnboundedSender<String>>,
 ) -> String {
-    let request_timeout = Duration::from_millis(config.gateway.request_timeout_ms);
+    let inactivity_timeout = if config.gateway.inactivity_timeout_secs > 0 {
+        Some(Duration::from_secs(config.gateway.inactivity_timeout_secs))
+    } else {
+        None
+    };
+    let inactivity_warning = if config.gateway.inactivity_warning_secs > 0 {
+        Some(Duration::from_secs(config.gateway.inactivity_warning_secs))
+    } else {
+        None
+    };
+    let inactivity_notify = if config.gateway.inactivity_notify_secs > 0 {
+        Some(Duration::from_secs(config.gateway.inactivity_notify_secs))
+    } else {
+        None
+    };
+    let wall_clock_ceiling = Duration::from_millis(config.gateway.request_timeout_ms);
+
     let mut response_text = String::new();
     let mut response_capped = false;
-    let collect_result = tokio::time::timeout(request_timeout, async {
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                AgentEvent::TextDelta(delta) => {
-                    if !response_capped {
-                        if response_text.len() + delta.len() > constants::MAX_RESPONSE_SIZE {
-                            let remaining =
-                                constants::MAX_RESPONSE_SIZE.saturating_sub(response_text.len());
-                            // Find a safe UTF-8 boundary to avoid panicking on multi-byte chars
-                            let safe_end = (0..=remaining)
-                                .rev()
-                                .find(|&i| delta.is_char_boundary(i))
-                                .unwrap_or(0);
-                            response_text.push_str(&delta[..safe_end]);
-                            response_text
-                                .push_str("\n\n[Response truncated: exceeded maximum size]");
-                            response_capped = true;
-                            warn!(
-                                "Agent response for channel '{}' exceeded {}KB cap, truncating",
-                                channel_name,
-                                constants::MAX_RESPONSE_SIZE / 1024
-                            );
-                            // Don't cancel the agent — let it finish its turn naturally.
-                            // The outer tokio::time::timeout handles hard timeout.
+    let mut last_activity = tokio::time::Instant::now();
+    let started_at = last_activity;
+    let mut warning_fired = false;
+    let mut timed_out = false;
+
+    // Tick once a second to re-evaluate elapsed time. Cheap and avoids the
+    // bookkeeping of recreating sleep futures on every event.
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            maybe_event = event_rx.recv() => {
+                let Some(event) = maybe_event else { break };
+
+                if event_is_activity(&event) {
+                    last_activity = tokio::time::Instant::now();
+                }
+
+                match event {
+                    AgentEvent::TextDelta(delta) => {
+                        if !response_capped {
+                            if response_text.len() + delta.len() > constants::MAX_RESPONSE_SIZE {
+                                let remaining =
+                                    constants::MAX_RESPONSE_SIZE.saturating_sub(response_text.len());
+                                let safe_end = (0..=remaining)
+                                    .rev()
+                                    .find(|&i| delta.is_char_boundary(i))
+                                    .unwrap_or(0);
+                                response_text.push_str(&delta[..safe_end]);
+                                response_text
+                                    .push_str("\n\n[Response truncated: exceeded maximum size]");
+                                response_capped = true;
+                                warn!(
+                                    "Agent response for channel '{}' exceeded {}KB cap, truncating",
+                                    channel_name,
+                                    constants::MAX_RESPONSE_SIZE / 1024
+                                );
+                            } else {
+                                response_text.push_str(&delta);
+                            }
+                        }
+                    }
+                    AgentEvent::Error(e) => {
+                        warn!("Agent error on channel '{}': {e}", channel_name);
+                        let friendly = borg_core::error_format::format_error_with_context(
+                            &e,
+                            borg_core::error_format::ErrorContext::Gateway,
+                        );
+                        if response_text.is_empty() {
+                            response_text = friendly;
                         } else {
-                            response_text.push_str(&delta);
+                            response_text.push_str(&format!("\n\n[Error: {friendly}]"));
+                        }
+                    }
+                    AgentEvent::ShellConfirmation { respond, command } => {
+                        warn!("Auto-denying shell confirmation in gateway mode: {command}");
+                        response_text
+                            .push_str("\n[Operation denied: shell command requires confirmation]");
+                        if respond.send(false).is_err() {
+                            warn!(
+                                "Failed to send shell-confirmation denial on channel '{channel_name}': receiver dropped"
+                            );
+                        }
+                    }
+                    AgentEvent::UserInputRequest { respond, prompt, .. } => {
+                        warn!("Auto-declining user input request in gateway mode: {prompt}");
+                        if respond.send("[Not available in gateway mode]".to_string()).is_err() {
+                            warn!(
+                                "Failed to send user-input decline on channel '{channel_name}': receiver dropped"
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            _ = tick.tick() => {
+                let now = tokio::time::Instant::now();
+                let idle = now.saturating_duration_since(last_activity);
+                let elapsed_total = now.saturating_duration_since(started_at);
+
+                // Hard wall-clock ceiling — last-resort guard. Inactivity timer
+                // is the primary control.
+                if elapsed_total >= wall_clock_ceiling {
+                    warn!(
+                        "Agent hit wall-clock ceiling {wall_clock_ceiling:?} on channel '{channel_name}'"
+                    );
+                    timed_out = true;
+                    break;
+                }
+
+                if let Some(timeout) = inactivity_timeout {
+                    if idle >= timeout {
+                        warn!(
+                            "Agent inactivity timeout {timeout:?} on channel '{channel_name}'"
+                        );
+                        timed_out = true;
+                        break;
+                    }
+                }
+
+                if !warning_fired {
+                    if let Some(warn_after) = inactivity_warning {
+                        if idle >= warn_after {
+                            warning_fired = true;
+                            if let (Some(tx), Some(timeout)) = (progress_tx, inactivity_timeout) {
+                                let elapsed_min = (idle.as_secs() / 60).max(1);
+                                let remaining_min =
+                                    (timeout.saturating_sub(idle).as_secs() / 60).max(1);
+                                let msg = format!(
+                                    "⚠️ No agent activity for {elapsed_min} min. \
+                                     Will time out in {remaining_min} min if it does not respond."
+                                );
+                                if let Err(e) = tx.send(msg) {
+                                    warn!(
+                                        "Failed to enqueue inactivity warning on channel '{channel_name}': {e}"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
-                AgentEvent::Error(e) => {
-                    warn!("Agent error on channel '{}': {e}", channel_name);
-                    let friendly = borg_core::error_format::format_error_with_context(
-                        &e,
-                        borg_core::error_format::ErrorContext::Gateway,
-                    );
-                    if response_text.is_empty() {
-                        response_text = friendly;
-                    } else {
-                        // Append error to partial response so the user knows
-                        // the response was cut short.
-                        response_text.push_str(&format!("\n\n[Error: {friendly}]"));
+
+                if let Some(notify) = inactivity_notify {
+                    // Fire periodic notify pings while idle. Re-arms each interval
+                    // by comparing idle against multiples of the notify period.
+                    // Skip if we've already crossed into the warning window —
+                    // the user has a more useful message there.
+                    let already_warned = warning_fired
+                        || inactivity_warning.is_some_and(|w| idle >= w);
+                    if !already_warned && idle >= notify && idle.as_secs() % notify.as_secs() < 1 {
+                        if let Some(tx) = progress_tx {
+                            let elapsed_min = (idle.as_secs() / 60).max(1);
+                            let msg = format!("⏳ Still working… ({elapsed_min} min idle)");
+                            if let Err(e) = tx.send(msg) {
+                                warn!(
+                                    "Failed to enqueue progress notify on channel '{channel_name}': {e}"
+                                );
+                            }
+                        }
                     }
                 }
-                AgentEvent::ShellConfirmation { respond, command } => {
-                    warn!("Auto-denying shell confirmation in gateway mode: {command}");
-                    response_text
-                        .push_str("\n[Operation denied: shell command requires confirmation]");
-                    let _ = respond.send(false);
-                }
-                AgentEvent::UserInputRequest {
-                    respond, prompt, ..
-                } => {
-                    warn!("Auto-declining user input request in gateway mode: {prompt}");
-                    let _ = respond.send("[Not available in gateway mode]".to_string());
-                }
-                _ => {}
             }
         }
-    })
-    .await;
+    }
 
-    if collect_result.is_err() {
-        warn!("Agent timed out after {request_timeout:?} on channel '{channel_name}'");
+    if timed_out {
         agent_cancel.cancel();
         if response_text.is_empty() {
-            response_text = "(request timed out)".to_string();
+            response_text = "(request timed out — agent was idle too long)".to_string();
+        } else {
+            response_text.push_str("\n\n[Timed out — partial output above]");
         }
     }
 
     response_text
+}
+
+/// Returns true if an `AgentEvent` represents the agent making forward
+/// progress. Used to reset the inactivity timer in `collect_agent_response`.
+///
+/// `UserInputRequest` and `ShellConfirmation` are intentionally excluded:
+/// they mean the agent is *waiting on the user*, not working, so the
+/// inactivity timer should keep counting.
+fn event_is_activity(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::TextDelta(_)
+            | AgentEvent::ThinkingDelta(_)
+            | AgentEvent::ToolExecuting { .. }
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::ToolOutputDelta { .. }
+            | AgentEvent::Usage(_)
+            | AgentEvent::SubAgentUpdate { .. }
+            | AgentEvent::SteerReceived { .. }
+            | AgentEvent::PlanUpdated { .. }
+            | AgentEvent::Preparing
+            | AgentEvent::TurnComplete
+            | AgentEvent::HistoryCompacted { .. }
+    )
 }
 
 /// Check sender access and return an early response if denied or challenged.
@@ -703,6 +857,7 @@ async fn invoke_agent_inner(
     health: Option<&Arc<RwLock<ChannelHealthRegistry>>>,
     bot_identifier: Option<&str>,
     auto_reply_state: Option<&crate::auto_reply::SharedAutoReplyState>,
+    progress_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<(String, String)> {
     // Phase 1: Activity logging
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
@@ -851,8 +1006,14 @@ async fn invoke_agent_inner(
     };
 
     // Collect the full response text
-    let mut response_text =
-        collect_agent_response(channel_name, config, &mut event_rx, &agent_cancel).await;
+    let mut response_text = collect_agent_response(
+        channel_name,
+        config,
+        &mut event_rx,
+        &agent_cancel,
+        progress_tx.as_ref(),
+    )
+    .await;
 
     // Wait for agent to finish (with a short grace period after cancellation)
     match tokio::time::timeout(Duration::from_secs(5), agent_handle).await {
@@ -896,9 +1057,6 @@ async fn process_message(
 ) -> Result<String> {
     let channel_name = &channel.manifest.name;
 
-    let (response_text, _session_id) =
-        invoke_agent(channel_name, &inbound, config, health, None).await?;
-
     // Prepare auth tokens (resolve from credential store, falling back to env vars)
     let token = channel
         .manifest
@@ -917,8 +1075,78 @@ async fn process_message(
         .unwrap_or_default();
 
     let executor = ChannelExecutor::new(&channel.manifest, &channel.dir);
-    let blocked_paths = &config.security.blocked_paths;
+    let blocked_paths = config.security.blocked_paths.clone();
     let retry_policy = build_retry_policy(channel);
+
+    // Drive the agent and inline-forward in-turn progress messages
+    // ("still working…", inactivity warnings) on the same task. We can't
+    // spawn a separate forwarder because `ChannelExecutor` borrows from
+    // `channel`. `tokio::select!` interleaves draining progress sends with
+    // waiting on the agent.
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+    let invoke_fut = invoke_agent_with_auto_reply(
+        channel_name,
+        &inbound,
+        config,
+        health,
+        None,
+        None,
+        Some(progress_tx),
+    );
+    tokio::pin!(invoke_fut);
+    let invoke_result = loop {
+        tokio::select! {
+            biased;
+
+            result = &mut invoke_fut => break result,
+            maybe_msg = progress_rx.recv() => {
+                let Some(msg) = maybe_msg else { continue };
+                let mut payload = serde_json::json!({
+                    "text": msg,
+                    "sender_id": inbound.sender_id,
+                    "channel_id": inbound.channel_id,
+                    "progress": true,
+                });
+                payload["token"] = serde_json::json!(token);
+                payload["secret"] = serde_json::json!(secret);
+                let outbound_str = payload.to_string();
+                match retry::send_with_retry(
+                    &executor,
+                    &outbound_str,
+                    &blocked_paths,
+                    &retry_policy,
+                )
+                .await
+                {
+                    RetryOutcome::Success(_) => {
+                        info!("Progress notify sent on channel '{channel_name}'");
+                    }
+                    RetryOutcome::PermanentFailure(e) | RetryOutcome::Exhausted(e) => {
+                        warn!("Progress notify failed on channel '{channel_name}': {e}");
+                    }
+                }
+            }
+        }
+    };
+    // Drain any progress messages enqueued just before completion. They are
+    // best-effort status pings; if delivery fails we just log and move on.
+    while let Ok(msg) = progress_rx.try_recv() {
+        let mut payload = serde_json::json!({
+            "text": msg,
+            "sender_id": inbound.sender_id,
+            "channel_id": inbound.channel_id,
+            "progress": true,
+        });
+        payload["token"] = serde_json::json!(token);
+        payload["secret"] = serde_json::json!(secret);
+        let outbound_str = payload.to_string();
+        if let RetryOutcome::PermanentFailure(e) | RetryOutcome::Exhausted(e) =
+            retry::send_with_retry(&executor, &outbound_str, &blocked_paths, &retry_policy).await
+        {
+            warn!("Progress notify (drain) failed on channel '{channel_name}': {e}");
+        }
+    }
+    let (response_text, _session_id) = invoke_result?;
 
     // Chunk text if max_message_chars is configured
     let chunks = match channel.manifest.settings.max_message_chars {
@@ -965,7 +1193,8 @@ async fn process_message(
         }
 
         // Send with retry
-        match retry::send_with_retry(&executor, &outbound_str, blocked_paths, &retry_policy).await {
+        match retry::send_with_retry(&executor, &outbound_str, &blocked_paths, &retry_policy).await
+        {
             RetryOutcome::Success(_) => {
                 info!(
                     "Outbound sent for channel '{}' (chunk {}/{})",
@@ -1574,5 +1803,188 @@ mod tests {
             source.contains("format_error_with_context"),
             "Webhook dispatch must format timeout errors with context"
         );
+    }
+
+    // ── Inactivity-based timeout in collect_agent_response ──
+
+    fn test_config(
+        inactivity_secs: u64,
+        warning_secs: u64,
+        notify_secs: u64,
+        wall_clock_ms: u64,
+    ) -> Config {
+        let mut cfg = Config::default();
+        cfg.gateway.inactivity_timeout_secs = inactivity_secs;
+        cfg.gateway.inactivity_warning_secs = warning_secs;
+        cfg.gateway.inactivity_notify_secs = notify_secs;
+        cfg.gateway.request_timeout_ms = wall_clock_ms;
+        cfg
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_response_returns_text_on_turn_complete() {
+        let config = test_config(60, 0, 0, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+
+        tx.send(AgentEvent::TextDelta("hello ".to_string()))
+            .await
+            .unwrap();
+        tx.send(AgentEvent::TextDelta("world".to_string()))
+            .await
+            .unwrap();
+        tx.send(AgentEvent::TurnComplete).await.unwrap();
+        drop(tx);
+
+        let text = collect_agent_response("test", &config, &mut rx, &cancel, None).await;
+        assert_eq!(text, "hello world");
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_response_resets_inactivity_on_activity() {
+        // Inactivity timeout = 5s. Send activity every 2s for 12s, then go
+        // silent while keeping the channel open. The agent should NOT time
+        // out during the active window — proving the timer resets on each
+        // event — and only fire after silence begins.
+        let config = test_config(5, 0, 0, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(32);
+        let cancel = CancellationToken::new();
+
+        // Keep `tx` alive for the duration of the test so channel-close
+        // doesn't short-circuit the loop. The clone goes to the producer.
+        let producer_tx = tx.clone();
+        let producer = tokio::spawn(async move {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                producer_tx
+                    .send(AgentEvent::TextDelta(".".to_string()))
+                    .await
+                    .ok();
+            }
+            // Producer exits; outer `tx` keeps the channel open so the
+            // inactivity timer (not channel close) ends the loop.
+        });
+
+        let text = collect_agent_response("test", &config, &mut rx, &cancel, None).await;
+        producer.await.unwrap();
+        drop(tx);
+        // Six dots accumulated during the active window, then the timer
+        // fires once silence begins. Total elapsed is well past the 5s
+        // timeout, but it never tripped during the active period.
+        assert!(text.starts_with("......"), "got: {text:?}");
+        assert!(text.contains("Timed out"), "got: {text:?}");
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_response_fires_inactivity_timeout_when_silent() {
+        let config = test_config(3, 0, 0, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+
+        // Send one event then go silent; timer should fire ~3s later.
+        tx.send(AgentEvent::TextDelta("partial".to_string()))
+            .await
+            .unwrap();
+        // Hold the sender open so the channel doesn't close (which would
+        // exit the loop early). Drop after the test asserts.
+        let _hold = tx;
+
+        let text = collect_agent_response("test", &config, &mut rx, &cancel, None).await;
+        assert!(text.starts_with("partial"));
+        assert!(text.contains("Timed out"));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_response_emits_progress_notify() {
+        // Inactivity timeout 30s, notify every 5s. After ~6s of silence we
+        // should see one "Still working…" message land on the progress
+        // channel; warning is disabled so it does not preempt notify.
+        let config = test_config(30, 0, 5, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+
+        // Send one delta to seed activity, then hold the channel open and
+        // schedule a TurnComplete after ~7s so the loop exits cleanly.
+        tx.send(AgentEvent::TextDelta("ok".to_string()))
+            .await
+            .unwrap();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+            tx.send(AgentEvent::TurnComplete).await.ok();
+        });
+
+        let text =
+            collect_agent_response("test", &config, &mut rx, &cancel, Some(&progress_tx)).await;
+        producer.await.unwrap();
+        drop(progress_tx);
+
+        assert_eq!(text, "ok");
+        let mut notifies = Vec::new();
+        while let Ok(m) = progress_rx.try_recv() {
+            notifies.push(m);
+        }
+        assert!(
+            notifies.iter().any(|m| m.contains("Still working")),
+            "expected at least one 'Still working' message, got {notifies:?}"
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn collect_response_emits_inactivity_warning_once() {
+        // Inactivity 60s, warning at 4s. After ~5s of silence we should
+        // see exactly one warning message. Then the loop is allowed to exit
+        // via TurnComplete before the final timeout fires.
+        let config = test_config(60, 4, 0, 600_000);
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+        let cancel = CancellationToken::new();
+
+        tx.send(AgentEvent::TextDelta("seed".to_string()))
+            .await
+            .unwrap();
+        let producer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            tx.send(AgentEvent::TurnComplete).await.ok();
+        });
+
+        let _ = collect_agent_response("test", &config, &mut rx, &cancel, Some(&progress_tx)).await;
+        producer.await.unwrap();
+        drop(progress_tx);
+
+        let mut warnings = Vec::new();
+        while let Ok(m) = progress_rx.try_recv() {
+            if m.contains("No agent activity") {
+                warnings.push(m);
+            }
+        }
+        assert_eq!(warnings.len(), 1, "expected one warning, got {warnings:?}");
+    }
+
+    #[test]
+    fn event_is_activity_excludes_user_input_and_shell() {
+        let (txb, _rxb) = tokio::sync::oneshot::channel::<bool>();
+        let (txs, _rxs) = tokio::sync::oneshot::channel::<String>();
+        assert!(!event_is_activity(&AgentEvent::ShellConfirmation {
+            command: "ls".into(),
+            respond: txb,
+        }));
+        assert!(!event_is_activity(&AgentEvent::UserInputRequest {
+            prompt: "ok?".into(),
+            choices: Vec::new(),
+            allow_custom: true,
+            respond: txs,
+        }));
+        assert!(event_is_activity(&AgentEvent::TextDelta("x".into())));
+        assert!(event_is_activity(&AgentEvent::TurnComplete));
+        assert!(event_is_activity(&AgentEvent::Preparing));
+        assert!(event_is_activity(&AgentEvent::ToolExecuting {
+            name: "n".into(),
+            args: "{}".into(),
+        }));
     }
 }

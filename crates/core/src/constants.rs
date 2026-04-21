@@ -311,7 +311,9 @@ pub const DEFAULT_LLM_INITIAL_RETRY_DELAY_MS: u64 = 200;
 pub const DEFAULT_LLM_REQUEST_TIMEOUT_MS: u64 = 120_000;
 
 /// Default per-chunk SSE timeout (seconds) while streaming.
-pub const DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS: u64 = 30;
+/// Thinking-capable models routinely pause >30s between chunks during reasoning,
+/// so the default is generous; the inactivity timer (gateway) is the higher-level guard.
+pub const DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
 
 /// Default LLM provider env var name (OpenRouter has the broadest model coverage).
 pub const DEFAULT_LLM_API_KEY_ENV: &str = "OPENROUTER_API_KEY";

@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.initial_retry_delay_ms, 200);
         assert_eq!(cfg.request_timeout_ms, 120_000);
-        assert_eq!(cfg.stream_chunk_timeout_secs, 30);
+        assert_eq!(cfg.stream_chunk_timeout_secs, 90);
         assert!(cfg.base_url.is_none());
         assert!(cfg.fallback.is_empty());
         assert_eq!(cfg.thinking, ThinkingLevel::Off);

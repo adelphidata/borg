@@ -176,6 +176,15 @@ fn apply_binding_overrides(config: &mut Config, binding: &GatewayBinding) {
     if let Some(timeout) = binding.stream_chunk_timeout_secs {
         config.llm.stream_chunk_timeout_secs = timeout;
     }
+    if let Some(secs) = binding.inactivity_timeout_secs {
+        config.gateway.inactivity_timeout_secs = secs;
+    }
+    if let Some(secs) = binding.inactivity_warning_secs {
+        config.gateway.inactivity_warning_secs = secs;
+    }
+    if let Some(secs) = binding.inactivity_notify_secs {
+        config.gateway.inactivity_notify_secs = secs;
+    }
     // Ensure gateway timeout is at least as large as LLM request timeout
     // to prevent the gateway timer from cancelling mid-request.
     if config.gateway.request_timeout_ms < config.llm.request_timeout_ms {
@@ -250,6 +259,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -280,6 +292,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "slack", "U12345678", None);
@@ -307,6 +322,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "discord", "user1", Some("group"));
@@ -335,6 +353,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
         // Tier 2: channel+sender
         config.gateway.bindings.push(GatewayBinding {
@@ -354,6 +375,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -382,6 +406,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -408,6 +435,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
         config.gateway.bindings.push(GatewayBinding {
             channel: "telegram".to_string(),
@@ -426,6 +456,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -452,6 +485,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -479,6 +515,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -506,6 +545,9 @@ mod tests {
             request_timeout_ms: None,
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -539,6 +581,9 @@ mod tests {
             request_timeout_ms: Some(300_000),
             gateway_timeout_ms: Some(360_000),
             stream_chunk_timeout_secs: Some(120),
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
@@ -549,7 +594,12 @@ mod tests {
 
     #[test]
     fn gateway_timeout_auto_bumped_to_match_llm_timeout() {
+        // The gateway default is generous (30 min), so to exercise the
+        // auto-bump rule we explicitly set a small gateway base timeout
+        // and a larger per-binding LLM timeout. The route should bump
+        // gateway back up to match LLM.
         let mut config = Config::default();
+        config.gateway.request_timeout_ms = 60_000;
         config.gateway.bindings.push(GatewayBinding {
             channel: "telegram".to_string(),
             sender: None,
@@ -567,11 +617,13 @@ mod tests {
             request_timeout_ms: Some(300_000),
             gateway_timeout_ms: None,
             stream_chunk_timeout_secs: None,
+            inactivity_timeout_secs: None,
+            inactivity_warning_secs: None,
+            inactivity_notify_secs: None,
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
         assert_eq!(route.config.llm.request_timeout_ms, 300_000);
-        // Gateway timeout should be bumped from 120s default to 300s
         assert_eq!(route.config.gateway.request_timeout_ms, 300_000);
     }
 }
