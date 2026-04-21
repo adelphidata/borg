@@ -7,8 +7,11 @@ afternoons.
 
 ## The daily maintenance task
 
-A scheduled task with `task_type = 'maintenance'` fires at **02:00 local
-time** every day (seeded in V37, id `00000000-0000-4000-8000-ada1ca1e0001`).
+A scheduled task with `task_type = 'maintenance'` fires at **02:00 UTC**
+every day (cron `0 0 2 * * *`, seeded in V37, id
+`00000000-0000-4000-8000-ada1ca1e0001`). All seeded cron schedules are
+evaluated in UTC regardless of the `timezone` column on the row — that
+column is display-only today.
 Unlike prompt/command tasks, it **does not invoke the LLM** — the task
 dispatcher calls `borg_core::maintenance::run_daily_maintenance` directly.
 That means it keeps running even when no provider key is configured and

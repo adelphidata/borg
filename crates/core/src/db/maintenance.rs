@@ -57,10 +57,4 @@ impl Database {
         )?;
         Ok(deleted)
     }
-
-    /// Count stalled scheduled tasks auto-healed within the last
-    /// `window_secs` seconds — surfaced by `borg doctor` / `/status`.
-    pub fn count_healed_tasks_since(&self, since_ts: i64) -> Result<i64> {
-        self.count_missed_runs_since(since_ts)
-    }
 }

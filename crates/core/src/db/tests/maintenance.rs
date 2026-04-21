@@ -61,6 +61,20 @@ fn find_stalled_tasks_returns_overdue_recurring_only() {
     ))
     .unwrap();
 
+    // Overdue recurring task that's already in retry backoff — excluded
+    // so we don't double-handle what the retry loop is already managing.
+    db.create_task(&simple_task(
+        "in-retry",
+        "retrying",
+        "prompt",
+        "cron",
+        "0 0 * * * *",
+        Some(long_ago),
+    ))
+    .unwrap();
+    db.set_task_retry("in-retry", 1, "simulated retry", now + 300)
+        .unwrap();
+
     let stalled = db
         .find_stalled_tasks(now, 3600)
         .expect("find_stalled_tasks");
@@ -68,6 +82,10 @@ fn find_stalled_tasks_returns_overdue_recurring_only() {
     assert!(ids.contains(&"stalled-1"), "overdue cron must be stalled");
     assert!(!ids.contains(&"oneshot"), "once-tasks must be excluded");
     assert!(!ids.contains(&"future"), "future task must not be stalled");
+    assert!(
+        !ids.contains(&"in-retry"),
+        "tasks with retry_after set must be excluded"
+    );
 }
 
 #[test]
@@ -115,6 +133,7 @@ fn record_and_latest_doctor_run_roundtrip() {
         embeddings_pruned: 0,
         stalled_tasks_healed: 0,
         persistent_warnings: vec!["Gateway:reachable".into()],
+        current_issues: vec!["Gateway:reachable".into()],
         check_summary: vec!["  ⚠ Gateway:reachable — down".into()],
     };
     db.record_doctor_run(&report).expect("record");

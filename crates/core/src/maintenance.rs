@@ -43,8 +43,14 @@ pub struct MaintenanceReport {
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
-    /// Doctor checks persisted across runs.
+    /// Doctor checks persisted across runs (subset of `current_issues`
+    /// that were also issues in the previous run).
     pub persistent_warnings: Vec<String>,
+    /// Every Warn/Fail check this run, keyed `"Category:Name"`. Used as
+    /// the structured input to persistent-warning detection on the next
+    /// sweep — do not format for display, the text lives in `check_summary`.
+    #[serde(default)]
+    pub current_issues: Vec<String>,
     /// Raw check lines (formatted) for display.
     pub check_summary: Vec<String>,
 }
@@ -127,7 +133,13 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     // 6. Compare against the previous run — warnings that persist across
     //    two consecutive sweeps are escalated. A single flaky run doesn't
     //    page the user.
-    report.persistent_warnings = compute_persistent_warnings(db, &diag.checks);
+    report.current_issues = diag
+        .checks
+        .iter()
+        .filter(|c| !matches!(c.status, CheckStatus::Pass))
+        .map(|c| format!("{}:{}", c.category, c.name))
+        .collect();
+    report.persistent_warnings = compute_persistent_warnings(db, &report.current_issues);
 
     // 7. Persist the run (best-effort; losing the audit row must not
     //    block the sweep).
@@ -172,44 +184,25 @@ fn prune_log_files(dir: &Path, cutoff: i64) -> Result<usize> {
     Ok(deleted)
 }
 
-/// Return the subset of current Warn/Fail checks that were ALSO Warn/Fail
-/// in the most recent prior doctor_runs row. Transient warnings that only
-/// appeared on this run are excluded — the point is to surface nags, not
-/// flukes.
-fn compute_persistent_warnings(db: &Database, current: &[DiagnosticCheck]) -> Vec<String> {
-    let current_issues: Vec<String> = current
-        .iter()
-        .filter(|c| !matches!(c.status, CheckStatus::Pass))
-        .map(|c| format!("{}:{}", c.category, c.name))
-        .collect();
+/// Return the subset of current Warn/Fail issues that were ALSO present
+/// in the most recent prior `doctor_runs` row. Transient warnings that
+/// only appeared on this run are excluded — the point is to surface
+/// nags, not flukes.
+///
+/// Compares structured `"Category:Name"` keys directly; no text parsing.
+fn compute_persistent_warnings(db: &Database, current_issues: &[String]) -> Vec<String> {
     if current_issues.is_empty() {
         return Vec::new();
     }
     let Ok(Some(prior)) = db.latest_doctor_run() else {
         return Vec::new();
     };
-    let prior_set: std::collections::HashSet<&str> = prior
-        .persistent_warnings
-        .iter()
-        .map(String::as_str)
-        .collect();
-    // First run sees an empty prior_set; we also want to compare against
-    // the prior run's *full* warn set, not just its persistent subset.
-    // The DB row stores the full check_summary so we can recover both.
-    let prior_issues: std::collections::HashSet<String> = prior
-        .check_summary
-        .iter()
-        .filter(|line| line.starts_with("  ⚠") || line.starts_with("  ✗"))
-        .map(|line| {
-            line.trim_start_matches(|c: char| !c.is_alphanumeric())
-                .to_string()
-        })
-        .collect();
+    let prior_set: std::collections::HashSet<&str> =
+        prior.current_issues.iter().map(String::as_str).collect();
     current_issues
-        .into_iter()
-        .filter(|issue| {
-            prior_set.contains(issue.as_str()) || prior_issues.iter().any(|p| p.contains(issue))
-        })
+        .iter()
+        .filter(|issue| prior_set.contains(issue.as_str()))
+        .cloned()
         .collect()
 }
 

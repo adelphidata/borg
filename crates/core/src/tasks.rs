@@ -195,12 +195,25 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
                 report.reset += 1;
             }
             Err(e) => {
-                tracing::warn!(
-                    task_id = %task.id,
-                    task_name = %task.name,
-                    error = %e,
-                    "could not recompute next_run for stalled task"
-                );
+                // Pause the task so we stop re-flagging it every 5 minutes
+                // forever. A bad schedule_expr that passed validation at
+                // insert time but errors now (corrupted row, library bump)
+                // should fail loud in the UI, not spam task_runs.
+                if let Err(se) = db.update_task_status(&task.id, TASK_STATUS_PAUSED) {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        task_name = %task.name,
+                        error = %se,
+                        "failed to pause stalled task with invalid schedule"
+                    );
+                } else {
+                    tracing::error!(
+                        task_id = %task.id,
+                        task_name = %task.name,
+                        error = %e,
+                        "paused task — schedule_expr no longer valid, cannot recompute next_run"
+                    );
+                }
             }
         }
     }

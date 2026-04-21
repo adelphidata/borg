@@ -759,31 +759,44 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     .await;
 
     let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
-    match result {
+    let (status, summary, error_msg) = match result {
         Ok(Ok(report)) => {
             let summary = report.activity_line();
-            if let Ok(db) = borg_core::db::Database::open() {
-                let _ = db.complete_task_run(*run_id, duration_ms, Some(&summary), None);
-                let _ = db.clear_task_retry(task_id);
-                borg_core::activity_log::log_activity(&db, "info", "task", &summary);
-            }
             tracing::info!("Maintenance task '{task_name}' completed: {summary}");
+            ("info", Some(summary), None)
         }
         Ok(Err(e)) => {
             let msg = format!("maintenance sweep failed: {e}");
-            if let Ok(db) = borg_core::db::Database::open() {
-                let _ = db.complete_task_run(*run_id, duration_ms, None, Some(&msg));
-                borg_core::activity_log::log_activity(&db, "error", "task", &msg);
-            }
             tracing::warn!("Maintenance task '{task_name}' failed: {e}");
+            ("error", None, Some(msg))
         }
         Err(join_err) => {
             let msg = format!("maintenance task panicked: {join_err}");
-            if let Ok(db) = borg_core::db::Database::open() {
-                let _ = db.complete_task_run(*run_id, duration_ms, None, Some(&msg));
-                borg_core::activity_log::log_activity(&db, "error", "task", &msg);
-            }
             tracing::error!("{msg}");
+            ("error", None, Some(msg))
+        }
+    };
+
+    match borg_core::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(
+                *run_id,
+                duration_ms,
+                summary.as_deref(),
+                error_msg.as_deref(),
+            ) {
+                tracing::warn!("maintenance: failed to finalize task_runs row {run_id}: {e}");
+            }
+            if error_msg.is_none() {
+                if let Err(e) = db.clear_task_retry(task_id) {
+                    tracing::warn!("maintenance: failed to clear retry for {task_id}: {e}");
+                }
+            }
+            let line = summary.as_deref().or(error_msg.as_deref()).unwrap_or("");
+            borg_core::activity_log::log_activity(&db, status, "task", line);
+        }
+        Err(e) => {
+            tracing::warn!("maintenance: could not reopen db to record task_runs completion: {e}");
         }
     }
 }
