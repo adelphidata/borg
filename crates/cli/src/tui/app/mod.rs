@@ -84,9 +84,19 @@ pub enum AppState {
     AwaitingApproval {
         respond: Option<oneshot::Sender<bool>>,
     },
-    /// Agent has asked a question mid-turn via `request_user_input`; waiting for user to type.
+    /// Agent has asked a question mid-turn via `request_user_input`; waiting for user to
+    /// either type a response or pick from `choices`.
+    ///
+    /// When `choices` is non-empty and `custom_mode` is `false`, the UI renders a selectable
+    /// list; Up/Down (or j/k) move `cursor`, 1..=9 jump to an index, Enter sends
+    /// `choices[cursor].label`. Tab (when `allow_custom`) toggles into free-text mode.
+    /// When `choices` is empty, behavior is free-text only.
     AwaitingInput {
         prompt: String,
+        choices: Vec<borg_core::tool_handlers::user_input::UserInputChoice>,
+        cursor: usize,
+        custom_mode: bool,
+        allow_custom: bool,
         respond: Option<oneshot::Sender<String>>,
     },
     PlanReview,
@@ -2459,5 +2469,169 @@ mod tests {
             .iter()
             .any(|c| matches!(c, HistoryCell::System { text } if text.contains("Usage: /model")));
         assert!(has_usage, "malformed /model should show usage hint");
+    }
+
+    // ========================================================================
+    // request_user_input with `choices` — selection mode key handling.
+    // Guards the contract that Up/Down move cursor, number keys quick-pick,
+    // Enter submits the selected label, Tab toggles free-text (when allowed),
+    // and Esc routes correctly depending on mode.
+    // ========================================================================
+
+    use borg_core::tool_handlers::user_input::UserInputChoice;
+
+    fn seed_awaiting_with_choices(
+        app: &mut App<'_>,
+        labels: &[&str],
+        allow_custom: bool,
+    ) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel::<String>();
+        let choices: Vec<UserInputChoice> = labels
+            .iter()
+            .map(|l| UserInputChoice {
+                label: (*l).to_string(),
+                description: None,
+            })
+            .collect();
+        app.state = AppState::AwaitingInput {
+            prompt: "pick one".to_string(),
+            choices,
+            cursor: 0,
+            custom_mode: false,
+            allow_custom,
+            respond: Some(tx),
+        };
+        rx
+    }
+
+    #[test]
+    fn choices_down_then_enter_submits_second_label() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let answer = rx.try_recv().expect("response sent");
+        assert_eq!(answer, "bravo");
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+    }
+
+    #[test]
+    fn choices_up_from_zero_wraps_to_last() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo", "charlie"], true);
+
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "charlie");
+    }
+
+    #[test]
+    fn choices_number_key_quick_selects() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo", "charlie"], true);
+
+        // '2' should submit the second option immediately, no Enter required.
+        app.handle_key(key(KeyCode::Char('2'))).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "bravo");
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+    }
+
+    #[test]
+    fn choices_number_key_out_of_range_is_noop() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+
+        app.handle_key(key(KeyCode::Char('5'))).unwrap();
+
+        assert!(rx.try_recv().is_err(), "no response should be sent");
+        assert!(
+            matches!(app.state, AppState::AwaitingInput { .. }),
+            "should remain in AwaitingInput"
+        );
+    }
+
+    #[test]
+    fn choices_tab_toggles_custom_mode_when_allowed() {
+        let mut app = make_app();
+        let _rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+
+        match &app.state {
+            AppState::AwaitingInput { custom_mode, .. } => assert!(*custom_mode),
+            _ => panic!("expected AwaitingInput"),
+        }
+    }
+
+    #[test]
+    fn choices_tab_ignored_when_custom_disallowed() {
+        let mut app = make_app();
+        let _rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], false);
+
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+
+        match &app.state {
+            AppState::AwaitingInput { custom_mode, .. } => {
+                assert!(!custom_mode, "Tab must be a no-op when allow_custom=false");
+            }
+            _ => panic!("expected AwaitingInput"),
+        }
+    }
+
+    #[test]
+    fn custom_mode_esc_returns_to_selection_not_decline() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        // Now in custom_mode.
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+
+        // Must not decline — just flip back to selection mode.
+        assert!(rx.try_recv().is_err());
+        match &app.state {
+            AppState::AwaitingInput { custom_mode, .. } => assert!(!*custom_mode),
+            _ => panic!("expected AwaitingInput"),
+        }
+    }
+
+    #[test]
+    fn choices_esc_declines_and_returns_to_streaming() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "[user declined to answer]");
+        assert!(matches!(app.state, AppState::Streaming { .. }));
+    }
+
+    #[test]
+    fn choices_enter_at_cursor_zero_submits_first_label() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "alpha");
+    }
+
+    #[test]
+    fn custom_mode_typed_answer_is_sent_on_enter() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+
+        // Seed the composer directly to avoid tripping the paste-burst detector,
+        // which buffers rapid single-char KeyEvents in tests.
+        app.composer.set_text("custom");
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), "custom");
+        assert!(matches!(app.state, AppState::Streaming { .. }));
     }
 }

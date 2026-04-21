@@ -626,7 +626,9 @@ async fn collect_agent_response(
                         .push_str("\n[Operation denied: shell command requires confirmation]");
                     let _ = respond.send(false);
                 }
-                AgentEvent::UserInputRequest { respond, prompt } => {
+                AgentEvent::UserInputRequest {
+                    respond, prompt, ..
+                } => {
                     warn!("Auto-declining user input request in gateway mode: {prompt}");
                     let _ = respond.send("[Not available in gateway mode]".to_string());
                 }

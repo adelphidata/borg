@@ -26,6 +26,7 @@ impl<'a> App<'a> {
             self.render_queue_preview(frame, app_layout.queue_preview);
         }
         self.composer.render(frame, app_layout.composer);
+        self.render_choices_overlay(frame, app_layout.composer);
         self.render_footer(frame, app_layout.footer);
         self.plan_overlay.render(frame, app_layout.composer);
         self.command_popup.render(frame, app_layout.composer);
@@ -198,13 +199,21 @@ impl<'a> App<'a> {
                 format!(" {} Approval needed — press y or n", theme::BULLET),
                 theme::error_style(),
             )]),
-            AppState::AwaitingInput { .. } => Line::from(vec![Span::styled(
-                format!(
-                    " {} Agent needs your input — type and press enter",
-                    theme::BULLET
-                ),
-                theme::tool_style(),
-            )]),
+            AppState::AwaitingInput {
+                choices,
+                custom_mode,
+                ..
+            } => {
+                let msg = if !choices.is_empty() && !custom_mode {
+                    format!(" {} Agent needs your input — pick an option", theme::BULLET)
+                } else {
+                    format!(
+                        " {} Agent needs your input — type and press enter",
+                        theme::BULLET
+                    )
+                };
+                Line::from(vec![Span::styled(msg, theme::tool_style())])
+            }
             AppState::PlanReview => Line::from(vec![Span::styled(
                 format!(" {} Plan ready — choose an action", theme::BULLET),
                 theme::tool_style(),
@@ -276,8 +285,30 @@ impl<'a> App<'a> {
                 }
             }
             AppState::AwaitingApproval { .. } => "y to approve  •  n to deny".to_string(),
-            AppState::AwaitingInput { prompt, .. } => {
-                format!("type your answer  •  enter to send  •  esc to skip  [{prompt}]")
+            AppState::AwaitingInput {
+                prompt,
+                choices,
+                custom_mode,
+                allow_custom,
+                ..
+            } => {
+                if !choices.is_empty() && !*custom_mode {
+                    let tab_hint = if *allow_custom {
+                        "  •  tab to type answer"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "↑/↓ select  •  1–{} quick pick  •  enter to confirm{tab_hint}  •  esc to skip  [{prompt}]",
+                        choices.len().min(9)
+                    )
+                } else if !choices.is_empty() && *custom_mode {
+                    format!(
+                        "type your answer  •  enter to send  •  esc back to options  [{prompt}]"
+                    )
+                } else {
+                    format!("type your answer  •  enter to send  •  esc to skip  [{prompt}]")
+                }
             }
             AppState::PlanReview => {
                 "shift+tab: cycle  •  1-3: jump  •  enter: confirm  •  esc: dismiss".to_string()
@@ -313,6 +344,55 @@ impl<'a> App<'a> {
         let overflow = if count > 3 { 1u16 } else { 0 };
         // header + shown messages + overflow + hint
         1 + shown + overflow + 1
+    }
+
+    /// Overlay a selectable choice list on top of the composer area when the
+    /// agent has asked `request_user_input` with `choices` and the user hasn't
+    /// switched to free-text (custom) mode. A `Clear` widget hides the composer
+    /// underneath so the options are the focal point.
+    fn render_choices_overlay(&self, frame: &mut Frame, area: Rect) {
+        let AppState::AwaitingInput {
+            choices,
+            cursor,
+            custom_mode,
+            ..
+        } = &self.state
+        else {
+            return;
+        };
+        if choices.is_empty() || *custom_mode {
+            return;
+        }
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(choices.len());
+        for (i, c) in choices.iter().enumerate() {
+            let selected = i == *cursor;
+            let marker = if selected { "▌ " } else { "  " };
+            let number = format!("{}. ", i + 1);
+            let base_style = if selected {
+                theme::tool_style().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![
+                Span::styled(marker.to_string(), base_style),
+                Span::styled(number, theme::dim()),
+                Span::styled(c.label.clone(), base_style),
+            ];
+            if let Some(desc) = c.description.as_deref() {
+                spans.push(Span::styled(format!("  — {desc}"), theme::dim()));
+            }
+            lines.push(Line::from(spans));
+        }
+        let needed = lines.len() as u16;
+        let h = needed.min(area.height);
+        let overlay = Rect {
+            x: area.x,
+            y: area.y + area.height.saturating_sub(h),
+            width: area.width,
+            height: h,
+        };
+        frame.render_widget(Clear, overlay);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), overlay);
     }
 
     fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {

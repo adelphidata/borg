@@ -575,6 +575,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn setup_instructs_choices_for_channels_and_timezone() {
+        // Regression guard: the first-boot template must tell the agent to use
+        // `request_user_input` with `choices` for the two enumerable onboarding
+        // topics (messaging channels, timezone). This is the contract that
+        // drives the selectable-answer UX on first launch — if it gets rewritten
+        // as free-text guidance, onboarding silently regresses.
+        let setup = generate_setup("Borg", "Dave").to_lowercase();
+        assert!(
+            setup.contains("request_user_input"),
+            "SETUP.md must reference the request_user_input tool"
+        );
+        assert!(
+            setup.contains("choices"),
+            "SETUP.md must instruct using `choices`"
+        );
+        assert!(
+            setup.contains("channels") && setup.contains("timezone"),
+            "SETUP.md must cover both channels and timezone as choice-driven topics"
+        );
+    }
+
+    #[test]
     fn generate_setup_replaces_all_placeholders() {
         // Regression guard: if a new `{placeholder}` is added to the template
         // and the generator isn't updated, the raw token leaks to the user.

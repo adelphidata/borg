@@ -240,21 +240,75 @@ impl<'a> App<'a> {
 
     fn handle_key_awaiting_input(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
         use crossterm::event::{KeyCode, KeyModifiers};
-        if let AppState::AwaitingInput { respond, .. } = &mut self.state {
+        let AppState::AwaitingInput {
+            respond,
+            choices,
+            cursor,
+            custom_mode,
+            allow_custom,
+            ..
+        } = &mut self.state
+        else {
+            return Ok(AppAction::Continue);
+        };
+
+        // Ctrl+C always cancels, regardless of mode.
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(tx) = respond.take() {
+                let _ = tx.send("[user declined to answer]".to_string());
+            }
+            if let Some(token) = self.cancel_token.take() {
+                token.cancel();
+            }
+            self.event_rx = None;
+            self.steer_tx = None;
+            self.composer.set_text("");
+            self.cells.push(HistoryCell::System {
+                text: "[interrupted]".to_string(),
+            });
+            self.state = AppState::Idle;
+            return Ok(AppAction::Continue);
+        }
+
+        if !*custom_mode && !choices.is_empty() {
+            // Selection mode.
+            let n = choices.len();
             match key.code {
-                KeyCode::Enter => {
-                    let text = self.composer.text().trim().to_string();
-                    if text.is_empty() {
-                        // Don't send empty responses — user must type something or press Esc
-                        return Ok(AppAction::Continue);
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *cursor = if *cursor == 0 { n - 1 } else { *cursor - 1 };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *cursor = (*cursor + 1) % n;
+                }
+                KeyCode::Char(c @ '1'..='9') => {
+                    let idx = (c as u8 - b'1') as usize;
+                    if idx < n {
+                        *cursor = idx;
+                        // Submit immediately on digit press for quick selection.
+                        let label = choices[idx].label.clone();
+                        if let Some(tx) = respond.take() {
+                            let _ = tx.send(label);
+                        }
+                        self.composer.set_text("");
+                        self.state = AppState::Streaming {
+                            start: Instant::now(),
+                        };
                     }
+                }
+                KeyCode::Enter => {
+                    let label = choices[*cursor].label.clone();
                     if let Some(tx) = respond.take() {
-                        let _ = tx.send(text);
+                        let _ = tx.send(label);
                     }
                     self.composer.set_text("");
                     self.state = AppState::Streaming {
                         start: Instant::now(),
                     };
+                }
+                KeyCode::Tab => {
+                    if *allow_custom {
+                        *custom_mode = true;
+                    }
                 }
                 KeyCode::Esc => {
                     if let Some(tx) = respond.take() {
@@ -265,25 +319,45 @@ impl<'a> App<'a> {
                         start: Instant::now(),
                     };
                 }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl+C: decline and cancel turn
+                _ => {}
+            }
+            return Ok(AppAction::Continue);
+        }
+
+        // Free-text / custom mode.
+        match key.code {
+            KeyCode::Enter => {
+                let text = self.composer.text().trim().to_string();
+                if text.is_empty() {
+                    // Don't send empty responses — user must type something or press Esc
+                    return Ok(AppAction::Continue);
+                }
+                if let Some(tx) = respond.take() {
+                    let _ = tx.send(text);
+                }
+                self.composer.set_text("");
+                self.state = AppState::Streaming {
+                    start: Instant::now(),
+                };
+            }
+            KeyCode::Esc => {
+                // If in custom_mode with choices available, Esc returns to selection mode
+                // rather than declining, so the user can back out of a typed-answer detour.
+                if *custom_mode && !choices.is_empty() {
+                    *custom_mode = false;
+                    self.composer.set_text("");
+                } else {
                     if let Some(tx) = respond.take() {
                         let _ = tx.send("[user declined to answer]".to_string());
                     }
-                    if let Some(token) = self.cancel_token.take() {
-                        token.cancel();
-                    }
-                    self.event_rx = None;
-                    self.steer_tx = None;
                     self.composer.set_text("");
-                    self.cells.push(HistoryCell::System {
-                        text: "[interrupted]".to_string(),
-                    });
-                    self.state = AppState::Idle;
+                    self.state = AppState::Streaming {
+                        start: Instant::now(),
+                    };
                 }
-                _ => {
-                    self.composer.handle_key(key);
-                }
+            }
+            _ => {
+                self.composer.handle_key(key);
             }
         }
         Ok(AppAction::Continue)

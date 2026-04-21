@@ -159,8 +159,15 @@ pub enum AgentEvent {
     /// The agent's plan has been updated (structured step tracking).
     PlanUpdated { steps: Vec<crate::types::PlanStep> },
     /// The agent is requesting user input mid-turn. Send the user's response via the channel.
+    ///
+    /// When `choices` is non-empty, the UI should render a selectable list; the selected
+    /// label is what gets sent back through `respond`. `allow_custom` allows falling back
+    /// to free-text entry (the TUI uses Tab to toggle). When `choices` is empty, behavior
+    /// is free-text only.
     UserInputRequest {
         prompt: String,
+        choices: Vec<crate::tool_handlers::user_input::UserInputChoice>,
+        allow_custom: bool,
         respond: oneshot::Sender<String>,
     },
     /// Emitted between tool result and next LLM stream to indicate preparation work.

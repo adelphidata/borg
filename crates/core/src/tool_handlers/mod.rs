@@ -6,7 +6,7 @@ mod projects;
 mod schedule;
 mod scripts;
 mod shell;
-mod user_input;
+pub mod user_input;
 mod web;
 
 use anyhow::Result;

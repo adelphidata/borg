@@ -136,11 +136,27 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     // Request user input — always available (disabled at gateway level)
     defs.push(ToolDefinition::new(
         tool_names::REQUEST_USER_INPUT,
-        "Ask the user a question and wait for their response. Use when you need clarification or a decision before proceeding. Do not use for routine confirmations — only when genuinely blocked.",
+        "Ask the user a question and wait for their response. Use when you need clarification or a decision before proceeding. Do not use for routine confirmations — only when genuinely blocked. Provide 'choices' when the expected answer is one of a small enumerated set (2–9 options) so the user can pick instead of typing; omit 'choices' for open questions.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "prompt": { "type": "string", "description": "The question to ask the user" }
+                "prompt": { "type": "string", "description": "The question to ask the user" },
+                "choices": {
+                    "type": "array",
+                    "description": "Optional candidate answers. When provided, the user picks one and its label is returned. Provide 2–9 options.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": { "type": "string", "description": "Shown to the user and returned as the answer" },
+                            "description": { "type": "string", "description": "Optional short hint shown next to the label" }
+                        },
+                        "required": ["label"]
+                    }
+                },
+                "allow_custom": {
+                    "type": "boolean",
+                    "description": "When 'choices' is provided, allow the user to type a free-text answer instead (default: true)."
+                }
             },
             "required": ["prompt"]
         }),

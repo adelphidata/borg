@@ -27,3 +27,6 @@ Thumbs.db
 # Internal specs (local only)
 /docs/specs/
 /docs/spec/
+
+# Claude Code local hooks
+/.claude/hooks/
