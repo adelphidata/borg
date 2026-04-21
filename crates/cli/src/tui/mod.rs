@@ -177,6 +177,25 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
 
 /// Restart the gateway: if a daemon owns the port, signal it via HTTP;
 /// otherwise cancel the local token and respawn in-process.
+/// Build the user-facing post-install message for a plugin.
+///
+/// Channel plugins get an extra line explaining the pairing workflow: the user
+/// must DM the bot first so a pairing code is generated, then approve it in
+/// the TUI. The gateway-restart outcome is intentionally NOT included here —
+/// it is logged separately for debugging.
+fn build_post_install_message(plugin_name: &str, notes: &[String], is_channel: bool) -> String {
+    let mut msg = format!("Installed {plugin_name}");
+    for note in notes {
+        msg.push_str(&format!("\n  {note}"));
+    }
+    if is_channel {
+        msg.push_str(&format!(
+            "\n  Send a message to the bot on {plugin_name} to get your pairing code, then run: /pairing approve <CODE>"
+        ));
+    }
+    msg
+}
+
 async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
     // Try to signal a running daemon's gateway first
     let config = match Config::load_from_db() {
@@ -955,18 +974,20 @@ async fn run_event_loop(
                                             }
                                         }
 
-                                        let mut msg = format!("Installed {}", def.name);
-                                        for note in &install_result.notes {
-                                            msg.push_str(&format!("\n  {note}"));
-                                        }
-                                        if def.kind == borg_plugins::PluginKind::Channel {
+                                        let is_channel =
+                                            def.kind == borg_plugins::PluginKind::Channel;
+                                        if is_channel {
                                             let gw_msg = restart_gateway(gateway_shutdown).await;
-                                            msg.push_str(&format!("\n  {gw_msg}"));
-                                            msg.push_str(
-                                                "\n  Approve senders with: /pairing approve <CODE>",
+                                            tracing::info!(
+                                                "Gateway restart after installing {}: {gw_msg}",
+                                                def.name
                                             );
                                         }
-                                        results.push(msg);
+                                        results.push(build_post_install_message(
+                                            def.name,
+                                            &install_result.notes,
+                                            is_channel,
+                                        ));
                                     }
                                     Err(e) => {
                                         results
@@ -1556,6 +1577,52 @@ mod tests {
     // ------------------------------------------------------------------------
     // Session-start greeting throttle gate
     // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // Post-install message composition
+    //
+    // Regression guard tied to a real user complaint: the UI previously said
+    // "Gateway restarted." (noise — moved to tracing::info!) and
+    // "Approve senders with: /pairing approve <CODE>" (confusing — didn't
+    // explain the user must DM the bot first to generate the code).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn post_install_message_does_not_mention_gateway_restarted() {
+        let msg = build_post_install_message("Telegram", &[], true);
+        assert!(
+            !msg.contains("Gateway restarted"),
+            "user-facing install message must not mention gateway restart (log-only): {msg}"
+        );
+    }
+
+    #[test]
+    fn post_install_channel_message_explains_pairing_workflow() {
+        let msg = build_post_install_message("Telegram", &[], true);
+        assert!(
+            msg.contains("Installed Telegram"),
+            "missing install line: {msg}"
+        );
+        assert!(
+            msg.contains("Send a message to the bot on Telegram"),
+            "channel install must tell user to DM the bot first: {msg}"
+        );
+        assert!(
+            msg.contains("/pairing approve <CODE>"),
+            "channel install must include the /pairing approve command: {msg}"
+        );
+    }
+
+    #[test]
+    fn post_install_non_channel_message_omits_pairing_hint() {
+        let msg = build_post_install_message("Gmail", &["foo".to_string()], false);
+        assert!(msg.starts_with("Installed Gmail"));
+        assert!(msg.contains("foo"), "notes should be preserved: {msg}");
+        assert!(
+            !msg.contains("/pairing"),
+            "non-channel plugins don't need pairing instructions: {msg}"
+        );
+    }
 
     #[test]
     fn session_start_disabled_never_fires() {

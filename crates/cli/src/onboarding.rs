@@ -547,7 +547,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             }
 
             println!(
-                "  Connected {}. Approve senders with: /pairing approve <CODE>",
+                "  Connected {0}. Send a message to the bot on {0} to get your pairing code, then run: /pairing approve <CODE>",
                 def.name
             );
         }

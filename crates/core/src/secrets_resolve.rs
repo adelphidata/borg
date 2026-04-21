@@ -108,11 +108,29 @@ pub enum SecretRef {
 fn extract_secret(output: std::process::Output, fail_context: &str) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{fail_context}: {stderr}");
+        bail!("{fail_context}: {}", humanize_keychain_error(&stderr));
     }
     String::from_utf8(output.stdout)
         .map(|s| s.trim().to_string())
         .context("Command output is not valid UTF-8")
+}
+
+/// The macOS `security` CLI prints "The specified item could not be found in
+/// the keychain" both when the item is genuinely absent AND when it exists but
+/// the calling process is not on its ACL. The latter is the common failure
+/// mode for the daemon (items are written by the TUI with a binary-scoped ACL
+/// that pre-fix entries lack). Rewrite that specific stderr into an actionable
+/// remediation hint so users know to reinstall the channel from the plugins
+/// popup rather than chasing a phantom "missing item".
+pub(crate) fn humanize_keychain_error(stderr: &str) -> String {
+    if stderr.contains("could not be found in the keychain") {
+        format!(
+            "{} (hint: the keychain item may exist but be unreadable by this process — reinstall the channel from the plugins popup to refresh its ACL)",
+            stderr.trim()
+        )
+    } else {
+        stderr.trim().to_string()
+    }
 }
 
 impl SecretRef {
@@ -215,6 +233,31 @@ pub fn resolve_first(refs: &[SecretRef]) -> Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_keychain_not_found_adds_remediation_hint() {
+        // The actual stderr emitted by macOS `security` when the item exists
+        // but the caller isn't on the ACL (same text as genuinely-missing).
+        let stderr =
+            "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n";
+        let humanized = humanize_keychain_error(stderr);
+        assert!(
+            humanized.contains("reinstall"),
+            "humanized error should suggest reinstalling: {humanized}"
+        );
+        assert!(
+            humanized.contains("plugins popup"),
+            "humanized error should point to the plugins popup: {humanized}"
+        );
+    }
+
+    #[test]
+    fn humanize_keychain_error_passthrough_for_other_stderr() {
+        let stderr = "security: some other error\n";
+        let humanized = humanize_keychain_error(stderr);
+        assert_eq!(humanized, "security: some other error");
+        assert!(!humanized.contains("reinstall"));
+    }
 
     #[test]
     fn resolve_env_var() {
