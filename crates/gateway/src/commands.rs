@@ -665,9 +665,16 @@ fn handle_settings(db: &Database, config: &Config, args: &str) -> String {
     }
 }
 
+/// Wrap evolution-command output in a fenced code block so channel formatters
+/// render it as monospace (Telegram `<pre>`, Slack/Discord ``` ```, Signal
+/// MONOSPACE style). Plain-text channels strip the outer fence at send time.
+fn wrap_monospace(text: String) -> String {
+    format!("```\n{}\n```", text.trim_end_matches('\n'))
+}
+
 fn handle_evolution(db: &Database) -> String {
     match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Evolution, db) {
-        Ok(out) => out.text,
+        Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/evolution dispatch failed: {e}");
             "Failed to render evolution.".to_string()
@@ -677,7 +684,7 @@ fn handle_evolution(db: &Database) -> String {
 
 fn handle_xp(db: &Database) -> String {
     match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Xp, db) {
-        Ok(out) => out.text,
+        Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/xp dispatch failed: {e}");
             "Failed to render XP.".to_string()
@@ -695,7 +702,7 @@ fn handle_card(db: &Database, args: &str) -> String {
         borg_core::evolution::EvolutionCommand::Card { out: None },
         db,
     ) {
-        Ok(out) => out.text,
+        Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/card dispatch failed: {e}");
             "Failed to render card.".to_string()
@@ -862,6 +869,28 @@ mod tests {
             out.contains('\u{256D}') || out.contains('\u{2570}'),
             "missing ASCII box border in {out}"
         );
+    }
+
+    // Evolution commands produce Unicode box-drawing + block-character output
+    // that only looks right in a monospace font. The gateway handlers wrap
+    // results in a ``` fence so channel formatters (Telegram <pre>, Slack
+    // mrkdwn, Discord, Signal MONOSPACE range) render them correctly.
+    // Plain-text channels strip the outer fence at send time.
+    #[test]
+    fn evolution_handlers_wrap_success_output_in_code_fence() {
+        let db = gateway_test_db();
+
+        for out in [handle_card(&db, ""), handle_xp(&db), handle_evolution(&db)] {
+            assert!(out.starts_with("```\n"), "expected opening fence: {out}");
+            assert!(out.ends_with("\n```"), "expected closing fence: {out}");
+        }
+    }
+
+    #[test]
+    fn handle_card_error_string_is_unwrapped() {
+        let db = gateway_test_db();
+        let out = handle_card(&db, "--out /tmp/x");
+        assert!(!out.starts_with("```"), "error should not be fenced: {out}");
     }
 
     #[test]

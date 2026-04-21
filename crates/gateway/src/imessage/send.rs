@@ -1,11 +1,18 @@
 use anyhow::{Context, Result};
 use tracing::debug;
 
+use crate::plain_text::strip_outer_code_fence;
+
 /// Send a message via iMessage using osascript (AppleScript).
 ///
 /// `to` is the recipient identifier (phone number or email).
 /// `service` is typically "iMessage" or "SMS".
 pub async fn send_imessage(to: &str, text: &str, service: &str) -> Result<()> {
+    // iMessage renders plain text only — strip any outer markdown code fence so
+    // callers that wrap preformatted output (e.g. /xp, /card, /evolution) don't
+    // leak literal backticks into the message body.
+    let text = strip_outer_code_fence(text);
+
     // Escape text for AppleScript string literal
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
 

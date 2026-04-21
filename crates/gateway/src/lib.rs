@@ -73,6 +73,8 @@ pub mod in_flight;
 pub mod link_understanding;
 /// `channel.toml` manifest parsing.
 pub mod manifest;
+/// Helpers for plain-text channels that cannot render Markdown code fences.
+pub mod plain_text;
 /// Sliding-window rate limiting for inbound messages.
 pub mod rate_limit;
 /// Channel registry: scan and register user-defined channels.

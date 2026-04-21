@@ -33,7 +33,12 @@ impl TwilioClient {
 
     /// Send an SMS message.
     pub async fn send_sms(&self, from: &str, to: &str, body: &str) -> Result<String> {
-        self.send_message(from, to, body).await
+        // SMS is plain-text only — strip any outer markdown code fence so
+        // preformatted command output (e.g. /xp, /card, /evolution) doesn't
+        // arrive with literal backticks. WhatsApp supports ```monospace```
+        // so `send_whatsapp` does NOT strip.
+        let stripped = crate::plain_text::strip_outer_code_fence(body);
+        self.send_message(from, to, &stripped).await
     }
 
     /// Send a WhatsApp message.
