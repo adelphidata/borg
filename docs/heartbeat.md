@@ -2,6 +2,8 @@
 
 The heartbeat system enables proactive check-ins -- the agent can reach out to you at regular intervals without being prompted.
 
+> See also: [Self-Healing](./self-healing.md) for missed-run detection on scheduled tasks and the daily maintenance sweep.
+
 ## How it works
 
 1. A `HeartbeatScheduler` runs as a separate tokio task alongside the TUI or daemon

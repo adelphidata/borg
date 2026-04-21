@@ -186,6 +186,12 @@ define_settings! {
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
+
+        // ── Maintenance (self-healing) ──
+        "maintenance.enabled" => maintenance.enabled, parsed(bool);
+        "maintenance.logs_retention_days" => maintenance.logs_retention_days, parsed(u32);
+        "maintenance.activity_retention_days" => maintenance.activity_retention_days, parsed(u32);
+        "maintenance.doctor_runs_keep" => maintenance.doctor_runs_keep, parsed(u32);
     }
 
     registry_only {
@@ -361,6 +367,12 @@ define_settings! {
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
         "security.secret_detection" => "Secret detection", Bool, "Security";
+
+        // — Maintenance (self-healing) —
+        "maintenance.enabled" => "Daily self-heal task", Bool, "Maintenance";
+        "maintenance.logs_retention_days" => "Log retention (days)", Uint, "Maintenance";
+        "maintenance.activity_retention_days" => "Activity retention (days)", Uint, "Maintenance";
+        "maintenance.doctor_runs_keep" => "Doctor runs kept", Uint, "Maintenance";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

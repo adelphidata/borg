@@ -226,6 +226,10 @@ Two layers share one `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `
 - **Compiled-in hooks** — `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook` registered in `crates/cli/src/repl.rs` and `crates/cli/src/tui/mod.rs`.
 - **User script hooks** — `ScriptHook` loaded from `~/.borg/hooks.json` (Claude Code / codex schema). Events: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`. Runs `sh -c <command>` with a JSON payload as `$1`, bounded by `timeout` (default 60s, clamped to `[1,600]`). `PreToolUse` non-zero exit / timeout returns `HookAction::Skip` and aborts the tool call. All other failure modes (parse error, spawn failure, non-zero exit, panic) log a `tracing::warn!` and return `Continue` — **hooks can never break the agent**. Gated on `hooks.enabled` (default true). See `docs/hooks.md`.
 
+### Self-Healing
+
+Daily maintenance task (`task_type = 'maintenance'`, seeded in V37, fires 02:00) runs a headless doctor sweep, prunes `~/.borg/logs/*.jsonl` and `activity_log` past retention, evicts stale embeddings, heals stalled scheduled tasks, and surfaces warnings that persist across two consecutive runs. No LLM call — dispatcher calls `borg_core::maintenance::run_daily_maintenance` directly, so it works with no provider configured. Daemon loop also scans every 5 min for scheduled tasks whose `next_run` drifted > `STALLED_TASK_GRACE_SECS` (1h) into the past, records `task_runs.status='missed'`, resets `next_run`. `write_memory` enforces a hard 20k-token cap (warn at 8k) so oversized entries fail loud instead of silently getting dropped by the token-budget loader. See `docs/self-healing.md`.
+
 ### Prompt Injection Defense
 
 5 layers: input sanitization (scoring-based, flags rather than strips), context segregation (XML trust boundaries), prompt hardening, rate limiting (per-session action caps), secret redaction.

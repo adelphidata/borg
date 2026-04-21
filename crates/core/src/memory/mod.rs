@@ -2,7 +2,7 @@ use anyhow::Result;
 use tracing::{debug, instrument};
 
 use crate::config::Config;
-use crate::constants::HEARTBEAT_FILE;
+use crate::constants::{HEARTBEAT_FILE, MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
 use crate::tokenizer::estimate_tokens;
 use crate::xml_util::escape_xml_attr;
 
@@ -21,10 +21,44 @@ pub enum WriteMode {
 // ── DB-Backed Memory API ──
 // These functions use the `memory_entries` table as the single source of truth.
 
-/// Write a memory entry to the database. Scans for injection before writing.
+/// Enforce the memory-entry size cap. Bails with a human-readable error
+/// if `projected_tokens` exceeds the reject threshold, logs a warning if
+/// it's between warn and reject, and otherwise is a no-op.
+fn enforce_memory_size(name: &str, scope: &str, projected_tokens: usize) -> Result<()> {
+    if projected_tokens >= MEMORY_ENTRY_REJECT_TOKENS {
+        anyhow::bail!(
+            "memory entry '{name}' (scope {scope}) would be ~{projected_tokens} tokens, \
+             over the {MEMORY_ENTRY_REJECT_TOKENS}-token cap. Split into multiple topic \
+             entries — oversized entries get silently dropped from the context window."
+        );
+    }
+    if projected_tokens >= MEMORY_ENTRY_WARN_TOKENS {
+        tracing::warn!(
+            "memory entry {scope}/{name} is ~{projected_tokens} tokens — approaching \
+             the {MEMORY_ENTRY_REJECT_TOKENS}-token cap; consider splitting"
+        );
+    }
+    Ok(())
+}
+
+/// Write a memory entry to the database. Scans for injection and enforces
+/// a hard size cap before writing — large entries get silently dropped by
+/// the token-budget loader, so we fail loud at write time and force the
+/// caller to split into topic-sized pieces.
 pub fn write_memory_db(name: &str, content: &str, mode: WriteMode, scope: &str) -> Result<String> {
     scan_for_injection(content)?;
     let db = crate::db::Database::open()?;
+    let projected_tokens = match mode {
+        WriteMode::Overwrite => estimate_tokens(content),
+        WriteMode::Append => {
+            let existing = db
+                .get_memory_entry(scope, name)?
+                .map(|e| e.content)
+                .unwrap_or_default();
+            estimate_tokens(&existing) + estimate_tokens(content)
+        }
+    };
+    enforce_memory_size(name, scope, projected_tokens)?;
     match mode {
         WriteMode::Overwrite => db.upsert_memory_entry(scope, name, content)?,
         WriteMode::Append => db.append_memory_entry(scope, name, content)?,
@@ -412,6 +446,35 @@ mod tests {
     fn estimate_tokens_nonempty() {
         assert_eq!(estimate_tokens(""), 0);
         assert!(estimate_tokens("Hello, world!") > 0);
+    }
+
+    #[test]
+    fn enforce_memory_size_accepts_small() {
+        enforce_memory_size("topic", "global", 100).expect("small entry should pass");
+    }
+
+    #[test]
+    fn enforce_memory_size_accepts_warn_threshold() {
+        // At warn threshold we log but still return Ok.
+        enforce_memory_size("topic", "global", MEMORY_ENTRY_WARN_TOKENS)
+            .expect("warn-sized entry should still be accepted");
+    }
+
+    #[test]
+    fn enforce_memory_size_rejects_at_reject_threshold() {
+        let err = enforce_memory_size("topic", "global", MEMORY_ENTRY_REJECT_TOKENS)
+            .expect_err("entry at cap must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("topic"), "error should name the entry");
+        assert!(
+            msg.contains("Split into multiple topic entries"),
+            "error should guide the caller to split: got {msg}"
+        );
+    }
+
+    #[test]
+    fn enforce_memory_size_rejects_over_cap() {
+        assert!(enforce_memory_size("big", "global", MEMORY_ENTRY_REJECT_TOKENS + 5_000).is_err());
     }
 
     // -- extra paths tests --

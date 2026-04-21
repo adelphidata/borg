@@ -40,6 +40,7 @@ pub(super) fn simple_task<'a>(
 
 mod activity;
 mod delivery;
+mod maintenance;
 mod memory;
 mod meta;
 mod multi_agent;

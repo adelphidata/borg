@@ -260,6 +260,52 @@ impl Database {
         Ok(updated > 0)
     }
 
+    /// Find scheduled tasks whose `next_run` has drifted more than
+    /// `grace_secs` into the past without firing — a silent stall.
+    ///
+    /// Excludes tasks pending retry (those are handled by the retry loop)
+    /// and one-shot tasks (they are allowed to sit until run). Returns the
+    /// full task row so callers can reschedule using the existing helpers.
+    pub fn find_stalled_tasks(&self, now: i64, grace_secs: i64) -> Result<Vec<ScheduledTaskRow>> {
+        let cutoff = now - grace_secs;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
+             WHERE status = 'active' \
+               AND retry_after IS NULL \
+               AND schedule_type != 'once' \
+               AND next_run IS NOT NULL \
+               AND next_run < ?1 \
+             ORDER BY next_run ASC"
+        ))?;
+        let rows = stmt
+            .query_map(params![cutoff], Self::map_task_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert a `task_runs` row with `status = 'missed'` so the stall is
+    /// visible in run history. `started_at` is the detection time, not the
+    /// would-have-fired time (the latter is available on `scheduled_tasks.next_run`
+    /// before it gets reset).
+    pub fn record_missed_run(&self, task_id: &str, started_at: i64, note: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO task_runs (task_id, started_at, duration_ms, error, status)
+             VALUES (?1, ?2, 0, ?3, ?4)",
+            params![task_id, started_at, note, crate::tasks::RUN_STATUS_MISSED],
+        )?;
+        Ok(())
+    }
+
+    /// Count `task_runs` rows with `status = 'missed'` newer than `since_ts`.
+    pub fn count_missed_runs_since(&self, since_ts: i64) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE status = ?1 AND started_at >= ?2",
+            params![crate::tasks::RUN_STATUS_MISSED, since_ts],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Mark any 'running' task_runs as 'failed' (from a crashed daemon). Returns count.
     pub fn recover_stale_runs(&self, error_msg: &str) -> Result<u64> {
         let updated = self.conn.execute(

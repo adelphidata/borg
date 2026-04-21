@@ -476,6 +476,26 @@ pub const GATEWAY_RESPAWN_BASE_DELAY: Duration = Duration::from_millis(250);
 /// Consecutive daemon-lock refresh failures before the daemon exits (lock stolen).
 pub const DAEMON_LOCK_MAX_REFRESH_FAILURES: u32 = 3;
 
+// ── Self-healing ──────────────────────────────────────────────────
+
+/// How often the daemon loop scans for scheduled tasks whose `next_run`
+/// has drifted into the past (clock jumps, crashed runs, silent stalls).
+pub const STALLED_TASK_SCAN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// A scheduled task is considered stalled when `next_run` is more than
+/// this many seconds in the past. Set generously to avoid racing a task
+/// that is about to fire on the normal cadence.
+pub const STALLED_TASK_GRACE_SECS: i64 = 3600;
+
+/// Warn when a memory entry exceeds this token count — writes succeed
+/// but the entry is close to the hard cap.
+pub const MEMORY_ENTRY_WARN_TOKENS: usize = 8_000;
+
+/// Reject memory writes that would produce an entry larger than this.
+/// Large entries get silently dropped from the context-window budget;
+/// failing at write time forces the caller to split into topics.
+pub const MEMORY_ENTRY_REJECT_TOKENS: usize = 20_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

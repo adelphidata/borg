@@ -90,6 +90,9 @@ pub mod llm;
 pub mod llm_error;
 /// Structured logging setup.
 pub mod logging;
+/// Daily self-healing maintenance runner (doctor sweep, log/activity
+/// pruning, persistent-warning surfacing). Seeded as a scheduled task.
+pub mod maintenance;
 /// Media file handling and type detection.
 pub mod media;
 /// Media understanding (image/audio analysis via LLM).

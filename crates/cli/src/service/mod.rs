@@ -8,8 +8,8 @@ use borg_core::agent::{Agent, AgentEvent};
 use borg_core::config::Config;
 use borg_core::constants::{
     DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, GATEWAY_MAX_CRASH_RESPAWNS,
-    GATEWAY_RESPAWN_BASE_DELAY, SLEEP_DRIFT_THRESHOLD, WATCHDOG_STALL_THRESHOLD,
-    WATCHDOG_TICK_INTERVAL,
+    GATEWAY_RESPAWN_BASE_DELAY, SLEEP_DRIFT_THRESHOLD, STALLED_TASK_GRACE_SECS,
+    STALLED_TASK_SCAN_INTERVAL, WATCHDOG_STALL_THRESHOLD, WATCHDOG_TICK_INTERVAL,
 };
 use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, HeartbeatScheduler, SkipReason};
 
@@ -210,6 +210,11 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
     let mut last_tick_wall = std::time::Instant::now();
     let mut gw_crash_count: u32 = 0;
 
+    // Self-healing: scan for scheduled tasks whose next_run silently drifted
+    // into the past. Runs on a slower cadence than the main loop to keep the
+    // DB pressure low.
+    let mut last_stalled_scan = std::time::Instant::now();
+
     loop {
         tokio::select! {
             biased;
@@ -317,6 +322,34 @@ pub async fn run_daemon(shutdown: CancellationToken) -> Result<()> {
                     shutdown.cancel();
                     continue;
                 }
+            }
+        }
+
+        // Self-healing scan for stalled scheduled tasks. Runs on a slower
+        // cadence than the main tick to keep DB pressure low. A task is
+        // "stalled" if status=active, retry_after is null, and next_run
+        // drifted more than STALLED_TASK_GRACE_SECS into the past.
+        if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
+            last_stalled_scan = std::time::Instant::now();
+            match borg_core::tasks::heal_stalled_tasks(&db, now, STALLED_TASK_GRACE_SECS) {
+                Ok(report) if report.detected > 0 => {
+                    tracing::warn!(
+                        detected = report.detected,
+                        reset = report.reset,
+                        "self-healing: reset next_run for stalled scheduled tasks"
+                    );
+                    borg_core::activity_log::log_activity(
+                        &db,
+                        "warn",
+                        "system",
+                        &format!(
+                            "Self-healing reset {} stalled scheduled task(s) (detected {})",
+                            report.reset, report.detected
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Stalled-task scan failed: {e}"),
             }
         }
 
@@ -654,6 +687,8 @@ async fn spawn_task_execution(
         let result = std::panic::AssertUnwindSafe(async {
             if task_type == "command" {
                 execute_command_task(&exec_ctx).await;
+            } else if task_type == "maintenance" {
+                execute_maintenance_task(&exec_ctx).await;
             } else {
                 execute_prompt_task(&exec_ctx).await;
             }
@@ -698,6 +733,59 @@ struct TaskExecContext {
     delivery_channel: Option<String>,
     delivery_target: Option<String>,
     config: Config,
+}
+
+/// Run the daily self-healing maintenance sweep. No LLM call — executes
+/// `run_daily_maintenance` directly and records the result against the
+/// `task_runs` row opened by `claim_due_tasks`.
+async fn execute_maintenance_task(ctx: &TaskExecContext) {
+    let TaskExecContext {
+        task_name,
+        task_id,
+        run_id,
+        started_at,
+        config,
+        ..
+    } = ctx;
+
+    // `spawn_blocking` because the maintenance sweep does synchronous
+    // sqlite work and filesystem walks. Keeps the async runtime free to
+    // handle heartbeat and gateway events.
+    let config_clone = config.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let db = borg_core::db::Database::open()?;
+        borg_core::maintenance::run_daily_maintenance(&db, &config_clone)
+    })
+    .await;
+
+    let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+    match result {
+        Ok(Ok(report)) => {
+            let summary = report.activity_line();
+            if let Ok(db) = borg_core::db::Database::open() {
+                let _ = db.complete_task_run(*run_id, duration_ms, Some(&summary), None);
+                let _ = db.clear_task_retry(task_id);
+                borg_core::activity_log::log_activity(&db, "info", "task", &summary);
+            }
+            tracing::info!("Maintenance task '{task_name}' completed: {summary}");
+        }
+        Ok(Err(e)) => {
+            let msg = format!("maintenance sweep failed: {e}");
+            if let Ok(db) = borg_core::db::Database::open() {
+                let _ = db.complete_task_run(*run_id, duration_ms, None, Some(&msg));
+                borg_core::activity_log::log_activity(&db, "error", "task", &msg);
+            }
+            tracing::warn!("Maintenance task '{task_name}' failed: {e}");
+        }
+        Err(join_err) => {
+            let msg = format!("maintenance task panicked: {join_err}");
+            if let Ok(db) = borg_core::db::Database::open() {
+                let _ = db.complete_task_run(*run_id, duration_ms, None, Some(&msg));
+                borg_core::activity_log::log_activity(&db, "error", "task", &msg);
+            }
+            tracing::error!("{msg}");
+        }
+    }
 }
 
 async fn execute_command_task(ctx: &TaskExecContext) {

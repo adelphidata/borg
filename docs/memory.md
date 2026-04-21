@@ -13,6 +13,8 @@ Borg has a two-tier memory system modeled on how human memory works: short-term 
 
 All long-term memory entries live in the `memory_entries` table with a `scope` + `name` unique key. No filesystem memory files — SQLite is the single source of truth.
 
+> **Size limits.** `write_memory` rejects entries larger than 20,000 tokens and warns at 8,000. Oversized entries are silently dropped by the token-budget loader, so the cap fails loud at write time. See [Self-Healing](./self-healing.md#memory-entry-size-limits) for details.
+
 ## Long-term memory
 
 ### How loading works

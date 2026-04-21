@@ -18,6 +18,11 @@ pub const TASK_STATUS_COMPLETED: &str = "completed";
 pub const RUN_STATUS_RUNNING: &str = "running";
 pub const RUN_STATUS_SUCCESS: &str = "success";
 pub const RUN_STATUS_FAILED: &str = "failed";
+/// Recorded when the self-healing loop detects a scheduled task whose
+/// `next_run` drifted into the past without firing (clock jump, crash,
+/// stuck retry). The run is not replayed — we just audit the miss and
+/// reset `next_run` to the next valid fire time.
+pub const RUN_STATUS_MISSED: &str = "missed";
 
 // ── Schedule type constants ──
 
@@ -34,6 +39,7 @@ pub fn format_run_status(status: &str) -> &str {
         RUN_STATUS_RUNNING => "RUNNING",
         RUN_STATUS_SUCCESS => "OK",
         RUN_STATUS_FAILED => "FAIL",
+        RUN_STATUS_MISSED => "MISSED",
         other => other,
     }
 }
@@ -129,6 +135,76 @@ pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
 /// Advance a task's next_run after execution.
 pub fn advance_next_run(task: &ScheduledTaskRow, db: &Database) -> Result<()> {
     advance_next_run_raw(db.conn(), task)
+}
+
+/// Summary of one stalled-task healing pass.
+#[derive(Debug, Default, Clone)]
+pub struct HealReport {
+    /// Number of tasks whose `next_run` had drifted past the grace window.
+    pub detected: usize,
+    /// Number of tasks for which `next_run` was successfully reset.
+    pub reset: usize,
+}
+
+/// Scan `scheduled_tasks` for rows whose `next_run` is older than
+/// `grace_secs` and quietly self-heal them:
+///
+/// 1. Record a `task_runs` row with `status = 'missed'` for auditability.
+/// 2. Recompute `next_run` from the schedule expression at the current time.
+///
+/// This does not replay the missed run — the assumption is that the user's
+/// intent is "fire on schedule from here on", not "catch up on everything
+/// we lost while the machine was asleep". Failures on individual tasks are
+/// logged and the scan continues; the caller gets an aggregate report.
+pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<HealReport> {
+    let stalled = db.find_stalled_tasks(now, grace_secs)?;
+    let mut report = HealReport {
+        detected: stalled.len(),
+        reset: 0,
+    };
+    for task in stalled {
+        let overdue_secs = task.next_run.map(|nr| now - nr).unwrap_or(0);
+        let note =
+            format!("self-healing: next_run drifted {overdue_secs}s into past without firing");
+        if let Err(e) = db.record_missed_run(&task.id, now, &note) {
+            tracing::warn!(
+                task_id = %task.id,
+                task_name = %task.name,
+                error = %e,
+                "failed to record missed-run audit row"
+            );
+        }
+        match calculate_next_run(&task.schedule_type, &task.schedule_expr) {
+            Ok(next) => {
+                if let Err(e) = db.update_task_next_run(&task.id, next) {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        task_name = %task.name,
+                        error = %e,
+                        "failed to reset next_run for stalled task"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    overdue_secs,
+                    next_run = ?next,
+                    "self-healed stalled scheduled task"
+                );
+                report.reset += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    task_name = %task.name,
+                    error = %e,
+                    "could not recompute next_run for stalled task"
+                );
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// Format a task row for display.

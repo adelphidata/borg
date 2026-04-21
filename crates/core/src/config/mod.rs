@@ -1,5 +1,6 @@
 pub mod gateway;
 pub mod llm;
+pub mod maintenance;
 pub mod media;
 pub mod security;
 #[macro_use]
@@ -11,6 +12,7 @@ mod tests;
 
 pub use gateway::*;
 pub use llm::*;
+pub use maintenance::*;
 pub use media::*;
 pub use security::*;
 
@@ -115,6 +117,9 @@ pub struct Config {
     /// Conversation evolution and personality drift settings.
     #[serde(default)]
     pub evolution: EvolutionConfig,
+    /// Daily self-healing maintenance task retention settings.
+    #[serde(default)]
+    pub maintenance: MaintenanceConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,

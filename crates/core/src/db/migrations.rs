@@ -1293,4 +1293,52 @@ impl Database {
         }
         Ok(())
     }
+
+    /// V37: Self-healing maintenance.
+    ///
+    /// - Creates `doctor_runs` to audit the daily maintenance sweep.
+    /// - Seeds a `task_type = 'maintenance'` scheduled task firing at 02:00
+    ///   daily (one hour before the nightly memory consolidation at 03:00).
+    pub(super) fn migrate_v37(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS doctor_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ran_at      INTEGER NOT NULL,
+                pass_count  INTEGER NOT NULL DEFAULT 0,
+                warn_count  INTEGER NOT NULL DEFAULT 0,
+                fail_count  INTEGER NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_doctor_runs_ran_at
+                ON doctor_runs(ran_at DESC);",
+        )?;
+        self.seed_maintenance_task()?;
+        Ok(())
+    }
+
+    /// Seed the daily self-healing maintenance task. Idempotent via
+    /// `INSERT OR IGNORE` so re-running on an existing install leaves the
+    /// row untouched.
+    fn seed_maintenance_task(&self) -> Result<()> {
+        let task_id = crate::maintenance::MAINTENANCE_TASK_ID;
+        const MAINTENANCE_CRON: &str = "0 0 2 * * *";
+        let now = chrono::Utc::now().timestamp();
+        let next_run = crate::tasks::calculate_next_run("cron", MAINTENANCE_CRON)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO scheduled_tasks
+             (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, 300000, NULL, 'maintenance')",
+            rusqlite::params![
+                task_id,
+                "Daily Self-Healing Maintenance",
+                "Runs the doctor sweep, prunes old logs and activity rows, heals stalled scheduled tasks, and surfaces persistent warnings. Pure maintenance — does not invoke the LLM.",
+                "cron",
+                MAINTENANCE_CRON,
+                "local",
+                next_run,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
 }
