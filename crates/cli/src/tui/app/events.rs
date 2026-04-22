@@ -179,6 +179,13 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_tool_executing(&mut self, name: String, args: String) {
+        // Drop a trailing empty streaming Assistant cell: models sometimes open
+        // with a tool call after emitting no text, which would otherwise leave
+        // a dangling cell rendering only the streaming cursor `▊`.
+        if matches!(self.cells.last(), Some(HistoryCell::Assistant { text, .. }) if text.trim().is_empty())
+        {
+            self.cells.pop();
+        }
         self.cells.push(HistoryCell::ToolStart {
             name,
             args,
@@ -262,9 +269,13 @@ impl<'a> App<'a> {
         // Clean up steer channel on turn completion
         self.steer_tx = None;
         self.pending_steers.clear();
-        // Clean up any leftover empty thinking placeholders
-        self.cells
-            .retain(|c| !matches!(c, HistoryCell::Thinking { text } if text.is_empty()));
+        // Clean up any leftover empty thinking or assistant placeholders
+        // (e.g. an Assistant cell whose text never arrived because the turn
+        // produced only a tool call).
+        self.cells.retain(|c| {
+            !matches!(c, HistoryCell::Thinking { text } if text.is_empty())
+                && !matches!(c, HistoryCell::Assistant { text, .. } if text.trim().is_empty())
+        });
         for cell in self.cells.iter_mut().rev() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;

@@ -250,6 +250,12 @@ pub struct Agent {
     /// re-summarizing from scratch. Populated either by the current
     /// session's compactions or by scanning loaded history on resume.
     previous_summary: Option<String>,
+    /// True for exactly one turn: set when `SETUP.md` was just consumed during
+    /// system-prompt assembly. The turn that consumed it must not offer tools
+    /// to the model (SETUP.md forbids first-message tool calls but weak models
+    /// ignore the prompt instruction). Reset after the prompt is built and the
+    /// tool list is selected.
+    setup_just_consumed: bool,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -378,6 +384,7 @@ impl Agent {
             recent_tool_names: std::collections::HashSet::new(),
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
             previous_summary: None,
+            setup_just_consumed: false,
         }
     }
 
@@ -895,6 +902,12 @@ impl Agent {
                             .render([("setup", setup.as_str())])
                             .context("setup template render failed")?,
                     );
+                    // Signal to the agent turn: on this turn we must not offer
+                    // tools to the model. SETUP.md forbids first-message tool
+                    // calls in prose, but that is not sufficient for weak
+                    // instruction-following models (e.g. Grok-4.20 emits a
+                    // malformed `write_memory` call anyway).
+                    self.setup_just_consumed = true;
                 }
                 let _ = tokio::fs::remove_file(&consumed).await;
             }
@@ -1934,7 +1947,16 @@ Rules:
             .unwrap_or("")
             .to_string();
 
-        let tool_defs = self.build_tool_definitions(&user_msg);
+        let tool_defs = if self.setup_just_consumed {
+            // First post-onboarding turn: starve the model of tool definitions
+            // entirely. SETUP.md's "DO NOT call any tools on your first message"
+            // prompt rule is not enough for weak models — this is the runtime
+            // enforcement. Flag is single-shot; the next turn gets tools back.
+            self.setup_just_consumed = false;
+            Vec::new()
+        } else {
+            self.build_tool_definitions(&user_msg)
+        };
 
         // Fire BeforeAgentStart (first iteration) or BeforeLlmCall
         let hook_point = if iteration == 1 {
