@@ -1,4 +1,6 @@
+use ansi_to_tui::IntoText;
 use borg_core::types::{PlanStep, PlanStepStatus};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
 use throbber_widgets_tui::ThrobberState;
@@ -18,6 +20,130 @@ pub(super) struct AssistantRenderCache {
     cached_width: Option<u16>,
     committed_lines: Vec<Line<'static>>,
     committed_byte_len: usize,
+}
+
+/// Parse a single line of tool output, honoring embedded ANSI escape
+/// sequences (colors / bold / etc.) so output from `cargo`, `git`,
+/// `pytest`, etc. retains its meaning. `fallback_style` is applied to
+/// spans that don't carry an explicit foreground color, so plain output
+/// still renders dim (or red, for errors).
+///
+/// On parse failure (malformed escape) falls back to a single dim/error
+/// span and logs via `tracing::warn!` per the project error-handling
+/// invariant.
+fn parse_ansi_line(text: &str, fallback_style: Style) -> Line<'static> {
+    match text.into_text() {
+        Ok(parsed) => {
+            // Callers split on `.lines()` so `\n` shouldn't reach us, but
+            // ansi-to-tui can also break on `\r` / form-feed. If that
+            // happens, log and merge — silently dropping content would hide
+            // tool output.
+            if parsed.lines.len() > 1 {
+                tracing::warn!(
+                    "parse_ansi_line: input produced {} lines, merging into one",
+                    parsed.lines.len()
+                );
+            }
+            let mut all_spans: Vec<ratatui::text::Span<'_>> = Vec::new();
+            for l in parsed.lines {
+                all_spans.extend(l.spans);
+            }
+            let spans: Vec<Span<'static>> = all_spans
+                .into_iter()
+                .map(|s| {
+                    // ansi-to-tui emits `Color::Reset` for `\x1b[0m`. Treat
+                    // Reset as "no explicit fg" so plain text after a reset
+                    // still picks up the dim/error fallback.
+                    let no_explicit_fg =
+                        matches!(s.style.fg, None | Some(ratatui::style::Color::Reset));
+                    let merged = if no_explicit_fg {
+                        let mut patched = fallback_style.patch(s.style);
+                        patched.fg = fallback_style.fg;
+                        patched
+                    } else {
+                        s.style
+                    };
+                    // Defense-in-depth: ansi-to-tui parses SGR escapes but
+                    // passes non-SGR control sequences (clear-screen, cursor
+                    // moves, OSC) through to span text. Strip ESC bytes so a
+                    // hostile tool can't repaint or wreck the transcript.
+                    let safe: String = s.content.chars().filter(|&c| c != '\x1b').collect();
+                    Span::styled(safe, merged)
+                })
+                .collect();
+            if spans.is_empty() {
+                let safe: String = text.chars().filter(|&c| c != '\x1b').collect();
+                Line::from(Span::styled(safe, fallback_style))
+            } else {
+                Line::from(spans)
+            }
+        }
+        Err(e) => {
+            tracing::warn!("ansi-to-tui parse failed: {e}; falling back to plain text");
+            let safe: String = text.chars().filter(|&c| c != '\x1b').collect();
+            Line::from(Span::styled(safe, fallback_style))
+        }
+    }
+}
+
+/// Wrap pre-styled body lines in a `╭─╮ │ ╰─╯` box. Width is the full cell
+/// width; the box itself sits inside a 2-space left indent so it visually
+/// aligns with the rest of the tool result. Pre-existing line content is
+/// padded to the inner width with spaces.
+///
+/// Used by both the `Thinking` cell and error `ToolResult` cells so the two
+/// boxed shapes stay visually consistent.
+fn render_boxed_lines(
+    inner_lines: Vec<Line<'static>>,
+    border_style: Style,
+    label: Option<&str>,
+    width: u16,
+    indent: usize,
+) -> Vec<Line<'static>> {
+    // Geometry, every row totals exactly `width` columns:
+    //   `{indent}{│}{ }{content of content_w cells}{│}` = indent + 3 + content_w
+    //   `{indent}{╭}{──}{label}{─×top_rule_len}{╮}`     = indent + 4 + label_w + top_rule_len
+    //   `{indent}{╰}{─×inner_w}{╯}`                      = indent + 2 + inner_w
+    // where inner_w = width - indent - 2  and  content_w = inner_w - 1
+    // (the leading space inside the box is for readability).
+    let inner_w = (width as usize).saturating_sub(indent + 2).max(3);
+    let content_w = inner_w.saturating_sub(1).max(1);
+    let indent_str = " ".repeat(indent);
+    let label = label.unwrap_or("");
+    let label_w = unicode_width::UnicodeWidthStr::width(label);
+    let top_rule_len = inner_w.saturating_sub(2 + label_w);
+    let top = format!(
+        "{indent_str}{}{}{label}{}{}",
+        theme::BOX_TOP_LEFT,
+        theme::SEPARATOR.repeat(2),
+        theme::SEPARATOR.repeat(top_rule_len),
+        theme::BOX_TOP_RIGHT,
+    );
+    let mut lines = vec![Line::from(Span::styled(top, border_style))];
+    for line in inner_lines {
+        // Truncate first so over-long inputs can't burst the box.
+        let line = line_utils::truncate_line_to_width(line, content_w);
+        let used = line_utils::line_width(&line);
+        let pad = content_w.saturating_sub(used);
+        let mut spans = vec![Span::styled(
+            format!("{indent_str}{} ", theme::BOX_VERTICAL),
+            border_style,
+        )];
+        spans.extend(line.spans);
+        spans.push(Span::styled(
+            format!("{}{}", " ".repeat(pad), theme::BOX_VERTICAL),
+            border_style,
+        ));
+        lines.push(Line::from(spans));
+    }
+    let bottom = format!(
+        "{indent_str}{}{}{}",
+        theme::BOX_BOTTOM_LEFT,
+        theme::SEPARATOR.repeat(inner_w),
+        theme::BOX_BOTTOM_RIGHT,
+    );
+    lines.push(Line::from(Span::styled(bottom, border_style)));
+    lines
 }
 
 /// Display *rows* of tool output shown before collapsing. Row-aware
@@ -551,13 +677,41 @@ impl HistoryCell {
                         let raw_lines: Vec<Line<'static>> = source
                             .lines()
                             .map(|l| {
-                                let text = line_utils::truncate_str_with_ellipsis(l, hard_cap);
-                                Line::from(Span::styled(text, style))
+                                let parsed = parse_ansi_line(l, style);
+                                line_utils::truncate_line_with_ellipsis(parsed, hard_cap)
                             })
                             .collect();
                         (raw_lines, style)
                     }
                 };
+
+                // Errors render boxed so failures stand out from successful
+                // tool calls. Skip the tree-end body prefix path entirely;
+                // the `✗ display_label` status line below the box keeps the
+                // visual link to the tool call.
+                if *is_error {
+                    let boxed = render_boxed_lines(
+                        body_lines,
+                        theme::error_style(),
+                        Some(" error "),
+                        width,
+                        2,
+                    );
+                    lines.extend(boxed);
+                    let (indicator, ind_style) = (theme::CROSS, theme::cross_style());
+                    let duration_str = match duration_ms {
+                        Some(ms) => {
+                            let secs_f = *ms as f64 / 1000.0;
+                            format!(" • {secs_f:.1}s")
+                        }
+                        None => String::new(),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {indicator} "), ind_style),
+                        Span::styled(format!("{display_label}{duration_str}"), theme::dim()),
+                    ]));
+                    return lines;
+                }
 
                 // Row-aware collapse: measure each logical line's post-wrap row
                 // cost so one stray long URL can't burst past the preview.
@@ -670,38 +824,15 @@ impl HistoryCell {
                 }
                 let border = theme::thinking_border_style();
                 let content_style = theme::reasoning_style();
-                let inner_w = (width as usize).saturating_sub(4);
-                let label = " thinking ";
-                let top_rule_len = inner_w.saturating_sub(label.len());
-                let top = format!(
-                    "{}{}{label}{}{}",
-                    theme::BOX_TOP_LEFT,
-                    theme::SEPARATOR.repeat(2),
-                    theme::SEPARATOR.repeat(top_rule_len),
-                    theme::BOX_TOP_RIGHT,
-                );
-                let mut lines = vec![Line::from(Span::styled(top, border))];
-                for l in text.lines() {
-                    let display = line_utils::truncate_str_to_width(l, inner_w);
-                    let display_len = unicode_width::UnicodeWidthStr::width(display);
-                    let pad = inner_w.saturating_sub(display_len);
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{} ", theme::BOX_VERTICAL), border),
-                        Span::styled(display.to_string(), content_style),
-                        Span::styled(
-                            format!("{}{}", " ".repeat(pad), theme::BOX_VERTICAL),
-                            border,
-                        ),
-                    ]));
-                }
-                let bottom = format!(
-                    "{}{}{}",
-                    theme::BOX_BOTTOM_LEFT,
-                    theme::SEPARATOR.repeat(inner_w + 2),
-                    theme::BOX_BOTTOM_RIGHT,
-                );
-                lines.push(Line::from(Span::styled(bottom, border)));
-                lines
+                let inner_w = (width as usize).saturating_sub(2).max(1);
+                let inner_lines: Vec<Line<'static>> = text
+                    .lines()
+                    .map(|l| {
+                        let display = line_utils::truncate_str_to_width(l, inner_w);
+                        Line::from(Span::styled(display.to_string(), content_style))
+                    })
+                    .collect();
+                render_boxed_lines(inner_lines, border, Some(" thinking "), width, 0)
             }
             HistoryCell::ToolStreaming {
                 lines: tool_lines, ..
@@ -724,12 +855,12 @@ impl HistoryCell {
                     } else {
                         theme::dim()
                     };
-                    let display = line_utils::truncate_str_with_ellipsis(line_text, hard_cap);
+                    let parsed = parse_ansi_line(line_text, style);
+                    let truncated = line_utils::truncate_line_with_ellipsis(parsed, hard_cap);
                     let prefix = if *is_stderr { "! " } else { "\u{2502} " };
-                    rendered.push(Line::from(vec![
-                        Span::styled(format!("  {prefix}"), style),
-                        Span::styled(display, style),
-                    ]));
+                    let mut spans = vec![Span::styled(format!("  {prefix}"), style)];
+                    spans.extend(truncated.spans);
+                    rendered.push(Line::from(spans));
                 }
                 rendered
             }
@@ -1546,6 +1677,141 @@ mod tests {
         assert_eq!(line.spans[1].style.fg, Some(ratatui::style::Color::White));
         // Description stays dim — no bold/white on the slash in "Write/append"
         assert_eq!(line.spans[2].style, theme::dim());
+    }
+
+    #[test]
+    fn parse_ansi_line_extracts_colors() {
+        // Red SGR around "error", reset, then plain text.
+        let raw = "\x1b[31merror\x1b[0m: failed";
+        let line = parse_ansi_line(raw, theme::dim());
+        // Should produce ≥2 spans with the first one carrying red fg.
+        assert!(line.spans.len() >= 2, "spans: {:?}", line.spans);
+        let red_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("error"))
+            .expect("error span");
+        // Must have an explicit fg that is NOT the Reset sentinel — that's
+        // the contract the dim-fallback merging relies on.
+        assert!(
+            red_span.style.fg.is_some() && red_span.style.fg != Some(ratatui::style::Color::Reset),
+            "expected explicit non-Reset fg on the colored span, got: {:?}",
+            red_span.style
+        );
+        // Trailing plain text should fall back to dim.
+        let plain = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("failed"))
+            .expect("plain span");
+        assert_eq!(plain.style.fg, theme::dim().fg);
+    }
+
+    #[test]
+    fn parse_ansi_line_strips_non_sgr_escapes() {
+        // Hostile sequence: clear-screen + cursor-home embedded in output.
+        // Must not survive into span text or it'll repaint the terminal.
+        let raw = "safe\x1b[2J\x1b[Hhostile";
+        let line = parse_ansi_line(raw, theme::dim());
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!joined.contains('\x1b'), "ESC byte leaked: {joined:?}");
+        assert!(joined.contains("safe"));
+        assert!(joined.contains("hostile"));
+    }
+
+    #[test]
+    fn parse_ansi_line_no_escapes_uses_fallback() {
+        let line = parse_ansi_line("plain output", theme::error_style());
+        let all: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(all, "plain output");
+        assert_eq!(line.spans[0].style.fg, theme::error_style().fg);
+    }
+
+    #[test]
+    fn render_tool_result_error_is_boxed() {
+        let cell = HistoryCell::ToolResult {
+            output: "boom".to_string(),
+            is_error: true,
+            duration_ms: Some(50),
+            display_label: "Ran `false`".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        let lines = cell.render(40, None);
+        // First line should be the box top, last meaningful body row uses │,
+        // bottom rule precedes the status line.
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(first.contains(theme::BOX_TOP_LEFT), "first: {first}");
+        assert!(first.contains(theme::BOX_TOP_RIGHT));
+        let has_vertical = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.contains(theme::BOX_VERTICAL))
+        });
+        assert!(has_vertical, "expected box side glyphs in body");
+        let has_bottom = lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.contains(theme::BOX_BOTTOM_LEFT))
+        });
+        assert!(has_bottom);
+        // Status line still shows the cross + label.
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(all.contains(theme::CROSS));
+        assert!(all.contains("Ran `false`"));
+    }
+
+    #[test]
+    fn render_boxed_lines_all_rows_equal_width() {
+        // Regression for the off-by-one width-math bug in `render_boxed_lines`:
+        // top, body, and bottom rows must all render at exactly `width` cells
+        // so the box rules align vertically. Tests indent=0 (Thinking) and
+        // indent=2 (boxed error ToolResult).
+        for indent in [0usize, 2] {
+            let inner = vec![
+                Line::from(Span::raw("hi")),
+                Line::from(Span::raw("longer body line here")),
+                Line::from(Span::raw("")),
+            ];
+            for width in [40u16, 60, 80] {
+                let lines = render_boxed_lines(
+                    inner.clone(),
+                    theme::error_style(),
+                    Some(" error "),
+                    width,
+                    indent,
+                );
+                let widths: Vec<usize> = lines.iter().map(line_utils::line_width).collect();
+                let target = width as usize;
+                assert!(
+                    widths.iter().all(|w| *w == target),
+                    "width={width} indent={indent} → row widths {widths:?} should all equal {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_tool_result_success_not_boxed() {
+        // Sanity: success path still uses the tree-end prefix, not a box.
+        let cell = HistoryCell::ToolResult {
+            output: "ok".to_string(),
+            is_error: false,
+            duration_ms: Some(10),
+            display_label: "Ran".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        let lines = cell.render(40, None);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(!first.contains(theme::BOX_TOP_LEFT));
+        assert!(first.contains(theme::TREE_END));
     }
 
     #[test]

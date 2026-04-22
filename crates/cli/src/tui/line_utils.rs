@@ -18,6 +18,83 @@ pub fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
+/// Truncate a styled line so its display width does not exceed `max_width`.
+/// Preserves span styles and stops at grapheme-correct char boundaries.
+/// Used by `render_boxed_lines` so over-long inputs can't burst the box.
+pub fn truncate_line_to_width(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if max_width == 0 {
+        return Line::from(Vec::<Span<'static>>::new());
+    }
+    let Line {
+        style,
+        alignment,
+        spans,
+    } = line;
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+
+    for span in spans {
+        let span_w = UnicodeWidthStr::width(span.content.as_ref());
+        if span_w == 0 {
+            out.push(span);
+            continue;
+        }
+        if used >= max_width {
+            break;
+        }
+        if used + span_w <= max_width {
+            used += span_w;
+            out.push(span);
+            continue;
+        }
+        let style_span = span.style;
+        let text = span.content.as_ref();
+        let mut end = 0usize;
+        for (idx, ch) in text.char_indices() {
+            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + ch_w > max_width {
+                break;
+            }
+            end = idx + ch.len_utf8();
+            used += ch_w;
+        }
+        if end > 0 {
+            out.push(Span::styled(text[..end].to_string(), style_span));
+        }
+        break;
+    }
+
+    Line {
+        style,
+        alignment,
+        spans: out,
+    }
+}
+
+/// Truncate `line` to `max_width` with a trailing `…` when it overflows.
+/// Fast path: if the line already fits, return it unchanged.
+pub fn truncate_line_with_ellipsis(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if max_width == 0 {
+        return Line::from(Vec::<Span<'static>>::new());
+    }
+    if line_width(&line) <= max_width {
+        return line;
+    }
+    let truncated = truncate_line_to_width(line, max_width.saturating_sub(1));
+    let Line {
+        style,
+        alignment,
+        mut spans,
+    } = truncated;
+    let ellipsis_style = spans.last().map(|s| s.style).unwrap_or_default();
+    spans.push(Span::styled("…", ellipsis_style));
+    Line {
+        style,
+        alignment,
+        spans,
+    }
+}
+
 /// Truncate a plain `&str` to `max_width` display columns (grapheme-safe,
 /// width-aware). Returns a borrowed slice pointing at a char boundary.
 pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
@@ -35,15 +112,6 @@ pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
         used += ch_w;
     }
     &s[..end]
-}
-
-/// Truncate a plain string to `max_width` columns with an appended `…` on overflow.
-pub fn truncate_str_with_ellipsis(s: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(s) <= max_width {
-        return s.to_string();
-    }
-    let head = truncate_str_to_width(s, max_width.saturating_sub(1));
-    format!("{head}…")
 }
 
 /// Compact pretty-printed JSON into a single line with spaces after `:` and
@@ -126,15 +194,15 @@ mod tests {
     }
 
     #[test]
-    fn truncate_str_with_ellipsis_adds_marker() {
-        let out = truncate_str_with_ellipsis("alpha beta gamma", 9);
-        assert!(out.ends_with('…'));
-        assert_eq!(UnicodeWidthStr::width(out.as_str()), 9);
-    }
-
-    #[test]
-    fn truncate_str_short_input_unchanged() {
-        assert_eq!(truncate_str_with_ellipsis("hi", 10), "hi");
+    fn truncate_line_with_ellipsis_appends_marker() {
+        // Style preserved on the ellipsis so it inherits the colour of the
+        // last visible span (matters for truncated coloured tool output).
+        let red = ratatui::style::Style::default().fg(ratatui::style::Color::Red);
+        let l = Line::from(vec![Span::raw("ok "), Span::styled("ERROR MESSAGE", red)]);
+        let out = truncate_line_with_ellipsis(l, 6);
+        assert!(out.spans.last().unwrap().content.contains('…'));
+        assert_eq!(out.spans.last().unwrap().style, red);
+        assert_eq!(line_width(&out), 6);
     }
 
     #[test]

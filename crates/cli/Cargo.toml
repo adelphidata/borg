@@ -51,6 +51,7 @@ base64 = { workspace = true }
 syntect = { version = "5", default-features = false, features = [
     "default-fancy",
 ] }
+ansi-to-tui = "7"
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }

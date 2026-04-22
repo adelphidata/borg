@@ -1,4 +1,5 @@
 use ratatui::text::Span;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme;
 
@@ -55,6 +56,55 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+/// Truncate a `/`-separated path so the trailing segment (filename) stays
+/// intact and as many leading segments as fit are retained, joined to the
+/// tail by `/…/`. Falls back to end-truncate for non-path strings or when a
+/// single segment alone exceeds `max`.
+///
+/// Inspired by codex `text_formatting::center_truncate_path` — preserves the
+/// part of the path the user actually identifies the file by.
+fn truncate_path(s: &str, max: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if !s.contains('/') {
+        return truncate(s, max);
+    }
+    let segments: Vec<&str> = s.split('/').collect();
+    let last = *segments.last().unwrap_or(&"");
+    let last_w = UnicodeWidthStr::width(last);
+    // If the filename alone won't fit with the "…/" prefix, give up and
+    // end-truncate so we at least preserve the start.
+    if last_w + 2 >= max {
+        return truncate(s, max);
+    }
+    let separator = "/…/";
+    let sep_w = UnicodeWidthStr::width(separator);
+    // Greedy: take leading segments until adding another would overflow.
+    let mut head = String::new();
+    let budget = max.saturating_sub(last_w + sep_w);
+    for seg in segments.iter().take(segments.len().saturating_sub(1)) {
+        let candidate_w = if head.is_empty() {
+            UnicodeWidthStr::width(*seg)
+        } else {
+            UnicodeWidthStr::width(head.as_str()) + 1 + UnicodeWidthStr::width(*seg)
+        };
+        if candidate_w > budget {
+            break;
+        }
+        if !head.is_empty() {
+            head.push('/');
+        }
+        head.push_str(seg);
+    }
+    if head.is_empty() {
+        // Couldn't fit any leading segment — show "…/filename" instead.
+        format!("…/{last}")
+    } else {
+        format!("{head}{separator}{last}")
     }
 }
 
@@ -220,7 +270,7 @@ pub fn tool_detail_line(cat: &ToolDisplayCategory) -> Option<Vec<Span<'static>>>
                     }
                     ExploreEntry::List(path) => {
                         spans.push(Span::styled("List ", cyan));
-                        spans.push(Span::styled(path.clone(), dim));
+                        spans.push(Span::styled(truncate_path(path, 60), dim));
                     }
                 }
             }
@@ -230,7 +280,14 @@ pub fn tool_detail_line(cat: &ToolDisplayCategory) -> Option<Vec<Span<'static>>>
             if *count == 0 {
                 return None;
             }
-            let names = files.join(", ");
+            // Per-file center-truncate so deep paths still expose the
+            // filename — `crates/.../foo.rs` instead of `crates/core/...`.
+            let per_file_max = if *count == 1 { 64 } else { 32 };
+            let names = files
+                .iter()
+                .map(|f| truncate_path(f, per_file_max))
+                .collect::<Vec<_>>()
+                .join(", ");
             Some(vec![Span::styled(
                 format!("{names} ({count} file(s))"),
                 dim,
@@ -660,5 +717,54 @@ mod tests {
         let result = truncate("a]very long string here", 10);
         assert!(result.ends_with("..."));
         assert!(result.chars().count() <= 10);
+    }
+
+    // -- truncate_path --
+
+    #[test]
+    fn truncate_path_short_unchanged() {
+        assert_eq!(truncate_path("src/main.rs", 40), "src/main.rs");
+    }
+
+    #[test]
+    fn truncate_path_preserves_filename() {
+        let p = "crates/cli/src/tui/tool_display.rs";
+        let out = truncate_path(p, 25);
+        assert!(out.ends_with("tool_display.rs"), "got: {out}");
+        assert!(out.contains("/…/"), "should mark elided middle, got: {out}");
+        assert!(
+            out.chars().count() <= 25,
+            "got len {}: {out}",
+            out.chars().count()
+        );
+    }
+
+    #[test]
+    fn truncate_path_falls_back_when_filename_too_long() {
+        // Filename alone (`extremely_long_filename.rs` = 26 chars) doesn't fit
+        // in max=15; fall back to end-truncate so we at least preserve the
+        // start of the original string.
+        let out = truncate_path("a/b/extremely_long_filename.rs", 15);
+        assert!(out.ends_with("..."), "should end-truncate, got: {out}");
+        assert_eq!(out.chars().count(), 15);
+    }
+
+    #[test]
+    fn truncate_path_no_slash_falls_back() {
+        let out = truncate_path("just_a_file_name_with_no_slash.rs", 12);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 12);
+    }
+
+    #[test]
+    fn truncate_path_keeps_at_least_one_leading_segment() {
+        // 60 chars budget should fit 'crates' + '/…/' + 'tool_display.rs' (25)
+        let p = "crates/cli/src/tui/sub/deeper/tool_display.rs";
+        let out = truncate_path(p, 30);
+        assert!(out.ends_with("tool_display.rs"));
+        assert!(
+            out.starts_with("crates"),
+            "leading segment kept, got: {out}"
+        );
     }
 }

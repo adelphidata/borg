@@ -4,6 +4,43 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::Frame;
 use throbber_widgets_tui::{Throbber, BRAILLE_EIGHT};
+use unicode_width::UnicodeWidthStr;
+
+/// One footer hint with a drop-priority. Higher = keep longer when the
+/// terminal narrows. Hints render in original (insertion) order; the
+/// width-fitter drops the lowest-priority entries first.
+struct FooterHint {
+    text: String,
+    priority: u8,
+}
+
+const HINT_SEP: &str = "  •  ";
+
+/// Greedy width-aware fit: keep dropping the lowest-priority hint until
+/// the rendered string (including ` • ` separators) fits in `available`.
+/// Hints render in their original order.
+fn fit_footer_hints(mut hints: Vec<FooterHint>, available: usize) -> String {
+    loop {
+        let rendered = hints
+            .iter()
+            .map(|h| h.text.as_str())
+            .collect::<Vec<_>>()
+            .join(HINT_SEP);
+        if hints.is_empty() || UnicodeWidthStr::width(rendered.as_str()) <= available {
+            return rendered;
+        }
+        // Drop the lowest-priority hint (ties: drop the rightmost).
+        let mut victim = 0usize;
+        let mut worst = u8::MAX;
+        for (i, h) in hints.iter().enumerate() {
+            if h.priority <= worst {
+                worst = h.priority;
+                victim = i;
+            }
+        }
+        hints.remove(victim);
+    }
+}
 
 use super::super::history::HistoryCell;
 use super::super::{layout, shimmer, theme};
@@ -281,35 +318,125 @@ impl<'a> App<'a> {
             return;
         }
 
-        let left = match &self.state {
-            AppState::Idle if matches!(self.backtrack, BacktrackPhase::Selecting { .. }) => {
-                "↑/↓ select message  •  enter to rewind  •  esc to cancel".to_string()
-            }
-            AppState::Idle if self.last_turn_errored && !self.queued_messages.is_empty() => {
-                "enter to resume queue  •  esc to clear queue".to_string()
-            }
+        // Hint priorities (higher = keep longer when terminal narrows):
+        //   100 = critical action keys (esc to cancel, y/n approval)
+        //    90 = primary state action (enter to confirm/resume/rewind)
+        //    80 = secondary action (queue count, edit last)
+        //    50 = mode label / state-bound info
+        //    40 = `? for shortcuts`
+        //    30 = `quit to exit`
+        //    20 = `esc to rewind`
+        let hints: Vec<FooterHint> = match &self.state {
+            AppState::Idle if matches!(self.backtrack, BacktrackPhase::Selecting { .. }) => vec![
+                FooterHint {
+                    text: "↑/↓ select message".into(),
+                    priority: 90,
+                },
+                FooterHint {
+                    text: "enter to rewind".into(),
+                    priority: 90,
+                },
+                FooterHint {
+                    text: "esc to cancel".into(),
+                    priority: 100,
+                },
+            ],
+            AppState::Idle if self.last_turn_errored && !self.queued_messages.is_empty() => vec![
+                FooterHint {
+                    text: "enter to resume queue".into(),
+                    priority: 90,
+                },
+                FooterHint {
+                    text: "esc to clear queue".into(),
+                    priority: 100,
+                },
+            ],
             AppState::Idle
                 if self.config.conversation.collaboration_mode == CollaborationMode::Plan =>
             {
-                "[plan]  •  shift+tab to toggle off  •  ? for shortcuts".to_string()
+                vec![
+                    FooterHint {
+                        text: "[plan]".into(),
+                        priority: 50,
+                    },
+                    FooterHint {
+                        text: "shift+tab to toggle off".into(),
+                        priority: 90,
+                    },
+                    FooterHint {
+                        text: "? for shortcuts".into(),
+                        priority: 40,
+                    },
+                ]
             }
-            AppState::Idle if self.composer.is_empty() => {
-                "esc to rewind  •  ? for shortcuts  •  quit to exit".to_string()
-            }
-            AppState::Idle => {
-                "? for shortcuts  •  pgup/pgdn to scroll  •  quit to exit".to_string()
-            }
+            AppState::Idle if self.composer.is_empty() => vec![
+                FooterHint {
+                    text: "esc to rewind".into(),
+                    priority: 20,
+                },
+                FooterHint {
+                    text: "? for shortcuts".into(),
+                    priority: 40,
+                },
+                FooterHint {
+                    text: "quit to exit".into(),
+                    priority: 30,
+                },
+            ],
+            AppState::Idle => vec![
+                FooterHint {
+                    text: "? for shortcuts".into(),
+                    priority: 40,
+                },
+                FooterHint {
+                    text: "pgup/pgdn to scroll".into(),
+                    priority: 30,
+                },
+                FooterHint {
+                    text: "quit to exit".into(),
+                    priority: 30,
+                },
+            ],
             AppState::Streaming { .. } => {
                 let count = self.queued_messages.len();
                 if count > 0 {
-                    format!(
-                        "esc to cancel (queue preserved)  •  alt+↑ edit last  •  ({count} queued)"
-                    )
+                    vec![
+                        FooterHint {
+                            text: "esc to cancel (queue preserved)".into(),
+                            priority: 100,
+                        },
+                        FooterHint {
+                            text: "alt+↑ edit last".into(),
+                            priority: 50,
+                        },
+                        FooterHint {
+                            text: format!("({count} queued)"),
+                            priority: 80,
+                        },
+                    ]
                 } else {
-                    "esc to cancel  •  enter to queue".to_string()
+                    vec![
+                        FooterHint {
+                            text: "esc to cancel".into(),
+                            priority: 100,
+                        },
+                        FooterHint {
+                            text: "enter to queue".into(),
+                            priority: 80,
+                        },
+                    ]
                 }
             }
-            AppState::AwaitingApproval { .. } => "y to approve  •  n to deny".to_string(),
+            AppState::AwaitingApproval { .. } => vec![
+                FooterHint {
+                    text: "y to approve".into(),
+                    priority: 100,
+                },
+                FooterHint {
+                    text: "n to deny".into(),
+                    priority: 100,
+                },
+            ],
             AppState::AwaitingInput {
                 prompt,
                 choices,
@@ -317,32 +444,121 @@ impl<'a> App<'a> {
                 allow_custom,
                 ..
             } => {
+                let prompt_hint = FooterHint {
+                    text: format!("[{prompt}]"),
+                    priority: 50,
+                };
                 if !choices.is_empty() && !*custom_mode {
-                    let tab_hint = if *allow_custom {
-                        "  •  tab to type answer"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "↑/↓ select  •  1–{} quick pick  •  enter to confirm{tab_hint}  •  esc to skip  [{prompt}]",
-                        choices.len().min(9)
-                    )
+                    let mut h = vec![
+                        FooterHint {
+                            text: "↑/↓ select".into(),
+                            priority: 80,
+                        },
+                        FooterHint {
+                            text: format!("1–{} quick pick", choices.len().min(9)),
+                            priority: 70,
+                        },
+                        FooterHint {
+                            text: "enter to confirm".into(),
+                            priority: 90,
+                        },
+                    ];
+                    if *allow_custom {
+                        h.push(FooterHint {
+                            text: "tab to type answer".into(),
+                            priority: 60,
+                        });
+                    }
+                    h.push(FooterHint {
+                        text: "esc to skip".into(),
+                        priority: 100,
+                    });
+                    h.push(prompt_hint);
+                    h
                 } else if !choices.is_empty() && *custom_mode {
-                    format!(
-                        "type your answer  •  enter to send  •  esc back to options  [{prompt}]"
-                    )
+                    vec![
+                        FooterHint {
+                            text: "type your answer".into(),
+                            priority: 70,
+                        },
+                        FooterHint {
+                            text: "enter to send".into(),
+                            priority: 90,
+                        },
+                        FooterHint {
+                            text: "esc back to options".into(),
+                            priority: 100,
+                        },
+                        prompt_hint,
+                    ]
                 } else {
-                    format!("type your answer  •  enter to send  •  esc to skip  [{prompt}]")
+                    vec![
+                        FooterHint {
+                            text: "type your answer".into(),
+                            priority: 70,
+                        },
+                        FooterHint {
+                            text: "enter to send".into(),
+                            priority: 90,
+                        },
+                        FooterHint {
+                            text: "esc to skip".into(),
+                            priority: 100,
+                        },
+                        prompt_hint,
+                    ]
                 }
             }
-            AppState::PlanReview => {
-                "shift+tab: cycle  •  1-3: jump  •  enter: confirm  •  esc: dismiss".to_string()
-            }
-            AppState::ConfirmingUninstall => "y to uninstall  •  N / enter to cancel".to_string(),
-            AppState::TranscriptPager => {
-                "↑/↓ scroll  •  pgup/pgdn jump  •  / search  •  n/N navigate  •  q close"
-                    .to_string()
-            }
+            AppState::PlanReview => vec![
+                FooterHint {
+                    text: "shift+tab: cycle".into(),
+                    priority: 80,
+                },
+                FooterHint {
+                    text: "1-3: jump".into(),
+                    priority: 60,
+                },
+                FooterHint {
+                    text: "enter: confirm".into(),
+                    priority: 90,
+                },
+                FooterHint {
+                    text: "esc: dismiss".into(),
+                    priority: 100,
+                },
+            ],
+            AppState::ConfirmingUninstall => vec![
+                FooterHint {
+                    text: "y to uninstall".into(),
+                    priority: 100,
+                },
+                FooterHint {
+                    text: "N / enter to cancel".into(),
+                    priority: 100,
+                },
+            ],
+            AppState::TranscriptPager => vec![
+                FooterHint {
+                    text: "↑/↓ scroll".into(),
+                    priority: 80,
+                },
+                FooterHint {
+                    text: "pgup/pgdn jump".into(),
+                    priority: 60,
+                },
+                FooterHint {
+                    text: "/ search".into(),
+                    priority: 70,
+                },
+                FooterHint {
+                    text: "n/N navigate".into(),
+                    priority: 50,
+                },
+                FooterHint {
+                    text: "q close".into(),
+                    priority: 100,
+                },
+            ],
         };
 
         let pct = self.compute_context_pct();
@@ -353,9 +569,16 @@ impl<'a> App<'a> {
         } else {
             theme::dim()
         };
+
+        // Reserve room for ` ctx NN%  •  ` on the left so hints can fit.
+        let prefix = format!(" ctx {pct}%");
+        let prefix_w = UnicodeWidthStr::width(prefix.as_str()) + UnicodeWidthStr::width(HINT_SEP);
+        let total_w = area.width as usize;
+        let available = total_w.saturating_sub(prefix_w);
+        let left = fit_footer_hints(hints, available);
         let line = Line::from(vec![
-            Span::styled(format!(" ctx {pct}%"), pct_style),
-            Span::styled(format!("  •  {left}"), theme::dim()),
+            Span::styled(prefix, pct_style),
+            Span::styled(format!("{HINT_SEP}{left}"), theme::dim()),
         ]);
         frame.render_widget(Paragraph::new(line), area);
     }
@@ -851,6 +1074,81 @@ mod tests {
             !rows[0].contains("should not be rendered"),
             "details must not bleed into the header row"
         );
+    }
+
+    #[test]
+    fn fit_footer_hints_keeps_all_when_room() {
+        let hints = vec![
+            FooterHint {
+                text: "alpha".into(),
+                priority: 50,
+            },
+            FooterHint {
+                text: "beta".into(),
+                priority: 90,
+            },
+        ];
+        let out = fit_footer_hints(hints, 80);
+        assert_eq!(out, "alpha  •  beta");
+    }
+
+    #[test]
+    fn fit_footer_hints_drops_lowest_priority_first() {
+        let hints = vec![
+            FooterHint {
+                text: "low".into(),
+                priority: 20,
+            },
+            FooterHint {
+                text: "high".into(),
+                priority: 100,
+            },
+            FooterHint {
+                text: "mid".into(),
+                priority: 50,
+            },
+        ];
+        // Total joined = "low  •  high  •  mid" = 20 cols. Cap at 14 forces
+        // a drop; the lowest-priority "low" must be the first to go.
+        let out = fit_footer_hints(hints, 14);
+        assert!(!out.contains("low"), "low should be dropped, got: {out}");
+        assert!(out.contains("high"));
+    }
+
+    #[test]
+    fn fit_footer_hints_preserves_original_order_after_drops() {
+        // Same input, two budgets:
+        // - 15 cols keeps `first` + `third` in original order; `drop me` (lowest
+        //   priority) is the one eliminated.
+        // - 5 cols keeps only `first` (priority 100).
+        let mk = || {
+            vec![
+                FooterHint {
+                    text: "first".into(),
+                    priority: 100,
+                },
+                FooterHint {
+                    text: "drop me".into(),
+                    priority: 10,
+                },
+                FooterHint {
+                    text: "third".into(),
+                    priority: 90,
+                },
+            ]
+        };
+        assert_eq!(fit_footer_hints(mk(), 15), "first  •  third");
+        assert_eq!(fit_footer_hints(mk(), 5), "first");
+    }
+
+    #[test]
+    fn fit_footer_hints_zero_budget_drops_everything() {
+        let hints = vec![FooterHint {
+            text: "anything".into(),
+            priority: 100,
+        }];
+        let out = fit_footer_hints(hints, 0);
+        assert_eq!(out, "");
     }
 
     #[test]
