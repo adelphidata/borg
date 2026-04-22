@@ -411,7 +411,7 @@ impl Config {
     pub fn resolve_provider(&self) -> Result<(Provider, String)> {
         let Some(provider_str) = self.llm.provider.as_deref() else {
             anyhow::bail!(
-                "No LLM provider configured. Run `borg init` to onboard, or set one explicitly with `borg settings set llm.provider <openrouter|openai|anthropic|gemini|deepseek|groq|ollama|claude-cli>` (or via the `/settings` popup in the TUI). Providers are never auto-detected."
+                "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one (OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Ollama, or Claude CLI). Borg won't guess."
             );
         };
         let provider = Provider::from_str(provider_str)?;
@@ -430,8 +430,7 @@ impl Config {
         }
 
         anyhow::bail!(
-            "API key not found for provider {provider}. Export {} (or {}) in the shell that launches borg, paste the key into the `/settings` popup under \"API key\", or run `borg settings set llm.api_key '{{\"source\":\"literal\",\"value\":\"<KEY>\"}}'`. Note: keys written to ~/.borg/.env are only picked up if that file existed when borg started — rerun borg after onboarding.",
-            self.llm.api_key_env,
+            "No API key found for {provider}. Open `/settings` in the TUI and paste your key under \"API key\", or export {} in your shell and restart borg.",
             provider.default_env_var()
         );
     }
@@ -472,15 +471,12 @@ impl Config {
                 }
             }
             if !keys.is_empty() {
-                let provider = if let Some(ref provider_str) = self.llm.provider {
-                    Provider::from_str(provider_str)?
-                } else {
-                    // Infer provider via resolve_provider; ignore errors since we have keys
-                    self.resolve_provider().map(|(p, _)| p).unwrap_or_else(|_| {
-                        warn!("Could not infer provider from config, defaulting to OpenRouter");
-                        Provider::OpenRouter
-                    })
+                let Some(ref provider_str) = self.llm.provider else {
+                    anyhow::bail!(
+                        "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one — Borg won't guess it from your API key."
+                    );
                 };
+                let provider = Provider::from_str(provider_str)?;
                 let provider = correct_provider_from_key(provider, &keys[0]);
                 return Ok((provider, keys));
             }

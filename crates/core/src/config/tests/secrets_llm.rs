@@ -364,29 +364,13 @@ fn resolve_provider_bails_when_unconfigured_no_silent_fallback() {
         .expect_err("must not auto-detect a provider when none is configured");
     let msg = format!("{err}");
     assert!(
-        msg.contains("No LLM provider configured"),
-        "error should explicitly say no provider is configured, got: {msg}"
+        msg.contains("No LLM provider selected"),
+        "error should explicitly say no provider is selected, got: {msg}"
     );
     assert!(
-        msg.contains("borg settings set llm.provider") || msg.contains("borg init"),
-        "error should point user at onboarding or settings, got: {msg}"
+        msg.contains("/settings") || msg.contains("/model"),
+        "error should point user at the TUI popups where they pick a provider, got: {msg}"
     );
-}
-
-/// The headline regression: even with Ollama happily running on localhost,
-/// resolve_provider returns Err — never Ok((Provider::Ollama, _)).
-/// This is the exact failure mode the user hit after onboarding OpenRouter.
-#[test]
-fn resolve_provider_never_silently_returns_ollama() {
-    let mut cfg = Config::default();
-    cfg.llm.provider = None;
-    // Regardless of whether 127.0.0.1:11434 would answer, the result must be Err.
-    if let Ok((p, _)) = cfg.resolve_provider() {
-        panic!(
-            "resolve_provider must error when provider is unset, got Ok({p:?}) — \
-             Ollama auto-promotion by TCP probe was the bug"
-        );
-    }
 }
 
 /// When the provider IS configured but the API key env var isn't exported,
@@ -437,6 +421,33 @@ fn resolve_api_keys_bails_when_provider_unconfigured() {
     assert!(
         result.is_err(),
         "resolve_api_keys must error when no provider is configured, got {result:?}"
+    );
+}
+
+/// Second bail path in resolve_api_keys: `api_keys` populated but `provider`
+/// is None. Previously defaulted silently to OpenRouter — that's the same
+/// "guess a provider the user didn't pick" antipattern the incident fixed.
+#[test]
+fn resolve_api_keys_bails_when_keys_set_but_provider_unconfigured() {
+    let env_name = "BORG_TEST_API_KEYS_NO_PROVIDER_BAIL";
+    std::env::set_var(env_name, "sk-or-v1-test");
+
+    let mut cfg = Config::default();
+    cfg.llm.provider = None;
+    cfg.llm.api_keys = vec![SecretRef::Env {
+        var: env_name.to_string(),
+    }];
+
+    let err = cfg
+        .resolve_api_keys()
+        .expect_err("must not infer provider from a key when none is configured");
+    let msg = format!("{err}");
+
+    std::env::remove_var(env_name);
+
+    assert!(
+        msg.to_lowercase().contains("provider"),
+        "error should mention the missing provider, got: {msg}"
     );
 }
 
