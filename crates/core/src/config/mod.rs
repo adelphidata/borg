@@ -398,45 +398,42 @@ impl Config {
         })
     }
 
-    /// Resolve the provider and API key from config + environment.
-    /// Resolution priority: api_key (SecretRef) → api_key_env → provider default env var → auto-detect.
+    /// Resolve the provider and API key from config.
+    ///
+    /// Strict: `llm.provider` MUST be set (via onboarding, `/settings`, `/model`,
+    /// or `borg settings set llm.provider <name>`). There is no auto-detection
+    /// or TCP-probe fallback — the provider is always the one the user chose,
+    /// never inferred from which API keys happen to be in the environment or
+    /// which local daemons happen to be listening.
+    ///
+    /// API key resolution order for the configured provider:
+    /// `llm.api_key` SecretRef → `llm.api_key_env` env var → provider's default env var.
     pub fn resolve_provider(&self) -> Result<(Provider, String)> {
-        if let Some(ref provider_str) = self.llm.provider {
-            let provider = Provider::from_str(provider_str)?;
-
-            // Keyless providers (e.g., Ollama) don't need API key resolution.
-            if !provider.requires_api_key() {
-                return Ok((provider, String::new()));
-            }
-
-            if let Some(key) = self
-                .try_resolve_api_key_secret_ref("api_key_env")
-                .or_else(|| try_resolve_env(&self.llm.api_key_env))
-                .or_else(|| try_resolve_env(provider.default_env_var()))
-            {
-                return Ok((provider, key));
-            }
-
+        let Some(provider_str) = self.llm.provider.as_deref() else {
             anyhow::bail!(
-                "API key not found for provider {provider}. Set {} or {} or configure api_key in config.toml.",
-                self.llm.api_key_env,
-                provider.default_env_var()
+                "No LLM provider configured. Run `borg init` to onboard, or set one explicitly with `borg settings set llm.provider <openrouter|openai|anthropic|gemini|deepseek|groq|ollama|claude-cli>` (or via the `/settings` popup in the TUI). Providers are never auto-detected."
             );
+        };
+        let provider = Provider::from_str(provider_str)?;
+
+        // Keyless providers (e.g., Ollama, Claude CLI) don't need API key resolution.
+        if !provider.requires_api_key() {
+            return Ok((provider, String::new()));
         }
 
-        // Auto-detect path: no provider set. Use any resolvable SecretRef or
-        // non-default env var and infer the provider from the env var name.
-        if let Some(key) = self.try_resolve_api_key_secret_ref("env detection") {
-            return Ok((self.infer_provider_from_env_name(), key));
+        if let Some(key) = self
+            .try_resolve_api_key_secret_ref("api_key_env")
+            .or_else(|| try_resolve_env(&self.llm.api_key_env))
+            .or_else(|| try_resolve_env(provider.default_env_var()))
+        {
+            return Ok((provider, key));
         }
 
-        if self.llm.api_key_env != LlmConfig::default().api_key_env {
-            if let Some(key) = try_resolve_env(&self.llm.api_key_env) {
-                return Ok((self.infer_provider_from_env_name(), key));
-            }
-        }
-
-        Provider::detect_from_env()
+        anyhow::bail!(
+            "API key not found for provider {provider}. Export {} (or {}) in the shell that launches borg, paste the key into the `/settings` popup under \"API key\", or run `borg settings set llm.api_key '{{\"source\":\"literal\",\"value\":\"<KEY>\"}}'`. Note: keys written to ~/.borg/.env are only picked up if that file existed when borg started — rerun borg after onboarding.",
+            self.llm.api_key_env,
+            provider.default_env_var()
+        );
     }
 
     /// Try to resolve `self.llm.api_key` via its `SecretRef`. Logs a warning
@@ -458,18 +455,6 @@ impl Config {
                 None
             }
         }
-    }
-
-    /// Best-effort provider inference from `api_key_env`, defaulting to
-    /// OpenRouter with a warning when no match is found.
-    fn infer_provider_from_env_name(&self) -> Provider {
-        Provider::from_env_var_name(&self.llm.api_key_env).unwrap_or_else(|| {
-            warn!(
-                "Could not infer provider from api_key_env '{}', defaulting to OpenRouter",
-                self.llm.api_key_env
-            );
-            Provider::OpenRouter
-        })
     }
 
     /// Resolve all available API keys for the configured provider.

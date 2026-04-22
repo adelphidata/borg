@@ -20,17 +20,6 @@ pub enum Provider {
     ClaudeCli,
 }
 
-/// Priority order for cloud API key auto-detection.
-/// Ollama is excluded — it's detected separately via TCP probe.
-const DETECT_ORDER: &[Provider] = &[
-    Provider::OpenRouter,
-    Provider::OpenAi,
-    Provider::Anthropic,
-    Provider::Gemini,
-    Provider::DeepSeek,
-    Provider::Groq,
-];
-
 impl Provider {
     /// API base URL for this provider.
     pub fn base_url(&self) -> &'static str {
@@ -107,37 +96,6 @@ impl Provider {
         }
 
         Ok(headers)
-    }
-
-    /// Auto-detect provider from environment variables. Checks cloud providers first,
-    /// then falls back to Ollama if reachable locally.
-    pub fn detect_from_env() -> Result<(Provider, String)> {
-        for provider in DETECT_ORDER {
-            if let Ok(key) = std::env::var(provider.default_env_var()) {
-                if !key.is_empty() {
-                    return Ok((*provider, key));
-                }
-            }
-        }
-
-        // Check for Claude CLI with valid OAuth auth
-        if crate::claude_cli::has_valid_auth() {
-            return Ok((Provider::ClaudeCli, String::new()));
-        }
-
-        // Fall back to Ollama if running locally
-        if Provider::ollama_available() {
-            return Ok((Provider::Ollama, String::new()));
-        }
-
-        bail!(
-            "No API key found. Set one of: {}, or run `ollama serve` for local inference, or install Claude Code for subscription access",
-            DETECT_ORDER
-                .iter()
-                .map(Provider::default_env_var)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
     }
 
     /// Strip vendor prefixes for direct providers (e.g., "anthropic/claude-sonnet-4" → "claude-sonnet-4").
@@ -232,22 +190,6 @@ impl Provider {
         }
     }
 
-    /// Infer provider from an environment variable name.
-    /// Returns `None` for unrecognized variable names.
-    pub fn from_env_var_name(name: &str) -> Option<Provider> {
-        match name {
-            "OPENROUTER_API_KEY" => Some(Provider::OpenRouter),
-            "OPENAI_API_KEY" => Some(Provider::OpenAi),
-            "ANTHROPIC_API_KEY" => Some(Provider::Anthropic),
-            "GEMINI_API_KEY" => Some(Provider::Gemini),
-            "DEEPSEEK_API_KEY" => Some(Provider::DeepSeek),
-            "GROQ_API_KEY" => Some(Provider::Groq),
-            "OLLAMA_HOST" => Some(Provider::Ollama),
-            "CLAUDE_CLI_PATH" => Some(Provider::ClaudeCli),
-            _ => None,
-        }
-    }
-
     /// Infer the provider from an API key's distinctive prefix.
     ///
     /// Returns `Some(provider)` only when the prefix is unambiguous
@@ -317,16 +259,21 @@ mod tests {
 
     #[test]
     fn from_str_round_trip() {
-        for provider in DETECT_ORDER {
+        let all = [
+            Provider::OpenRouter,
+            Provider::OpenAi,
+            Provider::Anthropic,
+            Provider::Gemini,
+            Provider::DeepSeek,
+            Provider::Groq,
+            Provider::Ollama,
+            Provider::ClaudeCli,
+        ];
+        for provider in &all {
             let s = provider.as_str();
             let parsed = Provider::from_str(s).unwrap();
             assert_eq!(parsed, *provider);
         }
-        // Ollama is not in DETECT_ORDER, test separately
-        assert_eq!(
-            Provider::from_str(Provider::Ollama.as_str()).unwrap(),
-            Provider::Ollama
-        );
     }
 
     #[test]
@@ -353,10 +300,9 @@ mod tests {
         assert!(Provider::from_str("unknown").is_err());
     }
 
-    // Note: detect_from_env tests are omitted because std::env::set_var/remove_var
-    // is not thread-safe and causes flaky failures in parallel test execution.
-    // The detection logic is simple enough to verify by inspection, and is covered
-    // by integration testing (setting env vars and running the binary).
+    // detect_from_env / from_env_var_name were removed along with provider auto-detection.
+    // Provider is now strictly sourced from `Config.llm.provider` (set via onboarding,
+    // `/settings`, or `borg settings set llm.provider <name>`). See config::resolve_provider.
 
     #[test]
     fn normalize_model_strips_prefix() {
@@ -552,19 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn from_env_var_name_round_trip() {
-        for provider in DETECT_ORDER {
-            let env_var = provider.default_env_var();
-            assert_eq!(Provider::from_env_var_name(env_var), Some(*provider));
-        }
-        assert_eq!(
-            Provider::from_env_var_name("OLLAMA_HOST"),
-            Some(Provider::Ollama)
-        );
-        assert_eq!(Provider::from_env_var_name("UNKNOWN_KEY"), None);
-    }
-
-    #[test]
     fn ollama_supports_vision() {
         assert!(Provider::Ollama.supports_vision("llava"));
         assert!(Provider::Ollama.supports_vision("llama3.2-vision"));
@@ -642,14 +575,6 @@ mod tests {
         let headers = Provider::ClaudeCli.build_headers("").unwrap();
         assert!(headers.get("Authorization").is_none());
         assert!(headers.get("x-api-key").is_none());
-    }
-
-    #[test]
-    fn claude_cli_from_env_var_name() {
-        assert_eq!(
-            Provider::from_env_var_name("CLAUDE_CLI_PATH"),
-            Some(Provider::ClaudeCli)
-        );
     }
 
     #[test]
