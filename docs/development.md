@@ -78,7 +78,7 @@ borg/
 │   │   │   ├── tool_policy.rs      # composable tool filtering (profiles, allow/deny)
 │   │   │   ├── tool_catalog.rs     # tool group definitions and profiles
 │   │   │   ├── session.rs          # session persistence + auto-titling
-│   │   │   ├── db/                 # SQLite database with versioned migrations (V33)
+│   │   │   ├── db/                 # SQLite database with versioned migrations (V39)
 │   │   │   ├── settings.rs         # two-tier settings resolver (DB -> defaults)
 │   │   │   ├── conversation.rs     # history compaction + normalization
 │   │   │   ├── policy.rs           # execution policy (approve/deny)
@@ -186,7 +186,7 @@ cp .env.example .env
 
 ## Database
 
-SQLite at `~/.borg/borg.db` with versioned migrations (currently V33). Key migrations:
+SQLite at `~/.borg/borg.db` with versioned migrations (currently V39). Key migrations:
 
 - **V1**: sessions, scheduled_tasks, task_runs, meta, token_usage
 - **V2**: messages table (crash recovery)
@@ -204,5 +204,11 @@ SQLite at `~/.borg/borg.db` with versioned migrations (currently V33). Key migra
 - **V31**: workflow engine — durable multi-step task orchestration + projects
 - **V32**: import config.toml into settings table, rename to .bak (DB-only config)
 - **V33**: pending celebrations outbox for async evolution message delivery
+- **V34**: import `~/.borg/MEMORY.md` + `memory/*.md` into `memory_entries` table (rename originals to `.bak`); seed nightly (3 AM) and weekly (4 AM Sunday) memory-consolidation scheduled tasks
+- **V35**: FTS5 index on `messages` for session search
+- **V36**: add `estimated_tokens` column to `memory_entries`
+- **V37**: `doctor_runs` table + daily `maintenance` scheduled task (02:00)
+- **V38**: settings registry validation
+- **V39**: `skill_audit` table (SHA-256 of user `SKILL.md` — post-install tamper detection)
 
 Schema version is tracked in the `meta` table; migrations run automatically on `Database::open()`.

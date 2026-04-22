@@ -20,9 +20,7 @@ Fifteen skills are embedded in the binary:
 | `discord` | `curl`, `DISCORD_BOT_TOKEN` | Send messages to Discord channels |
 | `github` | `gh` | Interact with GitHub (issues, PRs, repos) |
 | `weather` | `curl` | Get weather information |
-| `skill-creator` | -- | Meta-skill for creating new skills |
 | `git` | `git` | Git operations (commit, branch, diff, log) |
-| `email` | varies | Email operations |
 | `search` | `curl` | Web search integration |
 | `docker` | `docker` | Docker container management |
 | `database` | varies | SQL/database operations |
@@ -30,11 +28,13 @@ Fifteen skills are embedded in the binary:
 | `calendar` | varies | Calendar operations |
 | `1password` | `op` | 1Password secret management |
 | `browser` | varies | Web browser automation instructions |
+| `email` | varies | Email operations |
 | `scheduler` | -- | Scheduled task management |
+| `paperclip` | `npx`, `curl` | Orchestrate multi-agent autonomous companies via the Paperclip control plane |
 
 ## User skills
 
-User-created skills live at `~/.borg/skills/<name>/SKILL.md`. The agent creates these via the `apply_skill_patch` tool.
+User-created skills live at `~/.borg/skills/<name>/SKILL.md`. The agent creates these via `apply_patch` with `target: skills`.
 
 User skills with the same name as a built-in skill **override** the built-in version.
 
@@ -117,7 +117,7 @@ borg settings set skills.max_context_tokens 4000
 
 ## Creating a skill
 
-The agent can create skills during a conversation using `apply_skill_patch`:
+The agent can create skills during a conversation using `apply_patch` with `target: skills`:
 
 ```
 *** Begin Patch

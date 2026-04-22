@@ -69,7 +69,7 @@ The run is recorded to `doctor_runs`, and the table is capped at
 ### Disabling
 
 ```sh
-borg set maintenance.enabled false
+borg settings set maintenance.enabled false
 ```
 
 With `enabled = false` the task still fires but `run_daily_maintenance`

@@ -103,7 +103,7 @@ See [Configuration](../configuration.md#gateway) for details on the pairing syst
 ```toml
 [gateway]
 telegram_poll_timeout_secs = 30           # long-polling timeout
-telegram_circuit_failure_threshold = 5    # failures before circuit breaker trips
-telegram_circuit_suspension_secs = 60     # suspension after circuit break
-telegram_dedup_capacity = 10000           # dedup cache size
+telegram_circuit_failure_threshold = 10   # failures before circuit breaker trips
+telegram_circuit_suspension_secs = 300    # suspension after circuit break
+telegram_dedup_capacity = 1000            # dedup cache size
 ```

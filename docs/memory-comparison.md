@@ -10,15 +10,15 @@ Research comparison of three agent memory systems to understand strengths, weakn
 
 | Dimension | **Borg** (Rust) | **OpenClaw** (TypeScript) | **Hermes** (Python) |
 |-----------|-----------------|--------------------------|---------------------|
-| Storage | Markdown files + SQLite (embeddings, chunks, FTS5) | Markdown files + SQLite (embeddings, chunks, FTS5) | Markdown files (MEMORY.md, USER.md) + SQLite (sessions, FTS5) |
+| Storage | SQLite only — `memory_entries` + embedding cache + FTS5 (filesystem memory retired in V34) | Markdown files + SQLite (embeddings, chunks, FTS5) | Markdown files (MEMORY.md, USER.md) + SQLite (sessions, FTS5) |
 | Search | Hybrid: vector (70%) + BM25 (30%) + MMR diversity | Hybrid: vector + BM25 + MMR + temporal decay | FTS5 keyword only (built-in); HRR vectors via plugin |
-| Scoping | Global / local (per-CWD) / extra paths / scoped subdirs | Per-agent workspace | Two stores: MEMORY.md (agent notes) + USER.md (user profile) |
+| Scoping | `global` / `project:<id>` entries (scope + name unique per row) | Per-agent workspace | Two stores: MEMORY.md (agent notes) + USER.md (user profile) |
 | Capacity | Token-budgeted (default 8K tokens), unlimited files | Token-budgeted (model-aware), unlimited files | Hard char limits: 2,200 chars (memory) + 1,375 chars (user) |
 | Context loading | Ranked by embedding similarity, fallback to recency | Ranked by embedding similarity, fallback to recency | Frozen snapshot at session start, never updated mid-session |
 | Pre-compaction | LLM extracts durable facts -> daily/{date}.md | LLM flush with dedup (content hash gating) | `on_pre_compress` hook notifies providers; structured LLM summary |
 | Embedding providers | OpenAI -> OpenRouter -> Gemini (auto-detect) | OpenAI, Gemini, Voyage, Mistral, Ollama, local GGUF | None built-in; Holographic plugin uses deterministic SHA-256 phase vectors |
 | Write mechanism | `write_memory` tool (overwrite/append, scope param) | Agent writes markdown files directly | `memory` tool with add/replace/remove actions, substring matching |
-| File watching | `notify` crate, 1.5s debounce, auto re-embed | Chokidar, 1.5s debounce, auto re-index | None (files read at session start) |
+| File watching | n/a — DB-only (writes re-embed synchronously via `write_memory`) | Chokidar, 1.5s debounce, auto re-index | None (files read at session start) |
 
 ---
 

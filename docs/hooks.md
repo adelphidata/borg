@@ -33,6 +33,8 @@ Restart `borg`. Hooks are discovered at startup.
 | `PostToolUse` | After a tool call completes. Observer — exit code ignored. |
 | `Stop` | After a full agent turn completes. |
 
+Script hooks subscribe to these six events. The compiled-in `HookPoint` enum uses different names for two of them (`BeforeToolCall` = `PreToolUse`, `TurnComplete` = `Stop`) and adds three in-process-only variants (`BeforeLlmCall`, `AfterLlmResponse`, `OnError`) dispatched to compiled-in hooks (vitals, activity, bond, evolution) but not exposed to `hooks.json`.
+
 ## Handler config
 
 ```json
