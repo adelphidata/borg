@@ -581,20 +581,28 @@ impl Config {
         let service = format!("borg-{}", plugin_id.replace('/', "-"));
         let account = format!("borg-{key}");
 
-        let sr = crate::secrets_resolve::SecretRef::Keychain { service, account };
+        let sr = crate::secrets_resolve::SecretRef::Keychain {
+            service: service.clone(),
+            account: account.clone(),
+        };
         match sr.resolve() {
             Ok(v) if !v.is_empty() => {
                 tracing::info!(
                     "Resolved {key} from keychain fallback (credential ref missing from config)"
                 );
-                Some(v)
+                return Some(v);
             }
-            Ok(_) => None,
+            Ok(_) => {}
             Err(e) => {
                 tracing::debug!("Keychain fallback for {key} failed: {e}");
-                None
             }
         }
+
+        // Final fallback: the on-disk credentials file written by
+        // `borg_plugins::credential_store` when the keychain was unavailable
+        // at install time. Mirror of the same file format — kept inline so
+        // core does not take a hard dep on the plugins crate.
+        read_credentials_file(&service, &account)
     }
 
     /// Returns true if any native channel credentials are configured.
@@ -649,6 +657,27 @@ impl Config {
 /// and auto-detect API-key resolution paths need.
 fn try_resolve_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|v| !v.is_empty())
+}
+
+/// Read a credential from the on-disk fallback file
+/// (`~/.borg/.credentials.json`) written by the plugin installer when the OS
+/// keychain was unavailable. Mirror of `borg_plugins::credential_store::read`'s
+/// file branch — duplicated here to keep core free of a plugins dep.
+fn read_credentials_file(service: &str, account: &str) -> Option<String> {
+    let path = Config::data_dir().ok()?.join(".credentials.json");
+    if !path.exists() {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let value = json.get(service)?.get(account)?.as_str()?;
+    if value.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        "Resolved credential from ~/.borg/.credentials.json fallback (service={service})"
+    );
+    Some(value.to_string())
 }
 
 /// Override the configured provider when the API key's prefix points to a

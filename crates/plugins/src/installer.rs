@@ -121,9 +121,9 @@ pub fn uninstall(def: &PluginDef, data_dir: &std::path::Path) -> Result<()> {
     for cred in def.required_credentials {
         remove_credential(&service, cred.key);
         let account = credential_account(cred.key);
-        if crate::keychain::check(&service, &account) {
+        if crate::credential_store::check(&service, &account) {
             tracing::warn!(
-                "Keychain entry for {} still present after removal — may resurrect on restart",
+                "Credential entry for {} still present after removal — may resurrect on restart",
                 cred.key
             );
         }
@@ -135,7 +135,7 @@ pub fn uninstall(def: &PluginDef, data_dir: &std::path::Path) -> Result<()> {
 /// Check if an integration is already installed on the filesystem.
 ///
 /// For native integrations, checks that all required (non-optional) credentials
-/// are available via environment variable or OS keychain.
+/// are available via environment variable, OS keychain, or the credentials fallback file.
 pub fn is_installed(def: &PluginDef, _data_dir: &std::path::Path) -> bool {
     if def.is_native {
         return def.required_credentials.iter().all(|cred| {
@@ -147,7 +147,7 @@ pub fn is_installed(def: &PluginDef, _data_dir: &std::path::Path) -> bool {
                 .unwrap_or(false);
             let service = def.service_name();
             let account = credential_account(cred.key);
-            has_env || crate::keychain::check(&service, &account)
+            has_env || crate::credential_store::check(&service, &account)
         });
     }
 
@@ -254,12 +254,12 @@ fn credential_account(key: &str) -> String {
 
 fn store_credential(service: &str, key: &str, value: &str) -> Result<()> {
     let account = credential_account(key);
-    crate::keychain::store(service, &account, value)
+    crate::credential_store::store(service, &account, value)
 }
 
 fn remove_credential(service: &str, key: &str) {
     let account = credential_account(key);
-    crate::keychain::remove(service, &account);
+    crate::credential_store::remove(service, &account);
 }
 
 /// Post-install hook for iMessage: initialize state.json with current max ROWID

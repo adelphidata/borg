@@ -30,6 +30,8 @@
 
 /// Plugin catalog with built-in integration definitions.
 pub mod catalog;
+/// Credential storage: keychain primary, on-disk JSON fallback.
+pub mod credential_store;
 /// Plugin installer: credential prompts, template extraction, keychain storage.
 pub mod installer;
 /// OS keychain operations for storing plugin credentials.
