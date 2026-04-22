@@ -90,6 +90,11 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/save" => return Some(Ok(AppAction::SaveSession)),
+            "/export" => {
+                return Some(Ok(AppAction::ExportCurrentSession {
+                    format: borg_core::export::ExportFormat::Json,
+                }));
+            }
             "/new" => return Some(self.cmd_new()),
             "/resume" => {
                 self.push_system_message(
@@ -99,6 +104,19 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             _ => {}
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/export ") {
+            let arg = rest.trim();
+            match arg.parse::<borg_core::export::ExportFormat>() {
+                Ok(format) => {
+                    return Some(Ok(AppAction::ExportCurrentSession { format }));
+                }
+                Err(e) => {
+                    self.push_system_message(format!("Error: {e}\nUsage: /export [json|csv|txt]"));
+                    return Some(Ok(AppAction::Continue));
+                }
+            }
         }
 
         if let Some(rest) = trimmed.strip_prefix("/resume ") {
@@ -240,10 +258,11 @@ impl App<'_> {
              /pairing <code> - Approve (shortcut)\n  \
              /update    - Update borg to latest version\n\
              \n  \
-             /sessions  - Browse and load saved sessions\n  \
+             /sessions  - Browse and load saved sessions (press 'e' to export)\n  \
              /save      - Save current session\n  \
              /new       - Start new session\n  \
-             /resume <id> - Resume a saved session by id (prefix ok)\n\
+             /resume <id> - Resume a saved session by id (prefix ok)\n  \
+             /export [fmt] - Export current session (fmt: json|csv|txt, default json)\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
              /projects  - List projects\n  \

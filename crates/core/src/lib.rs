@@ -66,6 +66,8 @@ pub mod embeddings;
 pub mod error_format;
 /// Conversation evolution and personality drift.
 pub mod evolution;
+/// Session export (JSON / CSV / TXT) shared by CLI `borg export` and TUI `/export`.
+pub mod export;
 /// Task-local gateway origin context for tool handlers.
 pub mod gateway_context;
 /// Git utilities: ghost commits, context enrichment, turn diff tracking.

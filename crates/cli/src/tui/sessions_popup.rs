@@ -11,8 +11,10 @@ use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
 use super::theme;
 
+#[derive(Debug)]
 pub enum SessionAction {
     Load { id: String },
+    Export { id: String },
 }
 
 pub struct SessionsPopup {
@@ -81,6 +83,15 @@ impl SessionsPopup {
                     None
                 }
             }
+            KeyCode::Char('e') => {
+                if let Some(session) = self.sessions.get(self.cursor) {
+                    let id = session.id.clone();
+                    self.dismiss();
+                    Some(SessionAction::Export { id })
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -130,7 +141,7 @@ impl SessionsPopup {
         let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
         frame.render_widget(Paragraph::new(visible_lines), content_area);
 
-        popup_utils::render_footer(frame, inner, " Enter: load  Esc: close");
+        popup_utils::render_footer(frame, inner, " Enter: load  e: export (JSON)  Esc: close");
     }
 }
 
@@ -144,10 +155,13 @@ impl PopupHandler for SessionsPopup {
         key: crossterm::event::KeyEvent,
         _config: &mut Config,
     ) -> Result<Option<AppAction>> {
-        if let Some(SessionAction::Load { id }) = self.handle_key(key) {
-            Ok(Some(AppAction::LoadSession { id }))
-        } else {
-            Ok(None)
+        match self.handle_key(key) {
+            Some(SessionAction::Load { id }) => Ok(Some(AppAction::LoadSession { id })),
+            Some(SessionAction::Export { id }) => Ok(Some(AppAction::ExportSession {
+                id,
+                format: borg_core::export::ExportFormat::Json,
+            })),
+            None => Ok(None),
         }
     }
 }
@@ -216,9 +230,9 @@ mod tests {
     fn enter_loads_selected_session() {
         let mut popup = make_popup_with_sessions(3);
         let result = popup.handle_key(key(KeyCode::Enter));
-        assert!(result.is_some());
-        match result.unwrap() {
-            SessionAction::Load { id } => assert_eq!(id, "session-0"),
+        match result {
+            Some(SessionAction::Load { id }) => assert_eq!(id, "session-0"),
+            other => panic!("expected Load, got {other:?}"),
         }
     }
 
@@ -245,9 +259,30 @@ mod tests {
         let mut popup = make_popup_with_sessions(3);
         popup.handle_key(key(KeyCode::Down)); // cursor -> 1
         let result = popup.handle_key(key(KeyCode::Enter));
-        match result.unwrap() {
-            SessionAction::Load { id } => assert_eq!(id, "session-1"),
+        match result {
+            Some(SessionAction::Load { id }) => assert_eq!(id, "session-1"),
+            other => panic!("expected Load, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn e_key_exports_highlighted_session_and_dismisses() {
+        let mut popup = make_popup_with_sessions(3);
+        popup.handle_key(key(KeyCode::Down)); // cursor -> 1
+        let result = popup.handle_key(key(KeyCode::Char('e')));
+        match result {
+            Some(SessionAction::Export { id }) => assert_eq!(id, "session-1"),
+            other => panic!("expected Export, got {other:?}"),
+        }
+        assert!(!popup.is_visible(), "pressing 'e' should dismiss the popup");
+    }
+
+    #[test]
+    fn e_key_on_empty_returns_none() {
+        let mut popup = SessionsPopup::new();
+        popup.visible = true;
+        let result = popup.handle_key(key(KeyCode::Char('e')));
+        assert!(result.is_none());
     }
 
     #[test]

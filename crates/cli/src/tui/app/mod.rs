@@ -305,6 +305,15 @@ pub enum AppAction {
         question: String,
         snapshot: Vec<borg_core::types::Message>,
     },
+    /// Export a specific session by id (from the `/sessions` popup).
+    ExportSession {
+        id: String,
+        format: borg_core::export::ExportFormat,
+    },
+    /// Export the currently-loaded session (via `/export [format]`).
+    ExportCurrentSession {
+        format: borg_core::export::ExportFormat,
+    },
 }
 
 pub struct App<'a> {

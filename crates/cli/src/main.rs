@@ -205,6 +205,19 @@ enum Commands {
     },
     /// Permanently delete all Borg data and uninstall the service
     Uninstall,
+    /// Export a session to JSON (default), CSV, or TXT.
+    ///
+    /// With no `--output`, writes to stdout (pipeable into `jq`, files, etc.).
+    Export {
+        /// Session ID (full UUID — use `/sessions` in the TUI to find one).
+        session_id: String,
+        /// Output format: json (default), csv, txt.
+        #[arg(long, short, default_value = "json")]
+        format: String,
+        /// Write to a file instead of stdout.
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 /// Runtime worker thread stack size.
@@ -390,6 +403,11 @@ async fn async_main() -> Result<()> {
         Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action)?,
         Some(Commands::Update { dev, check }) => commands::misc::run_update(dev, check).await?,
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
+        Some(Commands::Export {
+            session_id,
+            format,
+            output,
+        }) => commands::export::run_export(&session_id, &format, output)?,
     }
 
     Ok(())
@@ -1027,5 +1045,68 @@ mod tests {
             }) => assert_eq!(id, "abc123"),
             _ => panic!("Expected Projects Archive"),
         }
+    }
+
+    // ── Export CLI parse tests ──
+
+    #[test]
+    fn test_parse_export_defaults_to_json_and_stdout() {
+        let cli = Cli::try_parse_from(["borg", "export", "sess-abc"]).unwrap();
+        match cli.command {
+            Some(Commands::Export {
+                session_id,
+                format,
+                output,
+            }) => {
+                assert_eq!(session_id, "sess-abc");
+                assert_eq!(format, "json");
+                assert!(output.is_none());
+            }
+            _ => panic!("Expected Export"),
+        }
+    }
+
+    #[test]
+    fn test_parse_export_csv_with_output() {
+        let cli = Cli::try_parse_from([
+            "borg",
+            "export",
+            "sess-abc",
+            "--format",
+            "csv",
+            "--output",
+            "/tmp/s.csv",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Export {
+                session_id,
+                format,
+                output,
+            }) => {
+                assert_eq!(session_id, "sess-abc");
+                assert_eq!(format, "csv");
+                assert_eq!(output.unwrap().to_str().unwrap(), "/tmp/s.csv");
+            }
+            _ => panic!("Expected Export"),
+        }
+    }
+
+    #[test]
+    fn test_parse_export_short_flags() {
+        let cli = Cli::try_parse_from(["borg", "export", "sess-xyz", "-f", "txt", "-o", "out.txt"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Export { format, output, .. }) => {
+                assert_eq!(format, "txt");
+                assert_eq!(output.unwrap().to_str().unwrap(), "out.txt");
+            }
+            _ => panic!("Expected Export"),
+        }
+    }
+
+    #[test]
+    fn test_parse_export_requires_session_id() {
+        assert!(Cli::try_parse_from(["borg", "export"]).is_err());
     }
 }

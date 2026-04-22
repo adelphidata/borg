@@ -500,6 +500,53 @@ fn drain_queued_if_idle(app: &mut App<'_>) -> Result<AppAction> {
     Ok(AppAction::Continue)
 }
 
+/// Write a session export to the current working directory and surface the
+/// result in the transcript. Errors (DB failure, file-system failure) are
+/// reported to the user — we never silently swallow.
+fn handle_export(app: &mut App<'_>, session_id: &str, format: borg_core::export::ExportFormat) {
+    let db = match borg_core::db::Database::open() {
+        Ok(db) => db,
+        Err(e) => {
+            app.push_system_message(format!("Export failed: {e}"));
+            return;
+        }
+    };
+    let (rendered, filename) = match borg_core::export::export_session(
+        &db,
+        session_id,
+        borg_core::export::ExportOptions { format },
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            app.push_system_message(format!("Export failed: {e}"));
+            return;
+        }
+    };
+    let path = match std::env::current_dir() {
+        Ok(cwd) => cwd.join(&filename),
+        Err(e) => {
+            app.push_system_message(format!("Export failed (cwd): {e}"));
+            return;
+        }
+    };
+    if path.exists() {
+        app.push_system_message(format!(
+            "Export aborted: {} already exists (refusing to overwrite).",
+            path.display()
+        ));
+        return;
+    }
+    if let Err(e) = std::fs::write(&path, rendered.as_bytes()) {
+        app.push_system_message(format!("Export failed writing {}: {e}", path.display()));
+        return;
+    }
+    app.push_system_message(format!(
+        "Exported session {} → {}",
+        &session_id[..8.min(session_id.len())],
+        path.display()
+    ));
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App<'_>,
@@ -802,6 +849,16 @@ async fn run_event_loop(
                 let mut agent = agent.lock().await;
                 agent.new_session();
                 app.push_system_message("New session started.".to_string());
+            }
+            AppAction::ExportSession { id, format } => {
+                handle_export(app, &id, format);
+            }
+            AppAction::ExportCurrentSession { format } => {
+                let id = {
+                    let agent = agent.lock().await;
+                    agent.session().meta.id.clone()
+                };
+                handle_export(app, &id, format);
             }
             AppAction::LoadSession { id } => {
                 // Clear existing UI state before loading a new session.
