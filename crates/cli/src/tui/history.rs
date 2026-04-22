@@ -3,13 +3,16 @@ use ratatui::text::{Line, Span};
 use throbber_widgets_tui::ThrobberState;
 
 use super::diff_render;
+use super::line_utils;
 use super::markdown;
 use super::theme;
 
-/// Lines of tool output shown before collapsing; results with more lines than
-/// this render with a "+N more lines" footer and can be toggled with Ctrl+E.
+/// Display *rows* of tool output shown before collapsing. Row-aware
+/// (post-wrap) — a single logical line that wraps to many rows counts
+/// against this budget, so a stray long URL can't blow past the preview.
+/// Toggled with Ctrl+E.
 pub const COLLAPSE_THRESHOLD: usize = 10;
-/// Lines shown as the preview when a tool result is in the collapsed state.
+/// Preview budget (display rows) when a tool result is collapsed.
 pub const COLLAPSE_PREVIEW_LINES: usize = 8;
 
 #[derive(Clone)]
@@ -98,18 +101,6 @@ fn split_mention_label(label: &str) -> (&str, &str) {
         }
     }
     (label, "")
-}
-
-/// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 boundary.
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// Style a system message line with visual hierarchy:
@@ -328,22 +319,32 @@ impl HistoryCell {
                 is_error,
                 ..
             } => {
-                // apply_patch uses the patch DSL line count; everything else
-                // uses raw output lines.
-                let line_count = if !*is_error && tool_name == "apply_patch" {
+                // Row-aware estimate at an assumed 80-col viewport. Width isn't
+                // known here, so use a conservative default so Ctrl+E activates
+                // whenever the body would plausibly spill past the preview.
+                const ASSUMED_WIDTH: usize = 80;
+                let content_width = ASSUMED_WIDTH.saturating_sub(4).max(1);
+                let source = if !*is_error && tool_name == "apply_patch" {
                     args_json
                         .as_deref()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                        .and_then(|v| {
-                            v.get("patch")
-                                .and_then(|p| p.as_str())
-                                .map(|s| s.lines().count())
-                        })
-                        .unwrap_or_else(|| output.lines().count())
+                        .and_then(|v| v.get("patch").and_then(|p| p.as_str()).map(str::to_string))
+                        .unwrap_or_else(|| output.clone())
                 } else {
-                    output.lines().count()
+                    output.clone()
                 };
-                line_count > COLLAPSE_THRESHOLD
+                let rows: usize = source
+                    .lines()
+                    .map(|l| {
+                        let w = unicode_width::UnicodeWidthStr::width(l);
+                        if w == 0 {
+                            1
+                        } else {
+                            w.div_ceil(content_width)
+                        }
+                    })
+                    .sum();
+                rows > COLLAPSE_THRESHOLD
             }
             _ => false,
         }
@@ -374,7 +375,7 @@ impl HistoryCell {
                     let wrapped = if line.is_empty() {
                         vec![std::borrow::Cow::Borrowed("")]
                     } else {
-                        textwrap::wrap(line, wrap_width)
+                        super::wrapping::wrap(line, wrap_width)
                     };
                     for wl in wrapped.iter() {
                         let prefix = if first {
@@ -488,14 +489,25 @@ impl HistoryCell {
                         } else {
                             theme::dim()
                         };
-                        let raw_lines: Vec<Line<'static>> = output
+                        let hard_cap = (width as usize).saturating_sub(6).max(80);
+                        // If the full output is pretty-printed JSON, collapse to a
+                        // compact form first so `textwrap` has `: ` / `, ` break
+                        // points and doesn't have to hard-split inside objects.
+                        let owned;
+                        let source: &str = if !*is_error {
+                            if let Some(compact) = line_utils::format_json_compact(output) {
+                                owned = compact;
+                                &owned
+                            } else {
+                                output
+                            }
+                        } else {
+                            output
+                        };
+                        let raw_lines: Vec<Line<'static>> = source
                             .lines()
                             .map(|l| {
-                                let text = if l.len() > 200 {
-                                    format!("{}...", truncate_str(l, 197))
-                                } else {
-                                    l.to_string()
-                                };
+                                let text = line_utils::truncate_str_with_ellipsis(l, hard_cap);
                                 Line::from(Span::styled(text, style))
                             })
                             .collect();
@@ -503,15 +515,40 @@ impl HistoryCell {
                     }
                 };
 
-                let total = body_lines.len();
-                let should_collapse = *collapsed && total > COLLAPSE_THRESHOLD;
-                let visible_end = if should_collapse {
-                    COLLAPSE_PREVIEW_LINES
+                // Row-aware collapse: measure each logical line's post-wrap row
+                // cost so one stray long URL can't burst past the preview.
+                let content_width = (width as usize).saturating_sub(4).max(1);
+                let row_cost = |line: &Line<'_>| -> usize {
+                    let w = line_utils::line_width(line);
+                    if w == 0 {
+                        1
+                    } else {
+                        w.div_ceil(content_width)
+                    }
+                };
+                let total_rows: usize = body_lines.iter().map(|l| row_cost(l)).sum();
+                let should_collapse = *collapsed && total_rows > COLLAPSE_THRESHOLD;
+
+                let (taken, rows_used) = if should_collapse {
+                    let mut used = 0usize;
+                    let mut n = 0usize;
+                    for line in body_lines.iter() {
+                        let cost = row_cost(line);
+                        if used + cost > COLLAPSE_PREVIEW_LINES && n > 0 {
+                            break;
+                        }
+                        used += cost;
+                        n += 1;
+                        if used >= COLLAPSE_PREVIEW_LINES {
+                            break;
+                        }
+                    }
+                    (n, used)
                 } else {
-                    total
+                    (body_lines.len(), total_rows)
                 };
 
-                for (i, line) in body_lines.into_iter().take(visible_end).enumerate() {
+                for (i, line) in body_lines.into_iter().take(taken).enumerate() {
                     let prefix = if i == 0 {
                         format!("  {} ", theme::TREE_END)
                     } else {
@@ -523,10 +560,10 @@ impl HistoryCell {
                 }
 
                 if should_collapse {
-                    let extra = total - visible_end;
+                    let extra = total_rows.saturating_sub(rows_used);
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "    {} +{extra} more lines — Ctrl+E to expand",
+                            "    {} +{extra} more rows — Ctrl+E to expand",
                             theme::ELLIPSIS
                         ),
                         theme::dim(),
@@ -588,9 +625,7 @@ impl HistoryCell {
                     return vec![];
                 }
                 let border = theme::thinking_border_style();
-                let content_style = ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::DarkGray)
-                    .add_modifier(ratatui::style::Modifier::ITALIC);
+                let content_style = theme::reasoning_style();
                 let inner_w = (width as usize).saturating_sub(4);
                 let label = " thinking ";
                 let top_rule_len = inner_w.saturating_sub(label.len());
@@ -603,7 +638,7 @@ impl HistoryCell {
                 );
                 let mut lines = vec![Line::from(Span::styled(top, border))];
                 for l in text.lines() {
-                    let display = truncate_str(l, inner_w);
+                    let display = line_utils::truncate_str_to_width(l, inner_w);
                     let display_len = unicode_width::UnicodeWidthStr::width(display);
                     let pad = inner_w.saturating_sub(display_len);
                     lines.push(Line::from(vec![
@@ -638,17 +673,14 @@ impl HistoryCell {
                         theme::dim(),
                     )));
                 }
+                let hard_cap = (width as usize).saturating_sub(6).max(80);
                 for (line_text, is_stderr) in tool_lines.iter().skip(skip) {
                     let style = if *is_stderr {
                         theme::error_style()
                     } else {
                         theme::dim()
                     };
-                    let display = if line_text.len() > 200 {
-                        format!("{}...", truncate_str(line_text, 197))
-                    } else {
-                        line_text.clone()
-                    };
+                    let display = line_utils::truncate_str_with_ellipsis(line_text, hard_cap);
                     let prefix = if *is_stderr { "! " } else { "\u{2502} " };
                     rendered.push(Line::from(vec![
                         Span::styled(format!("  {prefix}"), style),
@@ -759,26 +791,6 @@ fn parse_at_mentions(
 mod tests {
     use super::*;
     use ratatui::style::Style;
-
-    #[test]
-    fn truncate_str_ascii() {
-        assert_eq!(truncate_str("hello", 3), "hel");
-        assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(truncate_str("hello", 5), "hello");
-        assert_eq!(truncate_str("", 5), "");
-    }
-
-    #[test]
-    fn truncate_str_multibyte() {
-        // '€' is 3 bytes in UTF-8
-        let s = "€€€";
-        assert_eq!(s.len(), 9);
-        // Truncate at 4 bytes: can only fit 1 '€' (3 bytes), bytes 4-5 are mid-char
-        assert_eq!(truncate_str(s, 4), "€");
-        assert_eq!(truncate_str(s, 6), "€€");
-        assert_eq!(truncate_str(s, 3), "€");
-        assert_eq!(truncate_str(s, 1), "");
-    }
 
     #[test]
     fn parse_at_mentions_basic() {
@@ -1056,7 +1068,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         // 20 lines total, 8 preview → 12 hidden
-        assert!(all_text.contains("+12 more lines"), "got: {all_text}");
+        assert!(all_text.contains("+12 more rows"), "got: {all_text}");
         assert!(all_text.contains("Ctrl+E"), "footer should mention Ctrl+E");
         assert!(all_text.contains("1.5s"));
     }
@@ -1082,7 +1094,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more lines"), "should not collapse");
+        assert!(!all_text.contains("more rows"), "should not collapse");
         // All 20 lines should appear
         assert!(all_text.contains("line 0"));
         assert!(all_text.contains("line 19"));
@@ -1106,7 +1118,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more lines"));
+        assert!(!all_text.contains("more rows"));
     }
 
     #[test]
@@ -1124,14 +1136,14 @@ mod tests {
             collapsed: true,
         };
         assert!(cell.toggle_collapsed());
-        // Should no longer show "more lines" footer
+        // Should no longer show "more rows" footer
         let all_text: String = cell
             .render(80, None)
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more lines"));
+        assert!(!all_text.contains("more rows"));
         // Toggle back
         assert!(cell.toggle_collapsed());
         let all_text2: String = cell
@@ -1140,7 +1152,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(all_text2.contains("more lines"));
+        assert!(all_text2.contains("more rows"));
     }
 
     #[test]

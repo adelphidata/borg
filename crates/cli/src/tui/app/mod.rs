@@ -454,7 +454,11 @@ impl<'a> App<'a> {
         let mut app = Self {
             cells: Vec::new(),
             state: AppState::Idle,
-            composer: Composer::new(),
+            composer: {
+                let mut c = Composer::new();
+                c.load_persistent_history();
+                c
+            },
             command_popup: CommandPopup::new(),
             settings_popup: SettingsPopup::new(),
             model_popup: ModelPopup::new(),

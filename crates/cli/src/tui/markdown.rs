@@ -19,6 +19,10 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
     let mut ordered_index: Option<u64> = None;
     let mut in_blockquote = false;
     let mut list_item_indents: Vec<usize> = Vec::new();
+    // Stack of local file paths for open links — popped on TagEnd::Link. Each
+    // entry holds the pre-resolved display string to append in dim after the
+    // link text (e.g. " (src/foo.rs:L12)"). `None` = non-local (URL), no suffix.
+    let mut link_suffix_stack: Vec<Option<String>> = Vec::new();
 
     let wrap_width = width.saturating_sub(2) as usize;
 
@@ -103,8 +107,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                 Tag::Link { dest_url, .. } => {
                     let base = current_style(&style_stack);
                     style_stack.push(base.fg(theme::CYAN).add_modifier(Modifier::UNDERLINED));
-                    // Store URL to append after text
-                    let _ = dest_url;
+                    link_suffix_stack.push(resolve_local_link(dest_url.as_ref()));
                 }
                 _ => {}
             },
@@ -123,8 +126,14 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                     code_block_lang = None;
                     flush_line(&mut current_spans, &mut lines);
                 }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
+                }
+                TagEnd::Link => {
+                    style_stack.pop();
+                    if let Some(Some(suffix)) = link_suffix_stack.pop() {
+                        current_spans.push(Span::styled(format!(" ({suffix})"), theme::dim()));
+                    }
                 }
                 TagEnd::BlockQuote(_) => {
                     in_blockquote = false;
@@ -170,7 +179,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                     // content column (e.g. "- " → 2 cols, "1. " → 3 cols).
                     let hang = list_item_indents.last().copied().unwrap_or(0);
                     let effective_width = wrap_width.saturating_sub(hang).max(20);
-                    let wrapped = textwrap::wrap(&text, effective_width);
+                    let wrapped = super::wrapping::wrap(&text, effective_width);
                     if wrapped.len() <= 1 {
                         current_spans.push(Span::styled(text.to_string(), style));
                     } else {
@@ -215,6 +224,75 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
 
 fn current_style(stack: &[Style]) -> Style {
     stack.last().copied().unwrap_or_default()
+}
+
+/// Detect local file links in markdown destination URLs. Returns the display
+/// suffix (path + optional `:L<line>` anchor) for local paths, or `None` for
+/// http(s)/mailto/anchor-only references.
+///
+/// Ported concept from Codex `markdown_render.rs`: when the model links to
+/// a file in the repo, show the resolved path so the user sees where it
+/// points instead of the bare label.
+fn resolve_local_link(dest: &str) -> Option<String> {
+    if dest.is_empty() || dest.starts_with('#') {
+        return None;
+    }
+    // Strip file:// prefix if present.
+    let raw = dest.strip_prefix("file://").unwrap_or(dest);
+    // Reject anything with a scheme (http:, https:, mailto:, etc.).
+    if let Some(idx) = raw.find("://") {
+        let scheme = &raw[..idx];
+        if scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+        {
+            return None;
+        }
+    }
+    if raw.starts_with("mailto:") || raw.starts_with("tel:") {
+        return None;
+    }
+    // Split off optional `#Lnnn` line anchor. A bare fragment (`#install`)
+    // means an in-document anchor reference, not a file link — skip.
+    let (path_part, anchor) = if let Some((p, rest)) = raw.rsplit_once('#') {
+        if let Some(n) = rest.strip_prefix('L') {
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                (p, Some(format!(":L{n}")))
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        (raw, None)
+    };
+    let path = std::path::Path::new(path_part);
+    // Avoid false positives on plain label text like `[click](here)`: require
+    // either an absolute path, a path separator, or a file extension.
+    let looks_like_path = path.is_absolute()
+        || path_part.contains('/')
+        || path_part.contains('\\')
+        || path.extension().is_some();
+    if !looks_like_path {
+        return None;
+    }
+    let resolved = if path.is_absolute() {
+        if let Ok(cwd) = std::env::current_dir() {
+            path.strip_prefix(&cwd)
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        } else {
+            path.display().to_string()
+        }
+    } else {
+        path.display().to_string()
+    };
+    if resolved.is_empty() {
+        return None;
+    }
+    Some(format!("{resolved}{}", anchor.unwrap_or_default()))
 }
 
 fn flush_line(spans: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>) {

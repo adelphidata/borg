@@ -11,6 +11,7 @@ mod goodbye;
 mod highlight;
 mod history;
 mod layout;
+mod line_utils;
 mod markdown;
 pub(crate) mod migrate_popup;
 mod model_popup;
@@ -29,6 +30,7 @@ pub(crate) mod theme;
 mod toast;
 mod tool_display;
 mod transcript_pager;
+mod wrapping;
 
 use std::io::stdout;
 use std::panic;

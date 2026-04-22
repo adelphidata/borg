@@ -13,6 +13,16 @@ fn elapsed_since_start() -> std::time::Duration {
     start.elapsed()
 }
 
+/// Produce per-character spans with a sweeping shimmer highlight, defaulting
+/// to the detected terminal foreground/background so the sweep matches the
+/// user's theme. Falls back to the hardcoded teal pair when the terminal
+/// palette is unknown (tests, non-Unix, OSC-unfriendly terminals).
+pub(super) fn shimmer_spans_auto(text: &str) -> Vec<Span<'static>> {
+    let base = colors::default_fg().unwrap_or((0, 185, 174));
+    let highlight = colors::default_bg().unwrap_or((180, 255, 252));
+    shimmer_spans(text, base, highlight)
+}
+
 /// Produce per-character spans with a sweeping shimmer highlight.
 ///
 /// Adapted from Codex reference (`reference/codex/codex-rs/tui/src/shimmer.rs`).

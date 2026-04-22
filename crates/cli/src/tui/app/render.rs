@@ -178,12 +178,12 @@ impl<'a> App<'a> {
             throbber.to_symbol_span(&self.throbber_state),
         ];
         // Shimmer the live header so the eye has a visual cue distinct from
-        // the static "esc to interrupt" hint.
-        header_spans.extend(shimmer::shimmer_spans(
-            &format!("{}...", self.stream_status.header),
-            (2, 195, 189),
-            (180, 255, 252),
-        ));
+        // the static "esc to interrupt" hint. Colors come from the
+        // terminal-adaptive palette so light terminals get a legible gradient.
+        header_spans.extend(shimmer::shimmer_spans_auto(&format!(
+            "{}...",
+            self.stream_status.header
+        )));
         header_spans.push(Span::styled(format!(" ({elapsed}"), theme::tool_style()));
         header_spans.push(Span::styled(" • esc to interrupt)", theme::dim()));
 

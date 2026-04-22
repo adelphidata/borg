@@ -31,7 +31,14 @@ pub fn bold() -> Style {
 }
 
 pub fn dim() -> Style {
-    Style::default().fg(DIM_WHITE)
+    // On light terminals, DarkGray blends into the background; use a mid-grey
+    // so dim text still reads. `super::colors::is_light_terminal()` returns
+    // false when the terminal bg was not detected, keeping the legacy behavior.
+    if super::colors::is_light_terminal() {
+        Style::default().fg(Color::Rgb(90, 90, 90))
+    } else {
+        Style::default().fg(DIM_WHITE)
+    }
 }
 
 pub fn code_style() -> Style {
@@ -93,7 +100,18 @@ pub fn icon_style() -> Style {
 }
 
 pub fn thinking_border_style() -> Style {
-    Style::default().fg(Color::Rgb(80, 80, 80))
+    if super::colors::is_light_terminal() {
+        Style::default().fg(Color::Rgb(150, 150, 150))
+    } else {
+        Style::default().fg(Color::Rgb(80, 80, 80))
+    }
+}
+
+/// Italic + dim, used for reasoning/thinking bodies to visually separate
+/// chain-of-thought content from assistant responses. Shared so future
+/// cells can reuse the same look.
+pub fn reasoning_style() -> Style {
+    dim().add_modifier(Modifier::ITALIC)
 }
 
 pub fn diff_add_style() -> Style {

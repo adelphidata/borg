@@ -247,6 +247,16 @@ impl<'a> App<'a> {
         } else {
             format!("Ran {name}")
         };
+        // The final ToolResult replaces the live-streaming preview for *this*
+        // tool call only. Remove just the most recent ToolStreaming cell so a
+        // second tool running concurrently doesn't have its preview wiped.
+        if let Some(idx) = self
+            .cells
+            .iter()
+            .rposition(|c| matches!(c, HistoryCell::ToolStreaming { .. }))
+        {
+            self.cells.remove(idx);
+        }
         let is_error = result.starts_with("Error:");
         let line_count = result.lines().count();
         let collapsed = line_count > super::super::history::COLLAPSE_THRESHOLD;
@@ -413,12 +423,39 @@ impl<'a> App<'a> {
         if let Some(last_line) = delta.lines().rev().find(|l| !l.trim().is_empty()) {
             self.stream_status.set_details(Some(last_line.to_string()));
         }
-        if let Some(HistoryCell::ToolStreaming { lines, .. }) = self.cells.last_mut() {
-            lines.push((delta, is_stderr));
-        } else {
-            self.cells.push(HistoryCell::ToolStreaming {
-                lines: vec![(delta, is_stderr)],
-            });
+        // Attach to a ToolStreaming cell at the tail of the history. We only
+        // consider it "active" if the most recent cell is ToolStreaming or
+        // ToolStart — appending anywhere else would reorder transcript cells
+        // (e.g. shove an assistant message down the viewport).
+        let target = match self.cells.last() {
+            Some(HistoryCell::ToolStreaming { .. }) => Some(self.cells.len() - 1),
+            Some(HistoryCell::ToolStart { .. }) => {
+                self.cells
+                    .push(HistoryCell::ToolStreaming { lines: Vec::new() });
+                Some(self.cells.len() - 1)
+            }
+            _ => {
+                tracing::warn!(
+                    "tool output delta with no active ToolStart at tail — dropping {} bytes",
+                    delta.len()
+                );
+                None
+            }
+        };
+        if let Some(idx) = target {
+            if let HistoryCell::ToolStreaming { lines } = &mut self.cells[idx] {
+                let parts: Vec<&str> = delta.split('\n').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    if i == 0 {
+                        match lines.last_mut() {
+                            Some((buf, stream)) if *stream == is_stderr => buf.push_str(part),
+                            _ => lines.push((part.to_string(), is_stderr)),
+                        }
+                    } else {
+                        lines.push((part.to_string(), is_stderr));
+                    }
+                }
+            }
         }
         if self.auto_scroll {
             self.scroll_offset = 0;

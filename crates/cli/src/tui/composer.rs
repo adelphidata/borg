@@ -21,10 +21,121 @@ struct InputHistory {
     draft: String,
 }
 
+/// Max persisted history entries. Older entries are trimmed at save time.
+const HISTORY_MAX: usize = 1000;
+
+fn history_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".borg").join("history.jsonl"))
+}
+
+fn load_history() -> Vec<String> {
+    let Some(path) = history_path() else {
+        return Vec::new();
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!("failed to read history file {}: {e}", path.display());
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for (lineno, line) in contents.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<String>(line) {
+            Ok(s) => out.push(s),
+            Err(e) => tracing::warn!(
+                "history {}:{}: skip malformed entry: {e}",
+                path.display(),
+                lineno + 1
+            ),
+        }
+    }
+    out
+}
+
+/// Rewrite the history file from the in-memory entries. Used to bound on-disk
+/// size — otherwise the append-only log grows without limit.
+fn rewrite_history(entries: &[String]) {
+    let Some(path) = history_path() else { return };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("failed to create history dir: {e}");
+            return;
+        }
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut buf = String::new();
+    for entry in entries {
+        match serde_json::to_string(entry) {
+            Ok(s) => {
+                buf.push_str(&s);
+                buf.push('\n');
+            }
+            Err(e) => tracing::warn!("failed to encode history entry during rewrite: {e}"),
+        }
+    }
+    if let Err(e) = std::fs::write(&tmp, buf) {
+        tracing::warn!("failed to write history tmp {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        tracing::warn!("failed to rename history tmp into place: {e}");
+    }
+}
+
+fn append_history(text: &str) {
+    let Some(path) = history_path() else { return };
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("failed to create history dir: {e}");
+            return;
+        }
+    }
+    let encoded = match serde_json::to_string(text) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("failed to encode history entry: {e}");
+            return;
+        }
+    };
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{encoded}") {
+                tracing::warn!("failed to append history: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("failed to open history for append: {e}"),
+    }
+}
+
 impl InputHistory {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            cursor: None,
+            draft: String::new(),
+        }
+    }
+
+    /// Construct with entries loaded from `~/.borg/history.jsonl` (if any).
+    /// Separate from `new()` so in-memory unit tests stay hermetic.
+    fn new_persistent() -> Self {
+        let mut entries = load_history();
+        if entries.len() > HISTORY_MAX {
+            let drop = entries.len() - HISTORY_MAX;
+            entries.drain(..drop);
+        }
+        Self {
+            entries,
             cursor: None,
             draft: String::new(),
         }
@@ -36,6 +147,20 @@ impl InputHistory {
         }
         self.cursor = None;
         self.draft.clear();
+    }
+
+    fn push_persistent(&mut self, text: &str) {
+        if !text.is_empty() {
+            append_history(text);
+        }
+        self.push(text);
+        // Keep on-disk size bounded. Rewrite only when we overflow the cap by
+        // a margin so we don't rewrite on every submission.
+        if self.entries.len() > HISTORY_MAX + HISTORY_MAX / 10 {
+            let drop = self.entries.len() - HISTORY_MAX;
+            self.entries.drain(..drop);
+            rewrite_history(&self.entries);
+        }
     }
 
     /// Find the newest entry at or before `start` containing `query`.
@@ -156,11 +281,19 @@ impl<'a> Composer<'a> {
         );
         Self {
             textarea,
+            // Tests call `Composer::new()` directly and expect an empty
+            // history; persistence is opt-in via `load_persistent_history`.
             history: InputHistory::new(),
             search: None,
             image_attachments: Vec::new(),
             paste_burst: PasteBurst::new(),
         }
+    }
+
+    /// Load persisted history entries from `~/.borg/history.jsonl`.
+    /// Called from the App at startup. Tests skip this for hermetic state.
+    pub fn load_persistent_history(&mut self) {
+        self.history = InputHistory::new_persistent();
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -206,7 +339,7 @@ impl<'a> Composer<'a> {
                 if trimmed.is_empty() {
                     return None;
                 }
-                self.history.push(&trimmed);
+                self.history.push_persistent(&trimmed);
                 // Clear the textarea
                 self.textarea.select_all();
                 self.textarea.cut();

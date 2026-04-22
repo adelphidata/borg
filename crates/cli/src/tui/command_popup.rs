@@ -126,6 +126,31 @@ const COMMANDS: &[SlashCommandDef] = &[
 
 /// True when every char of `needle` appears in `haystack` in order
 /// (not necessarily contiguously). Both inputs are expected lowercase.
+/// Return the char-indices in `haystack` that match `needle` greedily
+/// left-to-right (case-insensitive). Used to underline matched characters
+/// in the command popup. Empty/no-match returns an empty set.
+fn subsequence_match_positions(needle: &str, haystack: &str) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let needle_lower: Vec<char> = needle.chars().flat_map(char::to_lowercase).collect();
+    let mut ni = 0usize;
+    for (hi, hc) in haystack.chars().enumerate() {
+        if ni >= needle_lower.len() {
+            break;
+        }
+        if hc.to_lowercase().next() == Some(needle_lower[ni]) {
+            out.insert(hi);
+            ni += 1;
+        }
+    }
+    if ni < needle_lower.len() {
+        out.clear();
+    }
+    out
+}
+
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
     if needle.is_empty() {
         return true;
@@ -270,6 +295,7 @@ impl CommandPopup {
             0
         };
 
+        let filter_lower = self.filter.to_lowercase();
         let lines: Vec<Line<'_>> = items
             .iter()
             .skip(scroll_offset)
@@ -277,15 +303,31 @@ impl CommandPopup {
             .enumerate()
             .map(|(i, cmd)| {
                 let actual_index = i + scroll_offset;
-                let style = if actual_index == self.selected {
+                let base = if actual_index == self.selected {
                     theme::popup_selected()
                 } else {
                     theme::dim()
                 };
-                Line::from(Span::styled(
-                    format!(" {:<12} {}", cmd.name, cmd.description),
-                    style,
-                ))
+                let highlight = base.add_modifier(
+                    ratatui::style::Modifier::UNDERLINED | ratatui::style::Modifier::BOLD,
+                );
+                // Pad command to width 12 (leading space + name), then append description.
+                let mut spans: Vec<Span<'_>> = Vec::new();
+                spans.push(Span::styled(" ", base));
+                let matched = subsequence_match_positions(&filter_lower, cmd.name);
+                let name_chars: Vec<char> = cmd.name.chars().collect();
+                for (idx, ch) in name_chars.iter().enumerate() {
+                    let style = if matched.contains(&idx) {
+                        highlight
+                    } else {
+                        base
+                    };
+                    spans.push(Span::styled(ch.to_string(), style));
+                }
+                let pad = 12usize.saturating_sub(name_chars.len());
+                spans.push(Span::styled(" ".repeat(pad + 1), base));
+                spans.push(Span::styled(cmd.description.to_string(), base));
+                Line::from(spans)
             })
             .collect();
 

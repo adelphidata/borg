@@ -6,6 +6,8 @@ use std::time::Duration;
 
 /// Cached terminal background RGB, queried once via OSC 11.
 static TERMINAL_BG: OnceLock<Option<(u8, u8, u8)>> = OnceLock::new();
+/// Cached terminal foreground RGB, queried once via OSC 10.
+static TERMINAL_FG: OnceLock<Option<(u8, u8, u8)>> = OnceLock::new();
 
 /// RAII guard that restores cooked mode on drop.
 struct RawModeGuard;
@@ -16,12 +18,12 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Query the terminal's actual background color via OSC 11.
+/// Query the terminal's actual foreground and background colors via OSC 10 / 11.
 /// Must be called **before** entering the alternate screen, as some terminals
 /// don't respond to OSC queries inside the alt buffer.
 pub(super) fn query_terminal_bg() {
     TERMINAL_BG.get_or_init(|| {
-        query_osc11_bg().or_else(|| {
+        query_osc_color(b"\x1b]11;?\x07").or_else(|| {
             // Fallback: try COLORFGBG env var (rxvt-family terminals)
             if let Ok(val) = std::env::var("COLORFGBG") {
                 if let Some(bg_str) = val.rsplit(';').next() {
@@ -38,13 +40,33 @@ pub(super) fn query_terminal_bg() {
             None
         })
     });
+    TERMINAL_FG.get_or_init(|| query_osc_color(b"\x1b]10;?\x07"));
 }
 
-/// Send OSC 11 query and parse the terminal's background color response.
+/// Cached terminal background color (None if not detected).
+pub(super) fn default_bg() -> Option<(u8, u8, u8)> {
+    TERMINAL_BG.get().copied().flatten()
+}
+
+/// Cached terminal foreground color (None if not detected).
+pub(super) fn default_fg() -> Option<(u8, u8, u8)> {
+    TERMINAL_FG.get().copied().flatten()
+}
+
+/// True when the detected terminal background is light. Returns `false`
+/// when the background is unknown (dark is our default styling target).
+pub(super) fn is_light_terminal() -> bool {
+    match default_bg() {
+        Some((r, g, b)) => luminance(r, g, b) > 128.0,
+        None => false,
+    }
+}
+
+/// Send an OSC 10/11 query and parse the terminal's color response.
 /// Briefly enters raw mode, sends the query, reads raw bytes from stdin
 /// using `poll(2)` with a 100ms timeout, then restores terminal state.
 #[cfg(unix)]
-fn query_osc11_bg() -> Option<(u8, u8, u8)> {
+fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
     use std::io::Read;
     use std::os::unix::io::AsRawFd;
 
@@ -56,9 +78,8 @@ fn query_osc11_bg() -> Option<(u8, u8, u8)> {
         None
     };
 
-    // Send OSC 11 query with BEL terminator (widest compatibility)
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(b"\x1b]11;?\x07");
+    let _ = stdout.write_all(query);
     let _ = stdout.flush();
 
     let mut buf = [0u8; 128];
@@ -104,16 +125,16 @@ fn query_osc11_bg() -> Option<(u8, u8, u8)> {
         return None;
     }
 
-    parse_osc11_response(&buf[..total])
+    parse_osc_color_response(&buf[..total])
 }
 
 #[cfg(not(unix))]
-fn query_osc11_bg() -> Option<(u8, u8, u8)> {
+fn query_osc_color(_query: &[u8]) -> Option<(u8, u8, u8)> {
     None
 }
 
-/// Parse an OSC 11 response like `\x1b]11;rgb:1c1c/1c1c/1c1c\x07`
-fn parse_osc11_response(data: &[u8]) -> Option<(u8, u8, u8)> {
+/// Parse an OSC 10/11 response like `\x1b]11;rgb:1c1c/1c1c/1c1c\x07`
+fn parse_osc_color_response(data: &[u8]) -> Option<(u8, u8, u8)> {
     let s = std::str::from_utf8(data).ok()?;
     let rgb_start = s.find("rgb:")?;
     let rgb_part = &s[rgb_start + 4..];
@@ -251,38 +272,38 @@ mod tests {
     #[test]
     fn parse_osc11_4digit() {
         let data = b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07";
-        assert_eq!(parse_osc11_response(data), Some((0x1c, 0x1c, 0x1c)));
+        assert_eq!(parse_osc_color_response(data), Some((0x1c, 0x1c, 0x1c)));
     }
 
     #[test]
     fn parse_osc11_2digit() {
         let data = b"\x1b]11;rgb:ff/00/80\x07";
-        assert_eq!(parse_osc11_response(data), Some((0xff, 0x00, 0x80)));
+        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x80)));
     }
 
     #[test]
     fn parse_osc11_st_terminated() {
         let data = b"\x1b]11;rgb:ffff/0000/0000\x1b\\";
-        assert_eq!(parse_osc11_response(data), Some((0xff, 0x00, 0x00)));
+        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x00)));
     }
 
     #[test]
     fn parse_osc11_3digit() {
         let data = b"\x1b]11;rgb:fff/000/888\x07";
-        assert_eq!(parse_osc11_response(data), Some((0xff, 0x00, 0x88)));
+        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x88)));
     }
 
     #[test]
     fn parse_osc11_1digit() {
         let data = b"\x1b]11;rgb:f/0/8\x07";
-        assert_eq!(parse_osc11_response(data), Some((0xff, 0x00, 0x88)));
+        assert_eq!(parse_osc_color_response(data), Some((0xff, 0x00, 0x88)));
     }
 
     #[test]
     fn parse_osc11_malformed() {
-        assert_eq!(parse_osc11_response(b"garbage"), None);
-        assert_eq!(parse_osc11_response(b"\x1b]11;rgb:ff/00\x07"), None);
-        assert_eq!(parse_osc11_response(b""), None);
+        assert_eq!(parse_osc_color_response(b"garbage"), None);
+        assert_eq!(parse_osc_color_response(b"\x1b]11;rgb:ff/00\x07"), None);
+        assert_eq!(parse_osc_color_response(b""), None);
     }
 
     #[test]
