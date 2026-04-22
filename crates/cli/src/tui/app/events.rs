@@ -131,10 +131,7 @@ impl<'a> App<'a> {
         if let Some(HistoryCell::Assistant { text, .. }) = self.cells.last_mut() {
             text.push_str(&delta);
         } else {
-            self.cells.push(HistoryCell::Assistant {
-                text: delta,
-                streaming: true,
-            });
+            self.cells.push(HistoryCell::assistant(delta, true));
         }
         // First visible assistant token → phase flips to "Responding"; further
         // deltas are cheap string compares so we don't re-allocate.

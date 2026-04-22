@@ -662,10 +662,7 @@ mod tests {
             HistoryCell::Thinking {
                 text: "reasoning".to_string(),
             },
-            HistoryCell::Assistant {
-                text: "hi there".to_string(),
-                streaming: false,
-            },
+            HistoryCell::assistant("hi there".to_string(), false),
             HistoryCell::ToolResult {
                 output: "tool output".to_string(),
                 is_error: false,
@@ -699,17 +696,11 @@ mod tests {
             HistoryCell::User {
                 text: "q1".to_string(),
             },
-            HistoryCell::Assistant {
-                text: "a1".to_string(),
-                streaming: false,
-            },
+            HistoryCell::assistant("a1".to_string(), false),
             HistoryCell::User {
                 text: "q2".to_string(),
             },
-            HistoryCell::Assistant {
-                text: "a2".to_string(),
-                streaming: false,
-            },
+            HistoryCell::assistant("a2".to_string(), false),
         ];
         let msgs = snapshot_cells_as_messages(&cells);
         let texts: Vec<_> = msgs

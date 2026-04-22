@@ -776,10 +776,7 @@ impl<'a> App<'a> {
         self.cells.push(HistoryCell::User {
             text: input.to_string(),
         });
-        self.cells.push(HistoryCell::Assistant {
-            text: String::new(),
-            streaming: true,
-        });
+        self.cells.push(HistoryCell::assistant(String::new(), true));
 
         // Take image attachments before file refs
         let images = self.composer.take_image_attachments();
@@ -851,10 +848,7 @@ impl<'a> App<'a> {
         }
         let final_input = expansion.augmented_text;
 
-        self.cells.push(HistoryCell::Assistant {
-            text: String::new(),
-            streaming: true,
-        });
+        self.cells.push(HistoryCell::assistant(String::new(), true));
 
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
         self.event_rx = Some(event_rx);
@@ -2297,10 +2291,8 @@ mod tests {
         app.cells.push(HistoryCell::User {
             text: "hello".to_string(),
         });
-        app.cells.push(HistoryCell::Assistant {
-            text: "hi".to_string(),
-            streaming: false,
-        });
+        app.cells
+            .push(HistoryCell::assistant("hi".to_string(), false));
         app.cells.push(HistoryCell::User {
             text: "world".to_string(),
         });
@@ -2345,17 +2337,13 @@ mod tests {
         app.cells.push(HistoryCell::User {
             text: "first".to_string(),
         });
-        app.cells.push(HistoryCell::Assistant {
-            text: "resp1".to_string(),
-            streaming: false,
-        });
+        app.cells
+            .push(HistoryCell::assistant("resp1".to_string(), false));
         app.cells.push(HistoryCell::User {
             text: "second".to_string(),
         });
-        app.cells.push(HistoryCell::Assistant {
-            text: "resp2".to_string(),
-            streaming: false,
-        });
+        app.cells
+            .push(HistoryCell::assistant("resp2".to_string(), false));
 
         // Enter backtrack (cursor starts at 0 = most recent)
         app.handle_key(key(KeyCode::Esc)).unwrap();

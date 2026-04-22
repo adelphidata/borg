@@ -1,11 +1,24 @@
 use borg_core::types::{PlanStep, PlanStepStatus};
 use ratatui::text::{Line, Span};
+use std::cell::RefCell;
 use throbber_widgets_tui::ThrobberState;
 
 use super::diff_render;
 use super::line_utils;
+use super::line_utils::{prefix_lines, LIVE_PREFIX_COLS};
 use super::markdown;
 use super::theme;
+
+/// Per-cell cache for the newline-gated streaming markdown collector. The
+/// committed region (bytes up to the last newline at render time) is rendered
+/// once per width change or newline advance; the pending tail is re-rendered
+/// every frame.
+#[derive(Default, Clone)]
+pub(super) struct AssistantRenderCache {
+    cached_width: Option<u16>,
+    committed_lines: Vec<Line<'static>>,
+    committed_byte_len: usize,
+}
 
 /// Display *rows* of tool output shown before collapsing. Row-aware
 /// (post-wrap) — a single logical line that wraps to many rows counts
@@ -30,6 +43,7 @@ pub enum HistoryCell {
     Assistant {
         text: String,
         streaming: bool,
+        cache: RefCell<AssistantRenderCache>,
     },
     ToolStart {
         name: String,
@@ -289,6 +303,15 @@ fn style_indented_line(line: &str) -> Line<'static> {
 }
 
 impl HistoryCell {
+    /// Construct an `Assistant` cell with an empty render cache.
+    pub fn assistant(text: String, streaming: bool) -> Self {
+        HistoryCell::Assistant {
+            text,
+            streaming,
+            cache: RefCell::new(AssistantRenderCache::default()),
+        }
+    }
+
     /// True when this cell should visually hug the previous cell
     /// (no blank-line spacer inserted before it by the render loop).
     pub fn is_stream_continuation(&self) -> bool {
@@ -399,29 +422,50 @@ impl HistoryCell {
                 }
                 lines
             }
-            HistoryCell::Assistant { text, streaming } => {
+            HistoryCell::Assistant {
+                text,
+                streaming,
+                cache,
+            } => {
+                let inner_width = width.saturating_sub(LIVE_PREFIX_COLS as u16);
+                let commit_end = text
+                    .as_bytes()
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+
+                let mut cache = cache.borrow_mut();
+                let cache_hit = cache.cached_width == Some(inner_width)
+                    && cache.committed_byte_len == commit_end;
+                if !cache_hit {
+                    cache.committed_lines = if commit_end == 0 {
+                        Vec::new()
+                    } else {
+                        markdown::render_markdown(&text[..commit_end], inner_width)
+                    };
+                    cache.committed_byte_len = commit_end;
+                    cache.cached_width = Some(inner_width);
+                }
+                let pending_lines = if commit_end < text.len() {
+                    markdown::render_markdown(&text[commit_end..], inner_width)
+                } else {
+                    Vec::new()
+                };
+
+                let prefix_span = Span::styled(format!("{} ", theme::BULLET), theme::dim());
+                let all: Vec<Line<'static>> = cache
+                    .committed_lines
+                    .iter()
+                    .cloned()
+                    .chain(pending_lines)
+                    .collect();
                 let mut lines = if text.is_empty() && *streaming {
                     vec![]
+                } else if all.is_empty() {
+                    vec![Line::from(prefix_span)]
                 } else {
-                    let prefix_span = Span::styled(format!("{} ", theme::BULLET), theme::dim());
-                    let md_lines = markdown::render_markdown(text, width.saturating_sub(2));
-                    if md_lines.is_empty() {
-                        vec![Line::from(prefix_span)]
-                    } else {
-                        let mut result = Vec::with_capacity(md_lines.len());
-                        for (i, mut line) in md_lines.into_iter().enumerate() {
-                            if i == 0 {
-                                let mut spans = vec![prefix_span.clone()];
-                                spans.extend(line.spans);
-                                result.push(Line::from(spans));
-                            } else {
-                                let mut spans = vec![Span::raw("  ")];
-                                spans.append(&mut line.spans);
-                                result.push(Line::from(spans));
-                            }
-                        }
-                        result
-                    }
+                    prefix_lines(all, prefix_span, Span::raw("  "))
                 };
                 if *streaming {
                     lines.push(Line::from(Span::styled("▊", theme::dim())));
@@ -899,10 +943,7 @@ mod tests {
 
     #[test]
     fn render_assistant_streaming() {
-        let cell = HistoryCell::Assistant {
-            text: "partial".to_string(),
-            streaming: true,
-        };
+        let cell = HistoryCell::assistant("partial".to_string(), true);
         let lines = cell.render(40, None);
         // Last line should be the cursor block
         let last = &lines[lines.len() - 1];
@@ -912,10 +953,7 @@ mod tests {
 
     #[test]
     fn render_assistant_not_streaming() {
-        let cell = HistoryCell::Assistant {
-            text: "done".to_string(),
-            streaming: false,
-        };
+        let cell = HistoryCell::assistant("done".to_string(), false);
         let lines = cell.render(40, None);
         // No trailing blank line; last line should contain the rendered text.
         let last = &lines[lines.len() - 1];
@@ -950,10 +988,7 @@ mod tests {
         let tool_streaming = HistoryCell::ToolStreaming { lines: vec![] };
         assert!(tool_streaming.is_stream_continuation());
 
-        let assistant = HistoryCell::Assistant {
-            text: "hi".to_string(),
-            streaming: false,
-        };
+        let assistant = HistoryCell::assistant("hi".to_string(), false);
         assert!(!assistant.is_stream_continuation());
 
         let user = HistoryCell::User {
@@ -1520,5 +1555,110 @@ mod tests {
         );
         assert_eq!(line.spans.len(), 1);
         assert_eq!(line.spans[0].style, theme::dim());
+    }
+
+    // --- Streaming markdown collector tests (newline-gated cache) ---
+
+    fn assistant_cache_snapshot(cell: &HistoryCell) -> (Option<u16>, usize, usize) {
+        match cell {
+            HistoryCell::Assistant { cache, .. } => {
+                let c = cache.borrow();
+                (
+                    c.cached_width,
+                    c.committed_byte_len,
+                    c.committed_lines.len(),
+                )
+            }
+            _ => panic!("expected Assistant"),
+        }
+    }
+
+    fn flatten_plain(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn streaming_pending_without_newline_is_not_committed() {
+        let cell = HistoryCell::assistant("Hello, world".to_string(), true);
+        let _ = cell.render(40, None);
+        let (w, committed_len, committed_count) = assistant_cache_snapshot(&cell);
+        assert_eq!(committed_len, 0, "no newline => nothing committed");
+        assert_eq!(committed_count, 0);
+        assert_eq!(w, Some(38), "width - LIVE_PREFIX_COLS");
+    }
+
+    #[test]
+    fn streaming_newline_commits_and_second_render_hits_cache() {
+        let cell = HistoryCell::assistant("Hello!\n".to_string(), true);
+        let first = cell.render(40, None);
+        let (_, committed_len, committed_count) = assistant_cache_snapshot(&cell);
+        assert_eq!(committed_len, 7, "committed_byte_len == last newline + 1");
+        assert!(committed_count >= 1);
+
+        // Second render at same width: cache hit (no panic, equivalent output).
+        let second = cell.render(40, None);
+        assert_eq!(flatten_plain(&first), flatten_plain(&second));
+        let (_, committed_len2, _) = assistant_cache_snapshot(&cell);
+        assert_eq!(committed_len2, 7);
+    }
+
+    #[test]
+    fn streaming_width_change_invalidates_cache() {
+        let long = "This is a long line that should wrap across different widths differently to make the cache width-sensitive.\n".to_string();
+        let cell = HistoryCell::assistant(long, true);
+        let _ = cell.render(40, None);
+        let (w1, _, _) = assistant_cache_snapshot(&cell);
+        assert_eq!(w1, Some(38));
+
+        let _ = cell.render(60, None);
+        let (w2, _, _) = assistant_cache_snapshot(&cell);
+        assert_eq!(w2, Some(58), "cache width reflects new render width");
+    }
+
+    #[test]
+    fn streaming_mid_fence_pending_renders_without_panic() {
+        // Open fence with language tag, content line, no closing fence.
+        // The only newline is after "rust", so commit_end == 8; the pending
+        // tail "fn main() {" is rendered per-frame.
+        let cell = HistoryCell::assistant("```rust\nfn main() {".to_string(), true);
+        let lines = cell.render(40, None);
+        let (_, committed_len, _) = assistant_cache_snapshot(&cell);
+        assert_eq!(committed_len, 8, "committed up to newline after ```rust");
+        let rendered = flatten_plain(&lines);
+        assert!(
+            rendered.contains("fn main"),
+            "pending tail should be rendered each frame, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_finalize_flushes_pending_without_cursor() {
+        let cell = HistoryCell::assistant("Line A\nLine B".to_string(), false);
+        let lines = cell.render(40, None);
+        let rendered = flatten_plain(&lines);
+        assert!(rendered.contains("Line A"));
+        assert!(rendered.contains("Line B"));
+        assert!(
+            !rendered.contains('▊'),
+            "no streaming cursor when streaming=false"
+        );
+    }
+
+    #[test]
+    fn streaming_empty_while_streaming_renders_cursor_only() {
+        let cell = HistoryCell::assistant(String::new(), true);
+        let lines = cell.render(40, None);
+        assert_eq!(lines.len(), 1, "empty streaming cell => cursor line only");
+        let rendered = flatten_plain(&lines);
+        assert_eq!(rendered, "▊");
     }
 }
