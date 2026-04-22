@@ -136,7 +136,7 @@ pub struct DiagnosticRunner {
     step: usize,
 }
 
-const STEP_COUNT: usize = 17;
+const STEP_COUNT: usize = 16;
 
 impl DiagnosticRunner {
     /// Create a new diagnostic runner starting at step 0.
@@ -147,24 +147,23 @@ impl DiagnosticRunner {
     /// Returns the label of the next step without running it, or `None` if done.
     pub fn peek_label(&self, config: &Config) -> Option<&'static str> {
         match self.step {
-            0 => Some("Config"),
-            1 => Some("Provider"),
-            2 => Some("Secrets"),
-            3 => Some("Sandbox"),
-            4 => Some("Skills"),
-            5 => Some("Memory"),
-            6 => Some("Embeddings"),
-            7 => Some("Data"),
-            8 => Some("Gateway"),
-            9 => Some("Heartbeat"),
-            10 => Some("Budget"),
-            11 => Some("Prompt Cache"),
-            12 => Some("Plugins"),
-            13 => Some("Browser"),
-            14 => Some("Agents"),
-            15 => Some("Security"),
-            16 if config.security.host_audit => Some("Host Audit"),
-            16 => None,
+            0 => Some("Provider"),
+            1 => Some("Secrets"),
+            2 => Some("Sandbox"),
+            3 => Some("Skills"),
+            4 => Some("Memory"),
+            5 => Some("Embeddings"),
+            6 => Some("Data"),
+            7 => Some("Gateway"),
+            8 => Some("Heartbeat"),
+            9 => Some("Budget"),
+            10 => Some("Prompt Cache"),
+            11 => Some("Plugins"),
+            12 => Some("Browser"),
+            13 => Some("Agents"),
+            14 => Some("Security"),
+            15 if config.security.host_audit => Some("Host Audit"),
+            15 => None,
             _ => None,
         }
     }
@@ -177,70 +176,66 @@ impl DiagnosticRunner {
         let mut checks = Vec::new();
         let label = match self.step {
             0 => {
-                check_config(&mut checks);
-                "Config"
-            }
-            1 => {
                 check_provider(config, &mut checks);
                 "Provider"
             }
-            2 => {
+            1 => {
                 check_secrets(config, &mut checks);
                 "Secrets"
             }
-            3 => {
+            2 => {
                 check_sandbox(&mut checks);
                 "Sandbox"
             }
-            4 => {
+            3 => {
                 check_skills(config, &mut checks);
                 "Skills"
             }
-            5 => {
+            4 => {
                 check_memory(&mut checks);
                 "Memory"
             }
-            6 => {
+            5 => {
                 check_embeddings(config, &mut checks);
                 "Embeddings"
             }
-            7 => {
+            6 => {
                 check_data_dir(&mut checks);
                 "Data"
             }
-            8 => {
+            7 => {
                 check_gateway(config, &mut checks);
                 "Gateway"
             }
-            9 => {
+            8 => {
                 check_heartbeat(config, &mut checks);
                 "Heartbeat"
             }
-            10 => {
+            9 => {
                 check_budget(config, &mut checks);
                 "Budget"
             }
-            11 => {
+            10 => {
                 check_prompt_cache(config, &mut checks);
                 "Prompt Cache"
             }
-            12 => {
+            11 => {
                 check_plugins(&mut checks);
                 "Plugins"
             }
-            13 => {
+            12 => {
                 check_browser(config, &mut checks);
                 "Browser"
             }
-            14 => {
+            13 => {
                 check_agents(config, &mut checks);
                 "Agents"
             }
-            15 => {
+            14 => {
                 check_config_security(config, &mut checks);
                 "Security"
             }
-            16 => {
+            15 => {
                 if config.security.host_audit {
                     crate::host_audit::run_host_security_checks(&mut checks);
                     self.step += 1;
@@ -271,42 +266,6 @@ pub fn run_diagnostics(config: &Config) -> DiagnosticReport {
         checks.extend(step_checks);
     }
     DiagnosticReport { checks }
-}
-
-fn check_config(checks: &mut Vec<DiagnosticCheck>) {
-    match Config::data_dir() {
-        Ok(data_dir) => {
-            let config_path = data_dir.join("config.toml");
-            if config_path.exists() {
-                checks.push(DiagnosticCheck::pass("Config", "config.toml exists"));
-                match Config::load_from_db() {
-                    Ok(_) => {
-                        checks.push(DiagnosticCheck::pass("Config", "config.toml valid"));
-                    }
-                    Err(e) => {
-                        checks.push(DiagnosticCheck::fail(
-                            "Config",
-                            "config.toml valid",
-                            format!("{e}"),
-                        ));
-                    }
-                }
-            } else {
-                checks.push(DiagnosticCheck::warn(
-                    "Config",
-                    "config.toml exists",
-                    "not found, using defaults",
-                ));
-            }
-        }
-        Err(e) => {
-            checks.push(DiagnosticCheck::fail(
-                "Config",
-                "data directory",
-                format!("{e}"),
-            ));
-        }
-    }
 }
 
 fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
@@ -379,12 +338,6 @@ fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             "Claude CLI available (alternative provider)",
         ));
     }
-
-    checks.push(DiagnosticCheck::warn(
-        "Provider",
-        "API connectivity",
-        "skipped (use --online for live check)",
-    ));
 }
 
 fn check_secrets(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
@@ -409,7 +362,7 @@ fn check_secrets(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                         let hint = if config.llm.api_key.is_some() {
                             "plaintext .env still present — consider removing it"
                         } else {
-                            "plaintext API keys in .env — consider using SecretRef in config.toml (e.g., api_key = { source = \"exec\", command = \"security\", args = [\"find-generic-password\", \"-s\", \"borg\", \"-w\"] })"
+                            "plaintext API keys in .env — move to the macOS keychain and set llm.api_key via a SecretRef exec source in settings (e.g., `security find-generic-password -s borg -w`)"
                         };
                         checks.push(DiagnosticCheck::warn(
                             "Secrets",
@@ -514,19 +467,6 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                 "Skills",
                 format!("{available}/{total} skills available"),
             ));
-
-            let missing: Vec<String> = skills
-                .iter()
-                .filter(|s| !s.available)
-                .map(|s| s.manifest.name.clone())
-                .collect();
-            if !missing.is_empty() {
-                checks.push(DiagnosticCheck::warn(
-                    "Skills",
-                    format!("missing requirements: {}", missing.join(", ")),
-                    "some skills unavailable",
-                ));
-            }
         }
         Err(e) => {
             checks.push(DiagnosticCheck::fail(
@@ -1337,16 +1277,16 @@ mod tests {
     fn report_format_output() {
         let report = DiagnosticReport {
             checks: vec![
-                DiagnosticCheck::pass("Config", "config.toml exists"),
-                DiagnosticCheck::pass("Config", "config.toml valid"),
-                DiagnosticCheck::fail("Provider", "API key set", "not found"),
+                DiagnosticCheck::pass("Provider", "API key set"),
+                DiagnosticCheck::pass("Provider", "Provider: openrouter"),
+                DiagnosticCheck::fail("Provider", "Claude CLI binary", "not found"),
                 DiagnosticCheck::warn("Sandbox", "sandbox-exec", "not available"),
             ],
         };
         let output = report.format();
         assert!(output.contains("Borg Doctor"));
-        assert!(output.contains("✓ config.toml exists"));
-        assert!(output.contains("✗ API key set"));
+        assert!(output.contains("✓ API key set"));
+        assert!(output.contains("✗ Claude CLI binary"));
         assert!(output.contains("⚠ sandbox-exec"));
         assert!(output.contains("2 passed, 1 warning(s), 1 failed"));
     }
@@ -1375,20 +1315,20 @@ mod tests {
     fn run_diagnostics_produces_checks() {
         let config = Config::default();
         let report = run_diagnostics(&config);
-        // Should always produce at least the config and provider checks
+        // Should always produce at least the provider checks
         assert!(!report.checks.is_empty());
-        // Should have at least config, provider, sandbox, tools, skills, memory, data categories
+        // Should have at least provider, sandbox, skills, memory, data categories
         let categories: std::collections::HashSet<&str> =
             report.checks.iter().map(|c| c.category).collect();
-        assert!(categories.contains("Config"));
         assert!(categories.contains("Provider"));
+        assert!(categories.contains("Sandbox"));
     }
 
     #[test]
     fn diagnostic_check_pass_fields() {
-        let check = DiagnosticCheck::pass("Config", "config.toml exists");
-        assert_eq!(check.category, "Config");
-        assert_eq!(check.name, "config.toml exists");
+        let check = DiagnosticCheck::pass("Provider", "API key set");
+        assert_eq!(check.category, "Provider");
+        assert_eq!(check.name, "API key set");
         assert_eq!(check.status, CheckStatus::Pass);
     }
 
@@ -1412,16 +1352,16 @@ mod tests {
     fn report_format_groups_consecutive_same_category() {
         let report = DiagnosticReport {
             checks: vec![
-                DiagnosticCheck::pass("Config", "check A"),
-                DiagnosticCheck::pass("Config", "check C"),
+                DiagnosticCheck::pass("Sandbox", "check A"),
+                DiagnosticCheck::pass("Sandbox", "check C"),
                 DiagnosticCheck::pass("Provider", "check B"),
             ],
         };
         let output = report.format();
-        // Consecutive Config checks should appear under a single Config heading
-        let config_heading_count = output.matches("\nConfig\n").count();
+        // Consecutive Sandbox checks should appear under a single Sandbox heading
+        let sandbox_heading_count = output.matches("\nSandbox\n").count();
         assert_eq!(
-            config_heading_count, 1,
+            sandbox_heading_count, 1,
             "Consecutive same-category checks should share one heading"
         );
         // check A and check C should both appear before Provider
