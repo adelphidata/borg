@@ -83,64 +83,46 @@ bundled_skills! {
     "paperclip"      => "paperclip"      { category: "developer", default_enabled: false, hidden: false },
 }
 
+/// Filter `SKILL_REGISTRY` to the names satisfying a predicate, all at compile time.
+/// Usage: `registry_filtered_names!(e => e.default_enabled)`.
+macro_rules! registry_filtered_names {
+    ($e:ident => $pred:expr) => {{
+        const fn count() -> usize {
+            let mut n = 0;
+            let mut i = 0;
+            while i < SKILL_REGISTRY.len() {
+                let $e = &SKILL_REGISTRY[i];
+                if $pred {
+                    n += 1;
+                }
+                i += 1;
+            }
+            n
+        }
+        const N: usize = count();
+        const fn build() -> [&'static str; N] {
+            let mut out = [""; N];
+            let mut i = 0;
+            let mut j = 0;
+            while i < SKILL_REGISTRY.len() {
+                let $e = &SKILL_REGISTRY[i];
+                if $pred {
+                    out[j] = SKILL_REGISTRY[i].name;
+                    j += 1;
+                }
+                i += 1;
+            }
+            out
+        }
+        build()
+    }};
+}
+
 /// Skills enabled by default when no explicit config entry exists.
-pub const DEFAULT_ENABLED_SKILLS: &[&str] = &{
-    // Count entries at compile time
-    const COUNT: usize = {
-        let mut n = 0;
-        let mut i = 0;
-        while i < SKILL_REGISTRY.len() {
-            if SKILL_REGISTRY[i].default_enabled {
-                n += 1;
-            }
-            i += 1;
-        }
-        n
-    };
-    const fn build() -> [&'static str; COUNT] {
-        let mut out = [""; COUNT];
-        let mut i = 0;
-        let mut j = 0;
-        while i < SKILL_REGISTRY.len() {
-            if SKILL_REGISTRY[i].default_enabled {
-                out[j] = SKILL_REGISTRY[i].name;
-                j += 1;
-            }
-            i += 1;
-        }
-        out
-    }
-    build()
-};
+pub const DEFAULT_ENABLED_SKILLS: &[&str] = &registry_filtered_names!(e => e.default_enabled);
 
 /// Skills hidden from the unified /plugins UI (still loaded for prompt injection).
-pub const HIDDEN_SKILLS: &[&str] = &{
-    const COUNT: usize = {
-        let mut n = 0;
-        let mut i = 0;
-        while i < SKILL_REGISTRY.len() {
-            if SKILL_REGISTRY[i].hidden {
-                n += 1;
-            }
-            i += 1;
-        }
-        n
-    };
-    const fn build() -> [&'static str; COUNT] {
-        let mut out = [""; COUNT];
-        let mut i = 0;
-        let mut j = 0;
-        while i < SKILL_REGISTRY.len() {
-            if SKILL_REGISTRY[i].hidden {
-                out[j] = SKILL_REGISTRY[i].name;
-                j += 1;
-            }
-            i += 1;
-        }
-        out
-    }
-    build()
-};
+pub const HIDDEN_SKILLS: &[&str] = &registry_filtered_names!(e => e.hidden);
 
 /// Returns `true` if the given name matches a built-in skill.
 pub fn is_builtin_skill_name(name: &str) -> bool {

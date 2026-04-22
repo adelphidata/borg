@@ -49,19 +49,27 @@ use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
 // ── Rate Limiting ──
 
+/// Maximum events per bucket per hour during replay, indexed by event type.
+/// Event types not listed fall back to `RATE_LIMIT_DEFAULT`.
+const RATE_LIMITS: &[(&str, u32)] = &[
+    ("xp_gain", 15),
+    ("evolution", 3),
+    ("classification", 3),
+    ("archetype_shift", 5),
+    ("level_up", 10),
+    ("milestone_unlocked", 3),
+    ("mood_changed", 5),
+    ("share_card_created", 3),
+];
+
+const RATE_LIMIT_DEFAULT: u32 = 10;
+
 /// Maximum events per bucket per hour during replay.
 pub(crate) fn rate_limit_for(event_type: &str) -> u32 {
-    match event_type {
-        "xp_gain" => 15,
-        "evolution" => 3,
-        "classification" => 3,
-        "archetype_shift" => 5,
-        "level_up" => 10,
-        "milestone_unlocked" => 3,
-        "mood_changed" => 5,
-        "share_card_created" => 3,
-        _ => 10,
-    }
+    RATE_LIMITS
+        .iter()
+        .find_map(|(k, v)| (*k == event_type).then_some(*v))
+        .unwrap_or(RATE_LIMIT_DEFAULT)
 }
 
 // ── Types ──

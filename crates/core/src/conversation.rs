@@ -6,15 +6,9 @@ use crate::tokenizer::estimate_tokens;
 use crate::types::{ContentPart, Message, MessageContent, Role};
 
 use crate::constants;
-
-/// Tokens reserved for the compaction summary marker.
-const COMPACTION_MARKER_TOKENS: usize = constants::COMPACTION_MARKER_TOKENS;
-/// Max characters from the transcript sent to the LLM summarizer.
-const MAX_TRANSCRIPT_CHARS: usize = constants::MAX_TRANSCRIPT_CHARS;
-/// Conservative token estimate per image (OpenAI high-detail ≈ 765).
-const IMAGE_TOKEN_ESTIMATE: usize = constants::IMAGE_TOKEN_ESTIMATE;
-/// Rough token estimate for audio (based on ~1 token per 4 bytes of decoded audio).
-const AUDIO_TOKEN_ESTIMATE_MIN: usize = constants::AUDIO_TOKEN_ESTIMATE_MIN;
+use crate::constants::{
+    AUDIO_TOKEN_ESTIMATE_MIN, COMPACTION_MARKER_TOKENS, IMAGE_TOKEN_ESTIMATE, MAX_TRANSCRIPT_CHARS,
+};
 
 /// Estimate the token count of a single message, including role overhead.
 fn message_tokens(msg: &Message) -> usize {

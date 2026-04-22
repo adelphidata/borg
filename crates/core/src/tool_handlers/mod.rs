@@ -177,59 +177,39 @@ mod tests {
         assert!(!names.contains(&"apply_skill_patch"));
     }
 
-    #[test]
-    fn core_tool_definitions_excludes_browser_when_disabled() {
+    fn assert_tool_gated(enabled: bool, set_enabled: fn(&mut Config, bool), tool_names: &[&str]) {
         let mut config = Config::default();
-        config.browser.enabled = false;
+        set_enabled(&mut config, enabled);
         let defs = core_tool_definitions(&config);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(!names.contains(&"browser"));
+        for tool in tool_names {
+            assert_eq!(
+                names.contains(tool),
+                enabled,
+                "tool `{tool}` presence should match enabled={enabled}"
+            );
+        }
     }
 
     #[test]
-    fn core_tool_definitions_includes_browser_when_enabled() {
-        let mut config = Config::default();
-        config.browser.enabled = true;
-        let defs = core_tool_definitions(&config);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(names.contains(&"browser"));
+    fn core_tool_definitions_gates_browser_on_config() {
+        let setter: fn(&mut Config, bool) = |c, v| c.browser.enabled = v;
+        assert_tool_gated(false, setter, &["browser"]);
+        assert_tool_gated(true, setter, &["browser"]);
     }
 
     #[test]
-    fn core_tool_definitions_excludes_tts_when_disabled() {
-        let config = Config::default();
-        let defs = core_tool_definitions(&config);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(!names.contains(&"text_to_speech"));
+    fn core_tool_definitions_gates_tts_on_config() {
+        let setter: fn(&mut Config, bool) = |c, v| c.tts.enabled = v;
+        assert_tool_gated(false, setter, &["text_to_speech"]);
+        assert_tool_gated(true, setter, &["text_to_speech"]);
     }
 
     #[test]
-    fn core_tool_definitions_includes_tts_when_enabled() {
-        let mut config = Config::default();
-        config.tts.enabled = true;
-        let defs = core_tool_definitions(&config);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(names.contains(&"text_to_speech"));
-    }
-
-    #[test]
-    fn core_tool_definitions_excludes_web_when_disabled() {
-        let mut config = Config::default();
-        config.web.enabled = false;
-        let defs = core_tool_definitions(&config);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(!names.contains(&"web_fetch"));
-        assert!(!names.contains(&"web_search"));
-    }
-
-    #[test]
-    fn core_tool_definitions_includes_web_when_enabled() {
-        let mut config = Config::default();
-        config.web.enabled = true;
-        let defs = core_tool_definitions(&config);
-        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert!(names.contains(&"web_fetch"));
-        assert!(names.contains(&"web_search"));
+    fn core_tool_definitions_gates_web_on_config() {
+        let setter: fn(&mut Config, bool) = |c, v| c.web.enabled = v;
+        assert_tool_gated(false, setter, &["web_fetch", "web_search"]);
+        assert_tool_gated(true, setter, &["web_fetch", "web_search"]);
     }
 
     #[test]
