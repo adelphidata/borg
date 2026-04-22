@@ -13,14 +13,14 @@ use borg_core::config::CollaborationMode;
 impl<'a> App<'a> {
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        let show_status = !matches!(self.state, AppState::Idle);
+        let status_height = self.desired_status_height();
         let composer_height = self.composer.height();
         let queue_preview_height = self.compute_queue_preview_height();
         let app_layout =
-            layout::compute_layout(area, composer_height, show_status, queue_preview_height);
+            layout::compute_layout(area, composer_height, status_height, queue_preview_height);
 
         self.render_transcript(frame, app_layout.transcript);
-        if show_status {
+        if status_height > 0 {
             self.render_status(frame, app_layout.status);
         }
         if queue_preview_height > 0 {
@@ -161,26 +161,65 @@ impl<'a> App<'a> {
         frame.render_widget(hint_para, hint_area);
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect) {
-        let line = match &self.state {
-            AppState::Streaming { start, .. } => {
-                let elapsed = theme::format_elapsed(start.elapsed().as_secs());
-                let throbber = Throbber::default()
-                    .throbber_set(BRAILLE_EIGHT)
-                    .throbber_style(theme::tool_style());
-                let mut spans = vec![
-                    Span::raw(" "),
-                    throbber.to_symbol_span(&self.throbber_state),
-                ];
-                spans.extend(shimmer::shimmer_spans(
-                    "Working...",
-                    (2, 195, 189),
-                    (180, 255, 252),
-                ));
-                spans.push(Span::styled(format!(" ({elapsed}"), theme::tool_style()));
-                spans.push(Span::styled(" • esc to interrupt)", theme::dim()));
-                Line::from(spans)
+    /// Render the live streaming row (throbber + phase header + elapsed +
+    /// optional details snippet). The header is driven by agent events
+    /// (`stream_status.header`) — "Preparing", "Thinking", "Responding",
+    /// "Running <tool>" — so the user has phase-level evidence the turn is
+    /// still making progress even when text output hasn't started yet.
+    fn render_streaming_status(&self, frame: &mut Frame, area: Rect, start: std::time::Instant) {
+        use ratatui::text::Text;
+
+        let elapsed = theme::format_elapsed(start.elapsed().as_secs());
+        let throbber = Throbber::default()
+            .throbber_set(BRAILLE_EIGHT)
+            .throbber_style(theme::tool_style());
+        let mut header_spans = vec![
+            Span::raw(" "),
+            throbber.to_symbol_span(&self.throbber_state),
+        ];
+        // Shimmer the live header so the eye has a visual cue distinct from
+        // the static "esc to interrupt" hint.
+        header_spans.extend(shimmer::shimmer_spans(
+            &format!("{}...", self.stream_status.header),
+            (2, 195, 189),
+            (180, 255, 252),
+        ));
+        header_spans.push(Span::styled(format!(" ({elapsed}"), theme::tool_style()));
+        header_spans.push(Span::styled(" • esc to interrupt)", theme::dim()));
+
+        let mut lines = vec![Line::from(header_spans)];
+        if area.height >= 2 {
+            if let Some(details) = self.stream_status.details.as_deref() {
+                lines.push(Line::from(vec![
+                    Span::styled("   └ ", theme::dim()),
+                    Span::styled(details.to_string(), theme::dim()),
+                ]));
             }
+        }
+        frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    }
+
+    /// How many rows the status bar wants for the current state. 0 when idle,
+    /// 1 for single-line status, 2 when a live `stream_status.details` tail
+    /// should be shown underneath the header.
+    pub(super) fn desired_status_height(&self) -> u16 {
+        match &self.state {
+            AppState::Idle => 0,
+            AppState::Streaming { .. } if self.stream_status.details.is_some() => 2,
+            _ => 1,
+        }
+    }
+
+    fn render_status(&self, frame: &mut Frame, area: Rect) {
+        if let AppState::Streaming { start, .. } = &self.state {
+            // Streaming is the one state with variable height (header + optional
+            // details), so render it through a dedicated path instead of
+            // shoehorning both rows into a single `Line`.
+            self.render_streaming_status(frame, area, *start);
+            return;
+        }
+        let line = match &self.state {
+            AppState::Streaming { .. } => unreachable!("handled above"),
             AppState::AwaitingApproval { .. } => Line::from(vec![Span::styled(
                 format!(" {} Approval needed — press y or n", theme::BULLET),
                 theme::error_style(),
@@ -694,6 +733,124 @@ mod tests {
         assert!(rendered.iter().any(|l| l == "mood:  stable"));
         // Mood must NOT appear on the class line — it lives on its own.
         assert!(rendered.iter().all(|l| !l.contains("(stable)")));
+    }
+
+    // ========================================================================
+    // desired_status_height — governs whether a second row is allocated for
+    // the live details snippet; layout depends on this number directly.
+    // ========================================================================
+
+    #[test]
+    fn desired_status_height_zero_when_idle() {
+        let app = make_app();
+        assert_eq!(app.desired_status_height(), 0);
+    }
+
+    #[test]
+    fn desired_status_height_one_while_streaming_without_details() {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        assert!(app.stream_status.details.is_none());
+        assert_eq!(app.desired_status_height(), 1);
+    }
+
+    #[test]
+    fn desired_status_height_two_when_streaming_has_details() {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.stream_status
+            .set_details(Some("cargo build --release".into()));
+        // A second row is required so the ellipsized details tail has
+        // somewhere to render; without this the layout module silently
+        // clamps the details to invisible.
+        assert_eq!(app.desired_status_height(), 2);
+    }
+
+    #[test]
+    fn desired_status_height_one_for_non_streaming_states() {
+        let mut app = make_app();
+        app.state = AppState::PlanReview;
+        assert_eq!(app.desired_status_height(), 1);
+        app.state = AppState::ConfirmingUninstall;
+        assert_eq!(app.desired_status_height(), 1);
+    }
+
+    /// Render the status bar into a TestBackend and return each row as a string.
+    fn render_status_rows(app: &App<'static>, w: u16, h: u16) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, w, h);
+                app.render_status(frame, area);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn render_status_shows_live_header_text_while_streaming() {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.stream_status.set_header("Thinking");
+        let rows = render_status_rows(&app, 80, 1);
+        // Liveness check: the phase label must actually appear on-screen.
+        // "Working..." alone would not be evidence of the header field
+        // flowing through to the renderer.
+        assert!(
+            rows[0].contains("Thinking"),
+            "expected 'Thinking' in status row, got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn render_status_renders_details_on_second_row_when_height_allows() {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.stream_status.set_header("Running run_shell");
+        app.stream_status
+            .set_details(Some("cargo test --all".into()));
+        let rows = render_status_rows(&app, 80, 2);
+        assert!(
+            rows[0].contains("Running run_shell"),
+            "header row: {:?}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("cargo test --all"),
+            "details row must show the tool-arg snippet, got: {:?}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn render_status_suppresses_details_when_only_one_row_available() {
+        // If the layout gave us only one row, we must not silently clip the
+        // details line into the header row — that would mangle the header.
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.stream_status.set_header("Thinking");
+        app.stream_status
+            .set_details(Some("should not be rendered".into()));
+        let rows = render_status_rows(&app, 80, 1);
+        assert!(rows[0].contains("Thinking"));
+        assert!(
+            !rows[0].contains("should not be rendered"),
+            "details must not bleed into the header row"
+        );
     }
 
     #[test]

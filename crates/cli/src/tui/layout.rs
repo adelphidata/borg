@@ -11,11 +11,9 @@ pub struct AppLayout {
 pub fn compute_layout(
     area: Rect,
     composer_height: u16,
-    show_status: bool,
+    status_height: u16,
     queue_preview_height: u16,
 ) -> AppLayout {
-    let status_height = if show_status { 1 } else { 0 };
-
     let chunks = Layout::vertical([
         Constraint::Min(3),                       // transcript
         Constraint::Length(status_height),        // status bar
@@ -44,7 +42,7 @@ mod tests {
 
     #[test]
     fn basic_layout_with_status() {
-        let layout = compute_layout(area(80, 40), 3, true, 0);
+        let layout = compute_layout(area(80, 40), 3, 1, 0);
         assert_eq!(layout.status.height, 1);
         assert_eq!(layout.composer.height, 3);
         assert_eq!(layout.footer.height, 1);
@@ -55,21 +53,29 @@ mod tests {
 
     #[test]
     fn layout_without_status() {
-        let layout = compute_layout(area(80, 40), 3, false, 0);
+        let layout = compute_layout(area(80, 40), 3, 0, 0);
         assert_eq!(layout.status.height, 0);
         assert_eq!(layout.transcript.height, 40 - 3 - 1);
     }
 
     #[test]
     fn layout_with_queue_preview() {
-        let layout = compute_layout(area(80, 40), 3, true, 2);
+        let layout = compute_layout(area(80, 40), 3, 1, 2);
         assert_eq!(layout.queue_preview.height, 2);
         assert_eq!(layout.transcript.height, 40 - 3 - 1 - 2 - 1);
     }
 
     #[test]
+    fn layout_with_two_line_status() {
+        // Streaming with a details line asks for status_height=2.
+        let layout = compute_layout(area(80, 40), 3, 2, 0);
+        assert_eq!(layout.status.height, 2);
+        assert_eq!(layout.transcript.height, 40 - 3 - 2 - 1);
+    }
+
+    #[test]
     fn layout_positions_are_contiguous() {
-        let layout = compute_layout(area(100, 50), 5, true, 3);
+        let layout = compute_layout(area(100, 50), 5, 1, 3);
         assert_eq!(layout.transcript.y, 0);
         assert_eq!(
             layout.status.y,

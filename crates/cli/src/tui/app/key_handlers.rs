@@ -10,8 +10,6 @@
 //! `KeyCode::Up`/`KeyCode::Down`. See the Rule A/B/C comment inside
 //! `handle_key_idle` — do NOT collapse those tiers.
 
-use std::time::Instant;
-
 use anyhow::Result;
 
 use borg_core::config::CollaborationMode;
@@ -217,9 +215,7 @@ impl<'a> App<'a> {
                     if let Some(HistoryCell::ShellApproval { status, .. }) = self.cells.last_mut() {
                         *status = ApprovalStatus::Approved;
                     }
-                    self.state = AppState::Streaming {
-                        start: Instant::now(),
-                    };
+                    self.resume_streaming();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     if let Some(tx) = respond.take() {
@@ -228,9 +224,7 @@ impl<'a> App<'a> {
                     if let Some(HistoryCell::ShellApproval { status, .. }) = self.cells.last_mut() {
                         *status = ApprovalStatus::Denied;
                     }
-                    self.state = AppState::Streaming {
-                        start: Instant::now(),
-                    };
+                    self.resume_streaming();
                 }
                 _ => {}
             }
@@ -290,9 +284,7 @@ impl<'a> App<'a> {
                             let _ = tx.send(label);
                         }
                         self.composer.set_text("");
-                        self.state = AppState::Streaming {
-                            start: Instant::now(),
-                        };
+                        self.resume_streaming();
                     }
                 }
                 KeyCode::Enter => {
@@ -301,9 +293,7 @@ impl<'a> App<'a> {
                         let _ = tx.send(label);
                     }
                     self.composer.set_text("");
-                    self.state = AppState::Streaming {
-                        start: Instant::now(),
-                    };
+                    self.resume_streaming();
                 }
                 KeyCode::Tab => {
                     if *allow_custom {
@@ -315,9 +305,7 @@ impl<'a> App<'a> {
                         let _ = tx.send("[user declined to answer]".to_string());
                     }
                     self.composer.set_text("");
-                    self.state = AppState::Streaming {
-                        start: Instant::now(),
-                    };
+                    self.resume_streaming();
                 }
                 _ => {}
             }
@@ -336,9 +324,7 @@ impl<'a> App<'a> {
                     let _ = tx.send(text);
                 }
                 self.composer.set_text("");
-                self.state = AppState::Streaming {
-                    start: Instant::now(),
-                };
+                self.resume_streaming();
             }
             KeyCode::Esc => {
                 // If in custom_mode with choices available, Esc returns to selection mode
@@ -351,9 +337,7 @@ impl<'a> App<'a> {
                         let _ = tx.send("[user declined to answer]".to_string());
                     }
                     self.composer.set_text("");
-                    self.state = AppState::Streaming {
-                        start: Instant::now(),
-                    };
+                    self.resume_streaming();
                 }
             }
             _ => {

@@ -116,6 +116,8 @@ impl<'a> App<'a> {
         self.cells.push(HistoryCell::Thinking {
             text: String::new(),
         });
+        self.stream_status.set_header("Preparing");
+        self.stream_status.set_details(None);
         if self.auto_scroll {
             self.scroll_offset = 0;
         }
@@ -133,6 +135,12 @@ impl<'a> App<'a> {
                 text: delta,
                 streaming: true,
             });
+        }
+        // First visible assistant token → phase flips to "Responding"; further
+        // deltas are cheap string compares so we don't re-allocate.
+        if self.stream_status.header != "Responding" {
+            self.stream_status.set_header("Responding");
+            self.stream_status.set_details(None);
         }
         if self.auto_scroll {
             self.scroll_offset = 0;
@@ -170,9 +178,17 @@ impl<'a> App<'a> {
                 } else {
                     len
                 };
-            self.cells
-                .insert(insert_pos, HistoryCell::Thinking { text: delta });
+            self.cells.insert(
+                insert_pos,
+                HistoryCell::Thinking {
+                    text: delta.clone(),
+                },
+            );
         }
+        if self.stream_status.header != "Thinking" {
+            self.stream_status.set_header("Thinking");
+        }
+        self.stream_status.set_details(Some(delta));
         if self.auto_scroll {
             self.scroll_offset = 0;
         }
@@ -186,6 +202,11 @@ impl<'a> App<'a> {
         {
             self.cells.pop();
         }
+        // Status row: "Running <tool>" + a compact args snippet so the user
+        // can see *which* call is in flight (e.g. a long-running shell).
+        self.stream_status.set_header(format!("Running {name}"));
+        self.stream_status
+            .set_details(Some(summarize_tool_args(&name, &args)));
         self.cells.push(HistoryCell::ToolStart {
             name,
             args,
@@ -238,6 +259,10 @@ impl<'a> App<'a> {
             args_json: matched_args,
             collapsed,
         });
+        // Tool finished; clear the "Running X" phase so the next stream event
+        // (thinking delta / text delta) decides the new header. If no further
+        // event arrives before TurnComplete, "Working" is the honest label.
+        self.stream_status.reset();
         if self.auto_scroll {
             self.scroll_offset = 0;
         }
@@ -382,6 +407,12 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_tool_output_delta(&mut self, delta: String, is_stderr: bool) {
+        // Surface the most recent output line as live status details so the
+        // user can see streaming tools (e.g. `cargo build`) are actually
+        // making progress — not just sitting on an open pipe.
+        if let Some(last_line) = delta.lines().rev().find(|l| !l.trim().is_empty()) {
+            self.stream_status.set_details(Some(last_line.to_string()));
+        }
         if let Some(HistoryCell::ToolStreaming { lines, .. }) = self.cells.last_mut() {
             lines.push((delta, is_stderr));
         } else {
@@ -460,4 +491,61 @@ impl<'a> App<'a> {
             },
         }
     }
+}
+
+/// Pull the most informative short substring out of a tool's raw JSON args for
+/// display in the live status row. This is a best-effort summary — the
+/// status row is purely informational, so an unparseable blob falls back to
+/// the raw arg string (which the details setter will left-ellipsize).
+///
+/// Explicit field preference by common tool name (`run_shell.command`,
+/// `read_file.path`, etc.) beats generic "first string value" extraction
+/// because an `apply_patch` invocation's first string is usually the giant
+/// `input` blob rather than the target path.
+pub(super) fn summarize_tool_args(name: &str, args: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return trimmed.to_string(),
+    };
+    let Some(obj) = parsed.as_object() else {
+        return trimmed.to_string();
+    };
+
+    // Preferred fields per tool — first hit wins.
+    const PREFERRED: &[(&str, &[&str])] = &[
+        ("run_shell", &["command"]),
+        ("read_file", &["path"]),
+        ("list_dir", &["path"]),
+        ("apply_patch", &["target", "path"]),
+        ("write_memory", &["name"]),
+        ("read_memory", &["name"]),
+        ("web_fetch", &["url"]),
+        ("web_search", &["query"]),
+        ("browser", &["url", "action"]),
+    ];
+    let preferred_fields: &[&str] = PREFERRED
+        .iter()
+        .find_map(|(n, fields)| (*n == name).then_some(*fields))
+        .unwrap_or(&[]);
+    for field in preferred_fields {
+        if let Some(v) = obj.get(*field).and_then(|v| v.as_str()) {
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+
+    // Generic fallback: first non-empty string value in the object.
+    for (_, v) in obj {
+        if let Some(s) = v.as_str() {
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
 }
