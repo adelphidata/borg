@@ -529,22 +529,31 @@ fn handle_export(app: &mut App<'_>, session_id: &str, format: borg_core::export:
             return;
         }
     };
-    if path.exists() {
-        app.push_system_message(format!(
-            "Export aborted: {} already exists (refusing to overwrite).",
-            path.display()
-        ));
-        return;
+    // create_new closes the TOCTOU window between exists() and write(). If the
+    // filename already exists (same second stamp, rapid re-export), fail loudly
+    // rather than clobber — the transcript message tells the user.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            if let Err(e) = f.write_all(rendered.as_bytes()) {
+                app.push_system_message(format!("Export failed writing {}: {e}", path.display()));
+                return;
+            }
+        }
+        Err(e) => {
+            app.push_system_message(format!(
+                "Export aborted: could not create {} (refusing to overwrite): {e}",
+                path.display()
+            ));
+            return;
+        }
     }
-    if let Err(e) = std::fs::write(&path, rendered.as_bytes()) {
-        app.push_system_message(format!("Export failed writing {}: {e}", path.display()));
-        return;
-    }
-    app.push_system_message(format!(
-        "Exported session {} → {}",
-        &session_id[..8.min(session_id.len())],
-        path.display()
-    ));
+    let short: String = session_id.chars().take(8).collect();
+    app.push_system_message(format!("Exported session {} → {}", short, path.display()));
 }
 
 async fn run_event_loop(

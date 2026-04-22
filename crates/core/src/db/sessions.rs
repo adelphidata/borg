@@ -25,6 +25,27 @@ impl Database {
         Ok(())
     }
 
+    /// Fetch a single session row by exact id. Returns `None` if absent.
+    pub fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, updated_at, total_tokens, model, title
+             FROM sessions WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row(params![id], |row| {
+                Ok(SessionRow {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    model: row.get(4)?,
+                    title: row.get(5)?,
+                })
+            })
+            .ok();
+        Ok(row)
+    }
+
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, updated_at, total_tokens, model, title

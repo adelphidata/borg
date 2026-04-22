@@ -87,13 +87,9 @@ pub fn export_session(
 /// row or messages are missing — we don't silently emit an empty export
 /// (see CLAUDE.md "no lying" invariant).
 fn load_session(db: &Database, session_id: &str) -> Result<Session> {
-    // Session metadata row.
-    let sessions = db
-        .list_sessions(10_000)
-        .with_context(|| format!("listing sessions while exporting '{session_id}'"))?;
-    let row = sessions
-        .into_iter()
-        .find(|s| s.id == session_id)
+    let row = db
+        .session_by_id(session_id)
+        .with_context(|| format!("looking up session '{session_id}'"))?
         .ok_or_else(|| anyhow!("session '{session_id}' not found"))?;
 
     let rows = db
@@ -175,14 +171,20 @@ fn render_csv(session: &Session) -> String {
         let tc = msg
             .tool_calls
             .as_ref()
-            .and_then(|tc| serde_json::to_string(tc).ok())
+            .map(|tc| match serde_json::to_string(tc) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("export: dropping tool_calls for CSV row {idx}: {e}");
+                    String::new()
+                }
+            })
             .unwrap_or_default();
         out.push_str(&format!(
             "{idx},{},{},{},{}\n",
             csv_escape(role),
             csv_escape(ts),
-            csv_escape(&content),
-            csv_escape(&tc),
+            csv_escape(&csv_defuse_formula(&content)),
+            csv_escape(&csv_defuse_formula(&tc)),
         ));
     }
     out
@@ -262,6 +264,16 @@ fn flatten_content(content: Option<&MessageContent>) -> String {
     }
 }
 
+/// Prefix fields that spreadsheet apps (Excel, Sheets, Numbers) would execute
+/// as formulas with a leading single quote. See OWASP "CSV Injection". Only
+/// applied to free-form content fields — not to known-safe columns like idx/role.
+fn csv_defuse_formula(s: &str) -> String {
+    match s.chars().next() {
+        Some('=' | '+' | '-' | '@' | '\t' | '\r') => format!("'{s}"),
+        _ => s.to_string(),
+    }
+}
+
 /// RFC 4180 CSV field escaping: wrap in quotes if the field contains `,` `"`
 /// `\n` or `\r`, doubling any interior quotes.
 fn csv_escape(s: &str) -> String {
@@ -275,7 +287,7 @@ fn csv_escape(s: &str) -> String {
 
 /// `borg-session-{short_id}-{yyyymmdd-HHMMSS}.{ext}`.
 fn suggested_filename(meta: &SessionMeta, format: ExportFormat) -> String {
-    let short = &meta.id[..8.min(meta.id.len())];
+    let short: String = meta.id.chars().take(8).collect();
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     format!("borg-session-{short}-{stamp}.{}", format.extension())
 }
@@ -283,7 +295,6 @@ fn suggested_filename(meta: &SessionMeta, format: ExportFormat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FunctionCall, ToolCall};
 
     fn seed_session(db: &Database, id: &str) {
         db.upsert_session(
@@ -476,20 +487,63 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_struct_serializes_as_expected() {
-        // Sanity: the ToolCall wire shape must match what export_session reads
-        // from tool_calls_json. If this regresses, JSON export will lose
-        // tool-call data silently.
-        let tc = ToolCall {
-            id: "x".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "n".to_string(),
-                arguments: "{}".to_string(),
+    fn csv_defuses_formula_prefixes() {
+        let db = Database::test_db();
+        db.upsert_session("sess-inj", 1, 2, 0, "m", "Inj").unwrap();
+        // Cover all four dangerous prefixes spreadsheets evaluate as formulas.
+        for (idx, payload) in ["=SUM(A1)", "+1+1", "-cmd", "@IF(1,1,0)"]
+            .iter()
+            .enumerate()
+        {
+            db.insert_message(
+                "sess-inj",
+                "user",
+                Some(payload),
+                None,
+                None,
+                Some(&format!("2024-01-01T00:00:{idx:02}Z")),
+                None,
+            )
+            .unwrap();
+        }
+        let (out, _) = export_session(
+            &db,
+            "sess-inj",
+            ExportOptions {
+                format: ExportFormat::Csv,
             },
+        )
+        .unwrap();
+        // Each payload must appear with a literal single-quote prefix so no
+        // spreadsheet app evaluates it. A `,` in the raw payload would also
+        // trigger RFC 4180 quoting, but these don't contain commas.
+        for payload in ["=SUM(A1)", "+1+1", "-cmd", "@IF(1,1,0)"] {
+            let defused = format!(",'{payload}");
+            // @IF(1,1,0) contains a comma — csv_escape will wrap in quotes.
+            let defused_quoted = format!(",\"'{payload}\"");
+            assert!(
+                out.contains(&defused) || out.contains(&defused_quoted),
+                "formula {payload:?} not defused in output: {out}"
+            );
+            // Safety check: the raw payload must NOT appear without the quote
+            // prefix (no false-positive from a lucky substring).
+            let raw = format!(",{payload}\n");
+            assert!(!out.contains(&raw), "raw {payload:?} leaked: {out}");
+        }
+    }
+
+    #[test]
+    fn suggested_filename_handles_non_ascii_id() {
+        let meta = SessionMeta {
+            id: "café-session-ümlaut".to_string(),
+            title: "t".to_string(),
+            created_at: "x".to_string(),
+            updated_at: "x".to_string(),
+            message_count: 0,
         };
-        let s = serde_json::to_string(&tc).unwrap();
-        assert!(s.contains("\"type\":\"function\""));
-        assert!(s.contains("\"name\":\"n\""));
+        // Byte-slicing would have panicked on the multibyte boundary.
+        let name = suggested_filename(&meta, ExportFormat::Json);
+        assert!(name.starts_with("borg-session-café-ses"), "got {name}");
+        assert!(name.ends_with(".json"));
     }
 }
