@@ -99,6 +99,8 @@ pub mod media;
 pub mod media_understanding;
 /// Memory loading with token budget and semantic search.
 pub mod memory;
+/// Client-side `@path` mention expansion for the TUI composer.
+pub mod mentions;
 /// Migration utilities for importing from other assistants.
 pub mod migrate;
 /// MMR diversity re-ranking (Jaccard similarity, greedy selection).

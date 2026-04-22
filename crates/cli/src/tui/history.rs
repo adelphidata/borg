@@ -76,7 +76,28 @@ pub enum HistoryCell {
     Plan {
         steps: Vec<PlanStep>,
     },
+    /// One-line card for a client-side `@path` mention expansion.
+    /// Emitted just before the assistant cell on each submit, one per
+    /// mention in the user's message. Rendered dim with a tree-end prefix.
+    MentionCard {
+        label: String,
+    },
     Separator,
+}
+
+/// Split a mention card label like `Read CLAUDE.md (275 lines)` into a
+/// plain-weight `"Read "` prefix and a bold `"CLAUDE.md (275 lines)"`
+/// tail. For labels without a clear verb split (`Skipped @foo (...)`),
+/// the whole label stays in the prefix.
+fn split_mention_label(label: &str) -> (&str, &str) {
+    // Known verb prefixes that we want to keep dim (unbolded).
+    for verb in &["Read ", "Listed directory "] {
+        if let Some(rest) = label.strip_prefix(verb) {
+            let split = label.len() - rest.len();
+            return (&label[..split], &label[split..]);
+        }
+    }
+    (label, "")
 }
 
 /// Truncate a string to at most `max_bytes` bytes at a valid UTF-8 boundary.
@@ -658,6 +679,24 @@ impl HistoryCell {
                     ]));
                 }
                 lines
+            }
+            HistoryCell::MentionCard { label } => {
+                // Matches the reference screenshot format: dim `⌞ Read
+                // CLAUDE.md (275 lines)` / `⌞ Listed directory foo/`.
+                // The filename/path portion after the verb is bolded.
+                let (verb, rest) = split_mention_label(label);
+                let mut spans = vec![Span::styled(
+                    format!("  {} ", theme::TREE_END),
+                    theme::dim(),
+                )];
+                spans.push(Span::styled(verb.to_string(), theme::dim()));
+                if !rest.is_empty() {
+                    spans.push(Span::styled(
+                        rest.to_string(),
+                        theme::dim().add_modifier(ratatui::style::Modifier::BOLD),
+                    ));
+                }
+                vec![Line::from(spans)]
             }
             HistoryCell::Separator => {
                 let rule_width = ((width as usize) * 2 / 3).min(80);

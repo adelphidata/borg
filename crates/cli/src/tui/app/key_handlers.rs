@@ -964,7 +964,8 @@ impl<'a> App<'a> {
                             self.file_popup.dismiss();
                         }
                     } else {
-                        self.composer.add_file_ref(display, path);
+                        let _ = path; // mentions expander re-resolves from display at submit
+                        self.composer.complete_file_mention(&display);
                         self.file_popup.dismiss();
                     }
                 }

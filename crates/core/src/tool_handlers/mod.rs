@@ -1,4 +1,4 @@
-mod filesystem;
+pub mod filesystem;
 mod list;
 mod media;
 mod memory;

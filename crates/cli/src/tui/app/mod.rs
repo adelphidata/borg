@@ -673,44 +673,26 @@ impl<'a> App<'a> {
         // Take image attachments before file refs
         let images = self.composer.take_image_attachments();
 
-        // Inject file contents from @mentions
-        let file_refs = self.composer.take_file_refs();
-        let final_input = if file_refs.is_empty() {
-            input.to_string()
-        } else {
-            let mut buf = input.to_string();
-            for fref in &file_refs {
-                match std::fs::read_to_string(&fref.path) {
-                    Ok(contents) => {
-                        const MAX_FILE_BYTES: usize = 100 * 1024;
-                        let truncated = if contents.len() > MAX_FILE_BYTES {
-                            format!(
-                                "{}\n[truncated — file exceeds 100KB]",
-                                &contents[..contents
-                                    .char_indices()
-                                    .take_while(|(i, _)| *i < MAX_FILE_BYTES)
-                                    .last()
-                                    .map(|(i, c)| i + c.len_utf8())
-                                    .unwrap_or(0)]
-                            )
-                        } else {
-                            contents
-                        };
-                        buf.push_str(&format!(
-                            "\n\n<file path=\"{}\">\n{truncated}\n</file>",
-                            fref.display
-                        ));
-                    }
-                    Err(e) => {
-                        buf.push_str(&format!(
-                            "\n\n<file path=\"{}\">\n[error reading file: {e}]\n</file>",
-                            fref.display
-                        ));
-                    }
-                }
+        // Client-side `@path` expansion. Files get read (≤50 KB),
+        // directories get listed (depth 1), blocked/missing paths
+        // produce skip cards. Cards render as one-line rows above the
+        // assistant response; raw content goes only to the LLM via
+        // `augmented_text`.
+        let expansion = borg_core::mentions::expand_mentions(input, &self.config);
+        // Insert mention cards BEFORE the assistant cell we pushed above
+        // so they render in the order: User → cards → Assistant.
+        if !expansion.cards.is_empty() {
+            let insert_at = self.cells.len().saturating_sub(1);
+            for card in &expansion.cards {
+                self.cells.insert(
+                    insert_at,
+                    HistoryCell::MentionCard {
+                        label: card.label(),
+                    },
+                );
             }
-            buf
-        };
+        }
+        let final_input = expansion.augmented_text;
 
         let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
         self.event_rx = Some(event_rx);
@@ -748,6 +730,18 @@ impl<'a> App<'a> {
         if !self.cells.is_empty() {
             self.cells.push(HistoryCell::Separator);
         }
+
+        // Expand `@path` mentions in the queued text. Cards render
+        // between the (already-shown) user cell and the assistant cell
+        // we're about to push. See `handle_submit` for the same pattern.
+        let expansion = borg_core::mentions::expand_mentions(&qm.text, &self.config);
+        for card in &expansion.cards {
+            self.cells.push(HistoryCell::MentionCard {
+                label: card.label(),
+            });
+        }
+        let final_input = expansion.augmented_text;
+
         self.cells.push(HistoryCell::Assistant {
             text: String::new(),
             streaming: true,
@@ -765,7 +759,7 @@ impl<'a> App<'a> {
         self.auto_scroll = true;
 
         Ok(AppAction::SendMessage {
-            input: qm.text,
+            input: final_input,
             images: qm.images,
             event_tx,
             cancel,
@@ -1888,6 +1882,103 @@ mod tests {
             text: text.to_string(),
             images: Vec::new(),
         }
+    }
+
+    // --- Mention expansion wiring (regression guard) ---
+    //
+    // If submit stops running `borg_core::mentions::expand_mentions`, the TUI
+    // silently falls back to firing `read_file`/`list_dir` tool calls (slow,
+    // one extra turn per mention). These tests assert:
+    //   1. the outgoing `AppAction::SendMessage.input` contains the
+    //      `<attached_file>` block for an `@path` in the user text,
+    //   2. a `HistoryCell::MentionCard` is inserted for each resolved
+    //      mention so the user sees the `Read foo (N lines)` row.
+    // Both conditions must hold together; either alone is a regression.
+
+    #[test]
+    fn handle_submit_expands_at_file_mention_into_outgoing_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("note.md");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let mut app = make_app();
+        let input = format!("summarize @{} please", file.display());
+
+        let action = app.handle_submit(&input).unwrap();
+
+        match action {
+            AppAction::SendMessage { input: sent, .. } => {
+                assert!(
+                    sent.contains("<attached_file"),
+                    "outgoing input missing <attached_file>: {sent}"
+                );
+                assert!(
+                    sent.contains("alpha\nbeta\ngamma"),
+                    "outgoing input missing file content"
+                );
+            }
+            _ => panic!("expected SendMessage"),
+        }
+
+        let has_card = app.cells.iter().any(|c| {
+            matches!(c, HistoryCell::MentionCard { label } if label.starts_with("Read ") && label.contains("(3 lines)"))
+        });
+        let card_labels: Vec<String> = app
+            .cells
+            .iter()
+            .filter_map(|c| match c {
+                HistoryCell::MentionCard { label } => Some(label.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            has_card,
+            "expected a `Read … (3 lines)` MentionCard in transcript; got cards: {card_labels:?}"
+        );
+    }
+
+    #[test]
+    fn handle_submit_without_mentions_emits_no_cards() {
+        // Guard against the expander accidentally injecting a card or
+        // block for plain text (e.g. email addresses, words with `@`).
+        let mut app = make_app();
+        let action = app.handle_submit("ping foo@bar.com how are you").unwrap();
+        match action {
+            AppAction::SendMessage { input, .. } => {
+                assert!(
+                    !input.contains("<attached_file"),
+                    "email must not trigger an attachment: {input}"
+                );
+            }
+            _ => panic!("expected SendMessage"),
+        }
+        assert!(app
+            .cells
+            .iter()
+            .all(|c| !matches!(c, HistoryCell::MentionCard { .. })));
+    }
+
+    #[test]
+    fn handle_queued_submit_also_expands_mentions() {
+        // Queued sends go through a different function; must also expand.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("q.md");
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let mut app = make_app();
+        let text = format!("@{} ?", file.display());
+        let action = app.handle_queued_submit(qm(&text)).unwrap();
+        match action {
+            AppAction::SendMessage { input, .. } => {
+                assert!(
+                    input.contains("<attached_file"),
+                    "queued submit must also expand mentions: {input}"
+                );
+            }
+            _ => panic!("expected SendMessage"),
+        }
+        assert!(app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::MentionCard { .. })));
     }
 
     #[test]

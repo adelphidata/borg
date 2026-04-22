@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::KeyEvent;
@@ -10,11 +9,6 @@ use tui_textarea::TextArea;
 
 use super::paste_burst::PasteBurst;
 use super::theme;
-
-pub struct FileRef {
-    pub display: String,
-    pub path: PathBuf,
-}
 
 pub struct ImageAttachment {
     pub data: Vec<u8>,
@@ -146,7 +140,6 @@ pub struct Composer<'a> {
     textarea: TextArea<'a>,
     history: InputHistory,
     search: Option<HistorySearch>,
-    file_refs: Vec<FileRef>,
     image_attachments: Vec<ImageAttachment>,
     paste_burst: PasteBurst,
 }
@@ -165,7 +158,6 @@ impl<'a> Composer<'a> {
             textarea,
             history: InputHistory::new(),
             search: None,
-            file_refs: Vec::new(),
             image_attachments: Vec::new(),
             paste_burst: PasteBurst::new(),
         }
@@ -293,7 +285,6 @@ impl<'a> Composer<'a> {
                 self.textarea.select_all();
                 self.textarea.cut();
                 self.history.reset();
-                self.file_refs.clear();
                 self.image_attachments.clear();
                 None
             }
@@ -499,13 +490,12 @@ impl<'a> Composer<'a> {
         self.textarea.insert_str(text);
     }
 
-    pub fn add_file_ref(&mut self, display: String, path: PathBuf) {
-        self.file_refs.push(FileRef {
-            display: display.clone(),
-            path,
-        });
+    /// Complete the in-progress `@query` to `@<display> ` (with trailing
+    /// space). The path content is NOT stored here — the client-side
+    /// mentions expander re-reads the `@` token from the composer text at
+    /// submit time, so the composer only needs to track the display name.
+    pub fn complete_file_mention(&mut self, display: &str) {
         let current = self.text();
-        // Replace the partial @query with the completed @mention
         let new_text = if let Some(at_pos) = current.rfind('@') {
             format!("{}@{display} ", &current[..at_pos])
         } else {
@@ -514,9 +504,9 @@ impl<'a> Composer<'a> {
         self.set_text(&new_text);
     }
 
-    /// Rewrite the in-progress `@query` to `@<display>` without pushing a
-    /// `FileRef` or appending a trailing space. Used when the user selects a
-    /// directory in the file popup so they can continue drilling into it.
+    /// Rewrite the in-progress `@query` to `@<display>` without appending
+    /// a trailing space. Used when the user selects a directory in the
+    /// file popup so they can continue drilling into it.
     pub fn set_partial_mention(&mut self, display: String) {
         let current = self.text();
         let new_text = if let Some(at_pos) = current.rfind('@') {
@@ -525,10 +515,6 @@ impl<'a> Composer<'a> {
             format!("{current}@{display}")
         };
         self.set_text(&new_text);
-    }
-
-    pub fn take_file_refs(&mut self) -> Vec<FileRef> {
-        std::mem::take(&mut self.file_refs)
     }
 
     pub fn add_image(&mut self, data: Vec<u8>, mime_type: String) {
