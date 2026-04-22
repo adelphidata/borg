@@ -20,6 +20,7 @@ use super::btw_popup::BtwPopup;
 use super::command_popup::CommandPopup;
 use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
+use super::file_search::FileSearchService;
 use super::history::HistoryCell;
 use super::migrate_popup::{MigrateAction, MigratePopup};
 use super::model_popup::ModelPopup;
@@ -415,6 +416,8 @@ pub struct App<'a> {
     pub schedule_popup: SchedulePopup,
     pub migrate_popup: MigratePopup,
     pub file_popup: FileSearchPopup,
+    /// Background filesystem walker feeding `file_popup` asynchronously.
+    pub file_search: FileSearchService,
     pub throbber_state: ThrobberState,
     /// Live header/details surfaced in the status row while streaming.
     pub stream_status: StreamStatus,
@@ -451,6 +454,8 @@ impl<'a> App<'a> {
         poke_tx: Option<mpsc::Sender<()>>,
     ) -> Self {
         let blocked_paths = config.security.blocked_paths.clone();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let file_search = FileSearchService::spawn(cwd, blocked_paths);
         let mut app = Self {
             cells: Vec::new(),
             state: AppState::Idle,
@@ -486,10 +491,8 @@ impl<'a> App<'a> {
             sessions_popup: SessionsPopup::new(),
             schedule_popup: SchedulePopup::new(),
             migrate_popup: MigratePopup::new(),
-            file_popup: FileSearchPopup::with_config(
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                blocked_paths,
-            ),
+            file_popup: FileSearchPopup::new(),
+            file_search,
             throbber_state: ThrobberState::default(),
             stream_status: StreamStatus::default(),
             transcript_area: Rect::default(),
@@ -561,6 +564,16 @@ impl<'a> App<'a> {
         self.state = AppState::Streaming {
             start: Instant::now(),
         };
+    }
+
+    /// Drain any file-search result batches posted by the background walker
+    /// and hand them to the popup. Stale batches (where the returned query
+    /// no longer matches the popup's `pending_query`) are dropped inside
+    /// `FileSearchPopup::apply_results`.
+    pub fn tick_file_search(&mut self) {
+        for result in self.file_search.drain_results() {
+            self.file_popup.apply_results(result.query, result.matches);
+        }
     }
 
     pub fn tick_paste_burst(&mut self) {

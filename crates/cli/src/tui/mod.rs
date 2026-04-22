@@ -7,6 +7,7 @@ mod composer;
 mod diff_render;
 mod external_editor;
 mod file_popup;
+mod file_search;
 mod goodbye;
 mod highlight;
 mod history;
@@ -694,6 +695,7 @@ async fn run_event_loop(
             _ = tick_interval.tick() => {
                 app.tick_throbber();
                 app.tick_paste_burst();
+                app.tick_file_search();
                 drain_queued_if_idle(app)?
             }
         };

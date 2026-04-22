@@ -795,7 +795,8 @@ impl<'a> App<'a> {
             self.command_popup.update_filter(&text);
             if !self.command_popup.is_visible() {
                 if let Some(q) = extract_at_query(&text) {
-                    self.file_popup.update_query(&q);
+                    self.file_popup.set_pending_query(&q);
+                    self.file_search.on_query(&q);
                 } else {
                     self.file_popup.dismiss();
                 }
@@ -943,7 +944,8 @@ impl<'a> App<'a> {
                         self.composer.set_partial_mention(display);
                         let text = self.composer.text();
                         if let Some(q) = extract_at_query(&text) {
-                            self.file_popup.update_query(&q);
+                            self.file_popup.set_pending_query(&q);
+                            self.file_search.on_query(&q);
                         } else {
                             self.file_popup.dismiss();
                         }
@@ -961,7 +963,8 @@ impl<'a> App<'a> {
                 self.composer.handle_key(key);
                 let text = self.composer.text();
                 if let Some(q) = extract_at_query(&text) {
-                    self.file_popup.update_query(&q);
+                    self.file_popup.set_pending_query(&q);
+                    self.file_search.on_query(&q);
                 } else {
                     self.file_popup.dismiss();
                 }

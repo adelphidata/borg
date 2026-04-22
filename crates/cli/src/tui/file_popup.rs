@@ -1,6 +1,5 @@
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{Path, PathBuf};
 
-use ignore::WalkBuilder;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -19,32 +18,34 @@ pub struct FileMatch {
     pub is_dir: bool,
 }
 
+/// UI state for the @-mention file picker. All filesystem I/O happens on a
+/// background task (see `file_search::FileSearchService`); this type owns
+/// only the visible state and the three-field machinery (`pending_query`,
+/// `display_query`, `waiting`) that lets it drop stale results.
 pub struct FileSearchPopup {
     visible: bool,
-    query: String,
+    /// Latest query the user has typed. Used to drop stale results: if a
+    /// result batch arrives for an older query, it's discarded.
+    pending_query: String,
+    /// Query whose results we're currently showing. Lags `pending_query`
+    /// while a walk is in flight.
+    display_query: String,
+    /// True when `pending_query != display_query` — a walk is in flight
+    /// and we haven't shown its results yet.
+    waiting: bool,
     selected: usize,
     results: Vec<FileMatch>,
-    cwd: PathBuf,
-    blocked_paths: Vec<String>,
 }
 
 impl FileSearchPopup {
-    #[cfg(test)]
-    fn new() -> Self {
-        Self::with_config(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            Vec::new(),
-        )
-    }
-
-    pub fn with_config(cwd: PathBuf, blocked_paths: Vec<String>) -> Self {
+    pub fn new() -> Self {
         Self {
             visible: false,
-            query: String::new(),
+            pending_query: String::new(),
+            display_query: String::new(),
+            waiting: false,
             selected: 0,
             results: Vec::new(),
-            cwd,
-            blocked_paths,
         }
     }
 
@@ -52,131 +53,34 @@ impl FileSearchPopup {
         self.visible
     }
 
-    pub fn update_query(&mut self, query: &str) {
+    /// Record a new user query. Does NOT touch the filesystem — the caller
+    /// must also push `q` into `FileSearchService::on_query`. Resets
+    /// selection to the top and flips `waiting` when the new query differs
+    /// from the currently-displayed one.
+    pub fn set_pending_query(&mut self, q: &str) {
         self.visible = true;
-        self.query = query.to_string();
         self.selected = 0;
-        self.results.clear();
-
-        if is_path_like(query) {
-            self.update_path(query);
-        } else {
-            self.update_fuzzy(query);
+        if self.pending_query != q {
+            self.pending_query = q.to_string();
+        }
+        if self.pending_query != self.display_query {
+            self.waiting = true;
         }
     }
 
-    fn update_fuzzy(&mut self, query: &str) {
-        let query_lower = query.to_lowercase();
-
-        let walker = WalkBuilder::new(&self.cwd)
-            .max_depth(Some(8))
-            .hidden(true)
-            .build();
-
-        for entry in walker.flatten() {
-            if self.results.len() >= 50 {
-                break;
-            }
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                continue;
-            }
-            let path = entry.path();
-            let rel = path
-                .strip_prefix(&self.cwd)
-                .unwrap_or(path)
-                .to_string_lossy();
-
-            if rel.is_empty() {
-                continue;
-            }
-
-            if self.is_blocked(path) {
-                continue;
-            }
-
-            if query_lower.is_empty() || rel.to_lowercase().contains(&query_lower) {
-                self.results.push(FileMatch {
-                    display: rel.to_string(),
-                    full_path: path.to_path_buf(),
-                    is_dir: false,
-                });
-            }
-        }
-    }
-
-    fn update_path(&mut self, query: &str) {
-        let (parent_frag, name_frag) = split_parent_fragment(query);
-
-        // Resolve the parent directory against cwd / home / absolute.
-        let Some(resolved_parent) = resolve_path_fragment(parent_frag, &self.cwd) else {
+    /// Apply a result batch posted by the background walker. Results for a
+    /// query that no longer matches `pending_query` are dropped — this is
+    /// the core stale-result guard.
+    pub fn apply_results(&mut self, query: String, matches: Vec<FileMatch>) {
+        if query != self.pending_query {
             return;
-        };
-
-        let read_dir = match std::fs::read_dir(&resolved_parent) {
-            Ok(rd) => rd,
-            Err(_) => return,
-        };
-
-        let name_lower = name_frag.to_lowercase();
-
-        // Preserve the user's typed prefix form for display.
-        // If the query ends with a separator, the entire query is the parent
-        // prefix; otherwise strip the final segment.
-        let display_parent: String = if name_frag.is_empty() {
-            query.to_string()
-        } else {
-            query[..query.len() - name_frag.len()].to_string()
-        };
-
-        let mut entries: Vec<(String, PathBuf, bool)> = Vec::new();
-        for entry in read_dir.flatten() {
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy().to_string();
-
-            // Case-insensitive prefix match.
-            if !name_lower.is_empty() && !name.to_lowercase().starts_with(&name_lower) {
-                continue;
-            }
-
-            let full_path = entry.path();
-            if self.is_blocked(&full_path) {
-                continue;
-            }
-
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            entries.push((name, full_path, is_dir));
         }
-
-        // Sort: directories first, then files, alphabetical (case-insensitive).
-        entries.sort_by(|a, b| {
-            b.2.cmp(&a.2)
-                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-        });
-        entries.truncate(50);
-
-        for (name, full_path, is_dir) in entries {
-            let mut display = format!("{display_parent}{name}");
-            if is_dir {
-                display.push(MAIN_SEPARATOR);
-            }
-            self.results.push(FileMatch {
-                display,
-                full_path,
-                is_dir,
-            });
+        self.results = matches;
+        self.display_query = query;
+        self.waiting = false;
+        if self.selected >= self.results.len() {
+            self.selected = 0;
         }
-    }
-
-    fn is_blocked(&self, path: &Path) -> bool {
-        if self.blocked_paths.is_empty() {
-            return false;
-        }
-        let path_str = path.to_string_lossy();
-        self.blocked_paths.iter().any(|blocked| {
-            // Match blocked segment anywhere in the path (mirrors other tool filtering).
-            path.components().any(|c| c.as_os_str() == blocked.as_str())
-                || path_str.contains(blocked.as_str())
-        })
     }
 
     pub fn move_up(&mut self) {
@@ -204,7 +108,9 @@ impl FileSearchPopup {
     pub fn dismiss(&mut self) {
         self.visible = false;
         self.selected = 0;
-        self.query.clear();
+        self.pending_query.clear();
+        self.display_query.clear();
+        self.waiting = false;
         self.results.clear();
     }
 
@@ -213,7 +119,8 @@ impl FileSearchPopup {
             return;
         }
 
-        if self.results.is_empty() {
+        // Empty + not waiting: display_query produced no matches. Show nothing.
+        if self.results.is_empty() && !self.waiting {
             return;
         }
 
@@ -222,7 +129,14 @@ impl FileSearchPopup {
             return;
         }
 
-        let item_count = self.results.len() as u16;
+        // Searching placeholder when we have no prior results to show.
+        let show_searching_only = self.results.is_empty() && self.waiting;
+
+        let item_count = if show_searching_only {
+            1u16
+        } else {
+            self.results.len() as u16
+        };
         let popup_height = (item_count + 2).min(available_above);
         let max_visible = (popup_height - 2) as usize;
         let popup_width = composer_area.width.min(60);
@@ -232,28 +146,30 @@ impl FileSearchPopup {
 
         frame.render_widget(Clear, popup_area);
 
-        let scroll_offset = if self.selected >= max_visible {
-            self.selected - max_visible + 1
+        let lines: Vec<Line<'_>> = if show_searching_only {
+            vec![Line::from(Span::styled(" Searching…", theme::dim()))]
         } else {
-            0
+            let scroll_offset = if self.selected >= max_visible {
+                self.selected - max_visible + 1
+            } else {
+                0
+            };
+            self.results
+                .iter()
+                .skip(scroll_offset)
+                .take(max_visible)
+                .enumerate()
+                .map(|(i, file)| {
+                    let actual_index = i + scroll_offset;
+                    let style = if actual_index == self.selected {
+                        theme::popup_selected()
+                    } else {
+                        theme::dim()
+                    };
+                    Line::from(Span::styled(format!(" {}", file.display), style))
+                })
+                .collect()
         };
-
-        let lines: Vec<Line<'_>> = self
-            .results
-            .iter()
-            .skip(scroll_offset)
-            .take(max_visible)
-            .enumerate()
-            .map(|(i, file)| {
-                let actual_index = i + scroll_offset;
-                let style = if actual_index == self.selected {
-                    theme::popup_selected()
-                } else {
-                    theme::dim()
-                };
-                Line::from(Span::styled(format!(" {}", file.display), style))
-            })
-            .collect();
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -268,7 +184,7 @@ impl FileSearchPopup {
 /// Returns true if the query looks like a filesystem path rather than a fuzzy
 /// filename search. Triggers path-mode completion against a resolved parent
 /// directory.
-fn is_path_like(query: &str) -> bool {
+pub(crate) fn is_path_like(query: &str) -> bool {
     if query.is_empty() {
         return false;
     }
@@ -298,7 +214,6 @@ fn is_path_like(query: &str) -> bool {
 /// If the query has no separator, the entire query is the name fragment and
 /// the parent is empty.
 pub(crate) fn split_parent_fragment(query: &str) -> (&str, &str) {
-    // Find the last separator (either `/` or OS-native `\`).
     let last_sep = query
         .char_indices()
         .rev()
@@ -317,12 +232,11 @@ pub(crate) fn split_parent_fragment(query: &str) -> (&str, &str) {
 /// - relative fragments resolve against `cwd`
 /// - absolute fragments are returned as-is
 /// - empty fragment means "current working directory"
-fn resolve_path_fragment(fragment: &str, cwd: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_path_fragment(fragment: &str, cwd: &Path) -> Option<PathBuf> {
     if fragment.is_empty() {
         return Some(cwd.to_path_buf());
     }
 
-    // Tilde expansion: `~` alone, `~/...`, or `~\...`.
     if fragment == "~" {
         return dirs::home_dir();
     }
@@ -345,8 +259,8 @@ fn resolve_path_fragment(fragment: &str, cwd: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::TempDir;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     #[test]
     fn new_popup_is_not_visible() {
@@ -355,31 +269,128 @@ mod tests {
     }
 
     #[test]
-    fn dismiss_hides_popup() {
+    fn set_pending_query_makes_visible_and_marks_waiting() {
         let mut popup = FileSearchPopup::new();
-        popup.update_query("");
+        popup.set_pending_query("foo");
         assert!(popup.is_visible());
+        assert!(popup.waiting);
+        assert_eq!(popup.pending_query, "foo");
+        assert_eq!(popup.display_query, "");
+    }
+
+    #[test]
+    fn apply_results_accepts_current_query() {
+        let mut popup = FileSearchPopup::new();
+        popup.set_pending_query("foo");
+        popup.apply_results(
+            "foo".to_string(),
+            vec![FileMatch {
+                display: "foo.txt".to_string(),
+                full_path: PathBuf::from("/tmp/foo.txt"),
+                is_dir: false,
+            }],
+        );
+        assert!(!popup.waiting);
+        assert_eq!(popup.display_query, "foo");
+        assert_eq!(popup.results.len(), 1);
+    }
+
+    #[test]
+    fn apply_results_drops_stale_batch() {
+        let mut popup = FileSearchPopup::new();
+        popup.set_pending_query("bar");
+        // Stale batch from an earlier "foo" query.
+        popup.apply_results(
+            "foo".to_string(),
+            vec![FileMatch {
+                display: "foo.txt".to_string(),
+                full_path: PathBuf::from("/tmp/foo.txt"),
+                is_dir: false,
+            }],
+        );
+        assert!(popup.results.is_empty(), "stale results must be dropped");
+        assert!(popup.waiting, "still waiting for 'bar'");
+        assert_eq!(popup.display_query, "");
+    }
+
+    #[test]
+    fn dismiss_clears_all_state() {
+        let mut popup = FileSearchPopup::new();
+        popup.set_pending_query("foo");
+        popup.apply_results(
+            "foo".to_string(),
+            vec![FileMatch {
+                display: "foo.txt".to_string(),
+                full_path: PathBuf::from("/tmp/foo.txt"),
+                is_dir: false,
+            }],
+        );
         popup.dismiss();
         assert!(!popup.is_visible());
+        assert!(popup.results.is_empty());
+        assert_eq!(popup.pending_query, "");
+        assert_eq!(popup.display_query, "");
+        assert!(!popup.waiting);
     }
 
     #[test]
     fn up_down_wrapping() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("a.txt"), "a").unwrap();
-        fs::write(tmp.path().join("b.txt"), "b").unwrap();
-        let mut popup = FileSearchPopup::with_config(tmp.path().to_path_buf(), Vec::new());
-        popup.update_query("");
-        let count = popup.results.len();
-        assert!(count >= 2);
+        let mut popup = FileSearchPopup::new();
+        popup.set_pending_query("");
+        popup.apply_results(
+            String::new(),
+            vec![
+                FileMatch {
+                    display: "a.txt".to_string(),
+                    full_path: PathBuf::from("a.txt"),
+                    is_dir: false,
+                },
+                FileMatch {
+                    display: "b.txt".to_string(),
+                    full_path: PathBuf::from("b.txt"),
+                    is_dir: false,
+                },
+            ],
+        );
         assert_eq!(popup.selected, 0);
         popup.move_up();
-        assert_eq!(popup.selected, count - 1);
+        assert_eq!(popup.selected, 1);
         popup.move_down();
         assert_eq!(popup.selected, 0);
     }
 
-    // ------------------- is_path_like -------------------
+    #[test]
+    fn render_shows_searching_when_waiting_and_empty() {
+        let mut popup = FileSearchPopup::new();
+        popup.set_pending_query("anything");
+        assert!(popup.waiting && popup.results.is_empty());
+
+        // Terminal tall enough to fit the popup above the composer.
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let composer_area = Rect::new(0, 8, 40, 2);
+                popup.render(f, composer_area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let mut found = false;
+        for y in 0..buffer.area().height {
+            let mut row = String::new();
+            for x in 0..buffer.area().width {
+                row.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            if row.contains("Searching") {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "expected 'Searching' row to render while waiting");
+    }
+
+    // ------------------- helper fn tests -------------------
 
     #[test]
     fn is_path_like_detects_tilde() {
@@ -420,8 +431,6 @@ mod tests {
         assert!(!is_path_like(""));
     }
 
-    // ------------------- split_parent_fragment -------------------
-
     #[test]
     fn split_no_separator() {
         assert_eq!(split_parent_fragment("foo"), ("", "foo"));
@@ -451,8 +460,6 @@ mod tests {
             ("C:\\Users\\me\\", "fo")
         );
     }
-
-    // ------------------- resolve_path_fragment -------------------
 
     #[test]
     fn resolve_empty_is_cwd() {
@@ -493,163 +500,5 @@ mod tests {
             resolve_path_fragment("src/", &cwd),
             Some(PathBuf::from("/tmp/project/src/"))
         );
-    }
-
-    // ------------------- path mode integration -------------------
-
-    #[test]
-    fn path_mode_lists_direct_children_only() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("top.txt"), "x").unwrap();
-        fs::create_dir(tmp.path().join("subdir")).unwrap();
-        fs::write(tmp.path().join("subdir").join("nested.txt"), "x").unwrap();
-
-        // Query with a trailing separator to list the whole dir.
-        let query = format!("{}/", tmp.path().display());
-        let mut popup = FileSearchPopup::with_config(PathBuf::from("/"), Vec::new());
-        popup.update_query(&query);
-
-        let names: Vec<_> = popup.results.iter().map(|m| m.display.clone()).collect();
-        assert!(names.iter().any(|n| n.ends_with("top.txt")));
-        // Directory entry should have a trailing separator.
-        assert!(names
-            .iter()
-            .any(|n| n.ends_with(&format!("subdir{MAIN_SEPARATOR}"))));
-        // Nested file must NOT appear — path mode is single-level.
-        assert!(!names.iter().any(|n| n.contains("nested.txt")));
-    }
-
-    #[test]
-    fn path_mode_case_insensitive_prefix_filter() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("Alpha.txt"), "x").unwrap();
-        fs::write(tmp.path().join("beta.txt"), "x").unwrap();
-        fs::write(tmp.path().join("alphabet.md"), "x").unwrap();
-
-        let query = format!("{}/alp", tmp.path().display());
-        let mut popup = FileSearchPopup::with_config(PathBuf::from("/"), Vec::new());
-        popup.update_query(&query);
-
-        let names: Vec<_> = popup.results.iter().map(|m| m.display.clone()).collect();
-        assert_eq!(
-            names.len(),
-            2,
-            "expected Alpha.txt + alphabet.md, got {names:?}"
-        );
-        assert!(names.iter().any(|n| n.ends_with("Alpha.txt")));
-        assert!(names.iter().any(|n| n.ends_with("alphabet.md")));
-        assert!(!names.iter().any(|n| n.ends_with("beta.txt")));
-    }
-
-    #[test]
-    fn path_mode_sorts_directories_before_files() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("a_file.txt"), "x").unwrap();
-        fs::create_dir(tmp.path().join("z_dir")).unwrap();
-
-        let query = format!("{}/", tmp.path().display());
-        let mut popup = FileSearchPopup::with_config(PathBuf::from("/"), Vec::new());
-        popup.update_query(&query);
-
-        assert!(popup.results.len() >= 2);
-        // z_dir (directory) comes before a_file.txt even though it's later alphabetically.
-        assert!(popup.results[0].is_dir);
-        assert!(popup.results[0]
-            .display
-            .ends_with(&format!("z_dir{MAIN_SEPARATOR}")));
-    }
-
-    #[test]
-    fn path_mode_preserves_display_prefix() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("file.txt"), "x").unwrap();
-
-        // Using a relative-style query resolved against cwd=tmp.
-        let mut popup = FileSearchPopup::with_config(tmp.path().to_path_buf(), Vec::new());
-        popup.update_query("./fil");
-
-        assert_eq!(popup.results.len(), 1);
-        assert_eq!(popup.results[0].display, "./file.txt");
-        assert!(!popup.results[0].is_dir);
-        // full_path should be the resolved absolute path, not the display form.
-        assert!(
-            popup.results[0].full_path.is_absolute()
-                || popup.results[0].full_path.starts_with(tmp.path())
-        );
-    }
-
-    #[test]
-    fn path_mode_empty_name_fragment_lists_all() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("one.txt"), "x").unwrap();
-        fs::write(tmp.path().join("two.txt"), "x").unwrap();
-
-        let mut popup = FileSearchPopup::with_config(tmp.path().to_path_buf(), Vec::new());
-        popup.update_query("./");
-        assert_eq!(popup.results.len(), 2);
-    }
-
-    #[test]
-    fn path_mode_nonexistent_parent_yields_no_results() {
-        let tmp = TempDir::new().unwrap();
-        let missing = tmp.path().join("does_not_exist");
-        let query = format!("{}/", missing.display());
-
-        let mut popup = FileSearchPopup::with_config(PathBuf::from("/"), Vec::new());
-        popup.update_query(&query);
-        assert!(popup.results.is_empty());
-    }
-
-    // ------------------- blocked_paths -------------------
-
-    #[test]
-    fn blocked_paths_filter_in_path_mode() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join(".ssh")).unwrap();
-        fs::write(tmp.path().join("public.txt"), "x").unwrap();
-
-        let mut popup =
-            FileSearchPopup::with_config(tmp.path().to_path_buf(), vec![".ssh".to_string()]);
-        popup.update_query("./");
-
-        let names: Vec<_> = popup.results.iter().map(|m| m.display.clone()).collect();
-        assert!(names.iter().any(|n| n.ends_with("public.txt")));
-        assert!(
-            !names.iter().any(|n| n.contains(".ssh")),
-            ".ssh must be filtered, got {names:?}"
-        );
-    }
-
-    #[test]
-    fn blocked_paths_filter_in_fuzzy_mode() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join("subdir")).unwrap();
-        fs::write(tmp.path().join("subdir").join("credentials.txt"), "x").unwrap();
-        fs::write(tmp.path().join("subdir").join("ok.txt"), "x").unwrap();
-
-        let mut popup = FileSearchPopup::with_config(
-            tmp.path().to_path_buf(),
-            vec!["credentials.txt".to_string()],
-        );
-        popup.update_query("txt");
-
-        let names: Vec<_> = popup.results.iter().map(|m| m.display.clone()).collect();
-        assert!(names.iter().any(|n| n.ends_with("ok.txt")));
-        assert!(!names.iter().any(|n| n.contains("credentials.txt")));
-    }
-
-    // ------------------- fuzzy mode unchanged for bare names -------------------
-
-    #[test]
-    fn bare_query_uses_fuzzy_walk() {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join("nested")).unwrap();
-        fs::write(tmp.path().join("nested").join("deep.rs"), "x").unwrap();
-
-        let mut popup = FileSearchPopup::with_config(tmp.path().to_path_buf(), Vec::new());
-        popup.update_query("deep");
-
-        // Recursive walk finds nested/deep.rs even though it's not in the top level.
-        assert!(popup.results.iter().any(|m| m.display.ends_with("deep.rs")));
     }
 }
