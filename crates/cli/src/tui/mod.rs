@@ -556,6 +556,21 @@ fn handle_export(app: &mut App<'_>, session_id: &str, format: borg_core::export:
     app.push_system_message(format!("Exported session {} → {}", short, path.display()));
 }
 
+/// Format an integer with comma thousands separators (e.g. `3999` → `"3,999"`).
+/// Used by the `/usage` display so large token counts are scannable.
+fn fmt_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App<'_>,
@@ -767,8 +782,13 @@ async fn run_event_loop(
                 let total_tok = prompt_tok + completion_tok;
 
                 let mut text = format!(
-                    "Session: {msg_count} messages, ~{token_count} estimated tokens\n\
-                     LLM usage: {prompt_tok} prompt + {completion_tok} completion = {total_tok} total tokens\n"
+                    "Session: {} messages, ~{} estimated tokens\n\
+                     LLM usage: {} prompt + {} completion = {} total tokens\n",
+                    fmt_commas(msg_count as u64),
+                    fmt_commas(token_count as u64),
+                    fmt_commas(prompt_tok),
+                    fmt_commas(completion_tok),
+                    fmt_commas(total_tok),
                 );
 
                 for (label, days) in [("24h", 1), ("7d", 7), ("30d", 30)] {
@@ -776,7 +796,9 @@ async fn run_event_loop(
                         Ok(stats) => {
                             text.push_str(&format!(
                                 "{label}: {} user, {} assistant, {} tool calls\n",
-                                stats.user_messages, stats.assistant_messages, stats.tool_calls
+                                fmt_commas(stats.user_messages as u64),
+                                fmt_commas(stats.assistant_messages as u64),
+                                fmt_commas(stats.tool_calls as u64),
                             ));
                         }
                         Err(e) => {
@@ -796,7 +818,9 @@ async fn run_event_loop(
                                 0
                             };
                             text.push_str(&format!(
-                                "Budget: {used}/{budget_limit} tokens ({pct}%) used this month\n"
+                                "Budget: {}/{} tokens ({pct}%) used this month\n",
+                                fmt_commas(used),
+                                fmt_commas(budget_limit),
                             ));
                         }
                         if let Ok(Some(cost)) = db.monthly_total_cost() {
@@ -1708,6 +1732,23 @@ mod tests {
     // "Approve senders with: /pairing approve <CODE>" (confusing — didn't
     // explain the user must DM the bot first to generate the code).
     // ------------------------------------------------------------------------
+
+    #[test]
+    fn fmt_commas_groups_digits() {
+        let cases: &[(u64, &str)] = &[
+            (0, "0"),
+            (42, "42"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (3_999, "3,999"),
+            (1_000_000, "1,000,000"),
+            (12_345_678, "12,345,678"),
+            (u64::MAX, "18,446,744,073,709,551,615"),
+        ];
+        for (n, expected) in cases {
+            assert_eq!(fmt_commas(*n), *expected, "fmt_commas({n})");
+        }
+    }
 
     #[test]
     fn post_install_message_does_not_mention_gateway_restarted() {

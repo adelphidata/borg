@@ -91,6 +91,17 @@ struct ChatRequest {
     /// to route consistent traffic to the same shard.
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    /// OpenAI streaming option. When `stream: true`, set
+    /// `stream_options.include_usage = true` so the provider emits a final
+    /// `usage` chunk — without this, OpenAI-compatible providers (OpenRouter,
+    /// DeepSeek, Groq, ...) never report token counts and `/usage` shows zeros.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -771,6 +782,9 @@ impl LlmClient {
             reasoning_effort,
             prompt_cache_key: self.prompt_cache_key.clone(),
             user: self.prompt_cache_key.clone(),
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
         debug!(
@@ -899,6 +913,7 @@ impl LlmClient {
             reasoning_effort,
             prompt_cache_key: self.prompt_cache_key.clone(),
             user: self.prompt_cache_key.clone(),
+            stream_options: None,
         };
 
         #[derive(Deserialize)]
@@ -1077,8 +1092,10 @@ impl LlmClient {
         let mut current_tool_index: usize = 0;
         let mut current_block_is_tool = false;
         let mut current_block_is_thinking = false;
-        // Cache token counts arrive on `message_start` but total usage lands
-        // on `message_delta`. Stash cache values here to merge later.
+        // `input_tokens` and cache counts arrive on `message_start`; only
+        // `output_tokens` lands on `message_delta`. Stash here to merge —
+        // without this the emitted Usage has `prompt_tokens = 0`.
+        let mut pending_input_tokens: u64 = 0;
         let mut pending_cached_input_tokens: u64 = 0;
         let mut pending_cache_creation_tokens: u64 = 0;
 
@@ -1096,6 +1113,7 @@ impl LlmClient {
                     &mut current_tool_index,
                     &mut current_block_is_tool,
                     &mut current_block_is_thinking,
+                    &mut pending_input_tokens,
                     &mut pending_cached_input_tokens,
                     &mut pending_cache_creation_tokens,
                 )
@@ -1113,6 +1131,7 @@ impl LlmClient {
         current_tool_index: &mut usize,
         current_block_is_tool: &mut bool,
         current_block_is_thinking: &mut bool,
+        pending_input_tokens: &mut u64,
         pending_cached_input_tokens: &mut u64,
         pending_cache_creation_tokens: &mut u64,
     ) -> crate::sse::SseAction {
@@ -1137,6 +1156,10 @@ impl LlmClient {
                         normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
                     *pending_cached_input_tokens = cached;
                     *pending_cache_creation_tokens = created;
+                    *pending_input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
                 }
                 SseAction::Continue
             }
@@ -1216,10 +1239,14 @@ impl LlmClient {
             "message_delta" => {
                 let mut events = Vec::new();
                 if let Some(usage) = event["usage"].as_object() {
-                    let input = usage
+                    let delta_input = usage
                         .get("input_tokens")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
+                    // Anthropic reports `input_tokens` on `message_start` and
+                    // omits it from `message_delta`. Prefer whichever is larger
+                    // so cache-refresh paths that re-emit input still win.
+                    let input = delta_input.max(*pending_input_tokens);
                     let output = usage
                         .get("output_tokens")
                         .and_then(serde_json::Value::as_u64)
@@ -1724,6 +1751,7 @@ mod tests {
             reasoning_effort: Some("high".to_string()),
             prompt_cache_key: None,
             user: None,
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["reasoning_effort"], "high");
@@ -1741,6 +1769,7 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: None,
             user: None,
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("reasoning_effort").is_none());
@@ -1758,6 +1787,7 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: Some("sess-abc-123".to_string()),
             user: Some("sess-abc-123".to_string()),
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["prompt_cache_key"], "sess-abc-123");
@@ -1776,10 +1806,166 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: None,
             user: None,
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("prompt_cache_key").is_none());
         assert!(json.get("user").is_none());
+    }
+
+    #[test]
+    fn openai_stream_request_serializes_include_usage() {
+        // Invariant: streaming requests MUST set `stream_options.include_usage
+        // = true`. Without this, OpenAI-compatible providers (OpenAI,
+        // OpenRouter, DeepSeek, Groq, Gemini-via-OpenAI) never emit a `usage`
+        // chunk and `/usage` + monthly budget tracking silently return zeros.
+        let request = ChatRequest {
+            model: "grok-4".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: None,
+            temperature: 0.7,
+            max_tokens: 4096,
+            stream: true,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            user: None,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn openai_nonstream_request_omits_stream_options() {
+        // Non-streaming responses carry usage natively; `stream_options` is
+        // meaningless there and should not be sent.
+        let request = ChatRequest {
+            model: "gpt-4.1".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: None,
+            temperature: 0.7,
+            max_tokens: 4096,
+            stream: false,
+            reasoning_effort: None,
+            prompt_cache_key: None,
+            user: None,
+            stream_options: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn anthropic_usage_carries_input_tokens_from_message_start() {
+        // Anthropic reports `input_tokens` on `message_start` and only
+        // `output_tokens` on `message_delta`. The parser must stash the
+        // input count and emit it when the delta fires — else prompt_tokens
+        // is always 0 and `/usage` + budget tracking silently return zeros.
+        use crate::sse::SseAction;
+        let mut tool_idx = 0usize;
+        let mut is_tool = false;
+        let mut is_thinking = false;
+        let mut pending_input = 0u64;
+        let mut pending_cached = 0u64;
+        let mut pending_created = 0u64;
+
+        // Feed message_start with input_tokens=150 → should be stashed, no emit.
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":150,"output_tokens":0}}}"#;
+        let action = LlmClient::parse_anthropic_sse_line(
+            start,
+            "anthropic",
+            "claude-opus-4",
+            &mut tool_idx,
+            &mut is_tool,
+            &mut is_thinking,
+            &mut pending_input,
+            &mut pending_cached,
+            &mut pending_created,
+        );
+        assert!(matches!(action, SseAction::Continue));
+        assert_eq!(pending_input, 150);
+
+        // Feed message_delta with only output_tokens — emit should merge.
+        let delta = r#"data: {"type":"message_delta","usage":{"output_tokens":42},"delta":{"stop_reason":"end_turn"}}"#;
+        let action = LlmClient::parse_anthropic_sse_line(
+            delta,
+            "anthropic",
+            "claude-opus-4",
+            &mut tool_idx,
+            &mut is_tool,
+            &mut is_thinking,
+            &mut pending_input,
+            &mut pending_cached,
+            &mut pending_created,
+        );
+        let events = match action {
+            SseAction::Done(ev) | SseAction::Emit(ev) => ev,
+            _ => panic!("expected emit/done for message_delta"),
+        };
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("message_delta must emit a Usage event");
+        assert_eq!(usage.prompt_tokens, 150);
+        assert_eq!(usage.completion_tokens, 42);
+        assert_eq!(usage.total_tokens, 192);
+    }
+
+    #[test]
+    fn anthropic_usage_prefers_larger_input_between_start_and_delta() {
+        // If the delta re-emits input_tokens (cache-refresh paths sometimes do),
+        // use whichever is larger so we never under-report.
+        use crate::sse::SseAction;
+        let mut tool_idx = 0usize;
+        let mut is_tool = false;
+        let mut is_thinking = false;
+        let mut pending_input = 0u64;
+        let mut pending_cached = 0u64;
+        let mut pending_created = 0u64;
+
+        let start = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0}}}"#;
+        let _ = LlmClient::parse_anthropic_sse_line(
+            start,
+            "anthropic",
+            "claude-opus-4",
+            &mut tool_idx,
+            &mut is_tool,
+            &mut is_thinking,
+            &mut pending_input,
+            &mut pending_cached,
+            &mut pending_created,
+        );
+
+        let delta = r#"data: {"type":"message_delta","usage":{"input_tokens":120,"output_tokens":10},"delta":{"stop_reason":"end_turn"}}"#;
+        let action = LlmClient::parse_anthropic_sse_line(
+            delta,
+            "anthropic",
+            "claude-opus-4",
+            &mut tool_idx,
+            &mut is_tool,
+            &mut is_thinking,
+            &mut pending_input,
+            &mut pending_cached,
+            &mut pending_created,
+        );
+        let events = match action {
+            SseAction::Done(ev) | SseAction::Emit(ev) => ev,
+            _ => panic!("expected emit/done"),
+        };
+        let usage = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .expect("expected Usage event");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 10);
     }
 
     #[test]
@@ -1819,6 +2005,7 @@ mod tests {
             reasoning_effort: None,
             prompt_cache_key: None,
             user: None,
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         let msgs = json["messages"].as_array().unwrap();
