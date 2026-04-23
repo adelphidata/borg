@@ -518,10 +518,10 @@ mod tests {
         let d = MentionCard {
             raw_token: "@foo/".to_string(),
             kind: MentionCardKind::Dir {
-                display: "../../reference/codex/".to_string(),
+                display: "../../reference/sample/".to_string(),
             },
         };
-        assert_eq!(d.label(), "Listed directory ../../reference/codex/");
+        assert_eq!(d.label(), "Listed directory ../../reference/sample/");
 
         let s = MentionCard {
             raw_token: "@.ssh/".to_string(),

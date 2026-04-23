@@ -2,7 +2,7 @@
 //!
 //! Scans skill content at load time for prompt injection, validates
 //! environment variable requests, checks for built-in name collisions,
-//! and verifies file permissions. Inspired by OpenClaw's scan-at-load approach.
+//! and verifies file permissions.
 
 use std::path::{Path, PathBuf};
 

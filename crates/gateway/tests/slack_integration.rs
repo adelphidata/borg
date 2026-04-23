@@ -3,9 +3,7 @@
 //! These tests drive `handle_slack_webhook` with realistic JSON payloads to
 //! verify the full flow: signature verification → dedup → parse → InboundMessage.
 //!
-//! They act as regression tests for:
-//! - Openclaw/Hermes parity gaps surfaced during review
-//! - Specific correctness bugs fixed in the parity pass:
+//! They act as regression tests for specific correctness bugs:
 //!   * `app_mention` + `message` double-processing (channel, ts) dedup
 //!   * `file_share` subtype drop
 //!   * bot `<@BOTID>` mention stripping

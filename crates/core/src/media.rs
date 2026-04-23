@@ -6,10 +6,10 @@ use tracing::warn;
 
 use crate::types::{ContentPart, MediaData};
 
-/// Max side length steps to try, descending. Matches OpenClaw.
+/// Max side length steps to try, descending.
 const DIMENSION_STEPS: &[u32] = &[2048, 1536, 1280, 1024, 800];
 
-/// JPEG quality levels to try, descending. Matches OpenClaw.
+/// JPEG quality levels to try, descending.
 const QUALITY_STEPS: &[u8] = &[85, 75, 65, 55, 45, 35];
 
 /// Parse a data URI like `data:image/png;base64,abc123` into a MediaData struct.
@@ -79,7 +79,7 @@ pub fn compress_image(
         .decode()
         .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?;
 
-    // Grid search: dimensions × quality (matching OpenClaw)
+    // Grid search: dimensions × quality
     for &dim in DIMENSION_STEPS {
         let resized = img.resize(dim, dim, image::imageops::FilterType::Lanczos3);
         for &quality in QUALITY_STEPS {

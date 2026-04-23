@@ -581,7 +581,7 @@ async fn prepare_message_text(
 
 /// Collect the full agent response from the event channel.
 ///
-/// Uses an **inactivity-based** timeout (ported from hermes-agent): the
+/// Uses an **inactivity-based** timeout: the
 /// timer resets every time the agent emits a meaningful progress event
 /// (stream tokens, tool calls, tool results, etc.). A long-but-active
 /// turn never times out. A separate hard wall-clock ceiling

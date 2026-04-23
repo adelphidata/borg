@@ -1,8 +1,8 @@
 //! Utilities for truncating large tool outputs while preserving a prefix
 //! and suffix on UTF-8 boundaries.
 //!
-//! Inspired by codex-rs truncation patterns. Keeps the beginning and end of
-//! output so the LLM can see both the start context and the final result.
+//! Keeps the beginning and end of output so the LLM can see both the start
+//! context and the final result.
 
 use crate::constants;
 

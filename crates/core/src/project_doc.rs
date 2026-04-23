@@ -1,8 +1,7 @@
 //! Project documentation discovery.
 //!
 //! Walks upward from CWD to the git root, collecting `AGENTS.md` and `CLAUDE.md`
-//! files. These provide project-specific instructions to the agent, similar to
-//! how Codex uses AGENTS.md for per-project context.
+//! files. These provide project-specific instructions to the agent.
 //!
 //! All discovered files are scanned for prompt injection before inclusion in the
 //! system prompt. Flagged content is wrapped with untrusted markers.

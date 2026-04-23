@@ -620,7 +620,7 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+B / Ctrl+F — full-page scroll (codex parity).
+        // Ctrl+B / Ctrl+F — full-page scroll.
         if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.scroll_up_by(self.viewport_height());
             return Ok(AppAction::Continue);
@@ -630,13 +630,13 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+U — half-page up (codex parity).
+        // Ctrl+U — half-page up.
         if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.scroll_up_by(self.half_viewport());
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+D — half-page down ONLY while scrolled up (codex parity).
+        // Ctrl+D — half-page down ONLY while scrolled up.
         // When at bottom, fall through to the "quit when composer empty" handler
         // below so the shell-style EOF shortcut is preserved.
         if key.code == KeyCode::Char('d')

@@ -230,9 +230,8 @@ fn current_style(stack: &[Style]) -> Style {
 /// suffix (path + optional `:L<line>` anchor) for local paths, or `None` for
 /// http(s)/mailto/anchor-only references.
 ///
-/// Ported concept from Codex `markdown_render.rs`: when the model links to
-/// a file in the repo, show the resolved path so the user sees where it
-/// points instead of the bare label.
+/// When the model links to a file in the repo, show the resolved path so the
+/// user sees where it points instead of the bare label.
 fn resolve_local_link(dest: &str) -> Option<String> {
     if dest.is_empty() || dest.starts_with('#') {
         return None;

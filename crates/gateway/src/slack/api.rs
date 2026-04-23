@@ -57,7 +57,7 @@ fn slack_error_hint(error: &str) -> &'static str {
 }
 
 /// Circuit breaker thresholds for Slack typing indicators.
-/// Trips after N consecutive failures (matching OpenClaw's maxConsecutiveFailures).
+/// Trips after N consecutive failures.
 const TYPING_CB_FAILURE_THRESHOLD: u32 = crate::constants::SLACK_TYPING_CB_FAILURE_THRESHOLD;
 const TYPING_CB_SUSPENSION_SECS: u64 = crate::constants::SLACK_TYPING_CB_SUSPENSION_SECS;
 

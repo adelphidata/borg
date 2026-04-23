@@ -260,7 +260,7 @@ pub async fn compact_history(history: &mut Vec<Message>, max_tokens: usize, llm:
 
 /// Compact history preserving a head region and iterating prior summaries.
 ///
-/// This is the hermes-inspired upgrade of [`compact_history`]:
+/// An upgrade of [`compact_history`]:
 /// - The first `protect_first_n` messages stay verbatim at the start so the
 ///   original user request and framing survive repeated compactions.
 /// - When `previous_summary` is `Some`, the summarizer is told to UPDATE the
@@ -789,7 +789,7 @@ pub fn rewind_to_nth_user(history: &mut Vec<Message>, n: usize) -> usize {
 
 /// Normalize conversation history to prevent API errors.
 ///
-/// Ensures structural invariants inspired by codex-rs:
+/// Ensures structural invariants:
 /// 1. Every tool call has a corresponding tool result (synthesize if missing).
 /// 2. Every tool result has a corresponding tool call (remove orphans).
 ///
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn summary_template_has_seven_sections() {
-        // Guard: future edits must keep the 7 hermes-aligned sections.
+        // Guard: future edits must keep all 7 summary sections.
         for section in [
             "## Goal",
             "## Constraints & Preferences",
@@ -1737,7 +1737,7 @@ mod tests {
         );
     }
 
-    // -- structured summary prompt (upgraded to 7 hermes-aligned sections) --
+    // -- structured summary prompt (7 sections) --
 
     #[test]
     fn summary_prompt_preserves_identifier_instruction() {

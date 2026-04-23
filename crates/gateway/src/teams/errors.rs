@@ -1,7 +1,6 @@
 //! Teams API error classification for structured retry and logging.
 //!
-//! Categorizes HTTP status codes into actionable error kinds following
-//! the same pattern as OpenClaw's error classification.
+//! Categorizes HTTP status codes into actionable error kinds.
 
 /// Classified Teams API error kind.
 #[derive(Debug, Clone, PartialEq, Eq)]

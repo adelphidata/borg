@@ -238,7 +238,7 @@ impl Default for TtsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MediaConfig {
-    /// Max image size in bytes after compression. Default: 6MB (matches OpenClaw).
+    /// Max image size in bytes after compression. Default: 6MB.
     pub max_image_bytes: usize,
     /// Enable/disable image compression. Default: true.
     pub compression_enabled: bool,
@@ -546,8 +546,8 @@ pub struct ConversationConfig {
     pub age_based_degradation: bool,
     /// Number of earliest history messages to preserve verbatim across
     /// compactions. 0 = legacy behavior (head can be dropped into the
-    /// summary). Non-zero = hermes-style head protection with iterative
-    /// summary updates.
+    /// summary). Non-zero = protect the first N messages and iteratively
+    /// update the summary instead.
     #[serde(default)]
     pub protect_first_n: usize,
     /// Concurrent tool execution settings.

@@ -2,9 +2,8 @@
 //! capability flags. Used to drive token-budget decisions (memory, skills,
 //! conversation history) without hardcoding limits that don't fit every model.
 //!
-//! Inspired by OpenAI Codex's `models-manager/models.json` (`context_window` /
-//! `max_context_window`), but compiled in to match Borg's "all integrations
-//! compiled unconditionally" philosophy.
+//! Tracks `context_window` / `max_context_window` per model; compiled in to
+//! match Borg's "all integrations compiled unconditionally" philosophy.
 //!
 //! Lookup uses prefix matching — `claude-sonnet-4-20250514` resolves via the
 //! `claude-sonnet-4` entry. Unknown models fall back to `DEFAULT_CONTEXT_WINDOW`

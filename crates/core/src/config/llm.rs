@@ -163,7 +163,7 @@ pub enum CacheStrategy {
     ToolsSystemAnd2,
     /// System + last 3 messages, no tools marker. Trades the tools breakpoint
     /// for deeper tail coverage — helpful on long conversations with a
-    /// relatively small tool list. Ported from hermes-agent.
+    /// relatively small tool list.
     #[serde(rename = "system_and_3")]
     SystemAnd3,
 }

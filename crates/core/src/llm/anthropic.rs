@@ -176,8 +176,7 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
 /// Normalize cache token fields from a provider usage object into
 /// `(cached_read_tokens, cache_creation_tokens)`.
 ///
-/// Accepts the many field-name variants we've seen in the wild (modeled after
-/// `openclaw/src/agents/usage.ts:normalizeUsage`):
+/// Accepts the many field-name variants we've seen in the wild:
 ///
 /// - **Anthropic**: `cache_read_input_tokens`, `cache_creation_input_tokens`
 /// - **OpenAI / Responses API**: `prompt_tokens_details.cached_tokens`

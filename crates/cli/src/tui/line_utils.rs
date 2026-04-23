@@ -1,8 +1,7 @@
 //! Reusable line/span utilities for the TUI.
 //!
-//! Adapted from Codex reference at `reference/codex/codex-rs/tui/src/render/line_utils.rs`
-//! and `line_truncation.rs`. Gathers the prefix/truncation helpers that were
-//! previously inlined across `history.rs` and popups.
+//! Gathers the prefix/truncation helpers that were previously inlined across
+//! `history.rs` and popups.
 
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -117,8 +116,7 @@ pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
 /// Compact pretty-printed JSON into a single line with spaces after `:` and
 /// `,` (outside of string values). Leaves non-JSON input untouched.
 ///
-/// Ported from Codex `text_formatting.rs::format_json_compact`. The spaces
-/// are kept because `textwrap` only breaks at whitespace; a compact
+/// The spaces are kept because `textwrap` only breaks at whitespace; a compact
 /// `{"key":"value","next":1}` stream would otherwise become one unwrappable
 /// blob and force hard character splitting in narrow viewports.
 pub fn format_json_compact(s: &str) -> Option<String> {

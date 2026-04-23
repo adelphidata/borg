@@ -210,7 +210,7 @@ fn strip_heredoc_wrapper(lines: Vec<&str>) -> Vec<&str> {
 
 /// Parse a patch string into a structured `Patch`.
 ///
-/// The format follows the codex apply-patch DSL:
+/// The format follows the apply-patch DSL:
 ///
 /// ```text
 /// *** Begin Patch
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn parse_full_example() {
-        // Mirrors the codex documentation example
+        // Mirrors the documentation example
         let input = "\
 *** Begin Patch
 *** Add File: hello.txt

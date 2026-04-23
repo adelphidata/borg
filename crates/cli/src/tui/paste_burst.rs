@@ -3,8 +3,6 @@
 //! When bracket paste mode is unavailable, pastes arrive as rapid streams of
 //! individual `KeyCode::Char` events. This module detects those bursts and
 //! buffers them so the composer can insert the entire paste as a single string.
-//!
-//! Adapted from Codex's paste_burst.rs.
 
 use std::time::{Duration, Instant};
 

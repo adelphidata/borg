@@ -1,6 +1,4 @@
-//! Minimal strict templating for prompt and text assets.
-//!
-//! Ported from codex-rs `codex-utils-template`. Supports:
+//! Minimal strict templating for prompt and text assets. Supports:
 //! - `{{ name }}` placeholder interpolation
 //! - `{{{{` for a literal `{{`
 //! - `}}}}` for a literal `}}`

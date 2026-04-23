@@ -1582,7 +1582,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 5, "typing must not move scroll");
     }
 
-    // --- PageUp / PageDown (viewport height, codex parity) ---
+    // --- PageUp / PageDown (viewport height) ---
 
     #[test]
     fn page_up_scrolls_by_viewport_height() {
@@ -1636,7 +1636,7 @@ mod tests {
         );
     }
 
-    // --- Ctrl+B / Ctrl+F — full-page scroll (codex parity) ---
+    // --- Ctrl+B / Ctrl+F — full-page scroll ---
 
     #[test]
     fn ctrl_b_scrolls_up_by_viewport_height() {
@@ -1678,7 +1678,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 160);
     }
 
-    // --- Ctrl+U / Ctrl+D — half-page scroll (codex parity) ---
+    // --- Ctrl+U / Ctrl+D — half-page scroll ---
 
     #[test]
     fn ctrl_u_scrolls_up_by_half_viewport_even_height() {

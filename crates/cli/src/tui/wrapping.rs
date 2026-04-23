@@ -1,15 +1,10 @@
 //! URL-safe plain text wrapping.
 //!
-//! Based on Codex reference (`reference/codex/codex-rs/tui/src/wrapping.rs`).
 //! When the input contains a URL-like token, wrapping switches to
 //! `WordSeparator::AsciiSpace` + `WordSplitter::NoHyphenation` +
 //! `break_words: false`, which keeps URLs intact on a single line.
-//! Other prose falls back to default `textwrap` behavior.
-//!
-//! We deliberately do **not** port Codex's line/span-slicing wrapper here
-//! (it would pull in `url`, `push_owned_lines`, and a large chunk of
-//! support infrastructure). This module is scoped to plain `&str` wrap
-//! which is what every current borg call site needs.
+//! Other prose falls back to default `textwrap` behavior. Scoped to plain
+//! `&str` wrap — line/span-slicing is intentionally out of scope.
 
 use std::borrow::Cow;
 

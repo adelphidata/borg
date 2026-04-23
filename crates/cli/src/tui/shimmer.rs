@@ -25,7 +25,6 @@ pub(super) fn shimmer_spans_auto(text: &str) -> Vec<Span<'static>> {
 
 /// Produce per-character spans with a sweeping shimmer highlight.
 ///
-/// Adapted from Codex reference (`reference/codex/codex-rs/tui/src/shimmer.rs`).
 /// A cosine-based band sweeps left-to-right over 2 seconds, blending each
 /// character from `base_rgb` toward `highlight_rgb`.  Falls back to BOLD/DIM
 /// modifiers when true-color is unavailable.

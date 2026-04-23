@@ -224,9 +224,7 @@ enum Commands {
 ///
 /// Rust futures can grow large frames along the agent-loop → tool-handler → sub-agent
 /// call chain. The tokio default (2 MiB on Linux/macOS) has been sufficient so far but
-/// leaves little headroom; codex reports stack overflows in CI on equivalent paths and
-/// addresses them by raising the thread stack (codex `2bfa62761`). Borg preemptively
-/// matches that posture with 4 MiB for all worker and blocking threads.
+/// leaves little headroom, so Borg uses 4 MiB for all worker and blocking threads.
 const RUNTIME_STACK_SIZE: usize = 4 * 1024 * 1024;
 
 fn main() -> Result<()> {

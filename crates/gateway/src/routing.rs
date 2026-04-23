@@ -5,7 +5,7 @@ use tracing::debug;
 pub struct ResolvedRoute {
     /// Base config with binding overrides applied.
     pub config: Config,
-    /// Unique ID for session isolation (like OpenClaw's agentId prefix).
+    /// Unique ID for session isolation.
     pub binding_id: String,
     /// Scoped memory directory name (if set by binding).
     pub memory_scope: Option<String>,
@@ -19,7 +19,7 @@ pub struct ResolvedRoute {
 
 /// Resolve which gateway binding (if any) matches the given channel context.
 ///
-/// Uses tiered matching adapted from OpenClaw's 7-tier cascade (simplified to 3 tiers):
+/// Uses tiered matching (3 tiers, first match wins):
 ///   Tier 1: channel + sender + peer_kind (most specific)
 ///   Tier 2: channel + sender (no peer_kind)
 ///   Tier 3: channel only (wildcard sender)

@@ -51,10 +51,10 @@ Or download manually from [Releases](https://github.com/borganization/borg/relea
 
 **Maintenance**
 
-| Command   | What it does                      |
-| --------- | --------------------------------- |
+| Command   | What it does                                 |
+| --------- | -------------------------------------------- |
 | `/doctor` | Run diagnostics on Borg and host environment |
-| `/update` | Update Borg to the latest release |
+| `/update` | Update Borg to the latest release            |
 
 ...and many more. Type `/` in a conversation to browse them all.
 
@@ -68,7 +68,7 @@ Any skill can be added as a plugin too — drop in a skill and Borg learns a new
 
 ## Documentation
 
-See the [docs/](docs/) directory for detailed guides on configuration, architecture, memory, skills, tools, sandboxing, and provider setup.
+Browse the docs site at <https://docs.borganization.ai>, or see the [docs/](docs/) directory for detailed guides on configuration, architecture, memory, skills, tools, sandboxing, and provider setup.
 
 ## Contributing
 

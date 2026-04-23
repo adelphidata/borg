@@ -397,8 +397,7 @@ pub async fn stream_claude_cli(
     }
 
     // Clear API key env vars to force OAuth path. ANTHROPIC_API_KEY_OLD is an
-    // undocumented fallback the CLI honors in some environments — clearing both
-    // matches OpenClaw's CLAUDE_CLI_CLEAR_ENV list.
+    // undocumented fallback the CLI honors in some environments — clear both.
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("ANTHROPIC_API_KEY_OLD");
 

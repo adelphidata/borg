@@ -48,7 +48,7 @@ pub fn handle_apply_patch_unified(args: &serde_json::Value, config: &Config) -> 
 
 // IMPORTANT: apply_patch supports absolute and ~/... paths for cross-directory
 // file creation. Security boundary is is_blocked_path(), NOT base_dir containment.
-// Do not re-add CWD-only restriction — see OpenClaw/Codex reference implementations.
+// Do not re-add a CWD-only restriction.
 pub fn handle_apply_patch(args: &serde_json::Value, config: &Config) -> Result<String> {
     let patch_text = require_str_param(args, "patch")?;
     let cwd = std::env::current_dir().context("Failed to determine current working directory")?;

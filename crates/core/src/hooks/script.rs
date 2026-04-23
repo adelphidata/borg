@@ -1,6 +1,6 @@
 //! User-authored script hooks discovered from `~/.borg/hooks.json`.
 //!
-//! Schema mirrors Claude Code / codex:
+//! Schema mirrors the Claude Code hooks format:
 //!
 //! ```json
 //! {

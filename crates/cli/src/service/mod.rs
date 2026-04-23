@@ -1257,10 +1257,9 @@ pub fn is_duplicate_heartbeat(
 }
 
 /// Returns true if a heartbeat response carries no meaningful information and
-/// should be suppressed before delivery. Inspired by openclaw's heartbeat
-/// transcript pruning — short acknowledgments like "ok", "no updates", "all
-/// good" pollute downstream channels without conveying anything the user
-/// couldn't already assume from the absence of a message.
+/// should be suppressed before delivery. Short acknowledgments like "ok",
+/// "no updates", "all good" pollute downstream channels without conveying
+/// anything the user couldn't already assume from the absence of a message.
 pub fn is_zero_info_heartbeat(response: &str) -> bool {
     const TRIVIAL_PATTERNS: &[&str] = &[
         "ok",

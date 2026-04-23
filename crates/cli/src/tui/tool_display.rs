@@ -62,10 +62,8 @@ fn truncate(s: &str, max: usize) -> String {
 /// Truncate a `/`-separated path so the trailing segment (filename) stays
 /// intact and as many leading segments as fit are retained, joined to the
 /// tail by `/…/`. Falls back to end-truncate for non-path strings or when a
-/// single segment alone exceeds `max`.
-///
-/// Inspired by codex `text_formatting::center_truncate_path` — preserves the
-/// part of the path the user actually identifies the file by.
+/// single segment alone exceeds `max`. Preserves the part of the path the
+/// user actually identifies the file by.
 fn truncate_path(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();

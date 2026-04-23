@@ -27,8 +27,7 @@ pub struct GatewayConfig {
     pub request_timeout_ms: u64,
     /// Inactivity timeout in seconds. The agent turn is cancelled if no
     /// progress event (stream token, tool call, tool result, etc.) arrives
-    /// within this window. `0` disables. Default: 1800 (30 min). Ported
-    /// from hermes-agent's `HERMES_AGENT_TIMEOUT`.
+    /// within this window. `0` disables. Default: 1800 (30 min).
     #[serde(default = "default_inactivity_timeout_secs")]
     pub inactivity_timeout_secs: u64,
     /// Send a one-shot warning message after this many idle seconds, before

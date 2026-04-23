@@ -6,7 +6,7 @@ use tracing::warn;
 use super::api::SlackClient;
 use crate::typing_keepalive::{self, TypingIndicatorHandle, TypingKeepaliveConfig};
 
-/// Keepalive interval for re-sending typing status (matches OpenClaw).
+/// Keepalive interval for re-sending typing status.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Reaction emoji added to the user's message while typing.
@@ -81,7 +81,7 @@ impl TypingIndicator {
         // Signal and wait for background task
         self.inner.stop().await;
 
-        // Clear thread status (empty string = clear, matching OpenClaw)
+        // Clear thread status (empty string = clear)
         if let Err(e) = self
             .client
             .set_thread_status(&self.channel, self.thread_ts.as_deref(), "")
@@ -104,7 +104,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constants_match_openclaw() {
+    fn typing_constants_are_stable() {
         assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(3));
         assert_eq!(TYPING_REACTION, "thinking_face");
     }

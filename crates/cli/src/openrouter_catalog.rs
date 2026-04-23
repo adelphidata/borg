@@ -6,9 +6,9 @@
 //! return means the caller should fall back to the hardcoded list (the cache
 //! is empty because the fetch hasn't completed, never ran, or failed).
 //!
-//! Mirrors the pattern Hermes uses in `hermes_cli/models.py`: curated list
-//! provides stable ordering + labels, live fetch drops stale IDs and tags
-//! zero-priced models as "(free)". No refresh command, no disk cache, no TTL.
+//! The curated list provides stable ordering + labels; the live fetch drops
+//! stale IDs and tags zero-priced models as "(free)". No refresh command, no
+//! disk cache, no TTL.
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
