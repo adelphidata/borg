@@ -258,6 +258,57 @@ const STRATEGIST_KEYWORDS: &[&str] = &[
     "benchmark",
 ];
 
+const MARKETER_KEYWORDS: &[&str] = &[
+    "marketing",
+    "campaign",
+    "seo",
+    "adwords",
+    "google-ads",
+    "facebook-ads",
+    "meta-ads",
+    "tiktok-ads",
+    "mailchimp",
+    "sendgrid",
+    "hubspot",
+    "marketo",
+    "pardot",
+    "klaviyo",
+    "customer.io",
+    "intercom",
+    "segment.io",
+    "mixpanel",
+    "amplitude",
+    "ga4",
+    "google-analytics",
+    "utm",
+    "funnel",
+    "conversion",
+    "cpc",
+    "roas",
+    "ltv",
+    "churn",
+    "retention",
+    "cohort",
+    "ab-test",
+    "landing-page",
+    "growth",
+    "newsletter",
+    "drip",
+    "audience",
+    "retargeting",
+    "remarketing",
+    "copywriting",
+    "subject-line",
+    "open-rate",
+    "click-through",
+    "brand",
+    "positioning",
+    "social-media",
+    "instagram",
+    "linkedin-ads",
+    "twitter-ads",
+];
+
 const TINKERER_KEYWORDS: &[&str] = &[
     "homelab",
     "proxmox",
@@ -361,6 +412,7 @@ fn classify_shell_command(metadata: Option<&str>) -> Option<Archetype> {
         (GUARDIAN_KEYWORDS, Archetype::Guardian),
         (STRATEGIST_KEYWORDS, Archetype::Strategist),
         (TINKERER_KEYWORDS, Archetype::Tinkerer),
+        (MARKETER_KEYWORDS, Archetype::Marketer),
     ];
 
     for (keywords, archetype) in keyword_sets {
@@ -390,29 +442,28 @@ pub fn fallback_evolution_name(archetype: Option<Archetype>, stage: Stage) -> (S
             );
         }
     };
-    let (name_s2, name_s3) = archetype_fallback_names(arch);
-    let name = match stage {
-        Stage::Base => name_s2, // pre-evolution — reuse stage 2 name
-        Stage::Evolved => name_s2,
-        Stage::Final => name_s3,
-    };
+    // Stage isn't part of the fallback name — the stage indicator (Evolved II /
+    // Final III) disambiguates tier. Keeping the signature stage-aware lets the
+    // LLM-generated path differ later without touching callers.
+    let _ = stage;
+    let name = archetype_fallback_name(arch);
     let description = archetype_fallback_description(arch);
     (name.to_string(), description.to_string())
 }
 
-/// (stage2 name, stage3 name) for each archetype.
-fn archetype_fallback_names(archetype: Archetype) -> (&'static str, &'static str) {
+fn archetype_fallback_name(archetype: Archetype) -> &'static str {
     match archetype {
-        Archetype::Ops => ("Pipeline Warden", "Infrastructure Sovereign"),
-        Archetype::Builder => ("Tool Forgemaster", "Automation Architect"),
-        Archetype::Analyst => ("Insight Diviner", "Pattern Oracle"),
-        Archetype::Communicator => ("Outreach Operative", "Signal Weaver"),
-        Archetype::Guardian => ("Vigilant Sentinel", "Fortress Keeper"),
-        Archetype::Strategist => ("Path Finder", "Grand Planner"),
-        Archetype::Creator => ("Word Smith", "Narrative Architect"),
-        Archetype::Caretaker => ("Gentle Steward", "Household Guardian"),
-        Archetype::Merchant => ("Ledger Keeper", "Commerce Sage"),
-        Archetype::Tinkerer => ("Bench Wizard", "Homelab Artisan"),
+        Archetype::Ops => "Ops Borg",
+        Archetype::Builder => "Builder Borg",
+        Archetype::Analyst => "Analyst Borg",
+        Archetype::Communicator => "Communicator Borg",
+        Archetype::Guardian => "Guardian Borg",
+        Archetype::Strategist => "Strategist Borg",
+        Archetype::Creator => "Creator Borg",
+        Archetype::Caretaker => "Caretaker Borg",
+        Archetype::Merchant => "Merchant Borg",
+        Archetype::Tinkerer => "Tinkerer Borg",
+        Archetype::Marketer => "Marketer Borg",
     }
 }
 
@@ -589,6 +640,9 @@ fn archetype_fallback_description(archetype: Archetype) -> &'static str {
         Archetype::Caretaker => "A quiet steward keeping the household rhythms on beat.",
         Archetype::Merchant => "A meticulous keeper of ledgers and commerce flows.",
         Archetype::Tinkerer => "A curious hacker who can't leave a homelab alone for five minutes.",
+        Archetype::Marketer => {
+            "A data-driven growth hand tuning funnels, campaigns, and audience fit."
+        }
     }
 }
 

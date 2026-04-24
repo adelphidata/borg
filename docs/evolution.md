@@ -6,9 +6,9 @@ The evolution system has three axes:
 
 1. **Classes (Stages)** — three permanent evolution tiers (Base → Evolved → Final)
 2. **Levels** — 0–99 within each stage, providing continuous progression
-3. **Archetypes** — 10 internal categories that classify your usage pattern and drive the generated evolution name
+3. **Archetypes** — 11 internal categories that classify your usage pattern and drive the generated evolution name
 
-Display format: `Pipeline Warden Lvl.42` (LLM-generated name + current level).
+Display format: `Ops Borg Lvl.42` (LLM-generated name + current level).
 
 ---
 
@@ -46,6 +46,7 @@ Archetypes classify how you use Borg. The LLM uses your dominant archetype to ge
 | **Caretaker** | Home, wellness, personal rhythms | "A quiet steward keeping the household rhythms on beat." |
 | **Merchant** | E-commerce, sales, finance | "A meticulous keeper of ledgers and commerce flows." |
 | **Tinkerer** | Homelab, hardware, experimentation | "A curious hacker who can't leave a homelab alone for five minutes." |
+| **Marketer** | Marketing, growth, campaigns, funnels | "A data-driven growth hand tuning funnels, campaigns, and audience fit." |
 
 Source: `crates/core/src/evolution/mod.rs` (`Archetype` enum), `crates/core/src/evolution/classification.rs`.
 
@@ -73,6 +74,7 @@ Actions are classified to archetypes via three layers, in order:
 | **Guardian** | firewall, ufw, iptables, nmap, chmod, chown, audit, vulnerability, cve, openssl, tls, certificate, encrypt, hmac, jwt, oauth, saml, kerberos, selinux, fail2ban, wireshark, tcpdump, pentest, metasploit, owasp, sast, trivy, cosign, gpg, secret, rotation, soc2, gdpr, hipaa |
 | **Strategist** | plan, prioritize, compare, evaluate, decision, roadmap, okr, kpi, milestone, sprint, backlog, epic, kanban, scrum, retro, stakeholder, budget, forecast, estimate, timeline, dependency, tradeoff, rfc, adr, objective, quarterly, benchmark |
 | **Tinkerer** | homelab, proxmox, pve, esxi, truenas, pihole, wireguard, tailscale, raspberry, arduino, gpio, mqtt, zigbee, esp32, stm32, fpga, oscilloscope, i2c, spi, uart, can-bus, modbus, home-assistant, openwrt, pfsense, opnsense, unifi, vlan, zfs, btrfs, octoprint, klipper, qemu, lxc |
+| **Marketer** | marketing, campaign, seo, google-ads, facebook-ads, mailchimp, sendgrid, hubspot, klaviyo, segment.io, mixpanel, amplitude, ga4, utm, funnel, conversion, cpc, roas, ltv, churn, retention, cohort, ab-test, landing-page, growth, newsletter, retargeting, remarketing, copywriting, brand, social-media |
 
 (Full lists in `crates/core/src/evolution/classification.rs`.)
 
@@ -100,18 +102,21 @@ The LLM returns strict JSON: `{"name": "<2-4 words, evocative, title case>", "de
 
 ### Fallback Evolution Names
 
-| Archetype | Stage 2 (Evolved) | Stage 3 (Final) |
-|-----------|-------------------|-----------------|
-| Ops | **Pipeline Warden** | **Infrastructure Sovereign** |
-| Builder | **Tool Forgemaster** | **Automation Architect** |
-| Analyst | **Insight Diviner** | **Pattern Oracle** |
-| Communicator | **Outreach Operative** | **Signal Weaver** |
-| Guardian | **Vigilant Sentinel** | **Fortress Keeper** |
-| Strategist | **Path Finder** | **Grand Planner** |
-| Creator | **Word Smith** | **Narrative Architect** |
-| Caretaker | **Gentle Steward** | **Household Guardian** |
-| Merchant | **Ledger Keeper** | **Commerce Sage** |
-| Tinkerer | **Bench Wizard** | **Homelab Artisan** |
+Fallback names follow a simple `{Archetype} Borg` pattern. Both stages share the same fallback — the stage indicator (e.g. `Evolved II`) provides the tier distinction.
+
+| Archetype | Fallback name |
+|-----------|---------------|
+| Ops | **Ops Borg** |
+| Builder | **Builder Borg** |
+| Analyst | **Analyst Borg** |
+| Communicator | **Communicator Borg** |
+| Guardian | **Guardian Borg** |
+| Strategist | **Strategist Borg** |
+| Creator | **Creator Borg** |
+| Caretaker | **Caretaker Borg** |
+| Merchant | **Merchant Borg** |
+| Tinkerer | **Tinkerer Borg** |
+| Marketer | **Marketer Borg** |
 
 Source: `crates/core/src/evolution/classification.rs`.
 
@@ -259,7 +264,7 @@ Evolution context is injected into the system prompt each turn:
 
 ```xml
 <evolution_context>
-Stage: Evolved | Pipeline Warden Lvl.42
+Stage: Evolved | Ops Borg Lvl.42
 Archetype: Ops (score: 74)
 </evolution_context>
 ```
@@ -274,7 +279,7 @@ The `Archetype:` line is omitted when there is no dominant archetype yet. An Ops
 
 ### Ambient TUI Header
 
-Shows name, level, mood, and dominant archetype (e.g. `Pipeline Warden Lv.42 — Focused — Ops`). Refreshes on `AfterToolCall` via cached `AmbientStatus`. Gated on `evolution.ambient_header_enabled` (default `true`).
+Shows name, level, mood, and dominant archetype (e.g. `Ops Borg Lv.42 — Focused — Ops`). Refreshes on `AfterToolCall` via cached `AmbientStatus`. Gated on `evolution.ambient_header_enabled` (default `true`).
 
 ---
 

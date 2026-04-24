@@ -74,7 +74,7 @@ pub(crate) fn rate_limit_for(event_type: &str) -> u32 {
 
 // ── Types ──
 
-/// The 10 archetypes that classify usage patterns.
+/// The 11 archetypes that classify usage patterns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Archetype {
     /// Infrastructure and deployment operations.
@@ -97,11 +97,13 @@ pub enum Archetype {
     Merchant,
     /// Homelab and hardware tinkering.
     Tinkerer,
+    /// Marketing, growth, and campaign workflows.
+    Marketer,
 }
 
 impl Archetype {
     /// All archetype variants in definition order.
-    pub const ALL: [Archetype; 10] = [
+    pub const ALL: [Archetype; 11] = [
         Archetype::Ops,
         Archetype::Builder,
         Archetype::Analyst,
@@ -112,6 +114,7 @@ impl Archetype {
         Archetype::Caretaker,
         Archetype::Merchant,
         Archetype::Tinkerer,
+        Archetype::Marketer,
     ];
 
     /// Parse an archetype name (case-insensitive) into the enum variant.
@@ -127,6 +130,7 @@ impl Archetype {
             "caretaker" => Some(Self::Caretaker),
             "merchant" => Some(Self::Merchant),
             "tinkerer" => Some(Self::Tinkerer),
+            "marketer" => Some(Self::Marketer),
             _ => None,
         }
     }
@@ -145,6 +149,7 @@ impl fmt::Display for Archetype {
             Self::Caretaker => write!(f, "caretaker"),
             Self::Merchant => write!(f, "merchant"),
             Self::Tinkerer => write!(f, "tinkerer"),
+            Self::Marketer => write!(f, "marketer"),
         }
     }
 }
@@ -1183,6 +1188,22 @@ mod tests {
     }
 
     #[test]
+    fn classify_shell_marketer_keywords() {
+        assert_eq!(
+            classify_tool_archetype("run_shell", Some("launch mailchimp campaign")),
+            Some(Archetype::Marketer)
+        );
+        assert_eq!(
+            classify_tool_archetype("run_shell", Some("check ga4 conversion funnel")),
+            Some(Archetype::Marketer)
+        );
+        assert_eq!(
+            classify_tool_archetype("run_shell", Some("pull ROAS from google-ads")),
+            Some(Archetype::Marketer)
+        );
+    }
+
+    #[test]
     fn classify_unknown_tool_returns_none() {
         assert_eq!(classify_tool_archetype("list_dir", None), None);
         assert_eq!(classify_tool_archetype("read_file", None), None);
@@ -1213,6 +1234,11 @@ mod tests {
             ("write_memory", None, Archetype::Creator),
             // Caretaker, Merchant are primarily classified by user-created tools
             ("run_shell", Some("homelab proxmox"), Archetype::Tinkerer),
+            (
+                "run_shell",
+                Some("mailchimp campaign retargeting"),
+                Archetype::Marketer,
+            ),
         ];
         for (tool, meta, expected) in cases {
             assert_eq!(
@@ -3103,10 +3129,10 @@ mod tests {
     fn fallback_name_per_archetype_and_stage() {
         let (n_s2, d) =
             classification::fallback_evolution_name(Some(Archetype::Ops), Stage::Evolved);
-        assert_eq!(n_s2, "Pipeline Warden");
+        assert_eq!(n_s2, "Ops Borg");
         assert!(!d.is_empty());
         let (n_s3, _) = classification::fallback_evolution_name(Some(Archetype::Ops), Stage::Final);
-        assert_eq!(n_s3, "Infrastructure Sovereign");
+        assert_eq!(n_s3, "Ops Borg");
         for a in [
             Archetype::Builder,
             Archetype::Analyst,
@@ -3117,12 +3143,14 @@ mod tests {
             Archetype::Caretaker,
             Archetype::Merchant,
             Archetype::Tinkerer,
+            Archetype::Marketer,
         ] {
             let (n2, d2) = classification::fallback_evolution_name(Some(a), Stage::Evolved);
             let (n3, d3) = classification::fallback_evolution_name(Some(a), Stage::Final);
-            assert!(!n2.is_empty() && !d2.is_empty(), "empty for {a:?} s2");
-            assert!(!n3.is_empty() && !d3.is_empty(), "empty for {a:?} s3");
-            assert_ne!(n2, n3, "s2 and s3 names must differ for {a:?}");
+            assert!(n2.ends_with(" Borg"), "{a:?} s2 missing Borg suffix: {n2}");
+            assert!(n3.ends_with(" Borg"), "{a:?} s3 missing Borg suffix: {n3}");
+            assert_eq!(n2, n3, "stage should not affect fallback name for {a:?}");
+            assert!(!d2.is_empty() && !d3.is_empty(), "empty desc for {a:?}");
         }
     }
 
