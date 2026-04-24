@@ -176,7 +176,6 @@ pub fn prefix_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::style::{Color, Style};
 
     #[test]
     fn line_width_sums_unicode_spans() {

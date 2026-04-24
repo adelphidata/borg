@@ -30,6 +30,26 @@ check:
     cargo fmt --check
     cargo clippy -- -D warnings
 
+# Install local CI helpers (cargo-audit, cargo-deny)
+install-ci-tools:
+    RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
+    RUSTUP_TOOLCHAIN=stable cargo install cargo-deny --locked
+
+# Security advisory scan (mirrors CI's Security Audit job)
+audit:
+    RUSTUP_TOOLCHAIN=stable cargo audit
+
+# Dependency check (mirrors CI's Dependency Check job)
+deny:
+    cargo deny --all-features check
+
+# Run everything CI runs (format, clippy, test, build, audit, deny)
+ci: check
+    cargo test --workspace
+    cargo build
+    just audit
+    just deny
+
 # Generate code coverage report (HTML)
 coverage:
     cargo llvm-cov --workspace --html
