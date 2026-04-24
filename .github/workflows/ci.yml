@@ -129,9 +129,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+      - uses: dtolnay/rust-toolchain@master
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          toolchain: stable
+      - name: Install cargo-audit
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo audit
 
   deny:
     name: Dependency Check
