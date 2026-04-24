@@ -4,7 +4,9 @@
 //! On Linux, uses `systemd-inhibit` if available, otherwise no-op.
 //! On other platforms, this is a no-op.
 
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "macos")]
+use tracing::warn;
 
 /// RAII guard that prevents system sleep while held.
 /// Dropping the guard re-enables sleep.
