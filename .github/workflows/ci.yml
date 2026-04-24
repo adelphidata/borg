@@ -93,7 +93,6 @@ jobs:
           key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-build-
       - run: cargo build
-      - run: cargo test
 
   coverage:
     name: Coverage
