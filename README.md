@@ -5,7 +5,7 @@
 [![Coverage](https://codecov.io/gh/borganization/borg/branch/main/graph/badge.svg)](https://codecov.io/gh/borganization/borg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Personal AI assistant that runs locally, remembers you, and gets better over time.**
+**Borg is your personal assistant, employee, developer, sidekick, and friend.**
 
 ## Quick Start
 
@@ -32,15 +32,7 @@ Or download manually from [Releases](https://github.com/borganization/borg/relea
 | `/memory`   | Inspect long-term memory context                 |
 | `/migrate`  | Import from another agent                        |
 
-**Conversation**
-
-| Command    | What it does                                                 |
-| ---------- | ------------------------------------------------------------ |
-| `/btw <q>` | Ask a side question using current context, no history impact |
-| `/poke`    | Trigger an immediate heartbeat check-in                      |
-| `/usage`   | Token and cost usage for the session                         |
-
-**Personality**
+**Evolution**
 
 | Command      | What it does                                            |
 | ------------ | ------------------------------------------------------- |
@@ -49,12 +41,21 @@ Or download manually from [Releases](https://github.com/borganization/borg/relea
 | `/stats`     | Borg vitals — stability, focus, sync, growth, happiness |
 | `/card`      | Print a shareable ASCII card of your Borg               |
 
+**Conversation**
+
+| Command    | What it does                                                 |
+| ---------- | ------------------------------------------------------------ |
+| `/btw <q>` | Ask a side question using current context, no history impact |
+| `/poke`    | Trigger an immediate heartbeat check-in                      |
+| `/usage`   | Token and cost usage for the session                         |
+
 **Maintenance**
 
-| Command   | What it does                                 |
-| --------- | -------------------------------------------- |
-| `/doctor` | Run diagnostics on Borg and host environment |
-| `/update` | Update Borg to the latest release            |
+| Command   | What it does                                          |
+| --------- | ----------------------------------------------------- |
+| `/doctor` | Run diagnostics on Borg and host environment          |
+| `/heal`   | Run the full self-healing maintenance sweep on demand |
+| `/update` | Update Borg to the latest release                     |
 
 ...and many more. Type `/` in a conversation to browse them all.
 

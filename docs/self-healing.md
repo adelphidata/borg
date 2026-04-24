@@ -66,6 +66,26 @@ Each run does the following in order:
 The run is recorded to `doctor_runs`, and the table is capped at
 `maintenance.doctor_runs_keep` (default 30) rows.
 
+### On-demand sweep
+
+Run the full sweep immediately without waiting for the 02:00 scheduled
+fire:
+
+```text
+/heal
+```
+
+The slash command calls `run_daily_maintenance` directly — same code
+path as the scheduled task, same `doctor_runs` row written, same
+`MaintenanceReport` returned. The TUI shows a summary line plus any
+persistent warnings inline.
+
+Unlike `/doctor` (read-only diagnostics, streamed), `/heal` executes
+the mutating steps: log truncation, activity-log pruning, embedding
+eviction, workflow pruning, stalled-task healing. Use `/doctor` when
+you want a quick health readout; use `/heal` when you want the sweep
+to actually do its housekeeping.
+
 ### Disabling
 
 ```sh

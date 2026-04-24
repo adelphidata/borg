@@ -42,6 +42,7 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
+            "/heal" => return Some(self.cmd_heal()),
             "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
             "/pairing" => {
                 if let Ok(data_dir) = borg_core::config::Config::data_dir() {
@@ -251,6 +252,7 @@ impl App<'_> {
              /history   - Show conversation history\n  \
              /logs      - Show activity log (error|warn|info|debug|all|raw)\n  \
              /doctor    - Run diagnostics\n  \
+             /heal      - Run the self-healing maintenance sweep on demand\n  \
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
              /pairing   - Manage sender pairing\n  \
@@ -588,6 +590,30 @@ impl App<'_> {
         })
     }
 
+    /// `/heal` — run the self-healing maintenance sweep on demand. This is the
+    /// same routine the daemon fires nightly at 02:00, exposed for users who
+    /// want to force a sweep without waiting.
+    fn cmd_heal(&mut self) -> Result<AppAction> {
+        let db = match borg_core::db::Database::open() {
+            Ok(db) => db,
+            Err(e) => {
+                tracing::warn!(error = %e, "on-demand /heal: failed to open database");
+                self.push_system_message(format!("Self-healing failed: {e}"));
+                return Ok(AppAction::Continue);
+            }
+        };
+        match borg_core::maintenance::run_daily_maintenance(&db, &self.config) {
+            Ok(report) => {
+                self.push_system_message(format_heal_summary(&report));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "on-demand /heal: maintenance sweep failed");
+                self.push_system_message(format!("Self-healing failed: {e}"));
+            }
+        }
+        Ok(AppAction::Continue)
+    }
+
     fn cmd_uninstall(&mut self) -> Result<AppAction> {
         self.push_system_message(
             "⚠ WARNING: This will permanently delete all Borg data (~/.borg/)\n\
@@ -599,6 +625,22 @@ impl App<'_> {
         self.state = AppState::ConfirmingUninstall;
         Ok(AppAction::Continue)
     }
+}
+
+/// Render a [`MaintenanceReport`] as the multi-line system-message body
+/// shown after `/heal`. Kept separate from `cmd_heal` so the formatting is
+/// testable without standing up an `App`.
+pub(super) fn format_heal_summary(report: &borg_core::maintenance::MaintenanceReport) -> String {
+    let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
+    text.push_str(&report.activity_line());
+    if !report.persistent_warnings.is_empty() {
+        text.push_str("\n\nPersistent warnings (seen in 2+ consecutive runs):");
+        for w in &report.persistent_warnings {
+            text.push_str("\n  • ");
+            text.push_str(w);
+        }
+    }
+    text
 }
 
 /// Build a best-effort `Vec<Message>` snapshot from the TUI transcript.
@@ -644,6 +686,71 @@ mod tests {
         assert!(
             code.contains("\"/status\""),
             "commands.rs must handle /status"
+        );
+    }
+
+    #[test]
+    fn commands_rs_registers_heal_command() {
+        // Regression guard: /heal is a documented user-facing command. If this
+        // match arm gets deleted, the slash handler silently falls through to
+        // "Unknown command" — easy to miss in review because the code still
+        // compiles. This mirrors the /stats + /status guard above.
+        let src = include_str!("commands.rs");
+        let code = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(code.contains("\"/heal\""), "commands.rs must handle /heal");
+    }
+
+    #[test]
+    fn format_heal_summary_includes_activity_line_and_header() {
+        let report = borg_core::maintenance::MaintenanceReport {
+            pass_count: 12,
+            warn_count: 1,
+            fail_count: 0,
+            log_files_deleted: 2,
+            ..Default::default()
+        };
+        let out = format_heal_summary(&report);
+        assert!(
+            out.starts_with("Self-healing sweep complete"),
+            "summary must lead with a header: {out:?}"
+        );
+        assert!(
+            out.contains(&report.activity_line()),
+            "summary must embed the canonical activity_line so headless \
+             and interactive runs agree on the numbers: {out:?}"
+        );
+        assert!(
+            !out.contains("Persistent warnings"),
+            "no persistent warnings section when list is empty: {out:?}"
+        );
+    }
+
+    #[test]
+    fn format_heal_summary_lists_persistent_warnings_when_present() {
+        // Persistent warnings are the whole point of surfacing maintenance to
+        // the user — a sweep that has "Data:SqliteIntegrity" for a second day
+        // in a row must not be hidden behind a single pass/warn/fail counter.
+        let report = borg_core::maintenance::MaintenanceReport {
+            pass_count: 10,
+            warn_count: 2,
+            fail_count: 0,
+            persistent_warnings: vec![
+                "Data:SqliteIntegrity".to_string(),
+                "Filesystem:LogDir".to_string(),
+            ],
+            ..Default::default()
+        };
+        let out = format_heal_summary(&report);
+        assert!(
+            out.contains("Persistent warnings"),
+            "must show persistent warnings section: {out:?}"
+        );
+        assert!(
+            out.contains("Data:SqliteIntegrity") && out.contains("Filesystem:LogDir"),
+            "every persistent warning must be rendered: {out:?}"
         );
     }
 

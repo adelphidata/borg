@@ -65,6 +65,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         description: "Run diagnostics",
     },
     SlashCommandDef {
+        name: "/heal",
+        description: "Run self-healing maintenance sweep",
+    },
+    SlashCommandDef {
         name: "/stats",
         description: "Show agent vitals",
     },
@@ -439,6 +443,7 @@ mod tests {
             "/history",
             "/logs",
             "/doctor",
+            "/heal",
             "/stats",
             "/xp",
             "/evolution",
