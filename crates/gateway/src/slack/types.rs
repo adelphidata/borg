@@ -48,6 +48,26 @@ pub struct SlackEvent {
     pub bot_id: Option<String>,
     /// Files attached to the message.
     pub files: Option<Vec<SlackFile>>,
+    /// Nested message payload for `message_changed` (the new content) and
+    /// `message_deleted` (typically inside `previous_message`). Slack puts the
+    /// post-edit message in `message`.
+    pub message: Option<NestedSlackMessage>,
+    /// Previous message content for `message_changed` and `message_deleted`.
+    pub previous_message: Option<NestedSlackMessage>,
+    /// Timestamp of the deleted message (for `message_deleted` events).
+    pub deleted_ts: Option<String>,
+}
+
+/// Inner message payload nested inside a `message_changed` or `message_deleted`
+/// envelope. Mirrors the subset of fields we actually consume; Slack sends more.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NestedSlackMessage {
+    /// Sender user ID.
+    pub user: Option<String>,
+    /// Text content of the nested message.
+    pub text: Option<String>,
+    /// Timestamp of the nested message.
+    pub ts: Option<String>,
 }
 
 /// File metadata attached to a Slack message event.

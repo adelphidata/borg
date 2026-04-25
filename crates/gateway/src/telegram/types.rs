@@ -304,6 +304,50 @@ impl ReactionType {
     }
 }
 
+/// Request body for editMessageText.
+#[derive(Debug, Serialize)]
+pub struct EditMessageTextRequest {
+    /// Target chat identifier.
+    pub chat_id: i64,
+    /// Identifier of the message to edit.
+    pub message_id: i64,
+    /// New text of the message.
+    pub text: String,
+    /// Parse mode for formatting (e.g. "HTML", "MarkdownV2").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_mode: Option<String>,
+    /// Optional inline keyboard markup to attach to the edited message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+/// Request body for deleteMessage.
+#[derive(Debug, Serialize)]
+pub struct DeleteMessageRequest {
+    /// Target chat identifier.
+    pub chat_id: i64,
+    /// Identifier of the message to delete.
+    pub message_id: i64,
+}
+
+/// Source of an outbound media file: existing Telegram file_id, public URL, or raw bytes upload.
+#[derive(Debug, Clone)]
+pub enum MediaSource<'a> {
+    /// Reuse a previously uploaded file by its Telegram file_id.
+    FileId(&'a str),
+    /// Tell Telegram to fetch the media from this URL.
+    Url(&'a str),
+    /// Upload bytes via multipart/form-data with the given filename.
+    Bytes {
+        /// Raw file bytes.
+        bytes: &'a [u8],
+        /// Filename Telegram should display.
+        filename: &'a str,
+        /// MIME type. If `None`, reqwest's default is used.
+        mime: Option<&'a str>,
+    },
+}
+
 /// Webhook info returned by getWebhookInfo.
 #[derive(Debug, Deserialize)]
 pub struct WebhookInfo {
@@ -737,6 +781,54 @@ mod tests {
         let reactions = json["reaction"].as_array().unwrap();
         assert_eq!(reactions[0]["type"], "emoji");
         assert_eq!(reactions[0]["emoji"], "👍");
+    }
+
+    #[test]
+    fn serialize_edit_message_text_request() {
+        let req = EditMessageTextRequest {
+            chat_id: 42,
+            message_id: 7,
+            text: "updated".into(),
+            parse_mode: Some("HTML".into()),
+            reply_markup: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["chat_id"], 42);
+        assert_eq!(json["message_id"], 7);
+        assert_eq!(json["text"], "updated");
+        assert_eq!(json["parse_mode"], "HTML");
+        assert!(json.get("reply_markup").is_none());
+    }
+
+    #[test]
+    fn serialize_edit_message_text_omits_optional_fields() {
+        let req = EditMessageTextRequest {
+            chat_id: 42,
+            message_id: 7,
+            text: "x".into(),
+            parse_mode: None,
+            reply_markup: None,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("parse_mode").is_none());
+        assert!(json.get("reply_markup").is_none());
+    }
+
+    #[test]
+    fn serialize_delete_message_request_minimal_shape() {
+        let req = DeleteMessageRequest {
+            chat_id: 42,
+            message_id: 100,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["chat_id"], 42);
+        assert_eq!(json["message_id"], 100);
+        let obj = json.as_object().expect("body is an object");
+        assert_eq!(
+            obj.len(),
+            2,
+            "deleteMessage body must contain exactly chat_id and message_id"
+        );
     }
 
     #[test]

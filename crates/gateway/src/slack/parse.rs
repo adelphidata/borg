@@ -87,14 +87,77 @@ pub async fn parse_event(
         return None;
     }
 
-    // Skip non-standard message subtypes.
-    // NOTE: `file_share` is intentionally NOT filtered — it's the subtype Slack uses
-    // when a user uploads a file (with or without a caption), and dropping it would
-    // silently lose all user file uploads.
-    if let Some(ref subtype) = event.subtype {
-        match subtype.as_str() {
-            "bot_message" | "message_changed" | "message_deleted" | "channel_join"
-            | "channel_leave" => return None,
+    // Surface message edits and deletes as inbound events with metadata so the
+    // downstream handler can route them. Pre-existing behavior dropped both
+    // entirely; openclaw exposes them via monitor/events/message-subtype-handlers.
+    //
+    // For `message_changed`, the new content lives in `event.message`. For
+    // `message_deleted`, the deleted content lives in `event.previous_message`
+    // and the original timestamp in `event.deleted_ts`. In both cases we set
+    // `metadata.event_type` to the subtype so a hook or filter can decide
+    // whether to invoke the agent — these aren't user prompts.
+    if let Some(subtype) = event.subtype.as_deref() {
+        match subtype {
+            "bot_message" | "channel_join" | "channel_leave" => return None,
+            "message_changed" => {
+                let nested = event.message.as_ref()?;
+                let sender = nested.user.as_deref()?.to_string();
+                let text = nested.text.clone().unwrap_or_default();
+                if text.is_empty() {
+                    return None;
+                }
+                let peer_kind = match event.channel_type.as_deref() {
+                    Some("im") => Some(PEER_KIND_DIRECT.to_string()),
+                    Some("channel") | Some("group") | Some("mpim") => {
+                        Some(PEER_KIND_GROUP.to_string())
+                    }
+                    _ => None,
+                };
+                return Some(InboundMessage {
+                    sender_id: sender,
+                    text,
+                    channel_id: event.channel.clone(),
+                    thread_id: nested.ts.clone(),
+                    message_id: nested.ts.clone(),
+                    thread_ts: nested.ts.clone(),
+                    attachments: Vec::new(),
+                    reaction: None,
+                    metadata: serde_json::json!({
+                        "event_type": "message_changed",
+                        "previous_text": event
+                            .previous_message
+                            .as_ref()
+                            .and_then(|m| m.text.clone()),
+                    }),
+                    peer_kind,
+                });
+            }
+            "message_deleted" => {
+                let prev = event.previous_message.as_ref()?;
+                let sender = prev.user.as_deref()?.to_string();
+                let deleted_ts = event.deleted_ts.clone().or_else(|| prev.ts.clone());
+                let peer_kind = match event.channel_type.as_deref() {
+                    Some("im") => Some(PEER_KIND_DIRECT.to_string()),
+                    Some("channel") | Some("group") | Some("mpim") => {
+                        Some(PEER_KIND_GROUP.to_string())
+                    }
+                    _ => None,
+                };
+                return Some(InboundMessage {
+                    sender_id: sender,
+                    text: prev.text.clone().unwrap_or_default(),
+                    channel_id: event.channel.clone(),
+                    thread_id: deleted_ts.clone(),
+                    message_id: deleted_ts.clone(),
+                    thread_ts: deleted_ts,
+                    attachments: Vec::new(),
+                    reaction: None,
+                    metadata: serde_json::json!({
+                        "event_type": "message_deleted",
+                    }),
+                    peer_kind,
+                });
+            }
             _ => {}
         }
     }
@@ -198,6 +261,9 @@ mod tests {
             channel_type: Some("channel".to_string()),
             bot_id: None,
             files: None,
+            message: None,
+            previous_message: None,
+            deleted_ts: None,
         }
     }
 
@@ -310,9 +376,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_changed_subtype_returns_none() {
+    async fn message_changed_without_nested_message_returns_none() {
+        // Defensive: if Slack sends a malformed message_changed envelope with no
+        // `message` field, we drop it rather than fabricating an empty edit.
         let mut event = make_slack_event("message");
         event.subtype = Some("message_changed".to_string());
+        event.message = None;
+        let cb = make_event(event);
+        assert!(parse_event(&cb, None, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_changed_surfaces_edit_event_with_new_text() {
+        use super::super::types::NestedSlackMessage;
+        let mut event = make_slack_event("message");
+        event.subtype = Some("message_changed".to_string());
+        event.text = Some("This message was edited.".to_string()); // Slack's outer placeholder
+        event.message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("the new text".to_string()),
+            ts: Some("1700000000.111".to_string()),
+        });
+        event.previous_message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("the old text".to_string()),
+            ts: Some("1700000000.111".to_string()),
+        });
+        let cb = make_event(event);
+        let msg = parse_event(&cb, None, None)
+            .await
+            .expect("message_changed should surface as an inbound edit event");
+        // The edit MUST carry the new text, not the outer placeholder.
+        assert_eq!(msg.text, "the new text");
+        // The original sender (from nested message), not whoever triggered the edit envelope.
+        assert_eq!(msg.sender_id, "U456");
+        assert_eq!(msg.metadata["event_type"], "message_changed");
+        assert_eq!(msg.metadata["previous_text"], "the old text");
+        // Edit threads to the original message timestamp so downstream handlers
+        // can attribute the edit to a session.
+        assert_eq!(msg.message_id.as_deref(), Some("1700000000.111"));
+    }
+
+    #[tokio::test]
+    async fn message_deleted_surfaces_delete_event_with_previous_text() {
+        use super::super::types::NestedSlackMessage;
+        let mut event = make_slack_event("message");
+        event.subtype = Some("message_deleted".to_string());
+        event.deleted_ts = Some("1700000000.222".to_string());
+        event.previous_message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("the deleted text".to_string()),
+            ts: Some("1700000000.222".to_string()),
+        });
+        // No `message` (Slack doesn't send one for deletes).
+        event.message = None;
+        let cb = make_event(event);
+        let msg = parse_event(&cb, None, None)
+            .await
+            .expect("message_deleted should surface as an inbound delete event");
+        assert_eq!(msg.text, "the deleted text");
+        assert_eq!(msg.sender_id, "U456");
+        assert_eq!(msg.metadata["event_type"], "message_deleted");
+        assert_eq!(msg.message_id.as_deref(), Some("1700000000.222"));
+    }
+
+    #[tokio::test]
+    async fn message_deleted_without_previous_message_returns_none() {
+        // Slack always sends previous_message; if it's missing, we have nothing
+        // to surface. Returning None avoids fabricating a sender of "".
+        let mut event = make_slack_event("message");
+        event.subtype = Some("message_deleted".to_string());
+        event.previous_message = None;
         let cb = make_event(event);
         assert!(parse_event(&cb, None, None).await.is_none());
     }

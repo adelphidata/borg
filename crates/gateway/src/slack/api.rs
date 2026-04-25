@@ -800,6 +800,49 @@ impl SlackClient {
         self.check_slack_response("chat.postEphemeral", resp).await
     }
 
+    /// Open a modal view via `views.open`.
+    ///
+    /// `trigger_id` comes from a slash command, shortcut, or `block_actions`
+    /// payload and is valid for ~3 seconds. `view` is the Block Kit modal
+    /// definition (typically built with the `blocks::Block` DSL plus the
+    /// surrounding `{type:"modal",title,...}` envelope).
+    pub async fn views_open(&self, trigger_id: &str, view: serde_json::Value) -> Result<()> {
+        let body = serde_json::json!({ "trigger_id": trigger_id, "view": view });
+        let resp = self
+            .slack_post("views.open", &body)
+            .await
+            .context("Failed to call views.open")?;
+        self.check_slack_response("views.open", resp).await
+    }
+
+    /// Update an open modal in place via `views.update`.
+    ///
+    /// Either `view_id` or `external_id` identifies the target. We accept
+    /// `view_id` since that's what `view_submission` payloads carry. The
+    /// agent uses this to react to a modal submit by replacing the modal
+    /// with a confirmation view rather than closing it.
+    pub async fn views_update(&self, view_id: &str, view: serde_json::Value) -> Result<()> {
+        let body = serde_json::json!({ "view_id": view_id, "view": view });
+        let resp = self
+            .slack_post("views.update", &body)
+            .await
+            .context("Failed to call views.update")?;
+        self.check_slack_response("views.update", resp).await
+    }
+
+    /// Publish an App Home tab view via `views.publish`.
+    ///
+    /// Triggered from an `app_home_opened` event; renders the agent's home
+    /// tab. `user_id` is the user whose Home tab to update.
+    pub async fn views_publish(&self, user_id: &str, view: serde_json::Value) -> Result<()> {
+        let body = serde_json::json!({ "user_id": user_id, "view": view });
+        let resp = self
+            .slack_post("views.publish", &body)
+            .await
+            .context("Failed to call views.publish")?;
+        self.check_slack_response("views.publish", resp).await
+    }
+
     /// Helper: POST a JSON body to a Slack API method.
     async fn slack_post(
         &self,
@@ -1084,6 +1127,27 @@ mod tests {
             format!("{SLACK_API_BASE}/conversations.info"),
             "https://slack.com/api/conversations.info"
         );
+    }
+
+    #[test]
+    fn views_endpoints_url_construction() {
+        for method in ["views.open", "views.update", "views.publish"] {
+            assert_eq!(
+                format!("{SLACK_API_BASE}/{method}"),
+                format!("https://slack.com/api/{method}")
+            );
+        }
+    }
+
+    #[test]
+    fn views_open_body_serialization_carries_trigger_id_and_view() {
+        // views.open requires both fields. Confirm their names + that the
+        // view payload survives round-trip without flattening.
+        let view = serde_json::json!({"type": "modal", "title": {"type":"plain_text","text":"Hi"}});
+        let body = serde_json::json!({"trigger_id": "tr1", "view": view });
+        assert_eq!(body["trigger_id"], "tr1");
+        assert_eq!(body["view"]["type"], "modal");
+        assert_eq!(body["view"]["title"]["text"], "Hi");
     }
 
     #[test]

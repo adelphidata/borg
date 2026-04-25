@@ -9,8 +9,9 @@ use tracing::warn;
 
 use super::circuit_breaker::CircuitBreaker;
 use super::types::{
-    ApiResponse, FileInfo, InlineKeyboardMarkup, ReactionType, SendMessageRequest, SendPollRequest,
-    SetMessageReactionRequest, Update, User,
+    ApiResponse, DeleteMessageRequest, EditMessageTextRequest, FileInfo, InlineKeyboardMarkup,
+    MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
+    Update, User,
 };
 use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
@@ -271,6 +272,262 @@ impl TelegramClient {
             );
         }
         Ok(())
+    }
+
+    /// Edit the text of an existing message via `editMessageText`.
+    ///
+    /// Used for streaming/draft UX — the agent sends an initial message, then
+    /// progressively updates it as more output arrives. Telegram rejects edits
+    /// to identical text with "message is not modified"; callers should compare
+    /// before calling. Errors propagate; rate-limit retry not applied since
+    /// edits are rarely batched and 429 is unusual here.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        parse_mode: Option<&str>,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let body = EditMessageTextRequest {
+            chat_id,
+            message_id,
+            text: text.to_string(),
+            parse_mode: parse_mode.map(String::from),
+            reply_markup,
+        };
+
+        let resp_body: ApiResponse<serde_json::Value> = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to call editMessageText")?
+            .json()
+            .await
+            .context("Failed to parse editMessageText response")?;
+
+        if !resp_body.ok {
+            bail!(
+                "editMessageText failed: {}",
+                resp_body
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+        Ok(())
+    }
+
+    /// Delete a message via `deleteMessage`.
+    ///
+    /// Telegram limits: a bot can delete *its own* messages at any time. To
+    /// delete *other users'* messages it must be a chat admin with the
+    /// `can_delete_messages` right, and even then only within 48 hours in
+    /// non-private chats. Errors propagate so callers can surface
+    /// "permission denied" cases.
+    pub async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let body = DeleteMessageRequest {
+            chat_id,
+            message_id,
+        };
+
+        let resp_body: ApiResponse<serde_json::Value> = self
+            .client
+            .post(self.api_url("deleteMessage"))
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to call deleteMessage")?
+            .json()
+            .await
+            .context("Failed to parse deleteMessage response")?;
+
+        if !resp_body.ok {
+            bail!(
+                "deleteMessage failed: {}",
+                resp_body
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+        Ok(())
+    }
+
+    /// Build a multipart form for a sendPhoto/sendVideo/etc. call.
+    ///
+    /// The `field` is the Telegram API field name (`photo`, `video`, …). For
+    /// `MediaSource::FileId`/`Url`, the value is set as a text field — Telegram
+    /// accepts this form. For `MediaSource::Bytes`, the file is attached.
+    fn build_media_form(
+        chat_id: i64,
+        field: &str,
+        source: &MediaSource<'_>,
+        caption: Option<&str>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<reqwest::multipart::Form> {
+        let mut form = reqwest::multipart::Form::new().text("chat_id", chat_id.to_string());
+
+        match source {
+            MediaSource::FileId(id) => {
+                form = form.text(field.to_string(), (*id).to_string());
+            }
+            MediaSource::Url(url) => {
+                form = form.text(field.to_string(), (*url).to_string());
+            }
+            MediaSource::Bytes {
+                bytes,
+                filename,
+                mime,
+            } => {
+                let mut part = reqwest::multipart::Part::bytes(bytes.to_vec())
+                    .file_name((*filename).to_string());
+                if let Some(m) = mime {
+                    part = part
+                        .mime_str(m)
+                        .with_context(|| format!("Invalid mime type: {m}"))?;
+                }
+                form = form.part(field.to_string(), part);
+            }
+        }
+
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+        if let Some(tid) = message_thread_id {
+            form = form.text("message_thread_id", tid.to_string());
+        }
+        if let Some(rid) = reply_to_message_id {
+            form = form.text("reply_to_message_id", rid.to_string());
+        }
+
+        Ok(form)
+    }
+
+    /// Internal: POST a multipart form to a Telegram media endpoint.
+    async fn send_media(&self, method: &str, form: reqwest::multipart::Form) -> Result<()> {
+        let resp = self
+            .client
+            .post(self.api_url(method))
+            .multipart(form)
+            .send()
+            .await
+            .with_context(|| format!("Failed to call {method}"))?;
+
+        let resp_body: ApiResponse<serde_json::Value> = resp
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse {method} response"))?;
+
+        if !resp_body.ok {
+            bail!(
+                "{method} failed: {}",
+                resp_body
+                    .description
+                    .unwrap_or_else(|| "unknown error".into())
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a photo via `sendPhoto`. Caption max 1024 chars.
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        photo: MediaSource<'_>,
+        caption: Option<&str>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let form = Self::build_media_form(
+            chat_id,
+            "photo",
+            &photo,
+            caption,
+            message_thread_id,
+            reply_to_message_id,
+        )?;
+        self.send_media("sendPhoto", form).await
+    }
+
+    /// Send a video via `sendVideo`.
+    pub async fn send_video(
+        &self,
+        chat_id: i64,
+        video: MediaSource<'_>,
+        caption: Option<&str>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let form = Self::build_media_form(
+            chat_id,
+            "video",
+            &video,
+            caption,
+            message_thread_id,
+            reply_to_message_id,
+        )?;
+        self.send_media("sendVideo", form).await
+    }
+
+    /// Send a document (any file type) via `sendDocument`.
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        document: MediaSource<'_>,
+        caption: Option<&str>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let form = Self::build_media_form(
+            chat_id,
+            "document",
+            &document,
+            caption,
+            message_thread_id,
+            reply_to_message_id,
+        )?;
+        self.send_media("sendDocument", form).await
+    }
+
+    /// Send an animation (GIF/short video) via `sendAnimation`.
+    pub async fn send_animation(
+        &self,
+        chat_id: i64,
+        animation: MediaSource<'_>,
+        caption: Option<&str>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let form = Self::build_media_form(
+            chat_id,
+            "animation",
+            &animation,
+            caption,
+            message_thread_id,
+            reply_to_message_id,
+        )?;
+        self.send_media("sendAnimation", form).await
+    }
+
+    /// Send a sticker via `sendSticker`. Stickers do not accept captions.
+    pub async fn send_sticker(
+        &self,
+        chat_id: i64,
+        sticker: MediaSource<'_>,
+        message_thread_id: Option<i64>,
+        reply_to_message_id: Option<i64>,
+    ) -> Result<()> {
+        let form = Self::build_media_form(
+            chat_id,
+            "sticker",
+            &sticker,
+            None,
+            message_thread_id,
+            reply_to_message_id,
+        )?;
+        self.send_media("sendSticker", form).await
     }
 
     /// Register a webhook URL with Telegram.
@@ -743,6 +1000,121 @@ mod tests {
         assert_eq!(json["chat_id"], 42);
         assert_eq!(json["message_id"], 100);
         assert_eq!(json["reaction"][0]["emoji"], "👍");
+    }
+
+    #[test]
+    fn edit_message_url_construction() {
+        let client = TelegramClient::new("123:ABC").unwrap();
+        assert_eq!(
+            client.api_url("editMessageText"),
+            "https://api.telegram.org/bot123:ABC/editMessageText"
+        );
+    }
+
+    #[test]
+    fn delete_message_url_construction() {
+        let client = TelegramClient::new("123:ABC").unwrap();
+        assert_eq!(
+            client.api_url("deleteMessage"),
+            "https://api.telegram.org/bot123:ABC/deleteMessage"
+        );
+    }
+
+    #[test]
+    fn media_endpoints_url_construction() {
+        let client = TelegramClient::new("123:ABC").unwrap();
+        for method in [
+            "sendPhoto",
+            "sendVideo",
+            "sendDocument",
+            "sendAnimation",
+            "sendSticker",
+        ] {
+            assert_eq!(
+                client.api_url(method),
+                format!("https://api.telegram.org/bot123:ABC/{method}")
+            );
+        }
+    }
+
+    #[test]
+    fn build_media_form_accepts_file_id_and_url_and_bytes() {
+        // FileId variant
+        let f = TelegramClient::build_media_form(
+            42,
+            "photo",
+            &MediaSource::FileId("AgACAgIAAxkB"),
+            None,
+            None,
+            None,
+        );
+        assert!(f.is_ok(), "file_id variant builds");
+
+        // URL variant
+        let f = TelegramClient::build_media_form(
+            42,
+            "video",
+            &MediaSource::Url("https://example.com/v.mp4"),
+            Some("a caption"),
+            Some(99),
+            Some(7),
+        );
+        assert!(
+            f.is_ok(),
+            "url variant builds with caption + thread + reply"
+        );
+
+        // Bytes variant with valid mime
+        let bytes = vec![0u8, 1, 2, 3];
+        let f = TelegramClient::build_media_form(
+            42,
+            "document",
+            &MediaSource::Bytes {
+                bytes: &bytes,
+                filename: "x.bin",
+                mime: Some("application/octet-stream"),
+            },
+            None,
+            None,
+            None,
+        );
+        assert!(f.is_ok(), "bytes variant with valid mime builds");
+
+        // Bytes variant with no mime (Telegram applies default)
+        let f = TelegramClient::build_media_form(
+            42,
+            "document",
+            &MediaSource::Bytes {
+                bytes: &bytes,
+                filename: "x.bin",
+                mime: None,
+            },
+            None,
+            None,
+            None,
+        );
+        assert!(f.is_ok(), "bytes variant without mime builds");
+    }
+
+    #[test]
+    fn build_media_form_rejects_invalid_mime() {
+        let bytes = vec![0u8];
+        let result = TelegramClient::build_media_form(
+            42,
+            "document",
+            &MediaSource::Bytes {
+                bytes: &bytes,
+                filename: "x.bin",
+                mime: Some("not a mime"),
+            },
+            None,
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "invalid mime must surface as an error, not a silent default"
+        );
     }
 
     #[test]

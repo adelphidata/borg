@@ -39,6 +39,8 @@ base64 = { workspace = true }
 ed25519-dalek = { version = "2", features = ["std"] }
 url = "2"
 scraper = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

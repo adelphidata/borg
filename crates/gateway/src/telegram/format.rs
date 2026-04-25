@@ -99,6 +99,29 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
     result
 }
 
+/// Telegram media caption byte limit. Captions longer than this are rejected
+/// by the Bot API (`caption is too long`).
+pub const TELEGRAM_CAPTION_LIMIT: usize = 1024;
+
+/// Split a caption into a leading chunk that fits Telegram's media caption
+/// limit and a remainder to send as a follow-up text message. The split
+/// always falls on a UTF-8 char boundary (counting *characters*, not bytes,
+/// which Telegram does for caption length too).
+///
+/// Returns `(caption, follow_up)` where:
+/// - `caption` is at most `TELEGRAM_CAPTION_LIMIT` characters long;
+/// - `follow_up` is the remaining text, or `None` if the input fit.
+pub fn split_caption(text: &str) -> (String, Option<String>) {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(TELEGRAM_CAPTION_LIMIT).collect();
+    let rest: String = chars.collect();
+    if rest.is_empty() {
+        (head, None)
+    } else {
+        (head, Some(rest))
+    }
+}
+
 fn find_char(chars: &[char], target: char, start: usize) -> Option<usize> {
     (start..chars.len()).find(|&i| chars[i] == target)
 }
@@ -211,6 +234,49 @@ mod tests {
             markdown_to_telegram_html("a single * star"),
             "a single * star"
         );
+    }
+
+    #[test]
+    fn split_caption_short_text_no_followup() {
+        let (cap, rest) = split_caption("hello world");
+        assert_eq!(cap, "hello world");
+        assert!(rest.is_none());
+    }
+
+    #[test]
+    fn split_caption_at_exact_limit_no_followup() {
+        let text = "a".repeat(TELEGRAM_CAPTION_LIMIT);
+        let (cap, rest) = split_caption(&text);
+        assert_eq!(cap.chars().count(), TELEGRAM_CAPTION_LIMIT);
+        assert!(
+            rest.is_none(),
+            "text exactly at the limit must not produce a follow-up"
+        );
+    }
+
+    #[test]
+    fn split_caption_over_limit_yields_followup() {
+        let text = "a".repeat(2000);
+        let (cap, rest) = split_caption(&text);
+        assert_eq!(cap.chars().count(), TELEGRAM_CAPTION_LIMIT);
+        let rest = rest.expect("over-limit text must produce a follow-up");
+        assert_eq!(rest.chars().count(), 2000 - TELEGRAM_CAPTION_LIMIT);
+    }
+
+    #[test]
+    fn split_caption_respects_char_boundaries() {
+        // "🌟" is 4 bytes but 1 char. Build a string whose split point is mid-emoji
+        // when counted by bytes — verify we count chars, not bytes.
+        let mut text = String::new();
+        for _ in 0..(TELEGRAM_CAPTION_LIMIT + 5) {
+            text.push('🌟');
+        }
+        let (cap, rest) = split_caption(&text);
+        // Every code point survives intact — no panic, no replacement chars.
+        assert_eq!(cap.chars().count(), TELEGRAM_CAPTION_LIMIT);
+        assert!(cap.chars().all(|c| c == '🌟'));
+        let rest = rest.unwrap();
+        assert_eq!(rest.chars().count(), 5);
     }
 
     #[test]
