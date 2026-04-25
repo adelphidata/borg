@@ -180,6 +180,12 @@ pub(crate) fn classify_status(
             source: anyhow::anyhow!("{provider} returned {status} (billing error): {body}"),
             reason: FailoverReason::Billing,
         },
+        404 if body_indicates_no_allowed_providers(body) => LlmError::Fatal {
+            source: anyhow::anyhow!(
+                "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {body}"
+            ),
+            reason: FailoverReason::AuthPermanent,
+        },
         404 if body_mentions_model(body) => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 404 (model not found): {body}"),
             reason: FailoverReason::ModelNotFound,
@@ -229,6 +235,16 @@ fn body_indicates_context_overflow(body: &str) -> bool {
 fn body_mentions_model(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("model")
+}
+
+/// True when an OpenRouter 404 body indicates the account's provider filters
+/// blocked every upstream that serves the model — distinct from "model not
+/// found" even though both return 404. Example body:
+///   {"error":{"message":"No allowed providers are available for the selected
+///   model.","code":404,"metadata":{"available_providers":[...]}}}
+fn body_indicates_no_allowed_providers(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("no allowed providers") || lower.contains("available_providers")
 }
 
 /// Recover a `FailoverReason` from an error message string.
@@ -544,6 +560,26 @@ mod tests {
         assert_eq!(err.reason(), FailoverReason::ModelNotFound);
         assert!(err.is_fast_fail());
         assert!(!err.should_fallback());
+    }
+
+    #[test]
+    fn classify_404_no_allowed_providers_is_auth_permanent() {
+        // Real OpenRouter response when the account's allowed-providers filter
+        // excludes every upstream that serves the model. The body mentions
+        // "model" too — verify the more specific branch wins and the surfaced
+        // message points the user at provider preferences.
+        let body = r#"{"error":{"message":"No allowed providers are available for the selected model.","code":404,"metadata":{"available_providers":["fireworks","together","minimax"]}}}"#;
+        let err = classify_status(reqwest::StatusCode::NOT_FOUND, body, Provider::OpenRouter);
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("no allowed providers"),
+            "expected user-facing message, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("openrouter.ai/settings/preferences"),
+            "expected preferences link, got: {rendered}"
+        );
     }
 
     #[test]

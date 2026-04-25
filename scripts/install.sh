@@ -195,9 +195,6 @@ parse_args() {
 usage() {
     cat <<'EOF'
 
-  🤖 Borg Installer
-  Your AI personal assistant.
-
 Usage: install.sh [OPTIONS]
 
 Options:
@@ -367,9 +364,6 @@ do_uninstall() {
 
 main() {
     parse_args "$@"
-
-    printf "\n  🤖 ${BOLD}Borg Installer${RESET}\n"
-    printf "  Your AI personal assistant.\n\n"
 
     # Uninstall flow
     if [[ "$UNINSTALL" == true ]]; then

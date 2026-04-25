@@ -94,6 +94,8 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 **What a good test looks like:** exercises a real code path, sets up inputs that could realistically occur, asserts on a specific observable outcome, and would fail if the production logic broke. Prefer fewer strong tests to many weak ones.
 
+**Every commit / PR that changes behavior must include tests.** Bug fixes need a regression test that fails before the fix and passes after. New features need tests for the happy path plus at least one edge case. The only exemptions are pure doc/comment/formatting changes and dependency bumps with no behavior change — anything else ships with tests.
+
 **When a regression guard looks like a fluff test, document why.** If a test is intentionally checking a constant or a source-level pattern because it enforces an invariant that types can't express (prompt cache stability, forbidden mouse-capture APIs, etc.), add a comment naming the invariant and the incident that motivated the guard. Otherwise reviewers will correctly delete it.
 
 ### Patch DSL — Every Content Line Needs a Prefix
