@@ -145,6 +145,7 @@ define_settings! {
         "gateway.auto_reply" => gateway.auto_reply, json_set;
         "gateway.link_understanding" => gateway.link_understanding, json_set;
         "gateway.channel_error_policies" => gateway.channel_error_policies, json_set;
+        "gateway.imessage_group_allowlist" => gateway.imessage_group_allowlist, json;
 
         // ── Agents ──
         "agents.enabled" => agents.enabled, parsed(bool);

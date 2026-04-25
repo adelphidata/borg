@@ -63,6 +63,12 @@ pub struct GatewayConfig {
     /// Optional allowlist of Discord guild IDs. Empty = allow all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discord_guild_allowlist: Option<Vec<String>>,
+    /// Optional allowlist for iMessage group threads. Entries match either a
+    /// `chat.guid` (UUID-style) or a `chat_identifier`. `None` (the default)
+    /// means all groups pass through. DM threads are never filtered by this
+    /// list — only group chats. Empty `Some(vec![])` blocks all groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imessage_group_allowlist: Option<Vec<String>>,
     /// Default access policy for direct messages: pairing, open, disabled.
     #[serde(default)]
     pub dm_policy: DmPolicy,
@@ -120,6 +126,7 @@ impl Default for GatewayConfig {
             bindings: Vec::new(),
             slack_channel_allowlist: None,
             discord_guild_allowlist: None,
+            imessage_group_allowlist: None,
             dm_policy: DmPolicy::default(),
             channel_policies: HashMap::new(),
             pairing_ttl_secs: default_pairing_ttl(),
@@ -336,6 +343,7 @@ mod tests {
         assert!(cfg.bindings.is_empty());
         assert!(cfg.slack_channel_allowlist.is_none());
         assert!(cfg.discord_guild_allowlist.is_none());
+        assert!(cfg.imessage_group_allowlist.is_none());
         assert_eq!(cfg.pairing_ttl_secs, 3600);
         assert!(cfg.signal_cli_host.is_none());
         assert!(cfg.signal_cli_port.is_none());

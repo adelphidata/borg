@@ -42,6 +42,48 @@ pub struct Activity {
     /// Members removed in a conversationUpdate activity.
     #[serde(default)]
     pub members_removed: Option<Vec<ChannelAccount>>,
+    /// Emoji reactions added in a `messageReaction` activity.
+    #[serde(default)]
+    pub reactions_added: Option<Vec<MessageReaction>>,
+    /// Emoji reactions removed in a `messageReaction` activity.
+    #[serde(default)]
+    pub reactions_removed: Option<Vec<MessageReaction>>,
+}
+
+/// A single reaction entry inside a `messageReaction` activity.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MessageReaction {
+    /// Reaction type: a well-known name (`like`, `heart`, `laugh`, `surprised`,
+    /// `sad`, `angry`) or a Unicode emoji.
+    #[serde(rename = "type")]
+    pub reaction_type: String,
+}
+
+/// Well-known Teams reaction types accepted by Graph `setReaction`.
+pub const TEAMS_REACTION_TYPES: &[&str] = &["like", "heart", "laugh", "surprised", "sad", "angry"];
+
+/// Normalize a reaction type string for outbound calls.
+///
+/// - Trims whitespace.
+/// - Lowercases known names (`like`, `heart`, …).
+/// - Passes Unicode emoji through unchanged (Graph beta accepts both).
+/// - Returns `Err` for empty input.
+///
+/// Mirrors OpenClaw's `normalizeReactionType` so behavior stays in sync.
+pub fn normalize_reaction_type(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!(
+            "Reaction type is required. Common types: {}",
+            TEAMS_REACTION_TYPES.join(", ")
+        );
+    }
+    let lowered = trimmed.to_lowercase();
+    if TEAMS_REACTION_TYPES.iter().any(|t| *t == lowered) {
+        Ok(lowered)
+    } else {
+        Ok(trimmed.to_string())
+    }
 }
 
 /// A user or bot account in a Teams conversation.
@@ -145,6 +187,25 @@ impl ReplyActivity {
         }
     }
 
+    /// Create a message with embedded @mentions.
+    ///
+    /// `text` should already contain `<at>Display Name</at>` tags at the
+    /// positions where each mention appears. The matching `mention` entities
+    /// are attached so Teams renders the mention pill instead of literal markup.
+    pub fn message_with_mentions(text: impl Into<String>, mentions: &[Mention]) -> Self {
+        let entities = if mentions.is_empty() {
+            None
+        } else {
+            Some(build_mention_entities(mentions))
+        };
+        Self {
+            activity_type: "message".to_string(),
+            text: text.into(),
+            attachments: None,
+            entities,
+        }
+    }
+
     /// Create a final streaming message activity.
     ///
     /// Closes the streaming session with `streamType: "final"`.
@@ -159,6 +220,56 @@ impl ReplyActivity {
             })]),
         }
     }
+}
+
+/// A user @mention to embed in an outbound Teams message.
+///
+/// Teams renders mentions only when **both** parts line up: the message body
+/// contains an `<at>Display Name</at>` tag AND the activity's `entities`
+/// array contains a matching `mention` entity referencing the same name and
+/// the user's account ID. Either half alone renders as plain text.
+#[derive(Debug, Clone)]
+pub struct Mention {
+    /// AAD object ID or Bot Framework ID (`28:...` / `29:...`) of the mentioned account.
+    pub id: String,
+    /// Display name to render inside `<at>...</at>` tags.
+    pub name: String,
+}
+
+impl Mention {
+    /// Construct a mention from id + display name.
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// Apply mentions to a body of text, returning a tuple of
+/// `(rewritten_body, entities_json)`.
+///
+/// The body is left **unchanged**: callers should already have inserted the
+/// `<at>Name</at>` tags where they want the mentions to appear (mirrors how
+/// Teams clients author messages). The returned entities array is what gets
+/// attached to `ReplyActivity.entities`.
+///
+/// Returns an empty vec when `mentions` is empty so the activity stays
+/// entity-free (Teams treats empty `entities: []` as noise on some surfaces).
+pub fn build_mention_entities(mentions: &[Mention]) -> Vec<serde_json::Value> {
+    mentions
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "type": "mention",
+                "text": format!("<at>{}</at>", m.name),
+                "mentioned": {
+                    "id": m.id,
+                    "name": m.name,
+                },
+            })
+        })
+        .collect()
 }
 
 /// An Adaptive Card attachment for Teams.
@@ -367,6 +478,109 @@ mod tests {
         let removed = activity.members_removed.unwrap();
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].id, "user-gone");
+    }
+
+    #[test]
+    fn message_with_mentions_emits_at_tag_and_entity() {
+        let mentions = [Mention::new("aad-id-1", "Alice")];
+        let activity = ReplyActivity::message_with_mentions("Hi <at>Alice</at>!", &mentions);
+        let json = serde_json::to_value(&activity).unwrap();
+        assert_eq!(json["type"], "message");
+        assert_eq!(json["text"], "Hi <at>Alice</at>!");
+        let entities = json["entities"].as_array().expect("entities present");
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["type"], "mention");
+        assert_eq!(entities[0]["text"], "<at>Alice</at>");
+        assert_eq!(entities[0]["mentioned"]["id"], "aad-id-1");
+        assert_eq!(entities[0]["mentioned"]["name"], "Alice");
+    }
+
+    #[test]
+    fn message_with_multiple_mentions_preserves_order() {
+        let mentions = [Mention::new("id-1", "Alice"), Mention::new("id-2", "Bob")];
+        let activity =
+            ReplyActivity::message_with_mentions("<at>Alice</at> and <at>Bob</at>", &mentions);
+        let json = serde_json::to_value(&activity).unwrap();
+        let entities = json["entities"].as_array().unwrap();
+        assert_eq!(entities.len(), 2);
+        assert_eq!(entities[0]["mentioned"]["id"], "id-1");
+        assert_eq!(entities[1]["mentioned"]["id"], "id-2");
+    }
+
+    #[test]
+    fn message_with_no_mentions_omits_entities_array() {
+        let activity = ReplyActivity::message_with_mentions("plain text", &[]);
+        let json = serde_json::to_value(&activity).unwrap();
+        assert!(
+            json.get("entities").is_none(),
+            "empty mentions should omit entities entirely, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_mention_entities_keyed_by_aad_id_not_name() {
+        // Two mentions with the same display name but different IDs must
+        // produce two distinct entities — Teams routes the @ping by id.
+        let mentions = [Mention::new("id-A", "Alex"), Mention::new("id-B", "Alex")];
+        let entities = build_mention_entities(&mentions);
+        assert_eq!(entities.len(), 2);
+        assert_ne!(
+            entities[0]["mentioned"]["id"],
+            entities[1]["mentioned"]["id"]
+        );
+    }
+
+    #[test]
+    fn normalize_reaction_type_lowercases_known_names() {
+        for (input, expected) in [
+            ("Like", "like"),
+            ("HEART", "heart"),
+            ("laugh", "laugh"),
+            ("  Surprised  ", "surprised"),
+            ("Sad", "sad"),
+            ("ANGRY", "angry"),
+        ] {
+            assert_eq!(normalize_reaction_type(input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn normalize_reaction_type_passes_emoji_through() {
+        // Unicode emoji must not be lowercased / mangled.
+        assert_eq!(normalize_reaction_type("👍").unwrap(), "👍");
+        assert_eq!(normalize_reaction_type("🎉").unwrap(), "🎉");
+    }
+
+    #[test]
+    fn normalize_reaction_type_passes_unknown_strings_through_untrimmed_case() {
+        // Unknown strings are trimmed but case-preserved (Graph treats unknowns as custom).
+        assert_eq!(
+            normalize_reaction_type(" CustomEmoji ").unwrap(),
+            "CustomEmoji"
+        );
+    }
+
+    #[test]
+    fn normalize_reaction_type_empty_errors() {
+        assert!(normalize_reaction_type("").is_err());
+        assert!(normalize_reaction_type("   ").is_err());
+    }
+
+    #[test]
+    fn deserialize_message_reaction_activity() {
+        let json = r#"{
+            "id": "act-r",
+            "type": "messageReaction",
+            "from": {"id": "user-1"},
+            "recipient": {"id": "bot-1"},
+            "replyToId": "parent-1",
+            "reactionsAdded": [{"type": "like"}]
+        }"#;
+        let activity: Activity = serde_json::from_str(json).unwrap();
+        assert_eq!(activity.activity_type, "messageReaction");
+        let added = activity.reactions_added.expect("reactionsAdded present");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].reaction_type, "like");
     }
 
     #[test]

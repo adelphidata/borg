@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use tracing::warn;
 
-use super::types::{ReplyActivity, TokenResponse};
+use super::types::{Mention, ReplyActivity, TokenResponse};
 use crate::chunker;
 use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
 use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
@@ -153,6 +153,40 @@ impl TeamsClient {
             let url = format!("{base}v3/conversations/{conversation_id}/activities");
             let reply = ReplyActivity::message(chunk.as_str());
             self.send_with_retry(&url, &reply).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Reply to a specific activity, embedding @mentions.
+    ///
+    /// `text` should already contain `<at>Display Name</at>` tags at the spots
+    /// where each mention appears; the matching `mention` entities are attached
+    /// so Teams renders them as pills. When `mentions` is empty the call is
+    /// equivalent to `reply_to_activity`. Long messages are still chunked, but
+    /// only the **first** chunk carries the mention entities (subsequent chunks
+    /// would re-ping the user, which is noisy).
+    pub async fn reply_with_mentions(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        text: &str,
+        mentions: &[Mention],
+    ) -> Result<()> {
+        validate_service_url(service_url)?;
+        let base = ensure_trailing_slash(service_url);
+
+        let chunks = chunker::chunk_text_nonempty(text, DEFAULT_MESSAGE_CHUNK_SIZE);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let url = format!("{base}v3/conversations/{conversation_id}/activities/{activity_id}");
+            let activity = if i == 0 {
+                ReplyActivity::message_with_mentions(chunk.as_str(), mentions)
+            } else {
+                ReplyActivity::message(chunk.as_str())
+            };
+            self.send_with_retry(&url, &activity).await?;
         }
 
         Ok(())

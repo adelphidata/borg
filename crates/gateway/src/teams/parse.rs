@@ -11,6 +11,12 @@ use crate::handler::InboundMessage;
 /// - Activities without text
 /// - Bot self-messages (from.id matches recipient.id)
 pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
+    // messageReaction activities have no text — surface them through the
+    // reaction field on InboundMessage so handlers can route them separately.
+    if activity.activity_type == "messageReaction" {
+        return parse_message_reaction(activity);
+    }
+
     // Handle message and invoke activities
     if activity.activity_type != "message" && activity.activity_type != "invoke" {
         return None;
@@ -71,6 +77,62 @@ pub fn parse_activity(activity: &Activity) -> Option<InboundMessage> {
         thread_ts: activity.reply_to_id.clone(),
         attachments: Vec::new(),
         reaction: None,
+        metadata: serde_json::Value::Null,
+        peer_kind: activity
+            .conversation
+            .as_ref()
+            .and_then(|c| c.is_group)
+            .map(|g| {
+                if g {
+                    PEER_KIND_GROUP.to_string()
+                } else {
+                    PEER_KIND_DIRECT.to_string()
+                }
+            }),
+    })
+}
+
+/// Parse a Bot Framework `messageReaction` activity into an `InboundMessage`.
+///
+/// Reactions don't carry text; we encode the reaction event as
+/// `InboundMessage.reaction = Some("+like")` (added) or `Some("-like")`
+/// (removed). Bot self-reactions are skipped. `text` is left empty so
+/// downstream handlers can branch on `reaction.is_some()` without parsing.
+fn parse_message_reaction(activity: &Activity) -> Option<InboundMessage> {
+    if let (Some(from), Some(recipient)) = (&activity.from, &activity.recipient) {
+        if from.id == recipient.id {
+            return None;
+        }
+    }
+
+    let added: Option<&str> = activity
+        .reactions_added
+        .as_ref()
+        .and_then(|v| v.first())
+        .map(|r| r.reaction_type.as_str());
+    let removed: Option<&str> = activity
+        .reactions_removed
+        .as_ref()
+        .and_then(|v| v.first())
+        .map(|r| r.reaction_type.as_str());
+
+    let reaction = match (added, removed) {
+        (Some(a), _) => format!("+{a}"),
+        (None, Some(r)) => format!("-{r}"),
+        (None, None) => return None,
+    };
+
+    let sender_id = activity.from.as_ref()?.id.clone();
+
+    Some(InboundMessage {
+        sender_id,
+        text: String::new(),
+        channel_id: activity.conversation.as_ref().map(|c| c.id.clone()),
+        thread_id: activity.reply_to_id.clone(),
+        message_id: Some(activity.id.clone()),
+        thread_ts: activity.reply_to_id.clone(),
+        attachments: Vec::new(),
+        reaction: Some(reaction),
         metadata: serde_json::Value::Null,
         peer_kind: activity
             .conversation
@@ -199,7 +261,65 @@ mod tests {
             members_added: None,
             members_removed: None,
             value: None,
+            reactions_added: None,
+            reactions_removed: None,
         }
+    }
+
+    // ── messageReaction parsing ──
+
+    #[test]
+    fn message_reaction_added_populates_reaction_field() {
+        use super::super::types::MessageReaction;
+        let mut activity = make_activity();
+        activity.activity_type = "messageReaction".to_string();
+        activity.text = None;
+        activity.reply_to_id = Some("parent-msg-7".to_string());
+        activity.reactions_added = Some(vec![MessageReaction {
+            reaction_type: "like".to_string(),
+        }]);
+        let msg = parse_activity(&activity).expect("messageReaction parses");
+        assert_eq!(msg.reaction.as_deref(), Some("+like"));
+        assert_eq!(msg.thread_id.as_deref(), Some("parent-msg-7"));
+        assert!(msg.text.is_empty());
+    }
+
+    #[test]
+    fn message_reaction_removed_uses_minus_prefix() {
+        use super::super::types::MessageReaction;
+        let mut activity = make_activity();
+        activity.activity_type = "messageReaction".to_string();
+        activity.text = None;
+        activity.reactions_removed = Some(vec![MessageReaction {
+            reaction_type: "heart".to_string(),
+        }]);
+        let msg = parse_activity(&activity).expect("messageReaction parses");
+        assert_eq!(msg.reaction.as_deref(), Some("-heart"));
+    }
+
+    #[test]
+    fn message_reaction_with_no_added_or_removed_returns_none() {
+        let mut activity = make_activity();
+        activity.activity_type = "messageReaction".to_string();
+        activity.text = None;
+        // both added and removed are None
+        assert!(parse_activity(&activity).is_none());
+    }
+
+    #[test]
+    fn message_reaction_from_self_skipped() {
+        use super::super::types::MessageReaction;
+        let mut activity = make_activity();
+        activity.activity_type = "messageReaction".to_string();
+        activity.text = None;
+        activity.from = Some(ChannelAccount {
+            id: "bot-1".to_string(), // matches recipient.id
+            name: Some("MyBot".to_string()),
+        });
+        activity.reactions_added = Some(vec![MessageReaction {
+            reaction_type: "like".to_string(),
+        }]);
+        assert!(parse_activity(&activity).is_none());
     }
 
     #[test]
