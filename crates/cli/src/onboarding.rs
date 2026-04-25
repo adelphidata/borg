@@ -364,6 +364,9 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         if !result.agent_name.is_empty() {
             db.set_setting("user.agent_name", &result.agent_name)?;
         }
+        // Sentinel that gates re-running the onboarding wizard on subsequent
+        // launches. See `is_onboarded` in `crates/cli/src/main.rs`.
+        db.set_setting("onboarded", "true")?;
 
         if use_keychain {
             let secret_json = if cfg!(target_os = "macos") {

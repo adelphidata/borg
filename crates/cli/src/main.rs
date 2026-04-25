@@ -412,12 +412,70 @@ async fn async_main() -> Result<()> {
 }
 
 fn ensure_onboarded() -> Result<()> {
-    let data_dir = borg_core::config::Config::data_dir()?;
-    let config_path = data_dir.join("config.toml");
-    if !config_path.exists() {
-        init_data_dir()?;
+    if is_onboarded() {
+        return Ok(());
     }
-    Ok(())
+    init_data_dir()
+}
+
+/// Returns true if onboarding has already completed.
+///
+/// Config is DB-only since the V32 migration; the previous filesystem check
+/// (presence of `config.toml`) was a stale signal that re-fired the wizard
+/// every launch (V32 renames `config.toml` → `.bak` after import). Source
+/// of truth is now the SQLite `settings` table — see `is_onboarded_from_db`.
+///
+/// Returns false (and logs) if the DB can't be opened. That re-runs the
+/// wizard, which is intrusive on a transient lock — but it's the safer
+/// default than silently skipping onboarding for a genuinely fresh install.
+fn is_onboarded() -> bool {
+    let Ok(data_dir) = borg_core::config::Config::data_dir() else {
+        return false;
+    };
+    // Fresh install: no DB → never onboarded. Avoid Database::open() here
+    // because it would create the file and run migrations on a fresh dir.
+    if !data_dir.join("borg.db").exists() {
+        return false;
+    }
+    let db = match borg_core::db::Database::open() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("is_onboarded: failed to open DB: {e}");
+            return false;
+        }
+    };
+    is_onboarded_from_db(&db)
+}
+
+/// Pure DB-side decision (extracted for testability against in-memory DBs).
+///
+/// Trade-offs:
+/// - **Partially-aborted onboarding** (DB created by some earlier write, then
+///   wizard cancelled): all settings still hold migration defaults
+///   (`provider="(auto-detect)"`, `model=""`), so this returns false and the
+///   user gets re-prompted. Intentional.
+/// - **Legacy users clearing `model` via `/settings`** would re-trigger the
+///   wizard on next launch. Users onboarded post-fix have the explicit
+///   `onboarded=true` flag, so they're insulated. Acceptable: the legacy
+///   cohort shrinks every time someone re-runs onboarding.
+fn is_onboarded_from_db(db: &borg_core::db::Database) -> bool {
+    if matches!(
+        db.get_setting("onboarded").ok().flatten().as_deref(),
+        Some("true")
+    ) {
+        return true;
+    }
+    // Backfill for users who completed onboarding before the `onboarded`
+    // sentinel was introduced. Default-seeded settings populate `provider`
+    // and `model` rows even on fresh DBs (defaults: "(auto-detect)" and "")
+    // so we can't just check existence — we must check the *value*.
+    // Onboarding writes a non-empty `model` (`apply_onboarding` in
+    // `crates/cli/src/onboarding.rs`), so a non-empty `model` is the
+    // most reliable post-onboarding signal.
+    db.get_setting("model")
+        .ok()
+        .flatten()
+        .is_some_and(|m| !m.is_empty())
 }
 
 fn init_data_dir() -> Result<()> {
@@ -547,6 +605,45 @@ mod tests {
     fn confirm_uninstall_rejects_arbitrary_input() {
         assert!(!commands::misc::confirm_uninstall("maybe"));
         assert!(!commands::misc::confirm_uninstall("yy"));
+    }
+
+    #[test]
+    fn is_onboarded_false_on_fresh_db_with_only_defaults() {
+        // Migrations seed every setting with a default, so a fresh DB has
+        // `provider="(auto-detect)"` and `model=""` rows present. The gate
+        // must NOT mistake these for completed onboarding.
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        let db = borg_core::db::Database::from_connection(conn).expect("init db");
+        assert!(!super::is_onboarded_from_db(&db));
+    }
+
+    #[test]
+    fn is_onboarded_true_with_explicit_flag() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        let db = borg_core::db::Database::from_connection(conn).expect("init db");
+        db.set_setting("onboarded", "true").unwrap();
+        assert!(super::is_onboarded_from_db(&db));
+    }
+
+    #[test]
+    fn is_onboarded_true_with_legacy_model_only() {
+        // Regression guard: users who completed onboarding before the
+        // `onboarded` sentinel was introduced still have a non-empty `model`
+        // written by `apply_onboarding`. They must not be re-onboarded.
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        let db = borg_core::db::Database::from_connection(conn).expect("init db");
+        db.set_setting("model", "anthropic/claude-sonnet-4")
+            .unwrap();
+        assert!(super::is_onboarded_from_db(&db));
+    }
+
+    #[test]
+    fn is_onboarded_false_when_flag_is_not_true() {
+        // Non-"true" values must not satisfy the gate (e.g. partially-aborted writes).
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
+        let db = borg_core::db::Database::from_connection(conn).expect("init db");
+        db.set_setting("onboarded", "false").unwrap();
+        assert!(!super::is_onboarded_from_db(&db));
     }
 
     #[test]
