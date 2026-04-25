@@ -11,9 +11,10 @@ use reqwest::Client;
 
 use borg_core::constants;
 
+use crate::constants::SIGNAL_HTTP_CONNECT_TIMEOUT;
+
 const MESSAGE_CHUNK_SIZE: usize = constants::SIGNAL_MESSAGE_CHUNK_SIZE;
 const RPC_TIMEOUT: Duration = Duration::from_secs(constants::SIGNAL_RPC_TIMEOUT_SECS);
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Circuit breaker thresholds for Signal API calls.
 const CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
@@ -35,7 +36,7 @@ impl SignalClient {
     pub fn new(base_url: &str, account: &str) -> Result<Self> {
         Ok(Self {
             client: Client::builder()
-                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .connect_timeout(SIGNAL_HTTP_CONNECT_TIMEOUT)
                 .timeout(RPC_TIMEOUT)
                 .build()
                 .context("Failed to build Signal HTTP client")?,
@@ -62,7 +63,7 @@ impl SignalClient {
     pub async fn get_sse(&self, url: &str) -> Result<reqwest::Response, reqwest::Error> {
         // Build a client without the short RPC timeout for long-lived SSE connections
         let sse_client = Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .connect_timeout(SIGNAL_HTTP_CONNECT_TIMEOUT)
             .build()
             .unwrap_or_default();
 

@@ -8,12 +8,12 @@ use crate::types::{ContentPart, Message, MessageContent, Role};
 use crate::constants;
 use crate::constants::{
     AUDIO_TOKEN_ESTIMATE_MIN, COMPACTION_MARKER_TOKENS, IMAGE_TOKEN_ESTIMATE, MAX_TRANSCRIPT_CHARS,
+    MESSAGE_ROLE_TOKEN_OVERHEAD,
 };
 
 /// Estimate the token count of a single message, including role overhead.
 fn message_tokens(msg: &Message) -> usize {
-    // Role token overhead (~4 tokens for role + formatting)
-    let role_overhead = 4;
+    let role_overhead = MESSAGE_ROLE_TOKEN_OVERHEAD;
     let content_tokens = match &msg.content {
         Some(MessageContent::Text(s)) => estimate_tokens(s),
         Some(MessageContent::Parts(parts)) => parts
@@ -304,7 +304,7 @@ pub async fn compact_history_v2(
     // have injected (e.g. a stray `</compaction_summary>` inside a code
     // block). Without this, a malicious input could close our tagged fence
     // early and smuggle untrusted content onto the internal side.
-    let safe_body = crate::xml_util::sanitize_xml_boundaries(&summary_body);
+    let safe_body = crate::sanitize::sanitize_xml_boundaries(&summary_body);
     let marker_text = format!(
         "{COMPACTION_MARKER_HEADING}\n\n{COMPACTION_MARKER_OPEN}\n{safe_body}\n{COMPACTION_MARKER_CLOSE}"
     );
@@ -406,7 +406,7 @@ async fn summarize_with_llm_v2(
 /// START with the exact agent-generated shape:
 /// `{HEADING}\n\n{OPEN_FENCE}\n` — a user typing the fence into a normal
 /// message (even at the very top) will also have to match the heading line
-/// preceding it, which [`crate::xml_util::sanitize_xml_boundaries`]
+/// preceding it, which [`crate::sanitize::sanitize_xml_boundaries`]
 /// additionally strips from untrusted content. Returns the body between the
 /// fences, trimmed.
 pub fn extract_last_compaction_summary(history: &[Message]) -> Option<String> {
@@ -582,7 +582,7 @@ pub const COMPACTION_MARKER_CLOSE: &str = "</compaction_summary>";
 /// Human-facing heading rendered above the tagged summary so transcripts
 /// stay readable. Not used for marker detection — detection uses the tag
 /// fence which user input cannot forge through
-/// [`crate::xml_util::sanitize_xml_boundaries`].
+/// [`crate::sanitize::sanitize_xml_boundaries`].
 pub const COMPACTION_MARKER_HEADING: &str =
     "[Earlier conversation was summarized to fit context limits.]";
 

@@ -5,8 +5,8 @@
 //! Never persisted directly — flushed to daily log entries on session end,
 //! then consolidated into long-term memory by the nightly job.
 
+use crate::sanitize::escape_xml_attr;
 use crate::tokenizer::estimate_tokens;
-use crate::xml_util::escape_xml_attr;
 
 /// Context about the currently active project.
 #[derive(Debug, Clone)]

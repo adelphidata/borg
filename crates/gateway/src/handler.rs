@@ -13,6 +13,9 @@ use borg_core::db::{Database, NewDelivery};
 use borg_core::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };
+use borg_core::validation::{sanitize_filename, sanitize_thread_id};
+
+use crate::constants::MAX_THREAD_ID_LEN;
 
 use crate::challenge_throttle::ChallengeThrottle;
 use crate::chunker;
@@ -26,26 +29,6 @@ use crate::retry::{self, RetryOutcome, RetryPolicy};
 /// challenges for the same sender within a 5-minute cooldown.
 static CHALLENGE_THROTTLE: LazyLock<Mutex<ChallengeThrottle>> =
     LazyLock::new(|| Mutex::new(ChallengeThrottle::default()));
-
-/// Sanitize an attachment filename from an external webhook.
-/// Extracts the basename, rejects path traversal, hidden files, and null bytes.
-fn sanitize_filename(name: &Option<String>) -> Option<String> {
-    name.as_ref().map(|n| {
-        let basename = std::path::Path::new(n)
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("attachment");
-        if basename.contains("..")
-            || basename.starts_with('.')
-            || basename.contains('\0')
-            || basename.is_empty()
-        {
-            "attachment".to_string()
-        } else {
-            basename.to_string()
-        }
-    })
-}
 
 /// A media attachment on an inbound message.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -97,22 +80,6 @@ impl InboundMessage {
     pub fn session_key(&self, channel: &str, sub: &str) -> String {
         format!("{}:{}:{}", channel, self.sender_id, sub)
     }
-}
-
-/// Sanitize a thread_id to prevent session key confusion via delimiter injection.
-///
-/// Allows alphanumeric characters, dots, hyphens, and underscores — enough to
-/// cover all real platform formats (Slack `thread_ts` like `1234567890.123456`,
-/// Discord numeric IDs, Google Chat `spaces/*/threads/*` stripped to the leaf,
-/// Telegram integer IDs). Colons are intentionally excluded because the session
-/// key is composed as `{sender_id}:{thread_id}`, so an injected colon would
-/// corrupt the key structure. Length is capped at 128 characters.
-fn sanitize_thread_id(thread_id: &str) -> String {
-    thread_id
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-        .take(128)
-        .collect()
 }
 
 /// Process a webhook request for a channel end-to-end.
@@ -368,7 +335,11 @@ async fn resolve_session_and_commands(
 ) -> Result<SessionResolution> {
     // Resolve session — include thread_id and binding_id in the key for isolation
     let base_key = match &inbound.thread_id {
-        Some(tid) => format!("{}:{}", inbound.sender_id, sanitize_thread_id(tid)),
+        Some(tid) => format!(
+            "{}:{}",
+            inbound.sender_id,
+            sanitize_thread_id(tid, MAX_THREAD_ID_LEN)
+        ),
         None => inbound.sender_id.clone(),
     };
     let session_key = if route.binding_id != "default" {
@@ -1346,55 +1317,6 @@ mod tests {
             .unwrap_or(false));
     }
 
-    #[test]
-    fn sanitize_filename_strips_path_traversal() {
-        assert_eq!(
-            sanitize_filename(&Some("../../etc/passwd".to_string())),
-            Some("passwd".to_string())
-        );
-        assert_eq!(
-            sanitize_filename(&Some("/var/log/../secret".to_string())),
-            Some("secret".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_filename_blocks_hidden_files() {
-        assert_eq!(
-            sanitize_filename(&Some(".hidden".to_string())),
-            Some("attachment".to_string())
-        );
-        assert_eq!(
-            sanitize_filename(&Some(".env".to_string())),
-            Some("attachment".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_filename_passes_normal_names() {
-        assert_eq!(
-            sanitize_filename(&Some("photo.jpg".to_string())),
-            Some("photo.jpg".to_string())
-        );
-        assert_eq!(
-            sanitize_filename(&Some("document.pdf".to_string())),
-            Some("document.pdf".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_filename_handles_none() {
-        assert_eq!(sanitize_filename(&None), None);
-    }
-
-    #[test]
-    fn sanitize_filename_blocks_null_bytes() {
-        assert_eq!(
-            sanitize_filename(&Some("file\0name.txt".to_string())),
-            Some("attachment".to_string())
-        );
-    }
-
     fn default_route() -> crate::routing::ResolvedRoute {
         let config = Config::default();
         crate::routing::ResolvedRoute {
@@ -1556,22 +1478,6 @@ mod tests {
         assert_ne!(
             msg.session_key("telegram", "main"),
             msg.session_key("telegram", "thread-123")
-        );
-    }
-
-    #[test]
-    fn sanitize_filename_empty_string() {
-        assert_eq!(
-            sanitize_filename(&Some(String::new())),
-            Some("attachment".to_string())
-        );
-    }
-
-    #[test]
-    fn sanitize_filename_double_dots() {
-        assert_eq!(
-            sanitize_filename(&Some("file..name.txt".to_string())),
-            Some("attachment".to_string())
         );
     }
 

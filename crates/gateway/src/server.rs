@@ -18,6 +18,7 @@ use borg_core::db::Database;
 use borg_core::telemetry::BorgMetrics;
 
 use crate::channel_trait::{self, NativeChannelRegistry, WebhookContext};
+use crate::constants::{POLL_INITIAL_BACKOFF, POLL_MAX_BACKOFF, POLL_MAX_CONSECUTIVE_ERRORS};
 use crate::discord::channel::DiscordChannel;
 use crate::google_chat::channel::GoogleChatChannel;
 use crate::handler;
@@ -520,9 +521,9 @@ impl GatewayServer {
 
                 let mut consecutive_errors: u32 = 0;
                 let mut total_error_cycles: u32 = 0;
-                let initial_backoff = Duration::from_secs(5);
-                let max_backoff = Duration::from_secs(300);
-                let max_consecutive_errors: u32 = 10;
+                let initial_backoff = POLL_INITIAL_BACKOFF;
+                let max_backoff = POLL_MAX_BACKOFF;
+                let max_consecutive_errors: u32 = POLL_MAX_CONSECUTIVE_ERRORS;
 
                 loop {
                     tokio::select! {

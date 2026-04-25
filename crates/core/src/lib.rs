@@ -179,11 +179,11 @@ pub mod tts;
 pub mod types;
 /// Self-update mechanism for the borg binary.
 pub mod update;
+/// Shared input validators and sanitizers.
+pub mod validation;
 /// Vitals system: passive agent health tracking via hooks.
 pub mod vitals;
 /// Web fetching and search capabilities.
 pub mod web;
 /// Workflow engine — durable multi-step task orchestration for weaker models.
 pub mod workflow;
-/// XML utility functions for structured content parsing.
-pub mod xml_util;

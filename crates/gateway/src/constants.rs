@@ -20,6 +20,31 @@ pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 /// Telegram HTTP connect timeout.
 pub const TELEGRAM_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Signal HTTP connect timeout for the signal-cli JSON-RPC daemon.
+pub const SIGNAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Max characters preserved for the inbound `thread_id` after sanitization.
+/// The session key format `{sender_id}:{thread_id}` cannot tolerate unbounded
+/// growth, so the sanitizer truncates here.
+pub const MAX_THREAD_ID_LEN: usize = 128;
+
+/// Max characters of Discord guild channel history to inject as context
+/// before the current message.
+pub const DISCORD_CHANNEL_CONTEXT_MAX_CHARS: usize = 8000;
+
+// ── Poll loop (Discord/etc.) ──────────────────────────────────────
+
+/// Initial backoff applied after the first consecutive poll error.
+pub const POLL_INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Cap on per-cycle poll backoff; also the pause length when the
+/// consecutive-error budget is exhausted before recycling.
+pub const POLL_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Consecutive poll errors tolerated before the loop pauses for one
+/// `POLL_MAX_BACKOFF` window and resets the error counter.
+pub const POLL_MAX_CONSECUTIVE_ERRORS: u32 = 10;
+
 /// Max retries for Telegram send operations.
 pub const TELEGRAM_MAX_SEND_RETRIES: u32 = 5;
 

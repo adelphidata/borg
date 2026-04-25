@@ -129,11 +129,12 @@ impl NativeChannel for DiscordChannel {
                     if let Some(ref channel_id) = inbound.channel_id {
                         match self.client.get_channel_messages(channel_id, 10).await {
                             Ok(history) if !history.is_empty() => {
-                                const MAX_CONTEXT_CHARS: usize = 8000;
                                 let mut context = String::new();
                                 for m in history.iter().rev() {
                                     let line = format!("{}: {}\n", m.author_username, m.content);
-                                    if context.len() + line.len() > MAX_CONTEXT_CHARS {
+                                    if context.len() + line.len()
+                                        > crate::constants::DISCORD_CHANNEL_CONTEXT_MAX_CHARS
+                                    {
                                         break;
                                     }
                                     context.push_str(&line);

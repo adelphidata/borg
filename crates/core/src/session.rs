@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::db::Database;
 use crate::types::{Message, MessageContent, Role, ToolCall};
+use crate::validation::validate_session_id;
 
 /// Lightweight metadata for a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,16 +37,6 @@ fn sessions_dir() -> Result<PathBuf> {
     let dir = Config::sessions_dir()?;
     fs::create_dir_all(&dir)?;
     Ok(dir)
-}
-
-fn validate_session_id(id: &str) -> Result<()> {
-    if id.is_empty() {
-        anyhow::bail!("Session ID must not be empty");
-    }
-    if id.contains("..") || id.contains('/') || id.contains('\\') {
-        anyhow::bail!("Invalid session ID: must not contain path separators or '..'");
-    }
-    Ok(())
 }
 
 fn session_path(id: &str) -> Result<PathBuf> {
@@ -188,25 +179,6 @@ pub fn recover_session_from_db(session_id: &str) -> Result<Option<Vec<Message>>>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn validate_session_id_empty() {
-        assert!(validate_session_id("").is_err());
-    }
-
-    #[test]
-    fn validate_session_id_path_traversal() {
-        assert!(validate_session_id("../etc/passwd").is_err());
-        assert!(validate_session_id("foo/bar").is_err());
-        assert!(validate_session_id("foo\\bar").is_err());
-        assert!(validate_session_id("..").is_err());
-    }
-
-    #[test]
-    fn validate_session_id_valid() {
-        assert!(validate_session_id("abc-123").is_ok());
-        assert!(validate_session_id("550e8400-e29b-41d4-a716-446655440000").is_ok());
-    }
 
     #[test]
     fn session_new_has_uuid_and_defaults() {

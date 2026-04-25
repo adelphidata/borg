@@ -346,6 +346,10 @@ pub const FLUSH_TRANSCRIPT_CAP_CHARS: usize = 20_000;
 
 // ── Conversation / Tokens ─────────────────────────────────────────
 
+/// Approximate token overhead per chat message for role + formatting framing
+/// (cl100k_base estimate; close enough for budget math).
+pub const MESSAGE_ROLE_TOKEN_OVERHEAD: usize = 4;
+
 /// Conservative token estimate per image (OpenAI high-detail ≈ 765).
 pub const IMAGE_TOKEN_ESTIMATE: usize = 765;
 

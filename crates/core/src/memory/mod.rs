@@ -3,8 +3,8 @@ use tracing::{debug, instrument};
 
 use crate::config::Config;
 use crate::constants::{HEARTBEAT_FILE, MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
+use crate::sanitize::escape_xml_attr;
 use crate::tokenizer::estimate_tokens;
-use crate::xml_util::escape_xml_attr;
 
 mod injection;
 pub use injection::{scan_for_injection, InjectionCategory};

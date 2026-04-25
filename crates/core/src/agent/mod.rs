@@ -2224,14 +2224,14 @@ Rules:
             self.metrics.tool_duration.record(tool_elapsed, &[]);
 
             // Sanitize tool name for XML embedding to prevent injection
-            let safe_name = crate::xml_util::escape_xml_attr(name);
+            let safe_name = crate::sanitize::escape_xml_attr(name);
 
             let (raw_text, extra_parts) = match tool_output {
                 ToolOutput::Text(t) => (t, None),
                 ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
             };
             let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::xml_util::sanitize_xml_boundaries(&redacted);
+            let sanitized = crate::sanitize::sanitize_xml_boundaries(&redacted);
             let xml = format!(
                 "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
             );
@@ -2412,13 +2412,13 @@ Rules:
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(elapsed, &[]);
 
-            let safe_name = crate::xml_util::escape_xml_attr(&name);
+            let safe_name = crate::sanitize::escape_xml_attr(&name);
             let (raw_text, extra_parts) = match tool_output {
                 ToolOutput::Text(t) => (t, None),
                 ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
             };
             let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::xml_util::sanitize_xml_boundaries(&redacted);
+            let sanitized = crate::sanitize::sanitize_xml_boundaries(&redacted);
             let xml = format!(
                 "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
             );

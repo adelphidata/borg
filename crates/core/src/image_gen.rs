@@ -233,9 +233,6 @@ fn is_fal_domain(url: &str) -> bool {
         || url.starts_with("https://fal-cdn.batuhan.me/") // legacy FAL CDN
 }
 
-/// Max image download size (50 MB).
-const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
-
 async fn generate_fal(
     provider: &ImageGenProvider,
     prompt: &str,
@@ -337,10 +334,11 @@ async fn generate_fal(
         match client.get(&fal_img.url).send().await {
             Ok(img_resp) if img_resp.status().is_success() => {
                 let bytes = img_resp.bytes().await?;
-                if bytes.len() > MAX_IMAGE_BYTES {
+                if bytes.len() > constants::MAX_IMAGE_FILE_SIZE {
                     warn!(
-                        "Skipping oversized FAL image ({} bytes, max {MAX_IMAGE_BYTES})",
-                        bytes.len()
+                        "Skipping oversized FAL image ({} bytes, max {})",
+                        bytes.len(),
+                        constants::MAX_IMAGE_FILE_SIZE
                     );
                     continue;
                 }
