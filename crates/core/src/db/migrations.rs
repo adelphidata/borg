@@ -1377,6 +1377,33 @@ impl Database {
         Ok(())
     }
 
+    /// V40: Evolution event signing — Ed25519 per-install keys + per-event session_id.
+    ///
+    /// Adds `device_keys` for storing public keys (private key lives in OS
+    /// keychain); adds `session_id` and `pubkey_id` to `evolution_events`.
+    /// Existing rows are grandfathered: `pubkey_id IS NULL` selects the
+    /// legacy HMAC verification path. New rows write Ed25519 signatures into
+    /// the `hmac`/`prev_hmac` columns (semantic shift — column names retained
+    /// to avoid cascading rename across the codebase).
+    pub(super) fn migrate_v40(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS device_keys (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                public_key  BLOB NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+            ALTER TABLE evolution_events ADD COLUMN session_id TEXT;
+            ALTER TABLE evolution_events ADD COLUMN pubkey_id INTEGER REFERENCES device_keys(id);
+            CREATE INDEX IF NOT EXISTS idx_evolution_events_session
+                ON evolution_events(session_id);
+            CREATE INDEX IF NOT EXISTS idx_evolution_events_pubkey
+                ON evolution_events(pubkey_id);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

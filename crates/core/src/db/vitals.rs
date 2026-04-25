@@ -68,7 +68,13 @@ impl Database {
 
         let evo_key = self.derive_hmac_key(crate::evolution::EVOLUTION_HMAC_DOMAIN);
         let evolution_events = self.load_all_evolution_events().unwrap_or_default();
-        let evolution_state = crate::evolution::replay_events_with_key(&evo_key, &evolution_events);
+        let evolution_pubkeys = self.load_device_pubkeys().unwrap_or_default();
+        let evolution_state = crate::evolution::replay_events_with_keys_at(
+            &evo_key,
+            &evolution_pubkeys,
+            &evolution_events,
+            chrono::Utc::now().timestamp(),
+        );
         let evolution_valid = evolution_state.chain_valid;
         let evolution_count = evolution_events.len() as u32;
 
@@ -520,7 +526,42 @@ impl Database {
     pub fn get_evolution_state(&self) -> Result<crate::evolution::EvolutionState> {
         let events = self.load_all_evolution_events()?;
         let key = self.derive_hmac_key(crate::evolution::EVOLUTION_HMAC_DOMAIN);
-        Ok(crate::evolution::replay_events_with_key(&key, &events))
+        let pubkeys = self.load_device_pubkeys()?;
+        Ok(crate::evolution::replay_events_with_keys_at(
+            &key,
+            &pubkeys,
+            &events,
+            chrono::Utc::now().timestamp(),
+        ))
+    }
+
+    /// Load all `device_keys` rows into a `pubkey_id → VerifyingKey` map.
+    /// Rows with corrupt key bytes are logged and skipped — replay falls back
+    /// to "missing device key" for events that referenced them.
+    pub(crate) fn load_device_pubkeys(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, ed25519_dalek::VerifyingKey>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, public_key FROM device_keys")?;
+        let rows = stmt.query_map([], |row| {
+            let id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (id, blob) = row?;
+            match crate::evolution::signature::verifying_key_from_bytes(&blob) {
+                Ok(pk) => {
+                    out.insert(id, pk);
+                }
+                Err(e) => {
+                    tracing::warn!("evolution: device_keys row {id} has invalid public_key: {e}");
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Load all evolution events ordered chronologically for replay.
@@ -529,7 +570,7 @@ impl Database {
     ) -> Result<Vec<crate::evolution::EvolutionEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
-                    created_at, hmac, prev_hmac
+                    created_at, hmac, prev_hmac, session_id, pubkey_id
              FROM evolution_events ORDER BY id ASC",
         )?;
         let events = stmt
@@ -544,6 +585,8 @@ impl Database {
                     created_at: row.get(6)?,
                     hmac: row.get(7)?,
                     prev_hmac: row.get(8)?,
+                    session_id: row.get(9)?,
+                    pubkey_id: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -559,6 +602,24 @@ impl Database {
         archetype: Option<&str>,
         source: &str,
         metadata: Option<&str>,
+    ) -> Result<()> {
+        self.record_evolution_event_with_session(
+            event_type, xp_delta, archetype, source, metadata, None,
+        )
+    }
+
+    /// Same as `record_evolution_event` but attaches an explicit `session_id`.
+    /// Used by signing-aware writers (plan_emission, agent hooks) so the
+    /// session linkage survives in a queryable column rather than only in
+    /// `metadata_json`.
+    pub fn record_evolution_event_with_session(
+        &self,
+        event_type: &str,
+        xp_delta: i32,
+        archetype: Option<&str>,
+        source: &str,
+        metadata: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<()> {
         // Validate event_type and xp_delta to prevent gaming via inflated XP
         if !crate::evolution::VALID_EVOLUTION_EVENT_TYPES.contains(&event_type) {
@@ -642,8 +703,12 @@ impl Database {
                 )
                 .unwrap_or_else(|_| "0".to_string());
 
-            let hmac = crate::evolution::compute_event_hmac(
-                &self.derive_hmac_key(crate::evolution::EVOLUTION_HMAC_DOMAIN),
+            // V40+: sign new events with Ed25519. Legacy rows (pubkey_id NULL)
+            // continue to verify against HMAC; the chain bridges naturally
+            // because prev_hmac is just bytes the next signer hashes over.
+            let (signing_key, pubkey_id) = self.evolution_signing_key()?;
+            let signature = crate::evolution::signature::sign_event(
+                &signing_key,
                 &prev_hmac,
                 event_type,
                 xp_delta,
@@ -655,9 +720,12 @@ impl Database {
 
             self.conn.execute(
                 "INSERT INTO evolution_events (event_type, xp_delta, archetype, source,
-                    metadata_json, created_at, hmac, prev_hmac)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![event_type, xp_delta, archetype, source, metadata, now, hmac, prev_hmac],
+                    metadata_json, created_at, hmac, prev_hmac, session_id, pubkey_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    event_type, xp_delta, archetype, source, metadata, now, signature, prev_hmac,
+                    session_id, pubkey_id,
+                ],
             )?;
             Ok(())
         })();
@@ -681,7 +749,7 @@ impl Database {
     ) -> Result<Vec<crate::evolution::EvolutionEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
-                    created_at, hmac, prev_hmac
+                    created_at, hmac, prev_hmac, session_id, pubkey_id
              FROM evolution_events WHERE created_at >= ?1 ORDER BY created_at DESC",
         )?;
         let events = stmt
@@ -696,6 +764,8 @@ impl Database {
                     created_at: row.get(6)?,
                     hmac: row.get(7)?,
                     prev_hmac: row.get(8)?,
+                    session_id: row.get(9)?,
+                    pubkey_id: row.get(10)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

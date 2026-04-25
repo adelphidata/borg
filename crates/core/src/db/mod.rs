@@ -42,6 +42,16 @@ pub struct Database {
     /// Keeps schema changes and filesystem moves atomic: if the migration rolls
     /// back, the files stay in place and the next run can retry cleanly.
     pending_post_migration_renames: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
+    /// Cached Ed25519 signing key + matching `device_keys.id`. Populated on
+    /// first call to `record_evolution_event`; survives the process lifetime.
+    /// `None` until first use; loading from the OS keychain is gated until
+    /// the evolution write path actually fires.
+    evolution_signing_key: std::cell::RefCell<Option<(ed25519_dalek::SigningKey, i64)>>,
+    /// Optional override keystore. Production code uses
+    /// [`crate::evolution::keychain::default_keystore`]; tests inject an
+    /// in-memory store so they don't touch the real OS keychain.
+    evolution_keystore_override:
+        std::cell::RefCell<Option<Box<dyn crate::evolution::keychain::KeyStore>>>,
 }
 
 impl Database {
@@ -108,6 +118,8 @@ impl Database {
             conn,
             hmac_salt: Vec::new(),
             pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
+            evolution_signing_key: std::cell::RefCell::new(None),
+            evolution_keystore_override: std::cell::RefCell::new(None),
         };
         db.run_migrations()?;
         // Seed all SETTING_REGISTRY defaults into the settings table.
@@ -119,7 +131,68 @@ impl Database {
             conn: db.conn,
             hmac_salt: salt,
             pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
+            evolution_signing_key: std::cell::RefCell::new(None),
+            evolution_keystore_override: std::cell::RefCell::new(None),
         })
+    }
+
+    /// Inject a keystore for the evolution signing path. Test-only: production
+    /// code uses [`crate::evolution::keychain::default_keystore`] resolved
+    /// lazily on first signing-event write. Once set, replaces any previously
+    /// cached signing key so the next write rebuilds from the override.
+    #[cfg(test)]
+    pub fn set_evolution_keystore(&self, store: Box<dyn crate::evolution::keychain::KeyStore>) {
+        *self.evolution_keystore_override.borrow_mut() = Some(store);
+        *self.evolution_signing_key.borrow_mut() = None;
+    }
+
+    /// Load (or generate + persist) the Ed25519 signing key used to sign new
+    /// evolution events. Cached for the process lifetime. The matching public
+    /// key is mirrored into `device_keys`; the returned i64 is its row id and
+    /// is what `evolution_events.pubkey_id` references.
+    pub(crate) fn evolution_signing_key(&self) -> Result<(ed25519_dalek::SigningKey, i64)> {
+        if let Some(ref cached) = *self.evolution_signing_key.borrow() {
+            return Ok((cached.0.clone(), cached.1));
+        }
+        // Resolve a keystore: test override or platform default.
+        let (key, _created) = {
+            let guard = self.evolution_keystore_override.borrow();
+            match guard.as_ref() {
+                Some(store) => {
+                    crate::evolution::keychain::load_or_create_signing_key(store.as_ref())?
+                }
+                None => crate::evolution::keychain::load_or_create_signing_key(
+                    crate::evolution::keychain::default_keystore().as_ref(),
+                )?,
+            }
+        };
+        let pubkey_bytes = key.verifying_key().to_bytes();
+
+        // Find or insert the matching device_keys row. Reuse on subsequent runs
+        // by matching public_key bytes — keeps the table compact.
+        let pubkey_blob = pubkey_bytes.to_vec();
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM device_keys WHERE public_key = ?1 LIMIT 1",
+                rusqlite::params![pubkey_blob],
+                |row| row.get(0),
+            )
+            .ok();
+        let pubkey_id = match existing {
+            Some(id) => id,
+            None => {
+                let now = chrono::Utc::now().timestamp();
+                self.conn.execute(
+                    "INSERT INTO device_keys (public_key, created_at) VALUES (?1, ?2)",
+                    rusqlite::params![pubkey_blob, now],
+                )?;
+                self.conn.last_insert_rowid()
+            }
+        };
+
+        *self.evolution_signing_key.borrow_mut() = Some((key.clone(), pubkey_id));
+        Ok((key, pubkey_id))
     }
 
     /// Queue a filesystem rename to execute after the migration transaction commits.
@@ -181,7 +254,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 39;
+    const CURRENT_VERSION: u32 = 40;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -259,6 +332,7 @@ impl Database {
             Database::migrate_v37,
             Database::migrate_v38,
             Database::migrate_v39,
+            Database::migrate_v40,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.
@@ -329,9 +403,13 @@ impl Database {
 
 #[cfg(test)]
 impl Database {
-    /// Create an in-memory database for tests. Runs all migrations.
+    /// Create an in-memory database for tests. Runs all migrations and
+    /// installs an in-memory keystore so the evolution signing path never
+    /// touches the real OS keychain during tests.
     pub fn test_db() -> Self {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        Self::from_connection(conn).expect("init test db")
+        let db = Self::from_connection(conn).expect("init test db");
+        db.set_evolution_keystore(Box::new(crate::evolution::keychain::InMemoryKeyStore::new()));
+        db
     }
 }

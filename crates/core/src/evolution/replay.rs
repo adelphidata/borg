@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 
+use ed25519_dalek::VerifyingKey;
+
 use crate::hmac_chain;
 
 use super::{
-    compute_momentum, evolution_gates_verified, level_from_xp, rate_limit_for, verify_event_hmac,
-    Archetype, EvolutionEvent, EvolutionState, Stage,
+    compute_momentum, evolution_gates_verified, level_from_xp, rate_limit_for, signature,
+    verify_event_hmac, Archetype, EvolutionEvent, EvolutionState, Stage,
 };
 
 #[cfg(test)]
@@ -39,9 +41,22 @@ pub fn replay_events_with_key(key: &[u8], events: &[EvolutionEvent]) -> Evolutio
     replay_events_with_key_at(key, events, chrono::Utc::now().timestamp())
 }
 
-/// Replay events with an explicit `now_ts` reference point for time-weighted scoring.
+/// Replay events using HMAC verification only (legacy path). Equivalent to
+/// `replay_events_with_keys_at` with an empty pubkey map.
 pub fn replay_events_with_key_at(
     key: &[u8],
+    events: &[EvolutionEvent],
+    now_ts: i64,
+) -> EvolutionState {
+    replay_events_with_keys_at(key, &HashMap::new(), events, now_ts)
+}
+
+/// Replay events with both an HMAC key (for legacy rows) and a `pubkey_id →
+/// VerifyingKey` map (for V40+ rows signed with Ed25519). Each row dispatches
+/// by `pubkey_id`: present → Ed25519 verify; absent → HMAC verify.
+pub fn replay_events_with_keys_at(
+    key: &[u8],
+    pubkeys: &HashMap<i64, VerifyingKey>,
     events: &[EvolutionEvent],
     now_ts: i64,
 ) -> EvolutionState {
@@ -61,10 +76,24 @@ pub fn replay_events_with_key_at(
     let mut accepted: Vec<EvolutionEvent> = Vec::new();
 
     for event in events {
-        // Verify HMAC chain
-        if !verify_event_hmac(key, event, &expected_prev_hmac) {
+        // Verify chain link: dispatch HMAC vs Ed25519 by `pubkey_id` presence.
+        let ok = match event.pubkey_id {
+            Some(id) => match pubkeys.get(&id) {
+                Some(pk) => verify_event_signature(pk, event, &expected_prev_hmac),
+                None => {
+                    tracing::warn!(
+                        "evolution: missing device_keys row {} for event {}, skipping",
+                        id,
+                        event.id
+                    );
+                    false
+                }
+            },
+            None => verify_event_hmac(key, event, &expected_prev_hmac),
+        };
+        if !ok {
             tracing::warn!(
-                "evolution: broken HMAC chain at event {}, skipping",
+                "evolution: broken signature chain at event {}, skipping",
                 event.id
             );
             chain_valid = false;
@@ -238,4 +267,29 @@ pub(crate) fn dominant_from_effective(
                 .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
         })
         .map(|(arch, _)| arch)
+}
+
+/// Verify a single Ed25519-signed event against its expected previous-link.
+/// Mirrors the HMAC v2 verifier shape so call sites can dispatch uniformly.
+fn verify_event_signature(
+    pubkey: &VerifyingKey,
+    event: &EvolutionEvent,
+    expected_prev_hmac: &str,
+) -> bool {
+    if event.prev_hmac != expected_prev_hmac {
+        return false;
+    }
+    let archetype = event.archetype.as_deref().unwrap_or("");
+    let metadata = event.metadata_json.as_deref().unwrap_or("");
+    signature::verify_event(
+        pubkey,
+        &event.hmac,
+        &event.prev_hmac,
+        &event.event_type,
+        event.xp_delta,
+        archetype,
+        &event.source,
+        metadata,
+        event.created_at,
+    )
 }

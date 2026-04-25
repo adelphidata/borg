@@ -49,6 +49,7 @@ notify = { workspace = true }
 image = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [lints]
 workspace = true

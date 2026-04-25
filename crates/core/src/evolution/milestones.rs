@@ -262,6 +262,8 @@ mod tests {
             created_at: 0,
             hmac: String::new(),
             prev_hmac: String::new(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
@@ -276,6 +278,8 @@ mod tests {
             created_at,
             hmac: String::new(),
             prev_hmac: String::new(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 

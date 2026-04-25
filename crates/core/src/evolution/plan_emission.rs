@@ -46,23 +46,29 @@ pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) ->
     let xp = BASE_XP_PLAN + if aligned { BONUS_XP_PLAN_ALIGNED } else { 0 };
 
     let metadata = build_metadata(session_id, archetype);
-    db.record_evolution_event(
+    db.record_evolution_event_with_session(
         "xp_gain",
         xp,
         archetype.map(|a| a.to_string()).as_deref(),
         "plan_emission",
         Some(&metadata),
+        Some(session_id),
     )?;
     Ok(true)
 }
 
 fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
     let conn = db.conn();
+    // Prefer the indexed `session_id` column (V40+); legacy rows fall back to
+    // `json_extract` so dedup still holds across the schema bump.
     let existing: i64 = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM evolution_events
              WHERE source = 'plan_emission'
-               AND json_extract(metadata_json, '$.session_id') = ?1
+               AND (
+                 session_id = ?1
+                 OR json_extract(metadata_json, '$.session_id') = ?1
+               )
          )",
         rusqlite::params![session_id],
         |row| row.get(0),
@@ -145,5 +151,19 @@ mod tests {
         assert_eq!(event.archetype.as_deref(), Some("ops"));
         // No prior dominant archetype on a fresh DB → base XP only, no aligned bonus.
         assert_eq!(event.xp_delta, BASE_XP_PLAN);
+    }
+
+    #[test]
+    fn session_id_populates_indexed_column() {
+        // V40 migration introduced an indexed `session_id` column. The dedup
+        // query must work via that column, not just the json_extract fallback.
+        let db = Database::test_db();
+        record_plan_emission(&db, "sess-via-column", "deploy kubernetes").unwrap();
+        let events = db.load_all_evolution_events().unwrap();
+        let event = events
+            .iter()
+            .find(|e| e.source == "plan_emission")
+            .expect("plan_emission row must exist");
+        assert_eq!(event.session_id.as_deref(), Some("sess-via-column"));
     }
 }

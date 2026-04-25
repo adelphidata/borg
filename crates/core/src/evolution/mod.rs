@@ -15,14 +15,16 @@ mod feed;
 mod format;
 mod helpers;
 mod hmac;
+pub mod keychain;
 mod milestones;
 pub mod plan_emission;
 mod replay;
 pub mod share_card;
+pub mod signature;
 
-pub(crate) use hmac::{compute_event_hmac, verify_event_hmac, EVOLUTION_HMAC_DOMAIN};
 #[cfg(test)]
-pub(crate) use hmac::{compute_event_hmac_legacy, EVOLUTION_HMAC_LEGACY};
+pub(crate) use hmac::{compute_event_hmac, compute_event_hmac_legacy, EVOLUTION_HMAC_LEGACY};
+pub(crate) use hmac::{verify_event_hmac, EVOLUTION_HMAC_DOMAIN};
 
 pub use celebration::{
     celebration_art, format_celebration, format_celebration_message, CelebrationArt,
@@ -305,10 +307,18 @@ pub struct EvolutionEvent {
     pub metadata_json: Option<String>,
     /// Unix timestamp of event creation.
     pub created_at: i64,
-    /// HMAC for this event in the chain.
+    /// Chain signature for this event. Either an HMAC-SHA256 (legacy rows
+    /// where `pubkey_id IS NULL`) or an Ed25519 signature (rows linked to a
+    /// `device_keys` row via `pubkey_id`). Hex-encoded in either case.
     pub hmac: String,
-    /// HMAC of the previous event in the chain.
+    /// Chain signature of the previous event.
     pub prev_hmac: String,
+    /// Originating session for this event, if known. Populated for events
+    /// recorded by signing-aware code paths (V40+); legacy rows are NULL.
+    pub session_id: Option<String>,
+    /// FK into `device_keys` identifying which Ed25519 public key signed this
+    /// row. `None` selects the legacy HMAC verification path on replay.
+    pub pubkey_id: Option<i64>,
 }
 
 /// Computed evolution state (derived from replaying events).
@@ -1327,6 +1337,8 @@ mod tests {
             created_at: 1000,
             hmac: hmac.clone(),
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
         assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
     }
@@ -1353,6 +1365,8 @@ mod tests {
             created_at: 1000,
             hmac,
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
         // Tamper with XP
         event.xp_delta = 999;
@@ -1375,6 +1389,8 @@ mod tests {
             created_at: 2000,
             hmac: h2,
             prev_hmac: h1.clone(),
+            session_id: None,
+            pubkey_id: None,
         };
         assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &e2, &h1));
         // Wrong prev_hmac
@@ -1412,6 +1428,8 @@ mod tests {
             created_at,
             hmac,
             prev_hmac: prev_hmac.to_string(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
@@ -2002,6 +2020,8 @@ mod tests {
                 created_at: ts,
                 hmac: hmac.clone(),
                 prev_hmac,
+                session_id: None,
+                pubkey_id: None,
             });
             prev_hmac = hmac;
         }
@@ -2193,6 +2213,8 @@ mod tests {
             created_at: 1000,
             hmac: legacy_hmac,
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
         // verify_event_hmac should accept via legacy fallback
         assert!(
@@ -2216,6 +2238,8 @@ mod tests {
             created_at: 1000,
             hmac,
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
         // Valid before tampering
         assert!(verify_event_hmac(key, &event, "0"));
@@ -2255,6 +2279,8 @@ mod tests {
             created_at: 2000,
             hmac,
             prev_hmac: e1.hmac.clone(),
+            session_id: None,
+            pubkey_id: None,
         };
 
         let state = replay_events(&[e1, e2]);
@@ -2283,6 +2309,8 @@ mod tests {
             created_at: 2000,
             hmac: no_meta_hmac,
             prev_hmac: e1b.hmac.clone(),
+            session_id: None,
+            pubkey_id: None,
         };
 
         let state2 = replay_events(&[e1b, e2_tampered]);
@@ -2338,6 +2366,8 @@ mod tests {
             created_at,
             hmac,
             prev_hmac: prev_hmac.to_string(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
@@ -2371,6 +2401,8 @@ mod tests {
             created_at,
             hmac,
             prev_hmac: prev_hmac.to_string(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
@@ -2682,6 +2714,8 @@ mod tests {
             created_at: 1_000,
             hmac: h1.clone(),
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
 
         // e2: v2 evolution event with metadata, chained off e1
@@ -2707,6 +2741,8 @@ mod tests {
             created_at: 3_700,
             hmac: h3,
             prev_hmac: e2.hmac.clone(),
+            session_id: None,
+            pubkey_id: None,
         };
 
         let state = replay_events(&[e1, e2, e3]);
@@ -2928,6 +2964,8 @@ mod tests {
             created_at,
             hmac,
             prev_hmac: prev_hmac.to_string(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
@@ -3522,6 +3560,8 @@ mod tests {
             created_at: 1000,
             hmac,
             prev_hmac: "0".to_string(),
+            session_id: None,
+            pubkey_id: None,
         };
         // Pristine event verifies.
         assert!(verify_event_hmac(EVOLUTION_HMAC_LEGACY, &event, "0"));
@@ -3881,5 +3921,141 @@ mod tests {
             1,
             "only the first transition should emit; second call is stable→stable"
         );
+    }
+
+    // ── V40: Ed25519 signing path ──
+
+    /// Records via the public `record_evolution_event` path (which now signs
+    /// with Ed25519) and verifies that the row reads back with `pubkey_id`
+    /// set, a matching `device_keys` row exists, and replay validates the
+    /// chain via the Ed25519 verifier (chain_valid stays true).
+    #[test]
+    fn record_via_public_api_signs_with_ed25519_and_verifies() {
+        let db = Database::test_db();
+        db.record_evolution_event_with_session(
+            "xp_gain",
+            2,
+            Some("ops"),
+            "plan_emission",
+            None,
+            Some("sess-sign-1"),
+        )
+        .unwrap();
+
+        let events = db.load_all_evolution_events().unwrap();
+        assert_eq!(events.len(), 1);
+        let row = &events[0];
+        assert!(
+            row.pubkey_id.is_some(),
+            "V40 writes must reference a device_keys row"
+        );
+        assert_eq!(row.session_id.as_deref(), Some("sess-sign-1"));
+
+        let device_count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM device_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(device_count, 1);
+
+        let state = db.get_evolution_state().unwrap();
+        assert!(
+            state.chain_valid,
+            "Ed25519 verification must accept rows signed by the cached key"
+        );
+        assert_eq!(state.total_events, 1);
+    }
+
+    /// Tampering an Ed25519-signed row's xp_delta must cause replay to drop
+    /// the row and flag chain_valid=false. Triggers prevent UPDATE so we
+    /// drop+re-insert with the new value to simulate post-write tampering.
+    #[test]
+    fn ed25519_tamper_detected_by_replay() {
+        let db = Database::test_db();
+        db.record_evolution_event("xp_gain", 2, Some("ops"), "plan_emission", None)
+            .unwrap();
+
+        // Bypass the append-only trigger to simulate offline tampering.
+        db.conn()
+            .execute_batch("DROP TRIGGER evolution_events_no_update")
+            .unwrap();
+        db.conn()
+            .execute("UPDATE evolution_events SET xp_delta = 99 WHERE id = 1", [])
+            .unwrap();
+
+        let state = db.get_evolution_state().unwrap();
+        assert!(
+            !state.chain_valid,
+            "tampered xp_delta must invalidate the Ed25519 signature"
+        );
+        // Tampered row was dropped, so accepted XP is 0 — not 2 and not 99.
+        assert_eq!(state.total_xp, 0);
+    }
+
+    /// A row whose `pubkey_id` references a non-existent `device_keys` row
+    /// must be rejected by replay. Exercises the missing-key arm of the
+    /// dispatcher in `replay_events_with_keys_at`.
+    #[test]
+    fn ed25519_row_with_missing_device_key_invalidates_chain() {
+        let db = Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // FK normally blocks inserting an event with a dangling pubkey_id.
+        // Temporarily disable enforcement to simulate a row whose device_keys
+        // parent was deleted out-of-band — e.g. a manually-edited DB or a
+        // future cleanup task that pruned a device_keys row. The dispatcher
+        // must still drop such rows and flag chain_valid=false.
+        db.conn()
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO evolution_events
+                    (event_type, xp_delta, archetype, source, metadata_json,
+                     created_at, hmac, prev_hmac, session_id, pubkey_id)
+                 VALUES ('xp_gain', 1, 'ops', 'run_shell', NULL, ?1,
+                         'deadbeef', '0', NULL, 9999)",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        db.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
+
+        let state = db.get_evolution_state().unwrap();
+        assert!(
+            !state.chain_valid,
+            "row referencing missing device_keys row must invalidate the chain"
+        );
+        assert_eq!(state.total_xp, 0, "rejected row must not contribute XP");
+    }
+
+    /// Legacy HMAC rows (pubkey_id NULL) and new Ed25519 rows (pubkey_id set)
+    /// must both verify in the same chain — V40 grandfathers existing data.
+    #[test]
+    fn legacy_hmac_row_followed_by_ed25519_row_chains_correctly() {
+        let db = Database::test_db();
+
+        // Insert a legacy HMAC row directly, bypassing the signing API.
+        let hmac_key = db.derive_hmac_key(EVOLUTION_HMAC_DOMAIN);
+        let now = chrono::Utc::now().timestamp();
+        let legacy_hmac =
+            compute_event_hmac(&hmac_key, "0", "xp_gain", 1, "ops", "run_shell", "", now);
+        db.conn()
+            .execute(
+                "INSERT INTO evolution_events
+                    (event_type, xp_delta, archetype, source, metadata_json,
+                     created_at, hmac, prev_hmac, session_id, pubkey_id)
+                 VALUES ('xp_gain', 1, 'ops', 'run_shell', NULL, ?1, ?2, '0', NULL, NULL)",
+                rusqlite::params![now, legacy_hmac],
+            )
+            .unwrap();
+
+        // Now record via the new API; it should chain off the legacy row's hmac.
+        db.record_evolution_event("xp_gain", 1, Some("ops"), "run_shell", None)
+            .unwrap();
+
+        let state = db.get_evolution_state().unwrap();
+        assert!(
+            state.chain_valid,
+            "mixed HMAC + Ed25519 chain must verify end-to-end"
+        );
+        assert_eq!(state.total_events, 2);
     }
 }

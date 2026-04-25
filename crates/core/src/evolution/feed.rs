@@ -172,6 +172,8 @@ mod tests {
             created_at: ts,
             hmac: String::new(),
             prev_hmac: String::new(),
+            session_id: None,
+            pubkey_id: None,
         }
     }
 
