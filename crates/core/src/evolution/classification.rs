@@ -309,6 +309,195 @@ const MARKETER_KEYWORDS: &[&str] = &[
     "twitter-ads",
 ];
 
+const COMMUNICATOR_KEYWORDS: &[&str] = &[
+    "mailx",
+    "mutt",
+    "neomutt",
+    "msmtp",
+    "sendmail",
+    "postfix",
+    "signal-cli",
+    "telegram-cli",
+    "tdl",
+    "slack-cli",
+    "matrix-commander",
+    "irssi",
+    "weechat",
+    "discord-cli",
+    "jmap",
+    "imapfilter",
+    "notmuch",
+    "offlineimap",
+    "isync",
+    "mbsync",
+    "khard",
+    "vdirsyncer",
+    "twilio",
+    "whatsapp",
+    "telegram",
+    "discord",
+    "slack",
+    "rocketchat",
+    "zulip",
+    "mattermost",
+    "outreach",
+    "follow-up",
+    "broadcast",
+    "announce",
+    "newsletter-send",
+    "reply-all",
+];
+
+const CREATOR_KEYWORDS: &[&str] = &[
+    "pandoc",
+    "mdbook",
+    "hugo",
+    "jekyll",
+    "eleventy",
+    "11ty",
+    "astro",
+    "gatsby",
+    "zola",
+    "obsidian",
+    "logseq",
+    "roam",
+    "ffmpeg",
+    "imagemagick",
+    "magick",
+    "inkscape",
+    "blender",
+    "audacity",
+    "sox",
+    "lilypond",
+    "musescore",
+    "scribus",
+    "krita",
+    "gimp",
+    "darktable",
+    "rawtherapee",
+    "lightroom",
+    "davinci",
+    "obs",
+    "shotcut",
+    "kdenlive",
+    "openshot",
+    "tex",
+    "latex",
+    "lualatex",
+    "xelatex",
+    "bibtex",
+    "biber",
+    "pdflatex",
+    "asciidoctor",
+    "rst2html",
+    "manuscript",
+    "draft",
+    "essay",
+    "blog-post",
+    "podcast",
+    "thumbnail",
+    "storyboard",
+    "screenplay",
+    "lyrics",
+];
+
+const CARETAKER_KEYWORDS: &[&str] = &[
+    "homeassistant",
+    "home-assistant",
+    "philips-hue",
+    "hue",
+    "nest",
+    "ecobee",
+    "roomba",
+    "irobot",
+    "ifttt",
+    "smartthings",
+    "wemo",
+    "tuya",
+    "shelly",
+    "oura",
+    "fitbit",
+    "garmin",
+    "whoop",
+    "withings",
+    "myfitnesspal",
+    "cronometer",
+    "headspace",
+    "sleep-cycle",
+    "grocery",
+    "shopping-list",
+    "meal-plan",
+    "mealie",
+    "grocy",
+    "tandoor",
+    "paprika",
+    "household",
+    "chore",
+    "wellness",
+    "hydration",
+    "medication",
+    "pill",
+    "appointment",
+    "doctor",
+    "pediatric",
+    "vet",
+    "pet-feeder",
+    "thermostat",
+    "garage-door",
+    "irrigation",
+    "rachio",
+];
+
+const MERCHANT_KEYWORDS: &[&str] = &[
+    "stripe",
+    "shopify",
+    "woocommerce",
+    "bigcommerce",
+    "magento",
+    "quickbooks",
+    "xero",
+    "freshbooks",
+    "wave-accounting",
+    "paypal",
+    "square",
+    "venmo",
+    "zelle",
+    "invoice",
+    "billing",
+    "refund",
+    "chargeback",
+    "ledger",
+    "p&l",
+    "pnl",
+    "profit-and-loss",
+    "balance-sheet",
+    "accounts-receivable",
+    "accounts-payable",
+    "ar/ap",
+    "inventory",
+    "skus",
+    "sku",
+    "fulfillment",
+    "warehouse-stock",
+    "etsy",
+    "ebay",
+    "amazon-seller",
+    "fba",
+    "merchant-of-record",
+    "tax-filing",
+    "sales-tax",
+    "vat",
+    "1099",
+    "w9",
+    "receipt",
+    "purchase-order",
+    "vendor",
+    "payout",
+    "payroll",
+    "gusto",
+    "rippling",
+];
+
 const TINKERER_KEYWORDS: &[&str] = &[
     "homelab",
     "proxmox",
@@ -338,8 +527,6 @@ const TINKERER_KEYWORDS: &[&str] = &[
     "uart",
     "can-bus",
     "modbus",
-    "home-assistant",
-    "hass",
     "openwrt",
     "pfsense",
     "opnsense",
@@ -403,7 +590,20 @@ pub fn classify_tool_archetype(tool_name: &str, metadata: Option<&str>) -> Optio
 
 /// Classify a shell command by scanning its content for archetype keywords.
 fn classify_shell_command(metadata: Option<&str>) -> Option<Archetype> {
-    let text = metadata?.to_lowercase();
+    classify_text(metadata?)
+}
+
+/// Classify free-form plan-mode text against the archetype keyword tables.
+///
+/// Used by Plan-mode emission to award XP aligned with what the agent
+/// actually proposes. First match wins, in the same priority order as
+/// shell-command classification.
+pub fn classify_plan_content(text: &str) -> Option<Archetype> {
+    classify_text(text)
+}
+
+fn classify_text(text: &str) -> Option<Archetype> {
+    let text = text.to_lowercase();
 
     let keyword_sets: &[(&[&str], Archetype)] = &[
         (OPS_KEYWORDS, Archetype::Ops),
@@ -413,6 +613,10 @@ fn classify_shell_command(metadata: Option<&str>) -> Option<Archetype> {
         (STRATEGIST_KEYWORDS, Archetype::Strategist),
         (TINKERER_KEYWORDS, Archetype::Tinkerer),
         (MARKETER_KEYWORDS, Archetype::Marketer),
+        (COMMUNICATOR_KEYWORDS, Archetype::Communicator),
+        (CREATOR_KEYWORDS, Archetype::Creator),
+        (CARETAKER_KEYWORDS, Archetype::Caretaker),
+        (MERCHANT_KEYWORDS, Archetype::Merchant),
     ];
 
     for (keywords, archetype) in keyword_sets {
@@ -707,6 +911,45 @@ mod tests {
         let raw = r#"{"name":"n\"q","description":"d"}"#;
         let (n, _) = parse_name_response(raw).unwrap();
         assert_eq!(n, "n\"q");
+    }
+
+    #[test]
+    fn shell_classification_covers_all_archetypes() {
+        // One representative command per archetype that previously had no
+        // keyword set. Regression guard against the "4 of 11 archetypes
+        // unreachable" bug — if any of these returns None, the keyword_sets
+        // array has lost an entry.
+        let cases: &[(&str, Archetype)] = &[
+            ("signal-cli send -m 'hi' +1555", Archetype::Communicator),
+            ("pandoc -o paper.pdf draft.md", Archetype::Creator),
+            ("homeassistant automation reload", Archetype::Caretaker),
+            (
+                "stripe invoices create --customer cus_123",
+                Archetype::Merchant,
+            ),
+        ];
+        for (cmd, want) in cases {
+            let got = classify_shell_command(Some(cmd));
+            assert_eq!(
+                got,
+                Some(*want),
+                "command {cmd:?} expected {want:?}, got {got:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn shell_classification_caretaker_specific() {
+        // Caretaker tokens should resolve. "homeassistant" is the canonical
+        // home-automation hub keyword.
+        assert_eq!(
+            classify_shell_command(Some("homeassistant restart core")),
+            Some(Archetype::Caretaker),
+        );
+        assert_eq!(
+            classify_shell_command(Some("python -m oura sync --since today")),
+            Some(Archetype::Caretaker),
+        );
     }
 
     /// Smoke test: `generate_evolution_name` always returns a non-empty pair,

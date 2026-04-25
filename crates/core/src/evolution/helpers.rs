@@ -90,6 +90,13 @@ pub fn compute_mood(evo: &EvolutionState, vitals: &VitalsState, bond: &BondState
         return Mood::Ascending;
     }
 
+    // Final-stage post-99 progression: stay Ascending so the agent reads as
+    // actively growing rather than "stable / done." No bond floor — once a
+    // user is past Lvl.99 in Final they've earned the perpetual mood.
+    if evo.stage == Stage::Final && evo.level > 99 {
+        return Mood::Ascending;
+    }
+
     if min_vital < 30 {
         return Mood::Strained;
     }
@@ -488,6 +495,30 @@ mod tests {
         let vitals = mk_vitals(80);
         let bond = mk_bond(50);
         assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Ascending);
+    }
+
+    #[test]
+    fn mood_ascending_in_final_past_99() {
+        // Regression: post-99 Final users were stuck on "Stable" because
+        // the prior rule required `stage != Final`. The new rule keeps
+        // Ascending lit while levels keep climbing past 99.
+        let evo = mk_evo_state(Stage::Final, 105);
+        let vitals = mk_vitals(80);
+        let bond = mk_bond(10); // intentionally low — no bond floor past 99
+        assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Ascending);
+    }
+
+    #[test]
+    fn mood_not_ascending_in_final_at_99() {
+        // Boundary: Lvl.99 in Final is *not* the post-99 case. The original
+        // pre-99 Ascending rule excludes Final, so Lvl.99 in Final should
+        // fall through to the normal mood derivation. Min-vital is 80,
+        // dominant archetype is set in the helper, focus 80 / stability 80,
+        // so the final read here is Focused, not Ascending.
+        let evo = mk_evo_state(Stage::Final, 99);
+        let vitals = mk_vitals(80);
+        let bond = mk_bond(50);
+        assert_eq!(compute_mood(&evo, &vitals, &bond), Mood::Focused);
     }
 
     #[test]

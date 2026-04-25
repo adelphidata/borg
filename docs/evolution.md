@@ -22,7 +22,11 @@ Stages are **permanent** — once your agent evolves, it never regresses. The ac
 | 2 | `Stage::Evolved` | Evolved Borg | `Evolved II` |
 | 3 | `Stage::Final` | Final Borg | `Final III` |
 
-Each class has its own 0–99 level progression. Reaching Lvl.99 is a hard gate for transitioning to the next stage.
+Each class has its own level progression. Stage 1 caps at Lvl.99. Stage 2
+gates transition at **Lvl.80** (lowered from 99 — the n^1.8 curve made 99 a
+6–12 month grind well past the engagement cliff). Stage 3 (Final) has **no
+hard cap**: levels past 99 cost a flat 50 XP each, giving long-term users an
+ongoing reason to engage.
 
 Autonomy is **not** derived from stage — it's a separate concept owned by the Bond module (`crates/core/src/bond.rs`, `AutonomyTier` with 5 variants: `ObserveOnly`, `Recommend`, `DraftAssist`, `GuidedAction`, `HighTrust`) driven by bond score. See `docs/bond.md`.
 
@@ -83,10 +87,19 @@ Actions are classified to archetypes via three layers, in order:
 Each archetype maintains a rolling score:
 
 ```
-effective_score = lifetime_score * 0.35 + last_30d_score * 0.65
+effective_score = lifetime_score * 0.20 + last_30d_score * 0.80
 ```
 
-Recent behavior steers specialization. A user pivoting from DevOps to marketing will see their dominant archetype shift over weeks.
+Re-tuned from the previous 35/65 split: recent activity now dominates the
+lifetime sum so real career pivots are recognized in **weeks, not months**.
+A user pivoting from DevOps to marketing will see their dominant archetype
+shift well within a single 30-day window.
+
+The "is there a clear leader" check used by surfaces (heartbeat seeds,
+memory consolidation, skill priority) lives in
+`crates/core/src/evolution/scorer.rs::dominant_for_surfaces`, gated on a
+single shared `DOMINANCE_THRESHOLD = 1.3`. One knob — if runaway
+specialization is observed, raise it everywhere at once.
 
 ---
 
@@ -118,9 +131,15 @@ Fallback names follow a simple `{Archetype} Borg` pattern. Both stages share the
 | Tinkerer | **Tinkerer Borg** |
 | Marketer | **Marketer Borg** |
 
-Source: `crates/core/src/evolution/classification.rs`.
+When no archetype clearly leads (top < `DOMINANCE_THRESHOLD` × runner-up),
+the fallback is a hybrid: `{Primary}-{Secondary} Hybrid Borg` (e.g.
+"Builder-Marketer Hybrid Borg"). Source:
+`crates/core/src/evolution/classification.rs::fallback_hybrid_name`.
 
-The evolution name is permanent — it's recorded in the `evolution_events` ledger and stays part of the agent's history even if the dominant archetype later drifts.
+The evolution name is recorded in the `evolution_events` ledger. If the
+dominant archetype drifts and stays stably different from the name's
+archetype for ≥ 14 days, a re-mint event can update the displayed name —
+ledger history is preserved.
 
 ---
 
@@ -134,13 +153,27 @@ Each class has its own level progression with an exponential XP curve.
 xp_for_level(stage, n) = stage_base + floor(n ^ stage_curve)
 ```
 
-| Stage | Base | Curve | Lvl.1 cost | Lvl.50 cost | Lvl.99 cost | Target duration |
-|-------|------|-------|------------|-------------|-------------|-----------------|
-| 1 (Base) | 20 | 1.4 | 21 XP | 259 XP | 642 XP | 2–5 days |
-| 2 (Evolved) | 40 | 1.55 | 41 XP | 469 XP | 1,279 XP | 6–12 months |
-| 3 (Final) | 80 | 1.8 | 81 XP | 1,223 XP | 3,989 XP | 1–2+ years |
+| Stage | Base | Curve | Lvl.1 cost | Lvl.50 cost | Lvl.99 cost | Cap |
+|-------|------|-------|------------|-------------|-------------|-----|
+| 1 (Base) | 20 | 1.4 | 21 XP | 259 XP | 642 XP | Lvl.99 |
+| 2 (Evolved) | 40 | 1.55 | 41 XP | 469 XP | 1,279 XP | Lvl.99 |
+| 3 (Final) | 80 | 1.8 | 81 XP | 1,223 XP | 3,989 XP | **none** |
 
-Hard cap: level 99. Source: `crates/core/src/evolution/xp.rs`.
+Final stage past Lvl.99 is piecewise: each level costs a flat **50 XP**
+(`FINAL_POST_99_LEVEL_COST`). Triggers the `Ascending` mood and unlocks
+post-99 milestones every 25 levels (`level_125_final`, `level_150_final`, …).
+Source: `crates/core/src/evolution/xp.rs`.
+
+### Plan-mode XP
+
+Plan mode used to earn ~⅓ the XP rate of Execute mode because the creation
+events that drive +2/+3 awards (`apply_patch`, `write_memory`) are blocked.
+A `plan_emission` award fixes this: when the agent emits a `<proposed_plan>`
+block in Plan mode, **+2 base / +3 if the plan's archetype matches the
+dominant archetype** is awarded once per session. Plan-text is classified
+against the same keyword tables as shell commands. Per-session cap:
+`record_plan_emission` rejects subsequent emissions in the same session.
+Source: `crates/core/src/evolution/plan_emission.rs`.
 
 ### XP Awarded per Action
 
@@ -178,29 +211,42 @@ Enforced during both write and replay:
 
 ### Stage 1 → Stage 2 (Base → Evolved)
 
-All four hard gates must pass simultaneously:
+All hard gates must pass simultaneously:
 
 | Requirement | Threshold |
 |-------------|-----------|
 | Level | Lvl.99 at Stage 1 |
 | Bond score | ≥ 30 |
 | Minimum vital | Every vital ≥ 20 |
-| Dominant archetype | Top score ≥ 1.3× runner-up (or runner-up = 0) |
+
+The previous version also required the dominant archetype to score
+≥ 1.3× runner-up — this locked generalists (the modal indie/founder user)
+out of the first transition entirely. The dominance ratio is **no longer a
+hard gate at any stage**; it survives as the surfaces query (heartbeat /
+memory / skills) only.
 
 ### Stage 2 → Stage 3 (Evolved → Final)
 
-All four hard gates must pass simultaneously:
+Tri-state result (`GateState::{Pass, Fail, Deferred}`):
 
 | Requirement | Threshold |
 |-------------|-----------|
-| Level | Lvl.99 at Stage 2 |
+| Level | **Lvl.80** at Stage 2 (was Lvl.99) |
 | Bond score | ≥ 55 |
-| Correction rate | < 20% over the last 14 days (corrections + negative sentiment ÷ total vitals events) |
 | Archetype stability | Dominant archetype unchanged for ≥ 14 days |
+| Vitals signal floor | ≥ 50 vitals events in 14d (else `Deferred`) |
+| Correction rate | < 20% over the last 14 days (only evaluated past the floor) |
+
+`Deferred` covers the "not enough signal yet" case: with fewer than 50
+vitals events in the 14-day window, a single correction is 25% and would
+falsely fail the gate forever. Surfaces render `Deferred` as
+"need N more events for signal", not "failed".
 
 ### Final Form (Stage 3)
 
-No further evolution. Reaching Lvl.99 in Final Form represents true mastery. The exponential XP curve ensures the last 20 levels feel like a genuine achievement.
+No further evolution at the stage level — but the Final stage no longer caps
+at Lvl.99. Levels past 99 are piecewise (50 XP each), `Ascending` mood is
+unlocked, and post-99 milestones fire every 25 levels.
 
 Source: `crates/core/src/evolution/mod.rs`.
 
@@ -258,18 +304,35 @@ Windows: last 7 days vs. 7–14 days ago. Archetypes absent from both windows ar
 
 ## What Evolution Unlocks
 
-### Identity Injection
+### Where archetype actually shows up
 
-Evolution context is injected into the system prompt each turn:
+The agent's **in-task behavior is unaffected by archetype** — an Ops Borg
+asked to draft a marketing email writes a marketing email, not a runbook.
+Per-turn `<evolution_context>` injection was removed because archetype claims
+at request time miscast the agent on cross-domain tasks.
 
-```xml
-<evolution_context>
+Archetype influences proactive surfaces only:
+
+- **Heartbeat seeds** — when there's a clear dominant archetype (top score
+  ≥ `DOMINANCE_THRESHOLD` × runner-up), heartbeat nudges can prefer
+  archetype-relevant topics.
+- **Memory consolidation** — the nightly/weekly consolidation prompt
+  weights archetype-relevant content when the dominance ratio is clear.
+- **Skill priority** — under token budget, archetype-relevant skills get a
+  +1.0 priority tiebreaker. Task-relevant skills always load.
+- **Evolution naming** — the LLM uses dominant archetype to mint the name
+  shown in status surfaces; with a hybrid (no clear leader) it produces a
+  combined name like "Builder-Marketer Hybrid".
+
+Status displays format the current state for surface rendering:
+
+```
 Stage: Evolved | Ops Borg Lvl.42
 Archetype: Ops (score: 74)
-</evolution_context>
 ```
 
-The `Archetype:` line is omitted when there is no dominant archetype yet. An Ops-specialized agent defaults to infrastructure-oriented solutions and proactively flags DevOps concerns.
+Source: `crates/core/src/evolution/scorer.rs` (dominance threshold),
+`crates/core/src/evolution/format.rs` (status rendering).
 
 ### Cosmetic
 

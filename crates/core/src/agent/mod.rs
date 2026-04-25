@@ -2008,9 +2008,37 @@ Rules:
         } else {
             tracing::debug!("Skipping persistence of empty assistant response");
         }
+        self.maybe_record_plan_emission(text_content);
         self.auto_save();
         self.metrics.agent_turns.add(1, &[]);
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
+    }
+
+    /// Award plan-emission XP when in Plan mode and the response carries a
+    /// `<proposed_plan>` block. Per-session cap lives in
+    /// `evolution::plan_emission::record_plan_emission` (DB-backed via
+    /// `EXISTS` over evolution_events.metadata_json).
+    fn maybe_record_plan_emission(&self, text_content: &str) {
+        if self.config.conversation.collaboration_mode != crate::config::CollaborationMode::Plan {
+            return;
+        }
+        if !(text_content.contains("<proposed_plan>") && text_content.contains("</proposed_plan>"))
+        {
+            return;
+        }
+        let session_id = self.session.meta.id.clone();
+        let guard = self.db_guard();
+        let Some(db) = guard.as_ref() else {
+            tracing::debug!("plan_emission: no DB available, skipping");
+            return;
+        };
+        match crate::evolution::plan_emission::record_plan_emission(db, &session_id, text_content) {
+            Ok(true) => tracing::debug!("plan_emission: recorded for session {session_id}"),
+            Ok(false) => {
+                tracing::debug!("plan_emission: already recorded for session {session_id}")
+            }
+            Err(e) => tracing::warn!("plan_emission: failed to record: {e}"),
+        }
     }
 
     /// Handle a text-only LLM response (no tool calls). Either terminates the

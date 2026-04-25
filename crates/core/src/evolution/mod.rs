@@ -16,6 +16,7 @@ mod format;
 mod helpers;
 mod hmac;
 mod milestones;
+pub mod plan_emission;
 mod replay;
 pub mod share_card;
 
@@ -328,8 +329,9 @@ pub struct EvolutionState {
     /// LLM-generated evolution description (set on stage transition).
     pub evolution_description: Option<String>,
     /// Effective XP score per archetype, computed as
-    /// `lifetime * 0.35 + last_30d * 0.65` and rounded to u32.
-    /// This is what drives dominant-archetype selection and the 1.3× gate.
+    /// `lifetime * 0.20 + last_30d * 0.80` and rounded to u32.
+    /// This is what drives dominant-archetype selection and surfaces that
+    /// gate on `DOMINANCE_THRESHOLD`.
     pub archetype_scores: HashMap<Archetype, u32>,
     /// Raw lifetime score per archetype (all verified xp_gain events).
     pub lifetime_scores: HashMap<Archetype, u32>,
@@ -428,7 +430,19 @@ fn dominant_archetype(scores: &HashMap<Archetype, u32>) -> Option<Archetype> {
 
 // ── Evolution Gates ──
 
+/// Ratio at which we treat the top archetype as dominant for surface decisions
+/// (heartbeat seeds, memory consolidation weighting, skill priority tiebreaks,
+/// hybrid vs specialized naming). One knob, used everywhere; if runaway
+/// specialization is observed, raise this single constant.
+pub const DOMINANCE_THRESHOLD: f64 = 1.3;
+
 /// Check if Stage 1→2 evolution gates are met.
+///
+/// The previous implementation also required the dominant archetype to score
+/// ≥ `DOMINANCE_THRESHOLD` × runner-up — this locked generalists out of the
+/// first transition entirely. The dominance ratio is no longer a hard gate at
+/// any stage; it survives only as the query used by surfaces to decide
+/// "is there a clear archetype right now".
 pub fn check_stage1_gates(state: &EvolutionState, bond_score: u8, min_vital: u8) -> bool {
     if state.stage != Stage::Base {
         return false;
@@ -442,46 +456,65 @@ pub fn check_stage1_gates(state: &EvolutionState, bond_score: u8, min_vital: u8)
     if min_vital < 20 {
         return false;
     }
-
-    // Dominant archetype must be ≥ 1.3x runner-up
-    let mut scores: Vec<u32> = state.archetype_scores.values().copied().collect();
-    scores.sort_unstable_by(|a, b| b.cmp(a));
-    if scores.is_empty() || scores[0] == 0 {
-        return false;
-    }
-    let runner_up = if scores.len() > 1 { scores[1] } else { 0 };
-    // Allow evolution if runner_up is 0 (only one archetype used)
-    if runner_up > 0 && (scores[0] as f64) < (runner_up as f64 * 1.3) {
-        return false;
-    }
-
     true
 }
 
+/// Tri-state result for Stage 2→3 gate evaluation.
+///
+/// `Deferred` covers the "not enough signal yet" case: with fewer than
+/// [`STAGE2_MIN_VITALS_EVENTS`] vitals events in the 14-day window, a single
+/// correction can swing correction-rate above 20% and falsely fail the gate.
+/// Surfaces should render `Deferred` as "need N more events", not "failed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateState {
+    /// All gates satisfied — transition is allowed.
+    Pass,
+    /// One or more gates failed.
+    Fail,
+    /// Insufficient signal to evaluate (not enough vitals events yet).
+    Deferred,
+}
+
+/// Minimum vitals events in the 14-day window before correction-rate is trusted.
+pub const STAGE2_MIN_VITALS_EVENTS: u32 = 50;
+
 /// Check if Stage 2→3 evolution gates are met.
+///
+/// Returns [`GateState::Deferred`] when fewer than [`STAGE2_MIN_VITALS_EVENTS`]
+/// vitals events have been recorded in the 14-day window — there isn't enough
+/// signal to evaluate the correction-rate gate without false-positives. This
+/// replaced the old bool return that conflated "not enough data" with "failed".
 pub fn check_stage2_gates(
     state: &EvolutionState,
     bond_score: u8,
     correction_rate: f64,
     archetype_stable_days: u32,
-) -> bool {
+    vitals_events_total: u32,
+) -> GateState {
     if state.stage != Stage::Evolved {
-        return false;
+        return GateState::Fail;
     }
-    if state.level < 99 {
-        return false;
+    // Lowered from 99 → 80 in the Final-stage rework: the n^1.8 curve made
+    // 99 a 6–12 month grind, well past the engagement cliff for active users
+    // who'd already demonstrated the other gates' mastery (bond ≥ 55,
+    // correction rate < 20%, archetype stable ≥ 14 days). Lvl.99 in Stage 2
+    // remains as the `level_99_evolved` milestone for completionists.
+    if state.level < 80 {
+        return GateState::Fail;
     }
     if bond_score < 55 {
-        return false;
-    }
-    if correction_rate >= 0.20 {
-        return false;
+        return GateState::Fail;
     }
     if archetype_stable_days < 14 {
-        return false;
+        return GateState::Fail;
     }
-
-    true
+    if vitals_events_total < STAGE2_MIN_VITALS_EVENTS {
+        return GateState::Deferred;
+    }
+    if correction_rate >= 0.20 {
+        return GateState::Fail;
+    }
+    GateState::Pass
 }
 
 /// Compute how many consecutive days the dominant archetype has been stable.
@@ -776,25 +809,39 @@ impl EvolutionHook {
                 // Compute correction rate from vitals events (last 14 days)
                 // Includes both corrections and negative sentiment
                 let fourteen_days_ago = chrono::Utc::now().timestamp() - 14 * 86400;
-                let (corrections, total) = db
+                let (corrections, total) = match db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "correction")
-                    .unwrap_or((0, 1));
-                let negatives = db
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!("evolution: count corrections failed: {e}");
+                        (0, 0)
+                    }
+                };
+                let negatives = match db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "negative_sentiment")
-                    .map(|(n, _)| n)
-                    .unwrap_or(0);
+                {
+                    Ok((n, _)) => n,
+                    Err(e) => {
+                        tracing::warn!("evolution: count negative_sentiment failed: {e}");
+                        0
+                    }
+                };
                 let correction_rate = if total > 0 {
                     (corrections + negatives) as f64 / total as f64
                 } else {
                     0.0
                 };
-                // Approximate archetype stable days from first event with current dominant archetype
                 let archetype_stable_days = compute_archetype_stable_days(db);
-                check_stage2_gates(
-                    &evo_state,
-                    bond_state.score,
-                    correction_rate,
-                    archetype_stable_days,
+                matches!(
+                    check_stage2_gates(
+                        &evo_state,
+                        bond_state.score,
+                        correction_rate,
+                        archetype_stable_days,
+                        total,
+                    ),
+                    GateState::Pass
                 )
             }
             Stage::Final => false,
@@ -918,16 +965,6 @@ impl EvolutionHook {
         }
     }
 
-    fn evolution_context(&self) -> String {
-        let Ok(db) = self.db.lock() else {
-            return String::new();
-        };
-        match db.get_evolution_state() {
-            Ok(state) => format_evolution_context(&state),
-            Err(_) => String::new(),
-        }
-    }
-
     /// Snapshot the current `Mood` by opening the DB and replaying vitals +
     /// bond + evolution state. Returns `None` if any load fails — callers
     /// treat that as "no transition to emit".
@@ -974,12 +1011,13 @@ impl Hook for EvolutionHook {
     }
 
     fn points(&self) -> &[HookPoint] {
-        &[
-            HookPoint::SessionStart,
-            HookPoint::BeforeAgentStart,
-            HookPoint::BeforeLlmCall,
-            HookPoint::AfterToolCall,
-        ]
+        // Per-turn `<evolution_context>` injection on BeforeAgentStart /
+        // BeforeLlmCall was removed: archetype claims at request time miscast
+        // the agent on cross-domain tasks, and the surfaces that actually
+        // benefit from archetype context (heartbeat seeds, memory
+        // consolidation, skill priority) read evolution state directly.
+        // `format_evolution_context` is still used by status surfaces.
+        &[HookPoint::SessionStart, HookPoint::AfterToolCall]
     }
 
     fn execute(&self, ctx: &HookContext) -> HookAction {
@@ -991,17 +1029,8 @@ impl Hook for EvolutionHook {
                 // Record interaction XP
                 self.record_xp("session_start", None, BASE_XP_INTERACTION);
             }
-            HookData::AgentStart { .. } => {
-                let context = self.evolution_context();
-                if !context.is_empty() {
-                    return HookAction::InjectContext(context);
-                }
-            }
-            HookData::LlmCall { .. } => {
-                let context = self.evolution_context();
-                if !context.is_empty() {
-                    return HookAction::InjectContext(context);
-                }
+            HookData::AgentStart { .. } | HookData::LlmCall { .. } => {
+                // No-op: see `points()` for why per-turn injection was removed.
             }
             HookData::ToolResult {
                 name,
@@ -1669,12 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn stage1_gates_fail_close_archetypes() {
+    fn stage1_gates_pass_for_generalist() {
+        // Regression: the old implementation required the dominant archetype
+        // to be ≥ 1.3x runner-up, which locked generalists out of Stage 1→2
+        // entirely. After the rework, a generalist with two roughly equal
+        // archetypes (100 vs 90) must pass once level/bond/vital are satisfied.
         let mut scores = HashMap::new();
         scores.insert(Archetype::Ops, 100);
-        scores.insert(Archetype::Builder, 90); // too close (100/90 < 1.3)
+        scores.insert(Archetype::Builder, 90);
         let state = make_state_at_level(Stage::Base, 99, scores);
-        assert!(!check_stage1_gates(&state, 30, 20));
+        assert!(check_stage1_gates(&state, 30, 20));
     }
 
     #[test]
@@ -1682,7 +1715,10 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(Archetype::Ops, 200);
         let state = make_state_at_level(Stage::Evolved, 99, scores);
-        assert!(check_stage2_gates(&state, 55, 0.10, 30));
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.10, 30, 80),
+            GateState::Pass
+        );
     }
 
     #[test]
@@ -1690,7 +1726,10 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(Archetype::Ops, 200);
         let state = make_state_at_level(Stage::Evolved, 99, scores);
-        assert!(!check_stage2_gates(&state, 55, 0.25, 30)); // correction too high
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.25, 30, 80),
+            GateState::Fail
+        );
     }
 
     #[test]
@@ -1698,7 +1737,46 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(Archetype::Ops, 200);
         let state = make_state_at_level(Stage::Evolved, 99, scores);
-        assert!(!check_stage2_gates(&state, 55, 0.10, 10)); // only 10 days stable
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.10, 10, 80),
+            GateState::Fail
+        );
+    }
+
+    #[test]
+    fn stage2_gates_pass_at_level_80() {
+        let mut scores = HashMap::new();
+        scores.insert(Archetype::Ops, 200);
+        let state = make_state_at_level(Stage::Evolved, 80, scores);
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.10, 30, 80),
+            GateState::Pass
+        );
+    }
+
+    #[test]
+    fn stage2_gates_fail_below_level_80() {
+        let mut scores = HashMap::new();
+        scores.insert(Archetype::Ops, 200);
+        let state = make_state_at_level(Stage::Evolved, 79, scores);
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.10, 30, 80),
+            GateState::Fail
+        );
+    }
+
+    #[test]
+    fn stage2_gates_deferred_when_vitals_thin() {
+        // Regression: with only 4 vitals events in 14d, a single correction is
+        // 25% — under the old bool-returning gate the user would silently fail
+        // forever. Now we surface `Deferred` so the user is told to keep going.
+        let mut scores = HashMap::new();
+        scores.insert(Archetype::Ops, 200);
+        let state = make_state_at_level(Stage::Evolved, 99, scores);
+        assert_eq!(
+            check_stage2_gates(&state, 55, 0.25, 30, 4),
+            GateState::Deferred,
+        );
     }
 
     // ── Formatting ──
@@ -1871,12 +1949,14 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert(Archetype::Ops, 200);
         let state = make_state_at_level(Stage::Evolved, 99, scores);
-        assert!(
-            check_stage2_gates(&state, 60, 0.10, 30),
+        assert_eq!(
+            check_stage2_gates(&state, 60, 0.10, 30, 80),
+            GateState::Pass,
             "low correction rate should pass"
         );
-        assert!(
-            !check_stage2_gates(&state, 60, 0.25, 30),
+        assert_eq!(
+            check_stage2_gates(&state, 60, 0.25, 30, 80),
+            GateState::Fail,
             "high correction rate should fail"
         );
     }
@@ -2854,7 +2934,7 @@ mod tests {
     #[test]
     fn time_weighted_scoring_prefers_recent_when_in_window() {
         // Ops dominates lifetime (12 old events), Builder dominates last 30d (3 recent events).
-        // With weights 0.35/0.65, effective should favor Builder.
+        // With weights 0.20/0.80, effective should favor Builder.
         let now = 1_700_000_000i64;
         let old_ts = now - 90 * 86_400; // way outside 30d window
         let recent_ts = now - 5 * 86_400;
@@ -2890,8 +2970,8 @@ mod tests {
             events.push(e);
         }
         let state = replay_events_with_key_at(EVOLUTION_HMAC_LEGACY, &events, now);
-        // Builder: lifetime=9, last_30d=9 → effective = 9*0.35 + 9*0.65 = 9
-        // Ops: lifetime=12, last_30d=0 → effective = 12*0.35 = 4.2 → 4
+        // Builder: lifetime=9, last_30d=9 → effective = 9*0.20 + 9*0.80 = 9
+        // Ops: lifetime=12, last_30d=0 → effective = 12*0.20 = 2.4 → 2
         assert_eq!(state.dominant_archetype, Some(Archetype::Builder));
         assert_eq!(*state.lifetime_scores.get(&Archetype::Ops).unwrap(), 12);
         assert_eq!(state.last_30d_scores.get(&Archetype::Ops), None);
@@ -3471,22 +3551,31 @@ mod tests {
     }
 
     #[test]
-    fn hook_agent_start_injects_context() {
+    fn hook_agent_start_does_not_inject_context() {
+        // Regression: per-turn `<evolution_context>` injection was removed in
+        // the evolution rework. Archetype claims at request time miscast the
+        // agent on cross-domain tasks, and the surfaces that need archetype
+        // context (heartbeat / memory / skills) read state directly.
         let db = Database::test_db();
         let hook = EvolutionHook::new_with(db, /* enabled */ true);
-        let ctx = HookContext {
-            point: HookPoint::BeforeAgentStart,
-            session_id: "test".to_string(),
-            turn_count: 0,
-            data: HookData::AgentStart {
-                user_message: "hi".to_string(),
-            },
-        };
-        match hook.execute(&ctx) {
-            HookAction::InjectContext(s) => {
-                assert!(s.contains("<evolution_context>"), "got: {s}");
-            }
-            other => panic!("expected InjectContext, got {other:?}"),
+        for point in [HookPoint::BeforeAgentStart, HookPoint::BeforeLlmCall] {
+            let data = match point {
+                HookPoint::BeforeAgentStart => HookData::AgentStart {
+                    user_message: "hi".to_string(),
+                },
+                HookPoint::BeforeLlmCall => HookData::LlmCall { message_count: 1 },
+                _ => unreachable!(),
+            };
+            let ctx = HookContext {
+                point,
+                session_id: "test".to_string(),
+                turn_count: 0,
+                data,
+            };
+            assert!(
+                matches!(hook.execute(&ctx), HookAction::Continue),
+                "expected Continue at {point:?} after injection removal",
+            );
         }
     }
 

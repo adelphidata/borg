@@ -15,10 +15,12 @@ use super::EVOLUTION_HMAC_LEGACY;
 /// 30-day window in seconds used for time-weighted archetype scoring.
 pub(crate) const WINDOW_30D_SECS: i64 = 30 * 86_400;
 
-/// Weighting: recent activity (last 30d) steers specialization more than lifetime sum.
+/// Weighting: recent activity (last 30d) dominates the lifetime sum so that
+/// real career pivots are recognized in weeks, not months. Re-tuned from the
+/// previous 35/65 split as part of the evolution rework.
 /// Matches `docs/evolution.md#archetype-scoring`.
-pub(crate) const LIFETIME_WEIGHT: f64 = 0.35;
-pub(crate) const LAST_30D_WEIGHT: f64 = 0.65;
+pub(crate) const LIFETIME_WEIGHT: f64 = 0.20;
+pub(crate) const LAST_30D_WEIGHT: f64 = 0.80;
 
 /// Replay verified events from baseline to compute current evolution state.
 /// Verifies HMAC chain and applies rate limits per event type per hour.

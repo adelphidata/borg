@@ -21,8 +21,14 @@ const ARCHETYPE_STABILITY_SECS: i64 = 7 * 86_400;
 /// Bond score threshold for `first_strong_bond`.
 const FIRST_STRONG_BOND_THRESHOLD: u8 = 55;
 
-/// Level thresholds that emit milestones.
+/// Level thresholds that emit milestones up to (and including) Lvl.99.
+/// Past Lvl.99 in Final stage, milestones are generated dynamically every
+/// `POST_99_MILESTONE_STRIDE` levels — see `post_99_thresholds_crossed`.
 const LEVEL_THRESHOLDS: &[u8] = &[10, 25, 50, 75, 99];
+
+/// In Final stage past Lvl.99, fire a milestone every N levels so progression
+/// has rhythm rather than a slow number tick.
+const POST_99_MILESTONE_STRIDE: u8 = 25;
 
 /// A milestone unlocked by the current session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +64,22 @@ pub fn check_milestones(
         for &threshold in LEVEL_THRESHOLDS {
             if prev.level < threshold && next.level >= threshold {
                 let id = format!("level_{threshold}_{stage_label}");
+                if !already_unlocked.contains(&id) {
+                    out.push(Milestone {
+                        id,
+                        title: format!("Lvl.{threshold}"),
+                        archetype: next.dominant_archetype,
+                    });
+                }
+            }
+        }
+
+        // Post-99 milestones in Final stage: every POST_99_MILESTONE_STRIDE
+        // levels past 99 (Lvl.125, 150, 175, …). Final has no level cap so
+        // long-term users keep getting celebrations.
+        if next.stage == Stage::Final {
+            for threshold in post_99_thresholds_crossed(prev.level, next.level) {
+                let id = format!("level_{threshold}_final");
                 if !already_unlocked.contains(&id) {
                     out.push(Milestone {
                         id,
@@ -121,6 +143,36 @@ pub fn check_milestones(
     }
 
     out
+}
+
+/// Yield every post-99 milestone level (Lvl.125, 150, 175, …) crossed by a
+/// level transition `prev_level → next_level`. Returns an empty iterator
+/// when no stride boundary lies in the open-closed interval `(prev, next]`.
+///
+/// Inputs are `u8` but we widen to `u16` internally so a long jump that
+/// would otherwise saturate the threshold past `u8::MAX` (255) doesn't loop
+/// forever at the level cap.
+fn post_99_thresholds_crossed(prev_level: u8, next_level: u8) -> Vec<u8> {
+    // Milestones are multiples of POST_99_MILESTONE_STRIDE starting at 125
+    // (= 99 + stride + 1 rounded up to the next stride multiple). Lvl.100
+    // is *not* a milestone — it's the entry boundary for the post-99
+    // piecewise XP curve, not a celebration tick.
+    if next_level <= 99 {
+        return Vec::new();
+    }
+    let stride = POST_99_MILESTONE_STRIDE as u16;
+    let first: u16 = ((100 / stride) + 1) * stride; // 125 for stride=25
+    let prev = prev_level as u16;
+    let next = next_level as u16;
+    let mut thresholds = Vec::new();
+    let mut t = first;
+    while t <= next && t <= u8::MAX as u16 {
+        if t > prev {
+            thresholds.push(t as u8);
+        }
+        t += stride;
+    }
+    thresholds
 }
 
 /// Stage label matching the string form used elsewhere (base/evolved/final).
@@ -367,6 +419,53 @@ mod tests {
             out.iter().all(|m| m.id != "aligned_streak_7d"),
             "streak should not fire without today's aligned XP; got {out:?}"
         );
+    }
+
+    #[test]
+    fn post_99_milestone_fires_at_125_in_final() {
+        let prev = state(Stage::Final, 124, None);
+        let next = state(Stage::Final, 125, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        assert!(
+            out.iter().any(|m| m.id == "level_125_final"),
+            "expected level_125_final, got {out:?}",
+        );
+    }
+
+    #[test]
+    fn post_99_milestone_does_not_fire_off_stride() {
+        // Crossing Lvl.99→100 is not a milestone — only multiples of 25 past 99.
+        let prev = state(Stage::Final, 99, None);
+        let next = state(Stage::Final, 100, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        assert!(
+            out.iter().all(|m| !m.id.starts_with("level_") || m.id == "level_99_final"
+                /* not crossing the 99 boundary either, but excluded for clarity */),
+            "unexpected post-99 milestone at Lvl.100: {out:?}",
+        );
+    }
+
+    #[test]
+    fn post_99_milestones_only_in_final_stage() {
+        // Base/Evolved cap at 99 so they should never see post-99 milestones
+        // even if the call signature theoretically allows it.
+        let prev = state(Stage::Evolved, 99, None);
+        let next = state(Stage::Evolved, 125, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        assert!(out.iter().all(|m| m.id != "level_125_final"));
+    }
+
+    #[test]
+    fn post_99_milestones_emit_multiple_on_long_jump() {
+        // A user replaying a backlog of XP could cross several post-99
+        // strides in one call. Each must fire.
+        let prev = state(Stage::Final, 100, None);
+        let next = state(Stage::Final, 175, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"level_125_final"), "{ids:?}");
+        assert!(ids.contains(&"level_150_final"), "{ids:?}");
+        assert!(ids.contains(&"level_175_final"), "{ids:?}");
     }
 
     #[test]

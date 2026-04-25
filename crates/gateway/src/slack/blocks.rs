@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn button_omits_optional_fields_when_none() {
-        let value = serde_json::to_value(&button("Go", "a", "v")).unwrap();
+        let value = serde_json::to_value(button("Go", "a", "v")).unwrap();
         let obj = value.as_object().unwrap();
         assert!(!obj.contains_key("style"));
         assert!(!obj.contains_key("url"));
