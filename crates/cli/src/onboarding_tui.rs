@@ -156,6 +156,8 @@ fn random_borg_name() -> String {
 
 const LOGO_HEIGHT: u16 = 8; // includes leading blank line
 
+const PAGE_JUMP: usize = 10;
+
 const SECURITY_TITLE: &str = "SECURITY WARNING - PLEASE READ";
 
 const SECURITY_BODY: &str = "\
@@ -644,16 +646,31 @@ impl OnboardingState {
         let models = models_for_provider(provider_id);
         let model_count = models.len();
 
+        // Navigation arms assume at least one model; confirm/cancel arms are safe.
+        let has_models = model_count > 0;
+
         match key.code {
-            KeyCode::Up => {
+            KeyCode::Up if has_models => {
                 if self.model_index > 0 {
                     self.model_index -= 1;
                 } else {
                     self.model_index = model_count - 1;
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down if has_models => {
                 self.model_index = (self.model_index + 1) % model_count;
+            }
+            KeyCode::PageUp => {
+                self.model_index = self.model_index.saturating_sub(PAGE_JUMP);
+            }
+            KeyCode::PageDown if has_models => {
+                self.model_index = (self.model_index + PAGE_JUMP).min(model_count - 1);
+            }
+            KeyCode::Home => {
+                self.model_index = 0;
+            }
+            KeyCode::End if has_models => {
+                self.model_index = model_count - 1;
             }
             KeyCode::Enter | KeyCode::Tab | KeyCode::Right => {
                 if is_shift_tab(&key) {
@@ -784,6 +801,23 @@ impl OnboardingState {
                 KeyCode::Down => {
                     if !self.channel_items.is_empty() {
                         self.channel_cursor = (self.channel_cursor + 1) % self.channel_items.len();
+                    }
+                }
+                KeyCode::PageUp => {
+                    self.channel_cursor = self.channel_cursor.saturating_sub(PAGE_JUMP);
+                }
+                KeyCode::PageDown => {
+                    if !self.channel_items.is_empty() {
+                        self.channel_cursor =
+                            (self.channel_cursor + PAGE_JUMP).min(self.channel_items.len() - 1);
+                    }
+                }
+                KeyCode::Home => {
+                    self.channel_cursor = 0;
+                }
+                KeyCode::End => {
+                    if !self.channel_items.is_empty() {
+                        self.channel_cursor = self.channel_items.len() - 1;
                     }
                 }
                 KeyCode::Char(' ') => {
@@ -1243,13 +1277,41 @@ fn render_model_selection(frame: &mut ratatui::Frame, area: Rect, state: &Onboar
 
     let mut lines: Vec<Line> = Vec::new();
 
+    let total = models.len();
+    let header = if total > 0 {
+        format!(
+            "Choose a model for {provider_label}  ({}/{})",
+            state.model_index + 1,
+            total
+        )
+    } else {
+        format!("Choose a model for {provider_label}")
+    };
     lines.push(Line::from(Span::styled(
-        format!("Choose a model for {provider_label}"),
+        header,
         Style::default().fg(theme::CYAN),
     )));
     lines.push(Line::default());
 
-    for (i, (_id, label)) in models.iter().enumerate() {
+    // Reserve 2 lines for potential ↑/↓ "more" hint rows so the item viewport
+    // stays stable regardless of scroll position.
+    let header_rows = 2usize;
+    let hint_rows = 2usize;
+    let visible = (area.height as usize)
+        .saturating_sub(header_rows + hint_rows)
+        .max(1);
+    let (offset, end) = visible_window(state.model_index, visible, total);
+
+    if offset > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  ↑ {offset} more"),
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::default());
+    }
+
+    for (i, (_id, label)) in models.iter().enumerate().skip(offset).take(end - offset) {
         let is_selected = i == state.model_index;
         let indicator = if is_selected { "● " } else { "○ " };
         let style = if is_selected {
@@ -1266,7 +1328,34 @@ fn render_model_selection(frame: &mut ratatui::Frame, area: Rect, state: &Onboar
         )));
     }
 
+    if end < total {
+        lines.push(Line::from(Span::styled(
+            format!("  ↓ {} more", total - end),
+            theme::dim(),
+        )));
+    } else {
+        lines.push(Line::default());
+    }
+
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Compute `[offset, end)` so that `cursor` is inside the window of at most
+/// `visible` rows over `total` items. The selected row is anchored to the
+/// nearer edge when scrolling — standard list-box behavior.
+fn visible_window(cursor: usize, visible: usize, total: usize) -> (usize, usize) {
+    if total == 0 || visible == 0 {
+        return (0, 0);
+    }
+    let visible = visible.min(total);
+    // `cursor + 1 - visible` cannot underflow: the branch guards `cursor >= visible`,
+    // so `cursor + 1 >= visible + 1 > visible`. Do not "simplify" without this invariant.
+    let offset = if cursor >= visible {
+        (cursor + 1 - visible).min(total - visible)
+    } else {
+        0
+    };
+    (offset, offset + visible)
 }
 
 fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingState) {
@@ -1284,7 +1373,28 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
             )));
             lines.push(Line::default());
 
-            for (i, item) in state.channel_items.iter().enumerate() {
+            // Viewport: header (3) + hint rows (2) + footer (2) = 7 reserved.
+            let total = state.channel_items.len();
+            let reserved = 7usize;
+            let visible = (area.height as usize).saturating_sub(reserved).max(1);
+            let (offset, end) = visible_window(state.channel_cursor, visible, total);
+
+            if offset > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↑ {offset} more"),
+                    theme::dim(),
+                )));
+            } else {
+                lines.push(Line::default());
+            }
+
+            for (i, item) in state
+                .channel_items
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(end - offset)
+            {
                 let is_selected = i == state.channel_cursor;
                 let check = if item.selected { "[x]" } else { "[ ]" };
 
@@ -1309,6 +1419,15 @@ fn render_channels(frame: &mut ratatui::Frame, area: Rect, state: &OnboardingSta
                 }
 
                 lines.push(Line::from(spans));
+            }
+
+            if end < total {
+                lines.push(Line::from(Span::styled(
+                    format!("  ↓ {} more", total - end),
+                    theme::dim(),
+                )));
+            } else {
+                lines.push(Line::default());
             }
 
             if state.channel_items.is_empty() {
@@ -1863,6 +1982,68 @@ mod tests {
         // Down wraps to first
         state.handle_model_selection_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(state.model_index, 0);
+    }
+
+    #[test]
+    fn model_selection_pagedown_jumps_and_clamps() {
+        let mut state = OnboardingState::new();
+        state.selecting_model = true;
+        state.provider_index = 0;
+        let model_count = models_for_provider("openrouter").len();
+        assert!(model_count > PAGE_JUMP, "need > PAGE_JUMP models to test");
+
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert_eq!(state.model_index, PAGE_JUMP);
+
+        // Repeated PageDown clamps at last index, does not wrap.
+        for _ in 0..model_count {
+            state.handle_model_selection_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert_eq!(state.model_index, model_count - 1);
+
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(state.model_index, model_count - 1 - PAGE_JUMP);
+
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 0);
+
+        // PageUp at 0 clamps (saturating_sub).
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(state.model_index, 0);
+
+        state.handle_model_selection_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.model_index, model_count - 1);
+    }
+
+    #[test]
+    fn visible_window_keeps_cursor_in_view() {
+        // Empty / zero-visible returns empty window.
+        assert_eq!(visible_window(0, 5, 0), (0, 0));
+        assert_eq!(visible_window(3, 0, 10), (0, 0));
+
+        // Cursor at top: window anchors at 0.
+        let (o, e) = visible_window(0, 5, 20);
+        assert_eq!((o, e), (0, 5));
+        assert!((o..e).contains(&0));
+
+        // Cursor inside first page: no scroll.
+        let (o, e) = visible_window(4, 5, 20);
+        assert_eq!((o, e), (0, 5));
+        assert!((o..e).contains(&4));
+
+        // Cursor past first page: anchored to bottom of window.
+        let (o, e) = visible_window(7, 5, 20);
+        assert_eq!((o, e), (3, 8));
+        assert!((o..e).contains(&7));
+
+        // Cursor at last item: window clamps to end.
+        let (o, e) = visible_window(19, 5, 20);
+        assert_eq!((o, e), (15, 20));
+        assert!((o..e).contains(&19));
+
+        // visible >= total: show everything.
+        let (o, e) = visible_window(3, 50, 10);
+        assert_eq!((o, e), (0, 10));
     }
 
     #[test]
