@@ -60,6 +60,14 @@ message OpenResponse {
 message SendRequest {
   string session_id = 1;
   string text = 2;
+  // Optional multimodal attachments. Empty = text-only turn.
+  repeated InlineImage images = 3;
+}
+
+message InlineImage {
+  string mime_type = 1;
+  bytes data = 2; // raw bytes, NOT base64
+  string filename = 3; // optional
 }
 
 message StreamRequest {

@@ -34,6 +34,7 @@ impl SessionBackend for DelayedDeltas {
     async fn run_turn(
         &self,
         _text: String,
+        _images: Vec<borgd::session::backend::InlineImage>,
         event_tx: mpsc::Sender<CoreEvent>,
         _cancel: CancellationToken,
     ) {
@@ -145,6 +146,7 @@ async fn two_clients_subscribed_to_same_session_see_identical_event_streams() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "go".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send")

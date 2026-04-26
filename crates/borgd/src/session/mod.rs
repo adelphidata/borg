@@ -168,7 +168,11 @@ impl SessionHost {
     /// "events with seq > baseline_after_start belong to this turn". Returns
     /// `(cancel_token, baseline_seq_at_start)`. Subscribe to the buffer
     /// before calling and filter `evt.event_seq > baseline_seq_at_start`.
-    pub async fn start_turn(&self, text: String) -> (CancellationToken, u64) {
+    pub async fn start_turn(
+        &self,
+        text: String,
+        images: Vec<backend::InlineImage>,
+    ) -> (CancellationToken, u64) {
         let cancel = CancellationToken::new();
         let inner = self.inner.clone();
         let cancel_for_task = cancel.clone();
@@ -207,7 +211,7 @@ impl SessionHost {
         tokio::spawn(async move {
             inner
                 .backend
-                .run_turn(text, event_tx, cancel_for_task)
+                .run_turn(text, images, event_tx, cancel_for_task)
                 .await;
         });
 
@@ -304,6 +308,7 @@ mod tests {
         async fn run_turn(
             &self,
             _text: String,
+            _images: Vec<backend::InlineImage>,
             event_tx: mpsc::Sender<AgentEvent>,
             cancel: CancellationToken,
         ) {
@@ -361,7 +366,7 @@ mod tests {
         // arrives via subscribe() with strictly increasing seqs.
         let host = SessionHost::new(stub("s1", &["a", "b", "c"], 1));
         let mut rx = host.subscribe();
-        host.start_turn("hi".into()).await;
+        host.start_turn("hi".into(), Vec::new()).await;
         let evts = drain_until_terminal(&mut rx).await;
         let kinds: Vec<&str> = evts
             .iter()
@@ -385,7 +390,7 @@ mod tests {
         // would run to completion ignoring `/cancel`.
         let host = SessionHost::new(stub("s2", &["a", "b", "c", "d", "e"], 200));
         let mut rx = host.subscribe();
-        host.start_turn("go".into()).await;
+        host.start_turn("go".into(), Vec::new()).await;
         // Let one delta land, then cancel.
         let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         let cancel_at = std::time::Instant::now();
@@ -411,7 +416,7 @@ mod tests {
         // miss the next one.
         let host = SessionHost::new(stub("s3", &["a", "b", "c"], 1));
         let mut rx = host.subscribe();
-        host.start_turn("hi".into()).await;
+        host.start_turn("hi".into(), Vec::new()).await;
         drain_until_terminal(&mut rx).await;
         let after_two = host.replay_since(2);
         let kinds: Vec<u64> = after_two.iter().map(|e| e.event_seq).collect();
@@ -440,7 +445,7 @@ mod tests {
         let host = SessionHost::new(stub("s4", &["x", "y"], 1));
         let mut rx_a = host.subscribe();
         let mut rx_b = host.subscribe();
-        host.start_turn("go".into()).await;
+        host.start_turn("go".into(), Vec::new()).await;
         let a = drain_until_terminal(&mut rx_a).await;
         let b = drain_until_terminal(&mut rx_b).await;
         let seqs_a: Vec<u64> = a.iter().map(|e| e.event_seq).collect();

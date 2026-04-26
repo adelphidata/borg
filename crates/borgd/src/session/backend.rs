@@ -33,15 +33,28 @@ pub struct SessionStateSnapshot {
     pub collab_mode: String,
 }
 
+/// One inline image to attach to a multimodal turn.
+#[derive(Debug, Clone)]
+pub struct InlineImage {
+    /// MIME type of the image (e.g. `image/png`).
+    pub mime_type: String,
+    /// Raw image bytes (not base64).
+    pub data: Vec<u8>,
+    /// Optional filename for display.
+    pub filename: Option<String>,
+}
+
 /// Per-session backend that runs one agent turn at a time.
 #[async_trait]
 pub trait SessionBackend: Send + Sync + 'static {
-    /// Run a turn on the user's `text`, streaming `AgentEvent`s through
-    /// `event_tx`. Implementations MUST send `AgentEvent::TurnComplete` (or
-    /// `AgentEvent::Error`) before returning so the gRPC stream can close.
+    /// Run a turn on the user's `text` plus optional inline `images`,
+    /// streaming `AgentEvent`s through `event_tx`. Implementations MUST send
+    /// `AgentEvent::TurnComplete` (or `AgentEvent::Error`) before returning so
+    /// the gRPC stream can close.
     async fn run_turn(
         &self,
         text: String,
+        images: Vec<InlineImage>,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     );
@@ -173,6 +186,7 @@ impl SessionBackend for AgentBackend {
     async fn run_turn(
         &self,
         text: String,
+        images: Vec<InlineImage>,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) {
@@ -192,10 +206,30 @@ impl SessionBackend for AgentBackend {
                 return;
             }
         };
-        if let Err(e) = agent
-            .send_message_with_cancel(&text, event_tx.clone(), cancel)
-            .await
-        {
+
+        let result = if images.is_empty() {
+            agent
+                .send_message_with_cancel(&text, event_tx.clone(), cancel)
+                .await
+        } else {
+            use base64::Engine as _;
+            use borg_core::types::{ContentPart, MediaData, Message};
+            let engine = base64::engine::general_purpose::STANDARD;
+            let mut parts = vec![ContentPart::Text(text)];
+            for img in images {
+                parts.push(ContentPart::ImageBase64 {
+                    media: MediaData {
+                        mime_type: img.mime_type,
+                        data: engine.encode(&img.data),
+                        filename: img.filename,
+                    },
+                });
+            }
+            let msg = Message::user_multimodal(parts);
+            agent.send_message_raw(msg, event_tx.clone(), cancel).await
+        };
+
+        if let Err(e) = result {
             tracing::warn!(session_id = %self.session_id, error = %e, "agent turn failed");
             if let Err(send_err) = event_tx.send(AgentEvent::Error(e.to_string())).await {
                 tracing::warn!(error = %send_err, "failed to surface agent error to client");

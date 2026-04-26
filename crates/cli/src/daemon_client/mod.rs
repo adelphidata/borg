@@ -77,11 +77,23 @@ impl DaemonClient {
         session_id: &str,
         text: &str,
     ) -> Result<Streaming<AgentEvent>> {
+        self.send_message_with_images(session_id, text, Vec::new())
+            .await
+    }
+
+    /// Send a multimodal message (text + inline images).
+    pub async fn send_message_with_images(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: Vec<borg_proto::session::InlineImage>,
+    ) -> Result<Streaming<AgentEvent>> {
         let stream = self
             .session
             .send(SendRequest {
                 session_id: session_id.to_string(),
                 text: text.to_string(),
+                images,
             })
             .await
             .context("Session.Send failed")?

@@ -97,7 +97,16 @@ impl Session for SessionSvc {
         // above that baseline, which is what `Send` semantically promises
         // ("events for THIS turn").
         let mut rx = host.subscribe();
-        let (_cancel, baseline_seq) = host.start_turn(req.text).await;
+        let images = req
+            .images
+            .into_iter()
+            .map(|i| crate::session::backend::InlineImage {
+                mime_type: i.mime_type,
+                data: i.data,
+                filename: (!i.filename.is_empty()).then_some(i.filename),
+            })
+            .collect();
+        let (_cancel, baseline_seq) = host.start_turn(req.text, images).await;
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {

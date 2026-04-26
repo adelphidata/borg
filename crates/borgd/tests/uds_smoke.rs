@@ -72,6 +72,7 @@ impl SessionBackend for ScriptedBackend {
     async fn run_turn(
         &self,
         text: String,
+        _images: Vec<borgd::session::backend::InlineImage>,
         event_tx: mpsc::Sender<CoreEvent>,
         cancel: CancellationToken,
     ) {
@@ -204,6 +205,7 @@ async fn open_send_streams_deltas_and_terminates_on_turn_complete() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "go".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send ok")
@@ -263,6 +265,7 @@ async fn cancel_during_turn_aborts_within_500ms_and_emits_error() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "long".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send ok")
@@ -326,6 +329,7 @@ async fn stream_resume_after_disconnect_replays_missed_events_with_no_dupes() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "go".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send ok")
@@ -420,6 +424,7 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "delete".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send ok")
@@ -493,6 +498,7 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "first".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send 0")
@@ -512,6 +518,7 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
         .send(SendRequest {
             session_id: opened.session_id.clone(),
             text: "second".into(),
+            images: Vec::new(),
         })
         .await
         .expect("send 1")
