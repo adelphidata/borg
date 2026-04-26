@@ -88,12 +88,13 @@ impl Session for SessionSvc {
         let host = self.host_or_err(&req.session_id)?;
 
         // Subscribe BEFORE starting the turn so we can't miss the first event.
-        // We also remember the highest seq already buffered; the per-turn
-        // stream only forwards events strictly above that mark, which is
-        // what `Send` semantically promises ("events for THIS turn").
+        // `start_turn` returns the baseline seq sampled atomically *after*
+        // the prior forwarder finished draining — see `SessionHost::start_turn`
+        // for why that matters. We then forward only events with seq strictly
+        // above that baseline, which is what `Send` semantically promises
+        // ("events for THIS turn").
         let mut rx = host.subscribe();
-        let baseline_seq = host.last_event_seq();
-        host.start_turn(req.text).await;
+        let (_cancel, baseline_seq) = host.start_turn(req.text).await;
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {

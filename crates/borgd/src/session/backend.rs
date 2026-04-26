@@ -51,18 +51,25 @@ impl AgentBackend {
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics)?;
 
-        if let Ok(vitals_hook) = borg_core::vitals::VitalsHook::new() {
-            agent.hook_registry_mut().register(Box::new(vitals_hook));
+        // Register the same hook set the in-process REPL/TUI uses. Failed
+        // registration is non-fatal — log so operators can debug "why is XP
+        // not advancing" rather than have it silently drop.
+        match borg_core::vitals::VitalsHook::new() {
+            Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
+            Err(e) => tracing::warn!(error = %e, "vitals hook unavailable"),
         }
-        if let Ok(activity_hook) = borg_core::activity_log::ActivityHook::new() {
-            agent.hook_registry_mut().register(Box::new(activity_hook));
+        match borg_core::activity_log::ActivityHook::new() {
+            Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
+            Err(e) => tracing::warn!(error = %e, "activity_log hook unavailable"),
         }
-        if let Ok(bond_hook) = borg_core::bond::BondHook::new() {
-            agent.hook_registry_mut().register(Box::new(bond_hook));
+        match borg_core::bond::BondHook::new() {
+            Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
+            Err(e) => tracing::warn!(error = %e, "bond hook unavailable"),
         }
         if agent.config().evolution.enabled {
-            if let Ok(evolution_hook) = borg_core::evolution::EvolutionHook::new() {
-                agent.hook_registry_mut().register(Box::new(evolution_hook));
+            match borg_core::evolution::EvolutionHook::new() {
+                Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
+                Err(e) => tracing::warn!(error = %e, "evolution hook unavailable"),
             }
         }
         for hook in borg_core::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
@@ -92,13 +99,30 @@ impl SessionBackend for AgentBackend {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) {
-        let mut agent = self.agent.lock().await;
+        // Reject overlapping turns explicitly rather than silently queuing on
+        // an async lock — a hung second `Send` is indistinguishable from a
+        // crashed daemon for the user. SessionHost serializes turns at a
+        // higher level, so this branch only fires when the protocol is
+        // misused (concurrent Send to the same session_id).
+        let mut agent = match self.agent.try_lock() {
+            Ok(a) => a,
+            Err(_) => {
+                let msg = "another turn is already in flight for this session";
+                tracing::warn!(session_id = %self.session_id, "{msg}");
+                if let Err(e) = event_tx.send(AgentEvent::Error(msg.into())).await {
+                    tracing::warn!(error = %e, "failed to surface concurrent-turn error");
+                }
+                return;
+            }
+        };
         if let Err(e) = agent
             .send_message_with_cancel(&text, event_tx.clone(), cancel)
             .await
         {
             tracing::warn!(session_id = %self.session_id, error = %e, "agent turn failed");
-            let _ = event_tx.send(AgentEvent::Error(e.to_string())).await;
+            if let Err(send_err) = event_tx.send(AgentEvent::Error(e.to_string())).await {
+                tracing::warn!(error = %send_err, "failed to surface agent error to client");
+            }
         }
     }
 

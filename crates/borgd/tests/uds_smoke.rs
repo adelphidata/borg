@@ -455,6 +455,90 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
 }
 
 #[tokio::test]
+async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
+    // Real failure mode (fixed in this commit): if the per-turn baseline_seq
+    // were captured BEFORE start_turn, the second Send's stream could include
+    // a tail event from the first turn (or, depending on timing, miss the
+    // second turn's first event). Asserts strict disjointness.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counter_in = counter.clone();
+    let backend = ScriptedBackend::new("seq", move |text, tx, _cancel| {
+        let n = counter_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            // Each turn emits a deterministic prefix so we can attribute
+            // events to a specific Send call after the fact.
+            let prefix = format!("turn{n}:{text}/");
+            for c in ["a", "b", "c"] {
+                let _ = tx.send(CoreEvent::TextDelta(format!("{prefix}{c}"))).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx.send(CoreEvent::TurnComplete).await;
+        })
+    });
+    let factory = StubFactory::new(backend);
+    let (socket, _shutdown) = spawn_session_service(tmp.path(), factory).await;
+
+    let mut client = SessionClient::new(uds_channel(socket).await);
+    let opened = client
+        .open(OpenRequest {
+            resume_id: String::new(),
+        })
+        .await
+        .expect("open ok")
+        .into_inner();
+
+    // Drive turn 0 and collect.
+    let mut s0 = client
+        .send(SendRequest {
+            session_id: opened.session_id.clone(),
+            text: "first".into(),
+        })
+        .await
+        .expect("send 0")
+        .into_inner();
+    let mut texts0 = Vec::new();
+    while let Some(item) = s0.next().await {
+        let evt = item.expect("evt");
+        match evt.kind {
+            Some(Kind::TextDelta(d)) => texts0.push(d.text),
+            Some(Kind::TurnComplete(_)) => break,
+            _ => {}
+        }
+    }
+
+    // Now turn 1.
+    let mut s1 = client
+        .send(SendRequest {
+            session_id: opened.session_id.clone(),
+            text: "second".into(),
+        })
+        .await
+        .expect("send 1")
+        .into_inner();
+    let mut texts1 = Vec::new();
+    while let Some(item) = s1.next().await {
+        let evt = item.expect("evt");
+        match evt.kind {
+            Some(Kind::TextDelta(d)) => texts1.push(d.text),
+            Some(Kind::TurnComplete(_)) => break,
+            _ => {}
+        }
+    }
+
+    assert!(
+        texts0.iter().all(|t| t.starts_with("turn0:first/")),
+        "turn 0 stream must contain only turn-0 events, got {texts0:?}"
+    );
+    assert!(
+        texts1.iter().all(|t| t.starts_with("turn1:second/")),
+        "turn 1 stream must contain only turn-1 events (no leak from turn 0), got {texts1:?}"
+    );
+    assert_eq!(texts0.len(), 3);
+    assert_eq!(texts1.len(), 3);
+}
+
+#[tokio::test]
 async fn close_returns_not_found_for_unknown_session() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let backend = ScriptedBackend::new("s5", |_t, tx, _c| {

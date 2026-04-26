@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
@@ -99,16 +99,14 @@ pub(crate) async fn run_poke() -> Result<()> {
     let socket = crate::daemon_client::default_socket_path();
     if socket.exists() {
         match crate::daemon_client::connect(Some(&socket)).await {
-            Ok(mut client) => match client.poke().await {
-                Ok(()) => {
-                    println!("Poke signal sent.");
-                    return Ok(());
-                }
-                Err(e) => {
-                    eprintln!("borgd reachable but Admin.Poke failed: {e:#}");
-                    return Ok(());
-                }
-            },
+            Ok(mut client) => {
+                // Propagate the gRPC error rather than print-and-return-Ok —
+                // the CLI exit code is the user's only signal that the poke
+                // didn't actually fire.
+                client.poke().await.context("Admin.Poke via borgd")?;
+                println!("Poke signal sent.");
+                return Ok(());
+            }
             Err(e) => eprintln!("borgd socket present but connect failed: {e:#}"),
         }
     }

@@ -25,6 +25,7 @@ use prompts::PromptRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// One live conversation. Cheap-to-clone — wraps an `Arc<Inner>`.
@@ -38,9 +39,21 @@ struct HostInner {
     backend: Arc<dyn SessionBackend>,
     buffer: SequencedBuffer,
     prompts: Arc<PromptRegistry>,
-    /// Cancellation token for the *current* in-flight turn (or a never-fired
-    /// fresh token between turns). Replaced on every `Session.Send`.
-    current_turn_cancel: AsyncMutex<CancellationToken>,
+    /// All mutable per-turn state that must be swapped atomically when a new
+    /// turn starts: cancel token + a join handle on the prior turn's
+    /// forwarder. Held under one mutex so `start_turn` can serialize a new
+    /// turn against the prior one's drain (no event-leak between turns).
+    turn_state: AsyncMutex<TurnState>,
+}
+
+struct TurnState {
+    cancel: CancellationToken,
+    /// Awaited at the start of the next turn so the prior forwarder finishes
+    /// pushing its events into the buffer before this turn's baseline is
+    /// captured. Without this, `Session.Send`'s "events for THIS turn" filter
+    /// could either include prior-turn tail events or skip early-this-turn
+    /// events, depending on scheduling.
+    forwarder: Option<JoinHandle<()>>,
 }
 
 impl SessionHost {
@@ -53,7 +66,10 @@ impl SessionHost {
                 backend,
                 buffer: SequencedBuffer::new(),
                 prompts: Arc::new(PromptRegistry::default()),
-                current_turn_cancel: AsyncMutex::new(CancellationToken::new()),
+                turn_state: AsyncMutex::new(TurnState {
+                    cancel: CancellationToken::new(),
+                    forwarder: None,
+                }),
             }),
         }
     }
@@ -89,38 +105,58 @@ impl SessionHost {
 
     /// Cancel the in-flight turn (if any). No-op when between turns.
     pub async fn cancel_turn(&self) {
-        let token = self.inner.current_turn_cancel.lock().await.clone();
+        let token = self.inner.turn_state.lock().await.cancel.clone();
         token.cancel();
     }
 
-    /// Drop every parked prompt — invoked when the session is being closed
-    /// so any waiting agent task unblocks promptly.
-    pub fn close(&self) {
+    /// Cancel the in-flight turn AND drop every parked prompt. Invoked when
+    /// the session is being closed or replaced so any waiting agent task
+    /// unblocks promptly and the next turn (if any) starts clean.
+    pub async fn close(&self) {
+        let token = self.inner.turn_state.lock().await.cancel.clone();
+        token.cancel();
         self.inner.prompts.clear();
     }
 
-    /// Run a single turn. Returns immediately after spawning the worker; the
-    /// caller observes events via [`Self::subscribe`] (and/or the buffer).
-    /// Returns the `CancellationToken` controlling this turn.
-    pub async fn start_turn(&self, text: String) -> CancellationToken {
+    /// Start a turn. Awaits the prior turn's forwarder draining into the
+    /// buffer before installing this turn's state — that's how we guarantee
+    /// "events with seq > baseline_after_start belong to this turn". Returns
+    /// `(cancel_token, baseline_seq_at_start)`. Subscribe to the buffer
+    /// before calling and filter `evt.event_seq > baseline_seq_at_start`.
+    pub async fn start_turn(&self, text: String) -> (CancellationToken, u64) {
         let cancel = CancellationToken::new();
-        {
-            let mut slot = self.inner.current_turn_cancel.lock().await;
-            *slot = cancel.clone();
-        }
-
         let inner = self.inner.clone();
         let cancel_for_task = cancel.clone();
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
 
-        // Forwarder: stamp + broadcast each core event as a proto event.
+        // Forwarder: stamp + broadcast each core event as a proto event. The
+        // task exits when ALL `event_tx` clones drop — see `AgentBackend`'s
+        // `run_turn` for the senders that hold this open.
         let inner_fwd = inner.clone();
-        tokio::spawn(async move {
+        let forwarder = tokio::spawn(async move {
             while let Some(evt) = event_rx.recv().await {
                 let proto = convert::to_proto(evt, &inner_fwd.prompts);
                 inner_fwd.buffer.push(proto);
             }
         });
+
+        // Critical section: await prior forwarder's drain, install our turn
+        // state, capture baseline seq — all under the same mutex so a
+        // concurrent `Send`/`Cancel`/`close` can't observe a half-installed
+        // state. The await on `prior_forwarder` may block if the previous
+        // turn's backend is still running; that's intentional — turns are
+        // serialized per session.
+        let baseline = {
+            let mut state = inner.turn_state.lock().await;
+            if let Some(prior) = state.forwarder.take() {
+                if let Err(e) = prior.await {
+                    tracing::warn!(error = %e, "prior turn's forwarder join failed");
+                }
+            }
+            state.cancel = cancel.clone();
+            state.forwarder = Some(forwarder);
+            inner.buffer.last_seq()
+        };
 
         // Backend turn — runs concurrently with the forwarder above.
         tokio::spawn(async move {
@@ -130,7 +166,7 @@ impl SessionHost {
                 .await;
         });
 
-        cancel
+        (cancel, baseline)
     }
 }
 
@@ -147,16 +183,20 @@ impl SessionRegistry {
     }
 
     /// Insert a host, replacing any prior entry with the same id (which would
-    /// indicate the caller resumed a session that was still live — close the
-    /// old host first to release pending prompts).
+    /// indicate the caller resumed a session that was still live — cancel the
+    /// old host's in-flight turn and clear its pending prompts in the
+    /// background so this call stays sync).
     pub fn insert(&self, host: SessionHost) {
         let id = host.id().to_string();
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(prior) = guard.insert(id, host) {
-            prior.close();
+        let prior = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.insert(id, host)
+        };
+        if let Some(prior) = prior {
+            tokio::spawn(async move { prior.close().await });
         }
     }
 
@@ -169,17 +209,22 @@ impl SessionRegistry {
         guard.get(id).cloned()
     }
 
-    /// Remove (and close) a session.
+    /// Remove (and close) a session. Cancellation/cleanup runs in the
+    /// background so this call stays sync.
     pub fn remove(&self, id: &str) -> bool {
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(host) = guard.remove(id) {
-            host.close();
-            true
-        } else {
-            false
+        let removed = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(id)
+        };
+        match removed {
+            Some(host) => {
+                tokio::spawn(async move { host.close().await });
+                true
+            }
+            None => false,
         }
     }
 

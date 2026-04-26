@@ -105,11 +105,16 @@ impl Status for StatusSvc {
 }
 
 /// Parse a heartbeat interval like `"30m"`, `"2h"`, `"45s"` to seconds.
-/// Returns `None` for malformed input — the caller falls back to 0.
+/// Returns `None` for malformed input (including unsupported sub-second units
+/// like `"30ms"`) so the caller can fall back to 0 explicitly rather than
+/// silently report "next heartbeat in 0 seconds."
 fn parse_interval_seconds(s: &str) -> Option<u64> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic())?);
+    let split = s.find(|c: char| c.is_alphabetic())?;
+    let (num, unit) = s.split_at(split);
     let n: u64 = num.trim().parse().ok()?;
+    // Match the EXACT unit string — `"ms"` falls through to `None` so callers
+    // see an unconfigured heartbeat instead of being told it'll fire instantly.
     match unit {
         "s" => Some(n),
         "m" => Some(n * 60),
@@ -135,9 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn interval_returns_none_on_garbage() {
+    fn interval_returns_none_on_garbage_and_subsecond_units() {
+        // Real failure mode: a regression that took only the first alpha char
+        // would split "30ms" into ("30", "m") and report 30 minutes, then the
+        // popup would say "next heartbeat in 1800s" when the user asked for
+        // ms-precision. Asserting None forces the caller to surface "unknown".
         assert_eq!(parse_interval_seconds(""), None);
         assert_eq!(parse_interval_seconds("forever"), None);
         assert_eq!(parse_interval_seconds("30x"), None);
+        assert_eq!(parse_interval_seconds("30ms"), None);
     }
 }

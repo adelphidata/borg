@@ -113,7 +113,14 @@ impl Admin for AdminSvc {
         };
         match tx {
             Some(tx) => {
-                let _ = tx.send(());
+                // broadcast::send returns Err only when no receivers are live
+                // — reporting Ok in that case would lie about the requested
+                // action having been applied.
+                if tx.send(()).is_err() {
+                    return Err(TStatus::failed_precondition(
+                        "shutdown broadcaster has no live receivers; daemon may be mid-shutdown already",
+                    ));
+                }
                 Ok(Response::new(Empty {}))
             }
             None => Err(TStatus::failed_precondition("no shutdown sender is wired")),
