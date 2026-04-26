@@ -1,0 +1,124 @@
+syntax = "proto3";
+
+package borg.session.v1;
+
+// Session is the per-conversation surface. One agent runs per session_id;
+// multiple clients may subscribe to the same session's event stream.
+service Session {
+  // Open a new session or resume an existing one. Returns session_id.
+  rpc Open(OpenRequest) returns (OpenResponse);
+
+  // Send a user message and receive the resulting AgentEvent stream for this turn.
+  // Closes when the agent emits TurnComplete or Error.
+  rpc Send(SendRequest) returns (stream AgentEvent);
+
+  // Subscribe to a session's event stream from a given cursor.
+  // Used by additional clients (multi-TUI) and for resume-after-disconnect.
+  rpc Stream(StreamRequest) returns (stream AgentEvent);
+
+  // Cancel the in-flight turn for a session.
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+
+  // Close the session and flush state.
+  rpc Close(CloseRequest) returns (CloseResponse);
+
+  // Reply to a ShellConfirmation or UserInputRequest, identified by prompt_id.
+  rpc RespondToPrompt(PromptResponse) returns (Empty);
+}
+
+message Empty {}
+
+message OpenRequest {
+  // Optional resume_id — if set, daemon resumes that session's history.
+  string resume_id = 1;
+}
+
+message OpenResponse {
+  string session_id = 1;
+  // Last event_seq currently buffered for this session (0 for new).
+  uint64 last_event_seq = 2;
+}
+
+message SendRequest {
+  string session_id = 1;
+  string text = 2;
+}
+
+message StreamRequest {
+  string session_id = 1;
+  // Resume cursor. Zero replays from start of in-memory ring buffer.
+  uint64 since_event_seq = 2;
+}
+
+message CancelRequest { string session_id = 1; }
+message CancelResponse {}
+
+message CloseRequest { string session_id = 1; }
+message CloseResponse {}
+
+message PromptResponse {
+  string session_id = 1;
+  string prompt_id = 2;
+  // For ShellConfirmation: "true" or "false". For UserInputRequest: the chosen text.
+  string value = 3;
+}
+
+// AgentEvent mirrors core::agent::AgentEvent. Each event carries a per-session
+// monotonic sequence number for resume support.
+message AgentEvent {
+  uint64 event_seq = 1;
+  oneof kind {
+    TextDelta text_delta = 10;
+    ThinkingDelta thinking_delta = 11;
+    ToolExecuting tool_executing = 12;
+    ToolResult tool_result = 13;
+    ShellConfirmation shell_confirmation = 14;
+    ToolOutputDelta tool_output_delta = 15;
+    Usage usage = 16;
+    SubAgentUpdate sub_agent_update = 17;
+    SteerReceived steer_received = 18;
+    PlanUpdated plan_updated = 19;
+    UserInputRequest user_input_request = 20;
+    Preparing preparing = 21;
+    TurnComplete turn_complete = 22;
+    HistoryCompacted history_compacted = 23;
+    ErrorEvent error = 24;
+  }
+}
+
+message TextDelta { string text = 1; }
+message ThinkingDelta { string text = 1; }
+message ToolExecuting { string name = 1; string args_json = 2; }
+message ToolResult { string name = 1; string result = 2; }
+message ShellConfirmation {
+  string command = 1;
+  // Client must reply via RespondToPrompt with this id.
+  string prompt_id = 2;
+}
+message ToolOutputDelta { string name = 1; string delta = 2; bool is_stderr = 3; }
+message Usage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 cache_read_tokens = 3;
+  uint64 cache_creation_tokens = 4;
+}
+message SubAgentUpdate { string agent_id = 1; string nickname = 2; string status = 3; }
+message SteerReceived { string text = 1; }
+message PlanStep { string id = 1; string text = 2; string status = 3; }
+message PlanUpdated { repeated PlanStep steps = 1; }
+message UserInputChoice { string label = 1; string description = 2; }
+message UserInputRequest {
+  string prompt = 1;
+  repeated UserInputChoice choices = 2;
+  bool allow_custom = 3;
+  string prompt_id = 4;
+}
+message Preparing {}
+message TurnComplete {}
+message HistoryCompacted {
+  uint64 dropped = 1;
+  uint64 before_tokens = 2;
+  uint64 after_tokens = 3;
+  bool iterative = 4;
+}
+message ErrorEvent { string message = 1; }

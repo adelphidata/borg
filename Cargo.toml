@@ -20,6 +20,8 @@ members = [
     "crates/apply-patch",
     "crates/gateway",
     "crates/plugins",
+    "crates/borg-proto",
+    "crates/borgd",
 ]
 
 [workspace.dependencies]
@@ -80,6 +82,13 @@ base64 = "0.22"
 async-trait = "0.1"
 rand = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+hyper-util = { version = "0.1", features = ["tokio"] }
+fs2 = "0.4"
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 
 [workspace.lints.clippy]
 identity_op = "deny"

@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package borg.capability.v1;
+
+// Capability is a bidi-stream where the client advertises capabilities it can
+// fulfill on the client's host (terminal.exec, clipboard.read, file.pick, etc.)
+// and the daemon issues invocations routed to that client.
+service Capability {
+  // Open the bidi-stream. Client sends Advertise first, then InvokeResult per
+  // server-issued Invoke. (Named `Channel` rather than `Connect` to avoid
+  // colliding with tonic's generated `connect()` constructor.)
+  rpc Channel(stream ClientMessage) returns (stream ServerMessage);
+}
+
+message ClientMessage {
+  oneof kind {
+    Advertise advertise = 1;
+    InvokeResult result = 2;
+  }
+}
+
+message ServerMessage {
+  oneof kind {
+    Invoke invoke = 1;
+    // Daemon-acknowledged advertise (optional, future use).
+    AdvertiseAck advertise_ack = 2;
+  }
+}
+
+// First message a client sends. Names come from borg-proto::capabilities.
+message Advertise {
+  string client_label = 1;
+  repeated string capabilities = 2;
+}
+
+message AdvertiseAck { uint64 client_id = 1; }
+
+// Server -> client request for a capability invocation.
+message Invoke {
+  string invocation_id = 1;
+  string capability = 2;
+  // JSON-encoded args, schema depends on the capability.
+  string args_json = 3;
+}
+
+// Client -> server response. Either result_json or error must be set.
+message InvokeResult {
+  string invocation_id = 1;
+  string result_json = 2;
+  string error = 3;
+}

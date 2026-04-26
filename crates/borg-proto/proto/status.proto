@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package borg.status.v1;
+
+// Status surfaces read-only views of agent health for the TUI status popup
+// and `borg status` CLI.
+service Status {
+  rpc GetVitals(Empty) returns (Vitals);
+  rpc GetPosture(Empty) returns (Posture);
+  rpc GetBudget(Empty) returns (Budget);
+  rpc GetHeartbeat(Empty) returns (Heartbeat);
+}
+
+message Empty {}
+
+message Vitals {
+  // Five core stats, 0-100.
+  uint32 stability = 1;
+  uint32 focus = 2;
+  uint32 sync = 3;
+  uint32 growth = 4;
+  uint32 happiness = 5;
+  // Stage name (Base/Evolved/Final).
+  string stage = 6;
+  uint64 xp = 7;
+}
+
+message Posture {
+  // 3-state posture multiplier (Hardened/Balanced/Relaxed).
+  string posture = 1;
+  double xp_multiplier = 2;
+}
+
+message Budget {
+  // Daily-reset spend caps; nullable values represented as 0 = no cap.
+  double daily_usd_cap = 1;
+  double daily_usd_spent = 2;
+}
+
+message Heartbeat {
+  // Seconds until next heartbeat (0 if disabled).
+  uint64 next_in_seconds = 1;
+  // Last heartbeat unix timestamp (0 if never).
+  uint64 last_unix_ts = 2;
+}

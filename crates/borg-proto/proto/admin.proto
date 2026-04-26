@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package borg.admin.v1;
+
+// Admin surfaces lifecycle, settings, and the data-access RPCs that replace
+// direct DB reads from the TUI popups.
+service Admin {
+  // Pairing — full impl arrives in Task 02.
+  rpc Pair(PairRequest) returns (PairResponse);
+
+  rpc Poke(Empty) returns (Empty);
+  rpc Heal(Empty) returns (HealReport);
+  rpc Shutdown(Empty) returns (Empty);
+
+  // Settings.
+  rpc GetSettings(Empty) returns (SettingsSnapshot);
+  rpc SetSetting(SettingMutation) returns (Empty);
+  rpc UnsetSetting(SettingKey) returns (Empty);
+
+  // Sessions.
+  rpc ListSessions(Empty) returns (SessionList);
+  rpc GetSession(SessionRef) returns (SessionDetail);
+}
+
+message Empty {}
+
+message PairRequest { string code = 1; string device_label = 2; }
+message PairResponse { string status = 1; string cert_pem = 2; }
+
+message HealReport {
+  uint64 pruned_logs = 1;
+  uint64 pruned_activity = 2;
+  uint64 evicted_embeddings = 3;
+  uint64 healed_tasks = 4;
+  repeated string warnings = 5;
+}
+
+message SettingKey { string key = 1; }
+message SettingMutation { string key = 1; string value = 2; }
+message SettingEntry { string key = 1; string value = 2; string category = 3; }
+message SettingsSnapshot { repeated SettingEntry entries = 1; }
+
+message SessionList {
+  repeated SessionSummary sessions = 1;
+}
+message SessionSummary {
+  string id = 1;
+  string title = 2;
+  uint64 message_count = 3;
+  uint64 updated_unix_ts = 4;
+}
+message SessionRef { string id = 1; }
+message SessionDetail {
+  string id = 1;
+  string title = 2;
+  repeated MessageView messages = 3;
+}
+message MessageView {
+  string role = 1;
+  string text = 2;
+  uint64 unix_ts = 3;
+}
