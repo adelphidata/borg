@@ -92,6 +92,27 @@ pub(crate) async fn run_update(dev: bool, check: bool) -> Result<()> {
 }
 
 pub(crate) async fn run_poke() -> Result<()> {
+    // Prefer the gRPC daemon when its socket is present; fall back to the
+    // legacy HTTP gateway poke endpoint while the gateway path is still
+    // co-installed. Once Task 8 migrates the gateway off Agent::new, the
+    // HTTP fallback goes away.
+    let socket = crate::daemon_client::default_socket_path();
+    if socket.exists() {
+        match crate::daemon_client::connect(Some(&socket)).await {
+            Ok(mut client) => match client.poke().await {
+                Ok(()) => {
+                    println!("Poke signal sent.");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("borgd reachable but Admin.Poke failed: {e:#}");
+                    return Ok(());
+                }
+            },
+            Err(e) => eprintln!("borgd socket present but connect failed: {e:#}"),
+        }
+    }
+
     let config = borg_core::config::Config::load_from_db()?;
     let url = format!(
         "http://{}:{}/internal/poke",

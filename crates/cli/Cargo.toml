@@ -15,6 +15,12 @@ borg-core = { path = "../core" }
 borg-heartbeat = { path = "../heartbeat" }
 borg-gateway = { path = "../gateway" }
 borg-plugins = { path = "../plugins" }
+borg-proto = { path = "../borg-proto" }
+tonic = { workspace = true }
+prost = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 crossterm = { workspace = true }

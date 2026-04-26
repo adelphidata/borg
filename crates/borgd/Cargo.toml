@@ -22,6 +22,7 @@ borg-proto = { path = "../borg-proto" }
 borg-core = { path = "../core" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }

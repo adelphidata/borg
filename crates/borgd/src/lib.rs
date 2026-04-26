@@ -14,3 +14,4 @@ pub mod daemon;
 pub mod grpc;
 pub mod paths;
 pub mod pidlock;
+pub mod session;

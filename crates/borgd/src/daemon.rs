@@ -1,15 +1,34 @@
 //! Daemon lifecycle: lock acquisition, transport setup, graceful shutdown.
 
 use crate::grpc;
+use crate::grpc::capability::CapabilityRouter;
+use crate::grpc::session::SessionFactory;
 use crate::paths;
 use crate::pidlock::PidLock;
+use crate::session::backend::AgentBackend;
+use crate::session::{SessionHost, SessionRegistry};
 use anyhow::{Context, Result};
+use borg_core::config::Config as CoreConfig;
+use borg_core::telemetry::BorgMetrics;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::UnixListenerStream;
+
+/// Production session factory: builds an `AgentBackend` for each session.
+struct DaemonSessionFactory;
+
+impl SessionFactory for DaemonSessionFactory {
+    fn open(&self, resume_id: Option<&str>) -> Result<SessionHost> {
+        let config =
+            CoreConfig::load_from_db().context("loading config from db for new session")?;
+        let backend = AgentBackend::new(config, BorgMetrics::noop(), resume_id)?;
+        Ok(SessionHost::new(backend))
+    }
+}
 
 /// Runtime configuration assembled from CLI args.
 pub struct Config {
@@ -58,7 +77,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     tracing::info!(socket = %socket_path.display(), "borgd listening on UDS");
 
-    let services = grpc::build_services();
+    let registry = SessionRegistry::new();
+    let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory);
+    let capability_router = Arc::new(CapabilityRouter::new());
+    let services = grpc::build_services(registry, factory, capability_router);
 
     // Single shutdown signal fanned out to every transport so SIGTERM drains
     // both UDS and TCP listeners in parallel rather than aborting the slower one.
@@ -69,11 +91,12 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let make_router = || {
         // Cloning the generated Server wrapper shares the inner `Arc<Svc>`,
-        // so two transports observe identical state. (When the services grow
-        // shared state in later tasks, this stays correct.)
+        // so two transports observe identical state.
         tonic::transport::Server::builder()
             .add_service(services.status.clone())
             .add_service(services.admin.clone())
+            .add_service(services.session.clone())
+            .add_service(services.capability.clone())
     };
 
     if let Some(addr) = cfg.listen_tcp {

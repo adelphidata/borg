@@ -44,6 +44,12 @@ use crate::commands::tasks::{CronAction, TasksAction};
 mod api_key_store;
 mod commands;
 mod credentials;
+// Daemon client lib lives in this crate to keep dev workflow tight; many of
+// its methods are consumed only by call sites that haven't been migrated yet
+// (TUI / REPL / popups). Allow dead_code on the module until those callers
+// land — the lints would otherwise force placeholder usage that drifts.
+#[allow(dead_code)]
+mod daemon_client;
 mod heartbeat_augmenters;
 mod logo;
 mod migrate_tui;
