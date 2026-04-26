@@ -21,13 +21,18 @@ pub use event_stream::spawn_event_adapter;
 use anyhow::{anyhow, Context, Result};
 use borg_proto::admin::admin_client::AdminClient;
 use borg_proto::admin::{
-    Empty as AdminEmpty, HealReport, SessionDetail, SessionList, SessionRef, SettingKey,
-    SettingMutation, SettingsSnapshot,
+    ApprovedSenderList, ApprovedSenderRef, DaemonStatus, Empty as AdminEmpty, HealReport,
+    PairingApproval, PairingFilter, PairingRequestList, Project, ProjectCreate, ProjectList,
+    ProjectRef, ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskList,
+    ScheduledTaskRef, SessionDetail, SessionList, SessionRef, SettingKey, SettingMutation,
+    SettingsSnapshot,
 };
 use borg_proto::session::session_client::SessionClient;
 use borg_proto::session::{
-    AgentEvent, CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest,
-    StreamRequest,
+    AgentEvent, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest, CompactRequest,
+    CompactResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
+    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use tonic::transport::Channel;
 use tonic::Streaming;
@@ -221,6 +226,293 @@ impl DaemonClient {
             .get_session(SessionRef { id: id.to_string() })
             .await
             .context("Admin.GetSession failed")?
+            .into_inner())
+    }
+
+    // ── Session-state RPCs (replace direct agent calls in TUI) ────────────
+
+    /// Snapshot of agent state for the given session_id.
+    pub async fn get_state(&mut self, session_id: &str) -> Result<SessionState> {
+        Ok(self
+            .session
+            .get_state(SessionStateRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.GetState failed")?
+            .into_inner())
+    }
+
+    /// Compact the agent's history.
+    pub async fn compact(&mut self, session_id: &str) -> Result<CompactResponse> {
+        Ok(self
+            .session
+            .compact(CompactRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.Compact failed")?
+            .into_inner())
+    }
+
+    /// Wipe history.
+    pub async fn clear_history(&mut self, session_id: &str) -> Result<()> {
+        self.session
+            .clear_history(ClearRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.ClearHistory failed")?;
+        Ok(())
+    }
+
+    /// Drop the most recent assistant turn.
+    pub async fn undo(&mut self, session_id: &str) -> Result<UndoResponse> {
+        Ok(self
+            .session
+            .undo(UndoRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.Undo failed")?
+            .into_inner())
+    }
+
+    /// Rewind to the Nth user message.
+    pub async fn rewind(&mut self, session_id: &str, n: u64) -> Result<RewindResponse> {
+        Ok(self
+            .session
+            .rewind_to_nth_user_message(RewindRequest {
+                session_id: session_id.to_string(),
+                n,
+            })
+            .await
+            .context("Session.RewindToNthUserMessage failed")?
+            .into_inner())
+    }
+
+    /// Persist the agent's current state.
+    pub async fn auto_save(&mut self, session_id: &str) -> Result<()> {
+        self.session
+            .auto_save(AutoSaveRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.AutoSave failed")?;
+        Ok(())
+    }
+
+    /// Start a fresh agent session inside the existing host.
+    pub async fn new_agent_session(&mut self, session_id: &str) -> Result<NewSessionResponse> {
+        Ok(self
+            .session
+            .new_session(NewSessionRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.NewSession failed")?
+            .into_inner())
+    }
+
+    /// Load an existing agent session by id inside the existing host.
+    pub async fn load_agent_session(
+        &mut self,
+        session_id: &str,
+        agent_session_id: &str,
+    ) -> Result<LoadSessionResponse> {
+        Ok(self
+            .session
+            .load_session(LoadSessionRequest {
+                session_id: session_id.to_string(),
+                agent_session_id: agent_session_id.to_string(),
+            })
+            .await
+            .context("Session.LoadSession failed")?
+            .into_inner())
+    }
+
+    /// Push a steer message into the in-flight turn.
+    pub async fn steer(&mut self, session_id: &str, text: &str) -> Result<()> {
+        self.session
+            .steer(SteerRequest {
+                session_id: session_id.to_string(),
+                text: text.to_string(),
+            })
+            .await
+            .context("Session.Steer failed")?;
+        Ok(())
+    }
+
+    // ── Projects ──────────────────────────────────────────────────────────
+
+    /// List all projects.
+    pub async fn list_projects(&mut self) -> Result<ProjectList> {
+        Ok(self
+            .admin
+            .list_projects(AdminEmpty {})
+            .await
+            .context("Admin.ListProjects failed")?
+            .into_inner())
+    }
+
+    /// Create a project.
+    pub async fn create_project(&mut self, name: &str, description: &str) -> Result<Project> {
+        Ok(self
+            .admin
+            .create_project(ProjectCreate {
+                name: name.to_string(),
+                description: description.to_string(),
+            })
+            .await
+            .context("Admin.CreateProject failed")?
+            .into_inner())
+    }
+
+    /// Update a project (empty fields are skipped).
+    pub async fn update_project(
+        &mut self,
+        id: &str,
+        name: &str,
+        description: &str,
+        status: &str,
+    ) -> Result<Project> {
+        Ok(self
+            .admin
+            .update_project(ProjectUpdate {
+                id: id.to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
+                status: status.to_string(),
+            })
+            .await
+            .context("Admin.UpdateProject failed")?
+            .into_inner())
+    }
+
+    /// Delete a project by id.
+    pub async fn delete_project(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .delete_project(ProjectRef { id: id.to_string() })
+            .await
+            .context("Admin.DeleteProject failed")?;
+        Ok(())
+    }
+
+    // ── Scheduled tasks ───────────────────────────────────────────────────
+
+    /// List all scheduled tasks.
+    pub async fn list_scheduled_tasks(&mut self) -> Result<ScheduledTaskList> {
+        Ok(self
+            .admin
+            .list_scheduled_tasks(AdminEmpty {})
+            .await
+            .context("Admin.ListScheduledTasks failed")?
+            .into_inner())
+    }
+
+    /// Create a scheduled task.
+    pub async fn create_scheduled_task(
+        &mut self,
+        spec: ScheduledTaskCreate,
+    ) -> Result<ScheduledTask> {
+        Ok(self
+            .admin
+            .create_scheduled_task(spec)
+            .await
+            .context("Admin.CreateScheduledTask failed")?
+            .into_inner())
+    }
+
+    /// Delete a scheduled task by id.
+    pub async fn delete_scheduled_task(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .delete_scheduled_task(ScheduledTaskRef { id: id.to_string() })
+            .await
+            .context("Admin.DeleteScheduledTask failed")?;
+        Ok(())
+    }
+
+    /// Pause a scheduled task.
+    pub async fn pause_scheduled_task(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .pause_scheduled_task(ScheduledTaskRef { id: id.to_string() })
+            .await
+            .context("Admin.PauseScheduledTask failed")?;
+        Ok(())
+    }
+
+    /// Resume a paused scheduled task.
+    pub async fn resume_scheduled_task(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .resume_scheduled_task(ScheduledTaskRef { id: id.to_string() })
+            .await
+            .context("Admin.ResumeScheduledTask failed")?;
+        Ok(())
+    }
+
+    // ── Pairing ───────────────────────────────────────────────────────────
+
+    /// List pairing requests, optionally filtered by channel.
+    pub async fn list_pairing_requests(
+        &mut self,
+        channel: Option<&str>,
+    ) -> Result<PairingRequestList> {
+        Ok(self
+            .admin
+            .list_pairing_requests(PairingFilter {
+                channel_name: channel.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.ListPairingRequests failed")?
+            .into_inner())
+    }
+
+    /// Approve a pairing request by code.
+    pub async fn approve_pairing(&mut self, channel: &str, code: &str) -> Result<()> {
+        self.admin
+            .approve_pairing(PairingApproval {
+                channel_name: channel.to_string(),
+                code: code.to_string(),
+            })
+            .await
+            .context("Admin.ApprovePairing failed")?;
+        Ok(())
+    }
+
+    /// List approved senders, optionally filtered by channel.
+    pub async fn list_approved_senders(
+        &mut self,
+        channel: Option<&str>,
+    ) -> Result<ApprovedSenderList> {
+        Ok(self
+            .admin
+            .list_approved_senders(PairingFilter {
+                channel_name: channel.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.ListApprovedSenders failed")?
+            .into_inner())
+    }
+
+    /// Revoke an approved sender.
+    pub async fn revoke_approved_sender(&mut self, channel: &str, sender_id: &str) -> Result<()> {
+        self.admin
+            .revoke_approved_sender(ApprovedSenderRef {
+                channel_name: channel.to_string(),
+                sender_id: sender_id.to_string(),
+            })
+            .await
+            .context("Admin.RevokeApprovedSender failed")?;
+        Ok(())
+    }
+
+    /// Daemon-wide status snapshot.
+    pub async fn get_daemon_status(&mut self) -> Result<DaemonStatus> {
+        Ok(self
+            .admin
+            .get_daemon_status(AdminEmpty {})
+            .await
+            .context("Admin.GetDaemonStatus failed")?
             .into_inner())
     }
 }

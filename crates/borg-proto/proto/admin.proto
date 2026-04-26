@@ -20,6 +20,28 @@ service Admin {
   // Sessions.
   rpc ListSessions(Empty) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
+
+  // Projects.
+  rpc ListProjects(Empty) returns (ProjectList);
+  rpc CreateProject(ProjectCreate) returns (Project);
+  rpc UpdateProject(ProjectUpdate) returns (Project);
+  rpc DeleteProject(ProjectRef) returns (Empty);
+
+  // Scheduled tasks.
+  rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
+  rpc CreateScheduledTask(ScheduledTaskCreate) returns (ScheduledTask);
+  rpc DeleteScheduledTask(ScheduledTaskRef) returns (Empty);
+  rpc PauseScheduledTask(ScheduledTaskRef) returns (Empty);
+  rpc ResumeScheduledTask(ScheduledTaskRef) returns (Empty);
+
+  // Pairing requests + approved senders.
+  rpc ListPairingRequests(PairingFilter) returns (PairingRequestList);
+  rpc ApprovePairing(PairingApproval) returns (Empty);
+  rpc ListApprovedSenders(PairingFilter) returns (ApprovedSenderList);
+  rpc RevokeApprovedSender(ApprovedSenderRef) returns (Empty);
+
+  // Daemon-wide status snapshot (replaces several DB reads from the TUI).
+  rpc GetDaemonStatus(Empty) returns (DaemonStatus);
 }
 
 message Empty {}
@@ -59,4 +81,87 @@ message MessageView {
   string role = 1;
   string text = 2;
   uint64 unix_ts = 3;
+}
+
+// Projects.
+message Project {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string status = 4;
+  uint64 created_at = 5;
+  uint64 updated_at = 6;
+}
+message ProjectList { repeated Project projects = 1; }
+message ProjectRef { string id = 1; }
+message ProjectCreate { string name = 1; string description = 2; }
+message ProjectUpdate {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string status = 4;
+}
+
+// Scheduled tasks.
+message ScheduledTask {
+  string id = 1;
+  string name = 2;
+  string prompt = 3;
+  string schedule_type = 4;
+  string schedule_expr = 5;
+  string timezone = 6;
+  string status = 7;
+  int64 next_run_unix = 8; // 0 = none
+  uint64 created_at = 9;
+  string task_type = 10; // "prompt" or "command"
+  string delivery_channel = 11;
+  string delivery_target = 12;
+}
+message ScheduledTaskList { repeated ScheduledTask tasks = 1; }
+message ScheduledTaskRef { string id = 1; }
+message ScheduledTaskCreate {
+  string name = 1;
+  string prompt = 2;
+  string schedule_type = 3;
+  string schedule_expr = 4;
+  string timezone = 5;
+  string task_type = 6;
+  string delivery_channel = 7;
+  string delivery_target = 8;
+}
+
+// Pairing.
+message PairingFilter { string channel_name = 1; } // empty = all
+message PairingRequest {
+  string id = 1;
+  string channel_name = 2;
+  string sender_id = 3;
+  string code = 4;
+  string status = 5;
+  string display_name = 6;
+  uint64 created_at = 7;
+  uint64 expires_at = 8;
+}
+message PairingRequestList { repeated PairingRequest requests = 1; }
+message PairingApproval { string channel_name = 1; string code = 2; }
+message ApprovedSender {
+  int64 id = 1;
+  string channel_name = 2;
+  string sender_id = 3;
+  string display_name = 4;
+  uint64 approved_at = 5;
+}
+message ApprovedSenderList { repeated ApprovedSender senders = 1; }
+message ApprovedSenderRef { string channel_name = 1; string sender_id = 2; }
+
+// Daemon status snapshot — what the TUI's status popup shows.
+message DaemonStatus {
+  string version = 1;
+  uint64 uptime_secs = 2;
+  uint64 live_session_count = 3;
+  string llm_provider = 4;
+  string llm_model = 5;
+  uint64 active_tasks = 6;
+  uint64 paused_tasks = 7;
+  uint64 pending_pairings = 8;
 }

@@ -118,6 +118,51 @@ impl SessionHost {
         self.inner.prompts.clear();
     }
 
+    /// Compact the agent's conversation. Forwards to the backend.
+    pub async fn compact(&self) -> Result<(usize, usize)> {
+        self.inner.backend.compact().await
+    }
+
+    /// Wipe history (keeps the agent alive for new turns).
+    pub fn clear_history(&self) -> Result<()> {
+        self.inner.backend.clear_history()
+    }
+
+    /// Drop the most recent assistant turn.
+    pub fn undo(&self) -> Result<usize> {
+        self.inner.backend.undo()
+    }
+
+    /// Rewind to Nth user message.
+    pub fn rewind_to_nth_user_message(&self, n: usize) -> Result<usize> {
+        self.inner.backend.rewind_to_nth_user_message(n)
+    }
+
+    /// Persist current agent state.
+    pub fn auto_save(&self) -> Result<()> {
+        self.inner.backend.auto_save()
+    }
+
+    /// Start a fresh agent session in this host.
+    pub fn new_agent_session(&self) -> Result<String> {
+        self.inner.backend.new_agent_session()
+    }
+
+    /// Load an existing agent session in this host.
+    pub fn load_agent_session(&self, id: &str) -> Result<u64> {
+        self.inner.backend.load_agent_session(id)
+    }
+
+    /// Snapshot of agent-visible state for `Session.GetState`.
+    pub fn snapshot_state(&self) -> Result<backend::SessionStateSnapshot> {
+        self.inner.backend.snapshot_state()
+    }
+
+    /// Push a steer message into the in-flight turn.
+    pub fn steer(&self, text: &str) -> Result<()> {
+        self.inner.backend.steer(text)
+    }
+
     /// Start a turn. Awaits the prior turn's forwarder draining into the
     /// buffer before installing this turn's state — that's how we guarantee
     /// "events with seq > baseline_after_start belong to this turn". Returns

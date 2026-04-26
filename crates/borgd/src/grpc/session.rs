@@ -8,8 +8,11 @@
 use crate::session::{convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
 use borg_proto::session::{
-    session_server::Session, AgentEvent, CancelRequest, CancelResponse, CloseRequest,
-    CloseResponse, Empty, OpenRequest, OpenResponse, PromptResponse, SendRequest, StreamRequest,
+    session_server::Session, AgentEvent, AutoSaveRequest, CancelRequest, CancelResponse,
+    ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
+    OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState,
+    SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use futures_util::Stream;
 use std::pin::Pin;
@@ -193,6 +196,118 @@ impl Session for SessionSvc {
         let host = self.host_or_err(&req.session_id)?;
         host.respond_to_prompt(&req.prompt_id, &req.value)
             .map_err(|e| TStatus::failed_precondition(e.to_string()))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn get_state(
+        &self,
+        req: Request<SessionStateRequest>,
+    ) -> Result<Response<SessionState>, TStatus> {
+        let req = req.into_inner();
+        let host = self.host_or_err(&req.session_id)?;
+        let snap = host
+            .snapshot_state()
+            .map_err(|e| TStatus::internal(format!("snapshot_state: {e}")))?;
+        Ok(Response::new(SessionState {
+            session_id: req.session_id,
+            agent_session_id: snap.agent_session_id,
+            title: snap.title,
+            message_count: snap.message_count,
+            user_message_count: snap.user_message_count,
+            token_estimate: snap.token_estimate,
+            llm_provider: snap.llm_provider,
+            llm_model: snap.llm_model,
+            collab_mode: snap.collab_mode,
+            turn_in_flight: false,
+        }))
+    }
+
+    async fn compact(
+        &self,
+        req: Request<CompactRequest>,
+    ) -> Result<Response<CompactResponse>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        let (dropped, after) = host
+            .compact()
+            .await
+            .map_err(|e| TStatus::internal(format!("compact: {e}")))?;
+        Ok(Response::new(CompactResponse {
+            dropped: dropped as u64,
+            after_tokens: after as u64,
+        }))
+    }
+
+    async fn clear_history(&self, req: Request<ClearRequest>) -> Result<Response<Empty>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        host.clear_history()
+            .map_err(|e| TStatus::internal(format!("clear_history: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn undo(&self, req: Request<UndoRequest>) -> Result<Response<UndoResponse>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        let removed = host
+            .undo()
+            .map_err(|e| TStatus::internal(format!("undo: {e}")))?;
+        Ok(Response::new(UndoResponse {
+            removed: removed as u64,
+        }))
+    }
+
+    async fn rewind_to_nth_user_message(
+        &self,
+        req: Request<RewindRequest>,
+    ) -> Result<Response<RewindResponse>, TStatus> {
+        let req = req.into_inner();
+        let host = self.host_or_err(&req.session_id)?;
+        let removed = host
+            .rewind_to_nth_user_message(req.n as usize)
+            .map_err(|e| TStatus::internal(format!("rewind: {e}")))?;
+        Ok(Response::new(RewindResponse {
+            removed: removed as u64,
+        }))
+    }
+
+    async fn auto_save(&self, req: Request<AutoSaveRequest>) -> Result<Response<Empty>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        host.auto_save()
+            .map_err(|e| TStatus::internal(format!("auto_save: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn new_session(
+        &self,
+        req: Request<NewSessionRequest>,
+    ) -> Result<Response<NewSessionResponse>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        let id = host
+            .new_agent_session()
+            .map_err(|e| TStatus::internal(format!("new_session: {e}")))?;
+        Ok(Response::new(NewSessionResponse {
+            agent_session_id: id,
+        }))
+    }
+
+    async fn load_session(
+        &self,
+        req: Request<LoadSessionRequest>,
+    ) -> Result<Response<LoadSessionResponse>, TStatus> {
+        let req = req.into_inner();
+        let host = self.host_or_err(&req.session_id)?;
+        let count = host
+            .load_agent_session(&req.agent_session_id)
+            .map_err(|e| TStatus::not_found(format!("load_session: {e}")))?;
+        Ok(Response::new(LoadSessionResponse {
+            agent_session_id: req.agent_session_id,
+            message_count: count,
+        }))
+    }
+
+    async fn steer(&self, req: Request<SteerRequest>) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let host = self.host_or_err(&req.session_id)?;
+        host.steer(&req.text)
+            .map_err(|e| TStatus::failed_precondition(format!("steer: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 }

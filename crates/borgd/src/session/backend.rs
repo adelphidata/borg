@@ -12,6 +12,27 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// Snapshot of the agent's user-facing state for `Session.GetState`.
+#[derive(Debug, Clone)]
+pub struct SessionStateSnapshot {
+    /// The borg_core session id (used for resume).
+    pub agent_session_id: String,
+    /// Human-friendly title of the active session.
+    pub title: String,
+    /// Total messages in history.
+    pub message_count: u64,
+    /// Number of user-authored messages.
+    pub user_message_count: u64,
+    /// Estimated token count of current history.
+    pub token_estimate: u64,
+    /// Active LLM provider name.
+    pub llm_provider: String,
+    /// Active model id.
+    pub llm_model: String,
+    /// Collaboration mode label (default/execute/plan).
+    pub collab_mode: String,
+}
+
 /// Per-session backend that runs one agent turn at a time.
 #[async_trait]
 pub trait SessionBackend: Send + Sync + 'static {
@@ -27,6 +48,55 @@ pub trait SessionBackend: Send + Sync + 'static {
 
     /// Stable session id (for logs / SessionRegistry indexing).
     fn session_id(&self) -> &str;
+
+    // ── Agent-control surface (default: not supported) ────────────────────
+    //
+    // These all return `Err(unsupported)` for stub backends; only `AgentBackend`
+    // implements them. Daemon RPC handlers translate `unsupported` into a
+    // gRPC `unimplemented` status so callers can render a clean message.
+
+    /// Compact conversation history. Returns `(dropped, after_tokens)`.
+    async fn compact(&self) -> anyhow::Result<(usize, usize)> {
+        Err(anyhow::anyhow!("compact not supported by this backend"))
+    }
+    /// Wipe history (keeping the agent alive for a fresh turn).
+    fn clear_history(&self) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "clear_history not supported by this backend"
+        ))
+    }
+    /// Drop the most recent assistant turn. Returns # messages removed.
+    fn undo(&self) -> anyhow::Result<usize> {
+        Err(anyhow::anyhow!("undo not supported by this backend"))
+    }
+    /// Rewind history to the Nth user message. Returns # messages removed.
+    fn rewind_to_nth_user_message(&self, _n: usize) -> anyhow::Result<usize> {
+        Err(anyhow::anyhow!("rewind not supported by this backend"))
+    }
+    /// Persist current state to disk.
+    fn auto_save(&self) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("auto_save not supported by this backend"))
+    }
+    /// Start a fresh agent session, returning the new session id.
+    fn new_agent_session(&self) -> anyhow::Result<String> {
+        Err(anyhow::anyhow!("new_session not supported by this backend"))
+    }
+    /// Load an existing agent session from disk by id.
+    fn load_agent_session(&self, _id: &str) -> anyhow::Result<u64> {
+        Err(anyhow::anyhow!(
+            "load_session not supported by this backend"
+        ))
+    }
+    /// Read current state for `Session.GetState`.
+    fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
+        Err(anyhow::anyhow!(
+            "snapshot_state not supported by this backend"
+        ))
+    }
+    /// Push a steer message into the running agent loop.
+    fn steer(&self, _text: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("steer not supported by this backend"))
+    }
 }
 
 /// Production backend: owns one `borg_core::Agent`. Hooks (vitals, activity,
@@ -39,6 +109,9 @@ pub struct AgentBackend {
     /// (which the protocol forbids but the transport doesn't enforce) queue
     /// safely instead of corrupting state.
     agent: Mutex<Agent>,
+    /// Steer channel sender — held here so `Session.Steer` can push text
+    /// into the running turn even though the agent is locked.
+    steer_tx: mpsc::UnboundedSender<String>,
 }
 
 impl AgentBackend {
@@ -83,10 +156,14 @@ impl AgentBackend {
             }
         }
 
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<String>();
+        agent.set_steer_channel(steer_rx);
+
         let session_id = agent.session().meta.id.clone();
         Ok(Arc::new(Self {
             session_id,
             agent: Mutex::new(agent),
+            steer_tx,
         }))
     }
 }
@@ -128,5 +205,67 @@ impl SessionBackend for AgentBackend {
 
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    async fn compact(&self) -> anyhow::Result<(usize, usize)> {
+        let mut agent = self.agent.lock().await;
+        Ok(agent.compact().await)
+    }
+
+    fn clear_history(&self) -> anyhow::Result<()> {
+        let mut agent = self.agent.blocking_lock();
+        agent.clear_history();
+        Ok(())
+    }
+
+    fn undo(&self) -> anyhow::Result<usize> {
+        let mut agent = self.agent.blocking_lock();
+        Ok(agent.undo())
+    }
+
+    fn rewind_to_nth_user_message(&self, n: usize) -> anyhow::Result<usize> {
+        let mut agent = self.agent.blocking_lock();
+        Ok(agent.rewind_to_nth_user_message(n))
+    }
+
+    fn auto_save(&self) -> anyhow::Result<()> {
+        let mut agent = self.agent.blocking_lock();
+        agent.auto_save();
+        Ok(())
+    }
+
+    fn new_agent_session(&self) -> anyhow::Result<String> {
+        let mut agent = self.agent.blocking_lock();
+        agent.new_session();
+        Ok(agent.session().meta.id.clone())
+    }
+
+    fn load_agent_session(&self, id: &str) -> anyhow::Result<u64> {
+        let mut agent = self.agent.blocking_lock();
+        agent.load_session(id)?;
+        Ok(agent.session().messages.len() as u64)
+    }
+
+    fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
+        let agent = self.agent.blocking_lock();
+        let session = agent.session();
+        let cfg = agent.config();
+        let (msgs, users) = agent.conversation_stats();
+        Ok(SessionStateSnapshot {
+            agent_session_id: session.meta.id.clone(),
+            title: session.meta.title.clone(),
+            message_count: msgs as u64,
+            user_message_count: users as u64,
+            token_estimate: 0,
+            llm_provider: cfg.llm.provider.clone().unwrap_or_default(),
+            llm_model: cfg.llm.model.clone(),
+            collab_mode: format!("{}", cfg.conversation.collaboration_mode),
+        })
+    }
+
+    fn steer(&self, text: &str) -> anyhow::Result<()> {
+        self.steer_tx
+            .send(text.to_string())
+            .map_err(|e| anyhow::anyhow!("steer channel closed: {e}"))
     }
 }

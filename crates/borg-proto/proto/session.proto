@@ -24,6 +24,24 @@ service Session {
 
   // Reply to a ShellConfirmation or UserInputRequest, identified by prompt_id.
   rpc RespondToPrompt(PromptResponse) returns (Empty);
+
+  // Inspect agent/session state (title, model, message count, plan, etc.)
+  // — replaces direct `agent.session()` / `agent.config()` reads from the TUI.
+  rpc GetState(SessionStateRequest) returns (SessionState);
+
+  // History operations on the active agent.
+  rpc Compact(CompactRequest) returns (CompactResponse);
+  rpc ClearHistory(ClearRequest) returns (Empty);
+  rpc Undo(UndoRequest) returns (UndoResponse);
+  rpc RewindToNthUserMessage(RewindRequest) returns (RewindResponse);
+  rpc AutoSave(AutoSaveRequest) returns (Empty);
+
+  // Lifecycle on the underlying agent (separate from the gRPC session id).
+  rpc NewSession(NewSessionRequest) returns (NewSessionResponse);
+  rpc LoadSession(LoadSessionRequest) returns (LoadSessionResponse);
+
+  // Push a steer message into a running turn.
+  rpc Steer(SteerRequest) returns (Empty);
 }
 
 message Empty {}
@@ -122,3 +140,40 @@ message HistoryCompacted {
   bool iterative = 4;
 }
 message ErrorEvent { string message = 1; }
+
+// ── Agent-control messages ──────────────────────────────────────────────
+
+message SessionStateRequest { string session_id = 1; }
+message SessionState {
+  string session_id = 1;
+  string agent_session_id = 2; // borg_core Session.meta.id (for resume)
+  string title = 3;
+  uint64 message_count = 4;
+  uint64 user_message_count = 5;
+  uint64 token_estimate = 6;
+  string llm_provider = 7;
+  string llm_model = 8;
+  string collab_mode = 9;
+  bool turn_in_flight = 10;
+}
+
+message CompactRequest { string session_id = 1; }
+message CompactResponse { uint64 dropped = 1; uint64 after_tokens = 2; }
+
+message ClearRequest { string session_id = 1; }
+
+message UndoRequest { string session_id = 1; }
+message UndoResponse { uint64 removed = 1; }
+
+message RewindRequest { string session_id = 1; uint64 n = 2; }
+message RewindResponse { uint64 removed = 1; }
+
+message AutoSaveRequest { string session_id = 1; }
+
+message NewSessionRequest { string session_id = 1; }
+message NewSessionResponse { string agent_session_id = 1; }
+
+message LoadSessionRequest { string session_id = 1; string agent_session_id = 2; }
+message LoadSessionResponse { string agent_session_id = 1; uint64 message_count = 2; }
+
+message SteerRequest { string session_id = 1; string text = 2; }
