@@ -13,8 +13,10 @@
 //! errors cleanly when the socket is missing.
 
 mod connect;
+mod event_stream;
 
 pub use connect::{connect, default_socket_path};
+pub use event_stream::spawn_event_adapter;
 
 use anyhow::{anyhow, Context, Result};
 use borg_proto::admin::admin_client::AdminClient;
