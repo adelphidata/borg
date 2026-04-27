@@ -290,7 +290,7 @@ Add directory `crates/gateway/src/<name>/` with types, parse, api, verify module
 
 ## Redesign In Progress (v1: gRPC daemon + mTLS)
 
-**Status:** Task 01 (daemon kernel + proto + DaemonClient) partially landed. Spec at `docs/redesign/`. The old in-process REPL/TUI still works during migration; do not delete in-process paths until the migration item explicitly removes them.
+**Status:** Task 01 (daemon kernel + proto + DaemonClient + TUI/gateway migration) is complete; one follow-up — wiring `CapabilityRouter` into runtime tool dispatch (see `crates/borgd/src/session/executor.rs` FIXME) — remains. Tasks 02–05 not started. Spec at `docs/redesign/`.
 
 **When in doubt, read the spec:** `docs/redesign/architecture-redesign.md` (overall), `auth-and-onboarding.md` (mTLS + PAKE), `approvals.md` (tier system), `llm-providers.md` (provider trait + budgets), `data-handling.md` (retention + backups), `security-posture.md` (3-state posture + XP multiplier), `threat-model.md`, `mobile.md`, plus per-task plans `tasks/01-daemon-grpc-kernel.md` … `tasks/05-posture-data-cleanup.md`.
 
@@ -415,7 +415,7 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 
 | Task | Scope | Status |
 |------|-------|--------|
-| **01** Daemon kernel + gRPC + TUI client migration | `borgd` binary, `protocols`, `DaemonClient`, port TUI off in-process agent | **Partial** — see below |
+| **01** Daemon kernel + gRPC + TUI client migration | `borgd` binary, `protocols`, `DaemonClient`, port TUI off in-process agent | **Complete** (capability router wiring tracked as a follow-up FIXME in `borgd/src/session/executor.rs`) |
 | **02** mTLS + PAKE pairing + audit chain | `identity`, pairing flow, verifiers, hash-chained audit | Not started (depends on 01) |
 | **03** Layer 5 adapters | Port 8 channels into `borgd`; OpenAI-compat HTTP; webhook; MCP server | Not started (depends on 01) |
 | **04** Provider trait + rate cards + budgets | Unified `Provider`, versioned rate cards, soft/hard budgets, air-gap | Not started |
@@ -431,12 +431,16 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 - In-process gateway spawn from `service::` hooked into `borgd`.
 - Per-session turn serialization; `close` cancels in-flight; concurrent `Send` no longer silently stalls.
 
-**Task 01 — remaining:**
-- TUI runtime rewrite: replace agent lock + `run_event_loop` match arms with `DaemonClient` calls; popups read via admin RPCs (no direct DB).
-- `crates/gateway/src/handler.rs` → `DaemonClient`.
-- Heartbeat scheduler + gateway server spawn move into `borgd`.
-- Delete `crates/interface/src/service/` and `crates/gateway/src/in_flight.rs` once unused.
-- Compile-time guard tests: no `rusqlite` or `cortex::db` import in `crates/interface`; single-writer flock; capability routing fallback path.
+**Task 01 — also landed (since the partial-status note above):**
+- TUI runtime fully on `DaemonClient`; no `Arc<Mutex<Agent>>` in `crates/interface`.
+- All TUI popups read/write via admin RPCs — no direct `Database::open()` from the TUI runtime. (CLI subcommands like `borg status` / `providers` / `webhook` still use `Database::open_readonly()` and are intentionally out of scope for Task 01.)
+- `crates/gateway/src/handler.rs` runs through `SessionExecutor` (registry-backed `SessionHost`); no per-message `Agent::new`.
+- Heartbeat scheduler + gateway server spawn live in `borgd` (`heartbeat.rs`, `orchestrator.rs`).
+- `crates/interface/src/service/` and `crates/interface/src/in_flight.rs` deleted.
+- Guard tests in place: `crates/interface/tests/grpc_client_smoke.rs` (no `rusqlite`/`cortex::db` from interface), `crates/borgd/tests/single_writer_lock.rs`, `crates/borgd/tests/capability_routing.rs`, plus `multi_client_broadcast.rs`.
+
+**Task 01 — open follow-up:**
+- `CapabilityRouter` is exercised by `capability_routing.rs` but its output isn't consulted by `AgentBackend` tool dispatch — `terminal.exec` / `clipboard.read` always run daemon-side. Behavior is safe (matches the spec's daemon-side fallback for `run_shell`), but client-side capability handling needs wiring before TUI shell aliases / clipboard work end-to-end. See FIXME in `crates/borgd/src/session/executor.rs`.
 
 ### Forward Compatibility (v2 mobile, v3 multi-tenancy/Sentry)
 
