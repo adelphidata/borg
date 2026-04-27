@@ -230,7 +230,7 @@ enum Commands {
     },
     /// Permanently delete all Borg data and uninstall the service
     Uninstall,
-    /// Pair a device with the daemon (Task 02 mTLS).
+    /// Pair a device with the daemon over the mTLS bootstrap socket.
     ///
     /// Run on the daemon host: `borg pair show` mints + prints a code.
     /// Run on the client device: `borg pair <code>` drives the SPAKE2

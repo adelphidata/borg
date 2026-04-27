@@ -83,10 +83,9 @@ impl std::error::Error for IngressReject {}
 
 /// Hook for recording ingress events to an append-only log.
 ///
-/// v1: [`NoopAuditSink`] — events drop on the floor. Task 02 replaces
-/// this with a hash-chained audit-log writer. The trait shape is fixed
-/// now so adapters integrate against the v1 stub and pick up the real
-/// implementation via DI when Task 02 lands.
+/// Production callers inject the daemon's hash-chained audit writer.
+/// Tests and surfaces that don't care about audit history use
+/// [`NoopAuditSink`], which drops events on the floor.
 pub trait AuditSink: Send + Sync {
     /// Record one inbound ingress event. Implementations MUST NOT
     /// block on network I/O — the gate runs synchronously on the
@@ -150,8 +149,8 @@ impl IngressGate {
         }
     }
 
-    /// Build a gate with a [`NoopAuditSink`] — convenience for v1
-    /// before Task 02's audit chain lands.
+    /// Build a gate with a [`NoopAuditSink`]. Convenience for tests and
+    /// surfaces that don't write to the daemon-wide audit chain.
     pub fn with_noop_audit(max_requests: u32, window: Duration) -> Self {
         Self::new(max_requests, window, Box::new(NoopAuditSink))
     }
@@ -183,9 +182,9 @@ impl IngressGate {
         }
 
         // Rate-limit keying: per-principal so a noisy webhook can't
-        // starve channel traffic. The principal is "local" for v1, so
-        // effectively this is a global limit until Task 02; the keying
-        // shape is what the new HTTP surfaces need to be useful.
+        // starve channel traffic. With the single hard-coded `local`
+        // principal this is effectively a global limit; once cert-derived
+        // principals flow through the gate the keying becomes per-device.
         let rate_key = message.principal.as_str();
         if let Err(rej) = self.check_rate(rate_key, &message.principal) {
             self.audit
@@ -288,8 +287,8 @@ mod tests {
     }
 
     /// Counts admit + reject calls. Concrete proof the audit hook fires
-    /// on the production code path — Task 02 will swap in a real audit
-    /// chain against this same trait surface.
+    /// on the production code path — the daemon's hash-chained audit
+    /// writer plugs into the same trait surface.
     #[derive(Default)]
     struct CountingSink {
         admits: AtomicUsize,
@@ -423,7 +422,7 @@ mod tests {
         // Real code path: gate.admit drives the audit hook with no
         // mocking of the production logic. Both admit and reject paths
         // must call exactly one audit method per call. Regressing
-        // either side would leave Task 02's audit chain with gaps.
+        // either side would leave the daemon-wide audit chain with gaps.
         let sink = Arc::new(CountingSink::default());
         let gate = IngressGate::new(2, Duration::from_secs(1), Box::new(Arc::clone(&sink)));
 

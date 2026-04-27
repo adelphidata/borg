@@ -32,7 +32,7 @@ pub mod admin {
     tonic::include_proto!("borg.admin.v1");
 }
 
-/// PKI / pairing / audit RPCs (Task 02).
+/// PKI / pairing / audit RPCs.
 pub mod pki {
     #![allow(missing_docs, clippy::all)]
     tonic::include_proto!("borg.pki.v1");

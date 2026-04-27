@@ -2,9 +2,9 @@
 //!
 //! Two flavors:
 //! - [`connect`] — fail fast if the socket is missing. Use in production.
-//! - [`connect_or_spawn`] — auto-launch `borgd --insecure-uds` and wait for
-//!   the socket. Use in dev / single-user setups where the daemon's lifecycle
-//!   is the user's CLI session.
+//! - [`connect_or_spawn`] — auto-launch `borgd` and wait for the socket.
+//!   Use in dev / single-user setups where the daemon's lifecycle is the
+//!   user's CLI session.
 
 use super::DaemonClient;
 use anyhow::{anyhow, Context, Result};
@@ -38,7 +38,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     };
     if !path.exists() {
         return Err(anyhow!(
-            "no borgd socket at {}. Start the daemon (`borgd --insecure-uds`) or use connect_or_spawn for auto-launch.",
+            "no borgd socket at {}. Start the daemon (`borgd`) or use connect_or_spawn for auto-launch.",
             path.display()
         ));
     }
@@ -57,8 +57,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
     Ok(DaemonClient::from_channel(channel))
 }
 
-/// Like [`connect`] but launches `borgd --insecure-uds` if the socket isn't
-/// present. The spawned daemon is detached — it lives on after this CLI
+/// Like [`connect`] but launches `borgd` if the socket isn't present. The spawned daemon is detached — it lives on after this CLI
 /// process exits, so subsequent `borg` invocations reuse it. If you don't
 /// want that lifecycle, prefer [`connect`] + an externally supervised daemon.
 pub async fn connect_or_spawn() -> Result<DaemonClient> {
@@ -83,7 +82,6 @@ fn spawn_detached_daemon() -> Result<()> {
         borgd = PathBuf::from("borgd");
     }
     Command::new(&borgd)
-        .arg("--insecure-uds")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

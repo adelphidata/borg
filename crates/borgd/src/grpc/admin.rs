@@ -12,17 +12,19 @@ use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
-    admin_server::Admin, ActivityLogQuery, ActivityLogText, AmbientStatus, ApiKeyEntry, ApiKeyList,
-    ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList,
-    ApprovedSenderRef, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
-    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent, KeychainRef,
-    LogActivityRequest, MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState,
-    PairRequest, PairResponse, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
-    ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    admin_server::Admin, ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus,
+    ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender,
+    ApprovedSenderList, ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest,
+    CreateWebhookResponse, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
+    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
+    IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
+    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairRequest, PairResponse,
+    PairingApproval, PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest,
+    PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef, ProjectUpdate,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
     ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
     SessionList, SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation,
-    SettingsSnapshot, WarningList, WorkflowList, WorkflowSummary,
+    SettingsSnapshot, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -95,7 +97,7 @@ impl AdminSvc {
 impl Admin for AdminSvc {
     async fn pair(&self, _req: Request<PairRequest>) -> Result<Response<PairResponse>, TStatus> {
         Err(TStatus::unimplemented(
-            "pairing lands in Task 02 (mTLS + PAKE)",
+            "pairing lives on the Pki service (mTLS + SPAKE2)",
         ))
     }
 
@@ -1172,6 +1174,146 @@ impl Admin for AdminSvc {
         Ok(Response::new(MonthlyTotalCost {
             cost: cost_val,
             present,
+        }))
+    }
+
+    // ── Provider CRUD (writer-only) ──────────────────────────────────────
+
+    async fn add_provider(
+        &self,
+        req: Request<AddProviderRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        if req.id.is_empty() || req.id.contains(char::is_whitespace) {
+            return Err(TStatus::invalid_argument(
+                "id must be non-empty and contain no whitespace",
+            ));
+        }
+        let category = match req.category.to_ascii_lowercase().as_str() {
+            "byo" | "byo_endpoint" => cortex::providers::ProviderCategory::BYOEndpoint,
+            "local" => cortex::providers::ProviderCategory::Local,
+            "public" | "public_cloud" => cortex::providers::ProviderCategory::PublicCloud,
+            other => {
+                return Err(TStatus::invalid_argument(format!(
+                    "unknown category '{other}'; expected byo, local, or public_cloud"
+                )));
+            }
+        };
+        let id_for_err = req.id.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let db = Database::open()?;
+            let display_name = if req.display_name.is_empty() {
+                req.id.clone()
+            } else {
+                req.display_name
+            };
+            let api_key_env = if req.api_key_env.is_empty() {
+                None
+            } else {
+                Some(req.api_key_env)
+            };
+            let row = cortex::providers::ProviderRow {
+                id: req.id,
+                category,
+                display_name,
+                endpoint_url: req.base_url,
+                api_key_env,
+                enabled: true,
+            };
+            row.insert(db.conn())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("add_provider task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("add_provider '{id_for_err}' failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    // ── Webhook CRUD (writer-only) ───────────────────────────────────────
+
+    async fn create_webhook(
+        &self,
+        req: Request<CreateWebhookRequest>,
+    ) -> Result<Response<CreateWebhookResponse>, TStatus> {
+        let req = req.into_inner();
+        let name = req.name.clone();
+        let created = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            let thread_path = if req.thread_path.is_empty() {
+                None
+            } else {
+                Some(req.thread_path.as_str())
+            };
+            gateway::generic_webhook::definitions::create(
+                &db,
+                &req.name,
+                &req.sender_path,
+                thread_path,
+                &req.body_path,
+            )
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("create_webhook task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("create_webhook '{name}' failed: {e}")))?;
+        Ok(Response::new(CreateWebhookResponse {
+            name: created.row.name,
+            hmac_secret: created.row.secret_hash,
+        }))
+    }
+
+    async fn revoke_webhook(&self, req: Request<WebhookRef>) -> Result<Response<Empty>, TStatus> {
+        let name = req.into_inner().name;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let db = Database::open()?;
+            gateway::generic_webhook::definitions::revoke(&db, &name)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("revoke_webhook task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("revoke_webhook failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    // ── Client tokens (writer-only) ──────────────────────────────────────
+
+    async fn issue_client_token(
+        &self,
+        req: Request<IssueClientTokenRequest>,
+    ) -> Result<Response<IssueClientTokenResponse>, TStatus> {
+        let req = req.into_inner();
+        let label = req.label.clone();
+        let issued = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            cortex::auth::tokens::issue(&db, &req.label, &req.scopes)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("issue_client_token task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("issue_client_token '{label}' failed: {e}")))?;
+        Ok(Response::new(IssueClientTokenResponse {
+            id: issued.row.id,
+            label: issued.row.label,
+            plaintext: issued.plaintext,
+        }))
+    }
+
+    async fn revoke_client_token(
+        &self,
+        req: Request<ClientTokenRef>,
+    ) -> Result<Response<RevokedClientToken>, TStatus> {
+        let label = req.into_inner().label;
+        let label_for_err = label.clone();
+        let row = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            cortex::auth::tokens::revoke_by_label(&db, &label)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("revoke_client_token task panicked: {e}")))?
+        .map_err(|e| {
+            TStatus::internal(format!("revoke_client_token '{label_for_err}' failed: {e}"))
+        })?;
+        Ok(Response::new(RevokedClientToken {
+            id: row.id,
+            label: row.label,
+            revoked_at: row.revoked_at.unwrap_or(0) as u64,
         }))
     }
 }

@@ -5,7 +5,8 @@ package borg.admin.v1;
 // Admin surfaces lifecycle, settings, and the data-access RPCs that replace
 // direct DB reads from the TUI popups.
 service Admin {
-  // Pairing — full impl arrives in Task 02.
+  // Pairing — superseded by the Pki service; this stub returns
+  // `unimplemented` and is kept only for legacy clients.
   rpc Pair(PairRequest) returns (PairResponse);
 
   rpc Poke(Empty) returns (Empty);
@@ -99,6 +100,18 @@ service Admin {
   // DB reads from the cli.
   rpc GetMonthlyTokenTotal(Empty) returns (MonthlyTokenTotal);
   rpc GetMonthlyTotalCost(Empty) returns (MonthlyTotalCost);
+
+  // BYO providers — writer-only RPCs. Reads can use Database::open_readonly.
+  rpc AddProvider(AddProviderRequest) returns (Empty);
+
+  // Generic webhook definitions — writer-only RPCs.
+  rpc CreateWebhook(CreateWebhookRequest) returns (CreateWebhookResponse);
+  rpc RevokeWebhook(WebhookRef) returns (Empty);
+
+  // Bearer client tokens — writer-only RPCs. Issue returns the plaintext
+  // token exactly once; the daemon stores only its hash.
+  rpc IssueClientToken(IssueClientTokenRequest) returns (IssueClientTokenResponse);
+  rpc RevokeClientToken(ClientTokenRef) returns (RevokedClientToken);
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }
@@ -406,4 +419,43 @@ message DaemonStatus {
   uint64 active_tasks = 6;
   uint64 paused_tasks = 7;
   uint64 pending_pairings = 8;
+}
+
+// Provider CRUD ─────────────────────────────────────────────────────────────
+message AddProviderRequest {
+  string id = 1;
+  string display_name = 2;
+  string base_url = 3;
+  string api_key_env = 4;       // empty = none
+  string category = 5;          // "byo" | "local" | "public_cloud"
+}
+
+// Webhook CRUD ──────────────────────────────────────────────────────────────
+message CreateWebhookRequest {
+  string name = 1;
+  string sender_path = 2;
+  string thread_path = 3;       // empty = none
+  string body_path = 4;
+}
+message CreateWebhookResponse {
+  string name = 1;
+  bytes hmac_secret = 2;        // raw key bytes; cli prints once as hex
+}
+message WebhookRef { string name = 1; }
+
+// Client token CRUD ─────────────────────────────────────────────────────────
+message IssueClientTokenRequest {
+  string label = 1;
+  string scopes = 2;
+}
+message IssueClientTokenResponse {
+  int64 id = 1;
+  string label = 2;
+  string plaintext = 3;         // returned only at issue time
+}
+message ClientTokenRef { string label = 1; }
+message RevokedClientToken {
+  int64 id = 1;
+  string label = 2;
+  uint64 revoked_at = 3;
 }

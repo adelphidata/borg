@@ -9,12 +9,10 @@
 //!     intentionally listed as an exception under the "Source-grep tests"
 //!     rule for the same reason as the TUI mouse-capture guards: the
 //!     invariant ("the cli must not open the SQLite DB directly — the
-//!     daemon owns the DB") is structural, not type-level. PR-E5 (final
-//!     daemon migration) is the motivating incident: prior to this work
-//!     the cli routinely opened `Database::open()` from background tasks,
-//!     racing the daemon's writer and corrupting state. After this PR,
-//!     remaining offenders are explicitly allowlisted with a `PR-B-pending`
-//!     comment so a future shrink of the list is mechanical.
+//!     daemon owns the DB") is structural, not type-level. Motivating
+//!     incident: prior to the daemon migration the cli routinely opened
+//!     `Database::open()` from background tasks, racing the daemon's
+//!     writer and corrupting state.
 //!
 //!  2. `daemon_client_round_trips_a_turn` — spins a `borgd` server over a
 //!     temp UDS, opens a session, sends a trivial message, and asserts at
@@ -103,9 +101,8 @@ fn allowlist_is_shrink_only() {
 fn crates_cli_src_has_no_direct_db_access() {
     // CLAUDE.md "Source-grep tests" exception:
     // Invariant: the cli must not open the SQLite DB directly — the daemon
-    // owns the DB and is the single writer. Motivating incident: PR-E5
-    // (final daemon migration) — prior to this work the cli routinely
-    // raced the daemon's writer.
+    // owns the DB and is the single writer. Motivating incident: prior
+    // to the daemon migration the cli routinely raced the daemon's writer.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let cli_src = PathBuf::from(&manifest_dir).join("src");
     assert!(cli_src.is_dir(), "{} is not a dir", cli_src.display());

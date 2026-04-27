@@ -2,9 +2,9 @@ syntax = "proto3";
 
 package borg.pki.v1;
 
-// Pki — Task 02 PKI surface. Lives in its own service (and its own .proto)
-// so this PR can land alongside parallel admin.proto changes without merge
-// conflicts. mTLS-required for every RPC.
+// Pki — internal-CA, pairing, and audit-chain RPCs. Lives in its own
+// service (and its own .proto) to keep mTLS-required RPCs isolated from
+// the looser admin surface. mTLS-required for every RPC.
 service Pki {
   // Mints a fresh PAKE code, persists `sha256(code)` to `pairing_codes`, and
   // returns the plaintext code to the caller. The actual SPAKE2 exchange runs

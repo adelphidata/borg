@@ -1,4 +1,4 @@
-//! End-to-end test for Task 02: pairing → audit chain → revocation.
+//! End-to-end test: pairing → audit chain → revocation.
 //!
 //! Covers:
 //! - Daemon mints CA on first start, persists to DB + keychain.

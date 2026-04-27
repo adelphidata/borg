@@ -63,7 +63,7 @@ pub(crate) fn dispatch(action: ProvidersAction) -> Result<()> {
 }
 
 fn list() -> Result<()> {
-    let db = cortex::db::Database::open()?;
+    let db = cortex::db::Database::open_readonly()?;
     let rows = ProviderRow::list(db.conn())?;
     if rows.is_empty() {
         println!("No BYO providers configured.");
@@ -100,20 +100,24 @@ fn add(
     if id.is_empty() || id.contains(char::is_whitespace) {
         bail!("--id must be non-empty and contain no whitespace");
     }
-    let category = parse_category(category_str)?;
+    // Validate locally before round-tripping so the user gets a fast error
+    // for typos without needing to spawn the daemon.
+    let _ = parse_category(category_str)?;
     let display_name = display_name.unwrap_or_else(|| id.clone());
 
-    let db = cortex::db::Database::open()?;
-    let row = ProviderRow {
-        id: id.clone(),
-        category,
-        display_name,
-        endpoint_url: base_url,
-        api_key_env,
-        enabled: true,
-    };
-    row.insert(db.conn())
-        .with_context(|| format!("inserting provider '{id}'"))?;
+    tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .add_provider(
+                &id,
+                &display_name,
+                &base_url,
+                api_key_env.as_deref(),
+                category_str,
+            )
+            .await
+            .with_context(|| format!("inserting provider '{id}'"))
+    })?;
     println!("Added provider '{id}'.");
     Ok(())
 }

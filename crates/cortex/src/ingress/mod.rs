@@ -8,8 +8,9 @@
 //! 1. Rate limiting (per-principal sliding window).
 //! 2. Prompt-injection sanitization (existing 5-layer defense applied
 //!    once, here, instead of duplicated per-surface).
-//! 3. Audit-write hook (no-op in v1; Task 02 swaps in the hash-chained
-//!    audit log).
+//! 3. Audit-write hook — wired to the daemon's hash-chained audit log
+//!    when a real [`AuditSink`] is injected; defaults to a no-op for
+//!    in-process tests.
 //!
 //! Session resolution is co-located here ([`session_key`]) so every
 //! surface derives `{sender_id}:{thread_id}` identically.

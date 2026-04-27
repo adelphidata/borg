@@ -35,7 +35,7 @@ pub mod activity_log;
 /// Agent conversation loop and tool dispatch.
 pub mod agent;
 /// Authentication primitives for non-mTLS ingress surfaces — bearer
-/// tokens for OpenAI-compat HTTP and MCP HTTP. mTLS lands in Task 02.
+/// tokens for OpenAI-compat HTTP and MCP HTTP.
 pub mod auth;
 /// Agent bond/relationship tracking.
 pub mod bond;

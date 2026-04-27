@@ -1,4 +1,4 @@
-//! gRPC handlers for the `Pki` service (Task 02).
+//! gRPC handlers for the `Pki` service.
 //!
 //! Wired in `daemon.rs` alongside the other services; mTLS is required to
 //! reach these RPCs (interceptor enforces). The pairing-code mint here is

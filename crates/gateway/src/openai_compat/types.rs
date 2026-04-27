@@ -77,7 +77,7 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stream: bool,
     /// Optional max output tokens — passed through to the agent for
-    /// budget enforcement (v1 ignores; lands in Task 04).
+    /// budget enforcement.
     #[serde(default, rename = "max_tokens")]
     pub max_tokens: Option<u32>,
     /// Optional sampling temperature — surfaced for completeness but
@@ -161,8 +161,8 @@ pub struct ChatCompletionDelta {
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
-/// Token usage block. v1 reports zeros — Task 04 (provider/budget)
-/// fills these in from agent UsageData events.
+/// Token usage block. Filled in from agent `UsageData` events when the
+/// provider reports them; surfaces that don't yet wire usage emit zeros.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Usage {
     /// Tokens in the prompt.

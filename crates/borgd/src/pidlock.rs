@@ -109,7 +109,7 @@ mod tests {
     fn pid_file_contents_are_current_process_id() {
         // Real failure mode: if we don't truncate before writing, a stale PID
         // from a prior crashed daemon would remain and confuse stale-detection
-        // logic added in Task 02.
+        // logic.
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("borgd.pid");
 

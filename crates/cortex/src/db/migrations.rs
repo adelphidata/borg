@@ -1583,7 +1583,7 @@ impl Database {
         Ok(())
     }
 
-    /// V46: Task 02 PKI + audit chain tables.
+    /// V46: PKI + audit chain tables.
     ///
     /// `internal_ca_certs` — root/server/client cert metadata; private keys
     /// live in the OS keychain, never on disk.

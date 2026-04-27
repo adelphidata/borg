@@ -91,9 +91,9 @@ async fn webhook_handler(
     // The stored `secret_hash` IS the HMAC key both sides use —
     // SHA-256 of the random plaintext shown to the user at create
     // time. Equivalent to a single-iteration KDF over a 32-byte
-    // CSPRNG secret. Task 02 will wrap this column in OS-keychain
-    // encryption; until then, DB read implies sig-forge ability,
-    // same threat profile as the existing `credentials` table.
+    // CSPRNG secret. DB read implies sig-forge ability, same threat
+    // profile as the existing `credentials` table; OS-keychain wrapping
+    // for this column is a follow-up.
     let secret_for_hmac = hex_lowercase(&definition.secret_hash);
     let now = chrono::Utc::now().timestamp();
     let sig_header = headers

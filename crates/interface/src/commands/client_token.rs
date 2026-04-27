@@ -1,7 +1,7 @@
 //! `borg client-token` subcommand — manage bearer tokens for the
 //! OpenAI-compat HTTP surface and MCP HTTP transport.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use cortex::auth::tokens;
 use cortex::db::Database;
@@ -39,12 +39,14 @@ pub(crate) fn dispatch_client_token(action: Option<ClientTokenAction>) -> Result
 }
 
 fn run_issue(label: &str, scopes: &str) -> Result<()> {
-    let db = Database::open()?;
-    let issued = tokens::issue(&db, label, scopes)?;
-    println!(
-        "Issued client token `{}` (id {}).",
-        issued.row.label, issued.row.id
-    );
+    let issued = tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .issue_client_token(label, scopes)
+            .await
+            .with_context(|| format!("issuing client token '{label}'"))
+    })?;
+    println!("Issued client token `{}` (id {}).", issued.label, issued.id);
     println!();
     println!("    {}", issued.plaintext);
     println!();
@@ -57,7 +59,7 @@ fn run_issue(label: &str, scopes: &str) -> Result<()> {
 }
 
 fn run_list() -> Result<()> {
-    let db = Database::open()?;
+    let db = Database::open_readonly()?;
     let rows = tokens::list(&db)?;
     if rows.is_empty() {
         println!("No client tokens issued.");
@@ -91,12 +93,18 @@ fn run_list() -> Result<()> {
 }
 
 fn run_revoke(label: &str) -> Result<()> {
-    let db = Database::open()?;
-    let row = tokens::revoke_by_label(&db, label)?;
-    let ts = row
-        .revoked_at
-        .map(|t| format_ts(t, "%Y-%m-%d %H:%M:%S"))
-        .unwrap_or_else(|| "?".to_string());
+    let row = tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .revoke_client_token(label)
+            .await
+            .with_context(|| format!("revoking client token '{label}'"))
+    })?;
+    let ts = if row.revoked_at == 0 {
+        "?".to_string()
+    } else {
+        format_ts(row.revoked_at as i64, "%Y-%m-%d %H:%M:%S")
+    };
     println!("Revoked `{}` at {}.", row.label, ts);
     Ok(())
 }

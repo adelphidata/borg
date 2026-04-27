@@ -134,7 +134,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         }
     };
-    // ── Task 02: PKI bootstrap ──
+    // ── PKI bootstrap ──
     //
     // Mint root CA + server cert on first run; load from DB+keychain on
     // subsequent starts. We open a daemon-owned `Database` here and wrap it
@@ -207,7 +207,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         let parsed: std::net::SocketAddr = addr
             .parse()
             .with_context(|| format!("parsing --listen address `{addr}`"))?;
-        tracing::warn!(addr = %parsed, "loopback TCP listener enabled (insecure, no auth — Task 02 wires mTLS)");
+        tracing::warn!(addr = %parsed, "loopback TCP listener enabled (mTLS not yet wired on this listener)");
 
         let mut uds_rx = shutdown_tx.subscribe();
         let mut tcp_rx = shutdown_tx.subscribe();

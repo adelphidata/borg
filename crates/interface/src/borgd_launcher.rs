@@ -36,7 +36,6 @@ const LAUNCHD_PLIST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>ProgramArguments</key>
     <array>
         <string>{{BINARY_PATH}}</string>
-        <string>--insecure-uds</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -60,7 +59,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={{BINARY_PATH}} --insecure-uds
+ExecStart={{BINARY_PATH}}
 Restart=on-failure
 RestartSec=5
 Environment=HOME={{HOME}}
@@ -131,8 +130,7 @@ pub async fn ensure_running() -> Result<()> {
 
     let binary = find_borgd_binary()?;
     let mut cmd = std::process::Command::new(&binary);
-    cmd.arg("--insecure-uds")
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cmd.spawn()
@@ -459,30 +457,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn launchd_template_targets_borgd_with_insecure_uds() {
+    fn launchd_template_targets_borgd_binary() {
         let content = LAUNCHD_PLIST_TEMPLATE
             .replace("{{LABEL}}", LAUNCHD_LABEL)
             .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
             .replace("{{LOG_DIR}}", "/tmp/logs")
             .replace("{{HOME}}", "/Users/test");
 
-        // Real failure mode: a regression to spawning `borg daemon` (the now
+        // Real failure mode: a regression to spawning `borg daemon` (the
         // removed subcommand) would leave installed services dead because
-        // dispatch no longer matches `Daemon`. Lock both the binary path and
-        // the `--insecure-uds` flag here.
+        // dispatch no longer matches `Daemon`. Also guard against the
+        // deprecated `--insecure-uds` flag sneaking back in.
         assert!(content.contains("<string>/usr/local/bin/borgd</string>"));
-        assert!(content.contains("<string>--insecure-uds</string>"));
+        assert!(!content.contains("--insecure-uds"));
         assert!(!content.contains(">daemon<"));
         assert!(!content.contains("{{"));
     }
 
     #[test]
-    fn systemd_template_targets_borgd_with_insecure_uds() {
+    fn systemd_template_targets_borgd_binary() {
         let content = SYSTEMD_UNIT_TEMPLATE
             .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
             .replace("{{HOME}}", "/home/test");
 
-        assert!(content.contains("ExecStart=/usr/local/bin/borgd --insecure-uds"));
+        assert!(content.contains("ExecStart=/usr/local/bin/borgd"));
+        assert!(!content.contains("--insecure-uds"));
         assert!(!content.contains("borgd daemon"));
         assert!(!content.contains("{{"));
     }

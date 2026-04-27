@@ -7,10 +7,10 @@
 //! settings I/O, list_sessions, get_session).
 //!
 //! Auto-spawn convenience: [`DaemonClient::connect_or_spawn`] launches a
-//! fresh `borgd --insecure-uds` if no socket is present at the expected
-//! path (dev workflow). Production deployments should run `borgd` as a
-//! supervised service and connect via [`DaemonClient::connect`] which
-//! errors cleanly when the socket is missing.
+//! fresh `borgd` if no socket is present at the expected path (dev
+//! workflow). Production deployments should run `borgd` as a supervised
+//! service and connect via [`DaemonClient::connect`] which errors cleanly
+//! when the socket is missing.
 
 mod connect;
 mod event_stream;
@@ -21,15 +21,17 @@ pub use event_stream::{forward_event_stream, spawn_event_adapter};
 use anyhow::{anyhow, Context, Result};
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
-    ActivityLogQuery, ActivityLogText, AmbientStatus, ApiKeyList, ApiKeyRef, ApiKeyValue,
-    ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, DaemonStatus,
-    Empty as AdminEmpty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest,
-    HealReport, HeartbeatEvent as PbHeartbeatEvent, LogActivityRequest, MonthlyTokenTotal,
-    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
-    ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
-    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, WarningList, WorkflowList,
+    ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyList, ApiKeyRef,
+    ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
+    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, Empty as AdminEmpty,
+    ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
+    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
+    LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
+    PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse, Project,
+    ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RevokedClientToken, ScheduledTask,
+    ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SettingKey,
+    SettingMutation, SettingsSnapshot, WarningList, WebhookRef, WorkflowList,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -1029,6 +1031,92 @@ impl DaemonClient {
             .get_daemon_status(AdminEmpty {})
             .await
             .context("Admin.GetDaemonStatus failed")?
+            .into_inner())
+    }
+
+    // ── Provider / webhook / client-token writes ──────────────────────────
+
+    /// Insert a BYO provider row. Reads stay on `Database::open_readonly`.
+    pub async fn add_provider(
+        &mut self,
+        id: &str,
+        display_name: &str,
+        base_url: &str,
+        api_key_env: Option<&str>,
+        category: &str,
+    ) -> Result<()> {
+        self.admin
+            .add_provider(AddProviderRequest {
+                id: id.to_string(),
+                display_name: display_name.to_string(),
+                base_url: base_url.to_string(),
+                api_key_env: api_key_env.unwrap_or("").to_string(),
+                category: category.to_string(),
+            })
+            .await
+            .context("Admin.AddProvider failed")?;
+        Ok(())
+    }
+
+    /// Create a webhook definition; returns the raw HMAC secret bytes —
+    /// the caller is responsible for printing the hex once and discarding.
+    pub async fn create_webhook(
+        &mut self,
+        name: &str,
+        sender_path: &str,
+        thread_path: Option<&str>,
+        body_path: &str,
+    ) -> Result<CreateWebhookResponse> {
+        Ok(self
+            .admin
+            .create_webhook(CreateWebhookRequest {
+                name: name.to_string(),
+                sender_path: sender_path.to_string(),
+                thread_path: thread_path.unwrap_or("").to_string(),
+                body_path: body_path.to_string(),
+            })
+            .await
+            .context("Admin.CreateWebhook failed")?
+            .into_inner())
+    }
+
+    /// Mark a webhook revoked. Idempotent.
+    pub async fn revoke_webhook(&mut self, name: &str) -> Result<()> {
+        self.admin
+            .revoke_webhook(WebhookRef {
+                name: name.to_string(),
+            })
+            .await
+            .context("Admin.RevokeWebhook failed")?;
+        Ok(())
+    }
+
+    /// Issue a bearer client token; the plaintext is returned exactly once.
+    pub async fn issue_client_token(
+        &mut self,
+        label: &str,
+        scopes: &str,
+    ) -> Result<IssueClientTokenResponse> {
+        Ok(self
+            .admin
+            .issue_client_token(IssueClientTokenRequest {
+                label: label.to_string(),
+                scopes: scopes.to_string(),
+            })
+            .await
+            .context("Admin.IssueClientToken failed")?
+            .into_inner())
+    }
+
+    /// Revoke a bearer token by label.
+    pub async fn revoke_client_token(&mut self, label: &str) -> Result<RevokedClientToken> {
+        Ok(self
+            .admin
+            .revoke_client_token(ClientTokenRef {
+                label: label.to_string(),
+            })
+            .await
+            .context("Admin.RevokeClientToken failed")?
             .into_inner())
     }
 }

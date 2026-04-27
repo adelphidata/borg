@@ -1,8 +1,8 @@
 //! `borgd` — the Borg agent daemon.
 //!
-//! v1 entrypoint per `docs/redesign/tasks/01-daemon-grpc-kernel.md`. Hosts the
-//! agent loop (lifted from the in-process TUI/REPL) and exposes Session,
-//! Capability, Status, and Admin gRPC services over a Unix Domain Socket.
+//! Hosts the agent loop (lifted from the in-process TUI/REPL) and exposes
+//! Session, Capability, Status, and Admin gRPC services over a Unix Domain
+//! Socket.
 
 use anyhow::Result;
 use borgd::{daemon, paths};
@@ -18,10 +18,13 @@ struct Args {
     #[arg(long, env = "BORG_HOME")]
     borg_home: Option<PathBuf>,
 
-    /// (Legacy) permit unauthenticated UDS connections. Task 02 now ships
-    /// the per-installation CA + paired-device flow, so the UDS no longer
-    /// requires this gate. Flag retained for backwards-compat invocation.
-    #[arg(long)]
+    /// (Deprecated) historical no-op. The UDS no longer has an "insecure"
+    /// mode — the per-installation CA + paired-device flow is enforced
+    /// unconditionally. Accepted silently so existing launchd / systemd
+    /// unit files keep starting, but the daemon emits a deprecation
+    /// warning. Remove from your unit file at your convenience; will be
+    /// hard-rejected after one minor release.
+    #[arg(long, hide = true)]
     insecure_uds: bool,
 
     /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`). Task
@@ -30,8 +33,8 @@ struct Args {
     #[arg(long)]
     listen: Option<String>,
 
-    /// (Legacy, deprecated) permit unauthenticated TCP. Ignored — Task 02
-    /// always requires mTLS on the TCP listener.
+    /// (Legacy, deprecated) permit unauthenticated TCP. Ignored — the
+    /// TCP listener always requires mTLS.
     #[arg(long)]
     insecure_tcp: bool,
 }
@@ -48,6 +51,13 @@ async fn main() -> Result<()> {
     if args.insecure_tcp {
         tracing::warn!(
             "--insecure-tcp is deprecated: TCP listener now requires mTLS unconditionally"
+        );
+    }
+    if args.insecure_uds {
+        tracing::warn!(
+            "--insecure-uds is deprecated and a no-op: the UDS no longer has an insecure mode. \
+             Remove it from your launchd / systemd unit; the daemon will hard-reject this flag \
+             in a future release."
         );
     }
 

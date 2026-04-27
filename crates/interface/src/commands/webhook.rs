@@ -1,6 +1,6 @@
 //! `borg webhook` subcommand — manage signed webhook definitions.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use cortex::db::Database;
 use gateway::generic_webhook::definitions;
@@ -53,17 +53,19 @@ fn run_create(
     thread_path: Option<&str>,
     body_path: &str,
 ) -> Result<()> {
-    let db = Database::open()?;
-    let created = definitions::create(&db, name, sender_path, thread_path, body_path)?;
+    let resp = tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .create_webhook(name, sender_path, thread_path, body_path)
+            .await
+            .with_context(|| format!("creating webhook '{name}'"))
+    })?;
     println!(
         "Created webhook `{}` at /v1/webhook/{}",
-        created.row.name, created.row.name
+        resp.name, resp.name
     );
     println!();
-    println!(
-        "HMAC key (hex): {}",
-        hex_lowercase(&created.row.secret_hash)
-    );
+    println!("HMAC key (hex): {}", hex_lowercase(&resp.hmac_secret));
     println!();
     println!(
         "Sign requests with: HMAC-SHA256(<key>, \"{{ts}}.{{body}}\")\n\
@@ -74,7 +76,7 @@ fn run_create(
 }
 
 fn run_list() -> Result<()> {
-    let db = Database::open()?;
+    let db = Database::open_readonly()?;
     let rows = definitions::list(&db)?;
     if rows.is_empty() {
         println!("No webhook definitions.");
@@ -104,8 +106,13 @@ fn run_list() -> Result<()> {
 }
 
 fn run_revoke(name: &str) -> Result<()> {
-    let db = Database::open()?;
-    definitions::revoke(&db, name)?;
+    tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .revoke_webhook(name)
+            .await
+            .with_context(|| format!("revoking webhook '{name}'"))
+    })?;
     println!("Revoked webhook `{name}`.");
     Ok(())
 }

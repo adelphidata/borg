@@ -1,7 +1,7 @@
 //! Bearer-token issuance, verification, and revocation.
 //!
-//! Used by the OpenAI-compat HTTP surface and the MCP HTTP transport
-//! (Task 03). Tokens are 32 random bytes, base64url-encoded; only the
+//! Used by the OpenAI-compat HTTP surface and the MCP HTTP transport.
+//! Tokens are 32 random bytes, base64url-encoded; only the
 //! SHA-256 hash is persisted. Plaintext is shown to the issuer once at
 //! creation and is never recoverable thereafter — same model as
 //! GitHub PATs. Revocation is a tombstone (`revoked_at` timestamp), not

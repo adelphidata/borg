@@ -74,15 +74,15 @@ impl MessageBody {
 }
 
 /// Identifier of the authenticated principal that produced this
-/// ingress. v1 has a single hard-coded `local` principal; Task 02
-/// replaces this with the cert-derived identity from the gRPC
+/// ingress. v1 has a single hard-coded `local` principal; the mTLS
+/// path replaces it with the cert-derived identity from the gRPC
 /// connection context.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrincipalId(String);
 
 impl PrincipalId {
-    /// The single v1 principal used by every ingress surface until
-    /// Task 02 (mTLS + cert-derived identity) lands.
+    /// Literal identity used by surfaces that haven't been wired to a
+    /// cert-derived principal yet (e.g. the in-process audit harness).
     pub const LOCAL_LITERAL: &'static str = "local";
 
     /// The single v1 local principal.
@@ -90,8 +90,8 @@ impl PrincipalId {
         Self(Self::LOCAL_LITERAL.to_string())
     }
 
-    /// Wrap an explicit identity (Task 02 boundary will call this with
-    /// a value derived from the client cert SAN).
+    /// Wrap an explicit identity (the mTLS interceptor calls this with a
+    /// value derived from the client cert SAN).
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
