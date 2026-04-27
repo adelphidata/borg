@@ -230,6 +230,25 @@ enum Commands {
     },
     /// Permanently delete all Borg data and uninstall the service
     Uninstall,
+    /// Pair a device with the daemon (Task 02 mTLS).
+    ///
+    /// Run on the daemon host: `borg pair show` mints + prints a code.
+    /// Run on the client device: `borg pair <code>` drives the SPAKE2
+    /// handshake and stashes the issued cert in the OS keychain.
+    Pair {
+        #[command(subcommand)]
+        action: PairCmd,
+    },
+    /// Revoke or list paired devices.
+    Revoke {
+        #[command(subcommand)]
+        action: Option<RevokeCmd>,
+    },
+    /// Verify the integrity of the audit chain.
+    Audit {
+        #[command(subcommand)]
+        action: AuditCmd,
+    },
     /// Export a session to JSON (default), CSV, or TXT.
     ///
     /// With no `--output`, writes to stdout (pipeable into `jq`, files, etc.).
@@ -243,6 +262,43 @@ enum Commands {
         #[arg(long, short)]
         output: Option<std::path::PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum PairCmd {
+    /// Mint a pairing code and print it (run on the daemon host).
+    Show,
+    /// Complete pairing using a code (run on the client device).
+    Complete {
+        /// The pairing code shown by `borg pair show` on the daemon host.
+        code: String,
+        /// Human-readable label for this device.
+        #[arg(long, default_value = "borg-device")]
+        label: String,
+        /// Override the bootstrap socket path.
+        #[arg(long)]
+        socket: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RevokeCmd {
+    /// Revoke a paired device by fingerprint.
+    Device {
+        /// SHA-256 cert fingerprint (lowercase hex, no colons).
+        fingerprint: String,
+        /// Reason recorded in the audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// List all paired devices.
+    List,
+}
+
+#[derive(Subcommand)]
+enum AuditCmd {
+    /// Replay the audit chain and report Ok or Tampered(seq).
+    Verify,
 }
 
 /// Runtime worker thread stack size.
@@ -433,6 +489,23 @@ async fn async_main() -> Result<()> {
             format,
             output,
         }) => commands::export::run_export(&session_id, &format, output)?,
+        Some(Commands::Pair { action }) => match action {
+            PairCmd::Show => commands::device_pair::run_show().await?,
+            PairCmd::Complete {
+                code,
+                label,
+                socket,
+            } => commands::device_pair::run_complete(&code, &label, socket).await?,
+        },
+        Some(Commands::Revoke { action }) => match action {
+            None | Some(RevokeCmd::List) => commands::revoke::run_list().await?,
+            Some(RevokeCmd::Device { fingerprint, reason }) => {
+                commands::revoke::run(&fingerprint, reason.as_deref()).await?
+            }
+        },
+        Some(Commands::Audit { action }) => match action {
+            AuditCmd::Verify => commands::audit::run_verify().await?,
+        },
     }
 
     Ok(())

@@ -1,10 +1,13 @@
+pub(crate) mod audit;
 pub(crate) mod client_token;
+pub(crate) mod device_pair;
 pub(crate) mod export;
 pub(crate) mod mcp;
 pub(crate) mod misc;
 pub(crate) mod pairing;
 pub(crate) mod projects;
 pub(crate) mod providers;
+pub(crate) mod revoke;
 pub(crate) mod settings;
 pub(crate) mod status;
 pub(crate) mod tasks;

@@ -17,6 +17,7 @@ borg-gateway = { path = "../gateway" }
 borg-plugins = { path = "../plugins" }
 borg-proto = { path = "../borg-proto" }
 borgd = { path = "../borgd" }
+borg-pki = { path = "../borg-pki" }
 tonic = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }

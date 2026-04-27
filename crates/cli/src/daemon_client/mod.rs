@@ -38,6 +38,11 @@ use borg_proto::session::{
     NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
     SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
+use borg_proto::pki::pki_client::PkiClient;
+use borg_proto::pki::{
+    PairedDeviceList, PkiEmpty, RevokeDeviceRequest, StartPairingRequest, StartPairingResponse,
+    VerifyAuditResponse,
+};
 use borg_proto::status::status_client::StatusClient;
 use borg_proto::status::{
     BondEventList, BondStateProto, Empty as StatusEmpty, EvolutionEventList, EvolutionStateProto,
@@ -55,6 +60,7 @@ pub struct DaemonClient {
     session: SessionClient<Channel>,
     admin: AdminClient<Channel>,
     status: StatusClient<Channel>,
+    pki: PkiClient<Channel>,
 }
 
 impl DaemonClient {
@@ -92,8 +98,41 @@ impl DaemonClient {
         Self {
             session: SessionClient::new(channel.clone()),
             admin: AdminClient::new(channel.clone()),
-            status: StatusClient::new(channel),
+            status: StatusClient::new(channel.clone()),
+            pki: PkiClient::new(channel),
         }
+    }
+
+    /// Mint a fresh pairing code on the daemon. Returns the plaintext code
+    /// and its expiry. The code is shown to the operator and used by a
+    /// separate `borg pair <code>` invocation that drives the SPAKE2 exchange
+    /// over the bootstrap UDS.
+    pub async fn start_pairing(&mut self, device_label: &str) -> Result<StartPairingResponse> {
+        Ok(self
+            .pki
+            .start_pairing(StartPairingRequest {
+                device_label: device_label.to_string(),
+            })
+            .await?
+            .into_inner())
+    }
+
+    pub async fn revoke_device(&mut self, fingerprint: &str, reason: &str) -> Result<()> {
+        self.pki
+            .revoke_device(RevokeDeviceRequest {
+                fingerprint: fingerprint.to_string(),
+                reason: reason.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_paired_devices(&mut self) -> Result<PairedDeviceList> {
+        Ok(self.pki.list_paired_devices(PkiEmpty {}).await?.into_inner())
+    }
+
+    pub async fn verify_audit_chain(&mut self) -> Result<VerifyAuditResponse> {
+        Ok(self.pki.verify_audit_chain(PkiEmpty {}).await?.into_inner())
     }
 
     /// Open a fresh session (or resume the named one if `resume_id` is set).
