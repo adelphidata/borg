@@ -415,10 +415,13 @@ mod tests {
         assert!(is_tombstone_payload(&r.event_json));
     }
 
-    /// Appending after a tombstone keeps downstream linkage — the new row's
-    /// `prev_hash` matches the tombstoned row's *new* hash. Without the
-    /// hash recompute in `tombstone_audit_event`, the next append would
-    /// link to the original hash and create a Tampered chain.
+    /// Appending after a tombstone keeps downstream linkage. By design
+    /// (`data-handling.md` §"Tombstone-on-purge") the tombstoned row's
+    /// stored `hash` is left untouched — it remains a forensic anchor
+    /// to the original payload — so the next row's `prev_hash` already
+    /// matches without any recompute. This test guards against a
+    /// regression where `tombstone_audit_event` rewrites either column
+    /// and breaks the chain at seq+1.
     #[test]
     fn tombstone_preserves_downstream_linkage() {
         let db = test_db();

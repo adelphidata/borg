@@ -167,7 +167,9 @@ pub fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
     let inner_dir = tmp.path().join("inner");
     fs::create_dir_all(&inner_dir).context("verify: mkdir inner")?;
     let f = fs::File::open(&body_tar).context("verify: reopen body.tar")?;
-    tar::Archive::new(BufReader::new(f))
+    let mut archive = tar::Archive::new(BufReader::new(f));
+    harden_archive(&mut archive);
+    archive
         .unpack(&inner_dir)
         .context("verify: extract inner tar")?;
 
@@ -228,7 +230,9 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
     let tmp = tempfile::tempdir().context("restore: tempdir")?;
     let (_, body_tar) = extract_outer(file, tmp.path())?;
     let f = fs::File::open(&body_tar).context("restore: open body.tar")?;
-    tar::Archive::new(BufReader::new(f))
+    let mut archive = tar::Archive::new(BufReader::new(f));
+    harden_archive(&mut archive);
+    archive
         .unpack(tmp.path())
         .context("restore: extract body.tar")?;
     let staged = tmp.path().join("borg_home");
@@ -380,6 +384,23 @@ fn should_skip_entry(rel: &Path) -> bool {
     })
 }
 
+/// Apply hardened-extraction settings to a `tar::Archive` before
+/// `unpack`. Defends against hostile tarballs that try to escape the
+/// extraction root via:
+/// - Symlink-then-file pairs writing outside the dir (`set_overwrite(false)`
+///   refuses to clobber existing entries, and the `tar` crate's own
+///   path-traversal protection rejects `..` / absolute paths).
+/// - Foreign uid/gid / sticky-bit / setuid bits in entries
+///   (`set_preserve_permissions(false)` — borg's own files are
+///   re-permissioned by the daemon on next start).
+/// - xattr metadata that might survive across hosts in surprising ways
+///   (`set_unpack_xattrs(false)`).
+fn harden_archive<R: std::io::Read>(archive: &mut tar::Archive<R>) {
+    archive.set_overwrite(false);
+    archive.set_preserve_permissions(false);
+    archive.set_unpack_xattrs(false);
+}
+
 /// Extract the outer (`metadata.json` + `body.tar`) container from a
 /// `tar.zst` file into `out_dir`. Returns the parsed manifest and the
 /// path to the extracted `body.tar`.
@@ -388,6 +409,7 @@ fn extract_outer(file: &Path, out_dir: &Path) -> Result<(BackupManifest, PathBuf
         .with_context(|| format!("open backup {}", file.display()))?;
     let dec = zstd::Decoder::new(BufReader::new(f)).context("init zstd decoder")?;
     let mut archive = tar::Archive::new(dec);
+    harden_archive(&mut archive);
     archive.unpack(out_dir).context("extract outer tar")?;
     let manifest_path = out_dir.join("metadata.json");
     let body_tar = out_dir.join("body.tar");

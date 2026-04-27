@@ -60,10 +60,10 @@ impl DataConfig {
     /// Encapsulates the `(retention_days, purge_policy)` interaction so
     /// callers don't reinvent the logic and miss the `Never` short-circuit.
     pub fn should_auto_purge(&self) -> bool {
-        match (self.retention_days, self.purge_policy) {
-            (Some(days), PurgePolicy::Auto) if days > 0 => true,
-            _ => false,
-        }
+        matches!(
+            (self.retention_days, self.purge_policy),
+            (Some(days), PurgePolicy::Auto) if days > 0
+        )
     }
 
     /// Cutoff timestamp (`now - retention_days * 86400`). Returns `None`

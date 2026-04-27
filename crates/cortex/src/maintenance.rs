@@ -201,7 +201,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     //     exists in the last 7 days and `backup_keep_count > 0`. Pruning
     //     happens after a successful create so a failed backup doesn't
     //     erase the last good copy.
-    if let Some(home) = Config::data_dir().ok() {
+    if let Ok(home) = Config::data_dir() {
         let backups_dir = home.join("backups");
         let keep = config.data.backup_keep_count as usize;
         if keep > 0 && weekly_backup_due(&backups_dir, now) {
@@ -218,10 +218,12 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             }
         } else if keep == 0 {
             // User explicitly disabled auto-backup — remove any stragglers.
-            if let Ok(n) = crate::backup::prune_backups(&backups_dir, 0) {
-                if n > 0 {
-                    report.backups_pruned = n;
-                }
+            match crate::backup::prune_backups(&backups_dir, 0) {
+                Ok(n) if n > 0 => report.backups_pruned = n,
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "maintenance: prune of disabled-auto-backup stragglers failed: {e}"
+                ),
             }
         }
     }
