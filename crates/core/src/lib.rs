@@ -41,6 +41,8 @@ pub mod auth;
 pub mod bond;
 /// Headless Chrome automation via CDP.
 pub mod browser;
+/// USD budget engine with versioned rate cards and pre/post-flight enforcement.
+pub mod budgets;
 /// Centralized channel name constants and `ChannelName` enum.
 pub mod channel_names;
 /// Markdown-aware content chunking with code fence preservation.
@@ -128,6 +130,8 @@ pub mod pricing;
 pub mod project_doc;
 /// LLM provider enum, auto-detection, and API headers.
 pub mod provider;
+/// Provider trait + registry — uniform interface over all LLM transports.
+pub mod providers;
 /// Per-session rate limiting for tool calls and actions.
 pub mod rate_guard;
 /// Retry utilities with exponential backoff.

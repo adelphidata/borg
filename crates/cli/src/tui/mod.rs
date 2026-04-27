@@ -272,8 +272,8 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let metrics = BorgMetrics::from_config(&config);
 
     // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,
-    // activity, bond, evolution, script), and config watcher all live inside
-    // `borgd` now — registered in `AgentBackend::new` rather than here.
+    // activity, bond, evolution, budget, script), and config watcher all live
+    // inside `borgd` now — registered in `AgentBackend::new` rather than here.
     let mut client = crate::daemon_client::connect_or_spawn().await?;
     let (session_id, _last_seq) = client.open_session(resume.as_deref()).await?;
 
@@ -1030,14 +1030,16 @@ async fn run_event_loop(
                                         // Build credentials JSON (cli holds the
                                         // keychain ref types — daemon just persists
                                         // the resulting blob to the settings table).
-                                        let credentials_json =
-                                            if install_result.credential_entries.is_empty() {
-                                                String::new()
-                                            } else {
-                                                let mut cfg =
-                                                    Config::load_from_db().unwrap_or_default();
-                                                for entry in &install_result.credential_entries {
-                                                    cfg.credentials.insert(
+                                        let credentials_json = if install_result
+                                            .credential_entries
+                                            .is_empty()
+                                        {
+                                            String::new()
+                                        } else {
+                                            let mut cfg =
+                                                Config::load_from_db().unwrap_or_default();
+                                            for entry in &install_result.credential_entries {
+                                                cfg.credentials.insert(
                                                         entry.key.clone(),
                                                         borg_core::config::CredentialValue::Ref(
                                                             borg_core::secrets_resolve::SecretRef::Keychain {
@@ -1046,31 +1048,28 @@ async fn run_event_loop(
                                                             },
                                                         ),
                                                     );
-                                                }
-                                                serde_json::to_string(&cfg.credentials)
-                                                    .unwrap_or_default()
-                                            };
+                                            }
+                                            serde_json::to_string(&cfg.credentials)
+                                                .unwrap_or_default()
+                                        };
 
-                                        let mut req =
-                                            borg_proto::admin::PluginInstallRequest {
-                                                plugin_id: def.id.to_string(),
-                                                plugin_name: def.name.to_string(),
-                                                kind: def.kind.to_string(),
-                                                category: def.category.to_string(),
-                                                file_hashes: install_result
-                                                    .file_hashes
-                                                    .iter()
-                                                    .map(|(p, h)| {
-                                                        borg_proto::admin::PluginFileHash {
-                                                            path: p.clone(),
-                                                            hash: h.clone(),
-                                                        }
-                                                    })
-                                                    .collect(),
-                                                installed_tool: None,
-                                                installed_channel: None,
-                                                credentials_json,
-                                            };
+                                        let mut req = borg_proto::admin::PluginInstallRequest {
+                                            plugin_id: def.id.to_string(),
+                                            plugin_name: def.name.to_string(),
+                                            kind: def.kind.to_string(),
+                                            category: def.category.to_string(),
+                                            file_hashes: install_result
+                                                .file_hashes
+                                                .iter()
+                                                .map(|(p, h)| borg_proto::admin::PluginFileHash {
+                                                    path: p.clone(),
+                                                    hash: h.clone(),
+                                                })
+                                                .collect(),
+                                            installed_tool: None,
+                                            installed_channel: None,
+                                            credentials_json,
+                                        };
                                         match def.kind {
                                             borg_plugins::PluginKind::Tool => {
                                                 req.installed_tool =
@@ -1146,8 +1145,7 @@ async fn run_event_loop(
                                         results.push(format!("{name}: {status}"));
                                     }
                                     Err(e) => {
-                                        results
-                                            .push(format!("Error persisting {name}: {e}"));
+                                        results.push(format!("Error persisting {name}: {e}"));
                                     }
                                 },
                                 Err(e) => {

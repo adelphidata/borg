@@ -4,6 +4,7 @@ pub(crate) mod mcp;
 pub(crate) mod misc;
 pub(crate) mod pairing;
 pub(crate) mod projects;
+pub(crate) mod providers;
 pub(crate) mod settings;
 pub(crate) mod status;
 pub(crate) mod tasks;

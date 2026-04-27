@@ -158,6 +158,10 @@ impl AgentBackend {
                 Err(e) => tracing::warn!(error = %e, "evolution hook unavailable"),
             }
         }
+        match borg_core::budgets::BudgetHook::new() {
+            Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
+            Err(e) => tracing::warn!(error = %e, "budget hook unavailable"),
+        }
         for hook in borg_core::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
             agent.hook_registry_mut().register(Box::new(hook));
         }

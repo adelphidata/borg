@@ -11,6 +11,8 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 pub mod approval_greeting;
+/// Hourly budget reset tick spawned at daemon startup.
+pub mod budget_tick;
 pub mod channel_delivery;
 pub mod daemon;
 pub mod grpc;

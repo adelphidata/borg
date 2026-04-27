@@ -1458,6 +1458,131 @@ impl Database {
         Ok(())
     }
 
+    /// V43: `providers` + `provider_rate_cards` — provider records and
+    /// versioned per-(provider, model) pricing.
+    ///
+    /// Rate-card lookup uses `MAX(effective_at) <= call_ts` so a budget
+    /// computation replayed from the audit chain at any future time picks
+    /// the same row that was active when the call was made. USD stored as
+    /// decimal strings to avoid float drift across replays.
+    ///
+    /// Built-in `PublicCloud` / `Local` providers are not seeded into
+    /// `providers` — they are inferred from compile-time `Provider` enum
+    /// variants via [`crate::providers::ProviderCategory::from`]. Only
+    /// user-added `BYOEndpoint` rows live here.
+    pub(super) fn migrate_v43(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS providers (
+                id              TEXT PRIMARY KEY,
+                category        TEXT NOT NULL,
+                display_name    TEXT NOT NULL,
+                endpoint_url    TEXT NOT NULL,
+                api_key_env     TEXT,
+                enabled         INTEGER NOT NULL DEFAULT 1,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS provider_rate_cards (
+                provider_id            TEXT NOT NULL,
+                model                  TEXT NOT NULL,
+                effective_at           INTEGER NOT NULL,
+                prompt_per_mtok_usd    TEXT NOT NULL,
+                completion_per_mtok_usd TEXT NOT NULL,
+                cached_per_mtok_usd    TEXT,
+                source                 TEXT NOT NULL DEFAULT 'bundled',
+                PRIMARY KEY (provider_id, model, effective_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_rate_cards_lookup
+                ON provider_rate_cards(provider_id, model, effective_at DESC);
+            ",
+        )?;
+        // Seed bundled rates from crate::pricing snapshot. Effective-at is
+        // the date stamped at the top of pricing.rs (2026-04-19 UTC).
+        const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO provider_rate_cards
+             (provider_id, model, effective_at, prompt_per_mtok_usd,
+              completion_per_mtok_usd, cached_per_mtok_usd, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'bundled')",
+        )?;
+        for entry in crate::pricing::bundled_rate_card_entries() {
+            stmt.execute(params![
+                entry.provider_id,
+                entry.model,
+                BUNDLED_EFFECTIVE_AT,
+                entry.prompt_per_mtok_usd,
+                entry.completion_per_mtok_usd,
+            ])?;
+        }
+        Ok(())
+    }
+
+    /// V44: `budgets` — pre/post-flight USD budget tracking with periodic reset.
+    ///
+    /// `scope` is `"default"` for the daemon-wide budget or `"principal:<id>"`
+    /// for per-principal caps. Effective cap = min(matching_principal, default).
+    /// Seeds a single `default` row with $5 soft / $20 daily hard cap.
+    pub(super) fn migrate_v44(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS budgets (
+                id                     TEXT PRIMARY KEY,
+                scope                  TEXT NOT NULL,
+                reset_period           TEXT NOT NULL,
+                hard_cap_usd           TEXT NOT NULL,
+                soft_cap_usd           TEXT,
+                current_spent_usd      TEXT NOT NULL DEFAULT '0',
+                current_period_start   INTEGER NOT NULL,
+                last_soft_toast_period INTEGER,
+                created_at             INTEGER NOT NULL,
+                updated_at             INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope);
+            ",
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO budgets
+             (id, scope, reset_period, hard_cap_usd, soft_cap_usd,
+              current_spent_usd, current_period_start, created_at, updated_at)
+             VALUES ('default', 'default', 'daily', '20', '5', '0', ?1, ?1, ?1)",
+            params![now],
+        )?;
+        Ok(())
+    }
+
+    /// V45: `provider_call_events` — replayable USD ledger.
+    ///
+    /// Each LLM call writes a `provider_call` row. Budget gates write
+    /// `budget_hit` / `budget_reset`. The ledger is the source of truth for
+    /// spend reconciliation; the `budgets.current_spent_usd` cache is just
+    /// a fast read for pre-flight gating.
+    pub(super) fn migrate_v45(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS provider_call_events (
+                id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type             TEXT NOT NULL,
+                provider_id            TEXT,
+                model                  TEXT,
+                rate_card_effective_at INTEGER,
+                prompt_tokens          INTEGER,
+                completion_tokens      INTEGER,
+                cached_tokens          INTEGER,
+                usd_cost               TEXT,
+                budget_scope           TEXT,
+                metadata_json          TEXT,
+                session_id             TEXT,
+                created_at             INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pce_created ON provider_call_events(created_at);
+            CREATE INDEX IF NOT EXISTS idx_pce_type ON provider_call_events(event_type);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

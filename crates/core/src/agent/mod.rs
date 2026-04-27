@@ -1391,7 +1391,20 @@ Rules:
             self.compact_history_if_needed(&event_tx).await?;
             self.warm_skills_cache();
 
-            let (messages, tool_defs) = self.prepare_llm_request(iteration).await?;
+            let (messages, tool_defs) = match self.prepare_llm_request(iteration).await? {
+                Some(r) => r,
+                None => {
+                    // Pre-flight hook (e.g. budget cap) refused this call.
+                    // Surface a system-visible message and end the turn —
+                    // mid-stream cancellation is forbidden by approvals.md,
+                    // and we never started a stream, so this is the right
+                    // place to halt.
+                    let refusal = "Budget hard cap reached — agent paused. \
+                                   Raise cap in /settings → Budgets, or wait for daily reset.";
+                    self.finalize_text_response(refusal, &event_tx).await;
+                    return Ok(());
+                }
+            };
             let tools = if tool_defs.is_empty() {
                 None
             } else {
@@ -1629,6 +1642,58 @@ Rules:
             cost,
         ) {
             warn!("Failed to log token usage: {e}");
+        }
+
+        // Budget post-flight reconcile + provider_call event. Price using
+        // the rate card row in effect at call time so a future replay of
+        // the audit chain produces the same USD total. If no rate row
+        // exists for this (provider, model), warn and skip — recording an
+        // f64-derived USD value here would seed the audit chain with a
+        // value that drifts on replay. The fix is to seed the rate card
+        // (`crates/core/src/pricing.rs::bundled_rate_card_entries` for a
+        // built-in, or `borg providers refresh-rates` once verification
+        // ships).
+        let now = chrono::Utc::now().timestamp();
+        let provider_id = usage.provider.to_ascii_lowercase();
+        let (actual_usd, rate_card_effective_at) =
+            match crate::budgets::RateCard::lookup(db.conn(), &provider_id, &usage.model, now) {
+                Ok(Some(row)) => {
+                    let priced = crate::budgets::RateCard::price(
+                        &row,
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                    );
+                    (priced, Some(row.effective_at))
+                }
+                Ok(None) => {
+                    warn!(
+                        "No rate card for {provider_id}/{}; skipping budget reconcile \
+                         (token usage still logged). Cost estimate from legacy table: {:?}",
+                        usage.model, cost
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        "Rate-card lookup failed for {provider_id}/{}: {e}",
+                        usage.model
+                    );
+                    return;
+                }
+            };
+        if let Err(e) = crate::budgets::BudgetEngine::post_flight(
+            db.conn(),
+            None, // principal_id wiring is v3
+            &provider_id,
+            &usage.model,
+            rate_card_effective_at,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_input_tokens,
+            actual_usd,
+            Some(self.session.meta.id.as_str()),
+        ) {
+            warn!("Budget post-flight failed: {e}");
         }
     }
 
@@ -1931,7 +1996,7 @@ Rules:
     async fn prepare_llm_request(
         &mut self,
         iteration: usize,
-    ) -> Result<(Vec<Message>, Vec<ToolDefinition>)> {
+    ) -> Result<Option<(Vec<Message>, Vec<ToolDefinition>)>> {
         let mut system_prompt = self
             .build_system_prompt()
             .await
@@ -1974,16 +2039,27 @@ Rules:
             }
         };
         let hook_ctx = self.hook_ctx(hook_point, hook_data);
-        if let HookAction::InjectContext(extra) = self.hook_registry.dispatch(&hook_ctx) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&extra);
+        match self.hook_registry.dispatch(&hook_ctx) {
+            HookAction::InjectContext(extra) => {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(&extra);
+            }
+            HookAction::Skip => {
+                // A pre-flight gate (e.g. BudgetHook) refused this LLM
+                // call. Bubble up with `Ok(None)` so the caller can
+                // surface a system message and end the turn cleanly,
+                // rather than burning an LLM call we already know
+                // won't be allowed.
+                return Ok(None);
+            }
+            HookAction::Continue => {}
         }
 
         let mut messages = Vec::with_capacity(self.history.len() + 1);
         messages.push(Message::system(&system_prompt));
         messages.extend(self.history.iter().cloned());
 
-        Ok((messages, tool_defs))
+        Ok(Some((messages, tool_defs)))
     }
 
     /// Finalize a text-only response: fire TurnComplete hook, persist, auto-save,

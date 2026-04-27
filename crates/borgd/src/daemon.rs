@@ -99,6 +99,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
+    // Hourly budget reset tick — advances any budget whose period expired
+    // and writes a `budget_reset` event. Failures stay isolated in the
+    // task; daemon health is unaffected.
+    crate::budget_tick::spawn(shutdown_tx.subscribe());
+
     let extras = match CoreConfig::load_from_db() {
         Ok(core_config) => {
             let handles =
@@ -122,8 +127,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         }
     };
-    let services =
-        grpc::build_services_with_extras(registry, factory, capability_router, extras);
+    let services = grpc::build_services_with_extras(registry, factory, capability_router, extras);
 
     let uds_stream = UnixListenerStream::new(uds);
 

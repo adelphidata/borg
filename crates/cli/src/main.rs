@@ -37,6 +37,7 @@ use tracing_subscriber::EnvFilter;
 use crate::commands::misc::{MigrateSubcommand, ServiceAction};
 use crate::commands::pairing::PairingAction;
 use crate::commands::projects::ProjectsAction;
+use crate::commands::providers::ProvidersAction;
 use crate::commands::settings::SettingsAction;
 use crate::commands::status::{BondAction, StatusAction};
 use crate::commands::tasks::{CronAction, TasksAction};
@@ -221,6 +222,11 @@ enum Commands {
     Mcp {
         #[command(subcommand)]
         action: Option<commands::mcp::McpAction>,
+    },
+    /// Manage LLM providers (BYO endpoints, rate-card refresh)
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
     },
     /// Permanently delete all Borg data and uninstall the service
     Uninstall,
@@ -407,6 +413,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Tasks { action }) => commands::tasks::dispatch_tasks(action)?,
         Some(Commands::Cron { action }) => commands::tasks::dispatch_cron(action)?,
         Some(Commands::Projects { action }) => commands::projects::dispatch_projects(action)?,
+        Some(Commands::Providers { action }) => commands::providers::dispatch(action)?,
         Some(Commands::Usage) => commands::status::run_usage()?,
         Some(Commands::Pairing { action }) => commands::pairing::dispatch_pairing(action)?,
         Some(Commands::Poke) => commands::misc::run_poke().await?,

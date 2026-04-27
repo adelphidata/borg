@@ -254,5 +254,46 @@ pub(crate) fn run_usage() -> Result<()> {
         println!("Budget: {total_tokens}/{budget_limit} tokens ({pct:.1}%) used");
     }
 
+    if let Ok(Some(snap)) = borg_core::budgets::BudgetEngine::status_snapshot(db.conn(), None) {
+        let period = match snap.reset_period {
+            borg_core::budgets::engine::ResetPeriod::Daily => "daily",
+            borg_core::budgets::engine::ResetPeriod::Weekly => "weekly",
+            borg_core::budgets::engine::ResetPeriod::Monthly => "monthly",
+        };
+        let elapsed_secs = (chrono::Utc::now().timestamp() - snap.current_period_start).max(1);
+        let period_secs: i64 = match snap.reset_period {
+            borg_core::budgets::engine::ResetPeriod::Daily => 86_400,
+            borg_core::budgets::engine::ResetPeriod::Weekly => 7 * 86_400,
+            borg_core::budgets::engine::ResetPeriod::Monthly => 30 * 86_400,
+        };
+        let pace_str = pace_per_period(
+            snap.spent.to_storage_string().as_str(),
+            elapsed_secs,
+            period_secs,
+        );
+        println!();
+        println!(
+            "Budgets · ${} / ${} {} · pace ~${}/{}",
+            snap.spent.to_display_string(),
+            snap.hard_cap.to_display_string(),
+            period,
+            pace_str,
+            period
+        );
+    }
+
     Ok(())
+}
+
+/// Forward-looking pace: extrapolate the current period's spend out to a
+/// full period at the current burn rate. The output is a UI hint only, so
+/// f64 arithmetic is acceptable here — replay determinism only matters
+/// for stored values.
+fn pace_per_period(spent_storage: &str, elapsed_secs: i64, period_secs: i64) -> String {
+    let spent = spent_storage.parse::<f64>().unwrap_or(0.0);
+    if elapsed_secs <= 0 || period_secs <= 0 {
+        return format!("{spent:.2}");
+    }
+    let pace = spent * (period_secs as f64) / (elapsed_secs as f64);
+    format!("{pace:.2}")
 }
