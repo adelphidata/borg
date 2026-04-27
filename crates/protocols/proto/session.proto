@@ -40,6 +40,11 @@ service Session {
   rpc NewSession(NewSessionRequest) returns (NewSessionResponse);
   rpc LoadSession(LoadSessionRequest) returns (LoadSessionResponse);
 
+  // Fork the active agent session at its last message. Daemon owns the
+  // single SQLite writer, so this must run in the daemon — TUI cannot open
+  // the DB directly without violating the single-writer invariant.
+  rpc Fork(ForkRequest) returns (ForkResponse);
+
   // Push a steer message into a running turn.
   rpc Steer(SteerRequest) returns (Empty);
 }
@@ -192,3 +197,10 @@ message LoadSessionRequest { string session_id = 1; string agent_session_id = 2;
 message LoadSessionResponse { string agent_session_id = 1; uint64 message_count = 2; }
 
 message SteerRequest { string session_id = 1; string text = 2; }
+
+message ForkRequest { string session_id = 1; }
+message ForkResponse {
+  string forked_agent_session_id = 1;
+  string title = 2;
+  uint64 message_count = 3;
+}

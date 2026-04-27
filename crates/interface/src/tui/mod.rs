@@ -775,52 +775,28 @@ async fn run_event_loop(
                 });
             }
             AppAction::ForkSession => {
-                let agent_id = match client.get_state(session_id).await {
-                    Ok(s) => s.agent_session_id,
-                    Err(e) => {
-                        app.push_system_message(format!("Fork failed: {e}"));
-                        continue;
-                    }
-                };
-                if agent_id.is_empty() {
-                    app.push_system_message("Fork failed: no active session to fork.".to_string());
-                    continue;
-                }
-                let fork_outcome = tokio::task::spawn_blocking(move || {
-                    let db = cortex::db::Database::open()?;
-                    let msgs = db.load_session_messages(&agent_id)?;
-                    let anchor = msgs
-                        .last()
-                        .map(|m| m.id)
-                        .ok_or_else(|| anyhow::anyhow!("session has no messages"))?;
-                    drop(db);
-                    cortex::session::fork_session(&agent_id, anchor)
-                })
-                .await;
-                match fork_outcome {
-                    Ok(Ok(forked)) => {
-                        let id = forked.meta.id.clone();
+                // Forking writes to SQLite (new session row + copied messages).
+                // The daemon is the single writer — do NOT open the DB here.
+                match client.fork_session(session_id).await {
+                    Ok(forked) => {
+                        let id = forked.forked_agent_session_id;
                         let short: String = id.chars().take(8).collect();
                         app.push_system_message(format!(
                             "Forked {} messages → {} ({short})",
-                            forked.meta.message_count, forked.meta.title
+                            forked.message_count, forked.title
                         ));
                         // Reuse the LoadSession path so daemon state, FTS, and
                         // popups all converge on the new session id.
                         app.cells.clear();
                         app.session_prompt_tokens = 0;
                         app.session_completion_tokens = 0;
-                        match client.load_agent_session(session_id, &id).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                app.push_system_message(format!(
-                                    "Forked, but switching failed: {e}"
-                                ));
-                            }
+                        if let Err(e) = client.load_agent_session(session_id, &id).await {
+                            app.push_system_message(format!(
+                                "Forked, but switching failed: {e}"
+                            ));
                         }
                     }
-                    Ok(Err(e)) => app.push_system_message(format!("Fork failed: {e}")),
-                    Err(e) => app.push_system_message(format!("Fork task panicked: {e}")),
+                    Err(e) => app.push_system_message(format!("Fork failed: {e}")),
                 }
             }
             AppAction::CompactHistory => match client.compact(session_id).await {

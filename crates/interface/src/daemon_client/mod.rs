@@ -41,9 +41,10 @@ use protocols::pki::{
 use protocols::session::session_client::SessionClient;
 use protocols::session::{
     AgentEvent, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest, CompactRequest,
-    CompactResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
-    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, OpenRequest, PromptResponse, RewindRequest,
+    RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest, StreamRequest,
+    UndoRequest, UndoResponse,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::{
@@ -457,6 +458,20 @@ impl DaemonClient {
             .await
             .context("Session.Steer failed")?;
         Ok(())
+    }
+
+    /// Fork the active agent session at its last message. Daemon-side
+    /// execution — the TUI must NOT open a SQLite writer to do this itself,
+    /// since `borgd` is the single writer (CLAUDE.md "DB writer split-brain").
+    pub async fn fork_session(&mut self, session_id: &str) -> Result<ForkResponse> {
+        Ok(self
+            .session
+            .fork(ForkRequest {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Session.Fork failed")?
+            .into_inner())
     }
 
     // ── Projects ──────────────────────────────────────────────────────────

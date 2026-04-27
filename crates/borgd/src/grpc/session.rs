@@ -11,9 +11,10 @@ use futures_util::Stream;
 use protocols::session::{
     session_server::Session, AgentEvent, AutoSaveRequest, CancelRequest, CancelResponse,
     ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty,
-    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
-    OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState,
-    SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
+    NewSessionResponse, OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse,
+    SendRequest, SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest,
+    UndoResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -318,5 +319,23 @@ impl Session for SessionSvc {
         host.steer(&req.text)
             .map_err(|e| TStatus::failed_precondition(format!("steer: {e}")))?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn fork(&self, req: Request<ForkRequest>) -> Result<Response<ForkResponse>, TStatus> {
+        let host = self.host_or_err(&req.into_inner().session_id)?;
+        let outcome = host.fork().await.map_err(|e| {
+            // "session has no messages" is a precondition failure, not internal.
+            let msg = e.to_string();
+            if msg.contains("no messages") {
+                TStatus::failed_precondition(msg)
+            } else {
+                TStatus::internal(format!("fork: {msg}"))
+            }
+        })?;
+        Ok(Response::new(ForkResponse {
+            forked_agent_session_id: outcome.forked_agent_session_id,
+            title: outcome.title,
+            message_count: outcome.message_count,
+        }))
     }
 }

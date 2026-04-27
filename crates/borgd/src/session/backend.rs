@@ -33,6 +33,17 @@ pub struct SessionStateSnapshot {
     pub collab_mode: String,
 }
 
+/// Result of forking the active agent session.
+#[derive(Debug, Clone)]
+pub struct ForkOutcome {
+    /// New cortex session id created by the fork.
+    pub forked_agent_session_id: String,
+    /// Title of the new session (typically `"<parent> (fork)"`).
+    pub title: String,
+    /// Number of messages copied into the fork.
+    pub message_count: u64,
+}
+
 /// One inline image to attach to a multimodal turn.
 #[derive(Debug, Clone)]
 pub struct InlineImage {
@@ -109,6 +120,12 @@ pub trait SessionBackend: Send + Sync + 'static {
     /// Push a steer message into the running agent loop.
     fn steer(&self, _text: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("steer not supported by this backend"))
+    }
+
+    /// Fork the active agent session at its last message. Daemon owns the
+    /// single SQLite writer, so this MUST run here rather than in the client.
+    async fn fork(&self) -> anyhow::Result<ForkOutcome> {
+        Err(anyhow::anyhow!("fork not supported by this backend"))
     }
 }
 
@@ -305,5 +322,34 @@ impl SessionBackend for AgentBackend {
         self.steer_tx
             .send(text.to_string())
             .map_err(|e| anyhow::anyhow!("steer channel closed: {e}"))
+    }
+
+    async fn fork(&self) -> anyhow::Result<ForkOutcome> {
+        // Resolve the parent agent session id under the agent lock, then
+        // release it before doing blocking DB work — fork can copy a large
+        // number of message rows and we don't want to block concurrent
+        // reads (e.g. `GetState`) on the agent for the full duration.
+        let parent_id = {
+            let agent = self.agent.lock().await;
+            agent.session().meta.id.clone()
+        };
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<ForkOutcome> {
+            let db = cortex::db::Database::open()?;
+            let msgs = db.load_session_messages(&parent_id)?;
+            let anchor = msgs
+                .last()
+                .map(|m| m.id)
+                .ok_or_else(|| anyhow::anyhow!("session has no messages"))?;
+            drop(db);
+            let forked = cortex::session::fork_session(&parent_id, anchor)?;
+            Ok(ForkOutcome {
+                forked_agent_session_id: forked.meta.id,
+                title: forked.meta.title,
+                message_count: forked.meta.message_count as u64,
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("fork task panicked: {e}"))?
     }
 }

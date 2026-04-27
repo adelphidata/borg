@@ -182,6 +182,14 @@ impl SessionHost {
         self.inner.backend.steer(text)
     }
 
+    /// Fork the active agent session at its last message. Forwards to the
+    /// backend; daemon-side execution is required because SQLite has a single
+    /// writer (the daemon) and the TUI cannot open a writer handle without
+    /// racing it.
+    pub async fn fork(&self) -> Result<backend::ForkOutcome> {
+        self.inner.backend.fork().await
+    }
+
     /// Start a turn. Awaits the prior turn's forwarder draining into the
     /// buffer before installing this turn's state — that's how we guarantee
     /// "events with seq > baseline_after_start belong to this turn". Returns
