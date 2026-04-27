@@ -15,7 +15,6 @@ pub const TREE_MID: &str = "├";
 pub const TREE_END: &str = "└";
 
 pub const TOOL_ACTIVE_GREEN: Color = Color::Rgb(0, 200, 0);
-pub const INPUT_PROMPT: &str = "› ";
 
 pub const CHECK: &str = "✓";
 pub const CROSS: &str = "✗";
@@ -176,6 +175,52 @@ pub fn diff_remove_bg() -> Color {
         Color::Rgb(255, 235, 233)
     } else {
         Color::Rgb(74, 34, 29)
+    }
+}
+
+/// More-saturated diff gutter backgrounds for line-number / sign columns.
+/// On dark terminals the gutter shares the row bg (returns the row bg). On
+/// light terminals the gutter is more saturated (`#aceebb` / `#ffcecb`) so
+/// the line numbers still read against the pastel row bg.
+pub fn diff_add_gutter_bg() -> Color {
+    if super::colors::is_light_terminal() {
+        Color::Rgb(172, 238, 187)
+    } else {
+        diff_add_bg()
+    }
+}
+
+pub fn diff_remove_gutter_bg() -> Color {
+    if super::colors::is_light_terminal() {
+        Color::Rgb(255, 206, 203)
+    } else {
+        diff_remove_bg()
+    }
+}
+
+/// Foreground for the diff gutter (line numbers + sign), tuned for contrast
+/// against the gutter bg.
+pub fn diff_gutter_fg() -> Color {
+    if super::colors::is_light_terminal() {
+        Color::Rgb(31, 35, 40)
+    } else {
+        Color::Rgb(140, 140, 140)
+    }
+}
+
+/// Magenta `$` shell prompt for exec/run_shell command echoes.
+pub fn shell_prompt_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(200, 100, 200))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Composer cursor chevron (`›`) — cyan when focused, dim when blurred.
+pub fn composer_cursor_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM_WHITE)
     }
 }
 

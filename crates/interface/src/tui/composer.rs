@@ -3,6 +3,7 @@ use std::time::Instant;
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
+use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::Frame;
 use tui_textarea::TextArea;
@@ -274,9 +275,15 @@ impl<'a> Composer<'a> {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
+        // Codex-style: chevron `›` rendered as a cyan+bold title span,
+        // distinct from the dim teal block border. Keeps the focal point on
+        // the prompt indicator rather than the border chrome.
         textarea.set_block(
             Block::bordered()
-                .title(format!("{} ", theme::INPUT_PROMPT))
+                .title(ratatui::text::Line::from(vec![
+                    Span::styled(theme::CHEVRON, theme::composer_cursor_style(true)),
+                    Span::raw(" "),
+                ]))
                 .border_style(Style::default().fg(theme::BORDER)),
         );
         Self {

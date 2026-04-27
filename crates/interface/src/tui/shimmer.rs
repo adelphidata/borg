@@ -78,6 +78,31 @@ pub(super) fn shimmer_spans(
     spans
 }
 
+/// Codex-style streaming spinner glyph.
+///
+/// - active + truecolor → shimmered `•` (single-char shimmer pulse).
+/// - active without truecolor → blinking `•`/`◦` toggle every 600ms.
+/// - inactive → static dim `•`.
+///
+/// Wired into the streaming status indicator extraction (Task 09 follow-up).
+#[allow(dead_code)]
+pub(super) fn spinner_span(active: bool) -> Span<'static> {
+    if !active {
+        return Span::styled("•", Style::default().add_modifier(Modifier::DIM));
+    }
+    if colors::supports_truecolor() {
+        // Reuse the shimmer math on a single bullet so it pulses.
+        let mut spans = shimmer_spans_auto("•");
+        spans
+            .pop()
+            .unwrap_or_else(|| Span::styled("•", super::theme::tool_style()))
+    } else {
+        let on = (elapsed_since_start().as_millis() / 600) % 2 == 0;
+        let glyph = if on { "•" } else { "◦" };
+        Span::styled(glyph, super::theme::tool_style())
+    }
+}
+
 fn color_for_level(intensity: f32) -> Style {
     if intensity < 0.2 {
         Style::default().add_modifier(Modifier::DIM)

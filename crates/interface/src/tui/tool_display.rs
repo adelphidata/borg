@@ -299,7 +299,17 @@ pub fn tool_detail_line(cat: &ToolDisplayCategory) -> Option<Vec<Span<'static>>>
             let u = truncate(url, 80);
             Some(vec![Span::styled(u, dim)])
         }
-        // Ran, Listed, and most others don't have a detail line from ToolStart
+        // Codex-style `$ command` echo for run_shell. The magenta `$` reads
+        // as a shell prompt; the command body is dim so the focus is the
+        // command itself, not the leading prompt char.
+        ToolDisplayCategory::Ran { command } => {
+            let cmd = truncate(command, 120);
+            Some(vec![
+                Span::styled("$ ", theme::shell_prompt_style()),
+                Span::styled(cmd, dim),
+            ])
+        }
+        // Listed and most others don't have a detail line from ToolStart
         _ => None,
     }
 }
@@ -649,11 +659,20 @@ mod tests {
     }
 
     #[test]
-    fn detail_ran_none() {
+    fn detail_ran_emits_shell_prompt() {
+        // Codex-style: run_shell tool start now emits a `$ <cmd>` echo line
+        // under the bullet header so the user sees what's about to run.
         let cat = ToolDisplayCategory::Ran {
-            command: "ls".to_string(),
+            command: "ls -la".to_string(),
         };
-        assert!(tool_detail_line(&cat).is_none());
+        let spans = tool_detail_line(&cat).expect("Ran emits a detail line");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.starts_with("$ ") && text.contains("ls -la"),
+            "got: {text:?}"
+        );
+        // Magenta `$` prompt followed by dim command body.
+        assert_eq!(spans[0].style, theme::shell_prompt_style());
     }
 
     #[test]

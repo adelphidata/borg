@@ -113,6 +113,61 @@ pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
     &s[..end]
 }
 
+/// Truncate a slash-separated path to fit `max_width` display columns by
+/// replacing middle segments with `…`. Keeps as many leading and trailing
+/// segments as possible. Falls back to a plain ellipsis truncation if even
+/// the first + last segments don't fit.
+///
+/// Codex parity: `crates/foo/src/very/long/path.rs` → `crates/foo/…/path.rs`
+/// when squeezed. Marked `allow(dead_code)` until downstream codex-skin
+/// surfaces (status indicator details, popup paths) consume it.
+#[allow(dead_code)]
+pub fn center_truncate_path(path: &str, max_width: usize) -> String {
+    let w = UnicodeWidthStr::width(path);
+    if w <= max_width {
+        return path.to_string();
+    }
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() <= 2 {
+        return format!(
+            "{}{}",
+            truncate_str_to_width(path, max_width.saturating_sub(1)),
+            "…"
+        );
+    }
+    // segments.len() > 2 here, so `last()` is always Some — but unwrap()
+    // is forbidden by the workspace clippy config.
+    let Some(&last) = segments.last() else {
+        return path.to_string();
+    };
+    // Try progressively dropping middle segments while keeping more leading
+    // segments; pick the longest fit ≤ max_width.
+    for keep_lead in (1..segments.len() - 1).rev() {
+        let mut out = String::new();
+        for (i, seg) in segments.iter().take(keep_lead).enumerate() {
+            if i > 0 {
+                out.push('/');
+            }
+            out.push_str(seg);
+        }
+        out.push_str("/…/");
+        out.push_str(last);
+        if UnicodeWidthStr::width(out.as_str()) <= max_width {
+            return out;
+        }
+    }
+    // Fall back: ".../<last>" then plain truncate.
+    let candidate = format!("…/{last}");
+    if UnicodeWidthStr::width(candidate.as_str()) <= max_width {
+        return candidate;
+    }
+    format!(
+        "{}{}",
+        truncate_str_to_width(path, max_width.saturating_sub(1)),
+        "…"
+    )
+}
+
 /// Compact pretty-printed JSON into a single line with spaces after `:` and
 /// `,` (outside of string values). Leaves non-JSON input untouched.
 ///
@@ -181,6 +236,30 @@ mod tests {
     fn line_width_sums_unicode_spans() {
         let l = Line::from(vec![Span::raw("ab"), Span::raw("汉字")]);
         assert_eq!(line_width(&l), 2 + 4);
+    }
+
+    #[test]
+    fn center_truncate_path_keeps_head_and_tail() {
+        // Wide path that doesn't fit: keep first segments + …/ + last segment.
+        let p = "crates/interface/src/tui/very/deep/nested/path.rs";
+        let out = center_truncate_path(p, 30);
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 30, "got: {out:?}");
+        assert!(out.contains('…'), "got: {out:?}");
+        assert!(out.ends_with("path.rs"), "got: {out:?}");
+    }
+
+    #[test]
+    fn center_truncate_path_short_path_unchanged() {
+        let out = center_truncate_path("a/b/c.rs", 80);
+        assert_eq!(out, "a/b/c.rs");
+    }
+
+    #[test]
+    fn center_truncate_path_two_segments_falls_back() {
+        // Single slash: head/tail strategy can't apply, fall back to plain trunc.
+        let out = center_truncate_path("looooooooooong/file.rs", 8);
+        assert!(out.ends_with('…'));
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 8);
     }
 
     #[test]

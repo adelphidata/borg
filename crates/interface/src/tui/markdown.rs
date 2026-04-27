@@ -161,7 +161,11 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
             Event::Text(text) => {
                 let style = current_style(&style_stack);
                 if in_blockquote && current_spans.is_empty() {
-                    current_spans.push(Span::styled("│ ", theme::success_style()));
+                    // Codex-style blockquote prefix: dim green `> ` marker.
+                    current_spans.push(Span::styled(
+                        "> ",
+                        theme::success_style().add_modifier(Modifier::DIM),
+                    ));
                 }
                 if in_code_block {
                     // Fenced code blocks with a known language get syntax
@@ -436,7 +440,8 @@ mod tests {
     fn blockquote() {
         let lines = render_markdown("> quoted text", 80);
         let texts = text_of(&lines);
-        assert!(texts.iter().any(|t| t.contains("│ ")));
+        // Codex-style: blockquote prefix is `> `, not `│ `.
+        assert!(texts.iter().any(|t| t.contains("> ")));
         assert!(texts.iter().any(|t| t.contains("quoted text")));
     }
 

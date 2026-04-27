@@ -506,25 +506,32 @@ impl HistoryCell {
     ) -> Vec<Line<'static>> {
         match self {
             HistoryCell::User { text } => {
+                // Codex-style: dim border `╭─╮│╰─╯` around the user message,
+                // with the subtle bg tint preserved on the inner rows.
                 let bg = theme::user_message_style();
                 let prefix_style =
                     bg.add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM);
+                let border_style = theme::dim();
                 let mention_style = theme::file_mention_style();
                 let w = width as usize;
+                // Inner content area sits inside `│ ... │` with 1-col padding each side.
+                let inner_w = w.saturating_sub(4).max(20);
                 let mut lines = Vec::new();
-                // Unstyled spacer — must NOT use `bg` or it creates a double-background
-                // band above the user message (the render loop already inserts a separator).
+                // Unstyled spacer above the box.
                 lines.push(Line::default());
-                // Wrap each logical line at (width - 2) so the "> " / "  " prefix
-                // column stays intact. Continuation lines hang under column 2,
-                // matching how assistant messages align under their bullet.
-                let wrap_width = w.saturating_sub(2).max(20);
+                // Top rule: ╭───────╮ across full width.
+                let rule_len = w.saturating_sub(2);
+                lines.push(Line::from(vec![
+                    Span::styled(theme::BOX_TOP_LEFT.to_string(), border_style),
+                    Span::styled(theme::SEPARATOR.repeat(rule_len), border_style),
+                    Span::styled(theme::BOX_TOP_RIGHT.to_string(), border_style),
+                ]));
                 let mut first = true;
                 for line in text.lines() {
                     let wrapped = if line.is_empty() {
                         vec![std::borrow::Cow::Borrowed("")]
                     } else {
-                        super::wrapping::wrap(line, wrap_width)
+                        super::wrapping::wrap(line, inner_w.saturating_sub(2).max(10))
                     };
                     for wl in wrapped.iter() {
                         let prefix = if first {
@@ -534,18 +541,33 @@ impl HistoryCell {
                             Span::styled("  ", bg)
                         };
                         let spans = parse_at_mentions(wl.as_ref(), bg, mention_style);
-                        let mut all_spans = vec![prefix];
-                        all_spans.extend(spans);
-                        let content_width: usize = all_spans
+                        let mut row: Vec<Span<'static>> = Vec::new();
+                        row.push(Span::styled(theme::BOX_VERTICAL.to_string(), border_style));
+                        row.push(Span::styled(" ", bg));
+                        row.push(prefix);
+                        row.extend(spans);
+                        let content_width: usize = row
                             .iter()
+                            .skip(1) // skip border
                             .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                             .sum();
-                        if content_width < w {
-                            all_spans.push(Span::styled(" ".repeat(w - content_width), bg));
+                        // Pad to fill inner area (minus the leading ` `, which is in
+                        // content_width already).
+                        let pad = inner_w.saturating_sub(content_width.saturating_sub(1));
+                        if pad > 0 {
+                            row.push(Span::styled(" ".repeat(pad), bg));
                         }
-                        lines.push(Line::from(all_spans).style(bg));
+                        row.push(Span::styled(" ", bg));
+                        row.push(Span::styled(theme::BOX_VERTICAL.to_string(), border_style));
+                        lines.push(Line::from(row));
                     }
                 }
+                // Bottom rule.
+                lines.push(Line::from(vec![
+                    Span::styled(theme::BOX_BOTTOM_LEFT.to_string(), border_style),
+                    Span::styled(theme::SEPARATOR.repeat(rule_len), border_style),
+                    Span::styled(theme::BOX_BOTTOM_RIGHT.to_string(), border_style),
+                ]));
                 lines
             }
             HistoryCell::Assistant {
@@ -759,9 +781,11 @@ impl HistoryCell {
 
                 if should_collapse {
                     let extra = total_rows.saturating_sub(rows_used);
+                    // Codex-style ellipsis line; nudges the user toward Ctrl+T
+                    // (transcript pager) which already exists in Borg.
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "    {} +{extra} more rows — Ctrl+E to expand",
+                            "    {} +{extra} lines (ctrl + t to view transcript)",
                             theme::ELLIPSIS
                         ),
                         theme::dim(),
@@ -1037,8 +1061,28 @@ mod tests {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
-        // 1 unstyled spacer + 1 content
-        assert_eq!(lines.len(), 2);
+        // Codex-style box: spacer + top rule + body + bottom rule = 4 lines.
+        assert_eq!(lines.len(), 4);
+        // Top rule starts with ╭ and ends with ╮.
+        let top = &lines[1];
+        assert_eq!(
+            top.spans.first().unwrap().content.as_ref(),
+            super::theme::BOX_TOP_LEFT
+        );
+        assert_eq!(
+            top.spans.last().unwrap().content.as_ref(),
+            super::theme::BOX_TOP_RIGHT
+        );
+        // Bottom rule.
+        let bot = lines.last().unwrap();
+        assert_eq!(
+            bot.spans.first().unwrap().content.as_ref(),
+            super::theme::BOX_BOTTOM_LEFT
+        );
+        assert_eq!(
+            bot.spans.last().unwrap().content.as_ref(),
+            super::theme::BOX_BOTTOM_RIGHT
+        );
     }
 
     #[test]
@@ -1078,8 +1122,11 @@ mod tests {
             .expect("chevron line");
         assert!(lines.len() > chev_idx + 1, "expected wrap, got {:?}", lines);
         let cont = &lines[chev_idx + 1];
-        // First span is the "  " continuation prefix, not another chevron.
-        assert_eq!(cont.spans[0].content.as_ref(), "  ");
+        // Continuation row inside the border: spans are [│, " ", "  ", ...].
+        // First span is the left border; the prefix-position span (index 2)
+        // is "  " continuation, never another chevron.
+        assert_eq!(cont.spans[0].content.as_ref(), super::theme::BOX_VERTICAL);
+        assert_eq!(cont.spans[2].content.as_ref(), "  ");
         assert!(!cont
             .spans
             .iter()
@@ -1247,9 +1294,13 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        // 20 lines total, 8 preview → 12 hidden
-        assert!(all_text.contains("+12 more rows"), "got: {all_text}");
-        assert!(all_text.contains("Ctrl+E"), "footer should mention Ctrl+E");
+        // 20 lines total, 8 preview → 12 hidden. Codex-style copy points
+        // users at the transcript pager (Ctrl+T).
+        assert!(all_text.contains("+12 lines"), "got: {all_text}");
+        assert!(
+            all_text.contains("ctrl + t"),
+            "footer should point at transcript pager: {all_text}"
+        );
         assert!(all_text.contains("1.5s"));
     }
 
@@ -1274,7 +1325,10 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more rows"), "should not collapse");
+        assert!(
+            !all_text.contains("ctrl + t to view transcript"),
+            "should not collapse"
+        );
         // All 20 lines should appear
         assert!(all_text.contains("line 0"));
         assert!(all_text.contains("line 19"));
@@ -1298,7 +1352,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more rows"));
+        assert!(!all_text.contains("ctrl + t to view transcript"));
     }
 
     #[test]
@@ -1316,14 +1370,14 @@ mod tests {
             collapsed: true,
         };
         assert!(cell.toggle_collapsed());
-        // Should no longer show "more rows" footer
+        // Should no longer show the collapse footer
         let all_text: String = cell
             .render(80, None)
             .iter()
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(!all_text.contains("more rows"));
+        assert!(!all_text.contains("ctrl + t to view transcript"));
         // Toggle back
         assert!(cell.toggle_collapsed());
         let all_text2: String = cell
@@ -1332,7 +1386,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        assert!(all_text2.contains("more rows"));
+        assert!(all_text2.contains("ctrl + t to view transcript"));
     }
 
     #[test]
