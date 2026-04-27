@@ -10,11 +10,10 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use protocols::session::{
     session_server::Session, AgentEvent, AutoSaveRequest, CancelRequest, CancelResponse,
-    ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty,
-    ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse,
-    SendRequest, SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest,
-    UndoResponse,
+    ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty, ForkRequest,
+    ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest,
+    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;

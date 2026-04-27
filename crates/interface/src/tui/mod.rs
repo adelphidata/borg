@@ -791,9 +791,7 @@ async fn run_event_loop(
                         app.session_prompt_tokens = 0;
                         app.session_completion_tokens = 0;
                         if let Err(e) = client.load_agent_session(session_id, &id).await {
-                            app.push_system_message(format!(
-                                "Forked, but switching failed: {e}"
-                            ));
+                            app.push_system_message(format!("Forked, but switching failed: {e}"));
                         }
                     }
                     Err(e) => app.push_system_message(format!("Fork failed: {e}")),
