@@ -70,10 +70,7 @@ pub fn parse_prefixed_code(code: &str) -> Option<(&'static str, &str)> {
 /// often autocorrect hyphens to spaces). Returns the canonical
 /// hyphen-joined phrase on success.
 pub fn validate_phrase(phrase: &str) -> Result<String> {
-    let words: Vec<&str> = phrase
-        .split(['-', ' '])
-        .filter(|w| !w.is_empty())
-        .collect();
+    let words: Vec<&str> = phrase.split(['-', ' ']).filter(|w| !w.is_empty()).collect();
     if words.len() != PHRASE_WORDS {
         anyhow::bail!(
             "pairing phrase must be {PHRASE_WORDS} words, got {}",

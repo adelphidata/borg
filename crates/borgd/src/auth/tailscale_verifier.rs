@@ -167,7 +167,10 @@ impl TailscaleVerifier {
     /// from the source if the cached snapshot has expired.
     fn peer_ips(&self) -> Result<HashSet<IpAddr>, VerifierError> {
         {
-            let g = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(ref c) = *g {
                 if c.fetched_at.elapsed() < self.ttl {
                     return Ok(c.peer_ips.clone());
@@ -206,7 +209,10 @@ impl TailscaleVerifier {
             }
         }
 
-        let mut g = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *g = Some(CachedStatus {
             fetched_at: Instant::now(),
             peer_ips: peers.clone(),

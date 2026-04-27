@@ -115,7 +115,10 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
     // Validate code against DB before doing PAKE work — single-use semantics
     // are enforced via consume_pairing_code.
     let outcome = {
-        let g = state.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let g = state
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.consume_pairing_code(&code)?
     };
     if outcome != ConsumeOutcome::Accepted {
@@ -169,7 +172,10 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
 
     // Persist cert + paired_device.
     {
-        let g = state.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let g = state
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let serial = g.insert_internal_cert(
             "client",
             &issued.cert_pem,

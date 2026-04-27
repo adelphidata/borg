@@ -74,6 +74,17 @@ pub fn write_memory_db(name: &str, content: &str, mode: WriteMode, scope: &str) 
 /// [`read_memory_db_or_not_found`].
 pub fn read_memory_db(name: &str, scope: &str) -> Result<Option<String>> {
     let db = crate::db::Database::open()?;
+    read_memory_db_with(&db, name, scope)
+}
+
+/// DB-passing form of [`read_memory_db`]. Tests use this with an in-memory
+/// `Database::test_db()` so they don't touch (or depend on the health of)
+/// the production DB at `~/.borg/borg.db`.
+pub fn read_memory_db_with(
+    db: &crate::db::Database,
+    name: &str,
+    scope: &str,
+) -> Result<Option<String>> {
     Ok(db.get_memory_entry(scope, name)?.map(|e| e.content))
 }
 
@@ -81,6 +92,16 @@ pub fn read_memory_db(name: &str, scope: &str) -> Result<Option<String>> {
 /// For use by tool handlers that surface results to the LLM.
 pub fn read_memory_db_or_not_found(name: &str, scope: &str) -> Result<String> {
     Ok(read_memory_db(name, scope)?.unwrap_or_else(|| format!("Memory entry '{name}' not found.")))
+}
+
+/// DB-passing form of [`read_memory_db_or_not_found`].
+pub fn read_memory_db_or_not_found_with(
+    db: &crate::db::Database,
+    name: &str,
+    scope: &str,
+) -> Result<String> {
+    Ok(read_memory_db_with(db, name, scope)?
+        .unwrap_or_else(|| format!("Memory entry '{name}' not found.")))
 }
 
 /// List all memory entries for a scope.
@@ -121,8 +142,17 @@ pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
     if max_tokens == 0 {
         return Ok(String::new());
     }
-
     let db = crate::db::Database::open()?;
+    load_memory_context_db_with(&db, max_tokens)
+}
+
+/// DB-passing form of [`load_memory_context_db`]. Tests use this with an
+/// in-memory `Database::test_db()` so they don't depend on the production
+/// DB being healthy or even present.
+pub fn load_memory_context_db_with(db: &crate::db::Database, max_tokens: usize) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
     let entries = db.list_memory_entries("global")?;
     let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
         tracing::warn!("failed to load cached token estimates, will recompute: {e}");
@@ -134,7 +164,7 @@ pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
 
     // Always load INDEX first
     if let Some(index) = entries.iter().find(|e| e.name == "INDEX") {
-        let tokens = tokens_for_entry(&db, index, &token_cache);
+        let tokens = tokens_for_entry(db, index, &token_cache);
         if estimated_tokens + tokens <= max_tokens {
             let safe_name = escape_xml_attr("INDEX");
             parts.push(format!(
@@ -151,7 +181,7 @@ pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
         if entry.name == "INDEX" {
             continue;
         }
-        let tokens = tokens_for_entry(&db, entry, &token_cache);
+        let tokens = tokens_for_entry(db, entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
             debug!("Skipping {} (would exceed token budget)", entry.name);
             continue;
@@ -182,8 +212,19 @@ pub fn load_memory_context_db_ranked(
     if max_tokens == 0 {
         return Ok(String::new());
     }
-
     let db = crate::db::Database::open()?;
+    load_memory_context_db_ranked_with(&db, max_tokens, ranked)
+}
+
+/// DB-passing form of [`load_memory_context_db_ranked`].
+pub fn load_memory_context_db_ranked_with(
+    db: &crate::db::Database,
+    max_tokens: usize,
+    ranked: &[(String, f32)],
+) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
     let entries = db.list_memory_entries("global")?;
     let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
         tracing::warn!("failed to load cached token estimates, will recompute: {e}");
@@ -206,7 +247,7 @@ pub fn load_memory_context_db_ranked(
                     estimated_tokens: &mut usize,
                     parts: &mut Vec<String>,
                     loaded: &mut std::collections::HashSet<String>| {
-        let tokens = tokens_for_entry(&db, entry, &token_cache);
+        let tokens = tokens_for_entry(db, entry, &token_cache);
         if *estimated_tokens + tokens > max_tokens {
             return;
         }
@@ -687,45 +728,22 @@ mod tests {
 
     // ── DB-backed memory load tests ──
     // These exercise the public `load_memory_context_db*` functions against
-    // a test DB. They use `write_memory_db` which opens the default DB, so we
-    // isolate by cleaning up named entries before/after.
-
-    fn cleanup_test_entries(names: &[&str]) {
-        let Ok(db) = crate::db::Database::open() else {
-            return;
-        };
-        for n in names {
-            let _ = db.delete_memory_entry("global", n);
-        }
-    }
+    // an isolated `Database::test_db()` (in-memory SQLite) via the `_with`
+    // form. They MUST NOT touch `~/.borg/borg.db` — both because production
+    // data shouldn't be in the test path and because a corrupted prod DB
+    // would silently mask real test failures.
 
     #[test]
     fn load_memory_context_db_index_loaded_first() {
-        let names = ["INDEX", "_t_aaa_", "_t_bbb_"];
-        cleanup_test_entries(&names);
-        write_memory_db(
-            "_t_aaa_",
-            "aaa-content marker_aaa",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
-        write_memory_db(
-            "_t_bbb_",
-            "bbb-content marker_bbb",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
-        write_memory_db(
-            "INDEX",
-            "- index-marker-xyz\n",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
+        let db = crate::db::Database::test_db();
+        db.upsert_memory_entry("global", "_t_aaa_", "aaa-content marker_aaa")
+            .unwrap();
+        db.upsert_memory_entry("global", "_t_bbb_", "bbb-content marker_bbb")
+            .unwrap();
+        db.upsert_memory_entry("global", "INDEX", "- index-marker-xyz\n")
+            .unwrap();
 
-        let out = load_memory_context_db(100_000).unwrap();
+        let out = load_memory_context_db_with(&db, 100_000).unwrap();
         let pos_index = out.find("index-marker-xyz").expect("INDEX not loaded");
         let pos_aaa = out.find("marker_aaa");
         let pos_bbb = out.find("marker_bbb");
@@ -733,41 +751,23 @@ mod tests {
         assert!(pos_bbb.is_some(), "bbb entry should be loaded");
         assert!(pos_index < pos_aaa.unwrap(), "INDEX must load before aaa");
         assert!(pos_index < pos_bbb.unwrap(), "INDEX must load before bbb");
-
-        cleanup_test_entries(&names);
     }
 
     #[test]
     fn load_memory_context_db_ranked_order() {
-        let names = ["INDEX", "_r_first_", "_r_second_", "_r_third_"];
-        cleanup_test_entries(&names);
-        write_memory_db(
-            "_r_first_",
-            "content for first ENT_FIRST",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
-        write_memory_db(
-            "_r_second_",
-            "content for second ENT_SECOND",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
-        write_memory_db(
-            "_r_third_",
-            "content for third ENT_THIRD",
-            WriteMode::Overwrite,
-            "global",
-        )
-        .unwrap();
+        let db = crate::db::Database::test_db();
+        db.upsert_memory_entry("global", "_r_first_", "content for first ENT_FIRST")
+            .unwrap();
+        db.upsert_memory_entry("global", "_r_second_", "content for second ENT_SECOND")
+            .unwrap();
+        db.upsert_memory_entry("global", "_r_third_", "content for third ENT_THIRD")
+            .unwrap();
 
         let ranked = vec![
             ("_r_third_".to_string(), 0.9),
             ("_r_first_".to_string(), 0.5),
         ];
-        let out = load_memory_context_db_ranked(100_000, &ranked).unwrap();
+        let out = load_memory_context_db_ranked_with(&db, 100_000, &ranked).unwrap();
         let pos_third = out.find("ENT_THIRD").unwrap();
         let pos_first = out.find("ENT_FIRST").unwrap();
         assert!(
@@ -776,27 +776,23 @@ mod tests {
         );
         // Unranked _r_second_ should still be included in fill-step.
         assert!(out.contains("ENT_SECOND"));
-
-        cleanup_test_entries(&names);
     }
 
     #[test]
     fn load_memory_context_db_respects_budget() {
-        let names = ["INDEX", "_b_big_", "_b_small_"];
-        cleanup_test_entries(&names);
+        let db = crate::db::Database::test_db();
         let big = "budgetword ".repeat(5000);
-        write_memory_db("_b_big_", &big, WriteMode::Overwrite, "global").unwrap();
-        write_memory_db("_b_small_", "tinymarker", WriteMode::Overwrite, "global").unwrap();
+        db.upsert_memory_entry("global", "_b_big_", &big).unwrap();
+        db.upsert_memory_entry("global", "_b_small_", "tinymarker")
+            .unwrap();
 
-        let out = load_memory_context_db(50).unwrap();
+        let out = load_memory_context_db_with(&db, 50).unwrap();
         assert!(
             !out.contains("budgetword"),
             "oversized entry must be skipped under small budget"
         );
         // The small entry should fit if the budget allows.
         assert!(out.contains("tinymarker"));
-
-        cleanup_test_entries(&names);
     }
 
     #[test]
@@ -809,13 +805,19 @@ mod tests {
 
     #[test]
     fn read_memory_db_missing_returns_none() {
-        let out = read_memory_db("_nope_xyz_nonexistent_", "global").unwrap();
+        // Use the `_with` form against an isolated test DB — the public
+        // `read_memory_db` opens `~/.borg/borg.db`, which would couple the
+        // test to the user's actual DB state.
+        let db = crate::db::Database::test_db();
+        let out = read_memory_db_with(&db, "_nope_xyz_nonexistent_", "global").unwrap();
         assert!(out.is_none());
     }
 
     #[test]
     fn read_memory_db_or_not_found_falls_back() {
-        let out = read_memory_db_or_not_found("_nope_xyz_nonexistent_", "global").unwrap();
+        let db = crate::db::Database::test_db();
+        let out =
+            read_memory_db_or_not_found_with(&db, "_nope_xyz_nonexistent_", "global").unwrap();
         assert!(out.contains("not found"));
     }
 

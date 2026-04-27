@@ -9,8 +9,25 @@ use super::{optional_str_param, require_str_param, with_db};
 use crate::config::Config;
 use crate::db::{Database, ProjectStatus};
 
+/// Valid action values for the `projects` tool. Centralized so action
+/// validation can run before we incur the cost (and possible failure) of
+/// opening the database — `unknown action` and `missing action` are pure
+/// argument errors that should not be masked by a DB-open failure.
+const PROJECT_ACTIONS: &[&str] = &["create", "list", "get", "update", "archive", "delete"];
+
 /// Handle the `projects` tool. Dispatches by action.
 pub fn handle_projects(args: &Value, _config: &Config) -> Result<String> {
+    // Validate the action up-front so unknown/missing-action errors don't
+    // depend on `Database::open()` succeeding. This also surfaces the
+    // user-facing "Unknown action" message even if the prod DB is missing
+    // or corrupted.
+    let action = require_str_param(args, "action")?;
+    if !PROJECT_ACTIONS.contains(&action) {
+        return Ok(format!(
+            "Unknown action: '{action}'. Valid actions: {}",
+            PROJECT_ACTIONS.join(", ")
+        ));
+    }
     with_db(|db| dispatch_project(args, db))
 }
 

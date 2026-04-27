@@ -67,7 +67,10 @@ impl Pki for PkiSvc {
         let expires_at = now + PAIRING_TTL_SECS;
 
         {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.create_pairing_code(&code, PAIRING_INTENT, PAIRING_TTL_SECS)
                 .map_err(|e| Status::internal(format!("create pairing code: {e}")))?;
         }
@@ -100,7 +103,10 @@ impl Pki for PkiSvc {
 
         // Look up the device + its current cert.
         let (device_label, _old_serial) = {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dev = g
                 .find_active_paired_device(&principal.fingerprint)
                 .map_err(|e| Status::internal(format!("db: {e}")))?
@@ -127,7 +133,10 @@ impl Pki for PkiSvc {
         let new_fp = fingerprint_sha256(&issued.cert_der);
 
         let new_serial = {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let serial = g
                 .insert_internal_cert(
                     "client",
@@ -180,7 +189,10 @@ impl Pki for PkiSvc {
             Some(r.reason.as_str())
         };
         {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.revoke_paired_device(&r.fingerprint, reason)
                 .map_err(|e| Status::internal(format!("revoke: {e}")))?;
         }
@@ -197,7 +209,10 @@ impl Pki for PkiSvc {
         _req: Request<PkiEmpty>,
     ) -> Result<Response<PairedDeviceList>, Status> {
         let rows = {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.list_paired_devices()
                 .map_err(|e| Status::internal(format!("list: {e}")))?
         };
@@ -227,7 +242,10 @@ impl Pki for PkiSvc {
             .clone();
         let now = chrono::Utc::now().timestamp();
         let not_after = {
-            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let g = self
+                .db
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.paired_device_cert_expiry(&principal.fingerprint)
                 .map_err(|e| Status::internal(format!("db: {e}")))?
                 .unwrap_or(0)

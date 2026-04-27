@@ -203,10 +203,7 @@ mod tests {
             issue_server_cert(&ca.cert_pem, &ca.key_pkcs8_pem, &p).expect("server cert");
         let meta = parse_cert_metadata(&issued.cert_der).expect("parse");
         let span_days = (meta.not_after - meta.not_before) / 86_400;
-        assert!(
-            (89..=91).contains(&span_days),
-            "span_days = {span_days}"
-        );
+        assert!((89..=91).contains(&span_days), "span_days = {span_days}");
         assert_eq!(meta.subject_cn.as_deref(), Some("borgd"));
     }
 
