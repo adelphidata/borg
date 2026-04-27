@@ -8,6 +8,7 @@
 
 use super::DaemonClient;
 use anyhow::{anyhow, Context, Result};
+use identity::KeychainStore;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
@@ -54,7 +55,19 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
         }))
         .await
         .with_context(|| format!("connecting to UDS {}", path.display()))?;
-    Ok(DaemonClient::from_channel(channel))
+    let mut client = DaemonClient::from_channel(channel);
+    // Best-effort silent cert renewal: if the daemon says we're inside the
+    // 14-day window, rotate now. Failures here MUST NOT block the connect —
+    // unauthenticated connections (bootstrap UDS, tests) intentionally fall
+    // through. Real failures are surfaced via tracing::warn! per the
+    // CLAUDE.md "log + continue" rule for fire-and-forget paths.
+    let kek = KeychainStore::new();
+    match client.ensure_cert_fresh(&kek).await {
+        Ok(true) => tracing::info!("client cert silently renewed"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "silent cert renewal failed"),
+    }
+    Ok(client)
 }
 
 /// Like [`connect`] but launches `borgd` if the socket isn't present. The spawned daemon is detached — it lives on after this CLI

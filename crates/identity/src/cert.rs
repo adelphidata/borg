@@ -67,6 +67,19 @@ pub fn parse_cert_metadata(cert_der: &[u8]) -> Result<CertMetadata, PkiError> {
     })
 }
 
+/// SHA-256 fingerprint of the first certificate in a PEM bundle.
+///
+/// Returns lowercase-hex (matches [`fingerprint_sha256`]). Errors if the
+/// bundle contains no `CERTIFICATE` block or the embedded DER fails to parse.
+pub fn fingerprint_of_pem(cert_pem: &[u8]) -> Result<String, PkiError> {
+    let mut cursor = std::io::Cursor::new(cert_pem);
+    let first = rustls_pemfile::certs(&mut cursor)
+        .next()
+        .ok_or_else(|| PkiError::Parse("no CERTIFICATE block in PEM bundle".to_string()))?;
+    let der = first.map_err(|e| PkiError::Parse(format!("pem read: {e}")))?;
+    Ok(fingerprint_sha256(&der))
+}
+
 /// True iff the cert expires within `days` from `now`.
 pub fn expires_within(meta: &CertMetadata, now_unix: i64, days: u32) -> bool {
     let cutoff = now_unix.saturating_add(i64::from(days) * 86_400);
@@ -134,6 +147,36 @@ mod tests {
         assert!(expires_within(&meta, now, 14));
         assert!(expires_within(&meta, now, 13));
         assert!(!expires_within(&meta, now, 12));
+    }
+
+    fn issue_test_cert_pem() -> (Vec<u8>, String) {
+        let mut params =
+            rcgen::CertificateParams::new(vec!["test.local".to_string()]).expect("rcgen params");
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("test-device".to_string()),
+        );
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let cert = params.self_signed(&key).expect("self_signed");
+        let der = cert.der().to_vec();
+        let pem = cert.pem();
+        (der, pem)
+    }
+
+    #[test]
+    fn fingerprint_of_pem_matches_der_fingerprint() {
+        let (der, pem) = issue_test_cert_pem();
+        let want = fingerprint_sha256(&der);
+        let got = fingerprint_of_pem(pem.as_bytes()).expect("pem fingerprint");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn fingerprint_of_pem_errors_when_no_cert_block() {
+        let err =
+            fingerprint_of_pem(b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+                .expect_err("must fail");
+        assert!(matches!(err, PkiError::Parse(_)));
     }
 
     #[test]

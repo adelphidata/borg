@@ -2909,6 +2909,7 @@ dependencies = [
  "prost",
  "protocols",
  "pulldown-cmark",
+ "qrcodegen",
  "rand 0.9.4",
  "ratatui",
  "reqwest 0.12.28",

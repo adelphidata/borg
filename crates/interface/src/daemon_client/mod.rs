@@ -161,6 +161,84 @@ impl DaemonClient {
             .into_inner())
     }
 
+    /// If the daemon reports the calling client's mTLS cert is inside the
+    /// 14-day silent-renewal window, mint a fresh cert and rotate the
+    /// keychain-stored PEMs in place. Returns `Ok(true)` if a renewal
+    /// happened, `Ok(false)` if no renewal was needed (no cert yet, daemon
+    /// reports nothing to renew, or the channel is unauthenticated /
+    /// unimplemented — e.g., bootstrap pairing UDS or in-process tests
+    /// without mTLS).
+    ///
+    /// The daemon enforces that the request fingerprint matches the
+    /// connection's `Principal` — so callers MUST invoke this on a
+    /// channel established with the keychain-stored client cert; passing
+    /// the keychain cert's fingerprint while connected with a different
+    /// identity is rejected as `permission_denied` by the server.
+    ///
+    /// **Keychain rotation order** is key-then-cert: a crash between the
+    /// two writes leaves the *old* cert paired with the *new* key, which
+    /// fails cleanly at next handshake (the daemon will offer renewal
+    /// again). The reverse order (cert-first) would brick the client,
+    /// because the daemon revokes the old fingerprint as part of the
+    /// successful `renew_cert` RPC.
+    ///
+    /// Errors when a renewal was attempted and failed mid-flight; callers
+    /// in fire-and-forget contexts should `tracing::warn!` and continue
+    /// rather than abort the user-visible operation.
+    pub async fn ensure_cert_fresh<K: identity::KekStore>(&mut self, kek: &K) -> Result<bool> {
+        // Pre-pairing connections (bootstrap UDS) have no cert yet — nothing
+        // to renew. Skip BEFORE calling the daemon so we don't surface a
+        // misleading "no client cert in keychain" error during pairing.
+        // `KekStore::get` returns `NotFound` (not `Ok(None)`) for absent
+        // accounts; treat that as the pre-pairing case.
+        let cert_pem = match kek.get(crate::commands::device_pair::CLIENT_CERT_KEY_ACCOUNT) {
+            Ok(pem) => pem,
+            Err(identity::PkiError::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(anyhow!("read current client cert from keychain: {e}")),
+        };
+
+        // Call the underlying tonic stub so we can inspect the gRPC
+        // `Status::code()` rather than the anyhow-wrapped form returned by
+        // [`Self::get_cert_lifecycle`]. Distinguish "this channel can't
+        // tell us" (unauthenticated / unimplemented / permission denied)
+        // from real failures — the former is silently a no-op; the latter
+        // must surface so the caller can `tracing::warn!`.
+        let lifecycle = match self.pki.get_cert_lifecycle(PkiEmpty {}).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) => {
+                use tonic::Code;
+                return match status.code() {
+                    Code::Unimplemented | Code::Unauthenticated | Code::PermissionDenied => {
+                        Ok(false)
+                    }
+                    _ => Err(anyhow!("get_cert_lifecycle: {}", status)),
+                };
+            }
+        };
+        if !lifecycle.renewal_due || lifecycle.not_after == 0 {
+            return Ok(false);
+        }
+        let fp =
+            identity::fingerprint_of_pem(&cert_pem).context("compute current cert fingerprint")?;
+        let resp = self
+            .renew_cert(&fp)
+            .await
+            .context("daemon renew_cert RPC")?;
+        // Key first, then cert — see doc comment for the failure-mode
+        // rationale. Anything that survives a key-only crash is recoverable.
+        kek.put(
+            crate::commands::device_pair::CLIENT_KEY_KEY_ACCOUNT,
+            resp.new_key_pkcs8_pem.as_bytes(),
+        )
+        .context("rotate client key in keychain")?;
+        kek.put(
+            crate::commands::device_pair::CLIENT_CERT_KEY_ACCOUNT,
+            resp.new_cert_pem.as_bytes(),
+        )
+        .context("rotate client cert in keychain")?;
+        Ok(true)
+    }
+
     /// Open a fresh session (or resume the named one if `resume_id` is set).
     /// Returns `(session_id, last_event_seq)`.
     pub async fn open_session(&mut self, resume_id: Option<&str>) -> Result<(String, u64)> {

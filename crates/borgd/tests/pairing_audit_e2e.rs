@@ -406,3 +406,249 @@ async fn replayed_code_is_rejected_after_first_use() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn rate_limit_blocks_listener_with_pairing_denied_audit() {
+    // Real failure mode: spec requires bounded retries on a pairing code
+    // (5 attempts). The DB layer flips the row to RateLimited once
+    // `attempts >= 5`; the listener must honor that and emit a
+    // `PAIRING_DENIED` audit event with reason `RateLimited` instead of
+    // letting the code be consumed. A regression that ignored the
+    // RateLimited variant would silently let a 6th attempt succeed.
+    let state = make_state();
+    let code = mint_pairing_code();
+    {
+        let g = state.db.lock().expect("lock");
+        g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .expect("mint");
+        for _ in 0..5 {
+            g.bump_pairing_attempts(&code).expect("bump");
+        }
+    }
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("pair.sock");
+    let listener_state = state.clone();
+    let listener_path = path.clone();
+    let server = tokio::spawn(async move {
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
+    });
+    wait_for_socket(&path).await;
+
+    let res = pair_client::run(&path, &code, "alice-laptop").await;
+    assert!(res.is_err(), "rate-limited code must be rejected");
+
+    let events = state
+        .db
+        .lock()
+        .expect("lock")
+        .list_audit_events()
+        .expect("list");
+    let denied = events
+        .iter()
+        .find(|e| e.event_type == audit_events::PAIRING_DENIED)
+        .expect("PAIRING_DENIED must be emitted");
+    assert!(
+        denied.event_json.contains("RateLimited"),
+        "denied reason must capture RateLimited; got {}",
+        denied.event_json,
+    );
+    // Code must NOT have been consumed — paired_devices stays empty.
+    assert!(state
+        .db
+        .lock()
+        .expect("lock")
+        .list_paired_devices()
+        .expect("list")
+        .is_empty());
+    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn renew_cert_rotates_fingerprint_and_emits_cert_renewed() {
+    // Real failure mode: silent renewal must (a) issue a new cert with a
+    // *different* fingerprint, (b) point the same paired_devices row at
+    // the new cert serial, (c) move the old fingerprint into
+    // revoked_fingerprints (so the old cert can never re-authenticate),
+    // and (d) emit a CERT_RENEWED audit row referencing both fingerprints.
+    // A regression in any one of those steps lets either the old cert
+    // outlive renewal (a/c) or breaks future TOFU lookups (b), so the
+    // assertions are spelled out.
+    use borgd::auth::Principal;
+    use borgd::pki_grpc::PkiSvc;
+    use protocols::pki::{pki_server::Pki, RenewCertRequest};
+
+    let state = make_state();
+
+    // Pair an "alice" device end-to-end first so we have a real cert + DB
+    // rows to renew against.
+    let code = mint_pairing_code();
+    {
+        let g = state.db.lock().expect("lock");
+        g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .expect("mint");
+    }
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("pair.sock");
+    let listener_state = state.clone();
+    let listener_path = path.clone();
+    let server = tokio::spawn(async move {
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
+    });
+    wait_for_socket(&path).await;
+    pair_client::run(&path, &code, "alice-laptop")
+        .await
+        .expect("pair");
+    server.abort();
+
+    let old_fp = state
+        .db
+        .lock()
+        .expect("lock")
+        .list_paired_devices()
+        .expect("list")[0]
+        .fingerprint
+        .clone();
+
+    let svc = PkiSvc::new(
+        state.db.clone(),
+        state.audit.clone(),
+        state.ca_cert_pem.clone(),
+        state.ca_key_pem.clone(),
+    );
+    let mut req = tonic::Request::new(RenewCertRequest {
+        fingerprint: old_fp.clone(),
+    });
+    req.extensions_mut().insert(Principal {
+        id: "alice-laptop".into(),
+        fingerprint: old_fp.clone(),
+    });
+    let resp = svc.renew_cert(req).await.expect("renew_cert").into_inner();
+    assert!(resp.new_cert_pem.contains("BEGIN CERTIFICATE"));
+    assert!(resp.not_after > chrono::Utc::now().timestamp());
+
+    // Cert PEM differs (different keypair + serial → different fingerprint).
+    let new_fp =
+        identity::fingerprint_of_pem(resp.new_cert_pem.as_bytes()).expect("fingerprint new cert");
+    assert_ne!(new_fp, old_fp, "renewal must mint a fresh fingerprint");
+
+    {
+        let g = state.db.lock().expect("lock");
+        // New fingerprint is the active paired device.
+        let active = g
+            .find_active_paired_device(&new_fp)
+            .expect("query")
+            .expect("new fp must be paired");
+        assert_eq!(active.device_label, "alice-laptop");
+        // Old fingerprint is in the revoked list.
+        assert!(
+            g.is_fingerprint_revoked(&old_fp).expect("query"),
+            "old fingerprint must be revoked after renewal",
+        );
+    }
+
+    // CERT_RENEWED audit event with both fingerprints in the payload.
+    let events = state
+        .db
+        .lock()
+        .expect("lock")
+        .list_audit_events()
+        .expect("list");
+    let renewed = events
+        .iter()
+        .find(|e| e.event_type == audit_events::CERT_RENEWED)
+        .expect("CERT_RENEWED must be emitted");
+    assert!(
+        renewed.event_json.contains(&old_fp) && renewed.event_json.contains(&new_fp),
+        "payload must reference both fingerprints; got {}",
+        renewed.event_json,
+    );
+    assert_eq!(state.audit.verify(), AuditChainOutcome::Ok);
+}
+
+#[tokio::test]
+async fn verify_audit_chain_grpc_reports_tampered_seq() {
+    // Real failure mode: the CLI `borg audit verify` is a thin wrapper over
+    // the `Pki.VerifyAuditChain` RPC. If a regression mapped the internal
+    // `Tampered { seq }` outcome to `outcome="ok"` (or lost the seq), the
+    // CLI would silently report a clean chain even though the chain was
+    // broken. Test exercises the actual gRPC handler.
+    use borgd::pki_grpc::PkiSvc;
+    use protocols::pki::{pki_server::Pki, PkiEmpty};
+
+    let state = make_state();
+
+    // Pair once so the chain has more than one event.
+    let code = mint_pairing_code();
+    {
+        let g = state.db.lock().expect("lock");
+        g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .expect("mint");
+    }
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("pair.sock");
+    let listener_state = state.clone();
+    let listener_path = path.clone();
+    let server = tokio::spawn(async move {
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
+    });
+    wait_for_socket(&path).await;
+    pair_client::run(&path, &code, "alice-laptop")
+        .await
+        .expect("pair");
+    server.abort();
+
+    let svc = PkiSvc::new(
+        state.db.clone(),
+        state.audit.clone(),
+        state.ca_cert_pem.clone(),
+        state.ca_key_pem.clone(),
+    );
+
+    // Clean chain — RPC reports ok.
+    let resp = svc
+        .verify_audit_chain(tonic::Request::new(PkiEmpty {}))
+        .await
+        .expect("verify clean")
+        .into_inner();
+    assert_eq!(resp.outcome, "ok");
+    assert_eq!(resp.tampered_seq, -1);
+
+    // Tamper with a non-final row. Pick a non-tombstoned row deterministically.
+    let target_seq: i64 = state
+        .db
+        .lock()
+        .expect("lock")
+        .conn()
+        .query_row(
+            "SELECT seq FROM audit_log_chain ORDER BY seq ASC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read seq");
+    {
+        let g = state.db.lock().expect("lock");
+        g.conn()
+            .execute(
+                "UPDATE audit_log_chain SET event_json = '{\"hacked\":true}' WHERE seq = ?1",
+                rusqlite::params![target_seq],
+            )
+            .expect("tamper");
+    }
+
+    let resp = svc
+        .verify_audit_chain(tonic::Request::new(PkiEmpty {}))
+        .await
+        .expect("verify dirty")
+        .into_inner();
+    assert_eq!(resp.outcome, "tampered");
+    assert_eq!(resp.tampered_seq, target_seq);
+    assert_eq!(resp.tombstone_count, 0);
+}
