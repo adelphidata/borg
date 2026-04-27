@@ -1404,6 +1404,60 @@ impl Database {
         Ok(())
     }
 
+    /// V41: `client_tokens` — bearer tokens for the OpenAI-compat HTTP
+    /// surface and MCP HTTP transport.
+    ///
+    /// Tokens are 32-byte random values base64url-encoded; only their
+    /// SHA-256 hash is persisted. Plaintext is shown to the issuer once
+    /// at creation time and never recoverable thereafter — same model
+    /// as GitHub PATs / Stripe API keys. `revoked_at IS NOT NULL` is
+    /// the canonical "tombstone" marker so audit replay can still see
+    /// the row even after revocation.
+    pub(super) fn migrate_v41(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS client_tokens (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash    BLOB    NOT NULL UNIQUE,
+                label         TEXT    NOT NULL UNIQUE,
+                scopes        TEXT    NOT NULL DEFAULT '',
+                created_at    INTEGER NOT NULL,
+                last_used_at  INTEGER,
+                revoked_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_client_tokens_hash
+                ON client_tokens(token_hash);
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V42: `webhook_definitions` — generic signed webhook surface.
+    ///
+    /// Each row defines one inbound endpoint at `/v1/webhook/{name}`.
+    /// `secret_hash` is the SHA-256 of the HMAC secret (shown to the
+    /// user once at creation, GitHub-PAT style). The three `*_path`
+    /// columns are JSON dot-paths (subset of JSONPath) that extract
+    /// `sender_id` (required), `thread_id` (optional), and `body`
+    /// (required) from the incoming JSON payload. Same routing
+    /// pipeline as native channels — gateway bindings apply.
+    pub(super) fn migrate_v42(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS webhook_definitions (
+                name         TEXT PRIMARY KEY,
+                secret_hash  BLOB NOT NULL,
+                sender_path  TEXT NOT NULL,
+                thread_path  TEXT,
+                body_path    TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                revoked_at   INTEGER
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

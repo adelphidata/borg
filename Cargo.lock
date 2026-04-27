@@ -492,6 +492,7 @@ dependencies = [
  "ansi-to-tui",
  "anyhow",
  "arboard",
+ "async-trait",
  "base64 0.22.1",
  "borg-core",
  "borg-gateway",
@@ -597,6 +598,7 @@ name = "borg-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum 0.8.8",
  "base64 0.22.1",

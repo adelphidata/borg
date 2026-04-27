@@ -75,7 +75,12 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
         },
         Kind::ShellConfirmation(s) => {
             let (respond_tx, respond_rx) = oneshot::channel::<bool>();
-            spawn_shell_responder(client.clone(), session_id.to_string(), s.prompt_id, respond_rx);
+            spawn_shell_responder(
+                client.clone(),
+                session_id.to_string(),
+                s.prompt_id,
+                respond_rx,
+            );
             CoreEvent::ShellConfirmation {
                 command: s.command,
                 respond: respond_tx,
@@ -113,7 +118,12 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
         },
         Kind::UserInputRequest(u) => {
             let (respond_tx, respond_rx) = oneshot::channel::<String>();
-            spawn_input_responder(client.clone(), session_id.to_string(), u.prompt_id, respond_rx);
+            spawn_input_responder(
+                client.clone(),
+                session_id.to_string(),
+                u.prompt_id,
+                respond_rx,
+            );
             CoreEvent::UserInputRequest {
                 prompt: u.prompt,
                 choices: u
@@ -162,7 +172,10 @@ fn spawn_shell_responder(
         match rx.await {
             Ok(approved) => {
                 let value = if approved { "true" } else { "false" };
-                if let Err(e) = client.respond_to_prompt(&session_id, &prompt_id, value).await {
+                if let Err(e) = client
+                    .respond_to_prompt(&session_id, &prompt_id, value)
+                    .await
+                {
                     tracing::warn!(
                         session = %session_id,
                         prompt = %prompt_id,
@@ -174,7 +187,10 @@ fn spawn_shell_responder(
             Err(_) => {
                 // Renderer dropped without answering — daemon still has a
                 // pending prompt; reply false so the agent doesn't hang.
-                if let Err(e) = client.respond_to_prompt(&session_id, &prompt_id, "false").await {
+                if let Err(e) = client
+                    .respond_to_prompt(&session_id, &prompt_id, "false")
+                    .await
+                {
                     tracing::warn!(error = %e, "fallback shell-deny failed");
                 }
             }
@@ -191,7 +207,10 @@ fn spawn_input_responder(
     tokio::spawn(async move {
         match rx.await {
             Ok(value) => {
-                if let Err(e) = client.respond_to_prompt(&session_id, &prompt_id, &value).await {
+                if let Err(e) = client
+                    .respond_to_prompt(&session_id, &prompt_id, &value)
+                    .await
+                {
                     tracing::warn!(
                         session = %session_id,
                         prompt = %prompt_id,

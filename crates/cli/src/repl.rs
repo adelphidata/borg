@@ -101,16 +101,16 @@ pub async fn one_shot(
             }
             AgentEvent::ToolResult { name, result } => {
                 if !json_output {
-                    let preview =
-                        if result.len() > borg_core::constants::TOOL_RESULT_PREVIEW_CHARS {
-                            let mut end = borg_core::constants::TOOL_RESULT_PREVIEW_CHARS;
-                            while end > 0 && !result.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            &result[..end]
-                        } else {
-                            &result
-                        };
+                    let preview = if result.len() > borg_core::constants::TOOL_RESULT_PREVIEW_CHARS
+                    {
+                        let mut end = borg_core::constants::TOOL_RESULT_PREVIEW_CHARS;
+                        while end > 0 && !result.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        &result[..end]
+                    } else {
+                        &result
+                    };
                     eprintln!("[{name} done] {preview}");
                 }
             }

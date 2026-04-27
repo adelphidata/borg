@@ -56,6 +56,10 @@ pub mod discord;
 pub mod error_dedup;
 /// Channel script subprocess execution.
 pub mod executor;
+/// Generic signed-payload webhook surface — `POST /v1/webhook/{name}`
+/// with HMAC-SHA256 verification. Lets users wire arbitrary upstream
+/// JSON events into the agent loop via per-webhook JSON dot-paths.
+pub mod generic_webhook;
 /// Native Google Chat integration.
 pub mod google_chat;
 /// Webhook handler: verify, parse, invoke agent, respond.
@@ -73,6 +77,14 @@ pub mod in_flight;
 pub mod link_understanding;
 /// `channel.toml` manifest parsing.
 pub mod manifest;
+/// MCP server — exposes Borg's read-only tools to MCP clients
+/// (Claude Desktop, MCP Inspector) over stdio + HTTP transports.
+pub mod mcp;
+/// OpenAI-compatible HTTP surface — `/v1/chat/completions`, `/v1/models`.
+/// Bearer auth via `borg_core::auth::tokens`. Lets ChatBox / Open
+/// WebUI / the official `openai` SDK point at borg as if it were
+/// OpenAI's API.
+pub mod openai_compat;
 /// Helpers for plain-text channels that cannot render Markdown code fences.
 pub mod plain_text;
 /// Sliding-window rate limiting for inbound messages.

@@ -34,6 +34,9 @@
 pub mod activity_log;
 /// Agent conversation loop and tool dispatch.
 pub mod agent;
+/// Authentication primitives for non-mTLS ingress surfaces — bearer
+/// tokens for OpenAI-compat HTTP and MCP HTTP. mTLS lands in Task 02.
+pub mod auth;
 /// Agent bond/relationship tracking.
 pub mod bond;
 /// Headless Chrome automation via CDP.
@@ -82,6 +85,10 @@ pub mod host_audit;
 pub mod identity;
 /// AI image generation (OpenAI DALL-E, Fal).
 pub mod image_gen;
+/// Normalized ingress message schema and pre-dispatch gate (rate-limit,
+/// sanitize, audit). Shared by every ingress surface — native channels,
+/// OpenAI-compat HTTP, generic webhook, MCP server.
+pub mod ingress;
 /// Installation integrity verification.
 pub mod integrity;
 /// Real-time `<internal>` tag stripping from streamed output.

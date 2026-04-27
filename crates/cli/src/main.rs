@@ -209,6 +209,22 @@ enum Commands {
         #[command(subcommand)]
         action: Option<CronAction>,
     },
+    /// Manage bearer tokens for OpenAI-compat HTTP and MCP HTTP surfaces
+    #[command(name = "client-token")]
+    ClientToken {
+        #[command(subcommand)]
+        action: Option<commands::client_token::ClientTokenAction>,
+    },
+    /// Manage signed webhook definitions for /v1/webhook/{name}
+    Webhook {
+        #[command(subcommand)]
+        action: Option<commands::webhook::WebhookAction>,
+    },
+    /// Run Borg as a Model Context Protocol (MCP) server
+    Mcp {
+        #[command(subcommand)]
+        action: Option<commands::mcp::McpAction>,
+    },
     /// Permanently delete all Borg data and uninstall the service
     Uninstall,
     /// Export a session to JSON (default), CSV, or TXT.
@@ -406,6 +422,11 @@ async fn async_main() -> Result<()> {
         Some(Commands::Available) => commands::misc::run_available().await?,
         Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action)?,
         Some(Commands::Update { dev, check }) => commands::misc::run_update(dev, check).await?,
+        Some(Commands::ClientToken { action }) => {
+            commands::client_token::dispatch_client_token(action)?
+        }
+        Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action)?,
+        Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
         Some(Commands::Export {
             session_id,
