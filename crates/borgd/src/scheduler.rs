@@ -6,8 +6,8 @@
 //! path.
 //!
 //! Task execution itself (LLM call, command spawn, maintenance sweep) is
-//! delegated back to the cli's `service::*` helpers via `borgd::run_legacy`
-//! while Stage E migrates them in. This module is the loop body only.
+//! delegated back to the cli's `service::*` helpers via `borgd::run_legacy`.
+//! This module is the loop body only.
 
 use anyhow::Result;
 use cortex::config::Config;

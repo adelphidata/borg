@@ -58,11 +58,11 @@ pub struct MaintenanceReport {
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
-    /// `messages` rows deleted by the retention purge (Task 05). `0` when
+    /// `messages` rows deleted by the retention purge. `0` when
     /// `data.retention_days` is `None` or `data.purge_policy != Auto`.
     #[serde(default)]
     pub messages_purged: usize,
-    /// `audit_log_chain` rows tombstoned by the retention purge (Task 05).
+    /// `audit_log_chain` rows tombstoned by the retention purge.
     /// Tombstones preserve hash-chain linkage; the row count is the
     /// observable side of the daily retention behavior.
     #[serde(default)]
@@ -179,8 +179,8 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         Err(e) => tracing::warn!("maintenance: workflow prune failed: {e}"),
     }
 
-    // 4c. Apply data retention (Task 05). Deletes `messages` rows past
-    //     the cutoff and tombstones `audit_log_chain` rows in place,
+    // 4c. Apply data retention. Deletes `messages` rows past the cutoff
+    //     and tombstones `audit_log_chain` rows in place,
     //     preserving hash-chain linkage. Skipped when `retention_days`
     //     is unset or `purge_policy` is `Never` / `OnDemandOnly` — see
     //     `DataConfig::should_auto_purge`.
@@ -197,7 +197,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         }
     }
 
-    // 4d. Weekly auto-backup (Task 05). Fires on Sunday when no backup
+    // 4d. Weekly auto-backup. Fires on Sunday when no backup
     //     exists in the last 7 days and `backup_keep_count > 0`. Pruning
     //     happens after a successful create so a failed backup doesn't
     //     erase the last good copy.

@@ -290,9 +290,10 @@ pub fn add_plugin(name: &str) -> Result<()> {
     println!();
     println!("{} configured successfully.", def.description);
     if def.is_channel {
-        // Stage E will switch this to a borgd_launcher restart. For now ask
-        // the daemon to shut down gracefully; the next `borg` invocation
-        // re-spawns it via `connect_or_spawn`, picking up the new channel.
+        // Ask the daemon to shut down gracefully; the next `borg`
+        // invocation re-spawns it via `connect_or_spawn`, picking up the
+        // new channel. Switching to a `borgd_launcher` restart is a
+        // future refinement.
         let shutdown_ok = match tokio::runtime::Handle::try_current() {
             Ok(h) => tokio::task::block_in_place(|| {
                 h.block_on(async {

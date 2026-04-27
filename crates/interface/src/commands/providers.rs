@@ -37,9 +37,9 @@ pub(crate) enum ProvidersAction {
     /// Pull the latest published rate-card manifest from the Borg
     /// release host. Opt-in only — never invoked from a timer.
     ///
-    /// In v1 the signed-manifest verification key is not yet shipped,
-    /// so this command refuses to write any rows and exits non-zero.
-    /// (Per CLAUDE.md "no silent error swallowing".)
+    /// The signed-manifest verification key is not yet shipped, so this
+    /// command refuses to write any rows and exits non-zero. (Per
+    /// CLAUDE.md "no silent error swallowing".)
     RefreshRates {
         /// Override the manifest URL (default: Borg release host).
         #[arg(long)]

@@ -100,8 +100,8 @@ pub(crate) async fn run_update(dev: bool, check: bool) -> Result<()> {
 pub(crate) async fn run_poke() -> Result<()> {
     // Prefer the gRPC daemon when its socket is present; fall back to the
     // legacy HTTP gateway poke endpoint while the gateway path is still
-    // co-installed. Once Task 8 migrates the gateway off Agent::new, the
-    // HTTP fallback goes away.
+    // co-installed. The HTTP fallback goes away once the gateway moves
+    // off `Agent::new` entirely.
     let socket = crate::daemon_client::default_socket_path();
     if socket.exists() {
         match crate::daemon_client::connect(Some(&socket)).await {

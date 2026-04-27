@@ -37,7 +37,7 @@ pub mod agent;
 /// Authentication primitives for non-mTLS ingress surfaces — bearer
 /// tokens for OpenAI-compat HTTP and MCP HTTP.
 pub mod auth;
-/// `BORG_HOME` backup unit (Task 05): tar.zst create/verify/restore.
+/// `BORG_HOME` backup unit: tar.zst create/verify/restore.
 pub mod backup;
 /// Agent bond/relationship tracking.
 pub mod bond;

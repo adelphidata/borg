@@ -1655,7 +1655,7 @@ impl Database {
         Ok(())
     }
 
-    /// V47 (Task 05): retention tombstone column + posture snapshots.
+    /// V47: retention tombstone column + posture snapshots.
     ///
     /// `audit_log_chain.event_purged` — tombstone flag set by the retention
     /// purge job. The chain hash includes this bit so flipping it without a

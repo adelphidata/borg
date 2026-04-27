@@ -57,9 +57,10 @@ use tower::service_fn;
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Files explicitly allowed to retain `Database::open(` writer-handle
-/// references. The list shrinks monotonically as follow-up PRs migrate
-/// each file to a `DaemonClient` admin RPC. When the list is empty, the
-/// `is_allowlisted` helper becomes a no-op.
+/// references. Currently empty — the cli has no direct writer openers —
+/// and the `allowlist_is_shrink_only` test below locks that in. The
+/// helper stays in place for the rare case a transitional opener needs
+/// to be tolerated for one merge.
 const ALLOWLIST: &[&str] = &[];
 
 fn is_allowlisted(rel: &str) -> bool {
@@ -85,11 +86,10 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 #[allow(clippy::const_is_empty)]
 fn allowlist_is_shrink_only() {
-    // Hard upper bound: every PR that grows this list needs a code review.
-    // The list shrinks monotonically as follow-up PRs migrate each file to
-    // a `DaemonClient` admin RPC. Currently the cli has zero direct writer
-    // openers — keep it that way. Clippy correctly notes the const is empty
-    // *right now*; that's the invariant we're locking in.
+    // Hard upper bound: every change that grows this list needs a code
+    // review. Currently the cli has zero direct writer openers — keep it
+    // that way. Clippy correctly notes the const is empty *right now*;
+    // that's the invariant we're locking in.
     assert!(
         ALLOWLIST.is_empty(),
         "ALLOWLIST should remain empty (len = {}); migrate the offending file to a DaemonClient admin RPC instead of allowlisting it",
@@ -187,7 +187,7 @@ fn crates_cli_src_has_no_direct_db_access() {
         "cli source must not reference cortex::db::* / Database::open(); \
          the daemon owns the database. Offenders:\n{}\n\n\
          If this is unavoidable for an in-flight migration, add the file to ALLOWLIST \
-         in this test with a comment naming the follow-up PR.",
+         in this test with an inline comment justifying the exception.",
         offenders.join("\n")
     );
 }

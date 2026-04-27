@@ -8,8 +8,8 @@
 //!   superset of the seven defaults defined in `SecurityConfig::default`.
 //! - `privileged_channels` ← any gateway channel binding flagged with
 //!   `allow_privileged = true`. Empty by default — the gateway config
-//!   doesn't expose this knob in v1, so the list is always empty until
-//!   Task 03 wires it through.
+//!   doesn't expose this knob yet, so the list is always empty until
+//!   the channel-binding flag ships.
 //! - `audit_chain_enabled` ← always `true` in v1 (audit chain is
 //!   unconditional after migration V46; cannot be disabled via config).
 //! - `catastrophic_denylist_intact` ← always `true` in v1 (the sandbox
@@ -60,7 +60,8 @@ fn compute_global_signals(config: &Config) -> GlobalSignals {
     GlobalSignals {
         sandbox_enabled: config.sandbox.enabled,
         blocked_paths_strict: blocked_paths_match_defaults(&config.security),
-        // v1 has no `allow_privileged` channel flag yet — Task 03 wiring.
+        // No `allow_privileged` channel flag in the config schema yet —
+        // wire-up follows when the flag ships.
         privileged_channels: Vec::new(),
         audit_chain_enabled: true,
         catastrophic_denylist_intact: true,

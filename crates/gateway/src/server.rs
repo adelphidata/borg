@@ -77,8 +77,9 @@ impl GatewayServer {
     /// `executor` is the daemon's `SessionExecutorHandle`: when present, it
     /// is installed as the process-wide handle so inbound channel messages
     /// route through `borgd::session::SessionRegistry`. When `None`, inbound
-    /// agent invocations short-circuit with an error — the in-process spawns
-    /// from `cli` (which Stage D removes) currently pass `None`.
+    /// agent invocations short-circuit with an error — the legacy
+    /// in-process spawns from `cli` pass `None` and will eventually go
+    /// away.
     pub fn new(
         config: Config,
         shutdown: CancellationToken,

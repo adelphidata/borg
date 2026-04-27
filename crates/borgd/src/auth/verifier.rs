@@ -1,5 +1,6 @@
-//! Verifier trait + TOFU implementation. Tailscale verifier is v1 opt-in
-//! (deferred to a follow-up; trait is structured so adding it is mechanical).
+//! Verifier trait + TOFU implementation. The trait shape is set so a
+//! Tailscale verifier (or any other transport-layer principal binder)
+//! can be added without touching call sites.
 
 use std::sync::{Arc, Mutex};
 

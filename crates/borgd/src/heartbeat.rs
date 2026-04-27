@@ -4,11 +4,9 @@
 //! that runs on each fire, and the broadcast channel feeding
 //! `Admin.SubscribeHeartbeatEvents` subscribers.
 //!
-//! Note: the in-process `crates/cli/src/service/mod.rs::execute_heartbeat_turn`
-//! currently still exists for the legacy `borg daemon` CLI path. This module
-//! is the daemon-native version that runs against `cortex::Agent` directly
-//! (Stage E will route through `DaemonSessionExecutor` once the heartbeat
-//! prompt builder lands inside the daemon's session machinery).
+//! Runs against `cortex::Agent` directly today; once the heartbeat
+//! prompt builder moves inside the daemon's session machinery, this
+//! module routes through `DaemonSessionExecutor` instead.
 
 use crate::session::DaemonSessionExecutor;
 use anyhow::Result;

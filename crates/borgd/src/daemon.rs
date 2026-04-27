@@ -166,7 +166,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     );
 
     // Reconcile security posture against live config before serving any
-    // traffic (Task 05). On a fresh DB this writes the bootstrap event;
+    // traffic. On a fresh DB this writes the bootstrap event;
     // on a restart with no config change it's a no-op. Failures are
     // logged and do NOT block daemon startup — XP writes will fall back
     // to `Default × 1.00` with `FallbackReason::PostureUndetermined`.

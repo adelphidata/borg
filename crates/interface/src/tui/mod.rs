@@ -1538,10 +1538,10 @@ async fn run_event_loop(
                     }
                 }
                 // Browser + DB are owned by the daemon now; ask it to shut
-                // down so the data directory can be removed cleanly. Stage D
-                // will replace this with a proper Admin.Shutdown call.
-                // (No-op for now — sandboxed Uninstall will surface any
-                // file-locked errors below.)
+                // down so the data directory can be removed cleanly. A proper
+                // `Admin.Shutdown` call will replace the no-op below; for now
+                // sandboxed Uninstall surfaces any file-locked errors that
+                // result.
                 // Let spawned tasks notice cancellation and wind down
                 tokio::task::yield_now().await;
 

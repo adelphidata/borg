@@ -22,11 +22,11 @@
 //! is unambiguous (a `posture_snapshots` row always points at the audit
 //! event that created it).
 //!
-//! TODO(task-05-followup): wire `xp_gain` events to read the head of
-//! `posture_snapshots`, apply `compute_xp_breakdown(...)` from
-//! `super::compute_xp_breakdown`, and persist the resulting `XpBreakdown`
-//! into `evolution_events.metadata_json` with `posture_event_seq` set to
-//! the current `posture_snapshots.evolution_event_id`. Until that lands,
+//! TODO: wire `xp_gain` events to read the head of `posture_snapshots`,
+//! apply `compute_xp_breakdown(...)` from `super::compute_xp_breakdown`,
+//! and persist the resulting `XpBreakdown` into
+//! `evolution_events.metadata_json` with `posture_event_seq` set to the
+//! current `posture_snapshots.evolution_event_id`. Until that lands,
 //! `Status::GetPosture` shows live posture but XP accrual is unmultiplied.
 
 use anyhow::{Context, Result};

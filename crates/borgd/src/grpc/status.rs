@@ -101,8 +101,8 @@ impl Status for StatusSvc {
     async fn get_budget(&self, _req: Request<Empty>) -> Result<Response<Budget>, TStatus> {
         // Today's `BudgetConfig` is a *monthly token* limit, not a daily USD
         // cap; map it onto the wire field as-is and leave spent at 0 until
-        // cost tracking lands. Renaming the proto field is a wire-break we'll
-        // do alongside the cost-tracking task.
+        // cost tracking is wired. Renaming the proto field is a wire-break
+        // saved for the same change.
         let cfg = tokio::task::spawn_blocking(Config::load_from_db)
             .await
             .map_err(|e| TStatus::internal(format!("config task panicked: {e}")))?

@@ -57,8 +57,8 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
                 .into_iter()
                 .map(|s| pb::PlanStep {
                     // PlanStep currently has no stable id — use the title slot
-                    // as the lookup key. Wire schema keeps `id` for forward
-                    // compat when an explicit id field lands in core.
+                    // as the lookup key. Wire schema keeps `id` so adding an
+                    // explicit id field later is non-breaking.
                     id: String::new(),
                     text: s.title,
                     status: match s.status {

@@ -10,7 +10,7 @@
 //!
 //! The verifier is **pure**: no clock, no network, no DB writes.
 //!
-//! ## Tombstone semantics (Task 05 retention)
+//! ## Tombstone semantics (retention purge)
 //!
 //! When the daily retention purge tombstones an event, it:
 //! 1. Rewrites `event_json` to `{"purged":1,"purged_at":<ts>,"original_type":"<t>"}`.
@@ -409,7 +409,7 @@ mod tests {
         assert_ne!(h1, h4);
     }
 
-    // ── Tombstone tests (Task 05) ──
+    // ── Tombstone tests ──
 
     /// After tombstoning, verify reports `OkWithTombstones { count: 1 }`,
     /// not `Tampered`. The seq=5 payload is the canonical tombstone shape.

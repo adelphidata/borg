@@ -116,7 +116,8 @@ impl std::fmt::Display for PrincipalId {
 pub struct IngressMessage {
     /// Origin surface + surface-specific name.
     pub source: IngressSource,
-    /// Authenticated principal (v1: always `local`).
+    /// Authenticated principal — `local` for in-process surfaces, the
+    /// cert-derived identity for mTLS connections.
     pub principal: PrincipalId,
     /// Platform-native sender id (telegram chat id, slack user id,
     /// webhook-extracted field, OpenAI token id, …).

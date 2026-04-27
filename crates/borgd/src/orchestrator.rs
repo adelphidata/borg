@@ -2,7 +2,8 @@
 //! dispatcher, watchdog, lock refresh — all in one place.
 //!
 //! Called from [`crate::daemon::run`] (production) and from the cli's
-//! `service::run_daemon` shim while Stage E migrates the legacy entry points.
+//! `service::run_daemon` shim — the latter remains until the legacy entry
+//! points are fully retired.
 
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;

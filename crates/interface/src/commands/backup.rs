@@ -1,4 +1,4 @@
-//! `borg backup create / verify / restore` — Task 05 backup unit.
+//! `borg backup create / verify / restore` — `BORG_HOME` backup unit.
 //!
 //! All three commands operate directly on the filesystem without going
 //! through the daemon, so they work even when `borgd` is stopped (which

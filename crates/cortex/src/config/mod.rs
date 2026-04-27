@@ -122,7 +122,7 @@ pub struct Config {
     /// Daily self-healing maintenance task retention settings.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
-    /// Daemon-wide data retention + backup policy (Task 05).
+    /// Daemon-wide data retention + backup policy.
     #[serde(default)]
     pub data: DataConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.

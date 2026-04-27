@@ -1,4 +1,4 @@
-//! `BORG_HOME` backup unit (Task 05).
+//! `BORG_HOME` backup unit.
 //!
 //! v1 ships a single tarball backup of the entire `BORG_HOME` directory
 //! (SQLite + blobs + skills + channels + hooks + config). mTLS private keys
