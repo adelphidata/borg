@@ -258,6 +258,27 @@ impl Default for LlmConfig {
     }
 }
 
+/// Air-gap and provider-routing policy. Lives next to [`LlmConfig`] but is
+/// scoped to v1 redesign concerns (Task 04 in `docs/redesign/`): which
+/// provider categories the daemon may reach over the network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProvidersConfig {
+    /// When `false`, the LLM transport refuses any provider whose category is
+    /// not [`crate::providers::ProviderCategory::Local`]. Defaults to `true`
+    /// for parity with current behavior; flipping it to `false` is the v1
+    /// air-gap switch.
+    pub outbound_allowed: bool,
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        Self {
+            outbound_allowed: true,
+        }
+    }
+}
+
 /// A fallback provider configuration for provider-level failover.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmFallback {

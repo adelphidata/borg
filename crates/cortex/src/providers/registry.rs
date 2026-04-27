@@ -89,6 +89,25 @@ impl ProviderRegistry {
         }
         Ok(resolved)
     }
+
+    /// Air-gap check for an already-known built-in [`Provider`] variant.
+    ///
+    /// Used by call sites that already hold a `Provider` (e.g.
+    /// `LlmClient::new`) and don't need DB lookup. Mirrors the policy in
+    /// [`Self::resolve`] so both paths stay in sync.
+    pub fn check_builtin_air_gap(
+        provider: Provider,
+        outbound_allowed: bool,
+    ) -> Result<(), ResolveError> {
+        let category: ProviderCategory = provider.into();
+        if !outbound_allowed && !category.is_air_gap_safe() {
+            return Err(ResolveError::AirGapPolicyViolation {
+                id: provider.to_string(),
+                category,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Map a string id to a built-in [`Provider`] variant. Case-insensitive.

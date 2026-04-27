@@ -301,6 +301,15 @@ impl LlmClient {
     /// Create a new LLM client from config (resolves provider and API keys).
     pub fn new(config: &Config) -> Result<Self> {
         let (provider, mut keys) = config.resolve_api_keys()?;
+        // Air-gap policy: when `providers.outbound_allowed = false` we refuse
+        // any non-Local provider before constructing the client so no HTTP
+        // socket is opened against a public endpoint.
+        crate::providers::ProviderRegistry::check_builtin_air_gap(
+            provider,
+            config.providers.outbound_allowed,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
         let debug_logging = config.debug.llm_logging;
         let client = Client::new();
         let api_key = keys.remove(0);
@@ -309,7 +318,19 @@ impl LlmClient {
         let mut provider_slots = Vec::new();
         for fb in &config.llm.fallback {
             match Self::resolve_fallback_slot(fb, config) {
-                Ok(slot) => provider_slots.push(slot),
+                Ok(slot) => {
+                    if let Err(e) = crate::providers::ProviderRegistry::check_builtin_air_gap(
+                        slot.provider,
+                        config.providers.outbound_allowed,
+                    ) {
+                        warn!(
+                            "Skipping fallback provider '{}' under air-gap policy: {e}",
+                            fb.provider
+                        );
+                        continue;
+                    }
+                    provider_slots.push(slot);
+                }
                 Err(e) => {
                     warn!("Skipping fallback provider '{}': {e}", fb.provider);
                 }
@@ -1492,6 +1513,72 @@ mod tests {
         config.llm.api_key_env = env_var.to_string();
         config.llm.model = "claude-sonnet-4".to_string();
         LlmClient::new(&config).unwrap()
+    }
+
+    #[test]
+    fn air_gap_blocks_public_cloud_construction() {
+        // outbound_allowed = false MUST refuse a PublicCloud provider before
+        // any HTTP socket is created. Regression guard for the wiring fix
+        // under docs/redesign/tasks/04-providers-and-budgets.md — the
+        // ProviderRegistry resolver previously had no caller, leaving the
+        // air-gap setting silently unenforced.
+        let env_var = "BORG_TEST_AIRGAP_OPENAI";
+        std::env::set_var(env_var, "sk-test");
+        let mut config = Config::default();
+        config.llm.provider = Some("openai".to_string());
+        config.llm.api_key_env = env_var.to_string();
+        config.llm.model = "gpt-4o-mini".to_string();
+        config.providers.outbound_allowed = false;
+
+        let err = match LlmClient::new(&config) {
+            Ok(_) => panic!("expected air-gap rejection"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("air-gap"),
+            "expected air-gap rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn air_gap_allows_local_construction() {
+        // Ollama is Local — must construct cleanly under air-gap.
+        let mut config = Config::default();
+        config.llm.provider = Some("ollama".to_string());
+        config.llm.model = "llama3".to_string();
+        config.providers.outbound_allowed = false;
+
+        LlmClient::new(&config).expect("local provider must be allowed under air-gap");
+    }
+
+    #[test]
+    fn air_gap_skips_public_cloud_fallback_slot() {
+        // A primary Local provider with a PublicCloud fallback under air-gap
+        // must construct, but the fallback slot must be dropped — otherwise
+        // the failover path would silently make outbound calls.
+        let env_var = "BORG_TEST_AIRGAP_FALLBACK";
+        std::env::set_var(env_var, "sk-test");
+        let mut config = Config::default();
+        config.llm.provider = Some("ollama".to_string());
+        config.llm.model = "llama3".to_string();
+        config.providers.outbound_allowed = false;
+        config.llm.fallback.push(crate::config::LlmFallback {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            api_key: None,
+            api_key_env: Some(env_var.to_string()),
+            api_keys: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            base_url: None,
+        });
+
+        let client = LlmClient::new(&config).expect("primary local must succeed");
+        assert!(
+            client.provider_slots.is_empty(),
+            "PublicCloud fallback must be dropped under air-gap"
+        );
     }
 
     #[test]

@@ -2060,6 +2060,7 @@ Rules:
         } else {
             HookData::LlmCall {
                 message_count: self.history.len(),
+                prompt_tokens: Some(crate::conversation::history_tokens(&self.history) as u64),
             }
         };
         let hook_ctx = self.hook_ctx(hook_point, hook_data);

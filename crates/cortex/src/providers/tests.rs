@@ -104,6 +104,45 @@ fn air_gap_refuses_byo_unless_marked_local() {
 }
 
 #[test]
+fn check_builtin_air_gap_refuses_public_cloud() {
+    use crate::provider::Provider;
+    let err = ProviderRegistry::check_builtin_air_gap(Provider::OpenAi, false).unwrap_err();
+    match err {
+        ResolveError::AirGapPolicyViolation { id, category } => {
+            assert_eq!(id, "openai");
+            assert_eq!(category, ProviderCategory::PublicCloud);
+        }
+        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
+    }
+}
+
+#[test]
+fn check_builtin_air_gap_allows_local() {
+    use crate::provider::Provider;
+    ProviderRegistry::check_builtin_air_gap(Provider::Ollama, false).unwrap();
+    ProviderRegistry::check_builtin_air_gap(Provider::ClaudeCli, false).unwrap();
+}
+
+#[test]
+fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
+    use crate::provider::Provider;
+    // outbound_allowed = true must be a no-op — a regression here would
+    // break every existing user's primary call path.
+    for p in [
+        Provider::OpenAi,
+        Provider::Anthropic,
+        Provider::Gemini,
+        Provider::Groq,
+        Provider::DeepSeek,
+        Provider::OpenRouter,
+        Provider::Ollama,
+        Provider::ClaudeCli,
+    ] {
+        ProviderRegistry::check_builtin_air_gap(p, true).unwrap();
+    }
+}
+
+#[test]
 fn category_db_round_trip_covers_all_variants() {
     // Catches a future variant addition that forgets to update either
     // `as_db_str` or `from_db_str`. Without this, an unknown variant

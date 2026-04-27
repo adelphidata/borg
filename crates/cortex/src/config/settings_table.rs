@@ -28,6 +28,9 @@ define_settings! {
         "llm.cache.rolling_messages" => llm.cache.rolling_messages, parsed(u8);
         "llm.cache.strategy" => llm.cache.strategy, json_quoted("Invalid cache strategy");
 
+        // ── Provider routing / air-gap ──
+        "providers.outbound_allowed" => providers.outbound_allowed, parsed(bool);
+
         // ── Sandbox ──
         "sandbox.enabled" => sandbox.enabled, parsed(bool);
 

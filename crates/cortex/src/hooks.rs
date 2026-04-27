@@ -56,6 +56,11 @@ pub enum HookData {
     LlmCall {
         /// Number of messages in the conversation.
         message_count: usize,
+        /// Pre-flight prompt-token estimate for the assembled message set.
+        /// `None` when the caller hasn't run the tokenizer (e.g. AgentStart
+        /// fallbacks). When `Some`, the budget hook prefers this over its
+        /// own `message_count * 50` heuristic for cap-crossing checks.
+        prompt_tokens: Option<u64>,
     },
     /// LLM response received.
     LlmResponse {
@@ -323,7 +328,10 @@ mod tests {
             point: HookPoint::BeforeLlmCall,
             session_id: "test".to_string(),
             turn_count: 1,
-            data: HookData::LlmCall { message_count: 5 },
+            data: HookData::LlmCall {
+                message_count: 5,
+                prompt_tokens: None,
+            },
         };
         assert!(matches!(registry.dispatch(&ctx), HookAction::Continue));
     }
@@ -403,7 +411,10 @@ mod tests {
         let _ = HookData::AgentStart {
             user_message: "hi".to_string(),
         };
-        let _ = HookData::LlmCall { message_count: 1 };
+        let _ = HookData::LlmCall {
+            message_count: 1,
+            prompt_tokens: None,
+        };
         let _ = HookData::LlmResponse {
             has_tool_calls: true,
             text_length: 42,

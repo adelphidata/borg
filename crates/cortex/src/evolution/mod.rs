@@ -3647,7 +3647,10 @@ mod tests {
                 HookPoint::BeforeAgentStart => HookData::AgentStart {
                     user_message: "hi".to_string(),
                 },
-                HookPoint::BeforeLlmCall => HookData::LlmCall { message_count: 1 },
+                HookPoint::BeforeLlmCall => HookData::LlmCall {
+                    message_count: 1,
+                    prompt_tokens: None,
+                },
                 _ => unreachable!(),
             };
             let ctx = HookContext {

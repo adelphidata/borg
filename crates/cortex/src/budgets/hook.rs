@@ -70,23 +70,18 @@ impl BudgetHook {
         Self { db: Mutex::new(db) }
     }
 
-    /// Estimate USD for a call with `prompt_tokens` against the active
-    /// provider/model's rate card. Returns `Usd::ZERO` if no rate row
-    /// exists (treat as priceless — local providers, mostly).
-    fn estimate_for_message_count(db: &Database, message_count: usize) -> Usd {
+    /// Estimate USD against the active provider/model's rate card given a
+    /// prompt-token estimate. Returns `Usd::ZERO` if no rate row exists
+    /// (treat as priceless — local providers, mostly).
+    fn estimate_for_prompt_tokens(db: &Database, prompt_tokens: u64) -> Usd {
         let (provider_id, model) = active_provider_and_model(db);
-        // Coarse pre-flight estimate: average message ≈ 50 tokens. The
-        // pre-flight check exists to catch *obvious* cap crossings (you're
-        // already at 99% and a 5%-of-cap call would push over). Exact
-        // accounting is post-flight via `Agent::record_usage`.
-        let estimated_tokens = (message_count as u64).saturating_mul(50);
         match RateCard::lookup(
             db.conn(),
             &provider_id,
             &model,
             chrono::Utc::now().timestamp(),
         ) {
-            Ok(Some(row)) => RateCard::price(&row, estimated_tokens, 0),
+            Ok(Some(row)) => RateCard::price(&row, prompt_tokens, 0),
             Ok(None) => Usd::ZERO,
             Err(e) => {
                 tracing::warn!(
@@ -108,13 +103,22 @@ impl Hook for BudgetHook {
     }
 
     fn execute(&self, ctx: &HookContext) -> HookAction {
-        let message_count = match &ctx.data {
-            HookData::LlmCall { message_count } => *message_count,
+        // Prefer the agent-supplied tiktoken-based count when available;
+        // fall back to message-count × 50 only when the assembled message
+        // set isn't yet available.
+        let prompt_tokens: u64 = match &ctx.data {
+            HookData::LlmCall {
+                prompt_tokens: Some(t),
+                ..
+            } => *t,
+            HookData::LlmCall {
+                message_count,
+                prompt_tokens: None,
+            } => (*message_count as u64).saturating_mul(50),
             HookData::AgentStart { user_message } => {
-                // Approximate: the very first call carries the user
-                // message + system prompt. Use a coarse 1-message
-                // placeholder; pre-flight only needs to catch cap crossings.
-                1 + user_message.len() / 200
+                // First-call fallback: rough byte → token estimate.
+                use crate::tokenizer::estimate_tokens;
+                estimate_tokens(user_message) as u64
             }
             _ => return HookAction::Continue,
         };
@@ -127,7 +131,7 @@ impl Hook for BudgetHook {
             }
         };
 
-        let estimate = Self::estimate_for_message_count(&db, message_count);
+        let estimate = Self::estimate_for_prompt_tokens(&db, prompt_tokens);
 
         match BudgetEngine::pre_flight(db.conn(), None, estimate) {
             Ok(PreFlightDecision::Allow) => HookAction::Continue,

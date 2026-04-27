@@ -459,3 +459,86 @@ fn rate_card_wildcard_fallback_for_local_providers() {
     assert_eq!(row.completion_per_mtok, Usd::parse("0").unwrap());
     assert_eq!(RateCard::price(&row, 1_000_000, 1_000_000), Usd::ZERO);
 }
+
+#[test]
+fn hook_uses_prompt_tokens_estimate_to_refuse_at_hard_cap() {
+    // Regression for the BudgetHook estimate fix: spec §Pipeline step 1 says
+    // pre-flight USD comes from `count_tokens` × rate card. The previous
+    // implementation used `message_count * 50` and missed cap crossings on
+    // long prompts. With anthropic/claude-sonnet-4 priced at $3/Mtok,
+    // 200k prompt tokens = $0.60 — at $19.50/$20 spent that trips the cap,
+    // whereas a 5-message × 50-token heuristic ($0.00075) would have let
+    // it through.
+    use crate::budgets::hook::BudgetHook;
+    use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
+
+    let db = Database::test_db();
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('providers.default_id', 'anthropic')",
+            [],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('model', 'claude-sonnet-4')",
+            [],
+        )
+        .unwrap();
+    override_default(&db, "20.00", Some("5.00"), "daily");
+    set_spent(&db, "default", "19.50", chrono::Utc::now().timestamp());
+
+    let hook = BudgetHook::from_database(db);
+    let ctx = HookContext {
+        point: HookPoint::BeforeLlmCall,
+        session_id: "test".to_string(),
+        turn_count: 1,
+        data: HookData::LlmCall {
+            message_count: 5,
+            prompt_tokens: Some(200_000),
+        },
+    };
+
+    assert!(
+        matches!(hook.execute(&ctx), HookAction::Skip),
+        "fat prompt must trip the hard cap via prompt_tokens"
+    );
+}
+
+#[test]
+fn hook_falls_back_to_message_count_heuristic_when_prompt_tokens_absent() {
+    // When prompt_tokens is None (legacy callers / tests), the hook falls
+    // back to message_count × 50 so the budget gate keeps working — just
+    // less precise. 3 × 50 × $3/Mtok ≈ $0.00045 → well under cap → Continue.
+    use crate::budgets::hook::BudgetHook;
+    use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
+
+    let db = Database::test_db();
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('providers.default_id', 'anthropic')",
+            [],
+        )
+        .unwrap();
+    db.conn()
+        .execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('model', 'claude-sonnet-4')",
+            [],
+        )
+        .unwrap();
+    override_default(&db, "20.00", None, "daily");
+    set_spent(&db, "default", "1.00", chrono::Utc::now().timestamp());
+
+    let hook = BudgetHook::from_database(db);
+    let ctx = HookContext {
+        point: HookPoint::BeforeLlmCall,
+        session_id: "test".to_string(),
+        turn_count: 1,
+        data: HookData::LlmCall {
+            message_count: 3,
+            prompt_tokens: None,
+        },
+    };
+
+    assert!(matches!(hook.execute(&ctx), HookAction::Continue));
+}

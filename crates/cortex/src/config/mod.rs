@@ -38,6 +38,9 @@ pub struct Config {
     /// LLM provider, model, temperature, retries, and fallback chain.
     #[serde(default)]
     pub llm: LlmConfig,
+    /// Air-gap and provider-routing policy (v1 redesign Task 04).
+    #[serde(default)]
+    pub providers: ProvidersConfig,
     /// Proactive heartbeat scheduling and quiet hours.
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
