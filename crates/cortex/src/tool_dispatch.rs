@@ -88,6 +88,13 @@ fn spawn_embedding_task(args: &serde_json::Value, config_arc: &Arc<Config>) {
 
 const MULTI_AGENT_DISABLED: &str = "Error: Multi-agent system is not enabled.";
 
+/// Returned for `send_to_agent`, which is not implemented in this build.
+/// Falling through with a structured tool-output string keeps the agent
+/// loop alive (vs. an `Err` that aborts the turn) so the model can pick
+/// a different tool. Any future implementation must remove this constant.
+const SEND_TO_AGENT_UNSUPPORTED: &str =
+    "Error: send_to_agent is unavailable in this build. Use spawn_agent + wait_for_agent to coordinate work.";
+
 /// Dispatch a multi-agent tool call. Returns `None` if the tool name is not
 /// a multi-agent tool, allowing the caller to fall through to the unknown-tool case.
 pub(crate) async fn try_handle_multi_agent_tool(
@@ -110,7 +117,7 @@ pub(crate) async fn try_handle_multi_agent_tool(
                 Ok(MULTI_AGENT_DISABLED.to_string())
             }
         }
-        tn::SEND_TO_AGENT => Err(anyhow::anyhow!("send_to_agent is not yet implemented")),
+        tn::SEND_TO_AGENT => Ok(SEND_TO_AGENT_UNSUPPORTED.to_string()),
         tn::WAIT_FOR_AGENT => {
             if let Some(ref mut ctrl) = agent_control {
                 crate::multi_agent::tools::handle_wait_for_agent(args, ctrl).await
@@ -209,10 +216,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_agent_always_unimplemented() {
+    async fn send_to_agent_returns_unsupported_string_not_panic() {
+        // Real failure mode: returning `Err` would abort the agent turn;
+        // panicking would crash the daemon. Either is worse than a tool
+        // result that lets the model pick a different action.
         let mut ctrl: Option<crate::multi_agent::AgentControl> = None;
         let config = Config::default();
-        let err = try_handle_multi_agent_tool(
+        let out = try_handle_multi_agent_tool(
             "send_to_agent",
             &json!({"agent_id": "x", "message": "y"}),
             &mut ctrl,
@@ -221,8 +231,11 @@ mod tests {
         )
         .await
         .expect("multi-agent tool matched")
-        .expect_err("send_to_agent is not yet implemented");
-        assert!(err.to_string().contains("not yet implemented"));
+        .expect("dispatch returns Ok with a structured tool-output string");
+        assert!(
+            out.starts_with("Error:") && out.contains("send_to_agent"),
+            "got: {out}"
+        );
     }
 
     #[tokio::test]

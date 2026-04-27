@@ -79,8 +79,9 @@ mod tests {
 
     #[test]
     fn terminal_exec_falls_back_to_host_but_clipboard_does_not() {
-        // Documents the asymmetric rule from architecture-redesign.md §Layer 3.
-        // If anyone changes the rule, this test forces them to update the doc.
+        // Real failure mode: collapsing the asymmetric rule (terminal.exec
+        // falls back to host; clipboard/file/notify do not) would let the
+        // daemon silently substitute its own host for client-only ops.
         assert_eq!(
             routing(TERMINAL_EXEC),
             Some(Routing::ClientWithHostFallback)

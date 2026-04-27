@@ -2,7 +2,7 @@
 
 User hooks let you run shell commands on agent lifecycle events without rebuilding the binary. A single JSON file — `~/.borg/hooks.json` — registers commands that fire when sessions start/end, messages arrive, tool calls begin/end, or the turn stops.
 
-The schema is compatible with Claude Code and [codex](https://github.com/openai/codex).
+The schema mirrors Claude Code's `hooks.json`.
 
 ## Quick start
 
@@ -89,9 +89,9 @@ borg settings set hooks.enabled false  # disable all user hooks
 
 Hooks are loaded once at startup. Edit `hooks.json` then restart `borg` to pick up changes.
 
-## Unsupported in v1
+## Unsupported
 
-- `"type": "prompt"` and `"type": "agent"` handlers (codex has these; we only support `"command"`).
+- `"type": "prompt"` and `"type": "agent"` handlers — only `"command"` is supported.
 - Per-project `hooks.json` layering (only the global file at `~/.borg/hooks.json` is read).
 - Hot reload.
 - Rich payloads (`tool_input`, `tool_result` text, `mutating` flag, sandbox metadata).

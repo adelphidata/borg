@@ -5,10 +5,6 @@ package borg.admin.v1;
 // Admin surfaces lifecycle, settings, and the data-access RPCs that replace
 // direct DB reads from the TUI popups.
 service Admin {
-  // Pairing — superseded by the Pki service; this stub returns
-  // `unimplemented` and is kept only for legacy clients.
-  rpc Pair(PairRequest) returns (PairResponse);
-
   rpc Poke(Empty) returns (Empty);
   rpc Heal(Empty) returns (HealReport);
   rpc Shutdown(Empty) returns (Empty);
@@ -226,8 +222,6 @@ message PluginInstallResponse {
 
 message Empty {}
 
-message PairRequest { string code = 1; string device_label = 2; }
-message PairResponse { string status = 1; string cert_pem = 2; }
 
 message HealReport {
   uint64 pruned_logs = 1;

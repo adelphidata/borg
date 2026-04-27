@@ -18,14 +18,13 @@ use protocols::admin::{
     CreateWebhookResponse, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
     GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
     IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
-    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairRequest, PairResponse,
-    PairingApproval, PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest,
-    PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef, ProjectUpdate,
-    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
-    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
-    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, WarningList,
-    WebhookRef, WorkflowList, WorkflowSummary,
+    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
+    PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
+    Project, ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RemoveProviderRequest,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
+    SessionList, SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation,
+    SettingsSnapshot, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -96,12 +95,6 @@ impl AdminSvc {
 
 #[tonic::async_trait]
 impl Admin for AdminSvc {
-    async fn pair(&self, _req: Request<PairRequest>) -> Result<Response<PairResponse>, TStatus> {
-        Err(TStatus::unimplemented(
-            "pairing lives on the Pki service (mTLS + SPAKE2)",
-        ))
-    }
-
     async fn poke(&self, _req: Request<Empty>) -> Result<Response<Empty>, TStatus> {
         let tx = {
             let g = self

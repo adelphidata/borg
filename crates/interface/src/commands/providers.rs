@@ -166,8 +166,7 @@ fn refresh_rates(manifest_url: Option<&str>) -> Result<()> {
     );
     eprintln!(
         "borg providers refresh-rates: signed-manifest verification is not \
-         shipped yet — refusing to overwrite rate cards from an unverified source.\n\
-         Tracking issue: docs/redesign/llm-providers.md (rate-card refresh)."
+         shipped yet — refusing to overwrite rate cards from an unverified source."
     );
     bail!("refresh-rates: verification stub, no rates applied");
 }

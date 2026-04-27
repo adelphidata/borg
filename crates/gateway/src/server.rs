@@ -718,10 +718,7 @@ fn db_open_factory() -> Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> 
     })
 }
 
-/// Build the shared `IngressGate` used by OpenAI-compat + generic
-/// webhook. Audit chain wiring is deferred to Task 02 — the
-/// `with_noop_audit` here will become `IngressGate::new(... audit ...)`
-/// once `audit_log_chain` ships.
+/// Build the shared `IngressGate` used by OpenAI-compat + generic webhook.
 fn build_ingress_gate(config: &Config) -> Arc<cortex::ingress::IngressGate> {
     let max_per_min = config.gateway.rate_limit_per_minute.max(1);
     Arc::new(cortex::ingress::IngressGate::with_noop_audit(

@@ -16,8 +16,8 @@
 //! renames the existing dir to `.bak.<unix_ts>`. A `state_restored` audit
 //! event is appended to the restored chain on success.
 //!
-//! Encryption (passphrase-from-fd) is deferred — see the v3 deferral list
-//! at the bottom of `data-handling.md`.
+//! Tarballs are unencrypted; users who need encryption-at-rest should layer
+//! it externally (full-disk encryption, encrypted backup destination).
 
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};

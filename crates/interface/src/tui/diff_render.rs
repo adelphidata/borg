@@ -73,7 +73,7 @@ fn render_content_line(
         DiffKind::Context => None,
     };
 
-    // Codex-style: 4-col line-number gutter for old + new, then 2-col sign column.
+    // 4-col line-number gutter for old + new, then 2-col sign column.
     let fmt_lineno = |n: Option<u32>| -> String {
         match n {
             Some(v) => format!("{v:>4}"),
@@ -142,7 +142,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
     let mut current_ext: Option<String> = None;
     let mut in_file = false;
     let mut recognized_anything = false;
-    // Codex-style line-number tracking: we increment per row inside a hunk.
+    // Line-number tracking: we increment per row inside a hunk.
     let mut old_lineno: u32 = 1;
     let mut new_lineno: u32 = 1;
 
@@ -409,8 +409,8 @@ mod tests {
 
     #[test]
     fn renders_line_number_gutter() {
-        // Codex-style: each content line carries an old + new line-number gutter
-        // and a sign column. Hunk header at line 5 means the first body line is 5.
+        // Each content line carries an old + new line-number gutter and a
+        // sign column. Hunk header at line 5 means the first body line is 5.
         let patch =
             "*** Begin Patch\n*** Update File: a.rs\n@@ -5,2 +5,2 @@\n ctx\n-old\n+new\n*** End Patch";
         let lines = render_patch(patch);

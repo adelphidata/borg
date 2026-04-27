@@ -11,7 +11,7 @@
 //! 2. A vector of [`MentionCard`] records the TUI renders as one-line rows
 //!    (`Read foo.rs (42 lines)` / `Listed directory foo/`).
 //!
-//! Matches opencode's per-file cap of 50 KB; on overflow, a truncation
+//! Per-file cap of 50 KB; on overflow, a truncation
 //! marker is appended to the attached content so the LLM knows to ask for
 //! specific byte ranges. No aggregate cap — the per-file cap plus the
 //! system prompt token budget are the bounds.
@@ -25,9 +25,8 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::tool_handlers::filesystem::{handle_list_dir, is_blocked_path};
 
-/// Opencode `read.ts` uses the same constant (`MAX_BYTES = 50 * 1024`).
-/// Files larger than this are truncated at a UTF-8 boundary and a marker
-/// line is appended.
+/// `MAX_BYTES = 50 * 1024`. Files larger than this are truncated at a
+/// UTF-8 boundary and a marker line is appended.
 const MAX_FILE_BYTES: usize = 50 * 1024;
 
 /// Characters we strip from the tail of a matched `@token` so trailing

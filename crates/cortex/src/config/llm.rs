@@ -258,9 +258,9 @@ impl Default for LlmConfig {
     }
 }
 
-/// Air-gap and provider-routing policy. Lives next to [`LlmConfig`] but is
-/// scoped to v1 redesign concerns (Task 04 in `docs/redesign/`): which
-/// provider categories the daemon may reach over the network.
+/// Air-gap and provider-routing policy. Lives next to [`LlmConfig`] and
+/// controls which provider categories the daemon may reach over the
+/// network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ProvidersConfig {

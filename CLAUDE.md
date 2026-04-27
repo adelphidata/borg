@@ -165,7 +165,7 @@ Posture v2: 3 states with XP multiplier — `Reduced` ×0.85, `Default` ×1.00, 
 
 ### Lifecycle Hooks
 
-One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src/hooks.rs`. Compiled-in: `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook`. User scripts at `~/.borg/hooks.json` (Claude Code/codex schema). `PreToolUse` non-zero exit aborts the tool call. All other failures log + continue — **hooks can never break the agent**. See `docs/hooks.md`.
+One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src/hooks.rs`. Compiled-in: `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook`. User scripts at `~/.borg/hooks.json` (Claude Code-compatible schema). `PreToolUse` non-zero exit aborts the tool call. All other failures log + continue — **hooks can never break the agent**. See `docs/hooks.md`.
 
 ### Self-Healing
 

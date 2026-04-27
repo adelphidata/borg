@@ -118,9 +118,9 @@ pub fn truncate_str_to_width(s: &str, max_width: usize) -> &str {
 /// segments as possible. Falls back to a plain ellipsis truncation if even
 /// the first + last segments don't fit.
 ///
-/// Codex parity: `crates/foo/src/very/long/path.rs` → `crates/foo/…/path.rs`
-/// when squeezed. Marked `allow(dead_code)` until downstream codex-skin
-/// surfaces (status indicator details, popup paths) consume it.
+/// Collapses `crates/foo/src/very/long/path.rs` → `crates/foo/…/path.rs`
+/// when squeezed. Marked `allow(dead_code)` until downstream UI surfaces
+/// (status indicator details, popup paths) consume it.
 #[allow(dead_code)]
 pub fn center_truncate_path(path: &str, max_width: usize) -> String {
     let w = UnicodeWidthStr::width(path);

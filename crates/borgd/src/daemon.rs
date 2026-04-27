@@ -416,8 +416,8 @@ mod tests {
     #[tokio::test]
     async fn bind_uds_sets_owner_only_permissions() {
         // Real failure mode: regression to default umask (0o755 effective)
-        // would let any local user connect to the agent's RPC channel before
-        // mTLS lands. Architecture-redesign §Layer 4a mandates 0600.
+        // would let any local user connect to the agent's RPC channel. The
+        // socket must be 0600 — owner-only.
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("borgd.sock");
         let _listener = bind_uds(&socket).expect("bind");

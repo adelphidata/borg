@@ -31,7 +31,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush_line(&mut current_spans, &mut lines);
-                    // H4–H6 share the italic style (matching Codex), but each level
+                    // H4–H6 share the italic style (matching the heading hierarchy), but each level
                     // still prints its own number of `#` hashes for the marker prefix.
                     let (style, hashes) = match level {
                         pulldown_cmark::HeadingLevel::H1 => (theme::md_h1_style(), 1),
@@ -41,7 +41,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                         pulldown_cmark::HeadingLevel::H5 => (theme::md_h4_style(), 5),
                         pulldown_cmark::HeadingLevel::H6 => (theme::md_h4_style(), 6),
                     };
-                    // Codex-style: render the literal "#"/"##"/... marker before the heading text.
+                    // render the literal "#"/"##"/... marker before the heading text.
                     current_spans.push(Span::styled(format!("{} ", "#".repeat(hashes)), style));
                     style_stack.push(style);
                 }
@@ -98,7 +98,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                     let bullet = if let Some(ref mut idx) = ordered_index {
                         let b = format!("{indent}{idx}. ");
                         *idx += 1;
-                        // Codex-style: ordered markers use light blue, not the cyan inline-code colour.
+                        // ordered markers use light blue, not the cyan inline-code colour.
                         current_spans
                             .push(Span::styled(b.clone(), theme::md_ordered_marker_style()));
                         b
@@ -161,7 +161,7 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
             Event::Text(text) => {
                 let style = current_style(&style_stack);
                 if in_blockquote && current_spans.is_empty() {
-                    // Codex-style blockquote prefix: dim green `> ` marker.
+                    // blockquote prefix: dim green `> ` marker.
                     current_spans.push(Span::styled(
                         "> ",
                         theme::success_style().add_modifier(Modifier::DIM),
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn heading_levels() {
         let lines = render_markdown("# H1\n## H2\n### H3", 80);
-        // Codex-style: each heading is rendered with its literal "#" prefix.
+        // each heading is rendered with its literal "#" prefix.
         let texts = text_of(&lines);
         assert!(texts.iter().any(|t| t == "# H1"));
         assert!(texts.iter().any(|t| t == "## H2"));
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn ordered_list_marker_uses_light_blue_not_cyan() {
         // Regression guard: ordered markers were previously rendered with the
-        // cyan inline-code style; Codex skin uses light blue. If a future
+        // cyan inline-code style; ordered markers use light blue. If a future
         // change reverts the colour this test fails before the visual hits
         // production.
         let lines = render_markdown("1. one", 40);
@@ -440,7 +440,7 @@ mod tests {
     fn blockquote() {
         let lines = render_markdown("> quoted text", 80);
         let texts = text_of(&lines);
-        // Codex-style: blockquote prefix is `> `, not `│ `.
+        // blockquote prefix is `> `, not `│ `.
         assert!(texts.iter().any(|t| t.contains("> ")));
         assert!(texts.iter().any(|t| t.contains("quoted text")));
     }

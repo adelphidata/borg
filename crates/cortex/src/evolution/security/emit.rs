@@ -6,21 +6,16 @@
 //! 2. A `security_posture_changed` row into `audit_log_chain` carrying
 //!    the full [`PostureSnapshot`] JSON (forensic tamper-evident record).
 //!
-//! Rate limit: **2 transitions per hour**, per locked-decision #6 of
-//! `docs/redesign/security-posture.md`. Excess writes are dropped — the
+//! Rate limit: **2 transitions per hour**. Excess writes are dropped — the
 //! prior posture continues for any `xp_gain` written in the dropped
 //! window. This kills the "flip-flop Boosted ↔ Reduced timed with
 //! high-XP actions" attack at one effective transition every 30 minutes.
 //!
-//! The full design specifies posture events going into `evolution_events`
-//! (HMAC-chained alongside `xp_gain`) so replay determinism is preserved.
-//! That wiring requires extending the evolution replay engine; v1-as-shipped
-//! lands posture in the audit chain only and the evolution_events
-//! integration is a follow-up. The `posture_snapshots.evolution_event_id`
-//! column will reference `evolution_events.id` once the chain integration
-//! lands; for now it stores the `audit_log_chain.seq` so the cross-reference
-//! is unambiguous (a `posture_snapshots` row always points at the audit
-//! event that created it).
+//! Posture events land in the audit chain only; `posture_snapshots.evolution_event_id`
+//! stores the `audit_log_chain.seq` so the cross-reference is unambiguous
+//! (every `posture_snapshots` row points at the audit event that created it).
+//! Wiring posture into `evolution_events` (HMAC-chained alongside `xp_gain`)
+//! for full replay determinism is a follow-up.
 //!
 //! TODO: wire `xp_gain` events to read the head of `posture_snapshots`,
 //! apply `compute_xp_breakdown(...)` from `super::compute_xp_breakdown`,

@@ -119,11 +119,11 @@ pub fn warn_invalid_setting_once(key: &str, err: &anyhow::Error) {
 /// True for keys whose change has security posture implications and should
 /// land in the hash-chained audit log.
 ///
-/// Why: `audit_log_chain` is meant to bracket every security-relevant state
-/// change (Task 02 §"Hash-chained audit log"). Emitting on *every* settings
-/// write would bloat the chain with LLM-tuning noise (`temperature`,
-/// `theme`, …), so this allow-list scopes the firing to keys whose change
-/// would shift posture, sandbox boundaries, or retention behavior.
+/// Why: `audit_log_chain` brackets every security-relevant state change.
+/// Emitting on *every* settings write would bloat the chain with LLM-tuning
+/// noise (`temperature`, `theme`, …), so this allow-list scopes the firing
+/// to keys whose change would shift posture, sandbox boundaries, or
+/// retention behavior.
 pub fn is_security_relevant_setting(key: &str) -> bool {
     const PREFIXES: &[&str] = &["security.", "sandbox.", "data."];
     PREFIXES.iter().any(|p| key.starts_with(p))

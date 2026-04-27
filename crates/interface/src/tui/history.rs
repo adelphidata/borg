@@ -506,7 +506,7 @@ impl HistoryCell {
     ) -> Vec<Line<'static>> {
         match self {
             HistoryCell::User { text } => {
-                // Codex-style: dim border `╭─╮│╰─╯` around the user message,
+                // dim border `╭─╮│╰─╯` around the user message,
                 // with the subtle bg tint preserved on the inner rows.
                 let bg = theme::user_message_style();
                 let prefix_style =
@@ -781,7 +781,7 @@ impl HistoryCell {
 
                 if should_collapse {
                     let extra = total_rows.saturating_sub(rows_used);
-                    // Codex-style ellipsis line; nudges the user toward Ctrl+T
+                    // ellipsis line; nudges the user toward Ctrl+T
                     // (transcript pager) which already exists in Borg.
                     lines.push(Line::from(Span::styled(
                         format!(
@@ -842,7 +842,7 @@ impl HistoryCell {
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
             HistoryCell::Card { lines } => lines.clone(),
             HistoryCell::Thinking { text } => {
-                // Codex-style reasoning: dim + italic bullet block, no box.
+                // reasoning: dim + italic bullet block, no box.
                 // Header line: "• thinking" (dim, italic) — bullet matches assistant
                 // bullet width so wrapped continuation lines hang under the body.
                 if text.is_empty() {
@@ -1061,7 +1061,7 @@ mod tests {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
-        // Codex-style box: spacer + top rule + body + bottom rule = 4 lines.
+        // box: spacer + top rule + body + bottom rule = 4 lines.
         assert_eq!(lines.len(), 4);
         // Top rule starts with ╭ and ends with ╮.
         let top = &lines[1];
@@ -1294,7 +1294,7 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
-        // 20 lines total, 8 preview → 12 hidden. Codex-style copy points
+        // 20 lines total, 8 preview → 12 hidden. The footer copy points
         // users at the transcript pager (Ctrl+T).
         assert!(all_text.contains("+12 lines"), "got: {all_text}");
         assert!(
@@ -1530,8 +1530,8 @@ mod tests {
     }
 
     #[test]
-    fn render_thinking_is_codex_style_not_boxed() {
-        // Codex skin: dim+italic bullet block, NOT a bordered box. Regression
+    fn render_thinking_is_bullet_style_not_boxed() {
+        // Dim+italic bullet block, NOT a bordered box. Regression
         // guard against the old `render_boxed_lines` rendering. Asserts the
         // header reads `• thinking` and no box-drawing characters appear.
         let cell = HistoryCell::Thinking {

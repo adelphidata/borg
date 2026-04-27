@@ -42,10 +42,13 @@ impl DaemonSessionExecutor {
     }
 
     fn ensure_host(&self, session_key: &str) -> anyhow::Result<SessionHost> {
-        // FIXME(post-stage-E): wire CapabilityRouter into AgentBackend tool
-        // dispatch — current behavior unconditionally routes terminal.exec /
-        // clipboard.read to daemon-side handlers. The router is exercised by
-        // capability_routing.rs but its output is unused.
+        // Today the AgentBackend dispatches all tool calls to daemon-side
+        // handlers. The CapabilityRouter is wired and tested in
+        // capability_routing.rs but its output is not consumed by the agent
+        // loop yet, so terminal.exec / clipboard.read always run on the
+        // daemon host even when a client advertises them. Wiring it up is
+        // tracked separately and changes routing semantics — leave alone
+        // unless updating the routing rules in `protocols::capabilities`.
         if let Some(host) = self.registry.get(session_key) {
             return Ok(host);
         }

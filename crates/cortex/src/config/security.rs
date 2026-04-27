@@ -10,9 +10,8 @@ use serde::{Deserialize, Serialize};
 /// principals whose IP doesn't appear as a peer node — opt-in via the
 /// `security.verifier` setting.
 ///
-/// External-CA verifiers (SCEP, EST, ACME, …) are explicitly v3-deferred per
-/// `docs/redesign/tasks/02-mtls-pairing-audit.md`; do not extend this enum
-/// for them yet.
+/// External-CA verifiers (SCEP, EST, ACME, …) are intentionally not
+/// supported; do not extend this enum for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VerifierKind {
@@ -100,8 +99,8 @@ pub struct SecurityConfig {
     #[serde(default = "default_gateway_action_limits")]
     pub gateway_action_limits: crate::rate_guard::ActionLimits,
     /// mTLS peer-cert verifier strategy. `Tofu` is the default; `Tailscale`
-    /// is opt-in per `docs/redesign/tasks/02-mtls-pairing-audit.md` and binds
-    /// pairs to a Tailscale node identity by cross-checking the peer IP.
+    /// is opt-in and binds pairs to a Tailscale node identity by
+    /// cross-checking the peer IP.
     #[serde(default)]
     pub verifier: VerifierKind,
 }

@@ -2,8 +2,7 @@
 
 use crate::provider::Provider;
 
-/// v1 provider categories. Air-gap mode refuses anything that isn't
-/// `Local`; a future Sentry mode (v3) adds `SovereignCloud`.
+/// Provider categories. Air-gap mode refuses anything that isn't `Local`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderCategory {
     /// Hosted on the public internet (OpenAI, Anthropic, Gemini, Groq,

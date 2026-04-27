@@ -78,13 +78,12 @@ pub(super) fn shimmer_spans(
     spans
 }
 
-/// Codex-style streaming spinner glyph.
+/// streaming spinner glyph.
 ///
 /// - active + truecolor → shimmered `•` (single-char shimmer pulse).
 /// - active without truecolor → blinking `•`/`◦` toggle every 600ms.
 /// - inactive → static dim `•`.
 ///
-/// Wired into the streaming status indicator extraction (Task 09 follow-up).
 #[allow(dead_code)]
 pub(super) fn spinner_span(active: bool) -> Span<'static> {
     if !active {

@@ -275,7 +275,7 @@ impl<'a> Composer<'a> {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("Type a message...");
         textarea.set_cursor_line_style(Style::default());
-        // Codex-style: chevron `›` rendered as a cyan+bold title span,
+        // chevron `›` rendered as a cyan+bold title span,
         // distinct from the dim teal block border. Keeps the focal point on
         // the prompt indicator rather than the border chrome.
         textarea.set_block(

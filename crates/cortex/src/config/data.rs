@@ -1,9 +1,8 @@
 //! Data-handling configuration: retention + backup.
 //!
-//! v1 retention is daemon-wide and single-knob (`retention_days`). The
-//! daily maintenance task purges messages and tombstones audit-chain rows
-//! whose `ts` falls past the cutoff. Per-workspace retention floors and
-//! classification-tagged retention are deferred to v3 (Sentry).
+//! Retention is daemon-wide and single-knob (`retention_days`). The daily
+//! maintenance task purges messages and tombstones audit-chain rows whose
+//! `ts` falls past the cutoff.
 //!
 //! Backups are tarball-based (`borg backup create/verify/restore`); a
 //! weekly auto-backup runs from the same maintenance task and prunes to
@@ -12,8 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Retention + backup configuration. All fields stored under `data.*` keys
-/// in the SQLite settings table; defaults match the v1 fresh-install spec
-/// from `docs/redesign/data-handling.md` §"Locked decisions" (decision #1).
+/// in the SQLite settings table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DataConfig {

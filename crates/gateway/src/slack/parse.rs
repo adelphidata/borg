@@ -89,7 +89,7 @@ pub async fn parse_event(
 
     // Surface message edits and deletes as inbound events with metadata so the
     // downstream handler can route them. Pre-existing behavior dropped both
-    // entirely; openclaw exposes them via monitor/events/message-subtype-handlers.
+    // entirely; we expose them so handlers can react to the subtype.
     //
     // For `message_changed`, the new content lives in `event.message`. For
     // `message_deleted`, the deleted content lives in `event.previous_message`

@@ -4106,7 +4106,7 @@ mod tests {
         assert_eq!(state.total_events, 2);
     }
 
-    // ── Posture multiplier wiring (Task 05) ──
+    // ── Posture multiplier wiring ──
 
     /// Seed a `posture_snapshots` head row + matching audit-chain event so
     /// `current_posture_for_xp` resolves to the requested state with a real

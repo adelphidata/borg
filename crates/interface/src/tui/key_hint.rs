@@ -1,4 +1,4 @@
-//! Codex-style keyboard binding rendering.
+//! Compact keyboard-binding span renderer.
 //!
 //! Produces compact `Span`s like `ctrl + c`, `shift + tab`, `↑`, `pgup` —
 //! used in footer hints and popup status lines.

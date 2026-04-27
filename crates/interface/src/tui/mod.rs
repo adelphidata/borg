@@ -73,7 +73,7 @@ use crossterm::ExecutableCommand;
 // This has regressed multiple times. Source-string guard tests in this module
 // and in app.rs will fail the build if any forbidden mode is reintroduced.
 // See CLAUDE.md "Mouse Interaction" for the full rationale.
-// Reference implementation: reference/codex/codex-rs/tui/src/tui.rs
+// Reference implementation:
 // ============================================================================
 
 /// Enable xterm Alternate Scroll Mode (`?1007h`).

@@ -7,7 +7,7 @@ requires:
 
 # Paperclip Skill
 
-Paperclip is a Node.js control plane that orchestrates multiple AI agents as an "autonomous company" — org charts, budgets, governance, goal alignment, and activity logging. It is **not** a chatbot or agent framework; it coordinates agents you already have (Claude Code, Codex, Cursor, Bash, HTTP, etc.).
+Paperclip is a Node.js control plane that orchestrates multiple AI agents as an "autonomous company" — org charts, budgets, governance, goal alignment, and activity logging. It is **not** a chatbot or agent framework; it coordinates agents you already have (Claude Code, Cursor, Bash, HTTP, etc.).
 
 Server runs at `http://localhost:3100` with an embedded PostgreSQL DB.
 

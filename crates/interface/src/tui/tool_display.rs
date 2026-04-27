@@ -299,9 +299,9 @@ pub fn tool_detail_line(cat: &ToolDisplayCategory) -> Option<Vec<Span<'static>>>
             let u = truncate(url, 80);
             Some(vec![Span::styled(u, dim)])
         }
-        // Codex-style `$ command` echo for run_shell. The magenta `$` reads
-        // as a shell prompt; the command body is dim so the focus is the
-        // command itself, not the leading prompt char.
+        // `$ command` echo for run_shell. The magenta `$` reads as a shell
+        // prompt; the command body is dim so the focus is the command
+        // itself, not the leading prompt char.
         ToolDisplayCategory::Ran { command } => {
             let cmd = truncate(command, 120);
             Some(vec![
@@ -660,8 +660,8 @@ mod tests {
 
     #[test]
     fn detail_ran_emits_shell_prompt() {
-        // Codex-style: run_shell tool start now emits a `$ <cmd>` echo line
-        // under the bullet header so the user sees what's about to run.
+        // run_shell tool start emits a `$ <cmd>` echo line under the bullet
+        // header so the user sees what's about to run.
         let cat = ToolDisplayCategory::Ran {
             command: "ls -la".to_string(),
         };

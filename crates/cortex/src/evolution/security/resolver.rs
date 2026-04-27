@@ -1,13 +1,12 @@
 //! Pure posture resolver. Read-only over [`super::PostureSnapshot`]; called
 //! from both write-time emission and replay so the rules stay deterministic.
 //!
-//! Locked decision (`docs/redesign/security-posture.md` §"State resolution"):
-//! `Reduced` wins on any single deliberate downgrade; `Boosted` requires the
-//! full positive set; otherwise `Default`.
+//! State-resolution rule: `Reduced` wins on any single deliberate
+//! downgrade; `Boosted` requires the full positive set; otherwise `Default`.
 
 use super::{AuthBackend, ListenerBindKind, PostureSnapshot, PostureState};
 
-/// Resolve to `Reduced` / `Default` / `Boosted` per the v1 contract.
+/// Resolve to `Reduced` / `Default` / `Boosted`.
 pub fn resolve_state(p: &PostureSnapshot) -> PostureState {
     if is_reduced(p) {
         return PostureState::Reduced;

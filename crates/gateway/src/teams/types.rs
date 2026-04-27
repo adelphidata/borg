@@ -69,7 +69,7 @@ pub const TEAMS_REACTION_TYPES: &[&str] = &["like", "heart", "laugh", "surprised
 /// - Passes Unicode emoji through unchanged (Graph beta accepts both).
 /// - Returns `Err` for empty input.
 ///
-/// Mirrors OpenClaw's `normalizeReactionType` so behavior stays in sync.
+/// Normalizes Teams reaction-type strings to canonical lowercase forms.
 pub fn normalize_reaction_type(raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {

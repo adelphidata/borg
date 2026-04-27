@@ -1,8 +1,7 @@
-//! Security posture v1 — 3-state model (`Reduced` / `Default` / `Boosted`).
+//! Security posture — 3-state model (`Reduced` / `Default` / `Boosted`).
 //!
 //! Posture is the XP-rate multiplier that binds gameplay to the security
-//! configuration of an install. See `docs/redesign/security-posture.md` for
-//! the design contract; the locked decisions there are the source of truth.
+//! configuration of an install.
 //!
 //! This module contains:
 //! - [`PostureState`] and the multiplier table (`xp_multiplier`).
@@ -225,7 +224,7 @@ pub enum FallbackReason {
 
 /// Compute the final XP for a single `xp_gain` write.
 ///
-/// Math (mirrors `docs/redesign/security-posture.md` §"Multiplier math"):
+/// Math:
 ///
 /// 1. `with_alignment = base + align_bonus`               (capped at MAX by callers)
 /// 2. `with_security  = with_alignment × multiplier`

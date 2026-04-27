@@ -8,7 +8,7 @@ pub const AMBER: Color = Color::Rgb(255, 191, 0);
 pub const DIM_WHITE: Color = Color::DarkGray;
 pub const BORDER: Color = Color::Rgb(3, 113, 113);
 
-// Codex-style glyphs: lighter bullet (•) and single chevron (›) for message prefixes.
+// glyphs: lighter bullet (•) and single chevron (›) for message prefixes.
 pub const BULLET: &str = "•";
 pub const CHEVRON: &str = "›";
 pub const TREE_MID: &str = "├";
@@ -115,7 +115,7 @@ pub fn reasoning_style() -> Style {
     dim().add_modifier(Modifier::ITALIC)
 }
 
-// --- Codex-style markdown semantic styles ---
+// --- markdown semantic styles ---
 
 /// Heading level 1: bold + underlined.
 pub fn md_h1_style() -> Style {
@@ -145,7 +145,7 @@ pub fn md_ordered_marker_style() -> Style {
     Style::default().fg(Color::LightBlue)
 }
 
-/// Key-hint footer text (Codex-style "ctrl + c" labels).
+/// Key-hint footer text ("ctrl + c" labels).
 pub fn key_hint_style() -> Style {
     dim()
 }
@@ -158,7 +158,7 @@ pub fn diff_remove_style() -> Style {
     Style::default().fg(RED)
 }
 
-/// Codex-style adaptive backgrounds for diff add/remove rows.
+/// adaptive backgrounds for diff add/remove rows.
 ///
 /// Dark terminals: muted green (`#213A2B`) / red (`#4A221D`).
 /// Light terminals: pastel green (`#dafbe1`) / red (`#ffebe9`).

@@ -7,9 +7,9 @@ use crate::config::Config;
 use crate::constants;
 use crate::db::Database;
 
-/// Number of words in a pairing phrase. Per `docs/redesign/tasks/02-mtls-pairing-audit.md`:
-/// "6-word phrase + QR". Sampled uniformly from the 2048-word BIP-39 English
-/// wordlist via `OsRng` → ~66 bits of entropy per code.
+/// Number of words in a pairing phrase. 6 words sampled uniformly from the
+/// 2048-word BIP-39 English wordlist via `OsRng` → ~66 bits of entropy per
+/// code.
 const PHRASE_WORDS: usize = 6;
 
 /// Channel name → lowercase prefix for self-describing pairing codes.

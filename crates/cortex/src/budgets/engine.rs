@@ -9,9 +9,9 @@
 //! Effective cap = `min(matching_principal, default)`. If a `principal:<id>`
 //! row exists with a tighter cap than the daemon-wide `default`, that wins.
 //!
-//! Mid-stream cancellation is forbidden by `docs/redesign/approvals.md` —
-//! `post_flight` always accepts the actual spend. If actual exceeds the cap
-//! (rare overshoot), the *next* `pre_flight` refuses.
+//! Mid-stream cancellation is forbidden: `post_flight` always accepts the
+//! actual spend. If actual exceeds the cap (rare overshoot), the *next*
+//! `pre_flight` refuses.
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};

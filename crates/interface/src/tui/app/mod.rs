@@ -1797,7 +1797,7 @@ mod tests {
         assert_eq!(app.scroll_offset, 6, "wheel/arrow must stay at 1 line/tick");
     }
 
-    // --- End / Home (opencode-style jump shortcuts) ---
+    // --- End / Home jump shortcuts ---
 
     #[test]
     fn end_key_scrolls_to_bottom_and_enables_autoscroll() {
@@ -1837,7 +1837,7 @@ mod tests {
         assert!(app.auto_scroll);
     }
 
-    // --- Force-jump on new user turn (matches opencode forceScrollToBottom) ---
+    // --- Force-jump on new user turn ---
 
     #[test]
     fn handle_submit_force_jumps_to_bottom() {

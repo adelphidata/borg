@@ -7,8 +7,6 @@
 //! `(provider_id, model, call_ts)` to the rate row that was active at call
 //! time so a budget computation replayed from the audit chain at any future
 //! point produces the same USD total.
-//!
-//! See `docs/redesign/approvals.md` for the full enforcement model.
 
 pub mod engine;
 pub mod hook;

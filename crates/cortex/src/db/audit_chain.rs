@@ -15,10 +15,10 @@
 //! When the daily retention purge tombstones an event, it:
 //! 1. Rewrites `event_json` to `{"purged":1,"purged_at":<ts>,"original_type":"<t>"}`.
 //! 2. Sets `event_purged = 1`.
-//! 3. **Leaves `prev_hash` and `hash` untouched** — per
-//!    `docs/redesign/data-handling.md`, the original hash is preserved as a
-//!    forensic anchor so external ledgers (e.g. backup tarballs taken
-//!    before purge) can confirm "this row existed at this seq".
+//! 3. **Leaves `prev_hash` and `hash` untouched** — the original hash is
+//!    preserved as a forensic anchor so external ledgers (e.g. backup
+//!    tarballs taken before purge) can confirm "this row existed at this
+//!    seq".
 //!
 //! The verifier accepts a tombstoned row by:
 //! - Always checking `prev_hash` linkage against the previous row's stored hash.

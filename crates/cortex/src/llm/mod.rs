@@ -1518,10 +1518,9 @@ mod tests {
     #[test]
     fn air_gap_blocks_public_cloud_construction() {
         // outbound_allowed = false MUST refuse a PublicCloud provider before
-        // any HTTP socket is created. Regression guard for the wiring fix
-        // under docs/redesign/tasks/04-providers-and-budgets.md — the
-        // ProviderRegistry resolver previously had no caller, leaving the
-        // air-gap setting silently unenforced.
+        // any HTTP socket is created. Real failure mode: the ProviderRegistry
+        // resolver loses its caller, leaving the air-gap setting silently
+        // unenforced.
         let env_var = "BORG_TEST_AIRGAP_OPENAI";
         std::env::set_var(env_var, "sk-test");
         let mut config = Config::default();
