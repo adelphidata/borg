@@ -1583,6 +1583,78 @@ impl Database {
         Ok(())
     }
 
+    /// V46: Task 02 PKI + audit chain tables.
+    ///
+    /// `internal_ca_certs` — root/server/client cert metadata; private keys
+    /// live in the OS keychain, never on disk.
+    /// `paired_devices` — per-device gRPC client identity, fingerprint-pinned.
+    /// `revoked_fingerprints` — explicit denylist (CRL-equivalent).
+    /// `pairing_codes` — short-lived PAKE codes; stored as `sha256(code)` so a
+    ///   DB leak never exposes the plaintext code.
+    /// `audit_log_chain` — append-only blake3 hash chain of security events.
+    pub(super) fn migrate_v46(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS internal_ca_certs (
+                serial      INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind        TEXT NOT NULL,
+                pem         TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                subject     TEXT NOT NULL,
+                not_before  INTEGER NOT NULL,
+                not_after   INTEGER NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active',
+                issued_at   INTEGER NOT NULL,
+                revoked_at  INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_internal_ca_certs_kind
+                ON internal_ca_certs(kind, status);
+
+            CREATE TABLE IF NOT EXISTS paired_devices (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint   TEXT NOT NULL UNIQUE,
+                device_label  TEXT NOT NULL,
+                scope_json    TEXT NOT NULL,
+                paired_at     INTEGER NOT NULL,
+                last_seen_at  INTEGER,
+                status        TEXT NOT NULL DEFAULT 'active',
+                principal_id  TEXT NOT NULL,
+                cert_serial   INTEGER NOT NULL REFERENCES internal_ca_certs(serial)
+            );
+
+            CREATE TABLE IF NOT EXISTS revoked_fingerprints (
+                fingerprint TEXT PRIMARY KEY,
+                revoked_at  INTEGER NOT NULL,
+                reason      TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS pairing_codes (
+                code_hash   TEXT PRIMARY KEY,
+                expires_at  INTEGER NOT NULL,
+                intent      TEXT NOT NULL,
+                created_at  INTEGER NOT NULL,
+                consumed_at INTEGER,
+                attempts    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pairing_codes_unconsumed
+                ON pairing_codes(consumed_at, expires_at);
+
+            CREATE TABLE IF NOT EXISTS audit_log_chain (
+                seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+                prev_hash    BLOB NOT NULL,
+                hash         BLOB NOT NULL,
+                event_type   TEXT NOT NULL,
+                event_json   TEXT NOT NULL,
+                ts           INTEGER NOT NULL,
+                principal_id TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
+                ON audit_log_chain(event_type, ts);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

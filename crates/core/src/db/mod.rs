@@ -1,5 +1,8 @@
 mod activity;
+mod audit_chain;
+mod audit_writer;
 mod delivery;
+mod device_pairing;
 mod maintenance;
 mod memory;
 mod meta;
@@ -7,6 +10,7 @@ mod migrations;
 mod models;
 mod multi_agent;
 mod pairing;
+mod pki;
 mod plugins;
 mod scripts;
 mod sessions;
@@ -20,7 +24,11 @@ mod workflow;
 #[cfg(test)]
 mod tests;
 
+pub use audit_chain::{compute_row_hash, AuditChainOutcome, AuditChainRow, GENESIS_PREV_HASH};
+pub use audit_writer::{audit_events, AuditWriter};
+pub use device_pairing::{hash_pairing_code, ConsumeOutcome};
 pub use models::*;
+pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use sessions::MessageFtsHit;
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
@@ -287,7 +295,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 45;
+    const CURRENT_VERSION: u32 = 46;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -371,6 +379,7 @@ impl Database {
             Database::migrate_v43,
             Database::migrate_v44,
             Database::migrate_v45,
+            Database::migrate_v46,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.
