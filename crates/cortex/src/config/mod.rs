@@ -1,3 +1,4 @@
+pub mod data;
 pub mod gateway;
 pub mod llm;
 pub mod maintenance;
@@ -10,6 +11,7 @@ pub mod settings_table;
 #[cfg(test)]
 mod tests;
 
+pub use data::*;
 pub use gateway::*;
 pub use llm::*;
 pub use maintenance::*;
@@ -120,6 +122,9 @@ pub struct Config {
     /// Daily self-healing maintenance task retention settings.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Daemon-wide data retention + backup policy (Task 05).
+    #[serde(default)]
+    pub data: DataConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,

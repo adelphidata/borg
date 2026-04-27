@@ -230,6 +230,44 @@ impl Database {
         }
     }
 
+    /// Tombstone every `audit_log_chain` row whose `ts < cutoff` and which
+    /// is not already tombstoned. Returns the count tombstoned. Each row
+    /// is tombstoned in its own transaction (see [`tombstone_audit_event`])
+    /// so a partial failure leaves the chain in a verifiable state.
+    ///
+    /// This is the daemon-side helper used by the daily retention sweep.
+    pub fn tombstone_audit_events_before(&self, cutoff: i64, purged_at: i64) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT seq FROM audit_log_chain
+             WHERE ts < ?1 AND event_purged = 0
+             ORDER BY seq ASC",
+        )?;
+        let seqs: Vec<i64> = stmt
+            .query_map(params![cutoff], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        let mut count = 0usize;
+        for seq in seqs {
+            if let Err(e) = self.tombstone_audit_event(seq, purged_at) {
+                tracing::warn!("audit: tombstone seq={seq} failed: {e}");
+                continue;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Delete `messages` rows older than `cutoff`. Hard delete — `messages`
+    /// is not hash-chained, so retention can free disk directly. Returns
+    /// the row count deleted.
+    pub fn purge_messages_before(&self, cutoff: i64) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM messages WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(n)
+    }
+
     pub fn list_audit_events(&self) -> Result<Vec<AuditChainRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT seq, prev_hash, hash, event_type, event_json, ts, principal_id, event_purged
@@ -460,6 +498,34 @@ mod tests {
             db.verify_audit_chain().expect("verify"),
             AuditChainOutcome::OkWithTombstones { count: 1 }
         );
+    }
+
+    /// Bulk tombstoning by cutoff: only rows with `ts < cutoff` get
+    /// tombstoned, and the chain still verifies. Regression target:
+    /// re-running the bulk helper must not re-tombstone (idempotency
+    /// at the DELETE FROM-style boundary).
+    #[test]
+    fn tombstone_audit_events_before_only_targets_old_rows() {
+        let db = test_db();
+        for i in 0..10 {
+            db.append_audit_event("evt", &format!(r#"{{"i":{i}}}"#), "p", 1_000 + i)
+                .expect("append");
+        }
+        // Cutoff at 1_005 → rows with ts < 1_005 (seqs 1..=5) get tombstoned.
+        let n = db
+            .tombstone_audit_events_before(1_005, 9_999)
+            .expect("bulk tombstone");
+        assert_eq!(n, 5);
+        match db.verify_audit_chain().expect("verify") {
+            AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 5),
+            other => panic!("expected OkWithTombstones(5), got {other:?}"),
+        }
+        // Re-running with the same cutoff is a no-op — the existing
+        // tombstones short-circuit `tombstone_audit_event`.
+        let n2 = db
+            .tombstone_audit_events_before(1_005, 9_999)
+            .expect("idempotent bulk");
+        assert_eq!(n2, 0);
     }
 
     /// Multiple non-contiguous tombstones — count reports correctly.

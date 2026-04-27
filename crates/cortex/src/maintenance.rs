@@ -58,6 +58,15 @@ pub struct MaintenanceReport {
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
+    /// `messages` rows deleted by the retention purge (Task 05). `0` when
+    /// `data.retention_days` is `None` or `data.purge_policy != Auto`.
+    #[serde(default)]
+    pub messages_purged: usize,
+    /// `audit_log_chain` rows tombstoned by the retention purge (Task 05).
+    /// Tombstones preserve hash-chain linkage; the row count is the
+    /// observable side of the daily retention behavior.
+    #[serde(default)]
+    pub audit_events_tombstoned: usize,
     /// Doctor checks persisted across runs (subset of `current_issues`
     /// that were also issues in the previous run).
     pub persistent_warnings: Vec<String>,
@@ -74,7 +83,7 @@ impl MaintenanceReport {
     /// Short one-line summary suitable for the activity log.
     pub fn activity_line(&self) -> String {
         format!(
-            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s)",
+            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
             self.pass_count,
             self.warn_count,
             self.fail_count,
@@ -84,6 +93,8 @@ impl MaintenanceReport {
             self.embeddings_pruned,
             self.workflows_pruned,
             self.stalled_tasks_healed,
+            self.messages_purged,
+            self.audit_events_tombstoned,
         )
     }
 }
@@ -158,6 +169,24 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     match db.prune_completed_workflows(workflow_cutoff) {
         Ok(n) => report.workflows_pruned = n,
         Err(e) => tracing::warn!("maintenance: workflow prune failed: {e}"),
+    }
+
+    // 4c. Apply data retention (Task 05). Deletes `messages` rows past
+    //     the cutoff and tombstones `audit_log_chain` rows in place,
+    //     preserving hash-chain linkage. Skipped when `retention_days`
+    //     is unset or `purge_policy` is `Never` / `OnDemandOnly` — see
+    //     `DataConfig::should_auto_purge`.
+    if config.data.should_auto_purge() {
+        if let Some(cutoff) = config.data.purge_cutoff(now) {
+            match db.purge_messages_before(cutoff) {
+                Ok(n) => report.messages_purged = n,
+                Err(e) => tracing::warn!("maintenance: messages retention purge failed: {e}"),
+            }
+            match db.tombstone_audit_events_before(cutoff, now) {
+                Ok(n) => report.audit_events_tombstoned = n,
+                Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
+            }
+        }
     }
 
     // 5. Proactively scan for stalled scheduled tasks. This duplicates
@@ -505,6 +534,100 @@ mod tests {
             persistent.is_empty(),
             "first run has nothing to compare against"
         );
+    }
+
+    /// Integration test: feeding a real `Config` with `data.retention_days
+    /// = Some(1)` through `run_daily_maintenance` must purge old messages
+    /// and tombstone old audit-chain rows, leaving the chain verifiable.
+    /// Failure mode: the wiring between `DataConfig::should_auto_purge` and
+    /// the maintenance step regressing silently — the daemon would happily
+    /// run the sweep but never purge anything.
+    #[test]
+    fn run_daily_maintenance_executes_retention_when_configured() {
+        use crate::config::{Config, DataConfig, PurgePolicy};
+        use crate::db::AuditChainOutcome;
+
+        let db = crate::db::Database::test_db();
+        // Two old audit events (well past cutoff) + one young one.
+        let now = chrono::Utc::now().timestamp();
+        let old_ts = now - 100 * SECS_PER_DAY;
+        let young_ts = now - 1; // safely under any reasonable retention cutoff
+        db.append_audit_event("evt", r#"{"i":1}"#, "p", old_ts)
+            .unwrap();
+        db.append_audit_event("evt", r#"{"i":2}"#, "p", old_ts + 1)
+            .unwrap();
+        db.append_audit_event("evt", r#"{"i":3}"#, "p", young_ts)
+            .unwrap();
+        // Two old messages, one young.
+        db.conn()
+            .execute(
+                "INSERT INTO messages (session_id, role, content, created_at)
+                 VALUES ('s', 'user', 'old1', ?1),
+                        ('s', 'user', 'old2', ?2),
+                        ('s', 'user', 'young', ?3)",
+                rusqlite::params![old_ts, old_ts + 1, young_ts],
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.data = DataConfig {
+            retention_days: Some(7),
+            purge_policy: PurgePolicy::Auto,
+            backup_keep_count: 0,
+        };
+
+        let report = run_daily_maintenance(&db, &config).expect("sweep");
+        assert_eq!(report.messages_purged, 2);
+        assert_eq!(report.audit_events_tombstoned, 2);
+
+        // The young row stayed; the chain still verifies with two
+        // tombstones in place.
+        let remaining_msgs: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_msgs, 1);
+        match db.verify_audit_chain().expect("verify") {
+            AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 2),
+            other => panic!("expected OkWithTombstones(2), got {other:?}"),
+        }
+    }
+
+    /// `purge_policy = Never` skips retention even when `retention_days`
+    /// is set — the litigation-hold escape hatch from `data-handling.md`.
+    #[test]
+    fn run_daily_maintenance_skips_retention_when_policy_never() {
+        use crate::config::{Config, DataConfig, PurgePolicy};
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        let old_ts = now - 100 * SECS_PER_DAY;
+        db.append_audit_event("evt", r#"{"i":1}"#, "p", old_ts)
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO messages (session_id, role, content, created_at)
+                 VALUES ('s', 'user', 'old', ?1)",
+                rusqlite::params![old_ts],
+            )
+            .unwrap();
+
+        let mut config = Config::default();
+        config.data = DataConfig {
+            retention_days: Some(7),
+            purge_policy: PurgePolicy::Never,
+            backup_keep_count: 0,
+        };
+
+        let report = run_daily_maintenance(&db, &config).expect("sweep");
+        assert_eq!(report.messages_purged, 0);
+        assert_eq!(report.audit_events_tombstoned, 0);
+
+        let remaining_msgs: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_msgs, 1);
     }
 
     #[test]
