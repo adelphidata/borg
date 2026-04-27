@@ -56,7 +56,7 @@ pub fn format_results(query: &str, results: &[SearchResult]) -> String {
 ///
 /// Priority when `search_provider = "auto"`:
 ///   Tavily > Serper > Brave > DuckDuckGo (keyless fallback)
-fn resolve_provider_id(config: &WebConfig) -> &str {
+pub fn resolve_provider_id(config: &WebConfig) -> &str {
     let p = config.search_provider.as_str();
     if p != "auto" {
         return p;
@@ -509,6 +509,7 @@ mod tests {
             enabled: true,
             search_provider: "brave".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         assert_eq!(resolve_provider_id(&config), "brave");
     }
@@ -519,6 +520,7 @@ mod tests {
             enabled: true,
             search_provider: "tavily".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         assert_eq!(resolve_provider_id(&config), "tavily");
     }
@@ -529,6 +531,7 @@ mod tests {
             enabled: true,
             search_provider: "serper".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         assert_eq!(resolve_provider_id(&config), "serper");
     }
@@ -539,6 +542,7 @@ mod tests {
             enabled: true,
             search_provider: "duckduckgo".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         assert_eq!(resolve_provider_id(&config), "duckduckgo");
     }
@@ -552,6 +556,7 @@ mod tests {
             enabled: true,
             search_provider: "auto".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         // We can't guarantee env vars aren't set, so just verify it returns a valid provider
         let provider = resolve_provider_id(&config);
@@ -568,6 +573,7 @@ mod tests {
             enabled: true,
             search_provider: "duckduckgo".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         };
         assert_eq!(resolve_provider_id(&config), "duckduckgo");
     }

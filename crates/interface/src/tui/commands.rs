@@ -107,6 +107,7 @@ impl App<'_> {
                 }));
             }
             "/new" => return Some(self.cmd_new()),
+            "/fork" => return Some(self.cmd_fork()),
             "/resume" => {
                 self.push_system_message(
                     "Usage: /resume <session-id>\nUse /sessions to browse saved sessions."
@@ -273,6 +274,7 @@ impl App<'_> {
              /sessions  - Browse and load saved sessions (press 'e' to export)\n  \
              /save      - Save current session\n  \
              /new       - Start new session\n  \
+             /fork      - Branch the current session into a new one (preserves history up to now)\n  \
              /resume <id> - Resume a saved session by id (prefix ok)\n  \
              /export [fmt] - Export current session (fmt: json|csv|txt, default json)\n\
              \n  \
@@ -394,6 +396,13 @@ impl App<'_> {
         self.session_prompt_tokens = 0;
         self.session_completion_tokens = 0;
         Ok(AppAction::NewSession)
+    }
+
+    /// Fork the current session at its most recent message. Resolution of
+    /// the live `agent_session_id` and the DB copy happen in the event loop
+    /// so the work can run async + share the daemon's writer.
+    fn cmd_fork(&mut self) -> Result<AppAction> {
+        Ok(AppAction::ForkSession)
     }
 
     fn cmd_mode_show(&mut self) -> Result<AppAction> {

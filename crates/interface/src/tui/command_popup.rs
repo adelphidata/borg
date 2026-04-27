@@ -101,6 +101,10 @@ const COMMANDS: &[SlashCommandDef] = &[
         name: "/new",
         description: "Start new session",
     },
+    SlashCommandDef {
+        name: "/fork",
+        description: "Branch the current session into a new one",
+    },
     // Integrations
     SlashCommandDef {
         name: "/plugins",
@@ -453,6 +457,7 @@ mod tests {
             "/sessions",
             "/save",
             "/new",
+            "/fork",
             "/plugins",
             "/projects",
             "/schedule",

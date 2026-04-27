@@ -30,6 +30,12 @@ pub struct SessionRow {
     pub model: String,
     /// User-facing session title.
     pub title: String,
+    /// Parent session id when this session was created via `/fork`.
+    /// `None` for top-level sessions.
+    pub parent_session_id: Option<String>,
+    /// Anchor message rowid copied as the last message of this fork.
+    /// `None` for top-level sessions.
+    pub forked_from_message_id: Option<i64>,
 }
 
 /// Scheduled task row from SQLite.

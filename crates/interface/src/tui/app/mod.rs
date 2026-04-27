@@ -349,6 +349,10 @@ pub enum AppAction {
         cancel: CancellationToken,
     },
     CompactHistory,
+    /// Fork the current agent session at its most recent message into a new
+    /// session. The event loop resolves the live agent_session_id, performs
+    /// the DB-level copy, and then dispatches a `LoadSession` for the fork.
+    ForkSession,
     ClearHistory,
     ShowUsage,
     UndoLastTurn,

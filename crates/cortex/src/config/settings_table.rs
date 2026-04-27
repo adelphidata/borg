@@ -125,6 +125,7 @@ define_settings! {
         // ── Web ──
         "web.enabled" => web.enabled, parsed(bool);
         "web.search_provider" => web.search_provider, string;
+        "web.search_cache_ttl_secs" => web.search_cache_ttl_secs, parsed(u64);
 
         // ── Tasks ──
         "tasks.max_concurrent" => tasks.max_concurrent, parsed(usize);

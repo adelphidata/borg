@@ -28,7 +28,8 @@ impl Database {
     /// Fetch a single session row by exact id. Returns `None` if absent.
     pub fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, total_tokens, model, title
+            "SELECT id, created_at, updated_at, total_tokens, model, title,
+                    parent_session_id, forked_from_message_id
              FROM sessions WHERE id = ?1",
         )?;
         let row = stmt
@@ -40,6 +41,8 @@ impl Database {
                     total_tokens: row.get(3)?,
                     model: row.get(4)?,
                     title: row.get(5)?,
+                    parent_session_id: row.get(6)?,
+                    forked_from_message_id: row.get(7)?,
                 })
             })
             .ok();
@@ -48,7 +51,8 @@ impl Database {
 
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, total_tokens, model, title
+            "SELECT id, created_at, updated_at, total_tokens, model, title,
+                    parent_session_id, forked_from_message_id
              FROM sessions ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -60,6 +64,8 @@ impl Database {
                     total_tokens: row.get(3)?,
                     model: row.get(4)?,
                     title: row.get(5)?,
+                    parent_session_id: row.get(6)?,
+                    forked_from_message_id: row.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -69,7 +75,8 @@ impl Database {
     /// Return sessions updated since a given Unix timestamp, ordered by most recent first.
     pub fn sessions_since(&self, since: i64) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, total_tokens, model, title
+            "SELECT id, created_at, updated_at, total_tokens, model, title,
+                    parent_session_id, forked_from_message_id
              FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC",
         )?;
         let rows = stmt
@@ -81,6 +88,8 @@ impl Database {
                     total_tokens: row.get(3)?,
                     model: row.get(4)?,
                     title: row.get(5)?,
+                    parent_session_id: row.get(6)?,
+                    forked_from_message_id: row.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -131,6 +140,65 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Create a forked session by copying message rows from `parent_id`
+    /// up to and including `anchor_message_id` into a brand-new session row
+    /// `new_id`. Done in a single transaction so partial copies never leak.
+    ///
+    /// Returns the number of messages copied. Errors if the anchor doesn't
+    /// exist in the parent session, or if the parent session row is missing.
+    pub fn fork_session(
+        &self,
+        parent_id: &str,
+        anchor_message_id: i64,
+        new_id: &str,
+        new_title: &str,
+        now: i64,
+    ) -> Result<usize> {
+        let parent = self
+            .session_by_id(parent_id)?
+            .ok_or_else(|| anyhow::anyhow!("parent session '{parent_id}' not found"))?;
+        let anchor_in_parent: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM messages WHERE session_id = ?1 AND id = ?2",
+                params![parent_id, anchor_message_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if anchor_in_parent.is_none() {
+            anyhow::bail!("anchor message {anchor_message_id} not found in session '{parent_id}'");
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO sessions
+                (id, created_at, updated_at, total_tokens, model, title,
+                 parent_session_id, forked_from_message_id)
+             VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5, ?6)",
+            params![
+                new_id,
+                now,
+                parent.model,
+                new_title,
+                parent_id,
+                anchor_message_id
+            ],
+        )?;
+        let copied = tx.execute(
+            "INSERT INTO messages
+                (session_id, role, content, tool_calls_json, tool_call_id,
+                 timestamp, created_at, content_parts_json)
+             SELECT ?1, role, content, tool_calls_json, tool_call_id,
+                    timestamp, created_at, content_parts_json
+             FROM messages
+             WHERE session_id = ?2 AND id <= ?3
+             ORDER BY id ASC",
+            params![new_id, parent_id, anchor_message_id],
+        )?;
+        tx.commit()?;
+        Ok(copied)
     }
 
     pub fn delete_session_messages(&self, session_id: &str) -> Result<usize> {
@@ -536,6 +604,108 @@ mod tests {
 
         let deleted = db.delete_last_assistant_turn("s1").unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn fork_copies_messages_up_to_anchor_inclusive() {
+        let db = test_db();
+        db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .unwrap();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(
+                db.insert_message(
+                    "parent",
+                    "user",
+                    Some(&format!("m{i}")),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+        let anchor = ids[3];
+
+        let copied = db
+            .fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .unwrap();
+        assert_eq!(copied, 4);
+
+        let parent_msgs = db.load_session_messages("parent").unwrap();
+        let child_msgs = db.load_session_messages("child").unwrap();
+        assert_eq!(parent_msgs.len(), 6);
+        assert_eq!(child_msgs.len(), 4);
+        let parent_contents: Vec<_> = parent_msgs[..4]
+            .iter()
+            .map(|m| m.content.clone().unwrap())
+            .collect();
+        let child_contents: Vec<_> = child_msgs
+            .iter()
+            .map(|m| m.content.clone().unwrap())
+            .collect();
+        assert_eq!(parent_contents, child_contents);
+    }
+
+    #[test]
+    fn fork_writes_independently() {
+        let db = test_db();
+        db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .unwrap();
+        let anchor = db
+            .insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .unwrap();
+
+        db.fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .unwrap();
+        db.insert_message("child", "user", Some("child-only"), None, None, None, None)
+            .unwrap();
+
+        let parent_msgs = db.load_session_messages("parent").unwrap();
+        let child_msgs = db.load_session_messages("child").unwrap();
+        assert_eq!(parent_msgs.len(), 1);
+        assert_eq!(child_msgs.len(), 2);
+        assert_eq!(child_msgs[1].content.as_deref(), Some("child-only"));
+    }
+
+    #[test]
+    fn fork_lineage_persisted_on_session_row() {
+        let db = test_db();
+        db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .unwrap();
+        let anchor = db
+            .insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .unwrap();
+        db.fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .unwrap();
+
+        let row = db.session_by_id("child").unwrap().expect("child exists");
+        assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
+        assert_eq!(row.forked_from_message_id, Some(anchor));
+        let parent_row = db.session_by_id("parent").unwrap().unwrap();
+        assert_eq!(parent_row.parent_session_id, None);
+        assert_eq!(parent_row.forked_from_message_id, None);
+    }
+
+    #[test]
+    fn fork_invalid_anchor_errors_and_does_not_create_session() {
+        let db = test_db();
+        db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .unwrap();
+        db.insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .unwrap();
+
+        let bad = db.fork_session("parent", 999_999, "child", "fork", 200);
+        assert!(bad.is_err());
+        assert!(db.session_by_id("child").unwrap().is_none());
+    }
+
+    #[test]
+    fn fork_unknown_parent_errors() {
+        let db = test_db();
+        let r = db.fork_session("ghost", 1, "child", "fork", 200);
+        assert!(r.is_err());
     }
 
     #[test]

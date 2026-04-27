@@ -1689,6 +1689,47 @@ impl Database {
         Ok(())
     }
 
+    /// V48: Session lineage (forking) + web search cache.
+    ///
+    /// `sessions.parent_session_id` / `sessions.forked_from_message_id` —
+    /// nullable lineage columns letting `/fork` branch a conversation at
+    /// any past message without losing the parent. Both indexable for
+    /// ancestor lookups; `forked_from_message_id` is the `messages.id` rowid
+    /// of the anchor copied as the last message of the fork.
+    ///
+    /// `web_search_cache` — keyed by `(provider, query_hash)`; `query_hash`
+    /// is a stable digest of the normalized query so identical queries via
+    /// different casings/whitespace share a cache entry. `body` stores the
+    /// pre-formatted result string (the exact string `web::web_search`
+    /// returns) so cached hits are byte-identical to live ones.
+    pub(super) fn migrate_v48(&self) -> Result<()> {
+        if !Self::has_column(&self.conn, "sessions", "parent_session_id") {
+            self.conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT;")?;
+        }
+        if !Self::has_column(&self.conn, "sessions", "forked_from_message_id") {
+            self.conn
+                .execute_batch("ALTER TABLE sessions ADD COLUMN forked_from_message_id INTEGER;")?;
+        }
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                ON sessions(parent_session_id);
+            CREATE TABLE IF NOT EXISTS web_search_cache (
+                provider    TEXT NOT NULL,
+                query_hash  TEXT NOT NULL,
+                query       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                fetched_at  INTEGER NOT NULL,
+                PRIMARY KEY (provider, query_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched_at
+                ON web_search_cache(fetched_at);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

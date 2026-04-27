@@ -113,6 +113,44 @@ impl Session {
     }
 }
 
+/// Fork an existing session at `anchor_message_id`, creating a new session
+/// whose history is the parent's messages up to and including the anchor.
+///
+/// The fork is recorded in SQLite (parent lineage on the `sessions` row,
+/// copied `messages` rows), then materialized as a JSON-on-disk session so
+/// it shows up in `/sessions` and `Session::load` works without falling
+/// through to `recover_session_from_db`.
+///
+/// Returns the new `Session`. Caller is responsible for switching the agent
+/// to it (typically via `LoadSession`).
+pub fn fork_session(parent_id: &str, anchor_message_id: i64) -> Result<Session> {
+    validate_session_id(parent_id)?;
+    let db = Database::open()?;
+    let parent_row = db
+        .session_by_id(parent_id)?
+        .ok_or_else(|| anyhow::anyhow!("Session '{parent_id}' not found"))?;
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now_secs = chrono::Utc::now().timestamp();
+    let new_title = format!("{} (fork)", parent_row.title);
+    db.fork_session(parent_id, anchor_message_id, &new_id, &new_title, now_secs)?;
+
+    let messages = recover_session_from_db(&new_id)?.unwrap_or_default();
+    let now_iso = Local::now().to_rfc3339();
+    let session = Session {
+        meta: SessionMeta {
+            id: new_id,
+            title: new_title,
+            created_at: now_iso.clone(),
+            updated_at: now_iso,
+            message_count: messages.len(),
+        },
+        messages,
+    };
+    session.save()?;
+    Ok(session)
+}
+
 /// Load the most recently updated session, if any exist.
 pub fn load_last_session() -> Result<Option<Session>> {
     let sessions = list_sessions()?;

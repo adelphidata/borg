@@ -24,7 +24,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     if config.web.enabled {
         defs.push(ToolDefinition::new(tool_names::WEB_FETCH, "Fetch a URL and return its text content. HTML pages are automatically converted to plain text.", serde_json::json!({"type":"object","properties":{"url":{"type":"string","description":"The URL to fetch"},"max_chars":{"type":"integer","description":"Maximum characters to return (default: 50000)","default":50000}},"required":["url"]})));
-        defs.push(ToolDefinition::new(tool_names::WEB_SEARCH, "Search the web and return results with titles, URLs, and snippets.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"}},"required":["query"]})));
+        defs.push(ToolDefinition::new(tool_names::WEB_SEARCH, "Search the web and return results with titles, URLs, and snippets.", serde_json::json!({"type":"object","properties":{"query":{"type":"string","description":"The search query"},"mode":{"type":"string","enum":["auto","live","cached"],"description":"Cache strategy: auto (cache hit if fresh else live + write), live (always hit network + refresh cache), cached (cache lookup only). Default: auto"}},"required":["query"]})));
     }
 
     defs.push(build_schedule_tool_def(config));

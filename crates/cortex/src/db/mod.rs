@@ -19,6 +19,7 @@ mod skill_audit;
 mod tasks;
 mod usage;
 mod vitals;
+pub mod web_search_cache;
 mod workflow;
 
 #[cfg(test)]
@@ -32,6 +33,7 @@ pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use sessions::MessageFtsHit;
 pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
+pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -311,7 +313,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 47;
+    const CURRENT_VERSION: u32 = 48;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -397,6 +399,7 @@ impl Database {
             Database::migrate_v45,
             Database::migrate_v46,
             Database::migrate_v47,
+            Database::migrate_v48,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.

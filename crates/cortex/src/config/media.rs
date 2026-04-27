@@ -596,6 +596,10 @@ pub struct WebConfig {
     pub search_provider: String,
     /// Override API key env var for the search provider.
     pub search_api_key_env: Option<String>,
+    /// TTL in seconds for cached `web_search` results. A cached row older
+    /// than this is treated as a miss in `auto` mode and refetched.
+    /// 0 disables caching entirely (every call is live).
+    pub search_cache_ttl_secs: u64,
 }
 
 impl Default for WebConfig {
@@ -604,6 +608,7 @@ impl Default for WebConfig {
             enabled: true,
             search_provider: "auto".into(),
             search_api_key_env: None,
+            search_cache_ttl_secs: 3600,
         }
     }
 }
