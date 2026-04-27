@@ -28,23 +28,34 @@ Thanks for your interest in contributing! This guide will help you get set up an
    lefthook install
    ```
 
+**Run during development** (via [just](https://github.com/casey/just)):
+```sh
+just run            # TUI/CLI client (borg)
+just daemon         # gRPC daemon (borgd)
+just check          # fmt + clippy
+just test           # all tests
+```
+
 **Auto-rebuild on file changes** (install `cargo-watch` first with `cargo install cargo-watch --locked`):
 ```sh
-cargo watch -x 'build --bin borg'
+cargo watch -x 'build --bin borg' -x 'build --bin borgd'
 ```
 
 ## Project Structure
 
-Borg is a Cargo workspace with 7 crates:
+Borg is a Cargo workspace:
 
 | Crate | Purpose |
 |-------|---------|
-| `crates/interface` | Binary: REPL, clap args, TUI, onboarding |
+| `crates/interface` | Binary (`borg`): REPL, clap args, TUI, onboarding — gRPC client to `borgd` |
+| `crates/borgd` | Binary (`borgd`): long-running gRPC daemon owning the agent loop, scheduler, ingress |
 | `crates/cortex` | Library: agent loop, LLM client, memory, config |
+| `crates/protocols` | Library: tonic gRPC schema for the daemon and its clients |
+| `crates/identity` | Library: internal CA, cert lifecycle, OS keychain wrapping (PKI) |
 | `crates/heartbeat` | Library: proactive scheduler with quiet hours |
 | `crates/sandbox` | Library: macOS Seatbelt + Linux Bubblewrap policies |
 | `crates/coding` | Library: patch DSL parser + filesystem applicator |
-| `crates/gateway` | Library: webhook gateway for messaging channels |
+| `crates/gateway` | Library: webhook gateway for messaging channels (migrating into `borgd`) |
 | `crates/plugins` | Library: marketplace catalog, plugin installer |
 
 See [docs/architecture.md](docs/architecture.md) for a deeper overview.

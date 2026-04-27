@@ -59,9 +59,13 @@ coverage:
 coverage-summary:
     cargo llvm-cov --workspace
 
-# Run the binary
+# Run the TUI/CLI client (borg)
 run *args="":
-    cargo run -- {{args}}
+    cargo run --bin borg -- {{args}}
+
+# Run the daemon (borgd)
+daemon *args="":
+    cargo run --bin borgd -- {{args}}
 
 # Clean cargo target dirs (main + worktrees)
 clean:
