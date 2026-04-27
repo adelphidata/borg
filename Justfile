@@ -59,6 +59,11 @@ coverage:
 coverage-summary:
     cargo llvm-cov --workspace
 
+# Default RUST_LOG for dev commands: surfaces cortex::llm lifecycle logs
+# (request start → response headers → first byte → stream end) and other
+# cortex-internal debug output. Override by exporting RUST_LOG before invoking.
+export RUST_LOG := env_var_or_default("RUST_LOG", "info,cortex=debug,borgd=debug,interface=debug,gateway=debug")
+
 # Run the TUI/CLI client (borg)
 run *args="":
     cargo run --bin borg -- {{args}}
