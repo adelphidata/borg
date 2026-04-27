@@ -141,6 +141,8 @@ fn record_and_latest_doctor_run_roundtrip() {
         stalled_tasks_healed: 0,
         messages_purged: 0,
         audit_events_tombstoned: 0,
+        auto_backup_path: None,
+        backups_pruned: 0,
         persistent_warnings: vec!["Gateway:reachable".into()],
         current_issues: vec!["Gateway:reachable".into()],
         check_summary: vec!["  ⚠ Gateway:reachable — down".into()],

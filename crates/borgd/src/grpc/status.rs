@@ -79,12 +79,22 @@ impl Status for StatusSvc {
     }
 
     async fn get_posture(&self, _req: Request<Empty>) -> Result<Response<Posture>, TStatus> {
-        // Real security-posture wiring lands in a follow-up task. Surface a
-        // truthful "neutral" value rather than fabricate a multiplier — when
-        // posture lands this method updates alongside the new state.
+        // Read the head of `posture_snapshots` (denormalized index over the
+        // `security_posture_changed` audit chain). On a fresh DB with no
+        // posture event yet, fall back to `Default × 1.00` rather than
+        // fabricating a state — `xp_gain` writes use the same fallback path
+        // (FallbackReason::PostureUndetermined).
+        let head = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+            let db = Database::open()?;
+            cortex::evolution::security::current_posture(&db)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("posture task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("posture load failed: {e}")))?;
+        let state = head.unwrap_or(cortex::evolution::security::PostureState::Default);
         Ok(Response::new(Posture {
-            posture: "Balanced".into(),
-            xp_multiplier: 1.0,
+            posture: state.as_str().into(),
+            xp_multiplier: state.xp_multiplier() as f64,
         }))
     }
 

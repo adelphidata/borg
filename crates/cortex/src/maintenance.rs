@@ -67,6 +67,14 @@ pub struct MaintenanceReport {
     /// observable side of the daily retention behavior.
     #[serde(default)]
     pub audit_events_tombstoned: usize,
+    /// Path to a weekly auto-backup tarball, when one was created on
+    /// this run. `None` outside the weekly cadence or when
+    /// `data.backup_keep_count == 0`.
+    #[serde(default)]
+    pub auto_backup_path: Option<String>,
+    /// Older `borg-backup-*.tar.zst` files removed by retention pruning.
+    #[serde(default)]
+    pub backups_pruned: usize,
     /// Doctor checks persisted across runs (subset of `current_issues`
     /// that were also issues in the previous run).
     pub persistent_warnings: Vec<String>,
@@ -189,6 +197,35 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         }
     }
 
+    // 4d. Weekly auto-backup (Task 05). Fires on Sunday when no backup
+    //     exists in the last 7 days and `backup_keep_count > 0`. Pruning
+    //     happens after a successful create so a failed backup doesn't
+    //     erase the last good copy.
+    if let Some(home) = Config::data_dir().ok() {
+        let backups_dir = home.join("backups");
+        let keep = config.data.backup_keep_count as usize;
+        if keep > 0 && weekly_backup_due(&backups_dir, now) {
+            let schema_version = db.schema_version().unwrap_or(0);
+            match crate::backup::create_backup(&home, &backups_dir, schema_version) {
+                Ok(path) => {
+                    report.auto_backup_path = Some(path.display().to_string());
+                    match crate::backup::prune_backups(&backups_dir, keep) {
+                        Ok(n) => report.backups_pruned = n,
+                        Err(e) => tracing::warn!("maintenance: backup prune failed: {e}"),
+                    }
+                }
+                Err(e) => tracing::warn!("maintenance: weekly backup create failed: {e}"),
+            }
+        } else if keep == 0 {
+            // User explicitly disabled auto-backup — remove any stragglers.
+            if let Ok(n) = crate::backup::prune_backups(&backups_dir, 0) {
+                if n > 0 {
+                    report.backups_pruned = n;
+                }
+            }
+        }
+    }
+
     // 5. Proactively scan for stalled scheduled tasks. This duplicates
     //    what the daemon loop does on a 5-minute cadence, but running it
     //    here covers the case where the daemon isn't running and the user
@@ -219,6 +256,40 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
 
     tracing::info!("{}", report.activity_line());
     Ok(report)
+}
+
+/// True when a weekly auto-backup is due. The cadence is "no backup in
+/// the last 7 days" — simpler than gating on day-of-week, and survives
+/// daemon downtime (a daemon offline for two weeks creates one backup
+/// when it next starts, not zero).
+fn weekly_backup_due(dir: &Path, now: i64) -> bool {
+    if !dir.exists() {
+        return true;
+    }
+    let mut newest_ts: i64 = 0;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+    for ent in entries.flatten() {
+        let name = ent.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name
+            .strip_prefix("borg-backup-")
+            .and_then(|s| s.strip_suffix(".tar.zst"))
+        else {
+            continue;
+        };
+        if let Ok(ts) = stem.parse::<i64>() {
+            if ts > newest_ts {
+                newest_ts = ts;
+            }
+        }
+    }
+    const SEVEN_DAYS_SECS: i64 = 7 * 86_400;
+    now - newest_ts >= SEVEN_DAYS_SECS
 }
 
 /// Head-truncate append-only log files under `dir` whose size exceeds
@@ -591,6 +662,37 @@ mod tests {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 2),
             other => panic!("expected OkWithTombstones(2), got {other:?}"),
         }
+    }
+
+    /// Weekly cadence: no backup → due. A backup written 1 hour ago →
+    /// not due. A backup written 8 days ago → due again. Failure mode:
+    /// using day-of-week instead of "last_ts > 7d ago" would miss the
+    /// case of a daemon offline for >7 days starting on a non-Sunday.
+    #[test]
+    fn weekly_backup_due_uses_seven_day_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = 1_900_000_000;
+        // Empty dir → due.
+        assert!(weekly_backup_due(dir, now));
+        // Recent backup → not due.
+        std::fs::write(
+            dir.join(format!("borg-backup-{}.tar.zst", now - 3600)),
+            b"x",
+        )
+        .unwrap();
+        assert!(!weekly_backup_due(dir, now));
+        // Old backup (8 days) plus the recent one → still not due (we
+        // pick the newest).
+        std::fs::write(
+            dir.join(format!("borg-backup-{}.tar.zst", now - 9 * 86400)),
+            b"x",
+        )
+        .unwrap();
+        assert!(!weekly_backup_due(dir, now));
+        // Remove recent → due again.
+        std::fs::remove_file(dir.join(format!("borg-backup-{}.tar.zst", now - 3600))).unwrap();
+        assert!(weekly_backup_due(dir, now));
     }
 
     /// `purge_policy = Never` skips retention even when `retention_days`

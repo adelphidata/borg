@@ -13,11 +13,15 @@
 //! - The pure [`resolver`] (Reduced-wins-on-conflict, Boosted requires the
 //!   full positive set) used by both write-time emission and replay.
 
+pub mod emit;
 pub mod resolver;
+pub mod snapshot;
 
 use serde::{Deserialize, Serialize};
 
+pub use emit::{current_posture, maybe_emit_posture_change, EmitOutcome};
 pub use resolver::{is_boosted, is_reduced, resolve_state};
+pub use snapshot::compute_live_snapshot;
 
 /// Per-event XP cap. Stays at 3 in v1; v3's 5-bucket ladder may raise it
 /// under `Hardened`. Mirrored from `evolution::MAX_XP_DELTA` so resolver
