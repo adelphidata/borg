@@ -10,8 +10,8 @@
 //! while Stage E migrates them in. This module is the loop body only.
 
 use anyhow::Result;
-use borg_core::config::Config;
-use borg_core::constants::{
+use cortex::config::Config;
+use cortex::constants::{
     DAEMON_LOCK_MAX_REFRESH_FAILURES, DAEMON_LOOP_INTERVAL, SLEEP_DRIFT_THRESHOLD,
     STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL, WATCHDOG_STALL_THRESHOLD,
     WATCHDOG_TICK_INTERVAL,
@@ -23,8 +23,13 @@ use tokio_util::sync::CancellationToken;
 /// Callback the dispatcher invokes for each claimed task. The cli's
 /// `service::spawn_task_execution` gets passed in here.
 pub type TaskSpawn = Arc<
-    dyn Fn(borg_core::db::ScheduledTaskRow, i64, bool, Arc<tokio::sync::Semaphore>, Config)
-            -> futures::future::BoxFuture<'static, ()>
+    dyn Fn(
+            cortex::db::ScheduledTaskRow,
+            i64,
+            bool,
+            Arc<tokio::sync::Semaphore>,
+            Config,
+        ) -> futures::future::BoxFuture<'static, ()>
         + Send
         + Sync,
 >;
@@ -32,10 +37,10 @@ pub type TaskSpawn = Arc<
 /// Workflow step spawn callback. Same shape — provided by the cli shim.
 pub type WorkflowStepSpawn = Arc<
     dyn Fn(
-            borg_core::db::WorkflowRow,
-            borg_core::db::WorkflowStepRow,
-            Vec<borg_core::db::WorkflowStepRow>,
-            Vec<borg_core::db::WorkflowStepRow>,
+            cortex::db::WorkflowRow,
+            cortex::db::WorkflowStepRow,
+            Vec<cortex::db::WorkflowStepRow>,
+            Vec<cortex::db::WorkflowStepRow>,
             Arc<tokio::sync::Semaphore>,
             Config,
         ) -> futures::future::BoxFuture<'static, ()>
@@ -45,7 +50,7 @@ pub type WorkflowStepSpawn = Arc<
 
 /// Celebration deliver callback.
 pub type CelebrationDeliver = Arc<
-    dyn Fn(Config, borg_core::db::PendingCelebration) -> futures::future::BoxFuture<'static, bool>
+    dyn Fn(Config, cortex::db::PendingCelebration) -> futures::future::BoxFuture<'static, bool>
         + Send
         + Sync,
 >;
@@ -72,7 +77,7 @@ pub async fn run(
     semaphore: Arc<tokio::sync::Semaphore>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = cortex::db::Database::open()?;
 
     let daemon_pid = std::process::id();
     let now = chrono::Utc::now().timestamp();
@@ -171,14 +176,10 @@ pub async fn run(
 
         if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
             last_stalled_scan = std::time::Instant::now();
-            if let Err(e) =
-                borg_core::tasks::heal_stalled_tasks(&db, now, STALLED_TASK_GRACE_SECS)
-            {
+            if let Err(e) = cortex::tasks::heal_stalled_tasks(&db, now, STALLED_TASK_GRACE_SECS) {
                 tracing::warn!("Stalled-task scan failed: {e}");
             }
-            if let Err(e) =
-                borg_core::tasks::recover_wedged_runs(&db, now, STALLED_TASK_GRACE_SECS)
-            {
+            if let Err(e) = cortex::tasks::recover_wedged_runs(&db, now, STALLED_TASK_GRACE_SECS) {
                 tracing::warn!("Wedged-run sweep failed: {e}");
             }
         }
@@ -211,13 +212,8 @@ pub async fn run(
                             continue;
                         }
                     };
-                    let fut = (hooks.spawn_task)(
-                        task,
-                        run_id,
-                        true,
-                        semaphore.clone(),
-                        config.clone(),
-                    );
+                    let fut =
+                        (hooks.spawn_task)(task, run_id, true, semaphore.clone(), config.clone());
                     fut.await;
                 }
             }
@@ -255,7 +251,7 @@ pub async fn run(
                     let deliver = hooks.deliver_celebration.clone();
                     tokio::spawn(async move {
                         let delivered = (deliver)(cfg, c).await;
-                        match borg_core::db::Database::open() {
+                        match cortex::db::Database::open() {
                             Ok(cdb) => {
                                 if delivered {
                                     if let Err(e) = cdb.mark_celebration_delivered(celebration_id) {
@@ -279,7 +275,7 @@ pub async fn run(
     }
 }
 
-fn skip_stale_tasks(db: &borg_core::db::Database) {
+fn skip_stale_tasks(db: &cortex::db::Database) {
     let now = chrono::Utc::now().timestamp();
     if let Ok(stale_tasks) = db.get_due_tasks(now) {
         for task in &stale_tasks {
@@ -290,7 +286,7 @@ fn skip_stale_tasks(db: &borg_core::db::Database) {
                     task.name,
                     age / 86400
                 );
-                if let Err(e) = borg_core::tasks::advance_next_run(task, db) {
+                if let Err(e) = cortex::tasks::advance_next_run(task, db) {
                     tracing::warn!(
                         error = %e,
                         task = %task.name,

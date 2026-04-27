@@ -4,7 +4,7 @@ Five logically isolated tasks. Each is sized for a separate agent session and li
 
 | # | Task | Touches | Depends on |
 |---|---|---|---|
-| 01 | [Daemon kernel + gRPC + TUI client](01-daemon-grpc-kernel.md) | new `borgd` crate, agent-loop lift, `crates/cli` TUI rewrite, capability protocol stubs | — |
+| 01 | [Daemon kernel + gRPC + TUI client](01-daemon-grpc-kernel.md) | new `borgd` crate, agent-loop lift, `crates/interface` TUI rewrite, capability protocol stubs | — |
 | 02 | [Seamless mTLS + PAKE pairing + audit chain](02-mtls-pairing-audit.md) | internal CA, paired_devices, audit_log_chain, verifier trait | 01 (gRPC server exists) |
 | 03 | [Layer 5 ingress adapters](03-ingress-adapters.md) | port 8 native channels + OpenAI-compat HTTP + webhook + MCP into daemon | 01 (daemon hosts adapters) |
 | 04 | [LLM provider plugin layer + budgets](04-providers-and-budgets.md) | `Provider` trait, rate cards, token accounting, `budgets` table, pre/post-flight enforcement | 01 (daemon owns LLM calls) |

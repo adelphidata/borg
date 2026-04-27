@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use borg_core::constants;
+use cortex::constants;
 use tracing::{info, warn};
 
 use crate::executor::ChannelExecutor;

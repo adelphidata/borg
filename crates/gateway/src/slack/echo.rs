@@ -2,7 +2,7 @@ use std::collections::{HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 
-use borg_core::constants;
+use cortex::constants;
 
 const DEFAULT_CAPACITY: usize = constants::SLACK_ECHO_CACHE_CAPACITY;
 

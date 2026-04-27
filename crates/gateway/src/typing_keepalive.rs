@@ -11,7 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use borg_core::constants::{TYPING_MAX_CONSECUTIVE_FAILURES, TYPING_MAX_TTL_SECS};
+use cortex::constants::{TYPING_MAX_CONSECUTIVE_FAILURES, TYPING_MAX_TTL_SECS};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tracing::warn;

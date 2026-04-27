@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::manifest::ChannelManifest;
-use borg_sandbox::runner::{run_sandboxed_script, validate_script_path};
+use sandbox::runner::{run_sandboxed_script, validate_script_path};
 
 pub struct ChannelExecutor<'a> {
     manifest: &'a ChannelManifest,

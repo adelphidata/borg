@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use borg_core::db::Database;
+use cortex::db::Database;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

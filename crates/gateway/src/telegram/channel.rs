@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tokio::sync::{Mutex, RwLock};
 
-use borg_core::config::Config;
+use cortex::config::Config;
 
 use crate::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
@@ -36,7 +36,7 @@ pub struct TelegramChannel {
     /// Application configuration.
     pub config: Config,
     /// Optional TTS synthesizer for auto-voice responses.
-    pub tts_synthesizer: Option<Arc<borg_core::tts::TtsSynthesizer>>,
+    pub tts_synthesizer: Option<Arc<cortex::tts::TtsSynthesizer>>,
 }
 
 #[async_trait]
@@ -102,7 +102,7 @@ impl NativeChannel for TelegramChannel {
         // Audio transcription (must happen before enqueue — needs file data)
         if let Some(ref audio) = audio_ref {
             if let Some(transcriber) =
-                borg_core::media_understanding::AudioTranscriber::from_config(&self.config)
+                cortex::media_understanding::AudioTranscriber::from_config(&self.config)
             {
                 match async {
                     let file_info = self.client.get_file(&audio.file_id).await?;
@@ -217,9 +217,9 @@ impl NativeChannel for TelegramChannel {
 
         // Auto-TTS: synthesize and send voice message after text
         if let Some(ref synth) = self.tts_synthesizer {
-            let tts_text = borg_core::tts::truncate_for_tts(response_text, 4096);
+            let tts_text = cortex::tts::truncate_for_tts(response_text, 4096);
             match synth
-                .synthesize(&tts_text, None, Some(borg_core::tts::AudioFormat::Opus))
+                .synthesize(&tts_text, None, Some(cortex::tts::AudioFormat::Opus))
                 .await
             {
                 Ok((audio_bytes, _, _)) => {

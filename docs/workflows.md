@@ -114,9 +114,9 @@ borg settings set workflow.enabled auto
 
 | File | Purpose |
 |------|---------|
-| `crates/core/src/workflow/mod.rs` | Status constants, `workflows_active()` |
-| `crates/core/src/workflow/engine.rs` | Step context template builder |
-| `crates/core/src/workflow/tier.rs` | Model tiering heuristic |
-| `crates/core/src/db/workflow.rs` | All DB operations (workflows, steps, projects) |
-| `crates/core/src/tool_handlers/schedule.rs` | Tool handler dispatch |
-| `crates/cli/src/service.rs` | Daemon step execution |
+| `crates/cortex/src/workflow/mod.rs` | Status constants, `workflows_active()` |
+| `crates/cortex/src/workflow/engine.rs` | Step context template builder |
+| `crates/cortex/src/workflow/tier.rs` | Model tiering heuristic |
+| `crates/cortex/src/db/workflow.rs` | All DB operations (workflows, steps, projects) |
+| `crates/cortex/src/tool_handlers/schedule.rs` | Tool handler dispatch |
+| `crates/interface/src/service.rs` | Daemon step execution |

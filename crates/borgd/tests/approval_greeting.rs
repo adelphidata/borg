@@ -10,14 +10,14 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
-use borg_core::config::Config;
-use borg_core::telemetry::BorgMetrics;
-use borg_proto::admin::admin_client::AdminClient;
-use borg_proto::admin::admin_server::AdminServer;
-use borg_proto::admin::ApprovalGreetingRequest;
 use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::session::{DaemonSessionExecutor, SessionRegistry};
+use cortex::config::Config;
+use cortex::telemetry::BorgMetrics;
+use protocols::admin::admin_client::AdminClient;
+use protocols::admin::admin_server::AdminServer;
+use protocols::admin::ApprovalGreetingRequest;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,7 +125,7 @@ async fn send_approval_greeting_accepts_request_when_executor_wired() {
     // Materialize DB so Config::load_from_db() inside the spawned greeting
     // task has something to read; the agent will then fail to construct
     // (no LLM provider) — that's logged + ignored, which is the design.
-    let _ = borg_core::db::Database::open().expect("seed db");
+    let _ = cortex::db::Database::open().expect("seed db");
 
     let socket = tmp.path().join("borgd.sock");
     let listener = bind_uds(&socket).expect("bind_uds");

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tokio::sync::RwLock;
 
-use borg_core::config::Config;
+use cortex::config::Config;
 
 use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;

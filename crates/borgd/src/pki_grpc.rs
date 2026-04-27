@@ -7,12 +7,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use borg_core::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
-use borg_pki::{
+use cortex::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
+use identity::{
     ca::{issue_client_cert, ClientCertParams},
     fingerprint_sha256,
 };
-use borg_proto::pki::{
+use protocols::pki::{
     pki_server::Pki, PairedDevice as PbPairedDevice, PairedDeviceList, PkiEmpty, RenewCertRequest,
     RenewCertResponse, RevokeDeviceRequest, StartPairingRequest, StartPairingResponse,
     VerifyAuditResponse,
@@ -141,14 +141,8 @@ impl Pki for PkiSvc {
             // The fingerprint-pinning model: on renewal the new cert has a
             // different fingerprint, but we keep the SAME paired_devices row
             // by updating its cert_serial. The client uses the new key+cert.
-            g.insert_paired_device(
-                &new_fp,
-                &device_label,
-                "{}",
-                &principal.id,
-                serial,
-            )
-            .map_err(|e| Status::internal(format!("update paired device: {}", e)))?;
+            g.insert_paired_device(&new_fp, &device_label, "{}", &principal.id, serial)
+                .map_err(|e| Status::internal(format!("update paired device: {}", e)))?;
             // Mark the old cert renewed.
             let _ = g.add_revoked_fingerprint(&principal.fingerprint, Some("renewed"));
             serial
@@ -180,7 +174,11 @@ impl Pki for PkiSvc {
             .map(|p| p.id.clone())
             .unwrap_or_else(|| "system".to_string());
         let r = req.into_inner();
-        let reason = if r.reason.is_empty() { None } else { Some(r.reason.as_str()) };
+        let reason = if r.reason.is_empty() {
+            None
+        } else {
+            Some(r.reason.as_str())
+        };
         {
             let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
             g.revoke_paired_device(&r.fingerprint, reason)

@@ -1,15 +1,15 @@
 //! Hourly budget reset tick.
 //!
 //! Spawned at daemon startup. Every hour (and once at boot) calls
-//! [`borg_core::budgets::BudgetEngine::reset_if_due`] to advance any budget
+//! [`cortex::budgets::BudgetEngine::reset_if_due`] to advance any budget
 //! whose period has elapsed and write a `budget_reset` event. Failures log
 //! a `tracing::warn!` and the loop continues — the daemon must never be
 //! killed by a budget tick error (CLAUDE.md error-handling invariant).
 
 use std::time::Duration;
 
-use borg_core::budgets::BudgetEngine;
-use borg_core::db::Database;
+use cortex::budgets::BudgetEngine;
+use cortex::db::Database;
 use tokio::sync::broadcast;
 use tokio::time::{interval, MissedTickBehavior};
 

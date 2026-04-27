@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use borg_core::config::ErrorPolicy;
+use cortex::config::ErrorPolicy;
 
 /// Maximum entries before pruning old ones.
 const MAX_STORE_SIZE: usize = 100;

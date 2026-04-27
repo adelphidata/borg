@@ -9,9 +9,9 @@ use crate::scheduler;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use crate::task_runner;
 use anyhow::Result;
-use borg_core::config::Config;
-use borg_core::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
-use borg_core::telemetry::BorgMetrics;
+use cortex::config::Config;
+use cortex::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
+use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -24,10 +24,10 @@ fn spawn_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let gw_config = config.clone();
     tokio::spawn(async move {
-        match borg_gateway::GatewayServer::new(
+        match gateway::GatewayServer::new(
             gw_config,
             shutdown,
-            borg_core::telemetry::BorgMetrics::noop(),
+            cortex::telemetry::BorgMetrics::noop(),
             poke_tx,
             None,
         ) {
@@ -93,7 +93,8 @@ pub fn start(
                 inner_for_join.cancel();
             });
 
-            let handle = spawn_gateway(&gw_config, inner_shutdown.clone(), Some(gw_poke_tx.clone()));
+            let handle =
+                spawn_gateway(&gw_config, inner_shutdown.clone(), Some(gw_poke_tx.clone()));
             let result = handle.await;
             if gw_outer_shutdown.is_cancelled() {
                 return;
@@ -125,16 +126,16 @@ pub fn start(
             if !imessage_dir.join("channel.toml").exists() {
                 return;
             }
-            let probe = borg_gateway::imessage::probe::probe_imessage();
+            let probe = gateway::imessage::probe::probe_imessage();
             match probe.status {
-                borg_gateway::imessage::probe::ProbeStatus::Ok => {
+                gateway::imessage::probe::ProbeStatus::Ok => {
                     if let Err(e) =
-                        borg_gateway::imessage::start_imessage_monitor(im_config, im_shutdown).await
+                        gateway::imessage::start_imessage_monitor(im_config, im_shutdown).await
                     {
                         tracing::warn!("iMessage monitor failed: {e}");
                     }
                 }
-                borg_gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
+                gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
                     tracing::warn!("iMessage: Full Disk Access required. Skipping monitor.");
                 }
                 other => {
@@ -165,7 +166,14 @@ pub fn start(
                 Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
             }),
         };
-        if let Err(e) = scheduler::run(scheduler_config, hooks, scheduler_semaphore, scheduler_shutdown).await {
+        if let Err(e) = scheduler::run(
+            scheduler_config,
+            hooks,
+            scheduler_semaphore,
+            scheduler_shutdown,
+        )
+        .await
+        {
             tracing::error!("Scheduled-task dispatcher exited: {e}");
         }
     });
@@ -182,8 +190,8 @@ pub fn start(
 /// responsible for any pre-flight setup (auto-spawning a borgd binary etc.).
 pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
     let config = Config::load_from_db()?;
-    borg_core::activity_log::log_activity(
-        &borg_core::db::Database::open()?,
+    cortex::activity_log::log_activity(
+        &cortex::db::Database::open()?,
         "info",
         "system",
         "Daemon orchestrator started (cli shim)",

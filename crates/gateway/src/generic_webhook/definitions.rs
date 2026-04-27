@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use borg_core::db::Database;
+use cortex::db::Database;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 

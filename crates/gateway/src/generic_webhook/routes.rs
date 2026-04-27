@@ -10,8 +10,8 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use borg_core::db::Database;
-use borg_core::ingress::{
+use cortex::db::Database;
+use cortex::ingress::{
     AdmittedIngress, IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId,
 };
 
@@ -149,9 +149,9 @@ async fn webhook_handler(
         Ok(a) => a,
         Err(e) => {
             let status = match e {
-                borg_core::ingress::IngressReject::EmptyBody => StatusCode::BAD_REQUEST,
-                borg_core::ingress::IngressReject::RateLimited { .. }
-                | borg_core::ingress::IngressReject::PrincipalCapacityExhausted => {
+                cortex::ingress::IngressReject::EmptyBody => StatusCode::BAD_REQUEST,
+                cortex::ingress::IngressReject::RateLimited { .. }
+                | cortex::ingress::IngressReject::PrincipalCapacityExhausted => {
                     StatusCode::TOO_MANY_REQUESTS
                 }
             };

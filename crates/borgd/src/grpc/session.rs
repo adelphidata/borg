@@ -7,14 +7,14 @@
 
 use crate::session::{convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
-use borg_proto::session::{
+use futures_util::Stream;
+use protocols::session::{
     session_server::Session, AgentEvent, AutoSaveRequest, CancelRequest, CancelResponse,
     ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest,
     OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState,
     SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
-use futures_util::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::mpsc;

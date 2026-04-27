@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use borg_core::config::Config;
-use borg_core::db::Database;
+use cortex::config::Config;
+use cortex::db::Database;
 use tracing::warn;
 
 /// Metadata for a single gateway slash command.
@@ -390,7 +390,7 @@ fn handle_usage(db: &Database, config: &Config, session_id: &str) -> String {
 
 fn handle_skills(config: &Config) -> String {
     let resolved_creds = config.resolve_credentials();
-    match borg_core::skills::load_all_skills(&resolved_creds, &config.skills) {
+    match cortex::skills::load_all_skills(&resolved_creds, &config.skills) {
         Ok(skills) if skills.is_empty() => "No skills installed.".to_string(),
         Ok(skills) => {
             let mut lines = vec![format!("Skills ({}):", skills.len())];
@@ -415,7 +415,7 @@ fn handle_whoami(sender_id: &str, channel_name: &str, db: &Database) -> String {
 }
 
 fn handle_memory() -> String {
-    match borg_core::memory::list_memory_files() {
+    match cortex::memory::list_memory_files() {
         Ok(files) if files.is_empty() => "No memory files.".to_string(),
         Ok(files) => {
             let mut lines = vec![format!("Memory files ({}):", files.len())];
@@ -433,17 +433,17 @@ fn handle_memory() -> String {
 }
 
 fn handle_doctor(config: &Config) -> String {
-    let report = borg_core::doctor::run_diagnostics(config);
+    let report = cortex::doctor::run_diagnostics(config);
     let (pass, warnings, fail) = report.counts();
     let mut lines = vec![format!(
         "Diagnostics: {pass} passed, {warnings} warning(s), {fail} failed"
     )];
     for check in &report.checks {
         match &check.status {
-            borg_core::doctor::CheckStatus::Warn(msg) => {
+            cortex::doctor::CheckStatus::Warn(msg) => {
                 lines.push(format!("  ⚠ {} — {msg}", check.name));
             }
-            borg_core::doctor::CheckStatus::Fail(msg) => {
+            cortex::doctor::CheckStatus::Fail(msg) => {
                 lines.push(format!("  ✗ {} — {msg}", check.name));
             }
             _ => {}
@@ -673,7 +673,7 @@ fn wrap_monospace(text: String) -> String {
 }
 
 fn handle_evolution(db: &Database) -> String {
-    match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Evolution, db) {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Evolution, db) {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/evolution dispatch failed: {e}");
@@ -683,7 +683,7 @@ fn handle_evolution(db: &Database) -> String {
 }
 
 fn handle_xp(db: &Database) -> String {
-    match borg_core::evolution::dispatch(borg_core::evolution::EvolutionCommand::Xp, db) {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Xp, db) {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/xp dispatch failed: {e}");
@@ -698,10 +698,7 @@ fn handle_card(db: &Database, args: &str) -> String {
     if !args.trim().is_empty() {
         return "/card on messaging channels does not accept arguments (no --out).".to_string();
     }
-    match borg_core::evolution::dispatch(
-        borg_core::evolution::EvolutionCommand::Card { out: None },
-        db,
-    ) {
+    match cortex::evolution::dispatch(cortex::evolution::EvolutionCommand::Card { out: None }, db) {
         Ok(out) => wrap_monospace(out.text),
         Err(e) => {
             warn!("/card dispatch failed: {e}");
@@ -825,7 +822,7 @@ mod tests {
                 &self,
                 _t: InboundTurn,
             ) -> anyhow::Result<(
-                tokio::sync::mpsc::Receiver<borg_core::agent::AgentEvent>,
+                tokio::sync::mpsc::Receiver<cortex::agent::AgentEvent>,
                 tokio_util::sync::CancellationToken,
             )> {
                 anyhow::bail!("not used in this test")

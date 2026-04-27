@@ -53,8 +53,8 @@
 //! required. [`collect`] picks up the new entry automatically on the next
 //! heartbeat tick.
 
-use borg_core::config::Config;
-use borg_core::db::Database;
+use cortex::config::Config;
+use cortex::db::Database;
 
 /// A single proactive nudge check.
 ///
@@ -164,22 +164,22 @@ fn check_critical_host_security(config: &Config) -> Option<String> {
         return None;
     }
     let mut checks = Vec::new();
-    borg_core::host_audit::check_firewall(&mut checks);
-    borg_core::host_audit::check_listening_ports(&mut checks);
-    borg_core::host_audit::check_ssh_config(&mut checks);
+    cortex::host_audit::check_firewall(&mut checks);
+    cortex::host_audit::check_listening_ports(&mut checks);
+    cortex::host_audit::check_ssh_config(&mut checks);
 
     build_security_nudge(&checks)
 }
 
 /// Build an LLM directive from diagnostic checks. Returns `None` when
 /// all checks pass. Extracted so it can be tested with synthetic data.
-fn build_security_nudge(checks: &[borg_core::doctor::DiagnosticCheck]) -> Option<String> {
+fn build_security_nudge(checks: &[cortex::doctor::DiagnosticCheck]) -> Option<String> {
     let issues: Vec<&str> = checks
         .iter()
         .filter_map(|c| match &c.status {
-            borg_core::doctor::CheckStatus::Warn(msg) => Some(msg.as_str()),
-            borg_core::doctor::CheckStatus::Fail(msg) => Some(msg.as_str()),
-            borg_core::doctor::CheckStatus::Pass => None,
+            cortex::doctor::CheckStatus::Warn(msg) => Some(msg.as_str()),
+            cortex::doctor::CheckStatus::Fail(msg) => Some(msg.as_str()),
+            cortex::doctor::CheckStatus::Pass => None,
         })
         .collect();
 
@@ -390,7 +390,7 @@ mod tests {
 
     // ── Host security augmenter tests ──
 
-    use borg_core::doctor::DiagnosticCheck;
+    use cortex::doctor::DiagnosticCheck;
 
     #[test]
     fn check_critical_host_security_respects_config_toggle() {

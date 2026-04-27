@@ -6,9 +6,9 @@
 //! per-day USD spend lands when the cost-tracking pipeline is wired into the
 //! daemon.
 
-use borg_core::config::Config;
-use borg_core::db::Database;
-use borg_proto::status::{
+use cortex::config::Config;
+use cortex::db::Database;
+use protocols::status::{
     status_server::Status, BondEvent as PbBondEvent, BondEventList, BondStateProto, Budget, Empty,
     EvolutionEvent as PbEvolutionEvent, EvolutionEventList, EvolutionStateProto, Heartbeat,
     Int64Cursor, Posture, StatusText, StatusTextRequest, Vitals, VitalsEvent as PbVitalsEvent,
@@ -39,9 +39,9 @@ impl Status for StatusSvc {
             let db = Database::open()?;
             let raw = db.get_vitals_state()?;
             let now = chrono::Utc::now();
-            let state = borg_core::vitals::apply_decay(&raw, now);
-            let drift = borg_core::vitals::detect_drift(&raw, now);
-            let drift_notice = borg_core::vitals::format_drift_notice(&drift).unwrap_or_default();
+            let state = cortex::vitals::apply_decay(&raw, now);
+            let drift = cortex::vitals::detect_drift(&raw, now);
+            let drift_notice = cortex::vitals::format_drift_notice(&drift).unwrap_or_default();
             let evo = match db.get_evolution_state() {
                 Ok(e) => Some(e),
                 Err(e) => {
@@ -58,9 +58,9 @@ impl Status for StatusSvc {
         let (stage, xp) = match evo {
             Some(e) => {
                 let stage = match e.stage {
-                    borg_core::evolution::Stage::Base => "Base",
-                    borg_core::evolution::Stage::Evolved => "Evolved",
-                    borg_core::evolution::Stage::Final => "Final",
+                    cortex::evolution::Stage::Base => "Base",
+                    cortex::evolution::Stage::Evolved => "Evolved",
+                    cortex::evolution::Stage::Final => "Final",
                 };
                 (stage, e.total_xp as u64)
             }
@@ -139,11 +139,11 @@ impl Status for StatusSvc {
         let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
             let db = Database::open()?;
             let events = db.get_all_bond_events()?;
-            let key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
-            let state = borg_core::bond::replay_events_with_key(&key, &events);
-            let correction = borg_core::bond::compute_correction_rate(&db);
-            let routine = borg_core::bond::compute_routine_success_rate(&db);
-            let pref = borg_core::bond::compute_preference_learning_count(&db);
+            let key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
+            let state = cortex::bond::replay_events_with_key(&key, &events);
+            let correction = cortex::bond::compute_correction_rate(&db);
+            let routine = cortex::bond::compute_routine_success_rate(&db);
+            let pref = cortex::bond::compute_preference_learning_count(&db);
             Ok((state, correction, routine, pref))
         })
         .await
@@ -294,38 +294,39 @@ impl Status for StatusSvc {
             };
 
             if let Some(ref evo) = evo_state {
-                compact_line = borg_core::evolution::format_compact(evo);
+                compact_line = cortex::evolution::format_compact(evo);
                 let width = if card_width == 0 {
                     48
                 } else {
                     card_width as usize
                 };
-                sections
-                    .push(borg_core::evolution::format_status_section_with_width(evo, width));
+                sections.push(cortex::evolution::format_status_section_with_width(
+                    evo, width,
+                ));
             }
 
             // Vitals
             if let Ok(state) = db.get_vitals_state() {
-                let state = borg_core::vitals::apply_decay(&state, now);
-                let mut drift = borg_core::vitals::detect_drift(&state, now);
+                let state = cortex::vitals::apply_decay(&state, now);
+                let mut drift = cortex::vitals::detect_drift(&state, now);
                 let since = (now - chrono::Duration::days(7)).timestamp();
                 let events = db.vitals_events_since(since).unwrap_or_default();
-                if borg_core::vitals::detect_failure_drift(&events) {
-                    drift.push(borg_core::vitals::DriftFlag::RepeatedFailures);
+                if cortex::vitals::detect_failure_drift(&events) {
+                    drift.push(cortex::vitals::DriftFlag::RepeatedFailures);
                 }
-                sections.push(borg_core::vitals::format_status(&state, &events, &drift));
+                sections.push(cortex::vitals::format_status(&state, &events, &drift));
             }
 
             // Bond
             if let Ok(bond_events) = db.get_all_bond_events() {
-                let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
-                let bond_state = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
-                let correction_rate = borg_core::bond::compute_correction_rate(&db);
-                let routine_rate = borg_core::bond::compute_routine_success_rate(&db);
-                let pref_count = borg_core::bond::compute_preference_learning_count(&db);
+                let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
+                let bond_state = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
+                let correction_rate = cortex::bond::compute_correction_rate(&db);
+                let routine_rate = cortex::bond::compute_routine_success_rate(&db);
+                let pref_count = cortex::bond::compute_preference_learning_count(&db);
                 let since = (now - chrono::Duration::days(7)).timestamp();
                 let recent = db.bond_events_since(since).unwrap_or_default();
-                sections.push(borg_core::bond::format_status(
+                sections.push(cortex::bond::format_status(
                     &bond_state,
                     correction_rate,
                     routine_rate,
@@ -335,13 +336,13 @@ impl Status for StatusSvc {
             }
 
             if let Some(ref evo) = evo_state {
-                sections.push(borg_core::evolution::format_archetype_scores(evo));
+                sections.push(cortex::evolution::format_archetype_scores(evo));
             }
 
             if cfg.evolution.enabled {
                 if let Ok(mut events) = db.evolution_events_since(0) {
                     events.reverse();
-                    sections.push(borg_core::evolution::format_history(&events));
+                    sections.push(cortex::evolution::format_history(&events));
                 }
             }
 
@@ -364,8 +365,8 @@ impl Status for StatusSvc {
     ) -> Result<Response<StatusText>, TStatus> {
         let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
             let db = Database::open()?;
-            let out = borg_core::evolution::commands::dispatch(
-                borg_core::evolution::commands::EvolutionCommand::Evolution,
+            let out = cortex::evolution::commands::dispatch(
+                cortex::evolution::commands::EvolutionCommand::Evolution,
                 &db,
             )?;
             Ok(out.text)
@@ -382,8 +383,8 @@ impl Status for StatusSvc {
     async fn get_xp_text(&self, _req: Request<Empty>) -> Result<Response<StatusText>, TStatus> {
         let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
             let db = Database::open()?;
-            let out = borg_core::evolution::commands::dispatch(
-                borg_core::evolution::commands::EvolutionCommand::Xp,
+            let out = cortex::evolution::commands::dispatch(
+                cortex::evolution::commands::EvolutionCommand::Xp,
                 &db,
             )?;
             Ok(out.text)
@@ -408,7 +409,7 @@ impl Status for StatusSvc {
             }
             let db = Database::open()?;
             let state = db.get_evolution_state()?;
-            Ok(borg_core::evolution::format_archetype_scores(&state))
+            Ok(cortex::evolution::format_archetype_scores(&state))
         })
         .await
         .map_err(|e| TStatus::internal(format!("archetypes text task panicked: {e}")))?
@@ -431,7 +432,7 @@ impl Status for StatusSvc {
             let db = Database::open()?;
             let mut events = db.evolution_events_since(0)?;
             events.reverse();
-            Ok(borg_core::evolution::format_history(&events))
+            Ok(cortex::evolution::format_history(&events))
         })
         .await
         .map_err(|e| TStatus::internal(format!("history text task panicked: {e}")))?

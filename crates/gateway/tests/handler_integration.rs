@@ -28,9 +28,9 @@
     clippy::useless_vec
 )]
 
-use borg_core::config::{ActivationMode, Config};
-use borg_gateway::handler::check_activation;
-use borg_gateway::routing::ResolvedRoute;
+use cortex::config::{ActivationMode, Config};
+use gateway::handler::check_activation;
+use gateway::routing::ResolvedRoute;
 
 fn route_with_activation(activation: Option<ActivationMode>) -> ResolvedRoute {
     ResolvedRoute {

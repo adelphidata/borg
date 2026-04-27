@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use borg_core::constants;
+use cortex::constants;
 use sha2::{Digest, Sha256};
 
 /// Cache of recently sent messages to detect echoes.

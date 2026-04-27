@@ -9,7 +9,7 @@ use crate::circuit_breaker::CircuitBreaker;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
-use borg_core::constants;
+use cortex::constants;
 
 use crate::constants::SIGNAL_HTTP_CONNECT_TIMEOUT;
 

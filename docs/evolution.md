@@ -28,9 +28,9 @@ gates transition at **Lvl.80** (lowered from 99 — the n^1.8 curve made 99 a
 hard cap**: levels past 99 cost a flat 50 XP each, giving long-term users an
 ongoing reason to engage.
 
-Autonomy is **not** derived from stage — it's a separate concept owned by the Bond module (`crates/core/src/bond.rs`, `AutonomyTier` with 5 variants: `ObserveOnly`, `Recommend`, `DraftAssist`, `GuidedAction`, `HighTrust`) driven by bond score. See `docs/bond.md`.
+Autonomy is **not** derived from stage — it's a separate concept owned by the Bond module (`crates/cortex/src/bond.rs`, `AutonomyTier` with 5 variants: `ObserveOnly`, `Recommend`, `DraftAssist`, `GuidedAction`, `HighTrust`) driven by bond score. See `docs/bond.md`.
 
-Source: `crates/core/src/evolution/mod.rs` (`Stage` enum), `crates/core/src/evolution/share_card.rs`.
+Source: `crates/cortex/src/evolution/mod.rs` (`Stage` enum), `crates/cortex/src/evolution/share_card.rs`.
 
 ---
 
@@ -52,7 +52,7 @@ Archetypes classify how you use Borg. The LLM uses your dominant archetype to ge
 | **Tinkerer** | Homelab, hardware, experimentation | "A curious hacker who can't leave a homelab alone for five minutes." |
 | **Marketer** | Marketing, growth, campaigns, funnels | "A data-driven growth hand tuning funnels, campaigns, and audience fit." |
 
-Source: `crates/core/src/evolution/mod.rs` (`Archetype` enum), `crates/core/src/evolution/classification.rs`.
+Source: `crates/cortex/src/evolution/mod.rs` (`Archetype` enum), `crates/cortex/src/evolution/classification.rs`.
 
 ### Signal Classification
 
@@ -80,7 +80,7 @@ Actions are classified to archetypes via three layers, in order:
 | **Tinkerer** | homelab, proxmox, pve, esxi, truenas, pihole, wireguard, tailscale, raspberry, arduino, gpio, mqtt, zigbee, esp32, stm32, fpga, oscilloscope, i2c, spi, uart, can-bus, modbus, home-assistant, openwrt, pfsense, opnsense, unifi, vlan, zfs, btrfs, octoprint, klipper, qemu, lxc |
 | **Marketer** | marketing, campaign, seo, google-ads, facebook-ads, mailchimp, sendgrid, hubspot, klaviyo, segment.io, mixpanel, amplitude, ga4, utm, funnel, conversion, cpc, roas, ltv, churn, retention, cohort, ab-test, landing-page, growth, newsletter, retargeting, remarketing, copywriting, brand, social-media |
 
-(Full lists in `crates/core/src/evolution/classification.rs`.)
+(Full lists in `crates/cortex/src/evolution/classification.rs`.)
 
 ### Archetype Scoring
 
@@ -97,7 +97,7 @@ shift well within a single 30-day window.
 
 The "is there a clear leader" check used by surfaces (heartbeat seeds,
 memory consolidation, skill priority) lives in
-`crates/core/src/evolution/scorer.rs::dominant_for_surfaces`, gated on a
+`crates/cortex/src/evolution/scorer.rs::dominant_for_surfaces`, gated on a
 single shared `DOMINANCE_THRESHOLD = 1.3`. One knob — if runaway
 specialization is observed, raise it everywhere at once.
 
@@ -134,7 +134,7 @@ Fallback names follow a simple `{Archetype} Borg` pattern. Both stages share the
 When no archetype clearly leads (top < `DOMINANCE_THRESHOLD` × runner-up),
 the fallback is a hybrid: `{Primary}-{Secondary} Hybrid Borg` (e.g.
 "Builder-Marketer Hybrid Borg"). Source:
-`crates/core/src/evolution/classification.rs::fallback_hybrid_name`.
+`crates/cortex/src/evolution/classification.rs::fallback_hybrid_name`.
 
 The evolution name is recorded in the `evolution_events` ledger. If the
 dominant archetype drifts and stays stably different from the name's
@@ -162,7 +162,7 @@ xp_for_level(stage, n) = stage_base + floor(n ^ stage_curve)
 Final stage past Lvl.99 is piecewise: each level costs a flat **50 XP**
 (`FINAL_POST_99_LEVEL_COST`). Triggers the `Ascending` mood and unlocks
 post-99 milestones every 25 levels (`level_125_final`, `level_150_final`, …).
-Source: `crates/core/src/evolution/xp.rs`.
+Source: `crates/cortex/src/evolution/xp.rs`.
 
 ### Plan-mode XP
 
@@ -173,7 +173,7 @@ block in Plan mode, **+2 base / +3 if the plan's archetype matches the
 dominant archetype** is awarded once per session. Plan-text is classified
 against the same keyword tables as shell commands. Per-session cap:
 `record_plan_emission` rejects subsequent emissions in the same session.
-Source: `crates/core/src/evolution/plan_emission.rs`.
+Source: `crates/cortex/src/evolution/plan_emission.rs`.
 
 ### XP Awarded per Action
 
@@ -248,13 +248,13 @@ No further evolution at the stage level — but the Final stage no longer caps
 at Lvl.99. Levels past 99 are piecewise (50 XP each), `Ascending` mood is
 unlocked, and post-99 milestones fire every 25 levels.
 
-Source: `crates/core/src/evolution/mod.rs`.
+Source: `crates/cortex/src/evolution/mod.rs`.
 
 ---
 
 ## Milestones
 
-Sub-evolution wins, detected by `check_milestones(prev, next)` in `crates/core/src/evolution/milestones.rs`. Each milestone ID fires **at most once** (deduped against `milestone_unlocked` rows in the ledger).
+Sub-evolution wins, detected by `check_milestones(prev, next)` in `crates/cortex/src/evolution/milestones.rs`. Each milestone ID fires **at most once** (deduped against `milestone_unlocked` rows in the ledger).
 
 ### Level Milestones
 
@@ -284,7 +284,7 @@ A lossy UX signal (not authoritative) surfaced in the TUI ambient header.
 | **Focused** | focus ≥ 70 + stability ≥ 60 |
 | **Stable** | Default fallback |
 
-Source: `crates/core/src/evolution/helpers.rs`.
+Source: `crates/cortex/src/evolution/helpers.rs`.
 
 ---
 
@@ -331,8 +331,8 @@ Stage: Evolved | Ops Borg Lvl.42
 Archetype: Ops (score: 74)
 ```
 
-Source: `crates/core/src/evolution/scorer.rs` (dominance threshold),
-`crates/core/src/evolution/format.rs` (status rendering).
+Source: `crates/cortex/src/evolution/scorer.rs` (dominance threshold),
+`crates/cortex/src/evolution/format.rs` (status rendering).
 
 ### Cosmetic
 
@@ -348,7 +348,7 @@ Shows name, level, mood, and dominant archetype (e.g. `Ops Borg Lv.42 — Focuse
 
 ## Status Surfaces
 
-All status commands share one dispatcher at `borg_core::evolution::{parse, dispatch, CommandOutput, EvolutionCommand}` — TUI and every messaging channel render identical text.
+All status commands share one dispatcher at `cortex::evolution::{parse, dispatch, CommandOutput, EvolutionCommand}` — TUI and every messaging channel render identical text.
 
 | Command | Content |
 |---------|---------|
@@ -437,7 +437,7 @@ Title: `* * *  F I N A L   F O R M  * * *` on Final transitions, `* * *  E V O L
 
 Simpler `MILESTONE UNLOCKED` card showing title, level, stage, and (if any) archetype. Inner width 36 chars.
 
-Source: `crates/core/src/evolution/celebration.rs`.
+Source: `crates/cortex/src/evolution/celebration.rs`.
 
 ---
 
@@ -460,18 +460,18 @@ Always returns `Continue` except at `BeforeAgentStart` / `BeforeLlmCall`.
 
 | File | Role |
 |------|------|
-| `crates/core/src/evolution/mod.rs` | Core types (`Stage`, `Archetype`, `Mood`, `Trend`), scoring, gate logic, `EvolutionHook` |
-| `crates/core/src/evolution/xp.rs` | XP curves and per-stage level costs |
-| `crates/core/src/evolution/classification.rs` | Keyword sets, tool mapping, LLM name generation, fallback names/descriptions |
-| `crates/core/src/evolution/milestones.rs` | Milestone detection and dedup |
-| `crates/core/src/evolution/celebration.rs` | ASCII art, celebration formatting |
-| `crates/core/src/evolution/share_card.rs` | `/card` renderer |
-| `crates/core/src/evolution/commands.rs` | `/evolution`, `/xp`, `/card` dispatcher |
-| `crates/core/src/evolution/feed.rs` | `/xp` feed entries |
-| `crates/core/src/evolution/format.rs` | Shared formatting helpers |
-| `crates/core/src/evolution/helpers.rs` | Mood computation, momentum windows |
-| `crates/core/src/evolution/hmac.rs` | HMAC chain helpers |
-| `crates/core/src/evolution/replay.rs` | Event replay → state |
-| `crates/core/src/db.rs` | V24 migration, `evolution_events` CRUD |
-| `crates/cli/src/main.rs` | `borg status` integration |
-| `crates/cli/src/tui/mod.rs`, `crates/cli/src/repl.rs` | `EvolutionHook` registration |
+| `crates/cortex/src/evolution/mod.rs` | Core types (`Stage`, `Archetype`, `Mood`, `Trend`), scoring, gate logic, `EvolutionHook` |
+| `crates/cortex/src/evolution/xp.rs` | XP curves and per-stage level costs |
+| `crates/cortex/src/evolution/classification.rs` | Keyword sets, tool mapping, LLM name generation, fallback names/descriptions |
+| `crates/cortex/src/evolution/milestones.rs` | Milestone detection and dedup |
+| `crates/cortex/src/evolution/celebration.rs` | ASCII art, celebration formatting |
+| `crates/cortex/src/evolution/share_card.rs` | `/card` renderer |
+| `crates/cortex/src/evolution/commands.rs` | `/evolution`, `/xp`, `/card` dispatcher |
+| `crates/cortex/src/evolution/feed.rs` | `/xp` feed entries |
+| `crates/cortex/src/evolution/format.rs` | Shared formatting helpers |
+| `crates/cortex/src/evolution/helpers.rs` | Mood computation, momentum windows |
+| `crates/cortex/src/evolution/hmac.rs` | HMAC chain helpers |
+| `crates/cortex/src/evolution/replay.rs` | Event replay → state |
+| `crates/cortex/src/db.rs` | V24 migration, `evolution_events` CRUD |
+| `crates/interface/src/main.rs` | `borg status` integration |
+| `crates/interface/src/tui/mod.rs`, `crates/interface/src/repl.rs` | `EvolutionHook` registration |

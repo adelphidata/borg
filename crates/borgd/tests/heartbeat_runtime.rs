@@ -12,13 +12,13 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use borg_proto::admin::admin_client::AdminClient;
-use borg_proto::admin::admin_server::AdminServer;
-use borg_proto::admin::Empty as AdminEmpty;
 use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::heartbeat::{DaemonHeartbeatEvent, HeartbeatBus, HeartbeatSource};
 use borgd::session::SessionRegistry;
+use protocols::admin::admin_client::AdminClient;
+use protocols::admin::admin_server::AdminServer;
+use protocols::admin::Empty as AdminEmpty;
 use std::path::Path;
 use std::time::Duration;
 use tokio::net::UnixStream;

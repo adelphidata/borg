@@ -11,7 +11,7 @@ use super::parse::parse_envelope;
 use super::types::SignalEnvelope;
 use crate::handler::InboundMessage;
 
-use borg_core::constants;
+use cortex::constants;
 
 const MIN_BACKOFF: Duration = constants::SIGNAL_SSE_MIN_BACKOFF;
 const MAX_BACKOFF: Duration = constants::SIGNAL_SSE_MAX_BACKOFF;

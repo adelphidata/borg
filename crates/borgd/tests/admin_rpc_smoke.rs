@@ -13,22 +13,27 @@
 //! directly. Same wire format, same handlers — the wrapper is a thin
 //! ergonomic layer (covered by the cli's own compile.)
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::type_complexity, clippy::await_holding_lock)]
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::type_complexity,
+    clippy::await_holding_lock
+)]
 
-use borg_core::db::{Database, NewTask, NewWorkflowStep, UpdateTask};
-use borg_proto::admin::admin_client::AdminClient;
-use borg_proto::admin::admin_server::AdminServer;
-use borg_proto::admin::{
-    api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ProjectRef, ScheduledTaskUpdate,
-};
-use borg_proto::status::status_client::StatusClient;
-use borg_proto::status::status_server::StatusServer;
-use borg_proto::status::{Empty as StatusEmpty, Int64Cursor};
 use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::grpc::status::StatusSvc;
 use borgd::session::SessionRegistry;
+use cortex::db::{Database, NewTask, NewWorkflowStep, UpdateTask};
+use protocols::admin::admin_client::AdminClient;
+use protocols::admin::admin_server::AdminServer;
+use protocols::admin::{
+    api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
+    ProjectRef, ScheduledTaskUpdate,
+};
+use protocols::status::status_client::StatusClient;
+use protocols::status::status_server::StatusServer;
+use protocols::status::{Empty as StatusEmpty, Int64Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -240,7 +245,7 @@ async fn projects_admin_rpcs_round_trip_workflows_and_archive() {
     assert!(warnings.warnings.is_empty(), "no doctor_runs → empty list");
     {
         let db = Database::open().expect("db");
-        let report = borg_core::maintenance::MaintenanceReport {
+        let report = cortex::maintenance::MaintenanceReport {
             ran_at: 1,
             persistent_warnings: vec!["A:check".into(), "B:check".into()],
             current_issues: vec!["other:thing".into()],
@@ -422,8 +427,14 @@ async fn api_key_admin_rpcs_round_trip_literal_keychain_and_unset() {
         .iter()
         .map(|e| (e.provider.clone(), e.backend.clone()))
         .collect();
-    assert_eq!(by_provider.get("openrouter").map(String::as_str), Some("literal"));
-    assert_eq!(by_provider.get("anthropic").map(String::as_str), Some("keychain"));
+    assert_eq!(
+        by_provider.get("openrouter").map(String::as_str),
+        Some("literal")
+    );
+    assert_eq!(
+        by_provider.get("anthropic").map(String::as_str),
+        Some("keychain")
+    );
 
     // 4. Unset → Get must report the unset variant (NOT a literal with an
     //    empty string — that's the off-by-one we're guarding against).
@@ -499,7 +510,7 @@ async fn status_rpcs_round_trip_evolution_bond_vitals_and_xp() {
             "session_start",
             // Must match the canonical delta for the "interaction" category;
             // record_vitals_event validates these to prevent gaming.
-            &borg_core::vitals::deltas_for(borg_core::vitals::EventCategory::Interaction),
+            &cortex::vitals::deltas_for(cortex::vitals::EventCategory::Interaction),
             None,
         )
         .expect("vitals 1");

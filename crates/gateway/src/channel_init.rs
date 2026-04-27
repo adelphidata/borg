@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use borg_core::config::Config;
-use borg_core::db::Database;
+use cortex::config::Config;
+use cortex::db::Database;
 use tracing::{info, warn};
 
 use crate::discord::api::DiscordClient;
@@ -27,7 +27,7 @@ fn resolve_credential(config: &Config, _plugin_id: &str, key: &str) -> Option<St
 
 fn log_gateway_activity(message: &str) {
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        borg_core::activity_log::log_activity(&adb, "info", "gateway", message);
+        cortex::activity_log::log_activity(&adb, "info", "gateway", message);
     }
 }
 
@@ -273,7 +273,7 @@ pub(crate) async fn init_signal(config: &Config) -> Option<Arc<SignalClient>> {
             let port = config
                 .gateway
                 .signal_cli_port
-                .unwrap_or(borg_core::constants::SIGNAL_CLI_PORT_DEFAULT);
+                .unwrap_or(cortex::constants::SIGNAL_CLI_PORT_DEFAULT);
             let base_url = format!("http://{host}:{port}");
             match SignalClient::new(&base_url, account) {
                 Ok(client) => match client.probe().await {
@@ -333,7 +333,7 @@ mod tests {
         unsafe { std::env::set_var(key, "config-value") };
         config.credentials.insert(
             key.to_string(),
-            borg_core::config::CredentialValue::EnvVar(key.to_string()),
+            cortex::config::CredentialValue::EnvVar(key.to_string()),
         );
         let result = resolve_credential(&config, "messaging/test", key);
         unsafe { std::env::remove_var(key) };
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn resolve_credential_or_env_logs_on_failure() {
         // Verify the source code contains the warning log
-        let source = include_str!("../../core/src/config/mod.rs");
+        let source = include_str!("../../cortex/src/config/mod.rs");
         assert!(
             source.contains("Failed to resolve credential"),
             "resolve_credential_or_env must log when credential resolution fails"
@@ -391,7 +391,7 @@ mod tests {
     /// Guard: TUI uninstall handler must wipe the data directory.
     #[test]
     fn uninstall_handler_wipes_data_directory() {
-        let source = include_str!("../../cli/src/tui/mod.rs");
+        let source = include_str!("../../interface/src/tui/mod.rs");
         let uninstall_section: String = source
             .lines()
             .skip_while(|l| !l.contains("PluginAction::Uninstall"))
@@ -407,7 +407,7 @@ mod tests {
     /// Guard: uninstall must restart gateway for channel plugins.
     #[test]
     fn uninstall_restarts_gateway_for_channels() {
-        let source = include_str!("../../cli/src/tui/mod.rs");
+        let source = include_str!("../../interface/src/tui/mod.rs");
         // Find the Uninstall block and verify it calls restart_gateway
         let uninstall_section: String = source
             .lines()

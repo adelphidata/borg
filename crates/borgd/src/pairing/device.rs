@@ -19,14 +19,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use borg_core::db::{audit_events, AuditWriter, ConsumeOutcome, Database};
-use borg_pki::{
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use cortex::db::{audit_events, AuditWriter, ConsumeOutcome, Database};
+use hkdf::Hkdf;
+use identity::{
     ca::{issue_client_cert, ClientCertParams},
     fingerprint_sha256,
 };
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
@@ -82,10 +82,8 @@ impl BootstrapListener {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
         tracing::info!(path = %self.socket_path.display(), "pairing bootstrap listener ready");
 
@@ -279,7 +277,11 @@ pub mod client {
         pub not_after: i64,
     }
 
-    pub async fn run(socket_path: &std::path::Path, code: &str, device_label: &str) -> Result<PairResult> {
+    pub async fn run(
+        socket_path: &std::path::Path,
+        code: &str,
+        device_label: &str,
+    ) -> Result<PairResult> {
         let mut stream = UnixStream::connect(socket_path)
             .await
             .with_context(|| format!("connect bootstrap socket {:?}", socket_path))?;
@@ -359,13 +361,13 @@ pub fn mint_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_pki::{ca::generate_root_ca, MemoryKekStore};
+    use identity::{ca::generate_root_ca, MemoryKekStore};
     use rusqlite::Connection;
 
     fn make_state() -> (BootstrapState, MemoryKekStore) {
         let kek = MemoryKekStore::new();
-        let db = Database::from_connection(Connection::open_in_memory().expect("db"))
-            .expect("init");
+        let db =
+            Database::from_connection(Connection::open_in_memory().expect("db")).expect("init");
         let ca = generate_root_ca("borg-test-ca").expect("ca");
         let shared = Arc::new(Mutex::new(db));
         let audit = AuditWriter::new(shared.clone());
@@ -452,7 +454,9 @@ mod tests {
             .expect("lock")
             .list_audit_events()
             .expect("audit");
-        assert!(events.iter().any(|e| e.event_type == audit_events::CERT_ISSUED));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == audit_events::CERT_ISSUED));
         assert!(events
             .iter()
             .any(|e| e.event_type == audit_events::PAIRING_APPROVED));
@@ -493,9 +497,13 @@ mod tests {
             .expect("lock")
             .list_audit_events()
             .expect("audit");
-        assert!(events.iter().any(|e| e.event_type == audit_events::PAIRING_DENIED));
+        assert!(events
+            .iter()
+            .any(|e| e.event_type == audit_events::PAIRING_DENIED));
         // No cert issued.
-        assert!(events.iter().all(|e| e.event_type != audit_events::CERT_ISSUED));
+        assert!(events
+            .iter()
+            .all(|e| e.event_type != audit_events::CERT_ISSUED));
 
         server.abort();
     }

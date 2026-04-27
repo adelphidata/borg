@@ -1,0 +1,2012 @@
+mod app;
+mod btw_popup;
+mod colors;
+mod command_popup;
+mod commands;
+mod composer;
+mod diff_render;
+mod external_editor;
+mod file_popup;
+mod file_search;
+mod goodbye;
+mod highlight;
+mod history;
+mod layout;
+mod line_utils;
+mod markdown;
+pub(crate) mod migrate_popup;
+mod model_popup;
+mod pairing_popup;
+mod paste_burst;
+mod plan_overlay;
+mod plugins_popup;
+mod popup_utils;
+mod projects_popup;
+mod schedule_popup;
+mod sessions_popup;
+mod settings_popup;
+mod shimmer;
+mod status_popup;
+pub(crate) mod theme;
+mod toast;
+mod tool_display;
+mod transcript_pager;
+mod wrapping;
+
+use std::io::stdout;
+use std::panic;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
+
+// ============================================================================
+// IMPORTANT: Native text selection MUST work in this TUI. DO NOT regress.
+// ============================================================================
+// Users expect click+drag selection (for copy/paste) to work exactly like any
+// normal terminal, with no modifier keys required. Any form of mouse tracking
+// reported to the application breaks this, because the terminal hands click
+// events to us instead of engaging its own selection handler.
+//
+// Strategy: we enable ONLY xterm "Alternate Scroll Mode" (?1007h). In alt
+// screen, the terminal itself translates mouse-wheel events into CUR_UP /
+// CUR_DOWN key sequences that arrive as normal KeyCode::Up / KeyCode::Down.
+// We never enable any mouse tracking mode, so click+drag text selection stays
+// handled entirely by the terminal — exactly like in `less`, `vim`, etc.
+//
+// FORBIDDEN — DO NOT ADD any of these (each one will regress text selection):
+//   - ?1000h  Normal button tracking — clicks go to app, breaks selection.
+//   - ?1002h  Button-event (drag) tracking — same, plus eats drag events.
+//   - ?1003h  Any-event tracking — captures every mouse movement.
+//   - ?1006h  SGR extended coordinates — only meaningful with the above.
+//   - crossterm::event::EnableMouseCapture — it turns on ?1000h + ?1002h + ?1003h + ?1006h.
+//
+// Wheel-sourced arrow keys are routed to transcript scroll vs composer history
+// in App::handle_key using the existing scroll_offset state as disambiguator.
+//
+// This has regressed multiple times. Source-string guard tests in this module
+// and in app.rs will fail the build if any forbidden mode is reintroduced.
+// See CLAUDE.md "Mouse Interaction" for the full rationale.
+// Reference implementation: reference/codex/codex-rs/tui/src/tui.rs
+// ============================================================================
+
+/// Enable xterm Alternate Scroll Mode (`?1007h`).
+///
+/// When active inside the alternate screen, the terminal translates
+/// mouse-wheel events into cursor-up / cursor-down key sequences. No mouse
+/// tracking is enabled, so native click+drag text selection is untouched.
+struct EnableAlternateScroll;
+
+impl crossterm::Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        // ?1007h — xterm Alternate Scroll Mode. DO NOT add any other mode here.
+        f.write_str("\x1b[?1007h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        // Windows consoles deliver wheel events through input records without
+        // needing an xterm-style mode switch, and there is no native equivalent
+        // to ?1007h. No-op is correct here.
+        Ok(())
+    }
+}
+
+/// Disable xterm Alternate Scroll Mode (`?1007l`).
+struct DisableAlternateScroll;
+
+impl crossterm::Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+use cortex::agent::AgentEvent;
+use cortex::config::{CollaborationMode, Config};
+use cortex::telemetry::BorgMetrics;
+use heartbeat::scheduler::HeartbeatEvent;
+
+use crate::daemon_client::{forward_event_stream, DaemonClient};
+
+use app::{App, AppAction};
+use history::HistoryCell;
+
+/// Spawn the gateway server and/or iMessage monitor.
+/// Always starts the gateway (native channels are detected via credentials inside GatewayServer).
+fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetrics) -> bool {
+    let gw_config = config.clone();
+    #[allow(clippy::redundant_clone)]
+    let gw_shutdown = shutdown.clone();
+    let gw_metrics = metrics;
+    tokio::spawn(async move {
+        match gateway::GatewayServer::new(gw_config, gw_shutdown, gw_metrics, None, None) {
+            Ok(server) => {
+                if let Err(e) = server.run().await {
+                    let msg = e.to_string();
+                    if msg.contains("address already in use") || msg.contains("AddrInUse") {
+                        tracing::warn!("Gateway: {e}");
+                    } else {
+                        tracing::error!("Gateway exited with error: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::error!("Failed to initialize gateway: {e}"),
+        }
+    });
+
+    // Start native iMessage monitor if channel is installed (mirrors service.rs)
+    #[cfg(target_os = "macos")]
+    if let Ok(data_dir) = Config::data_dir() {
+        let imessage_dir = data_dir.join("channels/imessage");
+        if imessage_dir.join("channel.toml").exists() {
+            let probe = gateway::imessage::probe::probe_imessage();
+            match probe.status {
+                gateway::imessage::probe::ProbeStatus::Ok => {
+                    let im_config = config.clone();
+                    let im_shutdown = shutdown;
+                    tokio::spawn(async move {
+                        match gateway::imessage::start_imessage_monitor(im_config, im_shutdown)
+                            .await
+                        {
+                            Ok(_handle) => tracing::info!("iMessage monitor started"),
+                            Err(e) => tracing::warn!("iMessage monitor failed: {e}"),
+                        }
+                    });
+                }
+                gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
+                    tracing::warn!("iMessage: Full Disk Access required (System Settings > Privacy & Security). Skipping monitor.");
+                }
+                other => {
+                    tracing::warn!("iMessage probe: {other}. Skipping monitor.");
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Restart the gateway: if a daemon owns the port, signal it via HTTP;
+/// otherwise cancel the local token and respawn in-process.
+/// Build the user-facing post-install message for a plugin.
+///
+/// Channel plugins get an extra line explaining the pairing workflow: the user
+/// must DM the bot first so a pairing code is generated, then approve it in
+/// the TUI. The gateway-restart outcome is intentionally NOT included here —
+/// it is logged separately for debugging.
+fn build_post_install_message(plugin_name: &str, notes: &[String], is_channel: bool) -> String {
+    let mut msg = format!("Installed {plugin_name}");
+    for note in notes {
+        msg.push_str(&format!("\n  {note}"));
+    }
+    if is_channel {
+        msg.push_str(&format!(
+            "\n  Send a message to the bot on {plugin_name} to get your pairing code, then run: /pairing approve <CODE>"
+        ));
+    }
+    msg
+}
+
+async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> String {
+    // Try to signal a running daemon's gateway first
+    let config = match Config::load_from_db() {
+        Ok(c) => c,
+        Err(e) => return format!("Gateway restart failed: could not reload config: {e}"),
+    };
+    let addr = format!("{}:{}", config.gateway.host, config.gateway.port);
+    let url = format!("http://{addr}/internal/restart");
+
+    let daemon_signalled = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .ok()?;
+        let resp = client.post(&url).send().await.ok()?;
+        resp.status().is_success().then_some(())
+    }
+    .await
+    .is_some();
+
+    if daemon_signalled {
+        return "Gateway restarted.".to_string();
+    }
+
+    // No daemon running — restart the in-process gateway
+    let shutdown = gateway_shutdown.try_lock();
+    let Ok(mut shutdown) = shutdown else {
+        return "Gateway restart failed: could not acquire lock".to_string();
+    };
+
+    shutdown.cancel();
+
+    let new_token = CancellationToken::new();
+    *shutdown = new_token.clone();
+
+    spawn_gateway(&config, new_token, BorgMetrics::noop());
+    "Gateway restarted.".to_string()
+}
+
+/// Guard that restores terminal state on drop (both normal exit and early error return).
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = stdout().execute(DisableBracketedPaste);
+        let _ = stdout().execute(DisableAlternateScroll);
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+    }
+}
+
+/// Information needed to print a "resume this session" hint after the TUI exits.
+pub struct ResumeHint {
+    /// Short (8-char) session ID for compact display.
+    pub short_id: String,
+    /// Session title for display.
+    pub title: String,
+}
+
+pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
+    // Kick off a background fetch of the OpenRouter model catalog so the
+    // `/model` picker reflects the live list (dropping stale IDs, tagging
+    // free models). Fire-and-forget: if it fails, the picker falls back to
+    // the hardcoded curated list.
+    crate::openrouter_catalog::spawn_prefetch();
+
+    let config = Config::load_from_db()?;
+    let metrics = BorgMetrics::from_config(&config);
+
+    // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,
+    // activity, bond, evolution, budget, script), and config watcher all live
+    // inside `borgd` now — registered in `AgentBackend::new` rather than here.
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    let (session_id, _last_seq) = client.open_session(resume.as_deref()).await?;
+
+    // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
+    // <id>` inside the TUI. Launching the TUI with no args always starts a
+    // fresh session.
+    let mut resumed_info: Option<(String, usize)> = None;
+    if let Some(prefix) = resume.as_deref() {
+        match cortex::session::resolve_session_id(prefix) {
+            Ok(meta) => {
+                let title = meta.title.clone();
+                let count = meta.message_count;
+                if let Err(e) = client.load_agent_session(&session_id, &meta.id).await {
+                    eprintln!("borg: failed to load session '{}': {e}", meta.id);
+                    return Ok(None);
+                }
+                resumed_info = Some((title, count));
+            }
+            Err(e) => {
+                eprintln!("borg: {e}");
+                return Ok(None);
+            }
+        }
+    }
+
+    // Heartbeat scheduling lives in the daemon now. The TUI subscribes to
+    // `Admin.SubscribeHeartbeatEvents` and forwards proto events into the
+    // App's existing heartbeat_rx so the rest of the rendering stays
+    // identical to the in-process scheduler.
+    let heartbeat_cancel = CancellationToken::new();
+    let _heartbeat_guard = heartbeat_cancel.clone().drop_guard();
+    let (hb_proto_tx, hb_proto_rx) = mpsc::channel::<HeartbeatEvent>(32);
+    let heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>> = Some(hb_proto_rx);
+    let heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>> = Some(hb_proto_tx.clone());
+    let poke_tx: Option<mpsc::Sender<()>> = None;
+    {
+        let mut sub_client = client.clone();
+        let cancel = heartbeat_cancel.clone();
+        tokio::spawn(async move {
+            let mut stream = match sub_client.subscribe_heartbeat_events().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("subscribe_heartbeat_events failed: {e}");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    next = stream.message() => {
+                        match next {
+                            Ok(Some(evt)) => {
+                                let result = match evt.status.as_str() {
+                                    "ran" => heartbeat::scheduler::HeartbeatResult::Ran {
+                                        message: evt.message,
+                                        duration_ms: evt.duration_ms as u64,
+                                    },
+                                    "skipped" => heartbeat::scheduler::HeartbeatResult::Skipped {
+                                        reason: heartbeat::scheduler::SkipReason::EmptyResponse,
+                                    },
+                                    _ => heartbeat::scheduler::HeartbeatResult::Failed {
+                                        error: evt.message,
+                                    },
+                                };
+                                if hb_proto_tx
+                                    .send(HeartbeatEvent::Result(result))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(e) => {
+                                tracing::warn!("heartbeat stream error: {e}");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Auto-start gateway if enabled and any channels are installed
+    let gateway_shutdown_token = CancellationToken::new();
+    let _gateway_guard = gateway_shutdown_token.clone().drop_guard();
+    spawn_gateway(&config, gateway_shutdown_token.clone(), metrics.clone());
+    let gateway_shutdown = Arc::new(Mutex::new(gateway_shutdown_token));
+
+    // Query terminal background before entering alt screen (some terminals
+    // don't respond to the query inside alternate screen).
+    colors::query_terminal_bg();
+
+    enable_raw_mode()?;
+    stdout().execute(EnterAlternateScreen)?;
+    stdout().execute(EnableAlternateScroll)?;
+    stdout().execute(EnableBracketedPaste)?;
+
+    // Guard ensures terminal is restored on any exit path (error or normal)
+    let _guard = TerminalGuard;
+
+    // Install panic hook that restores terminal before printing panic
+    let original_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        let _ = stdout().execute(DisableBracketedPaste);
+        let _ = stdout().execute(DisableAlternateScroll);
+        let _ = disable_raw_mode();
+        let _ = stdout().execute(LeaveAlternateScreen);
+        original_hook(info);
+    }));
+
+    let backend = CrosstermBackend::new(stdout());
+    let mut terminal = Terminal::new(backend)?;
+
+    let app_client = Arc::new(Mutex::new(client.clone()));
+    let mut app = App::new(
+        config,
+        heartbeat_rx,
+        heartbeat_event_tx,
+        poke_tx,
+        app_client,
+    );
+    if let Some((title, count)) = resumed_info {
+        app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
+    }
+    // Show drift notice on session start (computed daemon-side from raw
+    // vitals state — the cli only renders if non-empty).
+    match client.get_vitals().await {
+        Ok(v) => {
+            if !v.drift_notice.is_empty() {
+                app.push_system_message(v.drift_notice);
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "session-start vitals fetch failed"),
+    }
+    // Auto-trigger first conversation if SETUP.md exists (fresh onboarding),
+    // otherwise fire a throttled proactive greeting that reuses the heartbeat
+    // pipeline. Throttle is shared with the scheduled heartbeat via the
+    // persisted `heartbeat.last_fired_at` setting so we don't double-nudge.
+    let setup_exists = Config::data_dir()
+        .map(|d| d.join("SETUP.md").exists())
+        .unwrap_or(false);
+    if setup_exists {
+        app.queued_messages.push_back(app::QueuedMessage {
+            text: "Hello! I just finished onboarding.".to_string(),
+            images: Vec::new(),
+        });
+    } else if should_fire_session_start_greeting(&app.config) {
+        // Daemon owns heartbeat scheduling + execution. Ask it to fire one
+        // immediately; the proto event stream forwards the result back into
+        // our existing `heartbeat_rx` rendering path.
+        let mut poke_client = client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = poke_client.poke().await {
+                tracing::warn!("session-start poke failed: {e}");
+            }
+        });
+    }
+
+    let mut event_stream = EventStream::new();
+    let tick_rate = Duration::from_millis(100);
+
+    run_event_loop(
+        &mut terminal,
+        &mut app,
+        &mut client,
+        &session_id,
+        &mut event_stream,
+        tick_rate,
+        &gateway_shutdown,
+        &heartbeat_cancel,
+    )
+    .await
+}
+
+/// Convert the TUI's image attachments into the proto's `InlineImage` shape.
+/// The wire format takes raw bytes (NOT base64) — daemon side encodes when
+/// constructing the agent's multimodal message.
+fn images_to_proto(images: Vec<composer::ImageAttachment>) -> Vec<protocols::session::InlineImage> {
+    images
+        .into_iter()
+        .map(|img| protocols::session::InlineImage {
+            mime_type: img.mime_type,
+            data: img.data,
+            filename: String::new(),
+        })
+        .collect()
+}
+
+/// Gate for the TUI-open proactive greeting: respects the user's enable flag
+/// and the shared `heartbeat.last_fired_at` throttle so scheduled heartbeats
+/// and TUI-open greetings can't nudge within the same window.
+fn should_fire_session_start_greeting(config: &Config) -> bool {
+    if !config.heartbeat.session_start_enabled {
+        return false;
+    }
+    let throttle_secs = i64::from(config.heartbeat.session_start_throttle_minutes) * 60;
+    if throttle_secs <= 0 {
+        return true;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let last = config.heartbeat.last_fired_at;
+    last <= 0 || now - last >= throttle_secs
+}
+
+/// If the app just became idle and has queued messages, auto-submit the next one.
+/// Remaining messages stay in the queue and drain on subsequent TurnComplete events.
+/// If the last turn errored, pause the queue and notify the user.
+fn drain_queued_if_idle(app: &mut App<'_>) -> Result<AppAction> {
+    if matches!(app.state, app::AppState::Idle) {
+        // Don't start a new streaming turn while a popup is open — it would
+        // change AppState to Streaming and break input routing to the popup.
+        if app.any_popup_visible() {
+            return Ok(AppAction::Continue);
+        }
+        if app.last_turn_errored && !app.queued_messages.is_empty() {
+            if !app.queue_pause_notified {
+                app.push_system_message(
+                    "[queue paused — enter to resume, esc to clear]".to_string(),
+                );
+                app.queue_pause_notified = true;
+            }
+            return Ok(AppAction::Continue);
+        }
+        if let Some(qm) = app.pop_next_queued() {
+            return app.handle_queued_submit(qm);
+        }
+    }
+    Ok(AppAction::Continue)
+}
+
+/// Write a session export to the current working directory and surface the
+/// result in the transcript. Errors (RPC failure, file-system failure) are
+/// reported to the user — we never silently swallow.
+async fn handle_export(
+    app: &mut App<'_>,
+    client: &mut DaemonClient,
+    session_id: &str,
+    format: cortex::export::ExportFormat,
+) {
+    let format_str = match format {
+        cortex::export::ExportFormat::Json => "json",
+        cortex::export::ExportFormat::Csv => "csv",
+        cortex::export::ExportFormat::Txt => "txt",
+    };
+    let resp = match client.export_session(session_id, format_str).await {
+        Ok(r) => r,
+        Err(e) => {
+            app.push_system_message(format!("Export failed: {e}"));
+            return;
+        }
+    };
+    let rendered = String::from_utf8_lossy(&resp.content).into_owned();
+    let filename = resp.suggested_filename;
+    let path = match std::env::current_dir() {
+        Ok(cwd) => cwd.join(&filename),
+        Err(e) => {
+            app.push_system_message(format!("Export failed (cwd): {e}"));
+            return;
+        }
+    };
+    // create_new closes the TOCTOU window between exists() and write(). If the
+    // filename already exists (same second stamp, rapid re-export), fail loudly
+    // rather than clobber — the transcript message tells the user.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            if let Err(e) = f.write_all(rendered.as_bytes()) {
+                app.push_system_message(format!("Export failed writing {}: {e}", path.display()));
+                return;
+            }
+        }
+        Err(e) => {
+            app.push_system_message(format!(
+                "Export aborted: could not create {} (refusing to overwrite): {e}",
+                path.display()
+            ));
+            return;
+        }
+    }
+    let short: String = session_id.chars().take(8).collect();
+    app.push_system_message(format!("Exported session {} → {}", short, path.display()));
+}
+
+/// Format an integer with comma thousands separators (e.g. `3999` → `"3,999"`).
+/// Used by the `/usage` display so large token counts are scannable.
+fn fmt_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App<'_>,
+    client: &mut DaemonClient,
+    session_id: &str,
+    event_stream: &mut EventStream,
+    tick_rate: Duration,
+    gateway_shutdown: &Arc<Mutex<CancellationToken>>,
+    heartbeat_cancel: &CancellationToken,
+) -> Result<Option<ResumeHint>> {
+    let mut tick_interval = tokio::time::interval(tick_rate);
+
+    loop {
+        terminal.draw(|frame| app.render(frame))?;
+
+        let action = tokio::select! {
+            biased;
+
+            // Agent events (check first for responsiveness)
+            event = async {
+                if let Some(rx) = &mut app.event_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match event {
+                    Some(ev) => {
+                        app.process_agent_event(ev);
+                        drain_queued_if_idle(app)?
+                    }
+                    None => {
+                        // Channel closed (agent task finished or panicked)
+                        app.handle_agent_channel_closed();
+                        drain_queued_if_idle(app)?
+                    }
+                }
+            }
+
+            // Heartbeat events
+            Some(event) = async {
+                if let Some(rx) = &mut app.heartbeat_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match event {
+                    HeartbeatEvent::Fire => {
+                        // Daemon now schedules + runs heartbeats; the proto
+                        // forwarder only emits Result events. A Fire here is
+                        // unexpected — log and ignore rather than spawning a
+                        // local turn (which would race the daemon).
+                        tracing::warn!(
+                            "ignoring HeartbeatEvent::Fire in TUI; daemon owns scheduling"
+                        );
+                    }
+                    _ => {
+                        app.process_heartbeat(event);
+                    }
+                }
+                AppAction::Continue
+            }
+
+            // Doctor diagnostic events
+            event = async {
+                if let Some(rx) = &mut app.doctor_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(ev) = event {
+                    app.process_doctor_event(ev);
+                } else {
+                    app.doctor_rx = None;
+                }
+                AppAction::Continue
+            }
+
+            // /btw background task results
+            event = async {
+                if let Some(rx) = &mut app.btw_result_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                if let Some(result) = event {
+                    app.process_btw_result(result);
+                }
+                AppAction::Continue
+            }
+
+            // Terminal events
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => app.handle_key(key)?,
+                    Some(Ok(Event::Paste(text))) => app.handle_paste(text),
+                    // Intentionally NO `Event::Mouse` arm. We do not enable any
+                    // mouse tracking mode (see EnableAlternateScroll above), so
+                    // no mouse events should ever arrive here. Wheel events are
+                    // delivered as Up/Down key events via xterm ?1007h and are
+                    // handled in App::handle_key. DO NOT re-introduce a mouse
+                    // handler — it would require enabling ?1000h/?1002h/?1003h,
+                    // all of which break native text selection.
+                    Some(Ok(Event::Resize(_, _))) => AppAction::Continue,
+                    Some(Err(_)) | None => AppAction::Quit,
+                    _ => AppAction::Continue,
+                }
+            }
+
+            // Tick for status bar elapsed time + throbber animation + paste burst flush
+            _ = tick_interval.tick() => {
+                app.tick_throbber();
+                app.tick_paste_burst();
+                app.tick_file_search();
+                drain_queued_if_idle(app)?
+            }
+        };
+
+        match action {
+            AppAction::Quit => {
+                // Browser-close is daemon-side now; no TUI hook needed.
+                let hint = match client.get_state(session_id).await {
+                    Ok(s) if s.message_count > 0 => Some(ResumeHint {
+                        short_id: s.agent_session_id.chars().take(8).collect(),
+                        title: s.title,
+                    }),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GetState on quit failed; skipping resume hint");
+                        None
+                    }
+                };
+                return Ok(hint);
+            }
+            AppAction::SendMessage {
+                input,
+                images,
+                event_tx,
+                cancel,
+            } => {
+                // Steer channel: when the user types into a streaming turn,
+                // App routes the text to `steer_tx`; this task forwards each
+                // message to the daemon via `Session.Steer`.
+                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
+                app.steer_tx = Some(steer_tx);
+                app.pending_steers.clear();
+
+                {
+                    let mut steer_client = client.clone();
+                    let sid = session_id.to_string();
+                    tokio::spawn(async move {
+                        while let Some(text) = steer_rx.recv().await {
+                            if let Err(e) = steer_client.steer(&sid, &text).await {
+                                tracing::warn!(error = %e, "Session.Steer failed");
+                            }
+                        }
+                    });
+                }
+
+                // Cancel the in-flight turn if the user hits the cancel hot
+                // path. The token is already shared with the App; we just
+                // bridge it to the daemon's `Session.Cancel` here.
+                {
+                    let mut cancel_client = client.clone();
+                    let sid = session_id.to_string();
+                    let cancel_for_task = cancel.clone();
+                    tokio::spawn(async move {
+                        cancel_for_task.cancelled().await;
+                        if let Err(e) = cancel_client.cancel(&sid).await {
+                            tracing::warn!(error = %e, "Session.Cancel failed");
+                        }
+                    });
+                }
+
+                let mut send_client = client.clone();
+                let sid = session_id.to_string();
+                let proto_images = images_to_proto(images);
+                tokio::spawn(async move {
+                    match send_client
+                        .send_message_with_images(&sid, &input, proto_images)
+                        .await
+                    {
+                        Ok(stream) => {
+                            forward_event_stream(send_client, sid, stream, event_tx).await;
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(AgentEvent::Error(e.to_string())).await;
+                        }
+                    }
+                });
+            }
+            AppAction::CompactHistory => match client.compact(session_id).await {
+                Ok(r) => {
+                    let dropped = r.dropped as usize;
+                    let after = r.after_tokens as usize;
+                    app.push_system_message(format!(
+                        "Compacted: {dropped} messages dropped, ~{after} tokens remain"
+                    ));
+                }
+                Err(e) => app.push_system_message(format!("Compact failed: {e}")),
+            },
+            AppAction::ClearHistory => match client.clear_history(session_id).await {
+                Ok(()) => {
+                    app.push_system_message("Conversation cleared.".to_string());
+                }
+                Err(e) => app.push_system_message(format!("Clear failed: {e}")),
+            },
+            AppAction::ShowUsage => {
+                let (msg_count, token_count) = match client.get_state(session_id).await {
+                    Ok(s) => (s.message_count as usize, s.token_estimate as usize),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GetState for /usage failed");
+                        (0, 0)
+                    }
+                };
+
+                let prompt_tok = app.session_prompt_tokens;
+                let completion_tok = app.session_completion_tokens;
+                let total_tok = prompt_tok + completion_tok;
+
+                let mut text = format!(
+                    "Session: {} messages, ~{} estimated tokens\n\
+                     LLM usage: {} prompt + {} completion = {} total tokens\n",
+                    fmt_commas(msg_count as u64),
+                    fmt_commas(token_count as u64),
+                    fmt_commas(prompt_tok),
+                    fmt_commas(completion_tok),
+                    fmt_commas(total_tok),
+                );
+
+                for (label, days) in [("24h", 1), ("7d", 7), ("30d", 30)] {
+                    match cortex::logging::count_messages_for_period(days) {
+                        Ok(stats) => {
+                            text.push_str(&format!(
+                                "{label}: {} user, {} assistant, {} tool calls\n",
+                                fmt_commas(stats.user_messages as u64),
+                                fmt_commas(stats.assistant_messages as u64),
+                                fmt_commas(stats.tool_calls as u64),
+                            ));
+                        }
+                        Err(e) => {
+                            text.push_str(&format!("{label}: error reading logs: {e}\n"));
+                        }
+                    }
+                }
+
+                // Show monthly budget info (routed through the daemon).
+                let budget_limit = app.config.budget.monthly_token_limit;
+                if budget_limit > 0 {
+                    match client.get_monthly_token_total().await {
+                        Ok(t) => {
+                            let used = t.total;
+                            let pct = (used as f64 / budget_limit as f64 * 100.0) as u64;
+                            text.push_str(&format!(
+                                "Budget: {}/{} tokens ({pct}%) used this month\n",
+                                fmt_commas(used),
+                                fmt_commas(budget_limit),
+                            ));
+                        }
+                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTokenTotal failed"),
+                    }
+                    match client.get_monthly_total_cost().await {
+                        Ok(c) if c.present => {
+                            text.push_str(&format!("Estimated cost: ${:.4}\n", c.cost));
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTotalCost failed"),
+                    }
+                }
+
+                app.push_system_message(text.trim_end().to_string());
+            }
+            AppAction::UndoLastTurn => match client.undo(session_id).await {
+                Ok(r) => {
+                    let removed = r.removed as usize;
+                    if removed > 0 {
+                        app.push_system_message(format!(
+                            "Undid last turn ({removed} messages removed)."
+                        ));
+                    } else {
+                        app.push_system_message("Nothing to undo.".to_string());
+                    }
+                }
+                Err(e) => app.push_system_message(format!("Undo failed: {e}")),
+            },
+            AppAction::RewindTo { nth_user_message } => {
+                match client.rewind(session_id, nth_user_message as u64).await {
+                    Ok(r) => {
+                        let removed = r.removed as usize;
+                        if removed > 0 {
+                            app.push_system_message(format!(
+                                "Rewound conversation ({removed} messages removed). Edit and re-send."
+                            ));
+                        } else {
+                            app.push_system_message("Nothing to rewind.".to_string());
+                        }
+                    }
+                    Err(e) => app.push_system_message(format!("Rewind failed: {e}")),
+                }
+            }
+            AppAction::UpdateSetting { key, value } => {
+                if let Err(e) = client.set_setting(&key, &value).await {
+                    app.push_system_message(format!("Warning: set_setting failed: {e}"));
+                }
+            }
+            AppAction::ConfigReloaded => {
+                // Config now lives in the daemon — no in-process mutation to
+                // propagate. The daemon's config watcher fans out reloads.
+            }
+            AppAction::SaveSession => {
+                if let Err(e) = client.auto_save(session_id).await {
+                    app.push_system_message(format!("Save failed: {e}"));
+                } else {
+                    match client.get_state(session_id).await {
+                        Ok(s) => {
+                            app.push_system_message(format!(
+                                "Session saved: {} ({})",
+                                s.title, s.agent_session_id
+                            ));
+                        }
+                        Err(e) => {
+                            app.push_system_message(format!("Saved, but GetState failed: {e}"))
+                        }
+                    }
+                }
+            }
+            AppAction::NewSession => {
+                if let Err(e) = client.new_agent_session(session_id).await {
+                    app.push_system_message(format!("New session failed: {e}"));
+                } else {
+                    app.push_system_message("New session started.".to_string());
+                }
+            }
+            AppAction::ExportSession { id, format } => {
+                handle_export(app, client, &id, format).await;
+            }
+            AppAction::ExportCurrentSession { format } => {
+                let id = match client.get_state(session_id).await {
+                    Ok(s) => s.agent_session_id,
+                    Err(e) => {
+                        app.push_system_message(format!("Export failed: {e}"));
+                        continue;
+                    }
+                };
+                handle_export(app, client, &id, format).await;
+            }
+            AppAction::LoadSession { id } => {
+                // Clear existing UI state before loading a new session.
+                app.cells.clear();
+                app.session_prompt_tokens = 0;
+                app.session_completion_tokens = 0;
+                // Support partial ID matching (prefix) via shared resolver.
+                let load_id = match cortex::session::resolve_session_id(&id) {
+                    Ok(meta) => meta.id,
+                    Err(cortex::session::ResolveSessionError::Ambiguous { count, .. }) => {
+                        app.push_system_message(format!(
+                            "Ambiguous session ID '{id}' — matches {count} sessions. Be more specific."
+                        ));
+                        continue;
+                    }
+                    // NotFound / Empty: fall through to load_agent_session which
+                    // will surface a clean "Session '<id>' not found" error.
+                    Err(_) => id.clone(),
+                };
+
+                match client.load_agent_session(session_id, &load_id).await {
+                    Ok(_) => match client.get_state(session_id).await {
+                        Ok(s) => {
+                            app.push_system_message(format!(
+                                "Loaded session: {} ({} messages)",
+                                s.title, s.message_count
+                            ));
+                        }
+                        Err(e) => {
+                            app.push_system_message(format!("Loaded, but GetState failed: {e}"));
+                        }
+                    },
+                    Err(e) => {
+                        app.push_system_message(format!("Failed to load session: {e}"));
+                    }
+                }
+            }
+            AppAction::LaunchExternalEditor => {
+                let current_text = app.composer.text();
+                // Leave alternate screen and disable raw mode for editor
+                let _ = disable_raw_mode();
+                let _ = stdout().execute(LeaveAlternateScreen);
+
+                let result = external_editor::open_external_editor(&current_text);
+
+                // Restore terminal
+                let _ = enable_raw_mode();
+                let _ = stdout().execute(EnterAlternateScreen);
+                terminal.clear()?;
+
+                match result {
+                    Ok(text) => {
+                        let trimmed = text.trim_end();
+                        app.composer.set_text(trimmed);
+                    }
+                    Err(e) => {
+                        app.push_system_message(format!("Editor error: {e}"));
+                    }
+                }
+            }
+            AppAction::RunPlugins { actions } => {
+                let data_dir = match cortex::config::Config::data_dir() {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        app.push_system_message(format!("Failed to resolve data directory: {e}"));
+                        continue;
+                    }
+                };
+                let mut results: Vec<String> = Vec::new();
+
+                for action in actions {
+                    match action {
+                        plugins_popup::PluginAction::Install { id, credentials } => {
+                            if let Some(def) = plugins::catalog::find_by_id(&id) {
+                                match plugins::installer::install(
+                                    def,
+                                    &data_dir,
+                                    &credentials,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(install_result) => {
+                                        // Resolve item_name for installed tool/channel.
+                                        let item_name = if def.is_native {
+                                            def.id.rsplit('/').next().unwrap_or(def.id)
+                                        } else if let Some(first_tmpl) = def.templates.first() {
+                                            first_tmpl
+                                                .relative_path
+                                                .split('/')
+                                                .next()
+                                                .unwrap_or(def.id)
+                                        } else {
+                                            def.id
+                                        };
+                                        let runtime =
+                                            if def.is_native { "native" } else { "python" };
+
+                                        // Build credentials JSON (cli holds the
+                                        // keychain ref types — daemon just persists
+                                        // the resulting blob to the settings table).
+                                        let credentials_json = if install_result
+                                            .credential_entries
+                                            .is_empty()
+                                        {
+                                            String::new()
+                                        } else {
+                                            let mut cfg =
+                                                Config::load_from_db().unwrap_or_default();
+                                            for entry in &install_result.credential_entries {
+                                                cfg.credentials.insert(
+                                                        entry.key.clone(),
+                                                        cortex::config::CredentialValue::Ref(
+                                                            cortex::secrets_resolve::SecretRef::Keychain {
+                                                                service: entry.service.clone(),
+                                                                account: entry.account.clone(),
+                                                            },
+                                                        ),
+                                                    );
+                                            }
+                                            serde_json::to_string(&cfg.credentials)
+                                                .unwrap_or_default()
+                                        };
+
+                                        let mut req = protocols::admin::PluginInstallRequest {
+                                            plugin_id: def.id.to_string(),
+                                            plugin_name: def.name.to_string(),
+                                            kind: def.kind.to_string(),
+                                            category: def.category.to_string(),
+                                            file_hashes: install_result
+                                                .file_hashes
+                                                .iter()
+                                                .map(|(p, h)| protocols::admin::PluginFileHash {
+                                                    path: p.clone(),
+                                                    hash: h.clone(),
+                                                })
+                                                .collect(),
+                                            installed_tool: None,
+                                            installed_channel: None,
+                                            credentials_json,
+                                        };
+                                        match def.kind {
+                                            plugins::PluginKind::Tool => {
+                                                req.installed_tool =
+                                                    Some(protocols::admin::PluginInstalledTool {
+                                                        name: item_name.to_string(),
+                                                        description: def.description.to_string(),
+                                                        runtime: runtime.to_string(),
+                                                        plugin_id: def.id.to_string(),
+                                                    });
+                                            }
+                                            plugins::PluginKind::Channel => {
+                                                let webhook = format!("/webhook/{item_name}");
+                                                req.installed_channel = Some(
+                                                    protocols::admin::PluginInstalledChannel {
+                                                        name: item_name.to_string(),
+                                                        description: def.description.to_string(),
+                                                        runtime: runtime.to_string(),
+                                                        plugin_id: def.id.to_string(),
+                                                        webhook,
+                                                    },
+                                                );
+                                            }
+                                        }
+
+                                        if let Err(e) = client.plugin_install(req).await {
+                                            tracing::warn!("Admin.PluginInstall failed: {e}");
+                                            results.push(format!(
+                                                "Failed to record {} install: {e}",
+                                                def.name
+                                            ));
+                                            continue;
+                                        }
+
+                                        // Reload config to pick up newly saved credentials
+                                        match cortex::config::Config::load_from_db() {
+                                            Ok(c) => app.config = c,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Failed to reload config after plugin install: {e}"
+                                                );
+                                            }
+                                        }
+
+                                        let is_channel = def.kind == plugins::PluginKind::Channel;
+                                        if is_channel {
+                                            let gw_msg = restart_gateway(gateway_shutdown).await;
+                                            tracing::info!(
+                                                "Gateway restart after installing {}: {gw_msg}",
+                                                def.name
+                                            );
+                                        }
+                                        results.push(build_post_install_message(
+                                            def.name,
+                                            &install_result.notes,
+                                            is_channel,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        results
+                                            .push(format!("Failed to install {}: {e}", def.name));
+                                    }
+                                }
+                            }
+                        }
+                        plugins_popup::PluginAction::SetSkillEnabled { name, enabled } => {
+                            let key = format!("skills.entries.{name}.enabled");
+                            let val = enabled.to_string();
+                            match app.config.apply_setting(&key, &val) {
+                                Ok(_) => match client.set_setting(&key, &val).await {
+                                    Ok(()) => {
+                                        let status = if enabled { "enabled" } else { "disabled" };
+                                        results.push(format!("{name}: {status}"));
+                                    }
+                                    Err(e) => {
+                                        results.push(format!("Error persisting {name}: {e}"));
+                                    }
+                                },
+                                Err(e) => {
+                                    results.push(format!("Error updating {name}: {e}"));
+                                }
+                            }
+                        }
+                        plugins_popup::PluginAction::Uninstall { id } => {
+                            if let Some(def) = plugins::catalog::find_by_id(&id) {
+                                // Remove keychain entries
+                                if let Err(e) = plugins::installer::uninstall(def, &data_dir) {
+                                    results.push(format!("Failed to remove {}: {e}", def.name));
+                                    continue;
+                                }
+
+                                // Wipe entire data directory (~/.borg/)
+                                if data_dir.exists() {
+                                    if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                                        tracing::warn!(
+                                            "Failed to remove data directory {}: {e}",
+                                            data_dir.display()
+                                        );
+                                    }
+                                }
+
+                                let mut msg = format!("Removed {}", def.name);
+                                msg.push_str("\n  Data directory wiped.");
+                                if def.kind == plugins::PluginKind::Channel {
+                                    let gw_msg = restart_gateway(gateway_shutdown).await;
+                                    msg.push_str(&format!("\n  {gw_msg}"));
+                                }
+                                results.push(msg);
+                            }
+                        }
+                    }
+                }
+
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::PlanProceed { clear_context } => {
+                // Exit Plan mode before the follow-up turn — otherwise the proceed
+                // message would itself be blocked by mutation constraints.
+                let restored = app
+                    .previous_collab_mode
+                    .take()
+                    .unwrap_or(CollaborationMode::Default);
+                if app.config.conversation.collaboration_mode != restored {
+                    app.config.conversation.collaboration_mode = restored;
+                    app.push_system_message(format!("[mode: {restored}]"));
+                }
+
+                let proceed_msg = if clear_context {
+                    // Extract plan text before clearing so the agent knows what to do
+                    let plan_text = app
+                        .cells
+                        .iter()
+                        .rev()
+                        .find_map(|c| {
+                            if let HistoryCell::Assistant { text, .. } = c {
+                                if !text.trim().is_empty() {
+                                    return Some(text.clone());
+                                }
+                            }
+                            None
+                        })
+                        .unwrap_or_default();
+
+                    if let Err(e) = client.clear_history(session_id).await {
+                        tracing::warn!(error = %e, "PlanProceed clear_history failed");
+                    }
+                    app.cells.clear();
+                    app.session_prompt_tokens = 0;
+                    app.session_completion_tokens = 0;
+
+                    if plan_text.is_empty() {
+                        "Proceed with the plan as outlined.".to_string()
+                    } else {
+                        format!(
+                            "Here is the plan we agreed on:\n\n{plan_text}\n\nProceed with this plan."
+                        )
+                    }
+                } else {
+                    "Proceed with the plan as outlined.".to_string()
+                };
+                app.queued_messages.push_front(app::QueuedMessage {
+                    text: proceed_msg,
+                    images: Vec::new(),
+                });
+            }
+            AppAction::RunScheduleActions { actions } => {
+                let mut results: Vec<String> = Vec::new();
+                for action in actions {
+                    match action {
+                        schedule_popup::ScheduleAction::ToggleStatus {
+                            task_id,
+                            new_status,
+                        } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            let res = if new_status == "paused" {
+                                client.pause_scheduled_task(&task_id).await
+                            } else {
+                                client.resume_scheduled_task(&task_id).await
+                            };
+                            match res {
+                                Ok(()) => {
+                                    results.push(format!("Task {short} {new_status}"));
+                                }
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        schedule_popup::ScheduleAction::UpdateSchedule {
+                            task_id,
+                            schedule_type,
+                            new_expr,
+                        } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            let spec = protocols::admin::ScheduledTaskUpdate {
+                                id: task_id.clone(),
+                                name: String::new(),
+                                prompt: String::new(),
+                                schedule_type: schedule_type.clone(),
+                                schedule_expr: new_expr.clone(),
+                                timezone: String::new(),
+                            };
+                            match client.update_scheduled_task(spec).await {
+                                Ok(_) => results
+                                    .push(format!("Task {short} schedule updated to {new_expr}")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        schedule_popup::ScheduleAction::DeleteTask { task_id } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            match client.delete_scheduled_task(&task_id).await {
+                                Ok(()) => results.push(format!("Task {short} deleted")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                    }
+                }
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::RunProjectActions { actions } => {
+                let mut results: Vec<String> = Vec::new();
+                for action in actions {
+                    match action {
+                        projects_popup::ProjectAction::Create {
+                            id: _,
+                            name,
+                            description,
+                        } => match client.create_project(&name, &description).await {
+                            Ok(_) => results.push(format!("Project '{name}' created")),
+                            Err(e) => results.push(format!("Error: {e}")),
+                        },
+                        projects_popup::ProjectAction::Update {
+                            project_id,
+                            name,
+                            description,
+                        } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client
+                                .update_project(
+                                    &project_id,
+                                    name.as_deref().unwrap_or(""),
+                                    description.as_deref().unwrap_or(""),
+                                    "",
+                                )
+                                .await
+                            {
+                                Ok(_) => results.push(format!("Project {short} updated")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        projects_popup::ProjectAction::Archive { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.archive_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} archived")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        projects_popup::ProjectAction::Unarchive { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.unarchive_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} unarchived")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        projects_popup::ProjectAction::Delete { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.delete_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} deleted")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                    }
+                }
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::RunPairingActions { actions } => {
+                let mut results: Vec<String> = Vec::new();
+                for action in actions {
+                    match action {
+                        pairing_popup::PairingAction::Approve { channel, code } => {
+                            match client.approve_pairing(&channel, &code).await {
+                                Ok(()) => {
+                                    let display = cortex::pairing::channel_display_name(&channel);
+                                    results.push(format!("Approved: {code} on {display}"));
+                                    // Fire-and-forget greeting via the daemon's
+                                    // Admin.SendApprovalGreeting RPC.
+                                    let mut greet_client = client.clone();
+                                    let ch = channel.clone();
+                                    tokio::spawn(async move {
+                                        let senders = match greet_client
+                                            .list_approved_senders(Some(&ch))
+                                            .await
+                                        {
+                                            Ok(list) => list.senders,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "approval greeting: list_approved_senders failed"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        if let Some(sender) =
+                                            senders.iter().max_by_key(|s| s.approved_at)
+                                        {
+                                            if let Err(e) = greet_client
+                                                .send_approval_greeting(&ch, &sender.sender_id)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "Admin.SendApprovalGreeting failed"
+                                                );
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    results.push(format!("Failed to approve: {e}"));
+                                }
+                            }
+                        }
+                        pairing_popup::PairingAction::Revoke { channel, sender_id } => match client
+                            .revoke_approved_sender(&channel, &sender_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                let display = cortex::pairing::channel_display_name(&channel);
+                                results.push(format!("Revoked sender {sender_id} from {display}."));
+                            }
+                            Err(e) => {
+                                results.push(format!("Failed to revoke: {e}"));
+                            }
+                        },
+                    }
+                }
+                if !results.is_empty() {
+                    app.push_system_message(results.join("\n"));
+                }
+            }
+            AppAction::RunMigration { actions } => {
+                for action in actions {
+                    match action {
+                        migrate_popup::MigrateAction::Apply { plan, source_data } => {
+                            let borg_dir = match cortex::config::Config::data_dir() {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    app.push_system_message(format!("Migration error: {e}"));
+                                    continue;
+                                }
+                            };
+                            match cortex::migrate::apply::apply_plan(&plan, &source_data, &borg_dir)
+                            {
+                                Ok(result) => {
+                                    let mut msg = String::from("Migration complete:");
+                                    if result.config_changes_applied > 0 {
+                                        msg.push_str(&format!(
+                                            "\n  {} config change(s) applied",
+                                            result.config_changes_applied
+                                        ));
+                                    }
+                                    if result.credentials_added > 0 {
+                                        msg.push_str(&format!(
+                                            "\n  {} credential(s) added",
+                                            result.credentials_added
+                                        ));
+                                    }
+                                    if result.memory_files_copied > 0 {
+                                        msg.push_str(&format!(
+                                            "\n  {} memory file(s) copied",
+                                            result.memory_files_copied
+                                        ));
+                                    }
+                                    if result.persona_copied {
+                                        msg.push_str("\n  Persona copied to IDENTITY.md");
+                                    }
+                                    if result.skills_copied > 0 {
+                                        msg.push_str(&format!(
+                                            "\n  {} skill(s) copied",
+                                            result.skills_copied
+                                        ));
+                                    }
+                                    for warning in &result.warnings {
+                                        msg.push_str(&format!("\n  Warning: {warning}"));
+                                    }
+                                    // Log to activity log so /logs shows it
+                                    let mut log_client = client.clone();
+                                    let log_msg = msg.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = log_client
+                                            .log_activity("info", "migrate", &log_msg)
+                                            .await
+                                        {
+                                            tracing::warn!("Admin.LogActivity failed: {e}");
+                                        }
+                                    });
+                                    app.push_system_message(msg);
+                                    // Reload config to pick up migrated settings
+                                    app.config =
+                                        cortex::config::Config::load_from_db().unwrap_or_default();
+                                }
+                                Err(e) => {
+                                    let msg = format!("Migration failed: {e}");
+                                    let mut log_client = client.clone();
+                                    let log_msg = msg.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = log_client
+                                            .log_activity("error", "migrate", &log_msg)
+                                            .await
+                                        {
+                                            tracing::warn!("Admin.LogActivity failed: {e}");
+                                        }
+                                    });
+                                    app.push_system_message(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AppAction::RestartGateway => {
+                let msg = restart_gateway(gateway_shutdown).await;
+                app.push_system_message(msg);
+            }
+            AppAction::SelfUpdate { dev } => {
+                app.push_system_message(format!(
+                    "Checking for updates{}...",
+                    if dev { " (including pre-releases)" } else { "" }
+                ));
+                terminal.draw(|f| app.render(f))?;
+                match cortex::update::perform_update(dev).await {
+                    Ok(result) => match result.status {
+                        cortex::update::UpdateStatus::AlreadyUpToDate => {
+                            app.push_system_message(format!(
+                                "Already up to date ({})",
+                                result.current_version
+                            ));
+                        }
+                        cortex::update::UpdateStatus::Updated { from, to } => {
+                            app.push_system_message(format!(
+                                "Updated borg: {from} → {to}\nPlease restart borg to use the new version."
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        app.push_system_message(format!("Update failed: {e}"));
+                    }
+                }
+            }
+            AppAction::Uninstall => {
+                // Step 1: Uninstall daemon service + kill any lingering borg processes
+                app.push_system_message("Stopping daemon...".to_string());
+                terminal.draw(|f| app.render(f))?;
+                if let Err(e) = crate::borgd_launcher::uninstall_service() {
+                    tracing::debug!("Service uninstall skipped: {e}");
+                }
+                crate::borgd_launcher::kill_other_borg_processes();
+
+                // Step 2: Stop all in-process background tasks (gateway, heartbeat)
+                // so they can't reopen / recreate the database after we delete it.
+                heartbeat_cancel.cancel();
+                {
+                    if let Ok(gw) = gateway_shutdown.try_lock() {
+                        gw.cancel();
+                    }
+                }
+                // Browser + DB are owned by the daemon now; ask it to shut
+                // down so the data directory can be removed cleanly. Stage D
+                // will replace this with a proper Admin.Shutdown call.
+                // (No-op for now — sandboxed Uninstall will surface any
+                // file-locked errors below.)
+                // Let spawned tasks notice cancellation and wind down
+                tokio::task::yield_now().await;
+
+                // Step 3: Data directory
+                app.push_system_message("Removing data directory (~/.borg/)...".to_string());
+                terminal.draw(|f| app.render(f))?;
+                if let Ok(data_dir) = cortex::config::Config::data_dir() {
+                    if let Err(e) = std::fs::remove_dir_all(&data_dir) {
+                        tracing::warn!("Failed to remove data dir: {e}");
+                        app.push_system_message(format!("Warning: failed to remove data dir: {e}"));
+                        terminal.draw(|f| app.render(f))?;
+                    }
+                }
+
+                // Step 4: Binary
+                app.push_system_message("Removing binary...".to_string());
+                terminal.draw(|f| app.render(f))?;
+                if let Ok(exe) = std::env::current_exe() {
+                    let exe = exe.canonicalize().unwrap_or(exe);
+                    if let Err(e) = std::fs::remove_file(&exe) {
+                        tracing::debug!("Could not remove binary: {e}");
+                    }
+                }
+
+                // Fullscreen ASCII art goodbye
+                goodbye::render(terminal)?;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                // Final sweep: delete data dir again in case a background task
+                // recreated it (e.g. Database::open creates ~/.borg/ via create_dir_all)
+                if let Ok(data_dir) = cortex::config::Config::data_dir() {
+                    let _ = std::fs::remove_dir_all(&data_dir);
+                }
+                return Ok(None);
+            }
+            AppAction::Poke => {
+                let mut poke_client = client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = poke_client.poke().await {
+                        tracing::warn!("Admin.Poke failed: {e}");
+                    }
+                });
+                app.push_system_message("[poke: sent to daemon]".to_string());
+            }
+            AppAction::RunDoctor => {
+                app.push_system_message("Borg Doctor\n───────────".to_string());
+                let (tx, rx) = tokio::sync::mpsc::channel(32);
+                app.doctor_rx = Some(rx);
+                let config = app.config.clone();
+                tokio::task::spawn_blocking(move || {
+                    use cortex::doctor::DiagnosticRunner;
+                    let mut runner = DiagnosticRunner::new();
+                    let mut all_checks: Vec<cortex::doctor::DiagnosticCheck> = Vec::new();
+                    while let Some(label) = runner.peek_label(&config) {
+                        let _ = tx.blocking_send(app::DoctorEvent::Analyzing {
+                            label: label.to_string(),
+                        });
+                        if let Some((_label, checks)) = runner.next_step(&config) {
+                            all_checks.extend(checks.clone());
+                            let _ = tx.blocking_send(app::DoctorEvent::Result {
+                                label: label.to_string(),
+                                checks,
+                            });
+                        }
+                    }
+                    let report = cortex::doctor::DiagnosticReport { checks: all_checks };
+                    let (pass, warn, fail) = report.counts();
+                    let _ = tx.blocking_send(app::DoctorEvent::Done { pass, warn, fail });
+                });
+            }
+            AppAction::StartBtw { question, snapshot } => {
+                // Cancel any previous in-flight /btw — single-slot policy.
+                // The old task's result will arrive at the popup and be
+                // discarded by process_btw_result because the popup's
+                // Loading question will have moved on.
+                if let Some(prev) = app.btw_cancel.take() {
+                    prev.cancel();
+                }
+                // Lazily create the result channel on first use. Kept on the
+                // App so subsequent /btw runs reuse the same receiver.
+                if app.btw_result_tx.is_none() {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<app::BtwResult>();
+                    app.btw_result_tx = Some(tx);
+                    app.btw_result_rx = Some(rx);
+                }
+                let tx = match app.btw_result_tx.as_ref() {
+                    Some(t) => t.clone(),
+                    None => {
+                        tracing::warn!("/btw: result channel missing — dropping request");
+                        return Ok(None);
+                    }
+                };
+                let cancel = tokio_util::sync::CancellationToken::new();
+                app.btw_cancel = Some(cancel.clone());
+                let config = app.config.clone();
+                let q = question.clone();
+                tokio::spawn(async move {
+                    let outcome = cortex::agent::run_btw(config, q.clone(), snapshot, cancel)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    if tx
+                        .send(app::BtwResult {
+                            question: q,
+                            outcome,
+                        })
+                        .is_err()
+                    {
+                        tracing::debug!("/btw: result receiver dropped before completion");
+                    }
+                });
+            }
+            AppAction::Continue => {}
+        }
+    }
+}
+
+// =============================================================================
+// Tests — DO NOT REMOVE OR WEAKEN.
+// =============================================================================
+// These tests enforce the native-text-selection invariant. If any of them fail,
+// text selection in the TUI is almost certainly broken in at least one
+// terminal. This has regressed multiple times; the belt-and-suspenders approach
+// (sequence tests + source-string guards + lifecycle test) is intentional.
+// See CLAUDE.md "Mouse Interaction" for the full rationale.
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::Command;
+
+    /// Forbidden escape-sequence modes. Presence of ANY of these in the code
+    /// paths that emit ANSI to the terminal will break native text selection.
+    const FORBIDDEN_MODES: &[&str] = &["?1000", "?1002", "?1003", "?1006"];
+
+    // ------------------------------------------------------------------------
+    // Escape-sequence correctness
+    // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // Session-start greeting throttle gate
+    // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // Post-install message composition
+    //
+    // Regression guard tied to a real user complaint: the UI previously said
+    // "Gateway restarted." (noise — moved to tracing::info!) and
+    // "Approve senders with: /pairing approve <CODE>" (confusing — didn't
+    // explain the user must DM the bot first to generate the code).
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn fmt_commas_groups_digits() {
+        let cases: &[(u64, &str)] = &[
+            (0, "0"),
+            (42, "42"),
+            (999, "999"),
+            (1_000, "1,000"),
+            (3_999, "3,999"),
+            (1_000_000, "1,000,000"),
+            (12_345_678, "12,345,678"),
+            (u64::MAX, "18,446,744,073,709,551,615"),
+        ];
+        for (n, expected) in cases {
+            assert_eq!(fmt_commas(*n), *expected, "fmt_commas({n})");
+        }
+    }
+
+    #[test]
+    fn post_install_message_does_not_mention_gateway_restarted() {
+        let msg = build_post_install_message("Telegram", &[], true);
+        assert!(
+            !msg.contains("Gateway restarted"),
+            "user-facing install message must not mention gateway restart (log-only): {msg}"
+        );
+    }
+
+    #[test]
+    fn post_install_channel_message_explains_pairing_workflow() {
+        let msg = build_post_install_message("Telegram", &[], true);
+        assert!(
+            msg.contains("Installed Telegram"),
+            "missing install line: {msg}"
+        );
+        assert!(
+            msg.contains("Send a message to the bot on Telegram"),
+            "channel install must tell user to DM the bot first: {msg}"
+        );
+        assert!(
+            msg.contains("/pairing approve <CODE>"),
+            "channel install must include the /pairing approve command: {msg}"
+        );
+    }
+
+    #[test]
+    fn post_install_non_channel_message_omits_pairing_hint() {
+        let msg = build_post_install_message("Gmail", &["foo".to_string()], false);
+        assert!(msg.starts_with("Installed Gmail"));
+        assert!(msg.contains("foo"), "notes should be preserved: {msg}");
+        assert!(
+            !msg.contains("/pairing"),
+            "non-channel plugins don't need pairing instructions: {msg}"
+        );
+    }
+
+    #[test]
+    fn session_start_disabled_never_fires() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = false;
+        config.heartbeat.last_fired_at = 0;
+        assert!(!should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_fires_when_never_fired() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        config.heartbeat.last_fired_at = 0;
+        assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_suppressed_inside_throttle_window() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        // Fired 5 minutes ago — inside the 30-minute window.
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp() - 5 * 60;
+        assert!(!should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_fires_after_throttle_window() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 30;
+        // Fired 45 minutes ago — past the 30-minute window.
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp() - 45 * 60;
+        assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn session_start_zero_throttle_always_fires() {
+        let mut config = Config::default();
+        config.heartbeat.session_start_enabled = true;
+        config.heartbeat.session_start_throttle_minutes = 0;
+        config.heartbeat.last_fired_at = chrono::Utc::now().timestamp();
+        assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn enable_alternate_scroll_emits_exactly_1007h() {
+        let mut buf = String::new();
+        EnableAlternateScroll.write_ansi(&mut buf).unwrap();
+        assert_eq!(
+            buf, "\x1b[?1007h",
+            "EnableAlternateScroll must emit exactly ?1007h (xterm Alternate \
+             Scroll Mode). Anything else risks breaking text selection."
+        );
+    }
+
+    #[test]
+    fn disable_alternate_scroll_emits_exactly_1007l() {
+        let mut buf = String::new();
+        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
+        assert_eq!(buf, "\x1b[?1007l");
+    }
+
+    #[test]
+    fn enable_alternate_scroll_contains_no_forbidden_modes() {
+        let mut buf = String::new();
+        EnableAlternateScroll.write_ansi(&mut buf).unwrap();
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !buf.contains(mode),
+                "EnableAlternateScroll must NOT emit {mode} — it breaks native text selection"
+            );
+        }
+    }
+
+    #[test]
+    fn disable_alternate_scroll_contains_no_forbidden_modes() {
+        let mut buf = String::new();
+        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !buf.contains(mode),
+                "DisableAlternateScroll must NOT reference {mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn enable_and_disable_are_symmetric() {
+        let mut enable = String::new();
+        let mut disable = String::new();
+        EnableAlternateScroll.write_ansi(&mut enable).unwrap();
+        DisableAlternateScroll.write_ansi(&mut disable).unwrap();
+        // Strip the trailing `h`/`l` and compare — catches someone changing
+        // one side without the other.
+        assert_eq!(
+            enable.trim_end_matches('h'),
+            disable.trim_end_matches('l'),
+            "enable/disable sequences must target the same mode"
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Source-level guards — read this file and app.rs via include_str! and
+    // assert no forbidden mode appears in CODE (comments are allowed to
+    // reference them; they must, to document why they're forbidden).
+    // ------------------------------------------------------------------------
+
+    /// Strip line comments AND the `#[cfg(test)] mod tests { ... }` module
+    /// from a Rust source string. This lets us search code-only (i.e.,
+    /// non-test runtime code) for forbidden patterns while still allowing
+    /// comments and test scaffolding to reference them — comments must
+    /// document WHY the modes are forbidden, and tests must reference them
+    /// to assert their absence.
+    ///
+    /// Intentionally simple: the line-comment stripper does not handle block
+    /// comments or string literals containing `//`, and the test-module cut
+    /// is a naive "everything from the first `#[cfg(test)]` onward" slice.
+    /// Both are sufficient for the two files we guard.
+    fn strip_tests_and_comments(src: &str) -> String {
+        let code = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        code.lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn mod_rs_code_contains_no_forbidden_mouse_modes() {
+        let src = include_str!("mod.rs");
+        let code = strip_tests_and_comments(src);
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !code.contains(mode),
+                "crates/cli/src/tui/mod.rs code contains forbidden mouse mode {mode}. \
+                 This will break native text selection. See the comment block above \
+                 EnableAlternateScroll for the allowed modes and the rationale."
+            );
+        }
+    }
+
+    #[test]
+    fn app_rs_code_contains_no_forbidden_mouse_modes() {
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
+        let code = strip_tests_and_comments(src);
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !code.contains(mode),
+                "crates/cli/src/tui/app/ code contains forbidden mouse mode {mode}. \
+                 No mouse tracking mode may be referenced from app code — mouse events \
+                 are not delivered to the app at all (wheel → arrow keys via ?1007h)."
+            );
+        }
+    }
+
+    #[test]
+    fn mod_rs_code_does_not_call_crossterm_enable_mouse_capture() {
+        let src = include_str!("mod.rs");
+        let code = strip_tests_and_comments(src);
+        assert!(
+            !code.contains("EnableMouseCapture"),
+            "crossterm's EnableMouseCapture enables ?1000h/?1002h/?1003h/?1006h, \
+             all of which break native text selection. Use EnableAlternateScroll \
+             (?1007h) instead."
+        );
+        assert!(
+            !code.contains("DisableMouseCapture"),
+            "crossterm's DisableMouseCapture must not appear in code — we never \
+             enable mouse capture, so there is nothing to disable."
+        );
+    }
+
+    #[test]
+    fn app_rs_has_no_event_mouse_match_arm() {
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
+        let code = strip_tests_and_comments(src);
+        assert!(
+            !code.contains("Event::Mouse("),
+            "app/ must not match Event::Mouse — we do not enable mouse \
+             tracking, and adding such a handler would require enabling a \
+             forbidden mode."
+        );
+        assert!(
+            !code.contains("fn handle_mouse"),
+            "app/ must not define handle_mouse — there is no mouse event \
+             source. Wheel is routed as KeyCode::Up/Down via ?1007h and \
+             handled in handle_key."
+        );
+    }
+
+    #[test]
+    fn transcript_pager_source_does_not_enable_mouse() {
+        // The pager is a new full-screen overlay; verify it doesn't reintroduce
+        // any of the forbidden mouse-tracking patterns. If this fails, the
+        // pager's text-selection ergonomics will silently break.
+        let src = include_str!("transcript_pager.rs");
+        let code = strip_tests_and_comments(src);
+        for mode in FORBIDDEN_MODES {
+            assert!(
+                !code.contains(mode),
+                "transcript_pager.rs contains forbidden mouse mode {mode}"
+            );
+        }
+        for forbidden in [
+            "EnableMouseCapture",
+            "DisableMouseCapture",
+            "Event::Mouse(",
+            "MouseEventKind",
+            "fn handle_mouse",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "transcript_pager.rs must not reference {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_rs_has_no_mouse_event_kind_references() {
+        let src = concat!(
+            include_str!("app/mod.rs"),
+            include_str!("app/render.rs"),
+            include_str!("app/events.rs"),
+        );
+        let code = strip_tests_and_comments(src);
+        assert!(
+            !code.contains("MouseEventKind"),
+            "app/ must not reference crossterm::event::MouseEventKind — \
+             mouse events are not delivered to this crate."
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Lifecycle — dropping TerminalGuard must emit the disable sequence.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn disable_alternate_scroll_command_can_be_written_to_buffer() {
+        // Smoke test that the Command impl is still usable by crossterm.
+        // (TerminalGuard::drop writes to stdout which isn't capturable here;
+        // we verify the Command encoding instead, which is the only state
+        // the guard's drop reaches through.)
+        let mut buf = String::new();
+        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
+        assert!(buf.ends_with('l'));
+        assert!(buf.contains("?1007"));
+    }
+}

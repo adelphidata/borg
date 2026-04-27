@@ -1,7 +1,7 @@
 // Re-export the shared circuit breaker from gateway level.
 // Telegram-specific wrappers preserve backward compatibility.
 
-use borg_core::constants;
+use cortex::constants;
 
 pub use crate::circuit_breaker::CircuitBreaker as SharedCircuitBreaker;
 

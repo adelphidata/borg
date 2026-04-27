@@ -9,9 +9,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use borg_core::auth::tokens;
-use borg_core::db::Database;
-use borg_core::ingress::{IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId};
+use cortex::auth::tokens;
+use cortex::db::Database;
+use cortex::ingress::{IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId};
 use futures::StreamExt;
 use uuid::Uuid;
 
@@ -351,8 +351,8 @@ fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(body)).into_response()
 }
 
-fn rejected(reason: borg_core::ingress::IngressReject) -> Response {
-    use borg_core::ingress::IngressReject::*;
+fn rejected(reason: cortex::ingress::IngressReject) -> Response {
+    use cortex::ingress::IngressReject::*;
     let (status, msg) = match &reason {
         EmptyBody => (StatusCode::BAD_REQUEST, "empty body".to_string()),
         RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, reason.to_string()),
@@ -376,7 +376,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
-    use borg_core::ingress::AdmittedIngress;
+    use cortex::ingress::AdmittedIngress;
     use futures::stream::{self, BoxStream};
     use std::sync::Arc;
     use std::time::Duration;
@@ -386,7 +386,7 @@ mod tests {
         chunks: Vec<AgentEventChunk>,
     ) -> (
         OpenAiState,
-        borg_core::auth::tokens::IssuedToken,
+        cortex::auth::tokens::IssuedToken,
         tempfile::TempDir,
     ) {
         // Use a tempfile-backed DB so the `db_open` factory returns
@@ -404,7 +404,7 @@ mod tests {
             });
 
         let setup_db = (db_open)().expect("open setup db");
-        let issued = borg_core::auth::tokens::issue(&setup_db, "test-tok", "openai_compat")
+        let issued = cortex::auth::tokens::issue(&setup_db, "test-tok", "openai_compat")
             .expect("issue token");
 
         let gate = Arc::new(IngressGate::with_noop_audit(100, Duration::from_secs(1)));

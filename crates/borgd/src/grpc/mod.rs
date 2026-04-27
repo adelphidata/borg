@@ -7,10 +7,10 @@ pub mod status;
 
 use crate::heartbeat::HeartbeatBus;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
-use borg_proto::admin::admin_server::AdminServer;
-use borg_proto::capability::capability_server::CapabilityServer;
-use borg_proto::session::session_server::SessionServer;
-use borg_proto::status::status_server::StatusServer;
+use protocols::admin::admin_server::AdminServer;
+use protocols::capability::capability_server::CapabilityServer;
+use protocols::session::session_server::SessionServer;
+use protocols::status::status_server::StatusServer;
 use std::sync::Arc;
 
 /// Bundle of all service servers exposed by borgd.

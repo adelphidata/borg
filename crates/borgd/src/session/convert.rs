@@ -1,4 +1,4 @@
-//! Convert `borg_core::agent::AgentEvent` → wire `borg_proto::session::AgentEvent`.
+//! Convert `cortex::agent::AgentEvent` → wire `protocols::session::AgentEvent`.
 //!
 //! Two variants carry an `oneshot::Sender` for the user's reply
 //! (`ShellConfirmation`, `UserInputRequest`). On the wire we replace the
@@ -7,8 +7,8 @@
 //! `RespondToPrompt(prompt_id, value)` to deliver the reply.
 
 use super::prompts::{PendingPrompt, PromptRegistry};
-use borg_core::agent::AgentEvent as CoreEvent;
-use borg_proto::session as pb;
+use cortex::agent::AgentEvent as CoreEvent;
+use protocols::session as pb;
 use std::sync::Arc;
 
 /// Translate one core event. Returns `None` only when the event has no
@@ -62,9 +62,9 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
                     id: String::new(),
                     text: s.title,
                     status: match s.status {
-                        borg_core::types::PlanStepStatus::Pending => "pending".into(),
-                        borg_core::types::PlanStepStatus::InProgress => "in_progress".into(),
-                        borg_core::types::PlanStepStatus::Completed => "completed".into(),
+                        cortex::types::PlanStepStatus::Pending => "pending".into(),
+                        cortex::types::PlanStepStatus::InProgress => "in_progress".into(),
+                        cortex::types::PlanStepStatus::Completed => "completed".into(),
                     },
                 })
                 .collect(),
@@ -131,7 +131,7 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             delta: t.delta,
             is_stderr: t.is_stderr,
         },
-        Kind::Usage(u) => CoreEvent::Usage(borg_core::llm::UsageData {
+        Kind::Usage(u) => CoreEvent::Usage(cortex::llm::UsageData {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
             total_tokens: u.input_tokens + u.output_tokens,
@@ -150,12 +150,12 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             steps: p
                 .steps
                 .into_iter()
-                .map(|s| borg_core::types::PlanStep {
+                .map(|s| cortex::types::PlanStep {
                     title: s.text,
                     status: match s.status.as_str() {
-                        "in_progress" => borg_core::types::PlanStepStatus::InProgress,
-                        "completed" => borg_core::types::PlanStepStatus::Completed,
-                        _ => borg_core::types::PlanStepStatus::Pending,
+                        "in_progress" => cortex::types::PlanStepStatus::InProgress,
+                        "completed" => cortex::types::PlanStepStatus::Completed,
+                        _ => cortex::types::PlanStepStatus::Pending,
                     },
                 })
                 .collect(),
@@ -195,7 +195,7 @@ pub fn is_terminal(event: &pb::AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_core::tool_handlers::user_input::UserInputChoice;
+    use cortex::tool_handlers::user_input::UserInputChoice;
     use tokio::sync::oneshot;
 
     #[test]

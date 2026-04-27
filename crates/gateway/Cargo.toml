@@ -1,5 +1,5 @@
 [package]
-name = "borg-gateway"
+name = "gateway"
 description = "Webhook gateway for messaging channel integrations"
 version.workspace = true
 edition.workspace = true
@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-borg-core = { path = "../core" }
-borg-plugins = { path = "../plugins" }
-borg-sandbox = { path = "../sandbox" }
+cortex = { path = "../cortex" }
+plugins = { path = "../plugins" }
+sandbox = { path = "../sandbox" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

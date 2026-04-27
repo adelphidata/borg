@@ -7,7 +7,7 @@ use anyhow::Result;
 use regex::Regex;
 use tracing::debug;
 
-use borg_core::config::LinkUnderstandingConfig;
+use cortex::config::LinkUnderstandingConfig;
 
 /// Extract URLs from text, deduplicate, and cap at `max_links`.
 pub fn extract_urls(text: &str, max_links: usize) -> Vec<String> {

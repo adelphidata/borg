@@ -15,8 +15,8 @@ use axum::{
 /// before auth runs, since axum's `Json` extractor materializes the
 /// whole body before invoking the handler.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
-use borg_core::auth::tokens;
-use borg_core::db::Database;
+use cortex::auth::tokens;
+use cortex::db::Database;
 
 use super::server::McpServer;
 
@@ -102,7 +102,7 @@ mod tests {
 
     fn make_state() -> (
         McpHttpState,
-        borg_core::auth::tokens::IssuedToken,
+        cortex::auth::tokens::IssuedToken,
         tempfile::TempDir,
     ) {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -114,8 +114,7 @@ mod tests {
                 Database::from_connection(conn)
             });
         let setup_db = (db_open)().expect("open setup db");
-        let issued =
-            borg_core::auth::tokens::issue(&setup_db, "mcp-tok", "mcp").expect("issue token");
+        let issued = cortex::auth::tokens::issue(&setup_db, "mcp-tok", "mcp").expect("issue token");
         let tools: Vec<Box<dyn ReadOnlyToolHandler>> = vec![Box::new(StubTool)];
         let server = Arc::new(McpServer::new(tools, "0.1.0-test"));
         (McpHttpState { db_open, server }, issued, tmp)

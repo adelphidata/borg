@@ -9,7 +9,7 @@
 //! cannot or will not grant keychain access — keychain remains the preferred
 //! backend and is always attempted first.
 //!
-//! Precedent: `borg_core::scripts::get_or_create_hmac_key` uses the same
+//! Precedent: `cortex::scripts::get_or_create_hmac_key` uses the same
 //! keychain-first/file-fallback pattern for the script HMAC signing key.
 
 use std::collections::BTreeMap;

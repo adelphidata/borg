@@ -6,7 +6,7 @@
 //! the buffer using `since_event_seq`; lagged subscribers (broadcast capacity
 //! exceeded) recover via the same buffer rather than dropping events silently.
 
-use borg_proto::session::AgentEvent as ProtoEvent;
+use protocols::session::AgentEvent as ProtoEvent;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
@@ -106,7 +106,7 @@ impl Default for SequencedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_proto::session::{agent_event::Kind, TextDelta};
+    use protocols::session::{agent_event::Kind, TextDelta};
 
     fn delta(s: &str) -> ProtoEvent {
         ProtoEvent {

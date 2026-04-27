@@ -1,13 +1,13 @@
 //! Dispatcher trait that the OpenAI-compat routes use to drive the
 //! agent loop. Production wiring will provide an `AgentDispatcher`
-//! that spawns a `borg_core::agent::Agent`; tests inject a fake.
+//! that spawns a `cortex::agent::Agent`; tests inject a fake.
 
 use async_trait::async_trait;
-use borg_core::ingress::AdmittedIngress;
+use cortex::ingress::AdmittedIngress;
 use futures::stream::BoxStream;
 
 /// One chunk of agent output translated into the OpenAI streaming
-/// shape. Intermediate between the rich [`borg_core::agent::AgentEvent`]
+/// shape. Intermediate between the rich [`cortex::agent::AgentEvent`]
 /// and the OpenAI wire format — keeps the route layer free of agent
 /// internals and the trait testable without a real LLM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub enum AgentEventChunk {
 /// events translated into the OpenAI chunk shape.
 ///
 /// Implementations:
-/// - `AgentDispatcher` (production) — spawns `borg_core::agent::Agent`.
+/// - `AgentDispatcher` (production) — spawns `cortex::agent::Agent`.
 /// - Test fakes — yield canned chunk vectors.
 #[async_trait]
 pub trait ChatDispatcher: Send + Sync + 'static {

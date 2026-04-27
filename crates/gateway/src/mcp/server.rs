@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// One read-only tool exposed over MCP. Production wires `name` to the
-/// matching `borg_core::tool_handlers::*::handle` function; tests
+/// matching `cortex::tool_handlers::*::handle` function; tests
 /// inject fakes that record calls.
 #[async_trait]
 pub trait ReadOnlyToolHandler: Send + Sync + 'static {
@@ -207,7 +207,7 @@ mod tests {
     use std::sync::Mutex;
 
     /// Records every call. Production handlers will hit
-    /// `borg_core::tool_handlers::*` directly; this fake exists to
+    /// `cortex::tool_handlers::*` directly; this fake exists to
     /// drive the dispatcher without spinning the real backend.
     struct RecordingTool {
         descriptor: McpToolDescriptor,

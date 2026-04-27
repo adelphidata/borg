@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use borg_core::config::AutoReplyConfig;
+use cortex::config::AutoReplyConfig;
 
 /// Current auto-reply state.
 #[derive(Debug, Clone)]

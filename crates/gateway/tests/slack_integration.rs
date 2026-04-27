@@ -33,9 +33,9 @@
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, HeaderValue};
-use borg_gateway::slack::dedup::EventDeduplicator;
-use borg_gateway::slack::echo::EchoCache;
-use borg_gateway::slack::{handle_slack_webhook, SlackWebhookResult};
+use gateway::slack::dedup::EventDeduplicator;
+use gateway::slack::echo::EchoCache;
+use gateway::slack::{handle_slack_webhook, SlackWebhookResult};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::Mutex;

@@ -39,11 +39,11 @@ Borg is a Cargo workspace with 7 crates:
 
 | Crate | Purpose |
 |-------|---------|
-| `crates/cli` | Binary: REPL, clap args, TUI, onboarding |
-| `crates/core` | Library: agent loop, LLM client, memory, config |
+| `crates/interface` | Binary: REPL, clap args, TUI, onboarding |
+| `crates/cortex` | Library: agent loop, LLM client, memory, config |
 | `crates/heartbeat` | Library: proactive scheduler with quiet hours |
 | `crates/sandbox` | Library: macOS Seatbelt + Linux Bubblewrap policies |
-| `crates/apply-patch` | Library: patch DSL parser + filesystem applicator |
+| `crates/coding` | Library: patch DSL parser + filesystem applicator |
 | `crates/gateway` | Library: webhook gateway for messaging channels |
 | `crates/plugins` | Library: marketplace catalog, plugin installer |
 
@@ -53,10 +53,10 @@ See [docs/architecture.md](docs/architecture.md) for a deeper overview.
 
 ```sh
 cargo test                         # all tests
-cargo test -p borg-apply-patch     # patch DSL tests
-cargo test -p borg-core            # core tests
-cargo test -p borg-gateway         # gateway tests
-cargo test -p borg-plugins         # plugin tests
+cargo test -p coding     # patch DSL tests
+cargo test -p cortex            # core tests
+cargo test -p gateway         # gateway tests
+cargo test -p plugins         # plugin tests
 ```
 
 ## Code Style

@@ -210,6 +210,6 @@ The v1 schema (no `workspaces` table, no `classification_predicates`, no `kek_sh
 - Companion: [`architecture-redesign.md`](architecture-redesign.md) — Layer 4d audit chain
 - Companion: [`auth-and-onboarding.md`](auth-and-onboarding.md) — system audit chain, listener floors
 - Companion: [`threat-model.md`](threat-model.md) — tombstone vs crypto-erase reasoning
-- Existing audit chain code: `crates/core/src/db/migrations.rs`, `crates/core/src/evolution/replay.rs`
+- Existing audit chain code: `crates/cortex/src/db/migrations.rs`, `crates/cortex/src/evolution/replay.rs`
 - NIST SP 800-53 Rev 5: AU-9, AU-11, MP-6 (v3 mapping)
 - NIST SP 800-88 Rev 1 (media sanitization — v3 disclaimer)

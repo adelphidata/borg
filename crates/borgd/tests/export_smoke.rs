@@ -12,13 +12,13 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
-use borg_core::db::Database;
-use borg_proto::admin::admin_client::AdminClient;
-use borg_proto::admin::admin_server::AdminServer;
-use borg_proto::admin::ExportSessionRequest;
 use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::session::SessionRegistry;
+use cortex::db::Database;
+use protocols::admin::admin_client::AdminClient;
+use protocols::admin::admin_server::AdminServer;
+use protocols::admin::ExportSessionRequest;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;

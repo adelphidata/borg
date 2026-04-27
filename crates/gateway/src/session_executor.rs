@@ -4,7 +4,7 @@
 //! implementation (the daemon's `SessionRegistry`).
 
 use async_trait::async_trait;
-use borg_core::agent::AgentEvent;
+use cortex::agent::AgentEvent;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;

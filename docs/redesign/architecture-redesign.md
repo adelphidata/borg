@@ -194,7 +194,7 @@ v1 is a clean rewrite, not a phased evolution. The shape is too different from c
 ### Plan
 1. **Audit current invariants.** Before the rewrite, grep `CLAUDE.md` and the codebase for every "regressed multiple times" / "treat as a hard invariant" / guard-test comment. Carry those forward as test-first targets in the new TUI. The mouse-selection invariant in particular needs explicit forward-port plus the same source-level guard tests.
 2. **Daemon scaffolding.** Build the kernel + gRPC transport + storage layer with the existing SQLite migrations carried over.
-3. **Port the agent loop.** Lift `crates/core/src/agent.rs` into the daemon. The hook system, evolution events, vitals, heartbeat all live there.
+3. **Port the agent loop.** Lift `crates/cortex/src/agent.rs` into the daemon. The hook system, evolution events, vitals, heartbeat all live there.
 4. **Port the TUI as a gRPC client.** Re-implement cell rendering, input handling, slash commands against the gRPC stream. This is the riskiest part.
 5. **Port channels.** The existing 8 channel adapters become Layer 5 adapters (in-daemon translators, not out-of-process clients in v1).
 6. **Add new ingress.** OpenAI-compat HTTP, generic webhook, MCP.
@@ -204,7 +204,7 @@ v1 is a clean rewrite, not a phased evolution. The shape is too different from c
 Current Borg is frozen during the rewrite — no new features, no new channel adapters, no bug fixes for existing single-user use. Acceptable because the user count is one.
 
 ### Risk
-Clean rewrites are where load-bearing-but-undocumented invariants get re-violated. The mouse-selection guard tests in `crates/cli/src/tui/mod.rs` and `app.rs` are the prototype — anything that pattern-matches them gets the same forward-port treatment.
+Clean rewrites are where load-bearing-but-undocumented invariants get re-violated. The mouse-selection guard tests in `crates/interface/src/tui/mod.rs` and `app.rs` are the prototype — anything that pattern-matches them gets the same forward-port treatment.
 
 ---
 
@@ -239,5 +239,5 @@ Clean rewrites are where load-bearing-but-undocumented invariants get re-violate
 - Companion: [`data-handling.md`](data-handling.md) — retention + tombstone-on-purge + backup
 - Companion: [`mobile.md`](mobile.md) — v2 placeholder
 - Current Borg gateway: `crates/gateway/src/server.rs`
-- Current daemon entry: `crates/cli/src/service/mod.rs::run_daemon`
+- Current daemon entry: `crates/interface/src/service/mod.rs::run_daemon`
 - Hermes reference: `reference/hermes-agent/`

@@ -13,9 +13,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use borg_core::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
-use borg_pki::{ca::generate_root_ca, MemoryKekStore};
-use borgd::pairing::device::{client as pair_client, mint_pairing_code, BootstrapListener, BootstrapState};
+use borgd::pairing::device::{
+    client as pair_client, mint_pairing_code, BootstrapListener, BootstrapState,
+};
+use cortex::db::{audit_events, AuditChainOutcome, AuditWriter, Database};
+use identity::{ca::generate_root_ca, MemoryKekStore};
 use rusqlite::Connection;
 
 const PAIR_INTENT: &str = "device";
@@ -55,7 +57,8 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     let code = mint_pairing_code();
     {
         let g = state.db.lock().expect("lock");
-        g.create_pairing_code(&code, PAIR_INTENT, 300).expect("mint");
+        g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .expect("mint");
     }
 
     let dir = tempfile::tempdir().expect("tmpdir");
@@ -63,7 +66,9 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     let listener_state = state.clone();
     let listener_path = path.clone();
     let server = tokio::spawn(async move {
-        BootstrapListener::new(listener_path).serve(listener_state).await
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
     });
     wait_for_socket(&path).await;
 
@@ -105,8 +110,7 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     // 3. Revoke the device.
     {
         let g = state.db.lock().expect("lock");
-        g.revoke_paired_device(&fp, Some("test"))
-            .expect("revoke");
+        g.revoke_paired_device(&fp, Some("test")).expect("revoke");
     }
     assert!(state
         .db
@@ -157,7 +161,9 @@ async fn wrong_code_is_denied_no_cert_issued_chain_intact() {
     let listener_state = state.clone();
     let listener_path = path.clone();
     let server = tokio::spawn(async move {
-        BootstrapListener::new(listener_path).serve(listener_state).await
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
     });
     wait_for_socket(&path).await;
 
@@ -187,14 +193,17 @@ async fn replayed_code_is_rejected_after_first_use() {
     let code = mint_pairing_code();
     {
         let g = state.db.lock().expect("lock");
-        g.create_pairing_code(&code, PAIR_INTENT, 300).expect("mint");
+        g.create_pairing_code(&code, PAIR_INTENT, 300)
+            .expect("mint");
     }
     let dir = tempfile::tempdir().expect("tmpdir");
     let path = dir.path().join("pair.sock");
     let listener_state = state.clone();
     let listener_path = path.clone();
     let server = tokio::spawn(async move {
-        BootstrapListener::new(listener_path).serve(listener_state).await
+        BootstrapListener::new(listener_path)
+            .serve(listener_state)
+            .await
     });
     wait_for_socket(&path).await;
 

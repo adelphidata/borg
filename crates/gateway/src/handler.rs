@@ -6,14 +6,14 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
-use borg_core::agent::AgentEvent;
-use borg_core::config::Config;
-use borg_core::constants;
-use borg_core::db::{Database, NewDelivery};
-use borg_core::sanitize::{
+use cortex::agent::AgentEvent;
+use cortex::config::Config;
+use cortex::constants;
+use cortex::db::{Database, NewDelivery};
+use cortex::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };
-use borg_core::validation::{sanitize_filename, sanitize_thread_id};
+use cortex::validation::{sanitize_filename, sanitize_thread_id};
 
 use crate::constants::MAX_THREAD_ID_LEN;
 
@@ -203,7 +203,7 @@ pub fn check_activation(
         .unwrap_or(&config.gateway.group_activation);
 
     match activation {
-        borg_core::config::ActivationMode::Mention => {
+        cortex::config::ActivationMode::Mention => {
             if let Some(bot_id) = bot_identifier {
                 // Case-insensitive search for the bot mention
                 let lower_text = text.to_lowercase();
@@ -226,7 +226,7 @@ pub fn check_activation(
                 (true, text.to_string())
             }
         }
-        borg_core::config::ActivationMode::Always => (true, text.to_string()),
+        cortex::config::ActivationMode::Always => (true, text.to_string()),
     }
 }
 
@@ -275,12 +275,12 @@ pub async fn invoke_agent_with_auto_reply(
 ) -> Result<(String, String)> {
     // Expose the originating (channel, sender, thread) to tool handlers via a
     // task-local so e.g. the `schedule` tool can resolve `delivery="origin"`.
-    let origin = borg_core::gateway_context::GatewayOriginContext {
+    let origin = cortex::gateway_context::GatewayOriginContext {
         channel_name: channel_name.to_string(),
         sender_id: inbound.sender_id.clone(),
         thread_id: inbound.thread_id.clone(),
     };
-    borg_core::gateway_context::scope(
+    cortex::gateway_context::scope(
         origin,
         invoke_agent_inner(
             channel_name,
@@ -302,7 +302,7 @@ async fn check_sender_access_control(
     config: &Config,
     channel_name: &str,
     sender_id: &str,
-) -> Result<borg_core::pairing::AccessCheckResult> {
+) -> Result<cortex::pairing::AccessCheckResult> {
     let ch = channel_name.to_string();
     let sid = sender_id.to_string();
     let cfg = config.clone();
@@ -310,7 +310,7 @@ async fn check_sender_access_control(
     let access = tokio::task::spawn_blocking(move || {
         let db = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
             .context("Failed to open database for pairing check")?;
-        borg_core::pairing::check_sender_access(&db, &cfg, &ch, &sid, agent_name.as_deref())
+        cortex::pairing::check_sender_access(&db, &cfg, &ch, &sid, agent_name.as_deref())
     })
     .await
     .context("Pairing check task panicked")??;
@@ -643,9 +643,9 @@ async fn collect_agent_response(
                     }
                     AgentEvent::Error(e) => {
                         warn!("Agent error on channel '{}': {e}", channel_name);
-                        let friendly = borg_core::error_format::format_error_with_context(
+                        let friendly = cortex::error_format::format_error_with_context(
                             &e,
-                            borg_core::error_format::ErrorContext::Gateway,
+                            cortex::error_format::ErrorContext::Gateway,
                         );
                         if response_text.is_empty() {
                             response_text = friendly;
@@ -790,8 +790,8 @@ async fn enforce_access_control(
 ) -> Result<Option<(String, String)>> {
     let access = check_sender_access_control(config, channel_name, sender_id).await?;
     match access {
-        borg_core::pairing::AccessCheckResult::Allowed => Ok(None),
-        borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+        cortex::pairing::AccessCheckResult::Allowed => Ok(None),
+        cortex::pairing::AccessCheckResult::Challenge { message, .. } => {
             let suppress = CHALLENGE_THROTTLE
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -801,7 +801,7 @@ async fn enforce_access_control(
             }
             info!("Pairing challenge issued for sender '{sender_id}' on channel '{channel_name}'");
             if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
+                cortex::activity_log::log_activity(
                     &adb,
                     "info",
                     "gateway",
@@ -810,10 +810,10 @@ async fn enforce_access_control(
             }
             Ok(Some((message, String::new())))
         }
-        borg_core::pairing::AccessCheckResult::Denied { reason } => {
+        cortex::pairing::AccessCheckResult::Denied { reason } => {
             info!("Access denied for sender '{sender_id}' on channel '{channel_name}': {reason}");
             if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-                borg_core::activity_log::log_activity(
+                cortex::activity_log::log_activity(
                     &adb,
                     "warn",
                     "gateway",
@@ -839,7 +839,7 @@ async fn invoke_agent_inner(
 ) -> Result<(String, String)> {
     // Phase 1: Activity logging
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        borg_core::activity_log::log_activity(
+        cortex::activity_log::log_activity(
             &adb,
             "info",
             "gateway",
@@ -998,7 +998,7 @@ async fn invoke_agent_inner(
     }
 
     // Log outbound message (redact secrets before DB persistence)
-    let redacted_response = borg_core::secrets::redact_secrets(&response_text);
+    let redacted_response = cortex::secrets::redact_secrets(&response_text);
     if let Err(e) = db.log_channel_message(
         channel_name,
         &inbound.sender_id,
@@ -1198,9 +1198,9 @@ fn record_delivery_failure_sync(db: &Database, delivery_id: &str, error: &str) {
 /// sending back to a messaging channel. Uses `ErrorContext::Gateway` to include
 /// gateway-appropriate action hints (e.g. "try switching to a different model").
 pub fn format_gateway_error(err: &anyhow::Error) -> String {
-    borg_core::error_format::format_error_with_context(
+    cortex::error_format::format_error_with_context(
         &err.to_string(),
-        borg_core::error_format::ErrorContext::Gateway,
+        cortex::error_format::ErrorContext::Gateway,
     )
 }
 
@@ -1280,10 +1280,10 @@ mod tests {
             dir: std::path::PathBuf::from("/tmp"),
         };
         let policy = build_retry_policy(&channel);
-        assert_eq!(policy.max_retries, borg_core::constants::RETRY_MAX_RETRIES);
+        assert_eq!(policy.max_retries, cortex::constants::RETRY_MAX_RETRIES);
         assert_eq!(
             policy.initial_delay_ms,
-            borg_core::constants::RETRY_INITIAL_DELAY_MS
+            cortex::constants::RETRY_INITIAL_DELAY_MS
         );
     }
 
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn dm_activates_even_with_mention_mode() {
         let mut route = default_route();
-        route.activation = Some(borg_core::config::ActivationMode::Mention);
+        route.activation = Some(cortex::config::ActivationMode::Mention);
         let config = Config::default();
         let (activate, _) =
             check_activation("hello", Some("direct"), &route, &config, Some("@bot"));
@@ -1348,7 +1348,7 @@ mod tests {
     fn group_mention_mode_activates_when_mentioned() {
         let route = default_route();
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Mention;
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
         let (activate, text) = check_activation(
             "@mybot help me",
             Some("group"),
@@ -1364,7 +1364,7 @@ mod tests {
     fn group_mention_mode_skips_when_not_mentioned() {
         let route = default_route();
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Mention;
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
         let (activate, _) = check_activation(
             "hello everyone",
             Some("group"),
@@ -1379,7 +1379,7 @@ mod tests {
     fn group_always_mode_activates() {
         let route = default_route();
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Always;
+        config.gateway.group_activation = cortex::config::ActivationMode::Always;
         let (activate, text) =
             check_activation("hello", Some("group"), &route, &config, Some("@bot"));
         assert!(activate);
@@ -1390,7 +1390,7 @@ mod tests {
     fn group_no_bot_identifier_falls_back_to_always() {
         let route = default_route();
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Mention;
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
         let (activate, _) = check_activation("hello", Some("group"), &route, &config, None);
         assert!(activate);
     }
@@ -1398,9 +1398,9 @@ mod tests {
     #[test]
     fn binding_activation_overrides_global() {
         let mut route = default_route();
-        route.activation = Some(borg_core::config::ActivationMode::Always);
+        route.activation = Some(cortex::config::ActivationMode::Always);
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Mention;
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
         let (activate, _) = check_activation("hello", Some("group"), &route, &config, Some("@bot"));
         assert!(activate);
     }
@@ -1409,7 +1409,7 @@ mod tests {
     fn mention_only_text_still_activates() {
         let route = default_route();
         let mut config = Config::default();
-        config.gateway.group_activation = borg_core::config::ActivationMode::Mention;
+        config.gateway.group_activation = cortex::config::ActivationMode::Mention;
         let (activate, text) =
             check_activation("@mybot", Some("group"), &route, &config, Some("@mybot"));
         assert!(activate);
@@ -1509,18 +1509,17 @@ mod tests {
     /// New sender with DmPolicy::Pairing receives a non-empty challenge message.
     #[test]
     fn pairing_new_sender_gets_challenge() {
-        let db = borg_core::db::Database::from_connection(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let db =
+            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
         let mut config = Config::default();
-        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Pairing;
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "new_user", None)
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "new_user", None)
                 .unwrap();
         match result {
-            borg_core::pairing::AccessCheckResult::Challenge { code, message } => {
+            cortex::pairing::AccessCheckResult::Challenge { code, message } => {
                 assert!(!code.is_empty(), "pairing code must not be empty");
                 assert!(!message.is_empty(), "challenge message must not be empty");
                 assert!(
@@ -1557,15 +1556,14 @@ mod tests {
         assert!(should_respond, "DMs must always activate");
 
         // Step 2: Pairing check should return a non-empty challenge
-        let db = borg_core::db::Database::from_connection(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let db =
+            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "starter_user", None)
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "starter_user", None)
                 .unwrap();
         match result {
-            borg_core::pairing::AccessCheckResult::Challenge { message, .. } => {
+            cortex::pairing::AccessCheckResult::Challenge { message, .. } => {
                 assert!(
                     !message.trim().is_empty(),
                     "pairing challenge must not be empty (would be silently dropped)"
@@ -1578,18 +1576,16 @@ mod tests {
     /// DmPolicy::Disabled returns a non-empty denial message (not silently dropped).
     #[test]
     fn disabled_policy_returns_nonempty_denial() {
-        let db = borg_core::db::Database::from_connection(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let db =
+            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
         let mut config = Config::default();
-        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Disabled;
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Disabled;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
-                .unwrap();
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
         match result {
-            borg_core::pairing::AccessCheckResult::Denied { reason } => {
+            cortex::pairing::AccessCheckResult::Denied { reason } => {
                 assert!(!reason.trim().is_empty(), "denial reason must not be empty");
             }
             other => panic!("expected Denied, got {other:?}"),
@@ -1599,38 +1595,34 @@ mod tests {
     /// DmPolicy::Open lets any sender through without challenge.
     #[test]
     fn open_policy_allows_any_sender() {
-        let db = borg_core::db::Database::from_connection(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let db =
+            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
         let mut config = Config::default();
-        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Open;
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Open;
 
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "anyone", None)
-                .unwrap();
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "anyone", None).unwrap();
         assert!(matches!(
             result,
-            borg_core::pairing::AccessCheckResult::Allowed
+            cortex::pairing::AccessCheckResult::Allowed
         ));
     }
 
     /// After approval, the same sender is allowed through.
     #[test]
     fn approved_sender_passes_pairing() {
-        let db = borg_core::db::Database::from_connection(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )
-        .unwrap();
+        let db =
+            cortex::db::Database::from_connection(rusqlite::Connection::open_in_memory().unwrap())
+                .unwrap();
         let mut config = Config::default();
-        config.gateway.dm_policy = borg_core::pairing::DmPolicy::Pairing;
+        config.gateway.dm_policy = cortex::pairing::DmPolicy::Pairing;
 
         // Get challenge
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
-                .unwrap();
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None).unwrap();
         let code = match result {
-            borg_core::pairing::AccessCheckResult::Challenge { code, .. } => code,
+            cortex::pairing::AccessCheckResult::Challenge { code, .. } => code,
             other => panic!("expected Challenge, got {other:?}"),
         };
 
@@ -1639,11 +1631,10 @@ mod tests {
 
         // Now should be allowed
         let result =
-            borg_core::pairing::check_sender_access(&db, &config, "telegram", "user_x", None)
-                .unwrap();
+            cortex::pairing::check_sender_access(&db, &config, "telegram", "user_x", None).unwrap();
         assert!(matches!(
             result,
-            borg_core::pairing::AccessCheckResult::Allowed
+            cortex::pairing::AccessCheckResult::Allowed
         ));
     }
 

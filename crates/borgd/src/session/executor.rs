@@ -13,10 +13,10 @@ use crate::session::{
     convert, SessionHost, SessionRegistry,
 };
 use async_trait::async_trait;
-use borg_core::agent::AgentEvent;
-use borg_core::config::Config;
-use borg_core::telemetry::BorgMetrics;
-use borg_gateway::{InboundTurn, SessionExecutor};
+use cortex::agent::AgentEvent;
+use cortex::config::Config;
+use cortex::telemetry::BorgMetrics;
+use gateway::{InboundTurn, SessionExecutor};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 

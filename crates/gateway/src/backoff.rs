@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use borg_core::retry::{backoff_with_config, BackoffConfig};
+use cortex::retry::{backoff_with_config, BackoffConfig};
 
 /// Calculate exponential backoff with jitter.
 ///
-/// Thin wrapper around `borg_core::retry::backoff_with_config`.
+/// Thin wrapper around `cortex::retry::backoff_with_config`.
 /// `consecutive_errors` is 1-indexed (first error = 1).
 pub fn calculate_backoff(
     consecutive_errors: u32,

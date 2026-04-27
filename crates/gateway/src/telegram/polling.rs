@@ -10,7 +10,7 @@ use super::dedup::UpdateDeduplicator;
 use super::parse::parse_update;
 use super::types::Update;
 
-use borg_core::constants;
+use cortex::constants;
 
 const POLL_TIMEOUT_SECS: u64 = constants::TELEGRAM_POLL_TIMEOUT_SECS;
 const MIN_BACKOFF: Duration = constants::TELEGRAM_MIN_BACKOFF;

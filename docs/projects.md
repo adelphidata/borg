@@ -67,9 +67,9 @@ When creating a workflow via the `schedule` tool, pass `project_id` to associate
 
 | File | Purpose |
 |------|---------|
-| `crates/core/src/db/workflow.rs` | Project + workflow DB operations |
-| `crates/core/src/db/models.rs` | `ProjectRow` struct |
-| `crates/core/src/tool_handlers/projects.rs` | `projects` tool handler |
-| `crates/core/src/tool_definitions.rs` | Tool JSON schema |
-| `crates/cli/src/main.rs` | `borg projects` CLI subcommand |
-| `crates/cli/src/tui/commands.rs` | `/projects` TUI command |
+| `crates/cortex/src/db/workflow.rs` | Project + workflow DB operations |
+| `crates/cortex/src/db/models.rs` | `ProjectRow` struct |
+| `crates/cortex/src/tool_handlers/projects.rs` | `projects` tool handler |
+| `crates/cortex/src/tool_definitions.rs` | Tool JSON schema |
+| `crates/interface/src/main.rs` | `borg projects` CLI subcommand |
+| `crates/interface/src/tui/commands.rs` | `/projects` TUI command |

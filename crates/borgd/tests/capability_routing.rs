@@ -6,13 +6,13 @@
 //! fallback (e.g. `terminal.exec` → daemon `run_shell`) and a
 //! `CapabilityUnavailable` tool-result error (e.g. `clipboard.read`). The
 //! `Unavailable` ↔ fallback-policy mapping itself lives in
-//! `borg_proto::capabilities`; this test guards the routing layer's
+//! `protocols::capabilities`; this test guards the routing layer's
 //! observable behavior.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use borg_proto::capabilities::{CLIPBOARD_READ, TERMINAL_EXEC};
 use borgd::grpc::capability::{CapabilityRouter, InvocationResult};
+use protocols::capabilities::{CLIPBOARD_READ, TERMINAL_EXEC};
 
 #[tokio::test]
 async fn unadvertised_capabilities_return_unavailable() {

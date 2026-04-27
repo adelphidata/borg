@@ -2,7 +2,7 @@
 //! `crates/cli/src/service/mod.rs` so the daemon binary can run jobs without
 //! shelling out to the cli's in-process helpers.
 
-use borg_core::config::Config;
+use cortex::config::Config;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 /// behavior doesn't drift between the legacy in-cli path and the new
 /// in-borgd path.
 pub async fn spawn_task_execution(
-    task: borg_core::db::ScheduledTaskRow,
+    task: cortex::db::ScheduledTaskRow,
     run_id: i64,
     is_retry: bool,
     semaphore: Arc<Semaphore>,
@@ -23,8 +23,8 @@ pub async fn spawn_task_execution(
     let task_name = task.name.clone();
     let task_id = task.id.clone();
     let task_prompt = match task.id.as_str() {
-        borg_core::daily_summary::DAILY_SUMMARY_TASK_ID => {
-            match borg_core::daily_summary::build_daily_summary_prompt() {
+        cortex::daily_summary::DAILY_SUMMARY_TASK_ID => {
+            match cortex::daily_summary::build_daily_summary_prompt() {
                 Ok(enriched) => enriched,
                 Err(e) => {
                     tracing::warn!("Daily summary data gathering failed: {e}");
@@ -50,14 +50,14 @@ pub async fn spawn_task_execution(
                 return;
             }
         };
-        match borg_core::db::Database::open() {
+        match cortex::db::Database::open() {
             Ok(adb) => {
                 let attempt = if is_retry {
                     format!(" (retry {retry_count})")
                 } else {
                     String::new()
                 };
-                borg_core::activity_log::log_activity(
+                cortex::activity_log::log_activity(
                     &adb,
                     "info",
                     "task",
@@ -100,7 +100,7 @@ pub async fn spawn_task_execution(
                 .or_else(|| panic_err.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
             tracing::error!("Task '{task_name}' panicked: {panic_msg}");
-            match borg_core::db::Database::open() {
+            match cortex::db::Database::open() {
                 Ok(db) => {
                     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
                     if let Err(e) = db.complete_task_run(
@@ -120,10 +120,10 @@ pub async fn spawn_task_execution(
 
 /// Spawn a workflow step.
 pub async fn spawn_workflow_step(
-    workflow: borg_core::db::WorkflowRow,
-    step: borg_core::db::WorkflowStepRow,
-    prior_steps: Vec<borg_core::db::WorkflowStepRow>,
-    all_steps: Vec<borg_core::db::WorkflowStepRow>,
+    workflow: cortex::db::WorkflowRow,
+    step: cortex::db::WorkflowStepRow,
+    prior_steps: Vec<cortex::db::WorkflowStepRow>,
+    all_steps: Vec<cortex::db::WorkflowStepRow>,
     semaphore: Arc<Semaphore>,
     config: Config,
 ) {
@@ -143,7 +143,7 @@ pub async fn spawn_workflow_step(
             }
         };
 
-        let db = match borg_core::db::Database::open() {
+        let db = match cortex::db::Database::open() {
             Ok(db) => db,
             Err(e) => {
                 tracing::error!("Failed to open DB for workflow step: {e}");
@@ -151,25 +151,25 @@ pub async fn spawn_workflow_step(
             }
         };
 
-        let context = borg_core::workflow::engine::build_step_context_with_remaining(
+        let context = cortex::workflow::engine::build_step_context_with_remaining(
             &workflow,
             &step,
             &prior_steps,
             &all_steps,
         );
 
-        let identity = borg_core::identity::load_identity().unwrap_or_default();
-        let memory = borg_core::memory::load_memory_context_db(4000).unwrap_or_default();
+        let identity = cortex::identity::load_identity().unwrap_or_default();
+        let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
         let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
         let system = format!("{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n{context}");
 
         let messages = vec![
-            borg_core::types::Message::system(system),
-            borg_core::types::Message::user(&step.instructions),
+            cortex::types::Message::system(system),
+            cortex::types::Message::user(&step.instructions),
         ];
 
-        let llm = match borg_core::llm::LlmClient::new(&config) {
+        let llm = match cortex::llm::LlmClient::new(&config) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("Failed to create LLM client for workflow step '{step_title}': {e}");
@@ -189,10 +189,11 @@ pub async fn spawn_workflow_step(
                     tracing::warn!("Failed to complete workflow step: {e}");
                 }
                 if let Ok(Some(wf)) = db.get_workflow(&workflow_id) {
-                    if wf.status == borg_core::workflow::status::COMPLETED {
+                    if wf.status == cortex::workflow::status::COMPLETED {
                         if let (Some(ch), Some(tgt)) = (wf.delivery_channel, wf.delivery_target) {
                             let summary = build_workflow_summary(&db, &wf.id);
-                            deliver_task_result(&ch, &tgt, &workflow_title, &summary, &config).await;
+                            deliver_task_result(&ch, &tgt, &workflow_title, &summary, &config)
+                                .await;
                         }
                     }
                 }
@@ -201,22 +202,28 @@ pub async fn spawn_workflow_step(
                 let error_msg = format!("{e}");
                 tracing::warn!("Workflow step failed: {workflow_title} — {error_msg}");
                 if let Err(e2) = db.fail_workflow_step(step_id, &error_msg) {
-                    tracing::warn!("Workflow step '{workflow_title}': failed to mark failure: {e2}");
+                    tracing::warn!(
+                        "Workflow step '{workflow_title}': failed to mark failure: {e2}"
+                    );
                 }
             }
             Err(_) => {
                 let error_msg = format!("Step timed out after {}ms", step_timeout.as_millis());
                 tracing::warn!("Workflow step timed out: {workflow_title}");
                 if let Err(e2) = db.fail_workflow_step(step_id, &error_msg) {
-                    tracing::warn!("Workflow step '{workflow_title}': failed to mark timeout: {e2}");
+                    tracing::warn!(
+                        "Workflow step '{workflow_title}': failed to mark timeout: {e2}"
+                    );
                 }
             }
         }
     });
 }
 
-fn build_workflow_summary(db: &borg_core::db::Database, workflow_id: &str) -> String {
-    let steps = db.get_completed_workflow_steps(workflow_id).unwrap_or_default();
+fn build_workflow_summary(db: &cortex::db::Database, workflow_id: &str) -> String {
+    let steps = db
+        .get_completed_workflow_steps(workflow_id)
+        .unwrap_or_default();
     let mut summary = String::new();
     for s in &steps {
         summary.push_str(&format!("**Step {}: {}**\n", s.step_index + 1, s.title));
@@ -255,8 +262,8 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
 
     let config_clone = config.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let db = borg_core::db::Database::open()?;
-        borg_core::maintenance::run_daily_maintenance(&db, &config_clone)
+        let db = cortex::db::Database::open()?;
+        cortex::maintenance::run_daily_maintenance(&db, &config_clone)
     })
     .await;
 
@@ -271,9 +278,14 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
         Err(e) => (None, Some(format!("maintenance task panicked: {e}"))),
     };
 
-    match borg_core::db::Database::open() {
+    match cortex::db::Database::open() {
         Ok(db) => {
-            if let Err(e) = db.complete_task_run(*run_id, duration_ms, summary.as_deref(), error_msg.as_deref()) {
+            if let Err(e) = db.complete_task_run(
+                *run_id,
+                duration_ms,
+                summary.as_deref(),
+                error_msg.as_deref(),
+            ) {
                 tracing::warn!("maintenance: failed to finalize task_runs row {run_id}: {e}");
             }
             if error_msg.is_none() {
@@ -322,16 +334,20 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             };
 
             if output.status.success() {
-                match borg_core::db::Database::open() {
+                match cortex::db::Database::open() {
                     Ok(db) => {
-                        if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&combined), None) {
+                        if let Err(e) =
+                            db.complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                        {
                             tracing::warn!("Task '{task_name}': failed to finalize run: {e}");
                         }
                         if let Err(e) = db.clear_task_retry(task_id) {
                             tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
                         }
                     }
-                    Err(e) => tracing::warn!("Task '{task_name}': DB open failed at success path: {e}"),
+                    Err(e) => {
+                        tracing::warn!("Task '{task_name}': DB open failed at success path: {e}")
+                    }
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                     deliver_task_result(ch, tgt, task_name, &combined, config).await;
@@ -339,7 +355,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             } else {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let error_msg = format!("exit code {exit_code}");
-                match borg_core::db::Database::open() {
+                match cortex::db::Database::open() {
                     Ok(db) => {
                         if let Err(e) = db.complete_task_run(
                             *run_id,
@@ -347,10 +363,14 @@ async fn execute_command_task(ctx: &TaskExecContext) {
                             Some(&combined),
                             Some(&error_msg),
                         ) {
-                            tracing::warn!("Task '{task_name}': failed to record exit-code failure: {e}");
+                            tracing::warn!(
+                                "Task '{task_name}': failed to record exit-code failure: {e}"
+                            );
                         }
                     }
-                    Err(e) => tracing::warn!("Task '{task_name}': DB open failed at failure path: {e}"),
+                    Err(e) => {
+                        tracing::warn!("Task '{task_name}': DB open failed at failure path: {e}")
+                    }
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                     deliver_task_result(
@@ -416,8 +436,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         delivery_target,
         config,
     } = ctx;
-    let identity = borg_core::identity::load_identity().unwrap_or_default();
-    let memory = borg_core::memory::load_memory_context_db(4000).unwrap_or_default();
+    let identity = cortex::identity::load_identity().unwrap_or_default();
+    let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
     let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
 
     let system = format!(
@@ -427,18 +447,20 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
     );
 
     let messages = vec![
-        borg_core::types::Message::system(system),
-        borg_core::types::Message::user(task_prompt),
+        cortex::types::Message::system(system),
+        cortex::types::Message::user(task_prompt),
     ];
 
-    let llm = match borg_core::llm::LlmClient::new(config) {
+    let llm = match cortex::llm::LlmClient::new(config) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
-            match borg_core::db::Database::open() {
+            match cortex::db::Database::open() {
                 Ok(db) => {
                     if let Err(e2) = db.complete_task_run(*run_id, 0, None, Some(&format!("{e}"))) {
-                        tracing::warn!("Task '{task_name}': failed to record LLM-init failure: {e2}");
+                        tracing::warn!(
+                            "Task '{task_name}': failed to record LLM-init failure: {e2}"
+                        );
                     }
                 }
                 Err(e2) => tracing::warn!("Task '{task_name}': DB open failed at LLM-init: {e2}"),
@@ -452,16 +474,22 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         Ok(Ok(response)) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             let result_text = response.text_content().unwrap_or("");
-            match borg_core::db::Database::open() {
+            match cortex::db::Database::open() {
                 Ok(db) => {
-                    if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(result_text), None) {
-                        tracing::warn!("Task '{task_name}': failed to finalize prompt-task run: {e}");
+                    if let Err(e) =
+                        db.complete_task_run(*run_id, duration_ms, Some(result_text), None)
+                    {
+                        tracing::warn!(
+                            "Task '{task_name}': failed to finalize prompt-task run: {e}"
+                        );
                     }
                     if let Err(e) = db.clear_task_retry(task_id) {
                         tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
                     }
                 }
-                Err(e) => tracing::warn!("Task '{task_name}': DB open failed at prompt-success: {e}"),
+                Err(e) => {
+                    tracing::warn!("Task '{task_name}': DB open failed at prompt-success: {e}")
+                }
             }
             if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                 deliver_task_result(ch, tgt, task_name, result_text, config).await;
@@ -470,16 +498,34 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         Ok(Err(e)) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
-                task_id, task_name, *run_id, duration_ms, *retry_count, *max_retries,
-                schedule_type, delivery_channel, delivery_target, config, &format!("{e}"),
+                task_id,
+                task_name,
+                *run_id,
+                duration_ms,
+                *retry_count,
+                *max_retries,
+                schedule_type,
+                delivery_channel,
+                delivery_target,
+                config,
+                &format!("{e}"),
             )
             .await;
         }
         Err(_) => {
             let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
-                task_id, task_name, *run_id, duration_ms, *retry_count, *max_retries,
-                schedule_type, delivery_channel, delivery_target, config, "Task timed out",
+                task_id,
+                task_name,
+                *run_id,
+                duration_ms,
+                *retry_count,
+                *max_retries,
+                schedule_type,
+                delivery_channel,
+                delivery_target,
+                config,
+                "Task timed out",
             )
             .await;
         }
@@ -500,14 +546,14 @@ async fn handle_task_failure(
     config: &Config,
     error: &str,
 ) {
-    match borg_core::db::Database::open() {
+    match cortex::db::Database::open() {
         Ok(db) => {
             if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
                 tracing::warn!("Task '{task_name}': failed to record failure: {e}");
             }
-            if borg_core::tasks::is_transient_error(error) && retry_count < max_retries {
+            if cortex::tasks::is_transient_error(error) && retry_count < max_retries {
                 let next_attempt = retry_count + 1;
-                let delay = borg_core::tasks::retry_delay_secs(next_attempt);
+                let delay = cortex::tasks::retry_delay_secs(next_attempt);
                 let retry_at = chrono::Utc::now().timestamp() + delay;
                 if let Err(e) = db.set_task_retry(task_id, next_attempt, error, retry_at) {
                     tracing::warn!("Task '{task_name}': failed to schedule retry: {e}");
@@ -571,9 +617,7 @@ async fn deliver_task_result(
     config: &Config,
 ) {
     if channel == "origin" {
-        tracing::warn!(
-            "Task '{task_name}' has unresolved 'origin' delivery — dropping"
-        );
+        tracing::warn!("Task '{task_name}' has unresolved 'origin' delivery — dropping");
         return;
     }
     let parsed = parse_delivery_target(target);
@@ -588,22 +632,22 @@ async fn deliver_task_result(
 /// configured — in which case there's nothing to do).
 pub async fn deliver_celebration_to_channels(
     config: Config,
-    celebration: borg_core::db::PendingCelebration,
+    celebration: cortex::db::PendingCelebration,
 ) -> bool {
     let kind = match celebration.celebration_type.as_str() {
-        "evolution" => match serde_json::from_str::<borg_core::evolution::CelebrationPayload>(
+        "evolution" => match serde_json::from_str::<cortex::evolution::CelebrationPayload>(
             &celebration.payload_json,
         ) {
-            Ok(p) => borg_core::evolution::CelebrationKind::Evolution(p),
+            Ok(p) => cortex::evolution::CelebrationKind::Evolution(p),
             Err(e) => {
                 tracing::warn!("Bad evolution celebration payload: {e}");
                 return false;
             }
         },
-        "milestone" => match serde_json::from_str::<borg_core::evolution::MilestonePayload>(
+        "milestone" => match serde_json::from_str::<cortex::evolution::MilestonePayload>(
             &celebration.payload_json,
         ) {
-            Ok(p) => borg_core::evolution::CelebrationKind::Milestone(p),
+            Ok(p) => cortex::evolution::CelebrationKind::Milestone(p),
             Err(e) => {
                 tracing::warn!("Bad milestone celebration payload: {e}");
                 return false;
@@ -615,11 +659,11 @@ pub async fn deliver_celebration_to_channels(
         }
     };
 
-    let message = borg_core::evolution::format_celebration(&kind);
+    let message = cortex::evolution::format_celebration(&kind);
     let mut any_delivered = false;
 
     for channel_name in &config.heartbeat.channels {
-        if let Ok(db) = borg_core::db::Database::open() {
+        if let Ok(db) = cortex::db::Database::open() {
             if let Ok(approved) = db.list_approved_senders(Some(channel_name)) {
                 let recipients: Vec<String> = match config.heartbeat.recipients.get(channel_name) {
                     Some(ids) if ids.iter().any(|s| s == "*") => {

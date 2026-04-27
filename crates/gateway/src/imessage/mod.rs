@@ -19,7 +19,7 @@ use anyhow::Result;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use borg_core::config::Config;
+use cortex::config::Config;
 
 /// Start the native iMessage monitor. Reads `~/Library/Messages/chat.db`
 /// directly via rusqlite, processes inbound messages through echo detection

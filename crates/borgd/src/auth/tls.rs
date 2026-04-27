@@ -24,15 +24,13 @@ pub fn build_server_tls_config(material: &ServerCertMaterial) -> Result<ServerTl
         material.server_key_pem.as_bytes(),
     );
     let ca = Certificate::from_pem(material.ca_cert_pem.as_bytes());
-    Ok(ServerTlsConfig::new()
-        .identity(identity)
-        .client_ca_root(ca))
+    Ok(ServerTlsConfig::new().identity(identity).client_ca_root(ca))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_pki::{ca, ServerCertParams};
+    use identity::{ca, ServerCertParams};
 
     #[test]
     fn build_succeeds_with_valid_material() {

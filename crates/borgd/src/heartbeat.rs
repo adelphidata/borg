@@ -1,21 +1,21 @@
 //! Heartbeat scheduler glue inside the daemon.
 //!
-//! Owns the [`HeartbeatScheduler`] (from `borg_heartbeat`), the agent turn
+//! Owns the [`HeartbeatScheduler`] (from `heartbeat`), the agent turn
 //! that runs on each fire, and the broadcast channel feeding
 //! `Admin.SubscribeHeartbeatEvents` subscribers.
 //!
 //! Note: the in-process `crates/cli/src/service/mod.rs::execute_heartbeat_turn`
 //! currently still exists for the legacy `borg daemon` CLI path. This module
-//! is the daemon-native version that runs against `borg_core::Agent` directly
+//! is the daemon-native version that runs against `cortex::Agent` directly
 //! (Stage E will route through `DaemonSessionExecutor` once the heartbeat
 //! prompt builder lands inside the daemon's session machinery).
 
 use crate::session::DaemonSessionExecutor;
 use anyhow::Result;
-use borg_core::agent::AgentEvent;
-use borg_core::config::Config;
-use borg_gateway::{InboundTurn, SessionExecutor};
-use borg_heartbeat::scheduler::{
+use cortex::agent::AgentEvent;
+use cortex::config::Config;
+use gateway::{InboundTurn, SessionExecutor};
+use heartbeat::scheduler::{
     HeartbeatEvent as SchedulerEvent, HeartbeatResult, HeartbeatScheduler, SkipReason,
 };
 use std::collections::hash_map::DefaultHasher;
@@ -256,7 +256,7 @@ pub async fn execute_heartbeat_turn(
     let prev_hash = LAST_HASH.swap(hash, Ordering::Relaxed);
     let prev_time = LAST_HASH_TIME.swap(now_secs, Ordering::Relaxed);
 
-    let dedup_window = borg_core::tasks::parse_interval(&config.heartbeat.interval)
+    let dedup_window = cortex::tasks::parse_interval(&config.heartbeat.interval)
         .unwrap_or(std::time::Duration::from_secs(1800))
         .as_secs()
         .saturating_mul(2);
@@ -267,7 +267,7 @@ pub async fn execute_heartbeat_turn(
         };
     }
 
-    if let Ok(adb) = borg_core::db::Database::open() {
+    if let Ok(adb) = cortex::db::Database::open() {
         if let Err(e) = adb.set_setting("heartbeat.last_fired_at", &now_secs.to_string()) {
             tracing::warn!("Heartbeat: failed to persist last_fired_at: {e}");
         }
@@ -317,7 +317,7 @@ fn is_zero_info_heartbeat(response: &str) -> bool {
 
 fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
     let mut user_msg = "*heartbeat tick*".to_string();
-    if let Some(cl) = borg_core::memory::load_heartbeat_checklist() {
+    if let Some(cl) = cortex::memory::load_heartbeat_checklist() {
         user_msg.push_str("\n\n# Heartbeat Checklist\n");
         user_msg.push_str(&cl);
     }
@@ -325,7 +325,7 @@ fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
     // (e.g. no messaging channels configured). Rate-limited via the `meta`
     // table so each nudge fires at most once per its declared cooldown.
     // See `crates/borgd/src/heartbeat_augmenters.rs` for how to add one.
-    let augmenter_db = borg_core::db::Database::open().ok();
+    let augmenter_db = cortex::db::Database::open().ok();
     let nudges = crate::heartbeat_augmenters::collect(config, augmenter_db.as_ref());
     if !nudges.is_empty() {
         user_msg.push_str("\n\n<proactive_nudges>\n");
@@ -350,9 +350,9 @@ fn build_session_start_prompt(config: &Config) -> String {
     let hour = now_local.hour();
     let weekday = now_local.format("%A").to_string();
 
-    let (recent_activity, hours_since_last) = match borg_core::db::Database::open() {
+    let (recent_activity, hours_since_last) = match cortex::db::Database::open() {
         Ok(db) => {
-            let ctx = borg_core::daily_summary::gather_daily_context(&db).unwrap_or_default();
+            let ctx = cortex::daily_summary::gather_daily_context(&db).unwrap_or_default();
             let gap = db
                 .sessions_since(0)
                 .ok()
@@ -412,7 +412,7 @@ async fn deliver_to_channel(config: &Config, channel_name: &str, text: &str) -> 
 }
 
 fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>> {
-    let db = borg_core::db::Database::open()?;
+    let db = cortex::db::Database::open()?;
     let approved = db.list_approved_senders(Some(channel_name))?;
     if approved.is_empty() {
         return Ok(Vec::new());
@@ -441,7 +441,13 @@ mod tests {
 
     #[test]
     fn zero_info_recognizes_trivial_acks() {
-        for ack in &["OK", "ok.", "Nothing new", "all good", "   nothing to report   "] {
+        for ack in &[
+            "OK",
+            "ok.",
+            "Nothing new",
+            "all good",
+            "   nothing to report   ",
+        ] {
             assert!(is_zero_info_heartbeat(ack), "expected '{ack}' zero-info");
         }
     }

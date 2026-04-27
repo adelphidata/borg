@@ -21,12 +21,12 @@ The binary is `target/release/borg` (or `target/debug/borg`).
 
 ```sh
 cargo test                            # all tests
-cargo test -p borg-apply-patch        # patch parser + applicator
-cargo test -p borg-core               # config + skills + memory + settings tests
-cargo test -p borg-heartbeat          # heartbeat scheduler tests
-cargo test -p borg-sandbox            # sandbox policy + runner tests
-cargo test -p borg-gateway            # channel manifest + registry tests
-cargo test -p borg-plugins            # catalog + installer tests
+cargo test -p coding        # patch parser + applicator
+cargo test -p cortex               # config + skills + memory + settings tests
+cargo test -p heartbeat          # heartbeat scheduler tests
+cargo test -p sandbox            # sandbox policy + runner tests
+cargo test -p gateway            # channel manifest + registry tests
+cargo test -p plugins            # catalog + installer tests
 ```
 
 ## Linting
@@ -172,8 +172,8 @@ cp .env.example .env
 
 ## Adding a built-in skill
 
-1. Create `crates/core/skills/<name>/SKILL.md` with YAML frontmatter
-2. Add `const BUILTIN_<NAME>: &str = include_str!("../skills/<name>/SKILL.md");` in `crates/core/src/skills.rs`
+1. Create `crates/cortex/skills/<name>/SKILL.md` with YAML frontmatter
+2. Add `const BUILTIN_<NAME>: &str = include_str!("../skills/<name>/SKILL.md");` in `crates/cortex/src/skills.rs`
 3. Add the constant to the `builtins_raw` array in `load_all_skills()`
 4. Add a test case in the `builtins_parse_correctly` test
 

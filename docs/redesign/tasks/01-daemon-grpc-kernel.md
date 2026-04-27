@@ -6,21 +6,21 @@
 
 Lift the agent loop out of the TUI process and into a long-running daemon (`borgd`). TUI becomes a gRPC client. Internal transport is gRPC over HTTP/2 on a Unix domain socket (loopback TCP fallback). This is the structural foundation everything else in v1 sits on.
 
-Today the agent runs in-process inside `crates/cli` (REPL + TUI). After this task the agent only runs inside `borgd`; `crates/cli` shells out nothing — it speaks gRPC.
+Today the agent runs in-process inside `crates/interface` (REPL + TUI). After this task the agent only runs inside `borgd`; `crates/interface` shells out nothing — it speaks gRPC.
 
 ## Scope
 
 ### New: `crates/borgd`
 
 - Binary `borgd` with `tokio` runtime.
-- Owns: agent loop (lifted from `crates/core/src/agent.rs`), session state, hooks registry, scheduled tasks, heartbeat, gateway adapters, DB handle (one writer).
+- Owns: agent loop (lifted from `crates/cortex/src/agent.rs`), session state, hooks registry, scheduled tasks, heartbeat, gateway adapters, DB handle (one writer).
 - Listens on `$BORG_HOME/borgd.sock` (UDS) by default. `--listen 127.0.0.1:PORT` opt-in for loopback.
 - Single-instance lock via `flock` on `$BORG_HOME/borgd.pid`.
 - Graceful shutdown on SIGTERM (drain in-flight turns, flush DB).
 
-### gRPC schema (`crates/borg-proto`)
+### gRPC schema (`crates/protocols`)
 
-Define `.proto` files; codegen Rust (tonic) into `borg-proto`. Codegen for TS/Swift/Kotlin is out of scope for this task — just keep the schema clean enough that downstream codegen will work.
+Define `.proto` files; codegen Rust (tonic) into `protocols`. Codegen for TS/Swift/Kotlin is out of scope for this task — just keep the schema clean enough that downstream codegen will work.
 
 Minimum services:
 
@@ -31,21 +31,21 @@ Minimum services:
 
 Auth: stub the mTLS hook so Task 02 can drop in cert validation without re-plumbing. Daemon should accept a no-auth UDS connection in dev mode behind `--insecure-uds` (off by default after Task 02 lands).
 
-### TUI rewrite (`crates/cli`)
+### TUI rewrite (`crates/interface`)
 
 - Delete in-process agent invocation paths. TUI opens a gRPC `Session.Stream`, renders events, sends user input via `Session.Send`.
 - Implement client-side capability handlers: `terminal.exec` (the existing `run_shell` flow runs *in the TUI process*, not the daemon, so workstation tools and shell aliases still work), `clipboard.read/write`, `notify`.
-- **Mouse text-selection invariants are non-negotiable.** Re-read CLAUDE.md "Mouse Interaction" section. The guard tests in `crates/cli/src/tui/mod.rs` and `app.rs` must still pass.
+- **Mouse text-selection invariants are non-negotiable.** Re-read CLAUDE.md "Mouse Interaction" section. The guard tests in `crates/interface/src/tui/mod.rs` and `app.rs` must still pass.
 - `borg` CLI subcommands that currently run the agent (e.g. `borg poke`, scheduled task dispatch) become gRPC calls.
 
 ### Capability protocol
 
-Document the negotiated capability set in code (one source of truth — `crates/borg-proto/src/capabilities.rs`). Daemon stores last-advertised capabilities per connected client. If the agent issues a tool call that needs a capability the connected client doesn't have, fall back to daemon-side execution where possible (e.g. `run_shell` runs in the daemon's sandbox), or surface a clear error.
+Document the negotiated capability set in code (one source of truth — `crates/protocols/src/capabilities.rs`). Daemon stores last-advertised capabilities per connected client. If the agent issues a tool call that needs a capability the connected client doesn't have, fall back to daemon-side execution where possible (e.g. `run_shell` runs in the daemon's sandbox), or surface a clear error.
 
 ### Migration of `core`
 
-- Move agent loop, hooks dispatch, DB writer, scheduler from `crates/core` invocations in `cli` into `borgd`. `core` stays a library — `borgd` and any tests link it.
-- Keep `crates/core` building as a library for the test suite; do not duplicate code into `borgd`.
+- Move agent loop, hooks dispatch, DB writer, scheduler from `crates/cortex` invocations in `cli` into `borgd`. `core` stays a library — `borgd` and any tests link it.
+- Keep `crates/cortex` building as a library for the test suite; do not duplicate code into `borgd`.
 
 ## Out of scope for this task
 
@@ -61,12 +61,12 @@ Document the negotiated capability set in code (one source of truth — `crates/
 - Mouse-selection guard tests still pass; arrow-routing tests still pass.
 - `borg poke` triggers a heartbeat via gRPC.
 - Two TUI clients can connect to one daemon and observe independent sessions.
-- No code path in `crates/cli` calls into `borg_core::Agent` directly.
+- No code path in `crates/interface` calls into `cortex::Agent` directly.
 - `cargo fmt --check && cargo clippy -- -D warnings && cargo test` clean.
 
 ## Risks to watch
 
-- **Regressing CLAUDE.md invariants.** Run `grep -R "EnableMouseCapture\|MouseEventKind" crates/cli` before and after; should stay zero.
+- **Regressing CLAUDE.md invariants.** Run `grep -R "EnableMouseCapture\|MouseEventKind" crates/interface` before and after; should stay zero.
 - **DB writer split-brain.** Only `borgd` writes to `borg.db`. TUI must not open the DB in writeable mode. Add a startup check.
 - **Capability fallback ambiguity.** Pick one rule and document it: when a tool needs a capability the client lacks, daemon either (a) runs it locally if safe, or (b) returns a `CapabilityUnavailable` error the agent surfaces. Recommend (a) for `run_shell`, (b) for `clipboard`/`file.pick`.
 
@@ -76,12 +76,12 @@ Document the negotiated capability set in code (one source of truth — `crates/
 
 **Shipped (compiling, tested, on `main`):**
 
-- Workspace deps + `borg-proto` + `borgd` crates wired (commit `81476b4`).
+- Workspace deps + `protocols` + `borgd` crates wired (commit `81476b4`).
 - `borgd` daemon: flock + UDS listener, Session/Capability/Status/Admin services,
   `SessionHost` per-session broadcast + ring buffer, `PromptRegistry` for
   `RespondToPrompt`, in-process gateway server spawn from `service::`
   (commits `974c628`, `ab992d5`).
-- `crates/cli/src/daemon_client/`: `connect_or_spawn`, ergonomic wrappers,
+- `crates/interface/src/daemon_client/`: `connect_or_spawn`, ergonomic wrappers,
   pb→core `spawn_event_adapter` (commit `c3ba220`).
 - REPL one-shot (`borg ask`, `borg <message>`) migrated to DaemonClient
   (commit `c3ba220`).
@@ -112,7 +112,7 @@ The kernel and wire surface are complete. What remains is migrating the
 existing in-process call sites to use that surface, then deleting the
 in-process paths.
 
-### 1. TUI runtime rewrite — `crates/cli/src/tui/mod.rs`
+### 1. TUI runtime rewrite — `crates/interface/src/tui/mod.rs`
 
 The TUI still constructs `Arc<Mutex<Agent>>` at `tui/mod.rs:271-334` and
 threads it through `run_event_loop`. Every match arm in `run_event_loop`
@@ -136,7 +136,7 @@ exists in `DaemonClient`):
 | `AppAction::ConfigReloaded` (869) | delete — config lives in daemon |
 | `AppAction::SaveSession` (876) | `client.auto_save(session_id).await` then `client.get_state(session_id).await` for the title to display |
 | `AppAction::NewSession` (885) | `client.new_agent_session(session_id).await` |
-| `AppAction::LoadSession` (900) | resolve prefix locally (still OK — read-only `borg_core::session::resolve_session_id`), then `client.load_agent_session(session_id, &resolved).await` |
+| `AppAction::LoadSession` (900) | resolve prefix locally (still OK — read-only `cortex::session::resolve_session_id`), then `client.load_agent_session(session_id, &resolved).await` |
 | `AppAction::Quit` close-browser hint (705) | call `client.get_state(session_id).await` for the resume hint title |
 
 The `App` struct does **not** own an Agent today, so its struct doesn't need
@@ -158,9 +158,9 @@ exist on `DaemonClient`). Files + new call:
 - `tui/model_popup.rs:51` — settings via `client.set_setting("llm.model", ...)`
 - `tui/commands.rs:329,543,597` and `tui/app/mod.rs:242,255,291,740,960,966,970` — case-by-case; most are session/task/setting reads with admin-RPC equivalents.
 
-The plan calls for a compile-time guard test that `crates/cli` no longer
-links `rusqlite` or `borg_core::db` — see the test stub
-`crates/cli/tests/grpc_client_smoke.rs::tui_crate_does_not_link_rusqlite_or_borg_core_db`
+The plan calls for a compile-time guard test that `crates/interface` no longer
+links `rusqlite` or `cortex::db` — see the test stub
+`crates/interface/tests/grpc_client_smoke.rs::tui_crate_does_not_link_rusqlite_or_cortex_db`
 in the original task description.
 
 ### 3. Gateway handler — `crates/gateway/src/handler.rs:927`
@@ -172,12 +172,12 @@ Currently `Agent::new(config, metrics)` per inbound message. Replace with
 `client.cancel(session_id)`.
 
 The gateway handler is run by `borgd` itself (via `spawn_gateway` in
-`crates/cli/src/service/mod.rs` — that spawn currently lives in both `cli`
+`crates/interface/src/service/mod.rs` — that spawn currently lives in both `cli`
 and `borgd`). When this lands, only the `borgd`-side spawn remains.
 
 ### 4. Move heartbeat scheduler + gateway server spawn out of `service/`
 
-`crates/cli/src/service/mod.rs` (2245 LOC) hosts:
+`crates/interface/src/service/mod.rs` (2245 LOC) hosts:
 
 - `run_daemon(shutdown)` — the `borg daemon` subcommand entry point, runs
   scheduled-task dispatcher + heartbeat scheduler + gateway server.
@@ -201,27 +201,27 @@ using its own session machinery.
 
 After (3) and (4) land:
 
-- `crates/cli/src/service/` — delete the directory.
-- `crates/cli/src/in_flight.rs` — delete; replaced by `DaemonClient::cancel`
+- `crates/interface/src/service/` — delete the directory.
+- `crates/interface/src/in_flight.rs` — delete; replaced by `DaemonClient::cancel`
   routed through `borgd::session::SessionHost::cancel_turn`.
-- `crates/cli/src/main.rs:353,367-368,379,502` — drop `service::*` calls.
+- `crates/interface/src/main.rs:353,367-368,379,502` — drop `service::*` calls.
   `borg daemon` becomes `exec borgd` (or removed entirely if `borgd` is
   installed as a separate binary).
-- `crates/cli/src/commands/misc.rs:37,38,300,303` — `service::*` →
+- `crates/interface/src/commands/misc.rs:37,38,300,303` — `service::*` →
   `DaemonClient::shutdown()` for stop, drop install/uninstall (those are
   launchd/systemd tasks for `borgd`, not the CLI).
-- `crates/cli/src/commands/pairing.rs:102` — `service::send_approval_greeting`
+- `crates/interface/src/commands/pairing.rs:102` — `service::send_approval_greeting`
   → `client.send_approval_greeting(...)` (the new Admin RPC from step 4).
-- `crates/cli/src/plugins.rs:293` — `service::restart_service` → either drop
+- `crates/interface/src/plugins.rs:293` — `service::restart_service` → either drop
   or re-wire to `DaemonClient::shutdown()` and let the launcher restart.
 
 ### 6. Compile-time guard tests
 
 Add per the original plan:
 
-- `crates/cli/tests/grpc_client_smoke.rs` — `cargo metadata`-based test
-  asserting `crates/cli` no longer links `rusqlite` or
-  `borg_core::db::*`.
+- `crates/interface/tests/grpc_client_smoke.rs` — `cargo metadata`-based test
+  asserting `crates/interface` no longer links `rusqlite` or
+  `cortex::db::*`.
 - `crates/borgd/tests/single_writer_lock.rs` — verify second `borgd`
   startup fails fast when the first holds the flock; verify stale-PID
   recovery after SIGKILL of the first.
@@ -232,8 +232,8 @@ Add per the original plan:
 ### Verification (when 1–6 land)
 
 The plan's `Done when` checklist still applies. Specifically:
-`grep -R "EnableMouseCapture\|MouseEventKind" crates/cli` must stay zero,
-and the 11 mouse guard tests in `crates/cli/src/tui/mod.rs:1929-2047` and
-`crates/cli/src/tui/app.rs` must still pass against whatever new file
+`grep -R "EnableMouseCapture\|MouseEventKind" crates/interface` must stay zero,
+and the 11 mouse guard tests in `crates/interface/src/tui/mod.rs:1929-2047` and
+`crates/interface/src/tui/app.rs` must still pass against whatever new file
 layout the rewrite produces (their `include_str!` paths will need
 updating if files move).

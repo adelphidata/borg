@@ -1,5 +1,5 @@
 [package]
-name = "borg-sandbox"
+name = "sandbox"
 description = "macOS Seatbelt and Linux Bubblewrap sandboxing for Borg"
 version.workspace = true
 edition.workspace = true

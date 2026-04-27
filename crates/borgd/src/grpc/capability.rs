@@ -10,15 +10,15 @@
 //! layer to ask "is anyone offering capability X?" and to dispatch one
 //! invocation. When no client offers a capability, the router applies the
 //! routing rule from `borg-proto::capabilities` (HostOnly / Fallback /
-//! Required) — see [`borg_proto::capabilities::Routing`].
+//! Required) — see [`protocols::capabilities::Routing`].
 
 use async_trait::async_trait;
-use borg_proto::capabilities::{routing, Routing};
-use borg_proto::capability::{
+use futures_util::{Stream, StreamExt};
+use protocols::capabilities::{routing, Routing};
+use protocols::capability::{
     capability_server::Capability, client_message::Kind as CKind, server_message::Kind as SKind,
     AdvertiseAck, ClientMessage, Invoke, ServerMessage,
 };
-use futures_util::{Stream, StreamExt};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -310,7 +310,7 @@ impl Capability for CapabilitySvc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_proto::capabilities::{CLIPBOARD_READ, HOST_RUN_SHELL, TERMINAL_EXEC};
+    use protocols::capabilities::{CLIPBOARD_READ, HOST_RUN_SHELL, TERMINAL_EXEC};
 
     #[tokio::test]
     async fn invoke_with_no_advertising_client_returns_unavailable() {

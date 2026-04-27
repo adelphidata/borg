@@ -1,4 +1,4 @@
-use borg_core::config::{ActivationMode, Config, GatewayBinding};
+use cortex::config::{ActivationMode, Config, GatewayBinding};
 use tracing::debug;
 
 /// Result of route resolution for a gateway message.
@@ -194,7 +194,7 @@ fn apply_binding_overrides(config: &mut Config, binding: &GatewayBinding) {
         // Validate identity path to prevent traversal outside data dir
         if identity.contains("..") || identity.starts_with('/') || identity.starts_with('\\') {
             tracing::warn!("Ignoring identity path with traversal: {}", identity);
-        } else if let Ok(data_dir) = borg_core::config::Config::data_dir() {
+        } else if let Ok(data_dir) = cortex::config::Config::data_dir() {
             config.identity_override = Some(data_dir.join(identity));
         }
     }
@@ -526,7 +526,7 @@ mod tests {
 
     #[test]
     fn thinking_override_propagates_from_binding() {
-        use borg_core::config::ThinkingLevel;
+        use cortex::config::ThinkingLevel;
         let mut config = Config::default();
         config.gateway.bindings.push(GatewayBinding {
             channel: "telegram".to_string(),

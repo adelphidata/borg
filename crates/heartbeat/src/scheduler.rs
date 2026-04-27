@@ -6,11 +6,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
-use borg_core::config::HeartbeatConfig;
-use borg_core::tasks::parse_interval;
+use cortex::config::HeartbeatConfig;
+use cortex::tasks::parse_interval;
 
 /// Minimum allowed heartbeat interval (60 seconds) to prevent API waste.
-const MIN_INTERVAL_SECS: u64 = borg_core::constants::MIN_HEARTBEAT_INTERVAL_SECS;
+const MIN_INTERVAL_SECS: u64 = cortex::constants::MIN_HEARTBEAT_INTERVAL_SECS;
 
 /// Outcome of a heartbeat agent turn.
 #[derive(Debug, Clone)]

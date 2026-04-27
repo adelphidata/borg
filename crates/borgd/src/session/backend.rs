@@ -1,13 +1,13 @@
 //! Pluggable per-session backend.
 //!
-//! Production uses [`AgentBackend`] which owns a real `borg_core::Agent`.
+//! Production uses [`AgentBackend`] which owns a real `cortex::Agent`.
 //! Tests provide a stub backend that emits canned events without needing an
 //! LLM provider — keeps the daemon's session machinery testable in isolation.
 
 use async_trait::async_trait;
-use borg_core::agent::{Agent, AgentEvent};
-use borg_core::config::Config;
-use borg_core::telemetry::BorgMetrics;
+use cortex::agent::{Agent, AgentEvent};
+use cortex::config::Config;
+use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 /// Snapshot of the agent's user-facing state for `Session.GetState`.
 #[derive(Debug, Clone)]
 pub struct SessionStateSnapshot {
-    /// The borg_core session id (used for resume).
+    /// The cortex session id (used for resume).
     pub agent_session_id: String,
     /// Human-friendly title of the active session.
     pub title: String,
@@ -112,7 +112,7 @@ pub trait SessionBackend: Send + Sync + 'static {
     }
 }
 
-/// Production backend: owns one `borg_core::Agent`. Hooks (vitals, activity,
+/// Production backend: owns one `cortex::Agent`. Hooks (vitals, activity,
 /// bond, evolution, script) are registered at construction time, matching the
 /// in-process behavior of `crates/cli/src/repl.rs` and `tui/mod.rs`.
 pub struct AgentBackend {
@@ -140,29 +140,29 @@ impl AgentBackend {
         // Register the same hook set the in-process REPL/TUI uses. Failed
         // registration is non-fatal — log so operators can debug "why is XP
         // not advancing" rather than have it silently drop.
-        match borg_core::vitals::VitalsHook::new() {
+        match cortex::vitals::VitalsHook::new() {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "vitals hook unavailable"),
         }
-        match borg_core::activity_log::ActivityHook::new() {
+        match cortex::activity_log::ActivityHook::new() {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "activity_log hook unavailable"),
         }
-        match borg_core::bond::BondHook::new() {
+        match cortex::bond::BondHook::new() {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "bond hook unavailable"),
         }
         if agent.config().evolution.enabled {
-            match borg_core::evolution::EvolutionHook::new() {
+            match cortex::evolution::EvolutionHook::new() {
                 Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
                 Err(e) => tracing::warn!(error = %e, "evolution hook unavailable"),
             }
         }
-        match borg_core::budgets::BudgetHook::new() {
+        match cortex::budgets::BudgetHook::new() {
             Ok(h) => agent.hook_registry_mut().register(Box::new(h)),
             Err(e) => tracing::warn!(error = %e, "budget hook unavailable"),
         }
-        for hook in borg_core::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
+        for hook in cortex::hooks::ScriptHook::load_all(agent.config().hooks.enabled) {
             agent.hook_registry_mut().register(Box::new(hook));
         }
 
@@ -217,7 +217,7 @@ impl SessionBackend for AgentBackend {
                 .await
         } else {
             use base64::Engine as _;
-            use borg_core::types::{ContentPart, MediaData, Message};
+            use cortex::types::{ContentPart, MediaData, Message};
             let engine = base64::engine::general_purpose::STANDARD;
             let mut parts = vec![ContentPart::Text(text)];
             for img in images {

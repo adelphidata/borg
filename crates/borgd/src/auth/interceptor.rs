@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use borg_core::db::AuditWriter;
-use borg_pki::cert::fingerprint_sha256;
+use cortex::db::AuditWriter;
+use identity::cert::fingerprint_sha256;
 use serde_json::json;
 use tonic::transport::server::TlsConnectInfo;
 use tonic::{Request, Status};
@@ -36,7 +36,7 @@ pub fn auth_interceptor(
             .and_then(|cs| cs.first().map(|c| c.as_ref().to_vec()))
             .ok_or_else(|| {
                 audit.emit(
-                    borg_core::db::audit_events::GRPC_AUTH_FAILURE,
+                    cortex::db::audit_events::GRPC_AUTH_FAILURE,
                     "system",
                     &json!({"reason": "no_peer_cert"}),
                 );
@@ -56,13 +56,13 @@ pub fn auth_interceptor(
             }
             Err(e) => {
                 audit.emit(
-                    borg_core::db::audit_events::GRPC_AUTH_FAILURE,
+                    cortex::db::audit_events::GRPC_AUTH_FAILURE,
                     "system",
                     &json!({"reason": e.to_string(), "fingerprint": fingerprint}),
                 );
                 if let VerifierError::TofuMismatch { .. } = e {
                     audit.emit(
-                        borg_core::db::audit_events::TOFU_MISMATCH,
+                        cortex::db::audit_events::TOFU_MISMATCH,
                         "system",
                         &json!({"fingerprint": fingerprint}),
                     );

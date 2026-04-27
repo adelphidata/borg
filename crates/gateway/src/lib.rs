@@ -56,7 +56,7 @@ pub mod manifest;
 /// (Claude Desktop, MCP Inspector) over stdio + HTTP transports.
 pub mod mcp;
 /// OpenAI-compatible HTTP surface — `/v1/chat/completions`, `/v1/models`.
-/// Bearer auth via `borg_core::auth::tokens`. Lets ChatBox / Open
+/// Bearer auth via `cortex::auth::tokens`. Lets ChatBox / Open
 /// WebUI / the official `openai` SDK point at borg as if it were
 /// OpenAI's API.
 pub mod openai_compat;

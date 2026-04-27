@@ -13,10 +13,10 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use async_trait::async_trait;
-use borg_core::agent::AgentEvent;
-use borg_gateway::session_executor::{InboundTurn, SessionExecutor};
 use borgd::session::backend::{InlineImage, SessionBackend};
 use borgd::session::{SessionHost, SessionRegistry};
+use cortex::agent::AgentEvent;
+use gateway::session_executor::{InboundTurn, SessionExecutor};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -81,8 +81,8 @@ fn registry_with_stub(id: &str, deltas: Vec<&'static str>, pause_ms: u64) -> Ses
 fn executor(registry: SessionRegistry) -> borgd::session::DaemonSessionExecutor {
     borgd::session::DaemonSessionExecutor::new(
         registry,
-        borg_core::config::Config::default(),
-        borg_core::telemetry::BorgMetrics::noop(),
+        cortex::config::Config::default(),
+        cortex::telemetry::BorgMetrics::noop(),
     )
 }
 
@@ -177,8 +177,8 @@ async fn second_start_turn_reuses_existing_host() {
     let registry = registry_with_stub("carol:t1", vec!["one"], 1);
     let exec = borgd::session::DaemonSessionExecutor::new(
         registry.clone(),
-        borg_core::config::Config::default(),
-        borg_core::telemetry::BorgMetrics::noop(),
+        cortex::config::Config::default(),
+        cortex::telemetry::BorgMetrics::noop(),
     );
 
     // First turn

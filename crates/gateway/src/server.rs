@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
-use borg_core::config::Config;
-use borg_core::db::Database;
-use borg_core::telemetry::BorgMetrics;
+use cortex::config::Config;
+use cortex::db::Database;
+use cortex::telemetry::BorgMetrics;
 
 use crate::channel_trait::{self, NativeChannelRegistry, WebhookContext};
 use crate::constants::{POLL_INITIAL_BACKOFF, POLL_MAX_BACKOFF, POLL_MAX_CONSECUTIVE_ERRORS};
@@ -38,7 +38,7 @@ use crate::telegram::channel::TelegramChannel;
 use crate::telegram::dedup::UpdateDeduplicator;
 use crate::twilio::channel::TwilioChannel;
 
-use borg_core::constants;
+use cortex::constants;
 
 const MAX_BODY_SIZE: usize = constants::GATEWAY_MAX_BODY_SIZE;
 
@@ -144,9 +144,9 @@ impl GatewayServer {
         let signal_client = crate::channel_init::init_signal(&self.config).await;
 
         // TTS synthesizer (shared between webhook and polling paths)
-        let tts_synth: Option<Arc<borg_core::tts::TtsSynthesizer>> =
+        let tts_synth: Option<Arc<cortex::tts::TtsSynthesizer>> =
             if self.config.tts.enabled && self.config.tts.auto_mode {
-                borg_core::tts::TtsSynthesizer::from_config(&self.config).map(Arc::new)
+                cortex::tts::TtsSynthesizer::from_config(&self.config).map(Arc::new)
             } else {
                 None
             };
@@ -292,7 +292,7 @@ impl GatewayServer {
         })?;
         info!("Gateway listening on {addr} with {channel_count} channel(s)");
         if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-            borg_core::activity_log::log_activity(
+            cortex::activity_log::log_activity(
                 &adb,
                 "info",
                 "gateway",
@@ -397,11 +397,10 @@ impl GatewayServer {
                                 Err(_) => {
                                     typing.stop().await;
                                     warn!("Agent timed out in Telegram poll mode");
-                                    let error_msg =
-                                        borg_core::error_format::format_error_with_context(
-                                            "request timed out",
-                                            borg_core::error_format::ErrorContext::Gateway,
-                                        );
+                                    let error_msg = cortex::error_format::format_error_with_context(
+                                        "request timed out",
+                                        cortex::error_format::ErrorContext::Gateway,
+                                    );
                                     send_telegram_response(
                                         &tg, chat_id, &error_msg, thread_id, reply_to, &health,
                                         None,
@@ -821,7 +820,7 @@ async fn restart_handler(
     }
     info!("Gateway restart requested via /internal/restart");
     if let Ok(adb) = Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS) {
-        borg_core::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested");
+        cortex::activity_log::log_activity(&adb, "info", "gateway", "Gateway restart requested");
     }
     state.shutdown.cancel();
     (
@@ -1234,7 +1233,7 @@ async fn send_telegram_response(
     thread_id: Option<i64>,
     reply_to: Option<i64>,
     health: &Arc<RwLock<ChannelHealthRegistry>>,
-    tts_synthesizer: Option<&borg_core::tts::TtsSynthesizer>,
+    tts_synthesizer: Option<&cortex::tts::TtsSynthesizer>,
 ) {
     if response_text.trim().is_empty() {
         tracing::debug!("Telegram response empty after trim, skipping send for chat {chat_id}");
@@ -1266,9 +1265,9 @@ async fn send_telegram_response(
 
     // Auto-TTS: synthesize and send voice message after text
     if let Some(synth) = tts_synthesizer {
-        let tts_text = borg_core::tts::truncate_for_tts(response_text, 4096);
+        let tts_text = cortex::tts::truncate_for_tts(response_text, 4096);
         match synth
-            .synthesize(&tts_text, None, Some(borg_core::tts::AudioFormat::Opus))
+            .synthesize(&tts_text, None, Some(cortex::tts::AudioFormat::Opus))
             .await
         {
             Ok((audio_bytes, _, _)) => {

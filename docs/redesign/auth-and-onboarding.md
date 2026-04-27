@@ -321,18 +321,18 @@ Per-channel default tiers (configurable):
 
 ### Crates / files (sketch)
 
-- `crates/core/src/auth/mod.rs` — `Principal`, `Scope`, `Capability`, `Tier` types.
-- `crates/core/src/auth/verifier.rs` — `Verifier` trait + `TofuVerifier` + `TailscaleVerifier`.
-- `crates/core/src/auth/pake.rs` — SPAKE2/CPace pairing handshake.
-- `crates/core/src/auth/key_storage.rs` — abstraction over Keychain / Secure Enclave / TPM / encrypted file.
-- `crates/core/src/auth/internal_ca.rs` — daemon's internal CA: root generation, cert issuance, revocation list.
-- `crates/core/src/auth/scope_resolver.rs` — listener-ceiling intersection.
-- `crates/core/src/auth/recovery.rs` — L1 reset, L2 phrase generation/verification.
+- `crates/cortex/src/auth/mod.rs` — `Principal`, `Scope`, `Capability`, `Tier` types.
+- `crates/cortex/src/auth/verifier.rs` — `Verifier` trait + `TofuVerifier` + `TailscaleVerifier`.
+- `crates/cortex/src/auth/pake.rs` — SPAKE2/CPace pairing handshake.
+- `crates/cortex/src/auth/key_storage.rs` — abstraction over Keychain / Secure Enclave / TPM / encrypted file.
+- `crates/cortex/src/auth/internal_ca.rs` — daemon's internal CA: root generation, cert issuance, revocation list.
+- `crates/cortex/src/auth/scope_resolver.rs` — listener-ceiling intersection.
+- `crates/cortex/src/auth/recovery.rs` — L1 reset, L2 phrase generation/verification.
 - `crates/gateway/src/listener.rs` — per-listener TLS termination, dispatch to `Verifier`.
-- `crates/cli/src/cmd/device.rs` — `borg device {pair,list,revoke,retier}` CLI; same handler invoked by TUI `/devices`.
-- `crates/cli/src/cmd/listener.rs` — `borg listener {add,remove,list,update}` CLI; same handler invoked by `/settings → Network`.
-- `crates/cli/src/tui/devices.rs` — `/devices` screen.
-- `crates/cli/src/tui/settings/{network,security}.rs` — `/settings` subsections.
+- `crates/interface/src/cmd/device.rs` — `borg device {pair,list,revoke,retier}` CLI; same handler invoked by TUI `/devices`.
+- `crates/interface/src/cmd/listener.rs` — `borg listener {add,remove,list,update}` CLI; same handler invoked by `/settings → Network`.
+- `crates/interface/src/tui/devices.rs` — `/devices` screen.
+- `crates/interface/src/tui/settings/{network,security}.rs` — `/settings` subsections.
 
 ### SQLite tables (v1)
 
@@ -404,7 +404,7 @@ The v1 schema (`paired_devices.key_storage_tier`, `listeners.max_tier`, audit `p
 
 ## References
 
-- Existing channel pairing flow: `crates/core/src/db/pairing.rs` (approved_senders, pairing_requests)
+- Existing channel pairing flow: `crates/cortex/src/db/pairing.rs` (approved_senders, pairing_requests)
 - Existing gateway server: `crates/gateway/src/server.rs`
 - Hermes OpenAI-compat reference: `reference/hermes-agent/gateway/`
 - IETF RFC 8125 (PAKE survey), CFRG CPace draft, RFC 7250 (RPK)

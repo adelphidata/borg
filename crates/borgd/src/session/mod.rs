@@ -22,8 +22,8 @@ pub use executor::DaemonSessionExecutor;
 
 use anyhow::{anyhow, Result};
 use backend::SessionBackend;
-use borg_core::agent::AgentEvent;
 use buffer::SequencedBuffer;
+use cortex::agent::AgentEvent;
 use prompts::PromptRegistry;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -89,12 +89,12 @@ impl SessionHost {
 
     /// Snapshot of every buffered event with `event_seq > since`. Used by
     /// `Session.Stream` to bring a resuming subscriber up to the live cursor.
-    pub fn replay_since(&self, since: u64) -> Vec<borg_proto::session::AgentEvent> {
+    pub fn replay_since(&self, since: u64) -> Vec<protocols::session::AgentEvent> {
         self.inner.buffer.replay_since(since)
     }
 
     /// Subscribe to new events from the broadcast channel.
-    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<borg_proto::session::AgentEvent> {
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<protocols::session::AgentEvent> {
         self.inner.buffer.subscribe()
     }
 
@@ -295,7 +295,7 @@ impl SessionRegistry {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use borg_proto::session::agent_event::Kind;
+    use protocols::session::agent_event::Kind;
     use std::time::Duration;
 
     /// Stub backend: emits N TextDelta events then TurnComplete, sleeping
@@ -348,8 +348,8 @@ mod tests {
     }
 
     async fn drain_until_terminal(
-        rx: &mut tokio::sync::broadcast::Receiver<borg_proto::session::AgentEvent>,
-    ) -> Vec<borg_proto::session::AgentEvent> {
+        rx: &mut tokio::sync::broadcast::Receiver<protocols::session::AgentEvent>,
+    ) -> Vec<protocols::session::AgentEvent> {
         let mut out = Vec::new();
         while let Ok(Ok(evt)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             let term = convert::is_terminal(&evt);

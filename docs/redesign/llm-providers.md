@@ -263,4 +263,4 @@ The v1 schema (`providers`, `provider_rate_cards`) is forward-compatible — v3 
 - Companion: [`architecture-redesign.md`](architecture-redesign.md) — Layer 1 storage, capability protocol
 - Companion: [`auth-and-onboarding.md`](auth-and-onboarding.md) — credential store, listener model
 - Companion: [`approvals.md`](approvals.md) — budget enforcement reading provider call events
-- Existing fallback-chain code: `crates/core/src/config/llm.rs`
+- Existing fallback-chain code: `crates/cortex/src/config/llm.rs`

@@ -15,15 +15,15 @@ pub mod auth;
 /// Hourly budget reset tick spawned at daemon startup.
 pub mod budget_tick;
 pub mod channel_delivery;
-pub mod pairing;
-pub mod pki_grpc;
 pub mod daemon;
 pub mod grpc;
 pub mod heartbeat;
 pub mod heartbeat_augmenters;
 pub mod orchestrator;
+pub mod pairing;
 pub mod paths;
 pub mod pidlock;
+pub mod pki_grpc;
 pub mod scheduler;
 pub mod session;
 pub mod task_runner;

@@ -18,11 +18,11 @@ name = "borgd"
 path = "src/main.rs"
 
 [dependencies]
-borg-proto = { path = "../borg-proto" }
-borg-core = { path = "../core" }
-borg-gateway = { path = "../gateway" }
-borg-heartbeat = { path = "../heartbeat" }
-borg-pki = { path = "../borg-pki" }
+protocols = { path = "../protocols" }
+cortex = { path = "../cortex" }
+gateway = { path = "../gateway" }
+heartbeat = { path = "../heartbeat" }
+identity = { path = "../identity" }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

@@ -1,4 +1,4 @@
-use borg_core::constants;
+use cortex::constants;
 
 use crate::dedup::BoundedDedup;
 

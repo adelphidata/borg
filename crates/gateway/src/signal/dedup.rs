@@ -6,7 +6,7 @@
 
 crate::dedup_wrapper!(
     /// Message deduplicator: (sender_id, timestamp) → seen.
-    pub struct MessageDeduplicator((String, i64), borg_core::constants::SIGNAL_DEDUP_CAPACITY);
+    pub struct MessageDeduplicator((String, i64), cortex::constants::SIGNAL_DEDUP_CAPACITY);
     is_duplicate(key: (&str, i64)) => (key.0.to_string(), key.1);
 );
 

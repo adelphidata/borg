@@ -130,7 +130,7 @@ No `/budget` command. Reuses the existing `/status` discipline.
 
 ## Hooks integration
 
-`ApprovalHook` extends the existing hook system (`crates/core/src/hooks.rs`):
+`ApprovalHook` extends the existing hook system (`crates/cortex/src/hooks.rs`):
 
 | Hook point | v1 |
 |---|---|
@@ -187,5 +187,5 @@ The v1 schema (`budgets`, hook pipeline, audit categorization) is forward-compat
 - Companion: [`llm-providers.md`](llm-providers.md) — token accounting, rate cards
 - Companion: [`threat-model.md`](threat-model.md) — A5 boundary in v1
 - Existing approval invariant: `CLAUDE.md` "UX Philosophy — No Approval Prompts"
-- Existing hook system: `crates/core/src/hooks.rs`
-- Existing rate-limit table: `crates/core/src/evolution/mod.rs`
+- Existing hook system: `crates/cortex/src/hooks.rs`
+- Existing rate-limit table: `crates/cortex/src/evolution/mod.rs`

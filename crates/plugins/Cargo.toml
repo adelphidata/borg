@@ -1,5 +1,5 @@
 [package]
-name = "borg-plugins"
+name = "plugins"
 description = "Integration marketplace: curated plugins for messaging, email, and productivity"
 version.workspace = true
 edition.workspace = true

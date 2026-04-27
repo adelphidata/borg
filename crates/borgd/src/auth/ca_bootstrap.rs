@@ -6,8 +6,8 @@
 //! Triggers silent renewal when the server cert is ≤14d from expiry.
 
 use anyhow::{anyhow, Context, Result};
-use borg_core::db::Database;
-use borg_pki::{
+use cortex::db::Database;
+use identity::{
     ca::{generate_root_ca, issue_server_cert, ServerCertParams},
     cert::{expires_within, parse_cert_metadata, CertMetadata},
     fingerprint_sha256, KekStore,
@@ -71,7 +71,10 @@ pub fn ensure_server_cert(
 ) -> Result<(String, String, i64)> {
     let now = chrono::Utc::now().timestamp();
 
-    if let Some(row) = db.latest_active_cert("server").context("query server cert")? {
+    if let Some(row) = db
+        .latest_active_cert("server")
+        .context("query server cert")?
+    {
         let key_bytes = kek
             .get(SERVER_CERT_KEY)
             .map_err(|e| anyhow!("load server cert key from keychain: {}", e))?;
@@ -89,7 +92,8 @@ pub fn ensure_server_cert(
         // Renew: mint new, mark old renewed.
         let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
         let serial = persist_server_cert(db, kek, &issued, &new_key)?;
-        db.mark_cert_renewed(row.serial).context("mark old renewed")?;
+        db.mark_cert_renewed(row.serial)
+            .context("mark old renewed")?;
         return Ok((issued.cert_pem, new_key, serial));
     }
 
@@ -102,7 +106,7 @@ fn mint_server_cert(
     ca_cert_pem: &str,
     ca_key_pem: &str,
     san_dns: &[String],
-) -> Result<(borg_pki::IssuedCert, String)> {
+) -> Result<(identity::IssuedCert, String)> {
     let params = ServerCertParams {
         common_name: "borgd",
         san_dns,
@@ -114,7 +118,7 @@ fn mint_server_cert(
 fn persist_server_cert(
     db: &Database,
     kek: &dyn KekStore,
-    issued: &borg_pki::IssuedCert,
+    issued: &identity::IssuedCert,
     key_pem: &str,
 ) -> Result<i64> {
     let fp = fingerprint_sha256(&issued.cert_der);
@@ -134,7 +138,7 @@ fn persist_server_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_pki::MemoryKekStore;
+    use identity::MemoryKekStore;
     use rusqlite::Connection;
 
     fn db() -> Database {
@@ -173,6 +177,9 @@ mod tests {
         // Wipe the kek entry — simulates corrupt keychain.
         kek.delete(ROOT_CA_KEY).expect("delete");
         let res = ensure_root_ca(&d, &kek);
-        assert!(res.is_err(), "ensure_root_ca should fail when keychain entry missing");
+        assert!(
+            res.is_err(),
+            "ensure_root_ca should fail when keychain entry missing"
+        );
     }
 }

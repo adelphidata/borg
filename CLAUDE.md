@@ -6,17 +6,20 @@ AI personal assistant agent built in Rust. The agent itself is the plugin system
 
 ## Architecture
 
-Cargo workspace with 7 crates:
+Cargo workspace. Crate names follow a no-prefix convention; several are themed around the cybernetic-body metaphor:
 
 | Crate | Purpose |
 |-------|---------|
-| `cli` | Binary: REPL, TUI, clap commands, onboarding, heartbeat display |
-| `core` | Library: agent loop, multi-provider LLM, memory, identity, config, tools, skills, workflows |
+| `interface` | Binary: REPL, TUI, clap commands, onboarding, heartbeat display. Binary name remains `borg`. |
+| `cortex` | Library: agent loop, multi-provider LLM, memory, identity, config, tools, skills, workflows |
 | `heartbeat` | Library: proactive scheduler with quiet hours + dedup |
 | `sandbox` | Library: macOS Seatbelt + Linux Bubblewrap policies |
-| `apply-patch` | Library: patch DSL parser + filesystem applicator |
+| `coding` | Library: patch DSL parser + filesystem applicator |
 | `gateway` | Library: webhook gateway, native channel integrations |
 | `plugins` | Library: marketplace catalog + plugin installer |
+| `protocols` | Library: tonic gRPC schema for the daemon and its clients |
+| `identity` | Library: internal CA, cert lifecycle, OS keychain wrapping (PKI) |
+| `borgd` | Binary: long-running gRPC daemon (Unix daemon convention preserved) |
 
 ## Build & Test
 
@@ -66,7 +69,7 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 **Native click+drag text selection MUST work in the transcript with no modifier keys.** Has regressed multiple times — treat as a hard invariant.
 
-**Strategy:** xterm Alternate Scroll Mode (`?1007h`) only, via custom `EnableAlternateScroll` in `crates/cli/src/tui/mod.rs`. Terminal translates wheel events into arrow key sequences. No mouse tracking enabled — click+drag handled by terminal. Reference: `reference/codex/codex-rs/tui/src/tui.rs`.
+**Strategy:** xterm Alternate Scroll Mode (`?1007h`) only, via custom `EnableAlternateScroll` in `crates/interface/src/tui/mod.rs`. Terminal translates wheel events into arrow key sequences. No mouse tracking enabled — click+drag handled by terminal. Reference: `reference/codex/codex-rs/tui/src/tui.rs`.
 
 **Behavior:**
 - Click+drag selects text natively (Cmd/Ctrl+C copies). No modifier needed.
@@ -82,8 +85,8 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 - Scrollbar click/drag (requires `?1000h`)
 
 **Guard tests (do not remove or weaken):**
-- `crates/cli/src/tui/mod.rs` — escape-sequence correctness + source-level guards that read both `mod.rs` and `app.rs` via `include_str!` and fail if forbidden patterns reintroduced.
-- `crates/cli/src/tui/app.rs` — arrow-routing tests (scroll-while-scrolled-up, wheel-from-bottom, active-composer-history), Ctrl+P escape hatch, PageUp/PageDown regression guards.
+- `crates/interface/src/tui/mod.rs` — escape-sequence correctness + source-level guards that read both `mod.rs` and `app.rs` via `include_str!` and fail if forbidden patterns reintroduced.
+- `crates/interface/src/tui/app.rs` — arrow-routing tests (scroll-while-scrolled-up, wheel-from-bottom, active-composer-history), Ctrl+P escape hatch, PageUp/PageDown regression guards.
 
 ### Tool Conservation
 
@@ -153,7 +156,7 @@ All integrations compiled unconditionally. iMessage is macOS-only via `#[cfg(tar
 
 ### Config
 
-DB-only config — modularized at `crates/core/src/config/` (mod.rs, llm.rs, gateway.rs, media.rs, security.rs). All settings stored in SQLite `settings` table as key-value pairs. Complex types (gateway bindings, fallback chains, credentials) stored as JSON.
+DB-only config — modularized at `crates/cortex/src/config/` (mod.rs, llm.rs, gateway.rs, media.rs, security.rs). All settings stored in SQLite `settings` table as key-value pairs. Complex types (gateway bindings, fallback chains, credentials) stored as JSON.
 
 Two-tier resolution: **Database** → **compiled defaults**. `Config::load_from_db()` builds the runtime Config. `SettingsResolver` provides set/get/unset with validation. No config.toml (V32 migration imports and renames to .bak).
 
@@ -183,7 +186,7 @@ Two-tier architecture: short-term (session) + long-term (persistent). All memory
 
 ### Skills
 
-Instruction bundles (SKILL.md + YAML frontmatter) teaching CLI tool usage via `run_shell`. Built-in skills embedded via `include_str!` in `crates/core/skills/`: 1password, browser, calendar, database, discord, docker, email, git, github, notes, scheduler, search, skill-creator, slack, weather.
+Instruction bundles (SKILL.md + YAML frontmatter) teaching CLI tool usage via `run_shell`. Built-in skills embedded via `include_str!` in `crates/cortex/skills/`: 1password, browser, calendar, database, discord, docker, email, git, github, notes, scheduler, search, skill-creator, slack, weather.
 
 User skills at `~/.borg/skills/<name>/SKILL.md` override built-ins with same name. Progressive loading: metadata (~50 tokens each) always loaded; full body within token budget for available skills. Requirements (bins/env vars) checked at load time against process env and `[credentials]` store. Credentials injected as env vars into `run_shell`.
 
@@ -201,7 +204,7 @@ Thread-scoped history: DB session key is `{sender_id}:{thread_id}`. Parsers popu
 
 ### Collaboration Modes
 
-Three modes (config, `/mode` TUI, `--mode` CLI): **Default** (asks questions), **Execute** (autonomous), **Plan** (read-only, blocks mutating tools, produces `<proposed_plan>`). Templates in `crates/core/templates/collaboration_mode/`.
+Three modes (config, `/mode` TUI, `--mode` CLI): **Default** (asks questions), **Execute** (autonomous), **Plan** (read-only, blocks mutating tools, produces `<proposed_plan>`). Templates in `crates/cortex/templates/collaboration_mode/`.
 
 `/plan` shortcut toggles Plan mode with auto-restore on proceed. `App::previous_collab_mode` is the single source of truth for the transient Plan→execute flow.
 
@@ -211,7 +214,7 @@ Three modes (config, `/mode` TUI, `--mode` CLI): **Default** (asks questions), *
 
 ### Workflows
 
-Durable multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn with prior outputs injected. Persists in SQLite — survives crashes/restarts. All Claude models skip workflows (`workflow.enabled = "auto"`). Key files: `crates/core/src/workflow/`, `crates/core/src/db/workflow.rs`.
+Durable multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn with prior outputs injected. Persists in SQLite — survives crashes/restarts. All Claude models skip workflows (`workflow.enabled = "auto"`). Key files: `crates/cortex/src/workflow/`, `crates/cortex/src/db/workflow.rs`.
 
 ### Heartbeat
 
@@ -231,14 +234,14 @@ Event-sourced agent health: 5 stats (stability, focus, sync, growth, happiness) 
 
 ### Lifecycle Hooks
 
-Two layers share one `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/core/src/hooks.rs`:
+Two layers share one `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src/hooks.rs`:
 
-- **Compiled-in hooks** — `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook` registered in `crates/cli/src/repl.rs` and `crates/cli/src/tui/mod.rs`.
+- **Compiled-in hooks** — `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook` registered in `crates/interface/src/repl.rs` and `crates/interface/src/tui/mod.rs`.
 - **User script hooks** — `ScriptHook` loaded from `~/.borg/hooks.json` (Claude Code / codex schema). Events: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`. Runs `sh -c <command>` with a JSON payload as `$1`, bounded by `timeout` (default 60s, clamped to `[1,600]`). `PreToolUse` non-zero exit / timeout returns `HookAction::Skip` and aborts the tool call. All other failure modes (parse error, spawn failure, non-zero exit, panic) log a `tracing::warn!` and return `Continue` — **hooks can never break the agent**. Gated on `hooks.enabled` (default true). See `docs/hooks.md`.
 
 ### Self-Healing
 
-Daily maintenance task (`task_type = 'maintenance'`, seeded in V37, fires 02:00) runs a headless doctor sweep, prunes `~/.borg/logs/*.jsonl` and `activity_log` past retention, evicts stale embeddings, heals stalled scheduled tasks, and surfaces warnings that persist across two consecutive runs. No LLM call — dispatcher calls `borg_core::maintenance::run_daily_maintenance` directly, so it works with no provider configured. Daemon loop also scans every 5 min for scheduled tasks whose `next_run` drifted > `STALLED_TASK_GRACE_SECS` (1h) into the past, records `task_runs.status='missed'`, resets `next_run`. `write_memory` enforces a hard 20k-token cap (warn at 8k) so oversized entries fail loud instead of silently getting dropped by the token-budget loader. V39 added a `skill_audit` table (SHA-256 of every user `SKILL.md`) so the doctor Skills check flags post-install tampering on subsequent loads. On TUI open, `App::new` surfaces any `persistent_warnings` from the latest `doctor_runs` row as a one-shot `System` cell after the opening card — intentionally not a pinned banner. `/heal` slash command invokes the same `run_daily_maintenance` on demand (sync call from `cmd_heal` in `crates/cli/src/tui/commands.rs`). See `docs/self-healing.md`.
+Daily maintenance task (`task_type = 'maintenance'`, seeded in V37, fires 02:00) runs a headless doctor sweep, prunes `~/.borg/logs/*.jsonl` and `activity_log` past retention, evicts stale embeddings, heals stalled scheduled tasks, and surfaces warnings that persist across two consecutive runs. No LLM call — dispatcher calls `cortex::maintenance::run_daily_maintenance` directly, so it works with no provider configured. Daemon loop also scans every 5 min for scheduled tasks whose `next_run` drifted > `STALLED_TASK_GRACE_SECS` (1h) into the past, records `task_runs.status='missed'`, resets `next_run`. `write_memory` enforces a hard 20k-token cap (warn at 8k) so oversized entries fail loud instead of silently getting dropped by the token-budget loader. V39 added a `skill_audit` table (SHA-256 of every user `SKILL.md`) so the doctor Skills check flags post-install tampering on subsequent loads. On TUI open, `App::new` surfaces any `persistent_warnings` from the latest `doctor_runs` row as a one-shot `System` cell after the opening card — intentionally not a pinned banner. `/heal` slash command invokes the same `run_daily_maintenance` on demand (sync call from `cmd_heal` in `crates/interface/src/tui/commands.rs`). See `docs/self-healing.md`.
 
 ### Prompt Injection Defense
 
@@ -246,7 +249,7 @@ Daily maintenance task (`task_type = 'maintenance'`, seeded in V37, fires 02:00)
 
 ### Git Utilities
 
-`crates/core/src/git.rs` — ghost commits (snapshot repo on session start using temp index, enables atomic undo), git context for system prompt.
+`crates/cortex/src/git.rs` — ghost commits (snapshot repo on session start using temp index, enables atomic undo), git context for system prompt.
 
 ### Debugging
 
@@ -256,8 +259,8 @@ Logs at `~/.borg/logs/`: `tui.log` (TUI session), `daemon.log`/`daemon.err` (dae
 
 ### New Setting (single table)
 
-1. **`crates/core/src/config/<section>.rs`** — Add the Rust field + default to the matching config struct.
-2. **`crates/core/src/config/settings_table.rs`** — Add one line to the `define_settings!` macro. The macro generates `SETTING_REGISTRY`, the `apply_setting()` match arm, and (when you include it in the `tui_settings` block) the `/settings` popup row.
+1. **`crates/cortex/src/config/<section>.rs`** — Add the Rust field + default to the matching config struct.
+2. **`crates/cortex/src/config/settings_table.rs`** — Add one line to the `define_settings!` macro. The macro generates `SETTING_REGISTRY`, the `apply_setting()` match arm, and (when you include it in the `tui_settings` block) the `/settings` popup row.
 
 To show the setting in the TUI popup, append an entry to the `tui_settings { … }` block at the bottom of `settings_table.rs`:
 
@@ -270,14 +273,14 @@ To show the setting in the TUI popup, append an entry to the `tui_settings { …
 ### New Tool
 
 Strongly prefer extending an existing tool with a new action parameter. If you must add:
-- Definition in `crates/core/src/tool_definitions.rs`
-- Handler in `crates/core/src/tool_handlers/<name>.rs`
-- Group mapping in `crates/core/src/tool_catalog.rs` (`tool_group()`)
+- Definition in `crates/cortex/src/tool_definitions.rs`
+- Handler in `crates/cortex/src/tool_handlers/<name>.rs`
+- Group mapping in `crates/cortex/src/tool_catalog.rs` (`tool_group()`)
 - Plan mode: new tools default to blocked — add to allowlist in agent.rs if non-mutating
 
 ### New Skill
 
-Add `crates/core/skills/<name>/SKILL.md` with YAML frontmatter (name, description, requires.bins, requires.env). Register `include_str!` in `crates/core/src/skills.rs`.
+Add `crates/cortex/skills/<name>/SKILL.md` with YAML frontmatter (name, description, requires.bins, requires.env). Register `include_str!` in `crates/cortex/src/skills.rs`.
 
 ### New Native Channel
 
@@ -303,18 +306,18 @@ Add directory `crates/gateway/src/<name>/` with types, parse, api, verify module
 
 | Crate | Status | Purpose |
 |-------|--------|---------|
-| `crates/borgd` | **new, partial** | Daemon binary. Async tokio runtime, flock single-instance, UDS gRPC listener. Owns agent loop (lifted from `crates/core/src/agent.rs`), `SessionHost` per-session broadcast, `PromptRegistry`, scheduled tasks, heartbeat, hooks, all ingress. |
-| `crates/borg-proto` | **new, evolving** | tonic gRPC schema. Services: `Session`, `Status`, `Capability`, `Admin`. Codegen for Rust now; future TS/Swift/Kotlin for v2 mobile. |
-| `crates/borg-pki` | not started | Internal CA: issue/renew/revoke certs, OS-keychain wrapping (macOS Keychain / Linux Secret Service or TPM / Windows DPAPI). Private keys never on disk. |
-| `crates/cli` | **migrating** | TUI rewriting from in-process agent to gRPC client. New `daemon_client/` submodule with ergonomic wrappers (`send_message_with_images`, `get_state`, `compact`, `undo`, `rewind`, admin RPCs). `crates/cli/src/service/` and `in_flight.rs` will be deleted. |
+| `crates/borgd` | **new, partial** | Daemon binary. Async tokio runtime, flock single-instance, UDS gRPC listener. Owns agent loop (lifted from `crates/cortex/src/agent.rs`), `SessionHost` per-session broadcast, `PromptRegistry`, scheduled tasks, heartbeat, hooks, all ingress. |
+| `crates/protocols` | **new, evolving** | tonic gRPC schema. Services: `Session`, `Status`, `Capability`, `Admin`. Codegen for Rust now; future TS/Swift/Kotlin for v2 mobile. |
+| `crates/identity` | not started | Internal CA: issue/renew/revoke certs, OS-keychain wrapping (macOS Keychain / Linux Secret Service or TPM / Windows DPAPI). Private keys never on disk. |
+| `crates/interface` | **migrating** | TUI rewriting from in-process agent to gRPC client. New `daemon_client/` submodule with ergonomic wrappers (`send_message_with_images`, `get_state`, `compact`, `undo`, `rewind`, admin RPCs). `crates/interface/src/service/` and `in_flight.rs` will be deleted. |
 | `crates/gateway` | **migrating** | 8 native channel adapters port into `borgd`. Crate will downgrade to thin re-exports or be removed once Task 03 lands. |
-| `crates/core` | **library only, no breaking API** | Tests still link it; both `borgd` and `cli` link it. Agent loop logic only invoked by `borgd` post-migration. Do not add new in-process orchestration here. |
+| `crates/cortex` | **library only, no breaking API** | Tests still link it; both `borgd` and `cli` link it. Agent loop logic only invoked by `borgd` post-migration. Do not add new in-process orchestration here. |
 
 ### Transport: gRPC over HTTP/2
 
 - Default bind: Unix domain socket `$BORG_HOME/borgd.sock` (loopback mode).
 - `--listen 127.0.0.1:PORT` opt-in for loopback TCP.
-- Services (`crates/borg-proto/proto/`):
+- Services (`crates/protocols/proto/`):
   - `Session` — `Open`, `Send` (multimodal: text + `Vec<InlineImage>`), `Stream` (resumable token deltas + tool events).
   - `Status` — `Vitals`, `Posture`, `Budget`, `Heartbeat`.
   - `Capability` — bidi-stream; clients advertise capabilities, daemon dispatches invocations.
@@ -407,8 +410,8 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 
 | Task | Scope | Status |
 |------|-------|--------|
-| **01** Daemon kernel + gRPC + TUI client migration | `borgd` binary, `borg-proto`, `DaemonClient`, port TUI off in-process agent | **Partial** — see below |
-| **02** mTLS + PAKE pairing + audit chain | `borg-pki`, pairing flow, verifiers, hash-chained audit | Not started (depends on 01) |
+| **01** Daemon kernel + gRPC + TUI client migration | `borgd` binary, `protocols`, `DaemonClient`, port TUI off in-process agent | **Partial** — see below |
+| **02** mTLS + PAKE pairing + audit chain | `identity`, pairing flow, verifiers, hash-chained audit | Not started (depends on 01) |
 | **03** Layer 5 adapters | Port 8 channels into `borgd`; OpenAI-compat HTTP; webhook; MCP server | Not started (depends on 01) |
 | **04** Provider trait + rate cards + budgets | Unified `Provider`, versioned rate cards, soft/hard budgets, air-gap | Not started |
 | **05** Posture v2 + data handling + cleanup | 3-state posture, retention, tombstone, backups, dead-code sweep, docs | Not started |
@@ -417,7 +420,7 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 - `borgd` daemon: flock single-instance, UDS listener, `Session`/`Capability`/`Status`/`Admin` services scaffolded.
 - `SessionHost` per-session broadcast + ring buffer for resumable events.
 - `PromptRegistry` for pairing/approval requests.
-- `crates/borg-proto` with extended `Session`/`Admin` (multimodal Send with `Vec<InlineImage>`, agent control, scheduling, projects, pairing, sessions, popups).
+- `crates/protocols` with extended `Session`/`Admin` (multimodal Send with `Vec<InlineImage>`, agent control, scheduling, projects, pairing, sessions, popups).
 - `DaemonClient` ergonomic wrappers (`send_message_with_images`, `get_state`, `compact`, `undo`, `rewind`, admin RPCs).
 - `borg ask` REPL one-shot migrated to `DaemonClient` + pb→core event adapter.
 - In-process gateway spawn from `service::` hooked into `borgd`.
@@ -427,8 +430,8 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 - TUI runtime rewrite: replace agent lock + `run_event_loop` match arms with `DaemonClient` calls; popups read via admin RPCs (no direct DB).
 - `crates/gateway/src/handler.rs` → `DaemonClient`.
 - Heartbeat scheduler + gateway server spawn move into `borgd`.
-- Delete `crates/cli/src/service/` and `crates/gateway/src/in_flight.rs` once unused.
-- Compile-time guard tests: no `rusqlite` or `borg_core::db` import in `crates/cli`; single-writer flock; capability routing fallback path.
+- Delete `crates/interface/src/service/` and `crates/gateway/src/in_flight.rs` once unused.
+- Compile-time guard tests: no `rusqlite` or `cortex::db` import in `crates/interface`; single-writer flock; capability routing fallback path.
 
 ### Forward Compatibility (v2 mobile, v3 multi-tenancy/Sentry)
 

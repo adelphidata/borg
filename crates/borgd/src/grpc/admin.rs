@@ -1,25 +1,23 @@
 //! Admin service — lifecycle + data-access RPCs.
 //!
 //! Backed by:
-//! - `borg_core::settings::SettingsResolver` for Get/Set/Unset.
-//! - `borg_core::db::Database` for ListSessions / GetSession.
-//! - `borg_core::maintenance::run_daily_maintenance` for Heal.
+//! - `cortex::settings::SettingsResolver` for Get/Set/Unset.
+//! - `cortex::db::Database` for ListSessions / GetSession.
+//! - `cortex::maintenance::run_daily_maintenance` for Heal.
 //! - The daemon's `poke_tx` channel for Poke (set via `with_poke_sender`).
 //! - The daemon's `shutdown_tx` for Shutdown (set via `with_shutdown_sender`).
 
 use crate::heartbeat::HeartbeatBus;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
-use borg_core::db::Database;
-use borg_core::settings::SettingsResolver;
-use borg_proto::admin::{
-    admin_server::Admin, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue,
-    ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList, ApprovedSenderRef, DaemonStatus,
-    Empty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
-    ActivityLogQuery, ActivityLogText, HeartbeatEvent as PbHeartbeatEvent, KeychainRef,
-    LogActivityRequest, MessageView,
-    MonthlyTokenTotal, MonthlyTotalCost,
-    OnboardingState, PairRequest, PairResponse, PairingApproval, PairingFilter, PairingRequest,
-    PairingRequestList,
+use cortex::db::Database;
+use cortex::settings::SettingsResolver;
+use protocols::admin::{
+    admin_server::Admin, ActivityLogQuery, ActivityLogText, AmbientStatus, ApiKeyEntry, ApiKeyList,
+    ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList,
+    ApprovedSenderRef, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
+    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent, KeychainRef,
+    LogActivityRequest, MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState,
+    PairRequest, PairResponse, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
     PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
     ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
     ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
@@ -125,8 +123,8 @@ impl Admin for AdminSvc {
     async fn heal(&self, _req: Request<Empty>) -> Result<Response<HealReport>, TStatus> {
         let report = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
             let db = Database::open()?;
-            let config = borg_core::config::Config::load_from_db()?;
-            borg_core::maintenance::run_daily_maintenance(&db, &config)
+            let config = cortex::config::Config::load_from_db()?;
+            cortex::maintenance::run_daily_maintenance(&db, &config)
         })
         .await
         .map_err(|e| TStatus::internal(format!("heal task panicked: {e}")))?
@@ -209,28 +207,29 @@ impl Admin for AdminSvc {
         // Combine in-memory live sessions with the most recent persisted ones.
         let live: std::collections::HashSet<String> =
             self.registry.live_ids().into_iter().collect();
-        let sessions = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SessionSummary>> {
-            let db = Database::open()?;
-            let rows = db.list_sessions(100)?;
-            let mut sessions = Vec::with_capacity(rows.len());
-            for r in rows {
-                let count = db.count_session_messages(&r.id).unwrap_or(0);
-                let mut title = r.title.clone();
-                if live.contains(&r.id) && !title.contains("(live)") {
-                    title = format!("{title} (live)");
+        let sessions =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SessionSummary>> {
+                let db = Database::open()?;
+                let rows = db.list_sessions(100)?;
+                let mut sessions = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let count = db.count_session_messages(&r.id).unwrap_or(0);
+                    let mut title = r.title.clone();
+                    if live.contains(&r.id) && !title.contains("(live)") {
+                        title = format!("{title} (live)");
+                    }
+                    sessions.push(SessionSummary {
+                        id: r.id,
+                        title,
+                        message_count: count as u64,
+                        updated_unix_ts: r.updated_at as u64,
+                    });
                 }
-                sessions.push(SessionSummary {
-                    id: r.id,
-                    title,
-                    message_count: count as u64,
-                    updated_unix_ts: r.updated_at as u64,
-                });
-            }
-            Ok(sessions)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("list_sessions task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_sessions failed: {e}")))?;
+                Ok(sessions)
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("list_sessions task panicked: {e}")))?
+            .map_err(|e| TStatus::internal(format!("list_sessions failed: {e}")))?;
         Ok(Response::new(SessionList { sessions }))
     }
 
@@ -239,29 +238,30 @@ impl Admin for AdminSvc {
         req: Request<SessionRef>,
     ) -> Result<Response<SessionDetail>, TStatus> {
         let id = req.into_inner().id;
-        let detail = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<SessionDetail>> {
-            let db = Database::open()?;
-            let Some(row) = db.session_by_id(&id)? else {
-                return Ok(None);
-            };
-            let messages = db.load_session_messages(&row.id)?;
-            Ok(Some(SessionDetail {
-                id: row.id,
-                title: row.title,
-                messages: messages
-                    .into_iter()
-                    .map(|m| MessageView {
-                        role: m.role,
-                        text: m.content.unwrap_or_default(),
-                        unix_ts: m.created_at as u64,
-                    })
-                    .collect(),
-            }))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("get_session task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("get_session failed: {e}")))?
-        .ok_or_else(|| TStatus::not_found("session not found".to_string()))?;
+        let detail =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<SessionDetail>> {
+                let db = Database::open()?;
+                let Some(row) = db.session_by_id(&id)? else {
+                    return Ok(None);
+                };
+                let messages = db.load_session_messages(&row.id)?;
+                Ok(Some(SessionDetail {
+                    id: row.id,
+                    title: row.title,
+                    messages: messages
+                        .into_iter()
+                        .map(|m| MessageView {
+                            role: m.role,
+                            text: m.content.unwrap_or_default(),
+                            unix_ts: m.created_at as u64,
+                        })
+                        .collect(),
+                }))
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("get_session task panicked: {e}")))?
+            .map_err(|e| TStatus::internal(format!("get_session failed: {e}")))?
+            .ok_or_else(|| TStatus::not_found("session not found".to_string()))?;
         Ok(Response::new(detail))
     }
 
@@ -365,7 +365,7 @@ impl Admin for AdminSvc {
         let id = uuid::Uuid::new_v4().to_string();
         let id_for_lookup = id.clone();
         let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            use borg_core::db::NewTask;
+            use cortex::db::NewTask;
             let db = Database::open()?;
             let delivery_channel =
                 (!req.delivery_channel.is_empty()).then_some(req.delivery_channel.as_str());
@@ -446,7 +446,7 @@ impl Admin for AdminSvc {
         let req = req.into_inner();
         let id_for_lookup = req.id.clone();
         let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            use borg_core::db::UpdateTask;
+            use cortex::db::UpdateTask;
             let db = Database::open()?;
             // Empty string sentinel = "leave unchanged", matching the
             // ScheduledTaskUpdate proto semantics + Option<&str> on UpdateTask.
@@ -522,7 +522,11 @@ impl Admin for AdminSvc {
         let req = req.into_inner();
         let id = req.id;
         // 0 = caller didn't pin a limit; pick a sane default.
-        let limit = if req.limit == 0 { 10 } else { req.limit as usize };
+        let limit = if req.limit == 0 {
+            10
+        } else {
+            req.limit as usize
+        };
         let runs = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let db = Database::open()?;
             db.task_run_history(&id, limit)
@@ -541,8 +545,8 @@ impl Admin for AdminSvc {
     ) -> Result<Response<ScheduledTaskDetail>, TStatus> {
         let id = req.into_inner().id;
         let id_for_err = id.clone();
-        let detail = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Option<ScheduledTaskDetail>> {
+        let detail =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ScheduledTaskDetail>> {
                 let db = Database::open()?;
                 let Some(row) = db.get_task_by_id(&id)? else {
                     return Ok(None);
@@ -559,11 +563,10 @@ impl Admin for AdminSvc {
                     has_last_run: last.is_some(),
                     last_run: last.map(task_run_row_to_proto),
                 }))
-            },
-        )
-        .await
-        .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail panicked: {e}")))?
+            .map_err(|e| TStatus::internal(format!("get_scheduled_task_detail failed: {e}")))?;
         let detail = detail.ok_or_else(|| {
             TStatus::not_found(format!("scheduled task `{id_for_err}` not found"))
         })?;
@@ -584,18 +587,17 @@ impl Admin for AdminSvc {
             req.format
         };
         let session_id = req.session_id;
-        let (rendered, suggested) = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<(String, String)> {
-                use borg_core::export::{export_session, ExportFormat, ExportOptions};
+        let (rendered, suggested) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+                use cortex::export::{export_session, ExportFormat, ExportOptions};
                 use std::str::FromStr;
                 let format = ExportFormat::from_str(&format_str)?;
                 let db = Database::open()?;
                 export_session(&db, &session_id, ExportOptions { format })
-            },
-        )
-        .await
-        .map_err(|e| TStatus::internal(format!("export_session panicked: {e}")))?
-        .map_err(|e| TStatus::invalid_argument(format!("export_session failed: {e}")))?;
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("export_session panicked: {e}")))?
+            .map_err(|e| TStatus::invalid_argument(format!("export_session failed: {e}")))?;
         Ok(Response::new(ExportSessionResponse {
             content: rendered.into_bytes(),
             suggested_filename: suggested,
@@ -682,7 +684,7 @@ impl Admin for AdminSvc {
         let live_count = self.registry.live_ids().len() as u64;
         let snapshot = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
             let db = Database::open()?;
-            let cfg = borg_core::config::Config::load_from_db()?;
+            let cfg = cortex::config::Config::load_from_db()?;
             let tasks = db.list_tasks()?;
             let pairings = db.list_pairings(None)?;
             let active = tasks.iter().filter(|t| t.status == "active").count() as u64;
@@ -789,14 +791,13 @@ impl Admin for AdminSvc {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.clone()
         };
-        let executor = executor.ok_or_else(|| {
-            TStatus::failed_precondition("approval greeting executor not wired")
-        })?;
+        let executor = executor
+            .ok_or_else(|| TStatus::failed_precondition("approval greeting executor not wired"))?;
         // Fire-and-forget so the caller doesn't block on an LLM turn.
         let channel = req.channel;
         let sender_id = req.sender_id;
         tokio::spawn(async move {
-            let config = match borg_core::config::Config::load_from_db() {
+            let config = match cortex::config::Config::load_from_db() {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!("approval greeting: load_from_db failed: {e}");
@@ -822,8 +823,7 @@ impl Admin for AdminSvc {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.clone()
         };
-        let bus =
-            bus.ok_or_else(|| TStatus::failed_precondition("heartbeat bus not wired"))?;
+        let bus = bus.ok_or_else(|| TStatus::failed_precondition("heartbeat bus not wired"))?;
         let mut sub = bus.subscribe();
         let (tx, rx) = mpsc::channel::<Result<PbHeartbeatEvent, TStatus>>(16);
         tokio::spawn(async move {
@@ -843,9 +843,7 @@ impl Admin for AdminSvc {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(
-                            "heartbeat stream subscriber lagged by {n}; continuing"
-                        );
+                        tracing::warn!("heartbeat stream subscriber lagged by {n}; continuing");
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
@@ -865,7 +863,7 @@ impl Admin for AdminSvc {
         let message = req.message;
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let db = Database::open()?;
-            borg_core::activity_log::log_activity(&db, &level, &source, &message);
+            cortex::activity_log::log_activity(&db, &level, &source, &message);
             Ok(())
         })
         .await
@@ -901,7 +899,7 @@ impl Admin for AdminSvc {
             Ok(entries
                 .iter()
                 .rev()
-                .map(borg_core::activity_log::format_activity_entry)
+                .map(cortex::activity_log::format_activity_entry)
                 .collect::<Vec<_>>()
                 .join("\n"))
         })
@@ -921,12 +919,7 @@ impl Admin for AdminSvc {
         }
         let recorded = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
             let db = Database::open()?;
-            db.insert_plugin(
-                &req.plugin_id,
-                &req.plugin_name,
-                &req.kind,
-                &req.category,
-            )?;
+            db.insert_plugin(&req.plugin_id, &req.plugin_name, &req.kind, &req.category)?;
             let mut count = 0u32;
             for fh in &req.file_hashes {
                 if let Err(e) = db.insert_file_hash(&req.plugin_id, &fh.path, &fh.hash) {
@@ -1013,26 +1006,21 @@ impl Admin for AdminSvc {
     // The cli does keychain I/O; the daemon only persists/returns the
     // routing metadata.
 
-    async fn get_api_key(
-        &self,
-        req: Request<ApiKeyRef>,
-    ) -> Result<Response<ApiKeyValue>, TStatus> {
+    async fn get_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<ApiKeyValue>, TStatus> {
         let provider = req.into_inner().provider;
         if provider.is_empty() {
             return Err(TStatus::invalid_argument("provider required"));
         }
         let provider_for_lookup = provider.clone();
-        let body = tokio::task::spawn_blocking(
-            move || -> anyhow::Result<Option<ApiKeyRouting>> {
-                let db = Database::open()?;
-                let key = format!("credentials.{provider_for_lookup}");
-                let raw = db.get_setting(&key)?;
-                match raw {
-                    Some(s) if !s.is_empty() => Ok(Some(serde_json::from_str(&s)?)),
-                    _ => Ok(None),
-                }
-            },
-        )
+        let body = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ApiKeyRouting>> {
+            let db = Database::open()?;
+            let key = format!("credentials.{provider_for_lookup}");
+            let raw = db.get_setting(&key)?;
+            match raw {
+                Some(s) if !s.is_empty() => Ok(Some(serde_json::from_str(&s)?)),
+                _ => Ok(None),
+            }
+        })
         .await
         .map_err(|e| TStatus::internal(format!("get_api_key panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("get_api_key failed: {e}")))?;
@@ -1040,15 +1028,15 @@ impl Admin for AdminSvc {
         let value = match body {
             None => ApiKeyValue {
                 provider,
-                body: Some(borg_proto::admin::api_key_value::Body::Unset(Empty {})),
+                body: Some(protocols::admin::api_key_value::Body::Unset(Empty {})),
             },
             Some(ApiKeyRouting::Literal { value }) => ApiKeyValue {
                 provider,
-                body: Some(borg_proto::admin::api_key_value::Body::Literal(value)),
+                body: Some(protocols::admin::api_key_value::Body::Literal(value)),
             },
             Some(ApiKeyRouting::Keychain { service, account }) => ApiKeyValue {
                 provider,
-                body: Some(borg_proto::admin::api_key_value::Body::Keychain(
+                body: Some(protocols::admin::api_key_value::Body::Keychain(
                     KeychainRef { service, account },
                 )),
             },
@@ -1056,22 +1044,19 @@ impl Admin for AdminSvc {
         Ok(Response::new(value))
     }
 
-    async fn set_api_key(
-        &self,
-        req: Request<ApiKeyValue>,
-    ) -> Result<Response<Empty>, TStatus> {
+    async fn set_api_key(&self, req: Request<ApiKeyValue>) -> Result<Response<Empty>, TStatus> {
         let req = req.into_inner();
         if req.provider.is_empty() {
             return Err(TStatus::invalid_argument("provider required"));
         }
         let routing = match req.body {
-            Some(borg_proto::admin::api_key_value::Body::Literal(v)) => {
+            Some(protocols::admin::api_key_value::Body::Literal(v)) => {
                 if v.is_empty() {
                     return Err(TStatus::invalid_argument("literal value must be non-empty"));
                 }
                 ApiKeyRouting::Literal { value: v }
             }
-            Some(borg_proto::admin::api_key_value::Body::Keychain(kr)) => {
+            Some(protocols::admin::api_key_value::Body::Keychain(kr)) => {
                 if kr.service.is_empty() || kr.account.is_empty() {
                     return Err(TStatus::invalid_argument(
                         "keychain ref requires service and account",
@@ -1082,7 +1067,7 @@ impl Admin for AdminSvc {
                     account: kr.account,
                 }
             }
-            Some(borg_proto::admin::api_key_value::Body::Unset(_)) | None => {
+            Some(protocols::admin::api_key_value::Body::Unset(_)) | None => {
                 return Err(TStatus::invalid_argument(
                     "set_api_key requires literal or keychain body; use unset_api_key to clear",
                 ));
@@ -1102,10 +1087,7 @@ impl Admin for AdminSvc {
         Ok(Response::new(Empty {}))
     }
 
-    async fn unset_api_key(
-        &self,
-        req: Request<ApiKeyRef>,
-    ) -> Result<Response<Empty>, TStatus> {
+    async fn unset_api_key(&self, req: Request<ApiKeyRef>) -> Result<Response<Empty>, TStatus> {
         let provider = req.into_inner().provider;
         if provider.is_empty() {
             return Err(TStatus::invalid_argument("provider required"));
@@ -1122,10 +1104,7 @@ impl Admin for AdminSvc {
         Ok(Response::new(Empty {}))
     }
 
-    async fn list_api_keys(
-        &self,
-        _req: Request<Empty>,
-    ) -> Result<Response<ApiKeyList>, TStatus> {
+    async fn list_api_keys(&self, _req: Request<Empty>) -> Result<Response<ApiKeyList>, TStatus> {
         let entries = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<ApiKeyEntry>> {
             let db = Database::open()?;
             let rows = db.list_settings()?;
@@ -1228,9 +1207,9 @@ fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
     let evo = db.get_evolution_state()?;
     let vitals = db.get_vitals_state()?;
     let bond_events = db.get_all_bond_events()?;
-    let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
-    let bond = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
-    let mood = borg_core::evolution::compute_mood(&evo, &vitals, &bond);
+    let bond_key = db.derive_hmac_key(cortex::bond::BOND_HMAC_DOMAIN);
+    let bond = cortex::bond::replay_events_with_key(&bond_key, &bond_events);
+    let mood = cortex::evolution::compute_mood(&evo, &vitals, &bond);
     Ok(AmbientStatus {
         evolution_name: evo.evolution_name.unwrap_or_default(),
         level: evo.level as u32,
@@ -1256,7 +1235,7 @@ async fn update_task_status(id: String, status: &'static str) -> Result<Response
     Ok(Response::new(Empty {}))
 }
 
-fn project_row_to_proto(r: borg_core::db::ProjectRow) -> Project {
+fn project_row_to_proto(r: cortex::db::ProjectRow) -> Project {
     Project {
         id: r.id,
         name: r.name,
@@ -1267,7 +1246,7 @@ fn project_row_to_proto(r: borg_core::db::ProjectRow) -> Project {
     }
 }
 
-fn scheduled_task_row_to_proto(r: borg_core::db::ScheduledTaskRow) -> ScheduledTask {
+fn scheduled_task_row_to_proto(r: cortex::db::ScheduledTaskRow) -> ScheduledTask {
     ScheduledTask {
         id: r.id,
         name: r.name,
@@ -1284,7 +1263,7 @@ fn scheduled_task_row_to_proto(r: borg_core::db::ScheduledTaskRow) -> ScheduledT
     }
 }
 
-fn task_run_row_to_proto(r: borg_core::db::TaskRunRow) -> ScheduledTaskRun {
+fn task_run_row_to_proto(r: cortex::db::TaskRunRow) -> ScheduledTaskRun {
     ScheduledTaskRun {
         id: r.id,
         task_id: r.task_id,
@@ -1296,7 +1275,7 @@ fn task_run_row_to_proto(r: borg_core::db::TaskRunRow) -> ScheduledTaskRun {
     }
 }
 
-fn pairing_row_to_proto(r: borg_core::db::PairingRequestRow) -> PairingRequest {
+fn pairing_row_to_proto(r: cortex::db::PairingRequestRow) -> PairingRequest {
     PairingRequest {
         id: r.id,
         channel_name: r.channel_name,
@@ -1309,7 +1288,7 @@ fn pairing_row_to_proto(r: borg_core::db::PairingRequestRow) -> PairingRequest {
     }
 }
 
-fn approved_sender_row_to_proto(r: borg_core::db::ApprovedSenderRow) -> ApprovedSender {
+fn approved_sender_row_to_proto(r: cortex::db::ApprovedSenderRow) -> ApprovedSender {
     ApprovedSender {
         id: r.id,
         channel_name: r.channel_name,

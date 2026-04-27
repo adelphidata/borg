@@ -12,17 +12,17 @@
 //! fan-out under realistic transport conditions.
 
 use async_trait::async_trait;
-use borg_core::agent::AgentEvent as CoreEvent;
-use borg_proto::session::agent_event::Kind;
-use borg_proto::session::session_client::SessionClient;
-use borg_proto::session::session_server::SessionServer;
-use borg_proto::session::{
-    CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest, StreamRequest,
-};
 use borgd::daemon::bind_uds;
 use borgd::grpc::session::{SessionFactory, SessionSvc};
 use borgd::session::backend::SessionBackend;
 use borgd::session::{SessionHost, SessionRegistry};
+use cortex::agent::AgentEvent as CoreEvent;
+use protocols::session::agent_event::Kind;
+use protocols::session::session_client::SessionClient;
+use protocols::session::session_server::SessionServer;
+use protocols::session::{
+    CancelRequest, CloseRequest, OpenRequest, PromptResponse, SendRequest, StreamRequest,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

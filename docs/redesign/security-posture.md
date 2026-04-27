@@ -269,14 +269,14 @@ On first daemon start after v1 lands:
 
 ### Crates / files (sketch)
 
-- `crates/core/src/evolution/security/mod.rs` — `PostureSnapshot`, `PostureState`, `XpBreakdown`, public types.
-- `crates/core/src/evolution/security/resolver.rs` — `resolve_state`, `is_reduced`, `is_boosted`.
-- `crates/core/src/evolution/security/snapshot.rs` — read live config + listeners → `PostureSnapshot`.
-- `crates/core/src/evolution/security/emit.rs` — write `security_posture_changed` events with rate-limiting; daemon-startup reconciliation.
-- `crates/core/src/evolution/replay.rs` — extend running state with `current_posture`; apply multiplier to `xp_gain` replay.
-- `crates/core/src/evolution/feed.rs` — extend `/xp` header rendering with posture + weekly avg multiplier.
-- `crates/core/src/evolution/commands.rs` — extend `/evolution` rendering with posture line.
-- `crates/cli/src/tui/app.rs` — surface `security_posture_changed` toast as a `System` cell.
+- `crates/cortex/src/evolution/security/mod.rs` — `PostureSnapshot`, `PostureState`, `XpBreakdown`, public types.
+- `crates/cortex/src/evolution/security/resolver.rs` — `resolve_state`, `is_reduced`, `is_boosted`.
+- `crates/cortex/src/evolution/security/snapshot.rs` — read live config + listeners → `PostureSnapshot`.
+- `crates/cortex/src/evolution/security/emit.rs` — write `security_posture_changed` events with rate-limiting; daemon-startup reconciliation.
+- `crates/cortex/src/evolution/replay.rs` — extend running state with `current_posture`; apply multiplier to `xp_gain` replay.
+- `crates/cortex/src/evolution/feed.rs` — extend `/xp` header rendering with posture + weekly avg multiplier.
+- `crates/cortex/src/evolution/commands.rs` — extend `/evolution` rendering with posture line.
+- `crates/interface/src/tui/app.rs` — surface `security_posture_changed` toast as a `System` cell.
 
 ---
 
@@ -306,6 +306,6 @@ The `schema_version` field on `PostureSnapshot` exists exactly to enable this wi
 - Companion: [`evolution.md`](../evolution.md) — XP curves, archetypes, milestones, HMAC chain.
 - Companion: [`auth-and-onboarding.md`](auth-and-onboarding.md) — listener model, tier ceilings.
 - Companion: [`architecture-redesign.md`](architecture-redesign.md) — Layer 4 security model, audit chain.
-- Existing replay: `crates/core/src/evolution/replay.rs`
-- Existing milestone dedup: `crates/core/src/evolution/milestones.rs`
-- Existing rate-limit table: `crates/core/src/evolution/mod.rs`
+- Existing replay: `crates/cortex/src/evolution/replay.rs`
+- Existing milestone dedup: `crates/cortex/src/evolution/milestones.rs`
+- Existing rate-limit table: `crates/cortex/src/evolution/mod.rs`

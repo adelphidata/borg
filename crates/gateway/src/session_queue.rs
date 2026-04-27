@@ -8,20 +8,20 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn};
 
 /// How long a per-session consumer stays alive without messages before exiting.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(borg_core::constants::SESSION_IDLE_TIMEOUT_SECS);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(cortex::constants::SESSION_IDLE_TIMEOUT_SECS);
 
 /// Maximum buffered messages per session before backpressure kicks in.
-const QUEUE_CAPACITY: usize = borg_core::constants::SESSION_QUEUE_CAPACITY;
+const QUEUE_CAPACITY: usize = cortex::constants::SESSION_QUEUE_CAPACITY;
 
 /// Maximum number of concurrent session consumers to prevent memory exhaustion.
-const MAX_ACTIVE_SESSIONS: usize = borg_core::constants::MAX_ACTIVE_SESSIONS;
+const MAX_ACTIVE_SESSIONS: usize = cortex::constants::MAX_ACTIVE_SESSIONS;
 
 /// Maximum sessions a single sender can create across all channels/threads.
-const MAX_SESSIONS_PER_SENDER: usize = borg_core::constants::MAX_SESSIONS_PER_SENDER;
+const MAX_SESSIONS_PER_SENDER: usize = cortex::constants::MAX_SESSIONS_PER_SENDER;
 
 /// Brief window to coalesce rapid-fire messages from the same session.
 const COALESCE_WINDOW: Duration =
-    Duration::from_millis(borg_core::constants::SESSION_COALESCE_WINDOW_MS);
+    Duration::from_millis(cortex::constants::SESSION_COALESCE_WINDOW_MS);
 
 /// A unit of work to be processed sequentially within a session.
 pub type WorkFn = Pin<Box<dyn Future<Output = ()> + Send>>;

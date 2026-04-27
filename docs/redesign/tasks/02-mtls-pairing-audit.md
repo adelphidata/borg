@@ -17,7 +17,7 @@ Make the daemon's gRPC surface require client mTLS, with K8s-style seamless cert
   - Linux Secret Service / `tpm2-tss` when present
   - Windows DPAPI / TPM
 - New `internal_ca_certs` table tracks issued/renewed/revoked certs (cert PEM, fingerprint, subject, not_before, not_after, status).
-- `crates/borg-pki` (new) owns CA ops: issue, renew, revoke, list. Used by daemon at startup + on pairing + on cert-renewal tick.
+- `crates/identity` (new) owns CA ops: issue, renew, revoke, list. Used by daemon at startup + on pairing + on cert-renewal tick.
 
 ### Client cert lifecycle
 

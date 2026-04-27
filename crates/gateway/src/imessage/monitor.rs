@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
-use borg_core::config::Config;
+use cortex::config::Config;
 
 use super::echo_cache::EchoCache;
 use super::reflection_guard;

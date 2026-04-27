@@ -17,7 +17,7 @@ Any other value is parsed as an IANA zone name (e.g.
 UTC with a `tracing::warn!` — a corrupted timezone field must never
 stop a task from firing.
 Unlike prompt/command tasks, it **does not invoke the LLM** — the task
-dispatcher calls `borg_core::maintenance::run_daily_maintenance` directly.
+dispatcher calls `cortex::maintenance::run_daily_maintenance` directly.
 That means it keeps running even when no provider key is configured and
 costs zero tokens.
 
@@ -170,7 +170,7 @@ even when the daemon isn't running.
 
 `write_memory` rejects any write that would produce an entry larger than
 **20,000 tokens** and warns in logs at **8,000 tokens**. Both thresholds
-live in `crates/core/src/constants.rs` as
+live in `crates/cortex/src/constants.rs` as
 `MEMORY_ENTRY_REJECT_TOKENS` / `MEMORY_ENTRY_WARN_TOKENS`.
 
 Why a hard cap? The token-budget loader that populates the system prompt
@@ -209,7 +209,7 @@ Uninstalling a skill is a manual operation today (`rm -rf`); call
 to be treated as first-seen rather than modified.
 
 The helper that drives this is
-`borg_core::skill_security::audit_user_skills(&db, &dir)` — pure function,
+`cortex::skill_security::audit_user_skills(&db, &dir)` — pure function,
 takes an open DB and returns `Vec<SkillAuditFinding>`.
 
 ## Persistent-warning notice on TUI open
@@ -234,7 +234,7 @@ is always available in full via `borg doctor` or by querying
 `doctor_runs.report_json` directly.
 
 Implementation: `persistent_warning_notice_from_db` in
-`crates/cli/src/tui/app/mod.rs`.
+`crates/interface/src/tui/app/mod.rs`.
 
 ## Related systems
 

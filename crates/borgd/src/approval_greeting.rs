@@ -5,12 +5,12 @@
 //! in the daemon so the cli no longer needs to construct an `Agent` for this.
 //!
 //! On any failure (LLM down, channel API error, empty response) we fall back
-//! to the stock static notification via `borg_core::pairing::send_approval_notification`.
+//! to the stock static notification via `cortex::pairing::send_approval_notification`.
 
 use crate::session::DaemonSessionExecutor;
-use borg_core::agent::AgentEvent;
-use borg_core::config::{CollaborationMode, Config};
-use borg_gateway::{InboundTurn, SessionExecutor};
+use cortex::agent::AgentEvent;
+use cortex::config::{CollaborationMode, Config};
+use gateway::{InboundTurn, SessionExecutor};
 
 /// Run a quick agent turn to draft a greeting and deliver it. Fire-and-forget;
 /// errors are logged + the static fallback is sent.
@@ -34,8 +34,8 @@ pub async fn send(
                 sender = sender_id,
                 "Approval greeting delivered via LLM"
             );
-            if let Ok(adb) = borg_core::db::Database::open() {
-                borg_core::activity_log::log_activity(
+            if let Ok(adb) = cortex::db::Database::open() {
+                cortex::activity_log::log_activity(
                     &adb,
                     "info",
                     "pairing",
@@ -49,7 +49,7 @@ pub async fn send(
                 sender = sender_id,
                 "LLM greeting failed ({e}), falling back to static message"
             );
-            borg_core::pairing::send_approval_notification(
+            cortex::pairing::send_approval_notification(
                 config,
                 channel_name,
                 sender_id,
@@ -71,7 +71,7 @@ async fn generate_and_deliver(
     // Plan mode prevents any mutating tool from firing inside this brief turn.
     config.conversation.collaboration_mode = CollaborationMode::Plan;
 
-    let channel_display = borg_core::pairing::channel_display_name(channel_name);
+    let channel_display = cortex::pairing::channel_display_name(channel_name);
     let prompt = format!(
         "A new user has just been approved to message you on {channel_display}. \
          Generate a brief, warm greeting to introduce yourself as {agent_name}. \

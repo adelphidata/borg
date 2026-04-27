@@ -6,7 +6,7 @@
 //! duplicate replies. Interaction IDs are Discord snowflakes and globally
 //! unique, so they make an ideal dedup key.
 
-use borg_core::constants;
+use cortex::constants;
 
 crate::dedup_wrapper!(
     /// Bounded deduplicator for Discord interaction IDs.

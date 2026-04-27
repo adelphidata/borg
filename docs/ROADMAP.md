@@ -49,7 +49,7 @@ for current behavior:
 
 ## /btw — non-blocking side questions
 
-Shipped (TUI-only): `/btw <question>` spawns a tool-less, non-persistent side agent that answers using the current session's transcript snapshot. Result renders in a dismissable modal popup. See `crates/core/src/agent/btw.rs` and `crates/cli/src/tui/btw_popup.rs`.
+Shipped (TUI-only): `/btw <question>` spawns a tool-less, non-persistent side agent that answers using the current session's transcript snapshot. Result renders in a dismissable modal popup. See `crates/cortex/src/agent/btw.rs` and `crates/interface/src/tui/btw_popup.rs`.
 
 Deferred:
 

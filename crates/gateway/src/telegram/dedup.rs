@@ -1,4 +1,4 @@
-use borg_core::constants;
+use cortex::constants;
 
 crate::dedup_wrapper!(
     /// Bounded deduplicator for Telegram update IDs.

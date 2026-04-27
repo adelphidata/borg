@@ -12,11 +12,11 @@ use crate::pki_grpc::PkiSvc;
 use crate::session::backend::AgentBackend;
 use crate::session::{SessionHost, SessionRegistry};
 use anyhow::{Context, Result};
-use borg_core::config::Config as CoreConfig;
-use borg_core::db::{audit_events, AuditWriter, Database};
-use borg_core::telemetry::BorgMetrics;
-use borg_pki::KeychainStore;
-use borg_proto::pki::pki_server::PkiServer;
+use cortex::config::Config as CoreConfig;
+use cortex::db::{audit_events, AuditWriter, Database};
+use cortex::telemetry::BorgMetrics;
+use identity::KeychainStore;
+use protocols::pki::pki_server::PkiServer;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -140,8 +140,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // subsequent starts. We open a daemon-owned `Database` here and wrap it
     // in `Arc<Mutex>` so the AuditWriter and Pki service share the single
     // writer with the audit chain.
-    let db_for_pki = Database::open()
-        .context("opening DB for PKI bootstrap")?;
+    let db_for_pki = Database::open().context("opening DB for PKI bootstrap")?;
     let pki_db = Arc::new(Mutex::new(db_for_pki));
     let kek = Arc::new(KeychainStore::new());
     let (ca_cert_pem, ca_key_pem) = {
@@ -186,8 +185,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    let services =
-        grpc::build_services_with_extras(registry, factory, capability_router, extras);
+    let services = grpc::build_services_with_extras(registry, factory, capability_router, extras);
 
     let uds_stream = UnixListenerStream::new(uds);
 

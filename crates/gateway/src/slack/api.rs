@@ -62,7 +62,7 @@ const TYPING_CB_FAILURE_THRESHOLD: u32 = crate::constants::SLACK_TYPING_CB_FAILU
 const TYPING_CB_SUSPENSION_SECS: u64 = crate::constants::SLACK_TYPING_CB_SUSPENSION_SECS;
 
 /// Max file download size for Slack attachments.
-const MAX_FILE_DOWNLOAD: usize = borg_core::constants::SLACK_MAX_FILE_SIZE;
+const MAX_FILE_DOWNLOAD: usize = cortex::constants::SLACK_MAX_FILE_SIZE;
 
 /// A client for the Slack Web API.
 #[derive(Clone)]

@@ -104,7 +104,7 @@ No `/budget` command.
 
 ### Migration
 
-- Existing per-provider call sites in `crates/core/src/llm/` get refactored behind `Provider` impls. Public surface from `core::Agent` calls `Provider::call`, not `OpenAiClient::chat`.
+- Existing per-provider call sites in `crates/cortex/src/llm/` get refactored behind `Provider` impls. Public surface from `core::Agent` calls `Provider::call`, not `OpenAiClient::chat`.
 - Existing `[credentials]` table keeps owning API keys (no vault). Provider config refers to credential names.
 
 ## Out of scope

@@ -1,0 +1,80 @@
+[package]
+name = "interface"
+description = "CLI for the Borg AI personal assistant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "borg"
+path = "src/main.rs"
+
+[dependencies]
+cortex = { path = "../cortex" }
+heartbeat = { path = "../heartbeat" }
+gateway = { path = "../gateway" }
+plugins = { path = "../plugins" }
+protocols = { path = "../protocols" }
+borgd = { path = "../borgd" }
+identity = { path = "../identity" }
+tonic = { workspace = true }
+prost = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+dotenvy = { workspace = true }
+ratatui = { workspace = true }
+tui-textarea = { workspace = true }
+pulldown-cmark = { workspace = true }
+textwrap = { workspace = true }
+unicode-width = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+which = { workspace = true }
+uuid = { workspace = true }
+iana-time-zone = "0.1"
+reqwest = { workspace = true }
+tokio-util = { workspace = true }
+tracing-appender = { workspace = true }
+tempfile = { workspace = true }
+throbber-widgets-tui = { workspace = true }
+ignore = { workspace = true }
+libc = "0.2"
+arboard = { workspace = true }
+rand = { workspace = true }
+image = { workspace = true }
+base64 = { workspace = true }
+syntect = { version = "5", default-features = false, features = [
+    "default-fancy",
+] }
+ansi-to-tui = "7"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
+[features]
+# Exposes test-only constructors (e.g. `DaemonClient::lazy_for_tests`) outside
+# of `cargo test`. Off by default so production binaries cannot accidentally
+# instantiate disconnected clients.
+test-helpers = []
+
+[dev-dependencies]
+rusqlite = { workspace = true }
+wiremock = "0.5"
+async-trait = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "borg-heartbeat"
+name = "heartbeat"
 description = "Proactive heartbeat scheduler for Borg"
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-borg-core = { path = "../core" }
+cortex = { path = "../cortex" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

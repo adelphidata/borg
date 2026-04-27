@@ -15,7 +15,7 @@ Three loosely-coupled finishing pieces that don't justify their own task each:
 
 ### Posture v2
 
-Replace the current 5-bucket evolution posture model in `crates/core/src/evolution/` with:
+Replace the current 5-bucket evolution posture model in `crates/cortex/src/evolution/` with:
 
 ```rust
 enum Posture { Reduced, Default, Boosted }
@@ -66,7 +66,7 @@ Per `data-handling.md`:
 
 ### Cleanup pass
 
-- Delete in-process agent code paths from `crates/cli` that were replaced by gRPC client code in Task 01. Anything in `crates/core` only consumed by deleted CLI paths goes too.
+- Delete in-process agent code paths from `crates/interface` that were replaced by gRPC client code in Task 01. Anything in `crates/cortex` only consumed by deleted CLI paths goes too.
 - `crates/gateway` likely deletable after Task 03 — confirm and remove.
 - Doc sweep:
   - Re-grep `docs/` for cut concepts (`workspace`, `sentry`, `SCIM`, `FIPS`, `Hardened`, `Strict`, `Permissive`, `KEK escrow`, `Derived PIV`, `classification_predicate`). Anything outside `docs/redesign/` mentioning them is stale — fix or delete.

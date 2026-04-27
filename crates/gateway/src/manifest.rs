@@ -85,8 +85,8 @@ pub struct SandboxSection {
 
 impl SandboxSection {
     /// Convert to a `SandboxPolicy` for script execution.
-    pub fn to_policy(&self) -> borg_sandbox::policy::SandboxPolicy {
-        borg_sandbox::policy::SandboxPolicy {
+    pub fn to_policy(&self) -> sandbox::policy::SandboxPolicy {
+        sandbox::policy::SandboxPolicy {
             network: self.network,
             fs_read: self.fs_read.clone(),
             fs_write: self.fs_write.clone(),
@@ -157,10 +157,10 @@ fn default_outbound() -> String {
     "send_outbound.py".to_string()
 }
 fn default_timeout() -> u64 {
-    borg_core::constants::CHANNEL_DEFAULT_TIMEOUT_MS
+    cortex::constants::CHANNEL_DEFAULT_TIMEOUT_MS
 }
 fn default_max_concurrent() -> usize {
-    borg_core::constants::CHANNEL_DEFAULT_MAX_CONCURRENT
+    cortex::constants::CHANNEL_DEFAULT_MAX_CONCURRENT
 }
 
 impl ChannelManifest {
@@ -211,7 +211,7 @@ impl ChannelManifest {
     }
 
     /// Build a sandbox policy from this manifest's sandbox section.
-    pub fn sandbox_policy(&self) -> borg_sandbox::policy::SandboxPolicy {
+    pub fn sandbox_policy(&self) -> sandbox::policy::SandboxPolicy {
         self.sandbox.to_policy()
     }
 }

@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use tokio::sync::RwLock;
 
-use borg_core::config::Config;
-use borg_core::db::Database;
+use cortex::config::Config;
+use cortex::db::Database;
 
 use crate::handler::{self, InboundMessage};
 use crate::health::ChannelHealthRegistry;
@@ -259,9 +259,9 @@ pub async fn dispatch_webhook(
                             }
                             Err(_) => {
                                 tracing::warn!("{channel_name} agent timed out");
-                                borg_core::error_format::format_error_with_context(
+                                cortex::error_format::format_error_with_context(
                                     "request timed out",
-                                    borg_core::error_format::ErrorContext::Gateway,
+                                    cortex::error_format::ErrorContext::Gateway,
                                 )
                             }
                         };
@@ -285,7 +285,7 @@ pub async fn dispatch_webhook(
                             Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).ok();
 
                         if let Some(ref db) = db {
-                            let new_delivery = borg_core::db::NewDelivery {
+                            let new_delivery = cortex::db::NewDelivery {
                                 id: &delivery_id,
                                 channel_name: &channel_name,
                                 sender_id: &inbound.sender_id,

@@ -13,16 +13,16 @@ categories = ["command-line-utilities"]
 [workspace]
 resolver = "2"
 members = [
-    "crates/cli",
-    "crates/core",
+    "crates/interface",
+    "crates/cortex",
     "crates/heartbeat",
     "crates/sandbox",
-    "crates/apply-patch",
+    "crates/coding",
     "crates/gateway",
     "crates/plugins",
-    "crates/borg-proto",
+    "crates/protocols",
     "crates/borgd",
-    "crates/borg-pki",
+    "crates/identity",
 ]
 
 [workspace.dependencies]
