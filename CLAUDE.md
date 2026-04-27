@@ -27,6 +27,12 @@ cargo fmt --check
 cargo clippy -- -D warnings
 ```
 
+**Run tests once.** `tee` to a log, then grep/tail it — don't re-run for each view. Skip `--no-run` pre-compiles. Use `--lib --bins` for feedback; full `--workspace` only for ship checks.
+
+```sh
+cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
+```
+
 Binary: `borg`. Requires one of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, a running Ollama instance, or Claude Code CLI at runtime.
 
 Coverage: `just coverage` (HTML) / `just coverage-summary` (text). Target 80%+.
