@@ -109,6 +109,7 @@ message AgentEvent {
     TurnComplete turn_complete = 22;
     HistoryCompacted history_compacted = 23;
     ErrorEvent error = 24;
+    SystemNotice system_notice = 25;
   }
 }
 
@@ -148,6 +149,12 @@ message HistoryCompacted {
   bool iterative = 4;
 }
 message ErrorEvent { string message = 1; }
+// Out-of-band notice from the daemon (posture transitions, budget alerts, …)
+// — not part of the LLM stream; clients render as a system cell / toast.
+message SystemNotice {
+  string category = 1; // e.g. "posture", "budget"
+  string text = 2;
+}
 
 // ── Agent-control messages ──────────────────────────────────────────────
 

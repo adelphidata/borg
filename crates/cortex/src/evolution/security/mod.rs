@@ -23,6 +23,37 @@ pub use emit::{current_posture, maybe_emit_posture_change, EmitOutcome};
 pub use resolver::{is_boosted, is_reduced, resolve_state};
 pub use snapshot::compute_live_snapshot;
 
+use crate::db::Database;
+
+/// Read the head of `posture_snapshots` for write-time XP multiplier
+/// resolution. Returns `(state, posture_event_seq, fallback)` — the seq is
+/// the `evolution_event_id` (audit_log_chain.seq in v1) of the
+/// `security_posture_changed` row that established this state.
+///
+/// On a fresh DB with no posture row yet, returns
+/// `(Default, 0, Some(PostureUndetermined))` so `xp_gain` writes still pass
+/// through `compute_xp_breakdown` and surface the fallback in their
+/// `XpBreakdown` for `borg doctor` escalation.
+pub fn current_posture_for_xp(db: &Database) -> (PostureState, i64, Option<FallbackReason>) {
+    let row: Option<(String, i64)> = db
+        .conn()
+        .query_row(
+            "SELECT posture, evolution_event_id FROM posture_snapshots
+             ORDER BY taken_at DESC, id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+    match row.and_then(|(s, seq)| PostureState::parse(&s).map(|p| (p, seq))) {
+        Some((state, seq)) => (state, seq, None),
+        None => (
+            PostureState::Default,
+            0,
+            Some(FallbackReason::PostureUndetermined),
+        ),
+    }
+}
+
 /// Per-event XP cap. Stays at 3 in v1; v3's 5-bucket ladder may raise it
 /// under `Hardened`. Mirrored from `evolution::MAX_XP_DELTA` so resolver
 /// tests can reference it without pulling the whole module.

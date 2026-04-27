@@ -43,12 +43,20 @@ pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) ->
     };
 
     let aligned = matches!((archetype, dominant), (Some(a), Some(b)) if a == b);
-    let xp = BASE_XP_PLAN + if aligned { BONUS_XP_PLAN_ALIGNED } else { 0 };
+    let align_bonus = if aligned { BONUS_XP_PLAN_ALIGNED } else { 0 };
 
-    let metadata = build_metadata(session_id, archetype);
+    let (state, posture_seq, fallback) = super::security::current_posture_for_xp(db);
+    let breakdown = super::security::compute_xp_breakdown(
+        BASE_XP_PLAN as u32,
+        align_bonus as u32,
+        state,
+        posture_seq,
+        fallback,
+    );
+    let metadata = build_metadata(session_id, archetype, &breakdown, posture_seq);
     db.record_evolution_event_with_session(
         "xp_gain",
-        xp,
+        breakdown.final_xp as i32,
         archetype.map(|a| a.to_string()).as_deref(),
         "plan_emission",
         Some(&metadata),
@@ -76,7 +84,12 @@ fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
     Ok(existing != 0)
 }
 
-fn build_metadata(session_id: &str, archetype: Option<Archetype>) -> String {
+fn build_metadata(
+    session_id: &str,
+    archetype: Option<Archetype>,
+    breakdown: &super::security::XpBreakdown,
+    posture_seq: i64,
+) -> String {
     let mut obj = serde_json::Map::new();
     obj.insert(
         "session_id".to_string(),
@@ -88,6 +101,14 @@ fn build_metadata(session_id: &str, archetype: Option<Archetype>) -> String {
             serde_json::Value::String(a.to_string()),
         );
     }
+    obj.insert(
+        "xp_breakdown".to_string(),
+        serde_json::to_value(breakdown).unwrap_or(serde_json::Value::Null),
+    );
+    obj.insert(
+        "posture_event_seq".to_string(),
+        serde_json::Value::Number(posture_seq.into()),
+    );
     serde_json::Value::Object(obj).to_string()
 }
 
@@ -151,6 +172,47 @@ mod tests {
         assert_eq!(event.archetype.as_deref(), Some("ops"));
         // No prior dominant archetype on a fresh DB → base XP only, no aligned bonus.
         assert_eq!(event.xp_delta, BASE_XP_PLAN);
+    }
+
+    #[test]
+    fn plan_emission_applies_posture_multiplier_to_xp() {
+        // Real failure mode: plan emission writes raw XP bypassing the
+        // posture multiplier — boosted installs would lose the gameplay
+        // reward, and the audit-chain replay would disagree with the
+        // stored `xp_delta`.
+        let db = Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // Seed Reduced posture so 2 × 0.85 = 1.70 → round_half_up → 2.
+        // (Stored final_xp clamps to floor=1 if pre_clamp had been < 1.)
+        let seq = db
+            .append_audit_event(
+                "security_posture_changed",
+                r#"{"state":"Reduced"}"#,
+                "system",
+                now,
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO posture_snapshots
+                 (evolution_event_id, taken_at, posture, source, schema_version)
+                 VALUES (?1, ?2, 'Reduced', 'ConfigChange', 1)",
+                rusqlite::params![seq, now],
+            )
+            .unwrap();
+
+        record_plan_emission(&db, "sess-reduced", "deploy kubernetes pod").unwrap();
+        let events = db.load_all_evolution_events().unwrap();
+        let xp = events
+            .iter()
+            .find(|e| e.source == "plan_emission")
+            .expect("plan_emission row");
+        // Base 2, no alignment → 2 × 0.85 = 1.7 → round to 2.
+        assert_eq!(xp.xp_delta, 2);
+        let meta: serde_json::Value =
+            serde_json::from_str(xp.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["xp_breakdown"]["state"], "Reduced");
+        assert_eq!(meta["posture_event_seq"].as_i64(), Some(seq));
     }
 
     #[test]

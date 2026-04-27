@@ -109,6 +109,14 @@ impl<'a> App<'a> {
                     "Compacted {dropped} messages ({mode} summary, saved ~{saved} tokens)"
                 ));
             }
+            AgentEvent::SystemNotice { category, text } => {
+                // Daemon-emitted out-of-band notices (posture transitions,
+                // budget alerts). Render as a system cell so the user sees
+                // them between turns. `category` is informational only — the
+                // text already describes what happened.
+                let _ = category;
+                self.push_system_message(text);
+            }
         }
     }
 

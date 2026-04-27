@@ -103,6 +103,9 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
             iterative,
         }),
         CoreEvent::Error(message) => Kind::Error(pb::ErrorEvent { message }),
+        CoreEvent::SystemNotice { category, text } => {
+            Kind::SystemNotice(pb::SystemNotice { category, text })
+        }
     };
     pb::AgentEvent {
         event_seq: 0, // assigned by SequencedBuffer::push
@@ -169,6 +172,10 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             iterative: h.iterative,
         },
         Kind::Error(e) => CoreEvent::Error(e.message),
+        Kind::SystemNotice(s) => CoreEvent::SystemNotice {
+            category: s.category,
+            text: s.text,
+        },
         Kind::ShellConfirmation(sc) => {
             tracing::warn!(prompt_id = %sc.prompt_id, command = %sc.command,
                 "from_proto: dropping ShellConfirmation");

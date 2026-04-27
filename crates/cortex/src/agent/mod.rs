@@ -189,6 +189,15 @@ pub enum AgentEvent {
     },
     /// An error occurred during the agent turn.
     Error(String),
+    /// Out-of-band notice from the daemon — not part of the LLM stream.
+    /// Clients render this as a system cell / toast (e.g. posture transitions).
+    SystemNotice {
+        /// Free-form category tag (`"posture"`, `"budget"`, …) used by clients
+        /// to route or style the notice.
+        category: String,
+        /// User-facing text.
+        text: String,
+    },
 }
 
 /// Returns true if the agent should retry the LLM call because it returned

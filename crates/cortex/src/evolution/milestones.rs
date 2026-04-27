@@ -10,6 +10,7 @@
 
 use std::collections::HashSet;
 
+use super::security::PostureState;
 use super::{Archetype, EvolutionEvent, EvolutionState, Stage};
 
 /// Consecutive-day streak threshold for `aligned_streak_7d`.
@@ -53,6 +54,7 @@ pub fn check_milestones(
     bond_next: u8,
     events: &[EvolutionEvent],
     now: i64,
+    current_posture: Option<PostureState>,
 ) -> Vec<Milestone> {
     let already_unlocked = collect_unlocked_ids(events);
     let mut out = Vec::new();
@@ -126,6 +128,19 @@ pub fn check_milestones(
                 });
             }
         }
+    }
+
+    // First time live posture observed at Boosted. One-shot: only fires once
+    // per install, regardless of how often the operator flips between Boosted
+    // and the other states afterward.
+    if matches!(current_posture, Some(PostureState::Boosted))
+        && !already_unlocked.contains("posture_boosted_first")
+    {
+        out.push(Milestone {
+            id: "posture_boosted_first".to_string(),
+            title: "Boosted Posture".to_string(),
+            archetype: next.dominant_archetype,
+        });
     }
 
     // Aligned streak: 7 consecutive UTC days with ≥1 xp_gain event aligned
@@ -287,7 +302,7 @@ mod tests {
     fn level_threshold_fires_on_crossing() {
         let prev = state(Stage::Base, 9, None);
         let next = state(Stage::Base, 10, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "level_10_base");
     }
@@ -296,7 +311,7 @@ mod tests {
     fn level_threshold_includes_stage_in_id() {
         let prev = state(Stage::Evolved, 24, None);
         let next = state(Stage::Evolved, 25, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "level_25_evolved");
     }
@@ -306,7 +321,7 @@ mod tests {
         // Stage transition resets level to 0 — do not fire level milestones.
         let prev = state(Stage::Base, 99, None);
         let next = state(Stage::Evolved, 0, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         // Only `first_evolution` fires here, not a level row.
         assert!(out.iter().all(|m| !m.id.starts_with("level_")));
     }
@@ -315,7 +330,7 @@ mod tests {
     fn first_evolution_fires_on_base_to_evolved() {
         let prev = state(Stage::Base, 99, None);
         let next = state(Stage::Evolved, 0, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert!(out.iter().any(|m| m.id == "first_evolution"));
     }
 
@@ -323,7 +338,7 @@ mod tests {
     fn first_strong_bond_fires_once() {
         let prev = state(Stage::Base, 0, None);
         let next = state(Stage::Base, 0, None);
-        let out = check_milestones(&prev, &next, 54, 55, &[], 0);
+        let out = check_milestones(&prev, &next, 54, 55, &[], 0, None);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "first_strong_bond");
 
@@ -332,7 +347,7 @@ mod tests {
             "milestone_unlocked",
             Some(r#"{"milestone_id":"first_strong_bond"}"#),
         )];
-        let out2 = check_milestones(&prev, &next, 54, 55, &prior, 0);
+        let out2 = check_milestones(&prev, &next, 54, 55, &prior, 0, None);
         assert!(out2.iter().all(|m| m.id != "first_strong_bond"));
     }
 
@@ -343,7 +358,7 @@ mod tests {
         // Last shift 8 days ago → fires.
         next.dominant_history
             .push((now - 8 * 86_400, Archetype::Ops));
-        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &[], now);
+        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &[], now, None);
         assert!(out.iter().any(|m| m.id == "archetype_stabilized"));
     }
 
@@ -352,7 +367,7 @@ mod tests {
         let mut next = state(Stage::Base, 10, Some(Archetype::Ops));
         let now = 10 * 86_400;
         next.dominant_history.push((now - 86_400, Archetype::Ops));
-        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &[], now);
+        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &[], now, None);
         assert!(out.iter().all(|m| m.id != "archetype_stabilized"));
     }
 
@@ -364,7 +379,15 @@ mod tests {
         for d in 0..7 {
             events.push(xp(Archetype::Ops, now - d * 86_400));
         }
-        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &events, now);
+        let out = check_milestones(
+            &state(Stage::Base, 10, None),
+            &next,
+            0,
+            0,
+            &events,
+            now,
+            None,
+        );
         assert!(out.iter().any(|m| m.id == "aligned_streak_7d"));
     }
 
@@ -380,7 +403,15 @@ mod tests {
             }
             events.push(xp(Archetype::Ops, now - d * 86_400));
         }
-        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &events, now);
+        let out = check_milestones(
+            &state(Stage::Base, 10, None),
+            &next,
+            0,
+            0,
+            &events,
+            now,
+            None,
+        );
         assert!(out.iter().all(|m| m.id != "aligned_streak_7d"));
     }
 
@@ -391,7 +422,7 @@ mod tests {
         // per threshold, in threshold order.
         let prev = state(Stage::Base, 9, None);
         let next = state(Stage::Base, 26, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         assert!(
             ids.contains(&"level_10_base"),
@@ -418,7 +449,15 @@ mod tests {
         for d in 1..=7 {
             events.push(xp(Archetype::Ops, now - d * 86_400));
         }
-        let out = check_milestones(&state(Stage::Base, 10, None), &next, 0, 0, &events, now);
+        let out = check_milestones(
+            &state(Stage::Base, 10, None),
+            &next,
+            0,
+            0,
+            &events,
+            now,
+            None,
+        );
         assert!(
             out.iter().all(|m| m.id != "aligned_streak_7d"),
             "streak should not fire without today's aligned XP; got {out:?}"
@@ -429,7 +468,7 @@ mod tests {
     fn post_99_milestone_fires_at_125_in_final() {
         let prev = state(Stage::Final, 124, None);
         let next = state(Stage::Final, 125, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert!(
             out.iter().any(|m| m.id == "level_125_final"),
             "expected level_125_final, got {out:?}",
@@ -441,7 +480,7 @@ mod tests {
         // Crossing Lvl.99→100 is not a milestone — only multiples of 25 past 99.
         let prev = state(Stage::Final, 99, None);
         let next = state(Stage::Final, 100, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert!(
             out.iter().all(|m| !m.id.starts_with("level_") || m.id == "level_99_final"
                 /* not crossing the 99 boundary either, but excluded for clarity */),
@@ -455,7 +494,7 @@ mod tests {
         // even if the call signature theoretically allows it.
         let prev = state(Stage::Evolved, 99, None);
         let next = state(Stage::Evolved, 125, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert!(out.iter().all(|m| m.id != "level_125_final"));
     }
 
@@ -465,7 +504,7 @@ mod tests {
         // strides in one call. Each must fire.
         let prev = state(Stage::Final, 100, None);
         let next = state(Stage::Final, 175, None);
-        let out = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"level_125_final"), "{ids:?}");
         assert!(ids.contains(&"level_150_final"), "{ids:?}");
@@ -476,14 +515,50 @@ mod tests {
     fn idempotent_on_repeated_calls() {
         let prev = state(Stage::Base, 9, None);
         let next = state(Stage::Base, 10, None);
-        let first = check_milestones(&prev, &next, 0, 0, &[], 0);
+        let first = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         assert_eq!(first.len(), 1);
 
         // Feed the emitted milestone back in as an event and check that the
         // second call skips it.
         let meta = format!(r#"{{"milestone_id":"{}"}}"#, first[0].id);
         let events = vec![ev("milestone_unlocked", Some(&meta))];
-        let second = check_milestones(&prev, &next, 0, 0, &events, 0);
+        let second = check_milestones(&prev, &next, 0, 0, &events, 0, None);
         assert!(second.iter().all(|m| m.id != "level_10_base"));
+    }
+
+    #[test]
+    fn posture_boosted_first_fires_once_then_dedups() {
+        // Real failure mode: emitting the milestone every time the operator
+        // toggles to Boosted would trivialize the celebration. Dedup must
+        // honor the prior `milestone_unlocked` row.
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let first = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Boosted));
+        assert!(
+            first.iter().any(|m| m.id == "posture_boosted_first"),
+            "first Boosted observation should fire the milestone"
+        );
+
+        let prior = vec![ev(
+            "milestone_unlocked",
+            Some(r#"{"milestone_id":"posture_boosted_first"}"#),
+        )];
+        let again = check_milestones(&prev, &next, 0, 0, &prior, 0, Some(PostureState::Boosted));
+        assert!(
+            again.iter().all(|m| m.id != "posture_boosted_first"),
+            "milestone must not re-fire once already unlocked"
+        );
+    }
+
+    #[test]
+    fn posture_boosted_first_does_not_fire_on_default_or_reduced() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let out_default = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Default));
+        let out_reduced = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Reduced));
+        let out_none = check_milestones(&prev, &next, 0, 0, &[], 0, None);
+        for set in [out_default, out_reduced, out_none] {
+            assert!(set.iter().all(|m| m.id != "posture_boosted_first"));
+        }
     }
 }

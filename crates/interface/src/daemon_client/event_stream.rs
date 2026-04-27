@@ -201,6 +201,10 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
             iterative: h.iterative,
         },
         Kind::Error(e) => CoreEvent::Error(e.message),
+        Kind::SystemNotice(n) => CoreEvent::SystemNotice {
+            category: n.category,
+            text: n.text,
+        },
     })
 }
 

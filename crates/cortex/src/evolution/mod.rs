@@ -602,6 +602,26 @@ fn snapshot_evolution_and_bond(db: &Database) -> (Option<EvolutionState>, u8) {
     (evo, bond.score)
 }
 
+/// Apply the live posture multiplier to a base+align XP grant and produce
+/// the metadata payload for `evolution_events.metadata_json`.
+///
+/// Read-then-write is racy under concurrent posture transitions, but the
+/// emitted `XpBreakdown` records both the resolved state and its
+/// `posture_event_seq`, so replay can re-derive the same `final_xp`
+/// deterministically from the chain.
+pub(crate) fn build_posture_aware_xp(db: &Database, base: i32, align_bonus: i32) -> (i32, String) {
+    let base_u = base.max(0) as u32;
+    let align_u = align_bonus.max(0) as u32;
+    let (state, posture_seq, fallback) = security::current_posture_for_xp(db);
+    let breakdown = security::compute_xp_breakdown(base_u, align_u, state, posture_seq, fallback);
+    let metadata = serde_json::json!({
+        "xp_breakdown": breakdown,
+        "posture_event_seq": posture_seq,
+    })
+    .to_string();
+    (breakdown.final_xp as i32, metadata)
+}
+
 /// Persist a single milestone: a `level_up` row (for level thresholds), a
 /// `milestone_unlocked` row, and the paired `pending_celebration`.
 fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
@@ -716,7 +736,7 @@ impl EvolutionHook {
         }
     }
 
-    fn record_xp(&self, source: &str, archetype: Option<Archetype>, xp: i32) {
+    fn record_xp(&self, source: &str, archetype: Option<Archetype>, base: i32, align_bonus: i32) {
         let Ok(db) = self.db.lock() else {
             tracing::warn!("evolution: mutex poisoned, skipping event");
             return;
@@ -726,8 +746,14 @@ impl EvolutionHook {
         let (prev_evo, prev_bond) = snapshot_evolution_and_bond(&db);
 
         let arch_str = archetype.map(|a| a.to_string());
-        if let Err(e) = db.record_evolution_event("xp_gain", xp, arch_str.as_deref(), source, None)
-        {
+        let (final_xp, metadata) = build_posture_aware_xp(&db, base, align_bonus);
+        if let Err(e) = db.record_evolution_event(
+            "xp_gain",
+            final_xp,
+            arch_str.as_deref(),
+            source,
+            Some(&metadata),
+        ) {
             tracing::warn!("evolution: failed to record XP event: {e}");
             return;
         }
@@ -762,7 +788,24 @@ impl EvolutionHook {
             }
         };
         let now = chrono::Utc::now().timestamp();
-        let unlocked = check_milestones(prev, next, bond_prev, bond_next, &events, now);
+        let (current_posture_state, _, fallback) = security::current_posture_for_xp(db);
+        // Suppress posture-derived milestones when no posture event exists yet
+        // (fresh DB) — `current_posture_for_xp` falls back to `Default` for XP
+        // math, but milestones must wait until live posture is real.
+        let posture_for_milestones = if fallback.is_some() {
+            None
+        } else {
+            Some(current_posture_state)
+        };
+        let unlocked = check_milestones(
+            prev,
+            next,
+            bond_prev,
+            bond_next,
+            &events,
+            now,
+            posture_for_milestones,
+        );
         for milestone in unlocked {
             emit_milestone(db, &milestone, next);
         }
@@ -1038,7 +1081,7 @@ impl Hook for EvolutionHook {
         match &ctx.data {
             HookData::SessionStart { .. } => {
                 // Record interaction XP
-                self.record_xp("session_start", None, BASE_XP_INTERACTION);
+                self.record_xp("session_start", None, BASE_XP_INTERACTION, 0);
             }
             HookData::AgentStart { .. } | HookData::LlmCall { .. } => {
                 // No-op: see `points()` for why per-turn injection was removed.
@@ -1055,24 +1098,24 @@ impl Hook for EvolutionHook {
                         name.as_str(),
                         "apply_patch" | "apply_skill_patch" | "create_channel" | "write_memory"
                     );
-                    let xp = if is_creation {
+                    let (base, align_bonus) = if is_creation {
                         let bonus = if archetype.is_some() {
                             BONUS_XP_CREATION_ALIGNED
                         } else {
                             0
                         };
-                        BASE_XP_CREATION + bonus
+                        (BASE_XP_CREATION, bonus)
                     } else {
                         let bonus = if archetype.is_some() {
                             BONUS_XP_ALIGNED
                         } else {
                             0
                         };
-                        BASE_XP_TOOL_SUCCESS + bonus
+                        (BASE_XP_TOOL_SUCCESS, bonus)
                     };
 
                     let mood_before = self.snapshot_mood();
-                    self.record_xp(name, archetype, xp);
+                    self.record_xp(name, archetype, base, align_bonus);
 
                     if let Some(before) = mood_before {
                         if let Some(after) = self.snapshot_mood() {
@@ -4058,5 +4101,107 @@ mod tests {
             "mixed HMAC + Ed25519 chain must verify end-to-end"
         );
         assert_eq!(state.total_events, 2);
+    }
+
+    // ── Posture multiplier wiring (Task 05) ──
+
+    /// Seed a `posture_snapshots` head row + matching audit-chain event so
+    /// `current_posture_for_xp` resolves to the requested state with a real
+    /// `posture_event_seq`.
+    #[cfg(test)]
+    fn seed_posture(db: &Database, state: &str) -> i64 {
+        let now = chrono::Utc::now().timestamp();
+        let seq = db
+            .append_audit_event(
+                "security_posture_changed",
+                &format!(r#"{{"state":"{state}"}}"#),
+                "system",
+                now,
+            )
+            .expect("append audit");
+        db.conn()
+            .execute(
+                "INSERT INTO posture_snapshots
+                 (evolution_event_id, taken_at, posture, source, schema_version)
+                 VALUES (?1, ?2, ?3, 'ConfigChange', 1)",
+                rusqlite::params![seq, now, state],
+            )
+            .expect("insert posture row");
+        seq
+    }
+
+    /// Record_xp under Boosted multiplies (base + align) × 1.10 and stores
+    /// the breakdown in metadata_json. Real failure mode: forgetting to
+    /// thread the multiplier means high-posture installs accrue XP at the
+    /// same rate as `Default` and the gameplay reward for tightening
+    /// security disappears.
+    #[test]
+    fn xp_gain_applies_boosted_multiplier_and_persists_breakdown() {
+        let db = Database::test_db();
+        let posture_seq = seed_posture(&db, "Boosted");
+        let hook = EvolutionHook::new_with(db, true);
+
+        // base=2, align=0 → 2 × 1.10 = 2.20 → round_half_up = 2.
+        hook.record_xp("apply_patch", None, 2, 0);
+
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        let xp = events
+            .iter()
+            .find(|e| e.event_type == "xp_gain")
+            .expect("xp_gain row");
+        assert_eq!(xp.xp_delta, 2, "Boosted ×1.10 of 2 rounds to 2");
+
+        let meta: serde_json::Value =
+            serde_json::from_str(xp.metadata_json.as_deref().unwrap()).expect("parse metadata");
+        let breakdown = meta.get("xp_breakdown").expect("xp_breakdown present");
+        assert_eq!(breakdown["state"], "Boosted");
+        assert!((breakdown["state_multiplier"].as_f64().unwrap() - 1.10).abs() < 1e-5);
+        assert_eq!(breakdown["final_xp"].as_i64().unwrap(), 2);
+        assert_eq!(
+            meta.get("posture_event_seq").and_then(|v| v.as_i64()),
+            Some(posture_seq),
+            "metadata must cross-reference the posture audit seq"
+        );
+    }
+
+    /// Boosted at the per-event ceiling clamps at 3 instead of leaking to
+    /// 3 × 1.10 = 3.3. Regression target: dropping the clamp would silently
+    /// raise the per-event XP cap.
+    #[test]
+    fn xp_gain_clamps_after_boosted_multiplier() {
+        let db = Database::test_db();
+        seed_posture(&db, "Boosted");
+        let hook = EvolutionHook::new_with(db, true);
+        // base=2, align=1 → 3 × 1.10 = 3.30 → clamp to MAX_XP_DELTA (3).
+        hook.record_xp("apply_patch", Some(Archetype::Builder), 2, 1);
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        let xp = events
+            .iter()
+            .find(|e| e.event_type == "xp_gain")
+            .expect("xp_gain row");
+        assert_eq!(xp.xp_delta, MAX_XP_DELTA);
+    }
+
+    /// On a fresh DB with no posture snapshot, `record_xp` falls back to
+    /// `Default × 1.00` and stamps `PostureUndetermined` so the doctor sweep
+    /// can escalate persistent fallbacks.
+    #[test]
+    fn xp_gain_fallback_when_no_posture_snapshot() {
+        let db = Database::test_db();
+        let hook = EvolutionHook::new_with(db, true);
+        hook.record_xp("apply_patch", None, 2, 0);
+        let events = hook.db.lock().unwrap().load_all_evolution_events().unwrap();
+        let xp = events
+            .iter()
+            .find(|e| e.event_type == "xp_gain")
+            .expect("xp_gain row");
+        assert_eq!(
+            xp.xp_delta, 2,
+            "Default identity passes 2 through unchanged"
+        );
+        let meta: serde_json::Value =
+            serde_json::from_str(xp.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(meta["xp_breakdown"]["fallback"], "PostureUndetermined");
+        assert_eq!(meta["posture_event_seq"].as_i64(), Some(0));
     }
 }

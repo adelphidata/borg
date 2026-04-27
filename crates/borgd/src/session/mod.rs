@@ -98,6 +98,22 @@ impl SessionHost {
         self.inner.buffer.subscribe()
     }
 
+    /// Push an out-of-band [`SystemNotice`](protocols::session::SystemNotice)
+    /// event into the session's buffer so live subscribers and replayers see
+    /// it as a system cell. Used by daemon-level emitters (posture
+    /// transitions, budget alerts) that aren't part of any LLM turn.
+    pub fn push_system_notice(&self, category: impl Into<String>, text: impl Into<String>) -> u64 {
+        use protocols::session as pb;
+        let evt = pb::AgentEvent {
+            event_seq: 0,
+            kind: Some(pb::agent_event::Kind::SystemNotice(pb::SystemNotice {
+                category: category.into(),
+                text: text.into(),
+            })),
+        };
+        self.inner.buffer.push(evt)
+    }
+
     /// Route a `RespondToPrompt` reply through the prompt registry.
     pub fn respond_to_prompt(&self, prompt_id: &str, value: &str) -> Result<()> {
         self.inner
@@ -280,6 +296,25 @@ impl SessionRegistry {
         }
     }
 
+    /// Broadcast a system notice to every live session. Caller is responsible
+    /// for the rate limit on the upstream emitter (posture: 2/hr at the audit
+    /// chain layer); this method is unconditional and synchronous. Returns
+    /// the number of sessions that received the notice.
+    pub fn broadcast_system_notice(&self, category: &str, text: &str) -> usize {
+        let hosts: Vec<SessionHost> = {
+            let guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.values().cloned().collect()
+        };
+        let n = hosts.len();
+        for h in hosts {
+            h.push_system_notice(category, text);
+        }
+        n
+    }
+
     /// Snapshot of live session ids — used by `Admin.ListSessions` for the
     /// in-memory view (DB-persisted sessions are listed separately).
     pub fn live_ids(&self) -> Vec<String> {
@@ -455,5 +490,37 @@ mod tests {
         let seqs_b: Vec<u64> = b.iter().map(|e| e.event_seq).collect();
         assert_eq!(seqs_a, seqs_b);
         assert!(seqs_a.len() >= 3); // 2 deltas + TurnComplete
+    }
+
+    #[tokio::test]
+    async fn registry_broadcast_system_notice_reaches_every_live_session() {
+        // Real failure mode: posture transition fires in the audit chain but
+        // open clients never see the toast — UX promise broken.
+        let registry = SessionRegistry::new();
+        let host_a = SessionHost::new(stub("s-a", &[], 1));
+        let host_b = SessionHost::new(stub("s-b", &[], 1));
+        let mut rx_a = host_a.subscribe();
+        let mut rx_b = host_b.subscribe();
+        registry.insert(host_a);
+        registry.insert(host_b);
+
+        let n =
+            registry.broadcast_system_notice("posture", "Default \u{2192} Boosted (\u{00d7}1.10)");
+        assert_eq!(n, 2, "broadcast must reach every live session");
+
+        for rx in [&mut rx_a, &mut rx_b] {
+            let evt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("notice timeout")
+                .expect("recv");
+            match evt.kind.expect("kind") {
+                Kind::SystemNotice(n) => {
+                    assert_eq!(n.category, "posture");
+                    assert!(n.text.contains("Boosted"), "text: {}", n.text);
+                }
+                other => panic!("expected SystemNotice, got {other:?}"),
+            }
+            assert!(evt.event_seq > 0, "system notice must be sequenced");
+        }
     }
 }

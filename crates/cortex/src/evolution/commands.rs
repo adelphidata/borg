@@ -14,6 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use super::security::{current_posture_for_xp, PostureState};
 use super::{
     compute_mood, compute_readiness, format_evolution_overview, format_next_step_hints,
     format_xp_feed, format_xp_summary, next_step_hints, recent_xp_feed, render_ascii_card,
@@ -120,6 +121,8 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             let hints = next_step_hints(&state, &vitals_state, &bond_state);
 
             let mut text = format_evolution_overview(&state);
+            text.push('\n');
+            text.push_str(&format_posture_line(db));
             if !hints.is_empty() {
                 text.push('\n');
                 text.push_str(&format_next_step_hints(&hints));
@@ -135,6 +138,7 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             let summary = xp_summary(&events, now);
             let feed = recent_xp_feed(&events, 10);
             let mut text = String::new();
+            text.push_str(&format_posture_line(db));
             text.push_str(&format_xp_summary(&summary));
             text.push('\n');
             text.push_str(&format_xp_feed(&feed));
@@ -184,6 +188,28 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             })
         }
     }
+}
+
+/// One-line posture readout for `/evolution` and `/xp` headers.
+///
+/// Renders the head of `posture_snapshots`. `Default × 1.00` shows up
+/// verbatim on a fresh DB so the line is informative rather than missing.
+fn format_posture_line(db: &Database) -> String {
+    let (state, _seq, fallback) = current_posture_for_xp(db);
+    let label = match state {
+        PostureState::Reduced => "Reduced",
+        PostureState::Default => "Default",
+        PostureState::Boosted => "Boosted",
+    };
+    let suffix = if fallback.is_some() {
+        " (no posture event recorded yet)"
+    } else {
+        ""
+    };
+    format!(
+        "Posture: {label} ×{mult:.2}{suffix}\n",
+        mult = state.xp_multiplier()
+    )
 }
 
 // ── Tests ──
@@ -338,6 +364,52 @@ mod tests {
             "card should not render em-dash mood when state is derivable: {}",
             out.text
         );
+    }
+
+    #[test]
+    fn evolution_command_renders_posture_line_with_boosted_state() {
+        // Real failure mode: posture surface drift — the daemon ships
+        // posture changes via the audit chain but the human-facing surface
+        // never reads them, so users can't tell what multiplier is active.
+        let db = Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        let seq = db
+            .append_audit_event(
+                "security_posture_changed",
+                r#"{"state":"Boosted"}"#,
+                "system",
+                now,
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO posture_snapshots
+                 (evolution_event_id, taken_at, posture, source, schema_version)
+                 VALUES (?1, ?2, 'Boosted', 'ListenerBind', 1)",
+                rusqlite::params![seq, now],
+            )
+            .unwrap();
+        let out = dispatch(EvolutionCommand::Evolution, &db).expect("dispatch");
+        assert!(
+            out.text.contains("Posture: Boosted"),
+            "missing posture line: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("\u{00d7}1.10"),
+            "missing multiplier: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn xp_command_renders_posture_header_default_on_fresh_db() {
+        // Fallback path: fresh DB has no posture row, but `/xp` should still
+        // render a posture header (Default × 1.00) — no missing surface.
+        let db = Database::test_db();
+        let out = dispatch(EvolutionCommand::Xp, &db).expect("dispatch");
+        assert!(out.text.contains("Posture: Default"));
+        assert!(out.text.contains("\u{00d7}1.00"));
     }
 
     #[test]

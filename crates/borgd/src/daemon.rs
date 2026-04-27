@@ -182,6 +182,8 @@ pub async fn run(cfg: Config) -> Result<()> {
                 state, previous, ..
             }) => {
                 tracing::info!("posture reconcile: {previous:?} → {state:?} on daemon start");
+                let text = format_posture_transition(previous, state);
+                registry.broadcast_system_notice("posture", &text);
             }
             Ok(_) => {} // Unchanged or RateLimited — quiet success.
             Err(e) => tracing::warn!("posture reconcile on startup failed: {e}"),
@@ -263,6 +265,21 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// Install SIGTERM and SIGINT handlers; broadcast on either. If a handler
 /// can't be installed we log and continue with whichever one we got — the
 /// daemon is never left un-killable.
+/// Format a posture transition for a `system_notice` toast. Pulled out so
+/// runtime triggers (config change / listener bind) can reuse the exact
+/// wording — the daemon-startup site is the only caller today.
+pub(crate) fn format_posture_transition(
+    previous: Option<cortex::evolution::security::PostureState>,
+    next: cortex::evolution::security::PostureState,
+) -> String {
+    let prev_label = previous.map(|p| p.as_str()).unwrap_or("—");
+    format!(
+        "Posture: {prev_label} → {next_label} (×{mult:.2})",
+        next_label = next.as_str(),
+        mult = next.xp_multiplier()
+    )
+}
+
 async fn forward_signals_to(tx: broadcast::Sender<()>) {
     let term = signal(SignalKind::terminate())
         .map_err(|e| tracing::warn!(error = %e, "failed to install SIGTERM handler"))
@@ -297,8 +314,26 @@ async fn forward_signals_to(tx: broadcast::Sender<()>) {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_uds;
+    use super::{bind_uds, format_posture_transition};
+    use cortex::evolution::security::PostureState;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn posture_transition_toast_text_includes_arrow_and_multiplier() {
+        // Real failure mode: copy drift between the toast and the
+        // `posture_event_seq` it cross-references. The text must name the
+        // landing state and its multiplier so users can correlate the
+        // change with subsequent XP rates.
+        let s = format_posture_transition(Some(PostureState::Default), PostureState::Boosted);
+        assert!(s.contains("Default"));
+        assert!(s.contains("Boosted"));
+        assert!(s.contains("\u{2192}"));
+        assert!(s.contains("\u{00d7}1.10"));
+
+        let bootstrap = format_posture_transition(None, PostureState::Default);
+        assert!(bootstrap.contains("\u{2014}"), "no prior → em-dash");
+        assert!(bootstrap.contains("Default"));
+    }
 
     #[tokio::test]
     async fn bind_uds_sets_owner_only_permissions() {
