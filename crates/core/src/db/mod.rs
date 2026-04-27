@@ -26,7 +26,7 @@ pub use skill_audit::{SkillAuditOutcome, SkillAuditRow};
 pub use vitals::PendingCelebration;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use tracing::instrument;
 
@@ -88,6 +88,39 @@ impl Database {
     /// Used for testing with in-memory databases.
     pub fn from_connection(conn: Connection) -> Result<Self> {
         Self::init_connection(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
+    }
+
+    /// Open the database read-only. Skips migrations and writes — intended
+    /// for read-only consumers (e.g. the cli reading config/settings). The
+    /// single-writer invariant means only `borgd` may use [`open()`](Self::open)
+    /// or [`open_with_timeout()`](Self::open_with_timeout) for writes; CLI
+    /// processes that race the daemon's writer corrupt state.
+    ///
+    /// The connection is opened with `SQLITE_OPEN_READ_ONLY |
+    /// SQLITE_OPEN_NO_MUTEX`; any attempt to mutate via this handle returns
+    /// `SQLITE_READONLY` from rusqlite.
+    #[instrument(skip_all)]
+    pub fn open_readonly() -> Result<Self> {
+        let path = Self::db_path()?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&path, flags)
+            .with_context(|| format!("Failed to open DB read-only at {path:?}"))?;
+        let _: i64 = conn.query_row(
+            &format!("PRAGMA busy_timeout={}", Self::DEFAULT_BUSY_TIMEOUT_MS),
+            [],
+            |row| row.get(0),
+        )?;
+        // Read-only handle: no migrations, no settings seeding, no HMAC salt
+        // initialization (those are writes — they belong to the daemon).
+        // `hmac_salt` stays empty; consumers that need it must go through
+        // the daemon over gRPC.
+        Ok(Self {
+            conn,
+            hmac_salt: Vec::new(),
+            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
+            evolution_signing_key: std::cell::RefCell::new(None),
+            evolution_keystore_override: std::cell::RefCell::new(None),
+        })
     }
 
     /// Restrict DB file to owner-only access on Unix.

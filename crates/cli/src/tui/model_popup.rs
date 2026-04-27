@@ -4,16 +4,19 @@
 //! Overlaps `/settings` deliberately — this is the fast path for "swap my
 //! model" without wading through the full settings popup.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use borg_core::config::Config;
-use borg_core::db::Database;
 
 use crate::api_key_store::{self, ApiKeySaveOutcome};
+use crate::daemon_client::DaemonClient;
 use crate::onboarding::{models_for_provider, PROVIDERS};
 
 use super::app::{AppAction, PopupHandler};
@@ -43,24 +46,19 @@ pub struct ModelPopup {
     /// Index into `PROVIDERS` once the user has picked a provider.
     chosen_provider_idx: Option<usize>,
     status_message: Option<(String, bool)>,
-    db: Option<Database>,
+    /// Daemon client for setting writes. `None` only in unit tests that
+    /// build the popup via direct field access.
+    client: Option<Arc<Mutex<DaemonClient>>>,
 }
 
 impl ModelPopup {
     pub fn new() -> Self {
-        let db = match Database::open() {
-            Ok(db) => Some(db),
-            Err(e) => {
-                tracing::warn!("Model popup: failed to open database: {e}");
-                None
-            }
-        };
         Self {
             visible: false,
             step: Step::PickProvider { cursor: 0 },
             chosen_provider_idx: None,
             status_message: None,
-            db,
+            client: None,
         }
     }
 
@@ -69,10 +67,11 @@ impl ModelPopup {
     }
 
     /// Open the popup, seeding the provider cursor to the current provider.
-    pub fn show(&mut self, config: &Config) {
+    pub fn show(&mut self, config: &Config, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
         self.chosen_provider_idx = None;
         self.status_message = None;
+        self.client = Some(client.clone());
 
         let current_provider = config.llm.provider.as_deref().unwrap_or("openrouter");
         let cursor = PROVIDERS
@@ -254,16 +253,14 @@ impl ModelPopup {
             }
         }
 
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.set_setting("provider", provider_id) {
+        if let Err(e) = self.set_setting_blocking("provider", provider_id) {
+            self.status_message = Some((format!("DB save failed: {e}"), false));
+            return Ok(None);
+        }
+        if let Some(m) = model_id {
+            if let Err(e) = self.set_setting_blocking("model", m) {
                 self.status_message = Some((format!("DB save failed: {e}"), false));
                 return Ok(None);
-            }
-            if let Some(m) = model_id {
-                if let Err(e) = db.set_setting("model", m) {
-                    self.status_message = Some((format!("DB save failed: {e}"), false));
-                    return Ok(None);
-                }
             }
         }
 
@@ -288,18 +285,37 @@ impl ModelPopup {
         Ok(Some(AppAction::ConfigReloaded))
     }
 
+    /// Persist a setting via the daemon. `Ok(())` on success, `Err` if
+    /// either the daemon is unreachable or the write was rejected. Best-effort
+    /// no-op when no client is wired (test paths that exercise persistence
+    /// independently — see `model_pick_without_db_updates_config` which only
+    /// asserts on `Config` mutation, not on DB writes).
+    fn set_setting_blocking(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let Some(client) = self.client.clone() else {
+            return Ok(());
+        };
+        let Some(handle) = tokio::runtime::Handle::try_current().ok() else {
+            return Ok(());
+        };
+        let key = key.to_string();
+        let value = value.to_string();
+        tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                let mut c = client.lock().await;
+                c.set_setting(&key, &value).await
+            })
+        })
+    }
+
     fn save_api_key_and_close(
         &mut self,
         provider_id: &str,
         raw_key: &str,
         config: &mut Config,
     ) -> Result<Option<AppAction>> {
-        let Some(ref db) = self.db else {
-            self.status_message = Some(("Database unavailable".to_string(), false));
-            return Ok(None);
-        };
-
-        match api_key_store::save_api_key(db, config, provider_id, raw_key)? {
+        // `save_api_key` does its own daemon I/O; the first arg is a vestigial
+        // generic placeholder that no longer references the DB.
+        match api_key_store::save_api_key(&(), config, provider_id, raw_key)? {
             ApiKeySaveOutcome::StoredInKeychain => {
                 self.status_message = Some(("API key saved to keychain".to_string(), true));
                 self.dismiss();
@@ -458,14 +474,28 @@ mod tests {
     }
 
     fn make_popup() -> ModelPopup {
-        // Construct without opening a DB so tests can run hermetically.
+        // Construct without a daemon client so tests can run hermetically.
         ModelPopup {
             visible: false,
             step: Step::PickProvider { cursor: 0 },
             chosen_provider_idx: None,
             status_message: None,
-            db: None,
+            client: None,
         }
+    }
+
+    /// Open the popup without a daemon client, mirroring the pre-PR test
+    /// behaviour (set fields manually so we don't pull in tokio).
+    fn open(popup: &mut ModelPopup, cfg: &Config) {
+        popup.visible = true;
+        popup.chosen_provider_idx = None;
+        popup.status_message = None;
+        let current_provider = cfg.llm.provider.as_deref().unwrap_or("openrouter");
+        let cursor = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == current_provider)
+            .unwrap_or(0);
+        popup.step = Step::PickProvider { cursor };
     }
 
     #[test]
@@ -473,7 +503,7 @@ mod tests {
         let mut popup = make_popup();
         let cfg = Config::default();
         assert!(!popup.is_visible());
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         assert!(popup.is_visible());
         popup.dismiss();
         assert!(!popup.is_visible());
@@ -484,7 +514,7 @@ mod tests {
         let mut popup = make_popup();
         let mut cfg = Config::default();
         let original_provider = cfg.llm.provider.clone();
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         popup.handle_key(key(KeyCode::Esc), &mut cfg).unwrap();
         assert!(!popup.is_visible());
         assert_eq!(cfg.llm.provider, original_provider);
@@ -495,7 +525,7 @@ mod tests {
         let mut popup = make_popup();
         let mut cfg = Config::default();
         cfg.llm.provider = Some("anthropic".to_string());
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         let expected_idx = PROVIDERS
             .iter()
             .position(|(id, _, _)| *id == "anthropic")
@@ -510,7 +540,7 @@ mod tests {
     fn pick_provider_advances_to_pick_model() {
         let mut popup = make_popup();
         let mut cfg = Config::default();
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap();
         assert!(matches!(popup.step, Step::PickModel { cursor: 0 }));
         assert!(popup.chosen_provider_idx.is_some());
@@ -520,7 +550,7 @@ mod tests {
     fn provider_navigation_wraps() {
         let mut popup = make_popup();
         let mut cfg = Config::default();
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         // Force cursor to 0
         popup.step = Step::PickProvider { cursor: 0 };
         popup.handle_key(key(KeyCode::Up), &mut cfg).unwrap();
@@ -546,7 +576,7 @@ mod tests {
         // Safety: only the current test process reads this env var.
         unsafe { std::env::set_var("BORG_TEST_FAKE_KEY", "test-token") };
 
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap(); // pick provider
         let provider_id = popup.provider_id().unwrap();
         let expected_model = models_for_provider(provider_id)[0].0.clone();
@@ -575,7 +605,7 @@ mod tests {
             std::env::remove_var("GROQ_API_KEY");
         }
 
-        popup.show(&cfg);
+        open(&mut popup, &cfg);
         // Advance to a provider that requires a key — OpenRouter at index 0.
         popup.step = Step::PickProvider { cursor: 0 };
         popup.handle_key(key(KeyCode::Enter), &mut cfg).unwrap();

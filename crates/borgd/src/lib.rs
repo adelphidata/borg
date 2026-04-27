@@ -10,8 +10,15 @@
 // production code.
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
+pub mod approval_greeting;
+pub mod channel_delivery;
 pub mod daemon;
 pub mod grpc;
+pub mod heartbeat;
+pub mod heartbeat_augmenters;
+pub mod orchestrator;
 pub mod paths;
 pub mod pidlock;
+pub mod scheduler;
 pub mod session;
+pub mod task_runner;

@@ -1,19 +1,26 @@
-//! Save a raw API key to the OS keychain and wire up `llm.api_key` as a
-//! `SecretRef::Exec` that reads it back. Used by the `/settings` popup and
-//! `/model` popup to let users update provider credentials without re-running
-//! onboarding.
+//! Save a raw API key to the OS keychain (or as a literal) and persist the
+//! routing metadata to the daemon so `llm.api_key` resolves it on the next
+//! config reload.
 //!
-//! Mirrors the post-onboarding keychain path in `onboarding.rs` but packaged
-//! as a standalone helper so the TUI callers can invoke it in isolation.
+//! All DB access funnels through admin RPCs (`SetApiKey`/`GetApiKey`/etc.).
+//! The keychain `keyring` calls stay client-side — the daemon never touches
+//! the OS keychain.
+//!
+//! Public function shapes are unchanged from the pre-RPC version so
+//! settings-popup / model-popup callers don't need updates. The first
+//! parameter is now ignored (kept generic so existing callers passing a
+//! `&Database` continue to compile through this transitional stage).
 
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
 
 use borg_core::config::Config;
-use borg_core::db::Database;
 use borg_core::provider::Provider;
 use borg_core::secrets_resolve::SecretRef;
+use borg_proto::admin::{api_key_value::Body as ApiKeyBody, ApiKeyValue, KeychainRef};
+
+use crate::daemon_client;
 
 /// Outcome of attempting to save an API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,16 +62,46 @@ fn build_secret_ref_json(provider_id: &str) -> String {
     }
 }
 
-/// Save `raw_key` to the OS keychain under a stable service name derived from
-/// `provider_id`, then persist a `SecretRef::Exec` pointing at it to both the
-/// database and the live `cfg` so the new key takes effect immediately.
+/// Run `fut` to completion regardless of whether we're already inside a
+/// tokio runtime. `block_in_place` releases the worker thread so the inner
+/// `block_on` can drive other tasks (e.g. the gRPC connector). When called
+/// from a non-runtime thread we fall back to spinning a small current-thread
+/// runtime — necessary for sync test contexts and the rare CLI subcommand
+/// that calls this without `#[tokio::main]`.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => tokio::task::block_in_place(|| h.block_on(fut)),
+        Err(_) => {
+            // No ambient runtime — build a single-threaded one for this call.
+            // If runtime init fails the host is in such a degraded state that
+            // panicking surfaces the real fault faster than swallowing it.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => panic!("api_key_store: failed to spin a tokio runtime: {e}"),
+            };
+            rt.block_on(fut)
+        }
+    }
+}
+
+/// Save `raw_key` for `provider_id`. The keychain write happens locally;
+/// the daemon stores routing metadata so subsequent `Config::load_from_db`
+/// rebuilds `llm.api_key` correctly.
 ///
 /// Returns `EmptyInput` for empty/whitespace-only input without touching any
 /// state. Returns `KeychainUnavailable` when there's no keychain backend on
 /// the host — the caller should surface the env-var fallback hint to the user
 /// rather than persisting the secret anywhere.
-pub fn save_api_key(
-    db: &Database,
+///
+/// The first parameter is generic and ignored; it exists so callers that
+/// still hold a `&Database` reference compile through this transitional
+/// stage. Once those callers move off the DB handle the parameter will be
+/// dropped.
+pub fn save_api_key<D>(
+    _db: &D,
     cfg: &mut Config,
     provider_id: &str,
     raw_key: &str,
@@ -86,8 +123,34 @@ pub fn save_api_key(
     let secret_ref: SecretRef =
         serde_json::from_str(&secret_json).context("Failed to parse generated SecretRef JSON")?;
 
-    db.set_setting("llm.api_key", &secret_json)
-        .context("Failed to persist llm.api_key in database")?;
+    // Persist routing metadata via the daemon. The keychain entry is the
+    // source of truth for the secret; `credentials.{provider}` records WHERE
+    // to read it so other clients (e.g. the daemon itself) can resolve it.
+    // We also write `llm.api_key` so the existing resolver path picks the
+    // new key up on the next config reload without needing a per-provider
+    // lookup change.
+    let provider = provider_id.to_string();
+    let api_key_value = ApiKeyValue {
+        provider,
+        body: Some(ApiKeyBody::Keychain(KeychainRef {
+            service,
+            account: "borg".into(),
+        })),
+    };
+    let llm_api_key_json = secret_json;
+    block_on(async move {
+        let mut client = daemon_client::connect(None)
+            .await
+            .context("connect to borgd for api-key persistence")?;
+        client
+            .set_api_key(api_key_value)
+            .await
+            .context("Admin.SetApiKey failed")?;
+        client
+            .set_setting("llm.api_key", &llm_api_key_json)
+            .await
+            .context("Admin.SetSetting(llm.api_key) failed")
+    })?;
 
     cfg.llm.api_key = Some(secret_ref);
 
@@ -111,16 +174,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_input_returns_empty_outcome() {
-        let db =
-            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).expect("db");
-        let mut cfg = Config::default();
-        let outcome = save_api_key(&db, &mut cfg, "openrouter", "   ").unwrap();
-        assert_eq!(outcome, ApiKeySaveOutcome::EmptyInput);
-        assert!(cfg.llm.api_key.is_none());
-    }
-
-    #[test]
     fn keychain_service_name_format() {
         assert_eq!(keychain_service_name("openrouter"), "borg-openrouter");
         assert_eq!(keychain_service_name("anthropic"), "borg-anthropic");
@@ -141,7 +194,23 @@ mod tests {
         assert!(parsed.is_ok(), "invalid JSON: {json}");
     }
 
+    // The empty-input fast path doesn't need a daemon; it returns before any
+    // RPC. Exercising it here guards against a future refactor that moves
+    // the trim-check after the network call (which would force callers to
+    // run a daemon just to reject empty input).
+    #[test]
+    fn empty_input_returns_empty_outcome_without_rpc() {
+        let mut cfg = Config::default();
+        // Pass `&()` as the unused db handle — the generic parameter accepts
+        // any type, which is the whole point of the transitional shim.
+        let outcome = save_api_key(&(), &mut cfg, "openrouter", "   ").unwrap();
+        assert_eq!(outcome, ApiKeySaveOutcome::EmptyInput);
+        assert!(cfg.llm.api_key.is_none());
+    }
+
     // Keychain round-trip is exercised in `crates/plugins/src/keychain.rs`
     // under `#[cfg(target_os = "macos")]`. We avoid duplicating that here so
-    // this crate's test suite stays platform-agnostic.
+    // this crate's test suite stays platform-agnostic. The daemon RPC paths
+    // (set/get/unset/list) are covered end-to-end in
+    // `crates/borgd/tests/admin_rpc_smoke.rs`.
 }

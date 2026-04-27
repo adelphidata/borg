@@ -790,7 +790,11 @@ mod tests {
     use std::time::Instant;
 
     fn make_app() -> App<'static> {
-        App::new(Config::default(), None, None, None)
+        use crate::daemon_client::DaemonClient;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        App::new(Config::default(), None, None, None, client)
     }
 
     /// Populate the transcript with enough cells so that `total_lines > area.height`,

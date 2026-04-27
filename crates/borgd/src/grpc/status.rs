@@ -8,7 +8,12 @@
 
 use borg_core::config::Config;
 use borg_core::db::Database;
-use borg_proto::status::{status_server::Status, Budget, Empty, Heartbeat, Posture, Vitals};
+use borg_proto::status::{
+    status_server::Status, BondEvent as PbBondEvent, BondEventList, BondStateProto, Budget, Empty,
+    EvolutionEvent as PbEvolutionEvent, EvolutionEventList, EvolutionStateProto, Heartbeat,
+    Int64Cursor, Posture, StatusText, StatusTextRequest, Vitals, VitalsEvent as PbVitalsEvent,
+    VitalsEventList, XpEvent, XpSnapshot,
+};
 use tonic::{Request, Response, Status as TStatus};
 
 /// Status service implementation.
@@ -32,15 +37,24 @@ impl Status for StatusSvc {
     async fn get_vitals(&self, _req: Request<Empty>) -> Result<Response<Vitals>, TStatus> {
         let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
             let db = Database::open()?;
-            let state = db.get_vitals_state()?;
-            let state = borg_core::vitals::apply_decay(&state, chrono::Utc::now());
-            let evo = db.get_evolution_state().ok();
-            Ok((state, evo))
+            let raw = db.get_vitals_state()?;
+            let now = chrono::Utc::now();
+            let state = borg_core::vitals::apply_decay(&raw, now);
+            let drift = borg_core::vitals::detect_drift(&raw, now);
+            let drift_notice = borg_core::vitals::format_drift_notice(&drift).unwrap_or_default();
+            let evo = match db.get_evolution_state() {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "evolution state load failed");
+                    None
+                }
+            };
+            Ok((state, evo, drift_notice))
         })
         .await
         .map_err(|e| TStatus::internal(format!("vitals task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("vitals load failed: {e}")))?;
-        let (state, evo) = snap;
+        let (state, evo, drift_notice) = snap;
         let (stage, xp) = match evo {
             Some(e) => {
                 let stage = match e.stage {
@@ -60,6 +74,7 @@ impl Status for StatusSvc {
             happiness: state.happiness as u32,
             stage: stage.into(),
             xp,
+            drift_notice,
         }))
     }
 
@@ -85,6 +100,345 @@ impl Status for StatusSvc {
         Ok(Response::new(Budget {
             daily_usd_cap: cfg.budget.monthly_token_limit as f64,
             daily_usd_spent: 0.0,
+        }))
+    }
+
+    async fn get_evolution(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<EvolutionStateProto>, TStatus> {
+        let state = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+            let db = Database::open()?;
+            db.get_evolution_state()
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("evolution task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("evolution load failed: {e}")))?;
+        let archetype_scores = state
+            .archetype_scores
+            .iter()
+            .map(|(a, v)| (a.to_string(), *v as f64))
+            .collect();
+        Ok(Response::new(EvolutionStateProto {
+            stage: state.stage.to_string(),
+            total_xp: state.total_xp as u64,
+            name: state.evolution_name.unwrap_or_default(),
+            level: state.level as u32,
+            archetype: state
+                .dominant_archetype
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            archetype_scores,
+        }))
+    }
+
+    async fn get_bond_state(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<BondStateProto>, TStatus> {
+        let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+            let db = Database::open()?;
+            let events = db.get_all_bond_events()?;
+            let key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
+            let state = borg_core::bond::replay_events_with_key(&key, &events);
+            let correction = borg_core::bond::compute_correction_rate(&db);
+            let routine = borg_core::bond::compute_routine_success_rate(&db);
+            let pref = borg_core::bond::compute_preference_learning_count(&db);
+            Ok((state, correction, routine, pref))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("bond task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("bond load failed: {e}")))?;
+        let (state, correction, routine, pref) = snap;
+        Ok(Response::new(BondStateProto {
+            score: state.score as f64,
+            level: state.level.to_string().to_lowercase(),
+            correction_rate: correction as f64,
+            routine_rate: routine as f64,
+            pref_count: pref,
+        }))
+    }
+
+    async fn get_bond_events_since(
+        &self,
+        req: Request<Int64Cursor>,
+    ) -> Result<Response<BondEventList>, TStatus> {
+        let since = req.into_inner().since_unix;
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            db.bond_events_since(since)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("bond_events panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("bond_events failed: {e}")))?;
+        Ok(Response::new(BondEventList {
+            events: rows
+                .into_iter()
+                .map(|e| PbBondEvent {
+                    timestamp: e.created_at,
+                    kind: e.event_type,
+                    delta: e.score_delta as f64,
+                    note: e.reason,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_evolution_events_since(
+        &self,
+        req: Request<Int64Cursor>,
+    ) -> Result<Response<EvolutionEventList>, TStatus> {
+        let since = req.into_inner().since_unix;
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            db.evolution_events_since(since)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("evolution_events panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("evolution_events failed: {e}")))?;
+        Ok(Response::new(EvolutionEventList {
+            events: rows
+                .into_iter()
+                .map(|e| PbEvolutionEvent {
+                    timestamp: e.created_at,
+                    kind: e.event_type,
+                    delta: e.xp_delta as f64,
+                    note: e.source,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_vitals_events_since(
+        &self,
+        req: Request<Int64Cursor>,
+    ) -> Result<Response<VitalsEventList>, TStatus> {
+        let since = req.into_inner().since_unix;
+        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            db.vitals_events_since(since)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("vitals_events panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("vitals_events failed: {e}")))?;
+        Ok(Response::new(VitalsEventList {
+            events: rows
+                .into_iter()
+                .map(|e| PbVitalsEvent {
+                    timestamp: e.created_at,
+                    category: e.category,
+                    source: e.source,
+                    stability_delta: e.stability_delta,
+                    focus_delta: e.focus_delta,
+                    sync_delta: e.sync_delta,
+                    growth_delta: e.growth_delta,
+                    happiness_delta: e.happiness_delta,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn get_xp(&self, _req: Request<Empty>) -> Result<Response<XpSnapshot>, TStatus> {
+        let snap = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+            let db = Database::open()?;
+            let state = db.get_evolution_state()?;
+            // Surface the same recent feed `/xp` shows today: level_up +
+            // milestone_unlocked events. Cap matches the popup's window so
+            // the wire response can't unboundedly grow.
+            const RECENT_LIMIT: usize = 20;
+            let mut recent: Vec<XpEvent> = state
+                .level_up_events_recent
+                .iter()
+                .take(RECENT_LIMIT)
+                .map(|e| XpEvent {
+                    timestamp: e.created_at,
+                    source: e.source.clone(),
+                    amount: e.xp_delta.max(0) as u32,
+                })
+                .collect();
+            // Newest first.
+            recent.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            // Per `level_from_xp` semantics, `xp_to_next_level` is `0` only at
+            // a saturated stage cap; pass it through verbatim so the client
+            // can decide how to render.
+            Ok(XpSnapshot {
+                total_xp: state.total_xp as u64,
+                level: state.level as u32,
+                next_level_xp: state.xp_to_next_level as u64,
+                recent_events: recent,
+            })
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("xp task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("xp load failed: {e}")))?;
+        Ok(Response::new(snap))
+    }
+
+    async fn get_status_overview_text(
+        &self,
+        req: Request<StatusTextRequest>,
+    ) -> Result<Response<StatusText>, TStatus> {
+        let card_width = req.into_inner().card_width;
+        let snap = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
+            let cfg = Config::load_from_db().unwrap_or_default();
+            let db = Database::open()?;
+            let now = chrono::Utc::now();
+
+            let mut sections: Vec<String> = Vec::new();
+            let mut compact_line = String::new();
+
+            let evo_state = if cfg.evolution.enabled {
+                db.get_evolution_state().ok()
+            } else {
+                None
+            };
+
+            if let Some(ref evo) = evo_state {
+                compact_line = borg_core::evolution::format_compact(evo);
+                let width = if card_width == 0 {
+                    48
+                } else {
+                    card_width as usize
+                };
+                sections
+                    .push(borg_core::evolution::format_status_section_with_width(evo, width));
+            }
+
+            // Vitals
+            if let Ok(state) = db.get_vitals_state() {
+                let state = borg_core::vitals::apply_decay(&state, now);
+                let mut drift = borg_core::vitals::detect_drift(&state, now);
+                let since = (now - chrono::Duration::days(7)).timestamp();
+                let events = db.vitals_events_since(since).unwrap_or_default();
+                if borg_core::vitals::detect_failure_drift(&events) {
+                    drift.push(borg_core::vitals::DriftFlag::RepeatedFailures);
+                }
+                sections.push(borg_core::vitals::format_status(&state, &events, &drift));
+            }
+
+            // Bond
+            if let Ok(bond_events) = db.get_all_bond_events() {
+                let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
+                let bond_state = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
+                let correction_rate = borg_core::bond::compute_correction_rate(&db);
+                let routine_rate = borg_core::bond::compute_routine_success_rate(&db);
+                let pref_count = borg_core::bond::compute_preference_learning_count(&db);
+                let since = (now - chrono::Duration::days(7)).timestamp();
+                let recent = db.bond_events_since(since).unwrap_or_default();
+                sections.push(borg_core::bond::format_status(
+                    &bond_state,
+                    correction_rate,
+                    routine_rate,
+                    pref_count,
+                    &recent,
+                ));
+            }
+
+            if let Some(ref evo) = evo_state {
+                sections.push(borg_core::evolution::format_archetype_scores(evo));
+            }
+
+            if cfg.evolution.enabled {
+                if let Ok(mut events) = db.evolution_events_since(0) {
+                    events.reverse();
+                    sections.push(borg_core::evolution::format_history(&events));
+                }
+            }
+
+            // Join with blank-line separator, mirroring `push_section`.
+            let text = sections.join("\n");
+            Ok((text, compact_line))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("overview text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("overview text failed: {e}")))?;
+        Ok(Response::new(StatusText {
+            text: snap.0,
+            compact_class_line: snap.1,
+        }))
+    }
+
+    async fn get_evolution_text(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<StatusText>, TStatus> {
+        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
+            let db = Database::open()?;
+            let out = borg_core::evolution::commands::dispatch(
+                borg_core::evolution::commands::EvolutionCommand::Evolution,
+                &db,
+            )?;
+            Ok(out.text)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("evolution text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("evolution text failed: {e}")))?;
+        Ok(Response::new(StatusText {
+            text,
+            compact_class_line: String::new(),
+        }))
+    }
+
+    async fn get_xp_text(&self, _req: Request<Empty>) -> Result<Response<StatusText>, TStatus> {
+        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
+            let db = Database::open()?;
+            let out = borg_core::evolution::commands::dispatch(
+                borg_core::evolution::commands::EvolutionCommand::Xp,
+                &db,
+            )?;
+            Ok(out.text)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("xp text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("xp text failed: {e}")))?;
+        Ok(Response::new(StatusText {
+            text,
+            compact_class_line: String::new(),
+        }))
+    }
+
+    async fn get_archetype_scores_text(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<StatusText>, TStatus> {
+        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
+            let cfg = Config::load_from_db().unwrap_or_default();
+            if !cfg.evolution.enabled {
+                return Ok("Evolution system is disabled.".to_string());
+            }
+            let db = Database::open()?;
+            let state = db.get_evolution_state()?;
+            Ok(borg_core::evolution::format_archetype_scores(&state))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("archetypes text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("archetypes text failed: {e}")))?;
+        Ok(Response::new(StatusText {
+            text,
+            compact_class_line: String::new(),
+        }))
+    }
+
+    async fn get_evolution_history_text(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<StatusText>, TStatus> {
+        let text = tokio::task::spawn_blocking(|| -> anyhow::Result<String> {
+            let cfg = Config::load_from_db().unwrap_or_default();
+            if !cfg.evolution.enabled {
+                return Ok("Evolution system is disabled.".to_string());
+            }
+            let db = Database::open()?;
+            let mut events = db.evolution_events_since(0)?;
+            events.reverse();
+            Ok(borg_core::evolution::format_history(&events))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("history text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("history text failed: {e}")))?;
+        Ok(Response::new(StatusText {
+            text,
+            compact_class_line: String::new(),
         }))
     }
 

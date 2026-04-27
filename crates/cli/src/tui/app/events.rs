@@ -489,15 +489,11 @@ impl<'a> App<'a> {
                 // Fire events are handled by the TUI event loop (runs agent turn).
                 // If we receive one here, it means the event loop forwarded it.
             }
-            HeartbeatEvent::SchedulerStarted { mode } => {
-                if let Ok(db) = borg_core::db::Database::open() {
-                    borg_core::activity_log::log_activity(
-                        &db,
-                        "info",
-                        "heartbeat",
-                        &format!("Heartbeat scheduler started ({mode})"),
-                    );
-                }
+            HeartbeatEvent::SchedulerStarted { mode: _mode } => {
+                // The heartbeat scheduler now runs in `borgd`; the cli no
+                // longer logs scheduler-start activity itself. The daemon
+                // emits the corresponding activity_log row via its own
+                // bootstrap path.
             }
             HeartbeatEvent::Result(result) => match result {
                 HeartbeatResult::Ran { message, .. } => {

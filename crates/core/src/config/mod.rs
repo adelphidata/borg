@@ -266,8 +266,22 @@ impl Config {
     }
 
     /// Load config from the database (DB overrides + compiled defaults).
+    ///
+    /// Opens the DB **read-only** so cli processes never race the daemon's
+    /// writer. Consumers that need to mutate settings must go through the
+    /// daemon over gRPC (`Admin.SetSetting` / `Admin.UnsetSetting`).
     pub fn load_from_db() -> Result<Self> {
-        let db = crate::db::Database::open()?;
+        let db = match crate::db::Database::open_readonly() {
+            Ok(db) => db,
+            Err(e) => {
+                // Fall back to the writer path so the daemon's own startup
+                // (which legitimately needs to create the DB on first run)
+                // keeps working. CLI processes hit this path only when the
+                // daemon hasn't created the DB yet.
+                tracing::debug!(error = %e, "open_readonly failed; falling back to open()");
+                crate::db::Database::open()?
+            }
+        };
         let mut config = Self::default();
         for (key, value, _) in db.list_settings()? {
             if let Err(e) = config.apply_setting(&key, &value) {

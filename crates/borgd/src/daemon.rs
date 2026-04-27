@@ -3,6 +3,7 @@
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
 use crate::grpc::session::SessionFactory;
+use crate::orchestrator;
 use crate::paths;
 use crate::pidlock::PidLock;
 use crate::session::backend::AgentBackend;
@@ -80,12 +81,49 @@ pub async fn run(cfg: Config) -> Result<()> {
     let registry = SessionRegistry::new();
     let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory);
     let capability_router = Arc::new(CapabilityRouter::new());
-    let services = grpc::build_services(registry, factory, capability_router);
 
     // Single shutdown signal fanned out to every transport so SIGTERM drains
     // both UDS and TCP listeners in parallel rather than aborting the slower one.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     tokio::spawn(forward_signals_to(shutdown_tx.clone()));
+
+    // Bridge the broadcast shutdown into a CancellationToken for the
+    // orchestrator subsystems (gateway, heartbeat scheduler, task dispatcher).
+    let orchestrator_token = tokio_util::sync::CancellationToken::new();
+    {
+        let token = orchestrator_token.clone();
+        let mut sub = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let _ = sub.recv().await;
+            token.cancel();
+        });
+    }
+
+    let extras = match CoreConfig::load_from_db() {
+        Ok(core_config) => {
+            let handles =
+                orchestrator::start(registry.clone(), core_config, orchestrator_token.clone());
+            grpc::AdminExtras {
+                heartbeat_bus: Some(handles.heartbeat_bus),
+                executor: Some(handles.executor),
+                poke_tx: Some(handles.poke_tx),
+                shutdown_tx: Some(shutdown_tx.clone()),
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "borgd: load_from_db failed ({e}); orchestrator + approval-greeting disabled"
+            );
+            grpc::AdminExtras {
+                heartbeat_bus: None,
+                executor: None,
+                poke_tx: None,
+                shutdown_tx: Some(shutdown_tx.clone()),
+            }
+        }
+    };
+    let services =
+        grpc::build_services_with_extras(registry, factory, capability_router, extras);
 
     let uds_stream = UnixListenerStream::new(uds);
 

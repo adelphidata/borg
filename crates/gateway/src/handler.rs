@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument, warn};
 
-use borg_core::agent::{Agent, AgentEvent};
+use borg_core::agent::AgentEvent;
 use borg_core::config::Config;
 use borg_core::constants;
 use borg_core::db::{Database, NewDelivery};
@@ -375,7 +375,14 @@ async fn resolve_session_and_commands(
     // Handle `/cancel` before the sync dispatcher so the async registry call
     // doesn't hold `&db` across an await point (Database is !Send).
     if crate::commands::is_cancel_command(&inbound.text) {
-        let response = if crate::in_flight::GLOBAL.cancel(&session_id).await {
+        let cancelled = match crate::session_executor::global() {
+            Some(exec) => exec.cancel(&session_id).await,
+            None => {
+                warn!("cancel command received but no SessionExecutor is installed");
+                false
+            }
+        };
+        let response = if cancelled {
             "Cancelled.".to_string()
         } else {
             "Nothing to cancel.".to_string()
@@ -907,73 +914,73 @@ async fn invoke_agent_inner(
         }
     };
 
-    // Phase 6: Agent creation, input preparation, invocation, and response collection
+    // Phase 6: Hand the turn to the daemon's SessionExecutor.
+    // NOTE: per-session config overrides that used to live here (gw mode,
+    // gateway action_limits, adaptive cache TTL) now belong on the daemon
+    // side — `DaemonSessionExecutor` owns the AgentBackend's Config.
 
-    // Create Agent with gateway-specific (stricter) rate limits
-    let mut gw_config = config.clone();
-    gw_config.security.action_limits = gw_config.security.gateway_action_limits.clone();
+    // Suppress unused-variable warnings for fields the executor will consume
+    // post-Stage-D.
+    let _ = db;
 
-    // Apply per-session collaboration mode override (set via /mode command).
-    if let Ok(Some(mode_str)) = db.get_setting(&format!("gw:mode:{session_id}")) {
-        if let Ok(mode) = mode_str.parse::<borg_core::config::CollaborationMode>() {
-            gw_config.conversation.collaboration_mode = mode;
+    let executor = match crate::session_executor::global() {
+        Some(exec) => exec.clone(),
+        None => {
+            warn!(
+                "no SessionExecutor installed; cannot dispatch inbound message on '{channel_name}'"
+            );
+            anyhow::bail!("daemon SessionExecutor not configured");
         }
-    }
-
-    // Resolve adaptive cache TTL for gateway sessions (prefer longer TTL
-    // since inter-turn latency is typically >5 minutes).
-    gw_config.llm.cache.ttl = gw_config.llm.cache.ttl.resolve(true);
-
-    let mut agent = Agent::new(gw_config, borg_core::telemetry::BorgMetrics::noop())
-        .context("Failed to create agent")?;
-
-    if let Err(e) = agent.load_session(&session_id) {
-        warn!(
-            "Could not load session '{session_id}' for channel '{}': {e}",
-            channel_name
-        );
-    }
-
-    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
+    };
 
     // Prepare the message text (link understanding, injection scan, truncation, wrapping)
     let (message_text, has_image_attachments) =
         prepare_message_text(channel_name, inbound, config, cleaned_text).await;
 
-    let agent_cancel = CancellationToken::new();
-    // Register this turn's cancel token so a subsequent `/cancel` from the
-    // same sender (or a `borg cancel` CLI call) can interrupt it. Cleared
-    // unconditionally once the turn completes, below.
-    crate::in_flight::GLOBAL
-        .register(&session_id, agent_cancel.clone())
-        .await;
-    let agent_handle = if has_image_attachments {
-        let mut parts = vec![borg_core::types::ContentPart::Text(message_text)];
-        for att in &inbound.attachments {
-            if att.mime_type.starts_with("image/") {
-                parts.push(borg_core::types::ContentPart::ImageBase64 {
-                    media: borg_core::types::MediaData {
+    // Collect inline images for the multimodal turn payload.
+    let images: Vec<crate::session_executor::InlineImage> = if has_image_attachments {
+        inbound
+            .attachments
+            .iter()
+            .filter(|a| a.mime_type.starts_with("image/"))
+            .filter_map(|att| {
+                use base64::Engine as _;
+                let engine = base64::engine::general_purpose::STANDARD;
+                match engine.decode(att.data.as_bytes()) {
+                    Ok(bytes) => Some(crate::session_executor::InlineImage {
                         mime_type: att.mime_type.clone(),
-                        data: att.data.clone(),
+                        data: bytes,
                         filename: sanitize_filename(&att.filename),
-                    },
-                });
-            }
-        }
-        // Compress images before sending to agent
-        if config.media.compression_enabled {
-            borg_core::media::compress_content_parts(&mut parts, config.media.max_image_bytes);
-        }
-        let msg = borg_core::types::Message::user_multimodal(parts);
-        let cancel = agent_cancel.clone();
-        tokio::spawn(async move { agent.send_message_raw(msg, event_tx, cancel).await })
+                    }),
+                    Err(e) => {
+                        warn!(
+                            channel = %channel_name,
+                            mime = %att.mime_type,
+                            error = %e,
+                            "failed to base64-decode inbound image attachment; dropping",
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
     } else {
-        let cancel = agent_cancel.clone();
-        tokio::spawn(async move {
-            agent
-                .send_message_with_cancel(&message_text, event_tx, cancel)
-                .await
+        Vec::new()
+    };
+
+    let (mut event_rx, agent_cancel) = match executor
+        .start_turn(crate::session_executor::InboundTurn {
+            session_key: session_id.clone(),
+            text: message_text,
+            images,
         })
+        .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!("SessionExecutor::start_turn failed on '{channel_name}': {e}");
+            return Err(e.context("SessionExecutor::start_turn"));
+        }
     };
 
     // Collect the full response text
@@ -985,18 +992,6 @@ async fn invoke_agent_inner(
         progress_tx.as_ref(),
     )
     .await;
-
-    // Wait for agent to finish (with a short grace period after cancellation)
-    match tokio::time::timeout(Duration::from_secs(5), agent_handle).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => warn!("Agent error: {e}"),
-        Ok(Err(e)) => warn!("Agent task panicked: {e}"),
-        Err(_) => warn!("Agent did not finish within grace period for channel '{channel_name}'"),
-    }
-
-    // Turn is no longer in flight; drop the registry entry regardless of
-    // whether it completed normally, errored, or was externally cancelled.
-    crate::in_flight::GLOBAL.clear(&session_id).await;
 
     if response_text.is_empty() {
         response_text = "(no response)".to_string();

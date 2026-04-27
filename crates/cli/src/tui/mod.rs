@@ -116,10 +116,12 @@ use ratatui::Terminal;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
-use borg_core::agent::{Agent, AgentEvent};
+use borg_core::agent::AgentEvent;
 use borg_core::config::{CollaborationMode, Config};
 use borg_core::telemetry::BorgMetrics;
-use borg_heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, HeartbeatScheduler};
+use borg_heartbeat::scheduler::HeartbeatEvent;
+
+use crate::daemon_client::{forward_event_stream, DaemonClient};
 
 use app::{App, AppAction};
 use history::HistoryCell;
@@ -132,7 +134,7 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
     let gw_shutdown = shutdown.clone();
     let gw_metrics = metrics;
     tokio::spawn(async move {
-        match borg_gateway::GatewayServer::new(gw_config, gw_shutdown, gw_metrics, None) {
+        match borg_gateway::GatewayServer::new(gw_config, gw_shutdown, gw_metrics, None, None) {
             Ok(server) => {
                 if let Err(e) = server.run().await {
                     let msg = e.to_string();
@@ -268,46 +270,12 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
 
     let config = Config::load_from_db()?;
     let metrics = BorgMetrics::from_config(&config);
-    let mut agent = Agent::new(config.clone(), metrics.clone())?;
 
-    // Start config hot reload watcher (polls DB for changes, instant in-process notify)
-    let config_watcher = match borg_core::config_watcher::ConfigWatcher::start(config.clone()) {
-        Ok(watcher) => {
-            agent.set_config_watcher(watcher.subscribe());
-            Some(watcher)
-        }
-        Err(e) => {
-            tracing::warn!("Config watcher failed to start: {e}");
-            None
-        }
-    };
-
-    // Register vitals hook for passive health tracking
-    if let Ok(vitals_hook) = borg_core::vitals::VitalsHook::new() {
-        agent.hook_registry_mut().register(Box::new(vitals_hook));
-    }
-
-    // Register activity log hook for structured event logging
-    if let Ok(activity_hook) = borg_core::activity_log::ActivityHook::new() {
-        agent.hook_registry_mut().register(Box::new(activity_hook));
-    }
-
-    // Register bond hook for trust tracking (after vitals so events are available)
-    if let Ok(bond_hook) = borg_core::bond::BondHook::new() {
-        agent.hook_registry_mut().register(Box::new(bond_hook));
-    }
-
-    // Register evolution hook for XP tracking and specialization
-    if config.evolution.enabled {
-        if let Ok(evolution_hook) = borg_core::evolution::EvolutionHook::new() {
-            agent.hook_registry_mut().register(Box::new(evolution_hook));
-        }
-    }
-
-    // Register user-authored script hooks loaded from ~/.borg/hooks.json
-    for hook in borg_core::hooks::ScriptHook::load_all(config.hooks.enabled) {
-        agent.hook_registry_mut().register(Box::new(hook));
-    }
+    // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,
+    // activity, bond, evolution, script), and config watcher all live inside
+    // `borgd` now — registered in `AgentBackend::new` rather than here.
+    let mut client = crate::daemon_client::connect_or_spawn().await?;
+    let (session_id, _last_seq) = client.open_session(resume.as_deref()).await?;
 
     // Resume only when explicit: `borg --resume <id>` on the CLI or `/resume
     // <id>` inside the TUI. Launching the TUI with no args always starts a
@@ -318,7 +286,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
             Ok(meta) => {
                 let title = meta.title.clone();
                 let count = meta.message_count;
-                if let Err(e) = agent.load_session(&meta.id) {
+                if let Err(e) = client.load_agent_session(&session_id, &meta.id).await {
                     eprintln!("borg: failed to load session '{}': {e}", meta.id);
                     return Ok(None);
                 }
@@ -331,38 +299,64 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         }
     }
 
-    let agent = Arc::new(Mutex::new(agent));
-
-    // Start heartbeat scheduler unless daemon is already running its own.
-    // The daemon holds a lock in SQLite that is refreshed every 60s and goes
-    // stale after 300s. If a live daemon is detected, skip the TUI scheduler
-    // to avoid duplicate heartbeat firings.
+    // Heartbeat scheduling lives in the daemon now. The TUI subscribes to
+    // `Admin.SubscribeHeartbeatEvents` and forwards proto events into the
+    // App's existing heartbeat_rx so the rest of the rendering stays
+    // identical to the in-process scheduler.
     let heartbeat_cancel = CancellationToken::new();
     let _heartbeat_guard = heartbeat_cancel.clone().drop_guard();
-    let daemon_running = borg_core::db::Database::open()
-        .map(|db| db.is_daemon_lock_held())
-        .unwrap_or(false);
-    let (heartbeat_rx, heartbeat_event_tx, poke_tx) = if !daemon_running {
-        let (hb_tx, hb_rx) = mpsc::channel::<HeartbeatEvent>(32);
-        // Keep poke_tx alive so the poke_rx channel doesn't close immediately
-        let (poke_tx, poke_rx) = mpsc::channel::<()>(8);
-        let poke_tx_for_app = poke_tx.clone();
-        let tz = config.user_timezone();
-        let scheduler = HeartbeatScheduler::new(config.heartbeat.clone(), tz, poke_rx);
-        let hb_cancel = heartbeat_cancel.clone();
-        let hb_tx_clone = hb_tx.clone();
+    let (hb_proto_tx, hb_proto_rx) = mpsc::channel::<HeartbeatEvent>(32);
+    let heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>> = Some(hb_proto_rx);
+    let heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>> = Some(hb_proto_tx.clone());
+    let poke_tx: Option<mpsc::Sender<()>> = None;
+    {
+        let mut sub_client = client.clone();
+        let cancel = heartbeat_cancel.clone();
         tokio::spawn(async move {
-            // Move poke_tx into the task to keep it alive for the scheduler's lifetime
-            let _poke_tx = poke_tx;
-            scheduler.run(hb_tx, hb_cancel).await;
+            let mut stream = match sub_client.subscribe_heartbeat_events().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("subscribe_heartbeat_events failed: {e}");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    next = stream.message() => {
+                        match next {
+                            Ok(Some(evt)) => {
+                                let result = match evt.status.as_str() {
+                                    "ran" => borg_heartbeat::scheduler::HeartbeatResult::Ran {
+                                        message: evt.message,
+                                        duration_ms: evt.duration_ms as u64,
+                                    },
+                                    "skipped" => borg_heartbeat::scheduler::HeartbeatResult::Skipped {
+                                        reason: borg_heartbeat::scheduler::SkipReason::EmptyResponse,
+                                    },
+                                    _ => borg_heartbeat::scheduler::HeartbeatResult::Failed {
+                                        error: evt.message,
+                                    },
+                                };
+                                if hb_proto_tx
+                                    .send(HeartbeatEvent::Result(result))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(e) => {
+                                tracing::warn!("heartbeat stream error: {e}");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
         });
-        (Some(hb_rx), Some(hb_tx_clone), Some(poke_tx_for_app))
-    } else {
-        tracing::info!(
-            "Daemon is running — TUI heartbeat scheduler skipped (daemon owns heartbeat)"
-        );
-        (None, None, None)
-    };
+    }
 
     // Auto-start gateway if enabled and any channels are installed
     let gateway_shutdown_token = CancellationToken::new();
@@ -395,24 +389,26 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config, heartbeat_rx, heartbeat_event_tx, poke_tx);
-    if let Some(ref watcher) = config_watcher {
-        let tx = watcher.notify_sender();
-        app.config_notify_tx = Some(tx);
-    }
+    let app_client = Arc::new(Mutex::new(client.clone()));
+    let mut app = App::new(
+        config,
+        heartbeat_rx,
+        heartbeat_event_tx,
+        poke_tx,
+        app_client,
+    );
     if let Some((title, count)) = resumed_info {
         app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
     }
-    // Show vitals + evolution header on session start
-    if let Ok(db) = borg_core::db::Database::open() {
-        if let Ok(state) = db.get_vitals_state() {
-            let now = chrono::Utc::now();
-            let state = borg_core::vitals::apply_decay(&state, now);
-            let drift = borg_core::vitals::detect_drift(&state, now);
-            if let Some(notice) = borg_core::vitals::format_drift_notice(&drift) {
-                app.push_system_message(notice);
+    // Show drift notice on session start (computed daemon-side from raw
+    // vitals state — the cli only renders if non-empty).
+    match client.get_vitals().await {
+        Ok(v) => {
+            if !v.drift_notice.is_empty() {
+                app.push_system_message(v.drift_notice);
             }
         }
+        Err(e) => tracing::warn!(error = %e, "session-start vitals fetch failed"),
     }
     // Auto-trigger first conversation if SETUP.md exists (fresh onboarding),
     // otherwise fire a throttled proactive greeting that reuses the heartbeat
@@ -427,13 +423,13 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
             images: Vec::new(),
         });
     } else if should_fire_session_start_greeting(&app.config) {
-        let hb_config = app.config.clone();
-        let hb_tx_clone = app.heartbeat_event_tx.clone();
+        // Daemon owns heartbeat scheduling + execution. Ask it to fire one
+        // immediately; the proto event stream forwards the result back into
+        // our existing `heartbeat_rx` rendering path.
+        let mut poke_client = client.clone();
         tokio::spawn(async move {
-            let result =
-                run_heartbeat_turn(&hb_config, crate::service::HeartbeatSource::SessionStart).await;
-            if let Some(tx) = hb_tx_clone {
-                let _ = tx.send(HeartbeatEvent::Result(result)).await;
+            if let Err(e) = poke_client.poke().await {
+                tracing::warn!("session-start poke failed: {e}");
             }
         });
     }
@@ -444,7 +440,8 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     run_event_loop(
         &mut terminal,
         &mut app,
-        &agent,
+        &mut client,
+        &session_id,
         &mut event_stream,
         tick_rate,
         &gateway_shutdown,
@@ -453,12 +450,20 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     .await
 }
 
-/// Delegate to the shared heartbeat turn implementation.
-async fn run_heartbeat_turn(
-    config: &Config,
-    source: crate::service::HeartbeatSource,
-) -> HeartbeatResult {
-    crate::service::execute_heartbeat_turn(config, source).await
+/// Convert the TUI's image attachments into the proto's `InlineImage` shape.
+/// The wire format takes raw bytes (NOT base64) — daemon side encodes when
+/// constructing the agent's multimodal message.
+fn images_to_proto(
+    images: Vec<composer::ImageAttachment>,
+) -> Vec<borg_proto::session::InlineImage> {
+    images
+        .into_iter()
+        .map(|img| borg_proto::session::InlineImage {
+            mime_type: img.mime_type,
+            data: img.data,
+            filename: String::new(),
+        })
+        .collect()
 }
 
 /// Gate for the TUI-open proactive greeting: respects the user's enable flag
@@ -504,27 +509,28 @@ fn drain_queued_if_idle(app: &mut App<'_>) -> Result<AppAction> {
 }
 
 /// Write a session export to the current working directory and surface the
-/// result in the transcript. Errors (DB failure, file-system failure) are
+/// result in the transcript. Errors (RPC failure, file-system failure) are
 /// reported to the user — we never silently swallow.
-fn handle_export(app: &mut App<'_>, session_id: &str, format: borg_core::export::ExportFormat) {
-    let db = match borg_core::db::Database::open() {
-        Ok(db) => db,
+async fn handle_export(
+    app: &mut App<'_>,
+    client: &mut DaemonClient,
+    session_id: &str,
+    format: borg_core::export::ExportFormat,
+) {
+    let format_str = match format {
+        borg_core::export::ExportFormat::Json => "json",
+        borg_core::export::ExportFormat::Csv => "csv",
+        borg_core::export::ExportFormat::Txt => "txt",
+    };
+    let resp = match client.export_session(session_id, format_str).await {
+        Ok(r) => r,
         Err(e) => {
             app.push_system_message(format!("Export failed: {e}"));
             return;
         }
     };
-    let (rendered, filename) = match borg_core::export::export_session(
-        &db,
-        session_id,
-        borg_core::export::ExportOptions { format },
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            app.push_system_message(format!("Export failed: {e}"));
-            return;
-        }
-    };
+    let rendered = String::from_utf8_lossy(&resp.content).into_owned();
+    let filename = resp.suggested_filename;
     let path = match std::env::current_dir() {
         Ok(cwd) => cwd.join(&filename),
         Err(e) => {
@@ -574,10 +580,12 @@ fn fmt_commas(n: u64) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App<'_>,
-    agent: &Arc<Mutex<Agent>>,
+    client: &mut DaemonClient,
+    session_id: &str,
     event_stream: &mut EventStream,
     tick_rate: Duration,
     gateway_shutdown: &Arc<Mutex<CancellationToken>>,
@@ -622,19 +630,13 @@ async fn run_event_loop(
             } => {
                 match event {
                     HeartbeatEvent::Fire => {
-                        // Run a heartbeat agent turn in the background
-                        let hb_config = app.config.clone();
-                        let hb_tx_clone = app.heartbeat_event_tx.clone();
-                        tokio::spawn(async move {
-                            let result = run_heartbeat_turn(
-                                &hb_config,
-                                crate::service::HeartbeatSource::Scheduled,
-                            )
-                            .await;
-                            if let Some(tx) = hb_tx_clone {
-                                let _ = tx.send(HeartbeatEvent::Result(result)).await;
-                            }
-                        });
+                        // Daemon now schedules + runs heartbeats; the proto
+                        // forwarder only emits Result events. A Fire here is
+                        // unexpected — log and ignore rather than spawning a
+                        // local turn (which would race the daemon).
+                        tracing::warn!(
+                            "ignoring HeartbeatEvent::Fire in TUI; daemon owns scheduling"
+                        );
                     }
                     _ => {
                         app.process_heartbeat(event);
@@ -702,17 +704,15 @@ async fn run_event_loop(
 
         match action {
             AppAction::Quit => {
-                let hint = {
-                    let mut a = agent.lock().await;
-                    a.close_browser().await;
-                    let s = a.session();
-                    if s.meta.message_count > 0 {
-                        let short = s.meta.id.chars().take(8).collect::<String>();
-                        Some(ResumeHint {
-                            short_id: short,
-                            title: s.meta.title.clone(),
-                        })
-                    } else {
+                // Browser-close is daemon-side now; no TUI hook needed.
+                let hint = match client.get_state(session_id).await {
+                    Ok(s) if s.message_count > 0 => Some(ResumeHint {
+                        short_id: s.agent_session_id.chars().take(8).collect(),
+                        title: s.title,
+                    }),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GetState on quit failed; skipping resume hint");
                         None
                     }
                 };
@@ -724,62 +724,81 @@ async fn run_event_loop(
                 event_tx,
                 cancel,
             } => {
-                // Set up steer channel for mid-turn user guidance
-                let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+                // Steer channel: when the user types into a streaming turn,
+                // App routes the text to `steer_tx`; this task forwards each
+                // message to the daemon via `Session.Steer`.
+                let (steer_tx, mut steer_rx) = tokio::sync::mpsc::unbounded_channel();
                 app.steer_tx = Some(steer_tx);
                 app.pending_steers.clear();
 
-                let agent_clone = Arc::clone(agent);
+                {
+                    let mut steer_client = client.clone();
+                    let sid = session_id.to_string();
+                    tokio::spawn(async move {
+                        while let Some(text) = steer_rx.recv().await {
+                            if let Err(e) = steer_client.steer(&sid, &text).await {
+                                tracing::warn!(error = %e, "Session.Steer failed");
+                            }
+                        }
+                    });
+                }
+
+                // Cancel the in-flight turn if the user hits the cancel hot
+                // path. The token is already shared with the App; we just
+                // bridge it to the daemon's `Session.Cancel` here.
+                {
+                    let mut cancel_client = client.clone();
+                    let sid = session_id.to_string();
+                    let cancel_for_task = cancel.clone();
+                    tokio::spawn(async move {
+                        cancel_for_task.cancelled().await;
+                        if let Err(e) = cancel_client.cancel(&sid).await {
+                            tracing::warn!(error = %e, "Session.Cancel failed");
+                        }
+                    });
+                }
+
+                let mut send_client = client.clone();
+                let sid = session_id.to_string();
+                let proto_images = images_to_proto(images);
                 tokio::spawn(async move {
-                    let mut agent = agent_clone.lock().await;
-                    agent.set_steer_channel(steer_rx);
-                    if images.is_empty() {
-                        if let Err(e) = agent
-                            .send_message_with_cancel(&input, event_tx.clone(), cancel)
-                            .await
-                        {
-                            let _ = event_tx.send(AgentEvent::Error(e.to_string())).await;
+                    match send_client
+                        .send_message_with_images(&sid, &input, proto_images)
+                        .await
+                    {
+                        Ok(stream) => {
+                            forward_event_stream(send_client, sid, stream, event_tx).await;
                         }
-                    } else {
-                        // Build multimodal message with text + images
-                        use base64::Engine as _;
-                        use borg_core::types::{ContentPart, MediaData, Message};
-                        let engine = base64::engine::general_purpose::STANDARD;
-                        let mut parts = vec![ContentPart::Text(input)];
-                        for img in images {
-                            parts.push(ContentPart::ImageBase64 {
-                                media: MediaData {
-                                    mime_type: img.mime_type,
-                                    data: engine.encode(&img.data),
-                                    filename: None,
-                                },
-                            });
-                        }
-                        let msg = Message::user_multimodal(parts);
-                        if let Err(e) = agent.send_message_raw(msg, event_tx.clone(), cancel).await
-                        {
+                        Err(e) => {
                             let _ = event_tx.send(AgentEvent::Error(e.to_string())).await;
                         }
                     }
                 });
             }
-            AppAction::CompactHistory => {
-                let mut agent = agent.lock().await;
-                let (before, after) = agent.compact().await;
-                let freed = before.saturating_sub(after);
-                app.push_system_message(format!(
-                    "Compacted: {before} → {after} tokens ({freed} freed)"
-                ));
-            }
-            AppAction::ClearHistory => {
-                let mut agent = agent.lock().await;
-                agent.clear_history();
-                app.push_system_message("Conversation cleared.".to_string());
-            }
+            AppAction::CompactHistory => match client.compact(session_id).await {
+                Ok(r) => {
+                    let dropped = r.dropped as usize;
+                    let after = r.after_tokens as usize;
+                    app.push_system_message(format!(
+                        "Compacted: {dropped} messages dropped, ~{after} tokens remain"
+                    ));
+                }
+                Err(e) => app.push_system_message(format!("Compact failed: {e}")),
+            },
+            AppAction::ClearHistory => match client.clear_history(session_id).await {
+                Ok(()) => {
+                    app.push_system_message("Conversation cleared.".to_string());
+                }
+                Err(e) => app.push_system_message(format!("Clear failed: {e}")),
+            },
             AppAction::ShowUsage => {
-                let agent = agent.lock().await;
-                let (msg_count, token_count) = agent.conversation_stats();
-                drop(agent);
+                let (msg_count, token_count) = match client.get_state(session_id).await {
+                    Ok(s) => (s.message_count as usize, s.token_estimate as usize),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GetState for /usage failed");
+                        (0, 0)
+                    }
+                };
 
                 let prompt_tok = app.session_prompt_tokens;
                 let completion_tok = app.session_completion_tokens;
@@ -811,91 +830,105 @@ async fn run_event_loop(
                     }
                 }
 
-                // Show monthly budget info
+                // Show monthly budget info (routed through the daemon).
                 let budget_limit = app.config.budget.monthly_token_limit;
                 if budget_limit > 0 {
-                    if let Ok(db) = borg_core::db::Database::open() {
-                        if let Ok(used) = db.monthly_token_total() {
-                            let pct = if budget_limit > 0 {
-                                (used as f64 / budget_limit as f64 * 100.0) as u64
-                            } else {
-                                0
-                            };
+                    match client.get_monthly_token_total().await {
+                        Ok(t) => {
+                            let used = t.total;
+                            let pct = (used as f64 / budget_limit as f64 * 100.0) as u64;
                             text.push_str(&format!(
                                 "Budget: {}/{} tokens ({pct}%) used this month\n",
                                 fmt_commas(used),
                                 fmt_commas(budget_limit),
                             ));
                         }
-                        if let Ok(Some(cost)) = db.monthly_total_cost() {
-                            text.push_str(&format!("Estimated cost: ${cost:.4}\n"));
+                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTokenTotal failed"),
+                    }
+                    match client.get_monthly_total_cost().await {
+                        Ok(c) if c.present => {
+                            text.push_str(&format!("Estimated cost: ${:.4}\n", c.cost));
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTotalCost failed"),
                     }
                 }
 
                 app.push_system_message(text.trim_end().to_string());
             }
-            AppAction::UndoLastTurn => {
-                let mut agent = agent.lock().await;
-                let removed = agent.undo();
-                if removed > 0 {
-                    app.push_system_message(format!(
-                        "Undid last turn ({removed} messages removed)."
-                    ));
-                } else {
-                    app.push_system_message("Nothing to undo.".to_string());
+            AppAction::UndoLastTurn => match client.undo(session_id).await {
+                Ok(r) => {
+                    let removed = r.removed as usize;
+                    if removed > 0 {
+                        app.push_system_message(format!(
+                            "Undid last turn ({removed} messages removed)."
+                        ));
+                    } else {
+                        app.push_system_message("Nothing to undo.".to_string());
+                    }
                 }
-            }
+                Err(e) => app.push_system_message(format!("Undo failed: {e}")),
+            },
             AppAction::RewindTo { nth_user_message } => {
-                let mut agent = agent.lock().await;
-                let removed = agent.rewind_to_nth_user_message(nth_user_message);
-                if removed > 0 {
-                    app.push_system_message(format!(
-                        "Rewound conversation ({removed} messages removed). Edit and re-send."
-                    ));
-                } else {
-                    app.push_system_message("Nothing to rewind.".to_string());
+                match client.rewind(session_id, nth_user_message as u64).await {
+                    Ok(r) => {
+                        let removed = r.removed as usize;
+                        if removed > 0 {
+                            app.push_system_message(format!(
+                                "Rewound conversation ({removed} messages removed). Edit and re-send."
+                            ));
+                        } else {
+                            app.push_system_message("Nothing to rewind.".to_string());
+                        }
+                    }
+                    Err(e) => app.push_system_message(format!("Rewind failed: {e}")),
                 }
             }
             AppAction::UpdateSetting { key, value } => {
-                let mut agent = agent.lock().await;
-                if let Err(e) = agent.config_mut().apply_setting(&key, &value) {
-                    app.push_system_message(format!("Warning: failed to sync agent config: {e}"));
-                }
-                if let Some(ref tx) = app.config_notify_tx {
-                    let _ = tx.try_send(agent.config().clone());
+                if let Err(e) = client.set_setting(&key, &value).await {
+                    app.push_system_message(format!("Warning: set_setting failed: {e}"));
                 }
             }
             AppAction::ConfigReloaded => {
-                let mut agent = agent.lock().await;
-                *agent.config_mut() = app.config.clone();
-                if let Some(ref tx) = app.config_notify_tx {
-                    let _ = tx.try_send(app.config.clone());
-                }
+                // Config now lives in the daemon — no in-process mutation to
+                // propagate. The daemon's config watcher fans out reloads.
             }
             AppAction::SaveSession => {
-                let mut agent = agent.lock().await;
-                agent.auto_save();
-                let session = agent.session();
-                app.push_system_message(format!(
-                    "Session saved: {} ({})",
-                    session.meta.title, session.meta.id
-                ));
+                if let Err(e) = client.auto_save(session_id).await {
+                    app.push_system_message(format!("Save failed: {e}"));
+                } else {
+                    match client.get_state(session_id).await {
+                        Ok(s) => {
+                            app.push_system_message(format!(
+                                "Session saved: {} ({})",
+                                s.title, s.agent_session_id
+                            ));
+                        }
+                        Err(e) => {
+                            app.push_system_message(format!("Saved, but GetState failed: {e}"))
+                        }
+                    }
+                }
             }
             AppAction::NewSession => {
-                let mut agent = agent.lock().await;
-                agent.new_session();
-                app.push_system_message("New session started.".to_string());
+                if let Err(e) = client.new_agent_session(session_id).await {
+                    app.push_system_message(format!("New session failed: {e}"));
+                } else {
+                    app.push_system_message("New session started.".to_string());
+                }
             }
             AppAction::ExportSession { id, format } => {
-                handle_export(app, &id, format);
+                handle_export(app, client, &id, format).await;
             }
             AppAction::ExportCurrentSession { format } => {
-                let id = {
-                    let agent = agent.lock().await;
-                    agent.session().meta.id.clone()
+                let id = match client.get_state(session_id).await {
+                    Ok(s) => s.agent_session_id,
+                    Err(e) => {
+                        app.push_system_message(format!("Export failed: {e}"));
+                        continue;
+                    }
                 };
-                handle_export(app, &id, format);
+                handle_export(app, client, &id, format).await;
             }
             AppAction::LoadSession { id } => {
                 // Clear existing UI state before loading a new session.
@@ -911,21 +944,23 @@ async fn run_event_loop(
                         ));
                         continue;
                     }
-                    // NotFound / Empty: fall through to agent.load_session which will
-                    // produce a clean "Session '<id>' not found" error below.
+                    // NotFound / Empty: fall through to load_agent_session which
+                    // will surface a clean "Session '<id>' not found" error.
                     Err(_) => id.clone(),
                 };
 
-                let mut agent = agent.lock().await;
-                match agent.load_session(&load_id) {
-                    Ok(()) => {
-                        let session = agent.session();
-                        let title = session.meta.title.clone();
-                        let count = session.meta.message_count;
-                        app.push_system_message(format!(
-                            "Loaded session: {title} ({count} messages)"
-                        ));
-                    }
+                match client.load_agent_session(session_id, &load_id).await {
+                    Ok(_) => match client.get_state(session_id).await {
+                        Ok(s) => {
+                            app.push_system_message(format!(
+                                "Loaded session: {} ({} messages)",
+                                s.title, s.message_count
+                            ));
+                        }
+                        Err(e) => {
+                            app.push_system_message(format!("Loaded, but GetState failed: {e}"));
+                        }
+                    },
                     Err(e) => {
                         app.push_system_message(format!("Failed to load session: {e}"));
                     }
@@ -977,75 +1012,30 @@ async fn run_event_loop(
                                 .await
                                 {
                                     Ok(install_result) => {
-                                        // Record in DB + store file hashes
-                                        if let Ok(db) = borg_core::db::Database::open() {
-                                            if let Err(e) = db.insert_plugin(
-                                                def.id,
-                                                def.name,
-                                                &def.kind.to_string(),
-                                                &def.category.to_string(),
-                                            ) {
-                                                tracing::warn!("Failed to record plugin: {e}");
-                                            }
+                                        // Resolve item_name for installed tool/channel.
+                                        let item_name = if def.is_native {
+                                            def.id.rsplit('/').next().unwrap_or(def.id)
+                                        } else if let Some(first_tmpl) = def.templates.first() {
+                                            first_tmpl
+                                                .relative_path
+                                                .split('/')
+                                                .next()
+                                                .unwrap_or(def.id)
+                                        } else {
+                                            def.id
+                                        };
+                                        let runtime =
+                                            if def.is_native { "native" } else { "python" };
 
-                                            // Store file hashes for integrity verification
-                                            for (path, hash) in &install_result.file_hashes {
-                                                if let Err(e) =
-                                                    db.insert_file_hash(def.id, path, hash)
-                                                {
-                                                    tracing::warn!(
-                                                        "Failed to store file hash for {path}: {e}"
-                                                    );
-                                                }
-                                            }
-
-                                            // Register installed tool/channel
-                                            let item_name = if def.is_native {
-                                                def.id.rsplit('/').next().unwrap_or(def.id)
-                                            } else if let Some(first_tmpl) = def.templates.first() {
-                                                first_tmpl
-                                                    .relative_path
-                                                    .split('/')
-                                                    .next()
-                                                    .unwrap_or(def.id)
+                                        // Build credentials JSON (cli holds the
+                                        // keychain ref types — daemon just persists
+                                        // the resulting blob to the settings table).
+                                        let credentials_json =
+                                            if install_result.credential_entries.is_empty() {
+                                                String::new()
                                             } else {
-                                                def.id
-                                            };
-                                            let runtime =
-                                                if def.is_native { "native" } else { "python" };
-                                            match def.kind {
-                                                borg_plugins::PluginKind::Tool => {
-                                                    if let Err(e) = db.insert_installed_tool(
-                                                        item_name,
-                                                        def.description,
-                                                        runtime,
-                                                        def.id,
-                                                    ) {
-                                                        tracing::warn!(
-                                                            "Failed to register tool: {e}"
-                                                        );
-                                                    }
-                                                }
-                                                borg_plugins::PluginKind::Channel => {
-                                                    let webhook = format!("/webhook/{item_name}");
-                                                    if let Err(e) = db.insert_installed_channel(
-                                                        item_name,
-                                                        def.description,
-                                                        runtime,
-                                                        def.id,
-                                                        &webhook,
-                                                    ) {
-                                                        tracing::warn!(
-                                                            "Failed to register channel: {e}"
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Wire credential entries to DB
-                                        if !install_result.credential_entries.is_empty() {
-                                            if let Ok(mut cfg) = Config::load_from_db() {
+                                                let mut cfg =
+                                                    Config::load_from_db().unwrap_or_default();
                                                 for entry in &install_result.credential_entries {
                                                     cfg.credentials.insert(
                                                         entry.key.clone(),
@@ -1057,22 +1047,63 @@ async fn run_event_loop(
                                                         ),
                                                     );
                                                 }
-                                                if let Ok(json) =
-                                                    serde_json::to_string(&cfg.credentials)
-                                                {
-                                                    if let Ok(db) = borg_core::db::Database::open()
-                                                    {
-                                                        if let Err(e) =
-                                                            db.set_setting("credentials", &json)
-                                                        {
-                                                            tracing::warn!(
-                                                                "Failed to save credentials after plugin install: {e}"
-                                                            );
+                                                serde_json::to_string(&cfg.credentials)
+                                                    .unwrap_or_default()
+                                            };
+
+                                        let mut req =
+                                            borg_proto::admin::PluginInstallRequest {
+                                                plugin_id: def.id.to_string(),
+                                                plugin_name: def.name.to_string(),
+                                                kind: def.kind.to_string(),
+                                                category: def.category.to_string(),
+                                                file_hashes: install_result
+                                                    .file_hashes
+                                                    .iter()
+                                                    .map(|(p, h)| {
+                                                        borg_proto::admin::PluginFileHash {
+                                                            path: p.clone(),
+                                                            hash: h.clone(),
                                                         }
-                                                    }
-                                                }
+                                                    })
+                                                    .collect(),
+                                                installed_tool: None,
+                                                installed_channel: None,
+                                                credentials_json,
+                                            };
+                                        match def.kind {
+                                            borg_plugins::PluginKind::Tool => {
+                                                req.installed_tool =
+                                                    Some(borg_proto::admin::PluginInstalledTool {
+                                                        name: item_name.to_string(),
+                                                        description: def.description.to_string(),
+                                                        runtime: runtime.to_string(),
+                                                        plugin_id: def.id.to_string(),
+                                                    });
+                                            }
+                                            borg_plugins::PluginKind::Channel => {
+                                                let webhook = format!("/webhook/{item_name}");
+                                                req.installed_channel = Some(
+                                                    borg_proto::admin::PluginInstalledChannel {
+                                                        name: item_name.to_string(),
+                                                        description: def.description.to_string(),
+                                                        runtime: runtime.to_string(),
+                                                        plugin_id: def.id.to_string(),
+                                                        webhook,
+                                                    },
+                                                );
                                             }
                                         }
+
+                                        if let Err(e) = client.plugin_install(req).await {
+                                            tracing::warn!("Admin.PluginInstall failed: {e}");
+                                            results.push(format!(
+                                                "Failed to record {} install: {e}",
+                                                def.name
+                                            ));
+                                            continue;
+                                        }
+
                                         // Reload config to pick up newly saved credentials
                                         match borg_core::config::Config::load_from_db() {
                                             Ok(c) => app.config = c,
@@ -1106,23 +1137,22 @@ async fn run_event_loop(
                             }
                         }
                         plugins_popup::PluginAction::SetSkillEnabled { name, enabled } => {
-                            if let Ok(db) = borg_core::db::Database::open() {
-                                let key = format!("skills.entries.{name}.enabled");
-                                let val = enabled.to_string();
-                                match app.config.apply_setting(&key, &val) {
-                                    Ok(_) => {
-                                        let _ = db.set_setting(&key, &val);
+                            let key = format!("skills.entries.{name}.enabled");
+                            let val = enabled.to_string();
+                            match app.config.apply_setting(&key, &val) {
+                                Ok(_) => match client.set_setting(&key, &val).await {
+                                    Ok(()) => {
                                         let status = if enabled { "enabled" } else { "disabled" };
                                         results.push(format!("{name}: {status}"));
                                     }
                                     Err(e) => {
-                                        results.push(format!("Error updating {name}: {e}"));
+                                        results
+                                            .push(format!("Error persisting {name}: {e}"));
                                     }
+                                },
+                                Err(e) => {
+                                    results.push(format!("Error updating {name}: {e}"));
                                 }
-                            } else {
-                                results.push(format!(
-                                    "Error persisting {name}: could not open database"
-                                ));
                             }
                         }
                         plugins_popup::PluginAction::Uninstall { id } => {
@@ -1187,8 +1217,9 @@ async fn run_event_loop(
                         })
                         .unwrap_or_default();
 
-                    let mut agent = agent.lock().await;
-                    agent.clear_history();
+                    if let Err(e) = client.clear_history(session_id).await {
+                        tracing::warn!(error = %e, "PlanProceed clear_history failed");
+                    }
                     app.cells.clear();
                     app.session_prompt_tokens = 0;
                     app.session_completion_tokens = 0;
@@ -1210,76 +1241,53 @@ async fn run_event_loop(
             }
             AppAction::RunScheduleActions { actions } => {
                 let mut results: Vec<String> = Vec::new();
-                if let Ok(db) = borg_core::db::Database::open() {
-                    for action in actions {
-                        match action {
-                            schedule_popup::ScheduleAction::ToggleStatus {
-                                task_id,
-                                new_status,
-                            } => match db.update_task_status(&task_id, &new_status) {
-                                Ok(true) => {
-                                    results.push(format!(
-                                        "Task {} {new_status}",
-                                        &task_id[..8.min(task_id.len())]
-                                    ));
-                                }
-                                Ok(false) => {
-                                    results.push(format!(
-                                        "Task {} not found",
-                                        &task_id[..8.min(task_id.len())]
-                                    ));
+                for action in actions {
+                    match action {
+                        schedule_popup::ScheduleAction::ToggleStatus {
+                            task_id,
+                            new_status,
+                        } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            let res = if new_status == "paused" {
+                                client.pause_scheduled_task(&task_id).await
+                            } else {
+                                client.resume_scheduled_task(&task_id).await
+                            };
+                            match res {
+                                Ok(()) => {
+                                    results.push(format!("Task {short} {new_status}"));
                                 }
                                 Err(e) => results.push(format!("Error: {e}")),
-                            },
-                            schedule_popup::ScheduleAction::UpdateSchedule {
-                                task_id,
-                                schedule_type,
-                                new_expr,
-                            } => {
-                                let update = borg_core::db::UpdateTask {
-                                    name: None,
-                                    prompt: None,
-                                    schedule_type: Some(&schedule_type),
-                                    schedule_expr: Some(&new_expr),
-                                    timezone: None,
-                                };
-                                match db.update_task(&task_id, &update) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Task {} schedule updated to {new_expr}",
-                                            &task_id[..8.min(task_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Task {} not found",
-                                            &task_id[..8.min(task_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
                             }
-                            schedule_popup::ScheduleAction::DeleteTask { task_id } => {
-                                match db.delete_task(&task_id) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Task {} deleted",
-                                            &task_id[..8.min(task_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Task {} not found",
-                                            &task_id[..8.min(task_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
+                        }
+                        schedule_popup::ScheduleAction::UpdateSchedule {
+                            task_id,
+                            schedule_type,
+                            new_expr,
+                        } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            let spec = borg_proto::admin::ScheduledTaskUpdate {
+                                id: task_id.clone(),
+                                name: String::new(),
+                                prompt: String::new(),
+                                schedule_type: schedule_type.clone(),
+                                schedule_expr: new_expr.clone(),
+                                timezone: String::new(),
+                            };
+                            match client.update_scheduled_task(spec).await {
+                                Ok(_) => results
+                                    .push(format!("Task {short} schedule updated to {new_expr}")),
+                                Err(e) => results.push(format!("Error: {e}")),
+                            }
+                        }
+                        schedule_popup::ScheduleAction::DeleteTask { task_id } => {
+                            let short = &task_id[..8.min(task_id.len())];
+                            match client.delete_scheduled_task(&task_id).await {
+                                Ok(()) => results.push(format!("Task {short} deleted")),
+                                Err(e) => results.push(format!("Error: {e}")),
                             }
                         }
                     }
-                } else {
-                    results.push("Error: could not open database".to_string());
                 }
                 if !results.is_empty() {
                     app.push_system_message(results.join("\n"));
@@ -1287,100 +1295,57 @@ async fn run_event_loop(
             }
             AppAction::RunProjectActions { actions } => {
                 let mut results: Vec<String> = Vec::new();
-                if let Ok(db) = borg_core::db::Database::open() {
-                    for action in actions {
-                        match action {
-                            projects_popup::ProjectAction::Create {
-                                id,
-                                name,
-                                description,
-                            } => match db.create_project(&id, &name, &description) {
-                                Ok(()) => {
-                                    results.push(format!("Project '{name}' created"));
-                                }
-                                Err(e) => results.push(format!("Error: {e}")),
-                            },
-                            projects_popup::ProjectAction::Update {
-                                project_id,
-                                name,
-                                description,
-                            } => {
-                                match db.update_project(
+                for action in actions {
+                    match action {
+                        projects_popup::ProjectAction::Create {
+                            id: _,
+                            name,
+                            description,
+                        } => match client.create_project(&name, &description).await {
+                            Ok(_) => results.push(format!("Project '{name}' created")),
+                            Err(e) => results.push(format!("Error: {e}")),
+                        },
+                        projects_popup::ProjectAction::Update {
+                            project_id,
+                            name,
+                            description,
+                        } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client
+                                .update_project(
                                     &project_id,
-                                    name.as_deref(),
-                                    description.as_deref(),
-                                    None,
-                                ) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Project {} updated",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Project {} not found",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
+                                    name.as_deref().unwrap_or(""),
+                                    description.as_deref().unwrap_or(""),
+                                    "",
+                                )
+                                .await
+                            {
+                                Ok(_) => results.push(format!("Project {short} updated")),
+                                Err(e) => results.push(format!("Error: {e}")),
                             }
-                            projects_popup::ProjectAction::Archive { project_id } => {
-                                match db.archive_project(&project_id) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Project {} archived",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Project {} not found or already archived",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
+                        }
+                        projects_popup::ProjectAction::Archive { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.archive_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} archived")),
+                                Err(e) => results.push(format!("Error: {e}")),
                             }
-                            projects_popup::ProjectAction::Unarchive { project_id } => {
-                                match db.update_project(&project_id, None, None, Some("active")) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Project {} unarchived",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Project {} not found",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
+                        }
+                        projects_popup::ProjectAction::Unarchive { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.unarchive_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} unarchived")),
+                                Err(e) => results.push(format!("Error: {e}")),
                             }
-                            projects_popup::ProjectAction::Delete { project_id } => {
-                                match db.delete_project(&project_id) {
-                                    Ok(true) => {
-                                        results.push(format!(
-                                            "Project {} deleted",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "Project {} not found",
-                                            &project_id[..8.min(project_id.len())]
-                                        ));
-                                    }
-                                    Err(e) => results.push(format!("Error: {e}")),
-                                }
+                        }
+                        projects_popup::ProjectAction::Delete { project_id } => {
+                            let short = &project_id[..8.min(project_id.len())];
+                            match client.delete_project(&project_id).await {
+                                Ok(()) => results.push(format!("Project {short} deleted")),
+                                Err(e) => results.push(format!("Error: {e}")),
                             }
                         }
                     }
-                } else {
-                    results.push("Error: could not open database".to_string());
                 }
                 if !results.is_empty() {
                     app.push_system_message(results.join("\n"));
@@ -1388,58 +1353,65 @@ async fn run_event_loop(
             }
             AppAction::RunPairingActions { actions } => {
                 let mut results: Vec<String> = Vec::new();
-                if let Ok(db) = borg_core::db::Database::open() {
-                    for action in actions {
-                        match action {
-                            pairing_popup::PairingAction::Approve { channel, code } => {
-                                match db.approve_pairing(&channel, &code) {
-                                    Ok(row) => {
-                                        let display = borg_core::pairing::channel_display_name(
-                                            &row.channel_name,
-                                        );
-                                        results.push(format!(
-                                            "Approved: {} on {} (sender: {})",
-                                            row.code, display, row.sender_id
-                                        ));
-                                        // Fire-and-forget greeting
-                                        let config = app.config.clone();
-                                        let ch = row.channel_name;
-                                        let sid = row.sender_id;
-                                        tokio::spawn(async move {
-                                            crate::service::send_approval_greeting(
-                                                &config, &ch, &sid,
-                                            )
-                                            .await;
-                                        });
-                                    }
-                                    Err(e) => {
-                                        results.push(format!("Failed to approve: {e}"));
-                                    }
+                for action in actions {
+                    match action {
+                        pairing_popup::PairingAction::Approve { channel, code } => {
+                            match client.approve_pairing(&channel, &code).await {
+                                Ok(()) => {
+                                    let display =
+                                        borg_core::pairing::channel_display_name(&channel);
+                                    results.push(format!("Approved: {code} on {display}"));
+                                    // Fire-and-forget greeting via the daemon's
+                                    // Admin.SendApprovalGreeting RPC.
+                                    let mut greet_client = client.clone();
+                                    let ch = channel.clone();
+                                    tokio::spawn(async move {
+                                        let senders = match greet_client
+                                            .list_approved_senders(Some(&ch))
+                                            .await
+                                        {
+                                            Ok(list) => list.senders,
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "approval greeting: list_approved_senders failed"
+                                                );
+                                                return;
+                                            }
+                                        };
+                                        if let Some(sender) =
+                                            senders.iter().max_by_key(|s| s.approved_at)
+                                        {
+                                            if let Err(e) = greet_client
+                                                .send_approval_greeting(&ch, &sender.sender_id)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    "Admin.SendApprovalGreeting failed"
+                                                );
+                                            }
+                                        }
+                                    });
                                 }
-                            }
-                            pairing_popup::PairingAction::Revoke { channel, sender_id } => {
-                                match db.revoke_sender(&channel, &sender_id) {
-                                    Ok(true) => {
-                                        let display =
-                                            borg_core::pairing::channel_display_name(&channel);
-                                        results.push(format!(
-                                            "Revoked sender {sender_id} from {display}."
-                                        ));
-                                    }
-                                    Ok(false) => {
-                                        results.push(format!(
-                                            "No approved sender found for {channel}/{sender_id}."
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        results.push(format!("Failed to revoke: {e}"));
-                                    }
+                                Err(e) => {
+                                    results.push(format!("Failed to approve: {e}"));
                                 }
                             }
                         }
+                        pairing_popup::PairingAction::Revoke { channel, sender_id } => match client
+                            .revoke_approved_sender(&channel, &sender_id)
+                            .await
+                        {
+                            Ok(()) => {
+                                let display = borg_core::pairing::channel_display_name(&channel);
+                                results.push(format!("Revoked sender {sender_id} from {display}."));
+                            }
+                            Err(e) => {
+                                results.push(format!("Failed to revoke: {e}"));
+                            }
+                        },
                     }
-                } else {
-                    results.push("Error: could not open database".to_string());
                 }
                 if !results.is_empty() {
                     app.push_system_message(results.join("\n"));
@@ -1494,11 +1466,16 @@ async fn run_event_loop(
                                         msg.push_str(&format!("\n  Warning: {warning}"));
                                     }
                                     // Log to activity log so /logs shows it
-                                    if let Ok(db) = borg_core::db::Database::open() {
-                                        borg_core::activity_log::log_activity(
-                                            &db, "info", "migrate", &msg,
-                                        );
-                                    }
+                                    let mut log_client = client.clone();
+                                    let log_msg = msg.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = log_client
+                                            .log_activity("info", "migrate", &log_msg)
+                                            .await
+                                        {
+                                            tracing::warn!("Admin.LogActivity failed: {e}");
+                                        }
+                                    });
                                     app.push_system_message(msg);
                                     // Reload config to pick up migrated settings
                                     app.config = borg_core::config::Config::load_from_db()
@@ -1506,11 +1483,16 @@ async fn run_event_loop(
                                 }
                                 Err(e) => {
                                     let msg = format!("Migration failed: {e}");
-                                    if let Ok(db) = borg_core::db::Database::open() {
-                                        borg_core::activity_log::log_activity(
-                                            &db, "error", "migrate", &msg,
-                                        );
-                                    }
+                                    let mut log_client = client.clone();
+                                    let log_msg = msg.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = log_client
+                                            .log_activity("error", "migrate", &log_msg)
+                                            .await
+                                        {
+                                            tracing::warn!("Admin.LogActivity failed: {e}");
+                                        }
+                                    });
                                     app.push_system_message(msg);
                                 }
                             }
@@ -1551,10 +1533,10 @@ async fn run_event_loop(
                 // Step 1: Uninstall daemon service + kill any lingering borg processes
                 app.push_system_message("Stopping daemon...".to_string());
                 terminal.draw(|f| app.render(f))?;
-                if let Err(e) = crate::service::uninstall_service() {
+                if let Err(e) = crate::borgd_launcher::uninstall_service() {
                     tracing::debug!("Service uninstall skipped: {e}");
                 }
-                crate::service::kill_other_borg_processes();
+                crate::borgd_launcher::kill_other_borg_processes();
 
                 // Step 2: Stop all in-process background tasks (gateway, heartbeat)
                 // so they can't reopen / recreate the database after we delete it.
@@ -1564,12 +1546,11 @@ async fn run_event_loop(
                         gw.cancel();
                     }
                 }
-                // Close browser + DB
-                {
-                    let mut a = agent.lock().await;
-                    a.close_browser().await;
-                    a.close_db();
-                }
+                // Browser + DB are owned by the daemon now; ask it to shut
+                // down so the data directory can be removed cleanly. Stage D
+                // will replace this with a proper Admin.Shutdown call.
+                // (No-op for now — sandboxed Uninstall will surface any
+                // file-locked errors below.)
                 // Let spawned tasks notice cancellation and wind down
                 tokio::task::yield_now().await;
 
@@ -1606,26 +1587,10 @@ async fn run_event_loop(
                 return Ok(None);
             }
             AppAction::Poke => {
-                let config = app.config.clone();
+                let mut poke_client = client.clone();
                 tokio::spawn(async move {
-                    let url = format!(
-                        "http://{}:{}/internal/poke",
-                        config.gateway.host, config.gateway.port
-                    );
-                    let client = reqwest::Client::new();
-                    match client
-                        .post(&url)
-                        .timeout(std::time::Duration::from_secs(5))
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {}
-                        Ok(r) => {
-                            tracing::warn!("Poke via HTTP failed: {}", r.status());
-                        }
-                        Err(e) => {
-                            tracing::warn!("Poke via HTTP failed: {e}");
-                        }
+                    if let Err(e) = poke_client.poke().await {
+                        tracing::warn!("Admin.Poke failed: {e}");
                     }
                 });
                 app.push_system_message("[poke: sent to daemon]".to_string());

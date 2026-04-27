@@ -9,6 +9,40 @@ service Status {
   rpc GetPosture(Empty) returns (Posture);
   rpc GetBudget(Empty) returns (Budget);
   rpc GetHeartbeat(Empty) returns (Heartbeat);
+
+  // Replace direct Database reads from the TUI status popup.
+  rpc GetEvolution(Empty) returns (EvolutionStateProto);
+  rpc GetBondState(Empty) returns (BondStateProto);
+  rpc GetBondEventsSince(Int64Cursor) returns (BondEventList);
+  rpc GetEvolutionEventsSince(Int64Cursor) returns (EvolutionEventList);
+  rpc GetVitalsEventsSince(Int64Cursor) returns (VitalsEventList);
+  rpc GetXp(Empty) returns (XpSnapshot);
+
+  // Pre-rendered text views for the TUI status popup. The daemon owns the
+  // formatters (which need rich data: HMAC chains, metadata_json, momentum,
+  // mood, readiness) so the cli stays close to its previous shape — it just
+  // renders the returned text. `card_width` lets the Overview tab size the
+  // evolution card to the popup's inner width; pass 0 for a sane default.
+  rpc GetStatusOverviewText(StatusTextRequest) returns (StatusText);
+  rpc GetEvolutionText(Empty) returns (StatusText);
+  rpc GetXpText(Empty) returns (StatusText);
+  rpc GetArchetypeScoresText(Empty) returns (StatusText);
+  rpc GetEvolutionHistoryText(Empty) returns (StatusText);
+}
+
+message StatusTextRequest {
+  // Total card width including borders for the evolution section. 0 = default.
+  uint32 card_width = 1;
+}
+
+// Pre-rendered text plus a few headline fields the cli renders specially
+// (e.g. the cyan `class:` line on the Overview tab).
+message StatusText {
+  // Multi-line body. Each section ends with a trailing blank line.
+  string text = 1;
+  // Compact "Name Lvl.X | Archetype" suitable for the Overview header line.
+  // Empty when evolution is disabled or the state is unavailable.
+  string compact_class_line = 2;
 }
 
 message Empty {}
@@ -23,6 +57,10 @@ message Vitals {
   // Stage name (Base/Evolved/Final).
   string stage = 6;
   uint64 xp = 7;
+  // Optional session-start drift notice (e.g. "agent has been quiet for X days").
+  // Empty when no drift detected. Computed daemon-side via
+  // `borg_core::vitals::detect_drift` + `format_drift_notice`.
+  string drift_notice = 8;
 }
 
 message Posture {
@@ -42,4 +80,69 @@ message Heartbeat {
   uint64 next_in_seconds = 1;
   // Last heartbeat unix timestamp (0 if never).
   uint64 last_unix_ts = 2;
+}
+
+// Cursor wrapper for "events since this unix timestamp" queries.
+message Int64Cursor { int64 since_unix = 1; }
+
+// Subset of borg_core::evolution::EvolutionState exposed over the wire.
+// `archetype_scores` keys are lowercase archetype names ("explorer",
+// "guardian", etc) so the client can render without re-importing the enum.
+message EvolutionStateProto {
+  string stage = 1; // "base"|"evolved"|"final"
+  uint64 total_xp = 2;
+  string name = 3; // empty when unnamed
+  uint32 level = 4;
+  string archetype = 5; // empty when no dominant
+  map<string, double> archetype_scores = 6;
+}
+
+// Subset of borg_core::bond::BondState plus the rolling rate metrics the
+// status popup currently reads from `bond.rs::compute_*` helpers.
+message BondStateProto {
+  double score = 1;
+  string level = 2; // "fragile"|"emerging"|"stable"|"trusted"|"synced"
+  double correction_rate = 3;
+  double routine_rate = 4;
+  uint32 pref_count = 5;
+}
+
+message BondEvent {
+  int64 timestamp = 1;
+  string kind = 2;
+  double delta = 3;
+  string note = 4;
+}
+message BondEventList { repeated BondEvent events = 1; }
+
+message EvolutionEvent {
+  int64 timestamp = 1;
+  string kind = 2;
+  double delta = 3;
+  string note = 4;
+}
+message EvolutionEventList { repeated EvolutionEvent events = 1; }
+
+message VitalsEvent {
+  int64 timestamp = 1;
+  string category = 2;
+  string source = 3;
+  int32 stability_delta = 4;
+  int32 focus_delta = 5;
+  int32 sync_delta = 6;
+  int32 growth_delta = 7;
+  int32 happiness_delta = 8;
+}
+message VitalsEventList { repeated VitalsEvent events = 1; }
+
+message XpEvent {
+  int64 timestamp = 1;
+  string source = 2;
+  uint32 amount = 3;
+}
+message XpSnapshot {
+  uint64 total_xp = 1;
+  uint32 level = 2;
+  uint64 next_level_xp = 3; // 0 = at max stage
+  repeated XpEvent recent_events = 4;
 }

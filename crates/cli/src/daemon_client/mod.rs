@@ -16,16 +16,20 @@ mod connect;
 mod event_stream;
 
 pub use connect::{connect, default_socket_path};
-pub use event_stream::spawn_event_adapter;
+pub use event_stream::{forward_event_stream, spawn_event_adapter};
 
 use anyhow::{anyhow, Context, Result};
 use borg_proto::admin::admin_client::AdminClient;
 use borg_proto::admin::{
-    ApprovedSenderList, ApprovedSenderRef, DaemonStatus, Empty as AdminEmpty, HealReport,
-    PairingApproval, PairingFilter, PairingRequestList, Project, ProjectCreate, ProjectList,
-    ProjectRef, ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskList,
-    ScheduledTaskRef, SessionDetail, SessionList, SessionRef, SettingKey, SettingMutation,
-    SettingsSnapshot,
+    ActivityLogQuery, ActivityLogText, AmbientStatus, ApiKeyList, ApiKeyRef, ApiKeyValue,
+    ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, DaemonStatus,
+    Empty as AdminEmpty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest,
+    HealReport, HeartbeatEvent as PbHeartbeatEvent, LogActivityRequest, MonthlyTokenTotal,
+    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
+    PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
+    ProjectUpdate, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
+    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, WarningList, WorkflowList,
 };
 use borg_proto::session::session_client::SessionClient;
 use borg_proto::session::{
@@ -33,6 +37,11 @@ use borg_proto::session::{
     CompactResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
     NewSessionResponse, OpenRequest, PromptResponse, RewindRequest, RewindResponse, SendRequest,
     SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+};
+use borg_proto::status::status_client::StatusClient;
+use borg_proto::status::{
+    BondEventList, BondStateProto, Empty as StatusEmpty, EvolutionEventList, EvolutionStateProto,
+    Int64Cursor, StatusText, StatusTextRequest, Vitals, VitalsEventList, XpSnapshot,
 };
 use tonic::transport::Channel;
 use tonic::Streaming;
@@ -45,14 +54,45 @@ pub use connect::connect_or_spawn;
 pub struct DaemonClient {
     session: SessionClient<Channel>,
     admin: AdminClient<Channel>,
+    status: StatusClient<Channel>,
 }
 
 impl DaemonClient {
+    /// Construct a client whose channel is lazily connected (and will fail
+    /// every RPC). Test-only — used by TUI unit tests that build an `App`
+    /// without spawning a real daemon.
+    ///
+    /// Internally enters a process-wide tokio runtime context so it works
+    /// from sync `#[test]` fns; tonic's `connect_lazy` spawns reactor tasks
+    /// at construction time.
+    ///
+    /// Gated to test builds so production binaries cannot accidentally
+    /// instantiate a permanently-disconnected client.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn lazy_for_tests() -> Self {
+        use std::sync::OnceLock;
+        static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let rt = RT.get_or_init(|| {
+            match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => panic!("lazy_for_tests: failed to build tokio runtime: {e}"),
+            }
+        });
+        let _guard = rt.enter();
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Self::from_channel(channel)
+    }
+
     /// Wrap an already-connected channel.
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             session: SessionClient::new(channel.clone()),
-            admin: AdminClient::new(channel),
+            admin: AdminClient::new(channel.clone()),
+            status: StatusClient::new(channel),
         }
     }
 
@@ -462,6 +502,59 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Queue a scheduled task for immediate execution.
+    pub async fn run_scheduled_task_now(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .run_scheduled_task_now(ScheduledTaskRef { id: id.to_string() })
+            .await
+            .context("Admin.RunScheduledTaskNow failed")?;
+        Ok(())
+    }
+
+    /// Fetch the most recent run history for a scheduled task.
+    pub async fn get_scheduled_task_runs(
+        &mut self,
+        id: &str,
+        limit: u32,
+    ) -> Result<ScheduledTaskRunList> {
+        Ok(self
+            .admin
+            .get_scheduled_task_runs(GetScheduledTaskRunsRequest {
+                id: id.to_string(),
+                limit,
+            })
+            .await
+            .context("Admin.GetScheduledTaskRuns failed")?
+            .into_inner())
+    }
+
+    /// Detailed view of a scheduled task: full row + last run summary.
+    pub async fn get_scheduled_task_detail(&mut self, id: &str) -> Result<ScheduledTaskDetail> {
+        Ok(self
+            .admin
+            .get_scheduled_task_detail(ScheduledTaskRef { id: id.to_string() })
+            .await
+            .context("Admin.GetScheduledTaskDetail failed")?
+            .into_inner())
+    }
+
+    /// Render a session via the daemon's export pipeline.
+    pub async fn export_session(
+        &mut self,
+        session_id: &str,
+        format: &str,
+    ) -> Result<ExportSessionResponse> {
+        Ok(self
+            .admin
+            .export_session(ExportSessionRequest {
+                session_id: session_id.to_string(),
+                format: format.to_string(),
+            })
+            .await
+            .context("Admin.ExportSession failed")?
+            .into_inner())
+    }
+
     // ── Pairing ───────────────────────────────────────────────────────────
 
     /// List pairing requests, optionally filtered by channel.
@@ -516,6 +609,374 @@ impl DaemonClient {
             .await
             .context("Admin.RevokeApprovedSender failed")?;
         Ok(())
+    }
+
+    /// Update a scheduled task. Empty-string fields are left unchanged
+    /// (mirrors `borg_core::db::UpdateTask`'s `Option<&str>` semantics).
+    pub async fn update_scheduled_task(
+        &mut self,
+        spec: ScheduledTaskUpdate,
+    ) -> Result<ScheduledTask> {
+        Ok(self
+            .admin
+            .update_scheduled_task(spec)
+            .await
+            .context("Admin.UpdateScheduledTask failed")?
+            .into_inner())
+    }
+
+    /// Mark a project archived (convenience over UpdateProject).
+    pub async fn archive_project(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .archive_project(ProjectRef { id: id.to_string() })
+            .await
+            .context("Admin.ArchiveProject failed")?;
+        Ok(())
+    }
+
+    /// Mark a project active (convenience over UpdateProject).
+    pub async fn unarchive_project(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .unarchive_project(ProjectRef { id: id.to_string() })
+            .await
+            .context("Admin.UnarchiveProject failed")?;
+        Ok(())
+    }
+
+    /// List workflows for a project (used by the projects popup workflow_count).
+    pub async fn list_workflows_by_project(&mut self, project_id: &str) -> Result<WorkflowList> {
+        Ok(self
+            .admin
+            .list_workflows_by_project(ProjectRef {
+                id: project_id.to_string(),
+            })
+            .await
+            .context("Admin.ListWorkflowsByProject failed")?
+            .into_inner())
+    }
+
+    /// Ambient status (the `class:` line in the TUI header).
+    pub async fn get_ambient_status(&mut self) -> Result<AmbientStatus> {
+        Ok(self
+            .admin
+            .get_ambient_status(AdminEmpty {})
+            .await
+            .context("Admin.GetAmbientStatus failed")?
+            .into_inner())
+    }
+
+    /// Latest doctor-run persistent warnings.
+    pub async fn get_persistent_warnings(&mut self) -> Result<WarningList> {
+        Ok(self
+            .admin
+            .get_persistent_warnings(AdminEmpty {})
+            .await
+            .context("Admin.GetPersistentWarnings failed")?
+            .into_inner())
+    }
+
+    // ── Status ────────────────────────────────────────────────────────────
+
+    /// Vitals snapshot — already decay-applied, with optional drift_notice.
+    pub async fn get_vitals(&mut self) -> Result<Vitals> {
+        Ok(self
+            .status
+            .get_vitals(StatusEmpty {})
+            .await
+            .context("Status.GetVitals failed")?
+            .into_inner())
+    }
+
+    /// Evolution state snapshot (replay-derived).
+    pub async fn get_evolution(&mut self) -> Result<EvolutionStateProto> {
+        Ok(self
+            .status
+            .get_evolution(StatusEmpty {})
+            .await
+            .context("Status.GetEvolution failed")?
+            .into_inner())
+    }
+
+    /// Bond state snapshot.
+    pub async fn get_bond_state(&mut self) -> Result<BondStateProto> {
+        Ok(self
+            .status
+            .get_bond_state(StatusEmpty {})
+            .await
+            .context("Status.GetBondState failed")?
+            .into_inner())
+    }
+
+    /// Bond events since a unix timestamp (DESC).
+    pub async fn get_bond_events_since(&mut self, since_unix: i64) -> Result<BondEventList> {
+        Ok(self
+            .status
+            .get_bond_events_since(Int64Cursor { since_unix })
+            .await
+            .context("Status.GetBondEventsSince failed")?
+            .into_inner())
+    }
+
+    /// Evolution events since a unix timestamp (DESC).
+    pub async fn get_evolution_events_since(
+        &mut self,
+        since_unix: i64,
+    ) -> Result<EvolutionEventList> {
+        Ok(self
+            .status
+            .get_evolution_events_since(Int64Cursor { since_unix })
+            .await
+            .context("Status.GetEvolutionEventsSince failed")?
+            .into_inner())
+    }
+
+    /// Vitals events since a unix timestamp (DESC).
+    pub async fn get_vitals_events_since(&mut self, since_unix: i64) -> Result<VitalsEventList> {
+        Ok(self
+            .status
+            .get_vitals_events_since(Int64Cursor { since_unix })
+            .await
+            .context("Status.GetVitalsEventsSince failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered text for the status popup's Overview tab. `card_width` is
+    /// the popup's inner width (passed verbatim to the daemon's evolution-card
+    /// formatter); pass 0 for a sane default.
+    pub async fn get_status_overview_text(&mut self, card_width: u32) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_status_overview_text(StatusTextRequest { card_width })
+            .await
+            .context("Status.GetStatusOverviewText failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered `/evolution` text for the status popup's Evolution tab.
+    pub async fn get_evolution_text(&mut self) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_evolution_text(StatusEmpty {})
+            .await
+            .context("Status.GetEvolutionText failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered `/xp` text for the status popup's XP tab.
+    pub async fn get_xp_text(&mut self) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_xp_text(StatusEmpty {})
+            .await
+            .context("Status.GetXpText failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered archetype-scores text for the status popup.
+    pub async fn get_archetype_scores_text(&mut self) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_archetype_scores_text(StatusEmpty {})
+            .await
+            .context("Status.GetArchetypeScoresText failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered evolution-history text for the status popup.
+    pub async fn get_evolution_history_text(&mut self) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_evolution_history_text(StatusEmpty {})
+            .await
+            .context("Status.GetEvolutionHistoryText failed")?
+            .into_inner())
+    }
+
+    /// XP snapshot (`/xp` data).
+    pub async fn get_xp(&mut self) -> Result<XpSnapshot> {
+        Ok(self
+            .status
+            .get_xp(StatusEmpty {})
+            .await
+            .context("Status.GetXp failed")?
+            .into_inner())
+    }
+
+    /// Ask the daemon to shut down gracefully. Returns once the daemon has
+    /// acknowledged the request — the daemon's drain loop runs in the
+    /// background. Subsequent `borg` invocations re-spawn the daemon.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.admin
+            .shutdown(AdminEmpty {})
+            .await
+            .context("Admin.Shutdown failed")?;
+        Ok(())
+    }
+
+    /// Generate + deliver a personalized greeting for a newly approved sender.
+    pub async fn send_approval_greeting(&mut self, channel: &str, sender_id: &str) -> Result<()> {
+        self.admin
+            .send_approval_greeting(ApprovalGreetingRequest {
+                channel: channel.to_string(),
+                sender_id: sender_id.to_string(),
+            })
+            .await
+            .context("Admin.SendApprovalGreeting failed")?;
+        Ok(())
+    }
+
+    /// Subscribe to heartbeat lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    pub async fn subscribe_heartbeat_events(&mut self) -> Result<Streaming<PbHeartbeatEvent>> {
+        Ok(self
+            .admin
+            .subscribe_heartbeat_events(AdminEmpty {})
+            .await
+            .context("Admin.SubscribeHeartbeatEvents failed")?
+            .into_inner())
+    }
+
+    /// Append a row to `activity_log` via the daemon (avoids opening the DB
+    /// from the cli).
+    pub async fn log_activity(&mut self, level: &str, source: &str, message: &str) -> Result<()> {
+        self.admin
+            .log_activity(LogActivityRequest {
+                level: level.to_string(),
+                source: source.to_string(),
+                message: message.to_string(),
+            })
+            .await
+            .context("Admin.LogActivity failed")?;
+        Ok(())
+    }
+
+    /// Pre-rendered activity-log tail. `min_level` accepts the same level
+    /// strings as `borg_core::db::query_activity` (`"error"`, `"warn"`,
+    /// `"info"`, `"debug"`, `"all"`); empty falls back to `"info"`.
+    pub async fn get_activity_log_text(
+        &mut self,
+        count: u32,
+        min_level: &str,
+        category: &str,
+    ) -> Result<ActivityLogText> {
+        Ok(self
+            .admin
+            .get_activity_log_text(ActivityLogQuery {
+                count,
+                min_level: min_level.to_string(),
+                category: category.to_string(),
+            })
+            .await
+            .context("Admin.GetActivityLogText failed")?
+            .into_inner())
+    }
+
+    /// Persist plugin install metadata + file hashes in a single round-trip.
+    pub async fn plugin_install(
+        &mut self,
+        req: PluginInstallRequest,
+    ) -> Result<PluginInstallResponse> {
+        Ok(self
+            .admin
+            .plugin_install(req)
+            .await
+            .context("Admin.PluginInstall failed")?
+            .into_inner())
+    }
+
+    // ── API key routing ──────────────────────────────────────────────────
+
+    /// Fetch the routing metadata for a provider's API key. Returns an
+    /// `ApiKeyValue` whose `body` is one of `literal`/`keychain`/`unset`.
+    /// The cli does the keychain lookup locally — the daemon only stores
+    /// the routing.
+    pub async fn get_api_key(&mut self, provider: &str) -> Result<ApiKeyValue> {
+        Ok(self
+            .admin
+            .get_api_key(ApiKeyRef {
+                provider: provider.to_string(),
+            })
+            .await
+            .context("Admin.GetApiKey failed")?
+            .into_inner())
+    }
+
+    /// Persist API-key routing metadata for `provider`. The body must be a
+    /// `literal` or `keychain` ref — `unset` is rejected here; use
+    /// [`unset_api_key`](Self::unset_api_key) to clear.
+    pub async fn set_api_key(&mut self, value: ApiKeyValue) -> Result<()> {
+        self.admin
+            .set_api_key(value)
+            .await
+            .context("Admin.SetApiKey failed")?;
+        Ok(())
+    }
+
+    /// Clear the stored routing metadata for `provider`. The cli is
+    /// responsible for deleting any companion keychain entry.
+    pub async fn unset_api_key(&mut self, provider: &str) -> Result<()> {
+        self.admin
+            .unset_api_key(ApiKeyRef {
+                provider: provider.to_string(),
+            })
+            .await
+            .context("Admin.UnsetApiKey failed")?;
+        Ok(())
+    }
+
+    /// List every provider with routing metadata stored, with the backend
+    /// kind ("literal" or "keychain") so the cli can render which backend
+    /// is in use without leaking the secret.
+    pub async fn list_api_keys(&mut self) -> Result<ApiKeyList> {
+        Ok(self
+            .admin
+            .list_api_keys(AdminEmpty {})
+            .await
+            .context("Admin.ListApiKeys failed")?
+            .into_inner())
+    }
+
+    // ── Onboarding ───────────────────────────────────────────────────────
+
+    /// Read the `onboarded` sentinel from the daemon's settings table.
+    pub async fn get_onboarding_state(&mut self) -> Result<OnboardingState> {
+        Ok(self
+            .admin
+            .get_onboarding_state(AdminEmpty {})
+            .await
+            .context("Admin.GetOnboardingState failed")?
+            .into_inner())
+    }
+
+    /// Mark first-run onboarding complete (`onboarded=true` in settings).
+    pub async fn set_onboarding_complete(&mut self) -> Result<()> {
+        self.admin
+            .set_onboarding_complete(AdminEmpty {})
+            .await
+            .context("Admin.SetOnboardingComplete failed")?;
+        Ok(())
+    }
+
+    /// Monthly token total across `token_usage` rows in the current calendar
+    /// month (UTC). Used by the TUI `/usage` view.
+    pub async fn get_monthly_token_total(&mut self) -> Result<MonthlyTokenTotal> {
+        Ok(self
+            .admin
+            .get_monthly_token_total(AdminEmpty {})
+            .await
+            .context("Admin.GetMonthlyTokenTotal failed")?
+            .into_inner())
+    }
+
+    /// Monthly cost total. `present=false` means there are no rows this
+    /// month — caller should hide the line rather than render `$0.00`.
+    pub async fn get_monthly_total_cost(&mut self) -> Result<MonthlyTotalCost> {
+        Ok(self
+            .admin
+            .get_monthly_total_cost(AdminEmpty {})
+            .await
+            .context("Admin.GetMonthlyTotalCost failed")?
+            .into_inner())
     }
 
     /// Daemon-wide status snapshot.

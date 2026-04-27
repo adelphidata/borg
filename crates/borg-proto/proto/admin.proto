@@ -30,9 +30,29 @@ service Admin {
   // Scheduled tasks.
   rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
   rpc CreateScheduledTask(ScheduledTaskCreate) returns (ScheduledTask);
+  rpc UpdateScheduledTask(ScheduledTaskUpdate) returns (ScheduledTask);
   rpc DeleteScheduledTask(ScheduledTaskRef) returns (Empty);
   rpc PauseScheduledTask(ScheduledTaskRef) returns (Empty);
   rpc ResumeScheduledTask(ScheduledTaskRef) returns (Empty);
+  rpc RunScheduledTaskNow(ScheduledTaskRef) returns (Empty);
+  rpc GetScheduledTaskRuns(GetScheduledTaskRunsRequest) returns (ScheduledTaskRunList);
+  rpc GetScheduledTaskDetail(ScheduledTaskRef) returns (ScheduledTaskDetail);
+
+  // Session export — renders one session via borg_core::export to bytes.
+  rpc ExportSession(ExportSessionRequest) returns (ExportSessionResponse);
+
+  // Project convenience: archive/unarchive (vs the lower-level UpdateProject).
+  rpc ArchiveProject(ProjectRef) returns (Empty);
+  rpc UnarchiveProject(ProjectRef) returns (Empty);
+
+  // Workflows scoped by project — used by the projects popup workflow_count.
+  rpc ListWorkflowsByProject(ProjectRef) returns (WorkflowList);
+
+  // Ambient header status (the `class: …` line in the TUI header).
+  rpc GetAmbientStatus(Empty) returns (AmbientStatus);
+
+  // Persistent doctor warnings — latest doctor_runs row's persistent_warnings.
+  rpc GetPersistentWarnings(Empty) returns (WarningList);
 
   // Pairing requests + approved senders.
   rpc ListPairingRequests(PairingFilter) returns (PairingRequestList);
@@ -42,6 +62,152 @@ service Admin {
 
   // Daemon-wide status snapshot (replaces several DB reads from the TUI).
   rpc GetDaemonStatus(Empty) returns (DaemonStatus);
+
+  // Run a quick agent turn to deliver a personalized greeting to a newly
+  // approved sender on the given channel. Fire-and-forget on the daemon side.
+  rpc SendApprovalGreeting(ApprovalGreetingRequest) returns (Empty);
+
+  // Subscribe to heartbeat lifecycle events from the daemon. The TUI uses
+  // this to render heartbeat status without running its own scheduler.
+  rpc SubscribeHeartbeatEvents(Empty) returns (stream HeartbeatEvent);
+
+  // Append a row to `activity_log`. Replaces direct DB writes from cli.
+  rpc LogActivity(LogActivityRequest) returns (Empty);
+
+  // Render the recent activity_log tail as a single formatted string,
+  // matching `borg_core::activity_log::format_activity_entry`. Used by the
+  // TUI `/logs` command so the cli no longer opens the SQLite DB directly.
+  rpc GetActivityLogText(ActivityLogQuery) returns (ActivityLogText);
+
+  // Persist plugin install metadata in a single round-trip. The cli still
+  // performs the on-disk install; this RPC writes the DB rows + file hashes.
+  rpc PluginInstall(PluginInstallRequest) returns (PluginInstallResponse);
+
+  // Onboarding sentinel — checks/sets the `onboarded` settings-table flag
+  // so the cli wizard knows whether first-run is complete.
+  rpc GetOnboardingState(Empty) returns (OnboardingState);
+  rpc SetOnboardingComplete(Empty) returns (Empty);
+
+  // Per-provider API key routing — the daemon stores routing metadata
+  // (literal value vs. keychain ref); the cli does the keychain I/O.
+  rpc GetApiKey(ApiKeyRef) returns (ApiKeyValue);
+  rpc SetApiKey(ApiKeyValue) returns (Empty);
+  rpc UnsetApiKey(ApiKeyRef) returns (Empty);
+  rpc ListApiKeys(Empty) returns (ApiKeyList);
+
+  // Token-budget aggregates used by the TUI `/usage` view. Replaces direct
+  // DB reads from the cli.
+  rpc GetMonthlyTokenTotal(Empty) returns (MonthlyTokenTotal);
+  rpc GetMonthlyTotalCost(Empty) returns (MonthlyTotalCost);
+}
+
+message MonthlyTokenTotal { uint64 total = 1; }
+// `present` distinguishes "no rows this month" (false) from "real $0.00"
+// (true). Real failure mode without this: a regression returning 0.0 on no
+// rows would silently render "$0.0000" in /usage instead of hiding the
+// estimated-cost line.
+message MonthlyTotalCost { double cost = 1; bool present = 2; }
+
+message KeychainRef {
+  string service = 1;
+  string account = 2;
+}
+
+message ApiKeyValue {
+  string provider = 1;
+  oneof body {
+    string literal = 2;
+    KeychainRef keychain = 3;
+    Empty unset = 4;
+  }
+}
+
+message ApiKeyRef { string provider = 1; }
+
+message ApiKeyEntry {
+  string provider = 1;
+  // "literal" | "keychain" | "unset"
+  string backend = 2;
+}
+
+message ApiKeyList { repeated ApiKeyEntry entries = 1; }
+
+message ApprovalGreetingRequest {
+  string channel = 1;
+  string sender_id = 2;
+}
+
+message HeartbeatEvent {
+  // "scheduled" or "session_start"
+  string source = 1;
+  int64 started_at_unix = 2;
+  int64 finished_at_unix = 3;
+  // "ran" | "skipped" | "failed"
+  string status = 4;
+  string message = 5;
+  double duration_ms = 6;
+}
+
+message OnboardingState {
+  // True when the `onboarded` settings-table key holds "true". The daemon
+  // is the single source of truth; the cli no longer probes the DB itself.
+  bool onboarded = 1;
+}
+
+message LogActivityRequest {
+  string level = 1;
+  string source = 2;
+  string message = 3;
+}
+
+message ActivityLogQuery {
+  // Max entries to fetch (capped at 200 server-side).
+  uint32 count = 1;
+  // Min level: "error" | "warn" | "info" | "debug" | "all". Empty = "info".
+  string min_level = 2;
+  // Optional category filter; empty = all categories.
+  string category = 3;
+}
+
+message ActivityLogText {
+  string text = 1;
+}
+
+message PluginFileHash {
+  string path = 1;
+  string hash = 2;
+}
+
+message PluginInstalledTool {
+  string name = 1;
+  string description = 2;
+  string runtime = 3;
+  string plugin_id = 4;
+}
+
+message PluginInstalledChannel {
+  string name = 1;
+  string description = 2;
+  string runtime = 3;
+  string plugin_id = 4;
+  string webhook = 5;
+}
+
+message PluginInstallRequest {
+  string plugin_id = 1;
+  string plugin_name = 2;
+  string kind = 3;
+  string category = 4;
+  repeated PluginFileHash file_hashes = 5;
+  PluginInstalledTool installed_tool = 6;
+  PluginInstalledChannel installed_channel = 7;
+  // JSON blob of credentials map to persist via set_setting("credentials", ...).
+  // Empty string = leave credentials unchanged.
+  string credentials_json = 8;
+}
+
+message PluginInstallResponse {
+  uint32 file_hashes_recorded = 1;
 }
 
 message Empty {}
@@ -128,7 +294,83 @@ message ScheduledTaskCreate {
   string task_type = 6;
   string delivery_channel = 7;
   string delivery_target = 8;
+  // 0 = unset (handler picks default).
+  int64 next_run_unix = 9;
+  // -1 = unset (lets DB default apply); >=0 = explicit.
+  int32 max_retries = 10;
+  // 0 = unset.
+  int64 timeout_ms = 11;
+  string allowed_tools = 12;
 }
+
+message ScheduledTaskRun {
+  int64 id = 1;
+  string task_id = 2;
+  int64 started_at_unix = 3;
+  int64 duration_ms = 4;
+  string status = 5;
+  string result = 6;
+  string error = 7;
+}
+message ScheduledTaskRunList { repeated ScheduledTaskRun runs = 1; }
+message GetScheduledTaskRunsRequest {
+  string id = 1;
+  uint32 limit = 2; // 0 = default
+}
+
+message ScheduledTaskDetail {
+  ScheduledTask task = 1;
+  int32 max_retries = 2;
+  int32 retry_count = 3;
+  int64 retry_after_unix = 4; // 0 = unset
+  string last_error = 5;
+  int64 timeout_ms = 6;
+  // Last-run convenience (zero/empty if no runs yet).
+  bool has_last_run = 7;
+  ScheduledTaskRun last_run = 8;
+}
+
+message ExportSessionRequest {
+  string session_id = 1;
+  // "json" | "csv" | "txt"
+  string format = 2;
+}
+message ExportSessionResponse {
+  bytes content = 1;
+  string suggested_filename = 2;
+}
+
+// Optional fields — empty string means "leave unchanged". Maps to
+// borg_core::db::UpdateTask whose `Option<&str>` semantics this mirrors.
+message ScheduledTaskUpdate {
+  string id = 1;
+  string name = 2;
+  string prompt = 3;
+  string schedule_type = 4;
+  string schedule_expr = 5;
+  string timezone = 6;
+}
+
+message WorkflowSummary {
+  string id = 1;
+  string title = 2;
+  string status = 3;
+}
+message WorkflowList { repeated WorkflowSummary workflows = 1; }
+
+message AmbientStatus {
+  // Empty when the agent is still the unnamed placeholder. The TUI
+  // formatter renders "Base Borg" in that case.
+  string evolution_name = 1;
+  uint32 level = 2;
+  // Lowercase mood string ("stable", "focused", "strained", "learning",
+  // "drifting", "ascending"). Empty if unset.
+  string mood = 3;
+  // Lowercase archetype string. Empty if no dominant archetype.
+  string archetype = 4;
+}
+
+message WarningList { repeated string warnings = 1; }
 
 // Pairing.
 message PairingFilter { string channel_name = 1; } // empty = all

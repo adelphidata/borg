@@ -3,12 +3,15 @@ mod key_handlers;
 mod render;
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use ratatui::layout::Rect;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+
+use crate::daemon_client::DaemonClient;
 
 use borg_core::agent::AgentEvent;
 use borg_core::config::{CollaborationMode, Config};
@@ -238,42 +241,32 @@ pub struct AmbientStatus {
 /// deliberately quiet — a System cell that scrolls away, not a banner.
 /// The report is also in `doctor_runs` and surfaced via `borg doctor`;
 /// this is just a nudge when something has been stuck across sweeps.
-pub(super) fn load_persistent_warning_notice() -> Option<String> {
-    let db = match borg_core::db::Database::open() {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!("persistent_warning_notice: DB open failed: {e:#}");
-            return None;
-        }
-    };
-    persistent_warning_notice_from_db(&db)
+pub(super) fn load_persistent_warning_notice(
+    client: &Arc<Mutex<DaemonClient>>,
+) -> Option<String> {
+    let warnings = block_on_client(client, |c| Box::pin(async move {
+        c.get_persistent_warnings().await
+    }))?;
+    persistent_warning_notice_from_warnings(&warnings.warnings)
 }
 
-/// Testable core of [`load_persistent_warning_notice`]. Takes an open DB
-/// and returns the same `Option<String>` based on the latest `doctor_runs`
-/// row. Extracted so tests can seed an in-memory DB.
-fn persistent_warning_notice_from_db(db: &borg_core::db::Database) -> Option<String> {
-    let report = match db.latest_doctor_run() {
-        Ok(r) => r?,
-        Err(e) => {
-            tracing::warn!("persistent_warning_notice: latest_doctor_run failed: {e:#}");
-            return None;
-        }
-    };
-    if report.persistent_warnings.is_empty() {
+/// Testable core of [`load_persistent_warning_notice`]. Takes the warning
+/// strings from the daemon and renders the startup notice.
+fn persistent_warning_notice_from_warnings(warnings: &[String]) -> Option<String> {
+    if warnings.is_empty() {
         return None;
     }
 
     // Cap the list to keep the startup notice quiet — 3 warnings max.
     const MAX_SHOWN: usize = 3;
-    let total = report.persistent_warnings.len();
+    let total = warnings.len();
     let shown = total.min(MAX_SHOWN);
     let extra = total - shown;
     let mut lines = Vec::with_capacity(shown + 2);
     lines.push(format!(
         "⚠ doctor: {total} persistent warning(s) — run `borg doctor` for details"
     ));
-    for w in report.persistent_warnings.iter().take(shown) {
+    for w in warnings.iter().take(shown) {
         lines.push(format!("  • {w}"));
     }
     if extra > 0 {
@@ -282,26 +275,68 @@ fn persistent_warning_notice_from_db(db: &borg_core::db::Database) -> Option<Str
     Some(lines.join("\n"))
 }
 
-/// Load the current ambient-status snapshot from the DB. Errors propagate to
-/// the caller so `refresh_ambient_status` can decide whether to clear the
+/// Load the current ambient-status snapshot via the daemon. Errors propagate
+/// to the caller so `refresh_ambient_status` can decide whether to clear the
 /// cache and log a single warning (rather than duplicate messages per step).
-fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
-    use borg_core::evolution;
-
-    let db = borg_core::db::Database::open()?;
-    let evo = db.get_evolution_state()?;
-    let vitals = db.get_vitals_state()?;
-    let bond_events = db.get_all_bond_events()?;
-    let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
-    let bond = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
-
-    let mood = evolution::compute_mood(&evo, &vitals, &bond);
-    Ok(AmbientStatus {
-        evolution_name: evo.evolution_name.clone(),
-        level: evo.level,
-        mood,
-        archetype: evo.dominant_archetype,
+fn load_ambient_status(client: &Arc<Mutex<DaemonClient>>) -> anyhow::Result<AmbientStatus> {
+    let snap = block_on_client(client, |c| {
+        Box::pin(async move { c.get_ambient_status().await })
     })
+    .ok_or_else(|| anyhow::anyhow!("ambient_status: daemon RPC unavailable"))?;
+
+    // Map proto strings back to typed enums. Empty/unknown values are
+    // tolerated — they collapse to "Base Borg" / no archetype / Stable mood
+    // in the formatter.
+    let archetype = if snap.archetype.is_empty() {
+        None
+    } else {
+        borg_core::evolution::Archetype::parse(&snap.archetype)
+    };
+    let mood = match snap.mood.as_str() {
+        "focused" => borg_core::evolution::Mood::Focused,
+        "strained" => borg_core::evolution::Mood::Strained,
+        "learning" => borg_core::evolution::Mood::Learning,
+        "drifting" => borg_core::evolution::Mood::Drifting,
+        "ascending" => borg_core::evolution::Mood::Ascending,
+        _ => borg_core::evolution::Mood::Stable,
+    };
+    Ok(AmbientStatus {
+        evolution_name: if snap.evolution_name.is_empty() {
+            None
+        } else {
+            Some(snap.evolution_name)
+        },
+        level: snap.level.min(u8::MAX as u32) as u8,
+        mood,
+        archetype,
+    })
+}
+
+/// Run a single admin/status RPC from a sync context. Returns `None` when
+/// no tokio runtime is current (test paths) or the RPC errors. Logs the
+/// error in the latter case.
+fn block_on_client<F, T>(client: &Arc<Mutex<DaemonClient>>, f: F) -> Option<T>
+where
+    F: for<'b> FnOnce(
+        &'b mut DaemonClient,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'b>>,
+{
+    let client = client.clone();
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let res = tokio::task::block_in_place(|| {
+        handle.block_on(async move {
+            let mut c = client.lock().await;
+            f(&mut c).await
+        })
+    });
+    match res {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!("daemon RPC failed: {e:#}");
+            None
+        }
+    }
 }
 
 pub enum AppAction {
@@ -389,6 +424,11 @@ pub struct App<'a> {
     pub config: Config,
     pub event_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>>,
+    /// Retained for symmetry with the legacy in-process heartbeat scheduler;
+    /// the daemon owns scheduling now so nothing in the TUI feeds events
+    /// back through this sender. Kept on the struct so re-introducing a
+    /// local fallback path is a one-liner if needed.
+    #[allow(dead_code)]
     pub heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>>,
     pub poke_tx: Option<mpsc::Sender<()>>,
     pub cancel_token: Option<CancellationToken>,
@@ -440,10 +480,10 @@ pub struct App<'a> {
     pub btw_result_rx: Option<mpsc::UnboundedReceiver<BtwResult>>,
     pub btw_result_tx: Option<mpsc::UnboundedSender<BtwResult>>,
     pub doctor_rx: Option<mpsc::Receiver<DoctorEvent>>,
-    /// Sender for notifying the config watcher of in-process changes.
-    pub config_notify_tx: Option<tokio::sync::mpsc::Sender<Config>>,
     /// Transient corner notifications; auto-expire.
     pub toasts: super::toast::ToastStack,
+    /// Shared daemon client for admin RPCs from popups + commands.
+    pub client: Arc<Mutex<DaemonClient>>,
 }
 
 impl<'a> App<'a> {
@@ -452,6 +492,7 @@ impl<'a> App<'a> {
         heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>>,
         heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>>,
         poke_tx: Option<mpsc::Sender<()>>,
+        client: Arc<Mutex<DaemonClient>>,
     ) -> Self {
         let blocked_paths = config.security.blocked_paths.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -506,24 +547,24 @@ impl<'a> App<'a> {
             btw_result_rx: None,
             btw_result_tx: None,
             doctor_rx: None,
-            config_notify_tx: None,
             toasts: super::toast::ToastStack::new(),
+            client,
         };
         app.refresh_ambient_status();
         // One-shot persistent-warning notice. Rendered once after the
         // opening card on TUI startup, then scrolls away like any other
         // System cell — intentionally *not* a pinned banner.
-        if let Some(text) = load_persistent_warning_notice() {
+        if let Some(text) = load_persistent_warning_notice(&app.client) {
             app.cells.push(super::history::HistoryCell::System { text });
         }
         app
     }
 
-    /// Refresh the cached `AmbientStatus` from the DB (evolution + vitals +
-    /// bond). Called from `App::new` and after every tool result. On any DB
-    /// error the status is cleared to `None` with a warning.
+    /// Refresh the cached `AmbientStatus` via the daemon. Called from
+    /// `App::new` and after every tool result. On RPC failure the status is
+    /// cleared to `None` with a warning.
     pub fn refresh_ambient_status(&mut self) {
-        self.ambient_status = match load_ambient_status() {
+        self.ambient_status = match load_ambient_status(&self.client) {
             Ok(s) => Some(s),
             Err(e) => {
                 tracing::warn!("ambient_status: refresh failed: {e:#}");
@@ -737,19 +778,12 @@ impl<'a> App<'a> {
             }
         };
 
-        let text = match borg_core::db::Database::open() {
-            Ok(db) => match db.query_activity(50, level_filter, None) {
-                Ok(entries) if entries.is_empty() => "No activity log entries.".to_string(),
-                Ok(entries) => entries
-                    .iter()
-                    .rev()
-                    .map(borg_core::activity_log::format_activity_entry)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                Err(e) => format!("Error querying activity log: {e}"),
-            },
-            Err(e) => format!("Error opening database: {e}"),
-        };
+        let level_arg = level_filter.unwrap_or("info").to_string();
+        let text = block_on_client(&self.client, move |c| {
+            Box::pin(async move { c.get_activity_log_text(50, &level_arg, "").await })
+        })
+        .map(|res| res.text)
+        .unwrap_or_else(|| "Error querying activity log via daemon".to_string());
 
         self.push_system_message(text);
         Ok(AppAction::Continue)
@@ -949,54 +983,30 @@ mod tests {
 
     fn make_app() -> App<'static> {
         let config = Config::default();
-        App::new(config, None, None, None)
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        App::new(config, None, None, None, client)
     }
 
     // ========================================================================
-    // persistent_warning_notice_from_db — one-shot TUI notice on startup.
-    // Uses an in-memory test DB so these tests don't touch ~/.borg/borg.db.
+    // persistent_warning_notice_from_warnings — pure rendering helper for the
+    // one-shot TUI notice. The daemon owns the doctor_runs read; the cli only
+    // formats the WarningList payload, so these tests drive the formatter
+    // directly without touching SQLite.
     // ========================================================================
 
-    fn test_db() -> borg_core::db::Database {
-        // `Database::test_db()` is cfg(test)-gated inside borg-core so we
-        // can't see it from the CLI crate. Build one via the public
-        // `from_connection` API using an in-memory SQLite connection —
-        // same result, just the long way round.
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        borg_core::db::Database::from_connection(conn).expect("init in-memory db")
-    }
-
-    fn seed_report(
-        db: &borg_core::db::Database,
-        persistent: Vec<&str>,
-    ) -> borg_core::maintenance::MaintenanceReport {
-        let report = borg_core::maintenance::MaintenanceReport {
-            ran_at: chrono::Utc::now().timestamp(),
-            persistent_warnings: persistent.into_iter().map(String::from).collect(),
-            ..Default::default()
-        };
-        db.record_doctor_run(&report).expect("record doctor run");
-        report
+    fn warns(s: &[&str]) -> Vec<String> {
+        s.iter().map(|w| (*w).to_string()).collect()
     }
 
     #[test]
-    fn notice_none_when_no_doctor_runs() {
-        let db = test_db();
-        assert!(persistent_warning_notice_from_db(&db).is_none());
-    }
-
-    #[test]
-    fn notice_none_when_last_run_had_no_persistent_warnings() {
-        let db = test_db();
-        seed_report(&db, vec![]);
-        assert!(persistent_warning_notice_from_db(&db).is_none());
+    fn notice_none_when_no_warnings() {
+        assert!(persistent_warning_notice_from_warnings(&[]).is_none());
     }
 
     #[test]
     fn notice_lists_single_warning() {
-        let db = test_db();
-        seed_report(&db, vec!["Memory:Index staleness"]);
-        let notice = persistent_warning_notice_from_db(&db).expect("notice present");
+        let notice = persistent_warning_notice_from_warnings(&warns(&["Memory:Index staleness"]))
+            .expect("notice present");
         assert!(
             notice.contains("1 persistent warning"),
             "expected count line, got: {notice}"
@@ -1016,9 +1026,10 @@ mod tests {
         // Five persistent warnings — first three shown inline, remaining two
         // collapsed into a single "… and N more" line so the startup notice
         // stays quiet even after prolonged neglect.
-        let db = test_db();
-        seed_report(&db, vec!["a:one", "a:two", "a:three", "a:four", "a:five"]);
-        let notice = persistent_warning_notice_from_db(&db).expect("notice present");
+        let notice = persistent_warning_notice_from_warnings(&warns(&[
+            "a:one", "a:two", "a:three", "a:four", "a:five",
+        ]))
+        .expect("notice present");
         assert!(notice.contains("5 persistent warning"));
         assert!(notice.contains("• a:one"));
         assert!(notice.contains("• a:two"));
@@ -1031,19 +1042,6 @@ mod tests {
             notice.contains("… and 2 more"),
             "expected overflow indicator, got: {notice}"
         );
-    }
-
-    #[test]
-    fn notice_reads_latest_run_only() {
-        // If a recent run cleared warnings, the older noisy run must not
-        // resurface — newest doctor_runs row wins.
-        let db = test_db();
-        seed_report(&db, vec!["old:warning"]);
-        // Wait a second so the second row's ran_at is strictly larger
-        // (doctor_runs orders by ran_at DESC).
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        seed_report(&db, vec![]);
-        assert!(persistent_warning_notice_from_db(&db).is_none());
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2800,7 +2798,8 @@ mod tests {
     fn poke_with_channel_sends_and_continues() {
         let config = Config::default();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
-        let mut app = App::new(config, None, None, Some(tx));
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, Some(tx), client);
         let result = app.try_handle_command("/poke");
         assert!(result.is_some());
         let action = result.unwrap().unwrap();
@@ -2826,7 +2825,8 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         // Fill the channel
         tx.try_send(()).unwrap();
-        let mut app = App::new(config, None, None, Some(tx));
+        let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
+        let mut app = App::new(config, None, None, Some(tx), client);
         let result = app.try_handle_command("/poke");
         assert!(result.is_some());
         let action = result.unwrap().unwrap();

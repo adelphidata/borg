@@ -16,6 +16,7 @@ borg-heartbeat = { path = "../heartbeat" }
 borg-gateway = { path = "../gateway" }
 borg-plugins = { path = "../plugins" }
 borg-proto = { path = "../borg-proto" }
+borgd = { path = "../borgd" }
 tonic = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }
@@ -63,9 +64,16 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
+[features]
+# Exposes test-only constructors (e.g. `DaemonClient::lazy_for_tests`) outside
+# of `cargo test`. Off by default so production binaries cannot accidentally
+# instantiate disconnected clients.
+test-helpers = []
+
 [dev-dependencies]
 rusqlite = { workspace = true }
 wiremock = "0.5"
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

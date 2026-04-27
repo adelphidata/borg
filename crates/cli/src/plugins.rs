@@ -290,9 +290,35 @@ pub fn add_plugin(name: &str) -> Result<()> {
     println!();
     println!("{} configured successfully.", def.description);
     if def.is_channel {
-        match crate::service::restart_service() {
-            Ok(()) => println!("Daemon restarted to activate {name} channel."),
-            Err(_) => println!("Gateway will start automatically when you run `borg`."),
+        // Stage E will switch this to a borgd_launcher restart. For now ask
+        // the daemon to shut down gracefully; the next `borg` invocation
+        // re-spawns it via `connect_or_spawn`, picking up the new channel.
+        let shutdown_ok = match tokio::runtime::Handle::try_current() {
+            Ok(h) => tokio::task::block_in_place(|| {
+                h.block_on(async {
+                    match crate::daemon_client::connect(None).await {
+                        Ok(mut client) => client.shutdown().await.is_ok(),
+                        Err(_) => false,
+                    }
+                })
+            }),
+            Err(_) => false,
+        };
+        if shutdown_ok {
+            println!("Daemon stopping to activate {name} channel; it will restart on next `borg` invocation.");
+        } else {
+            // Fall back to the legacy launchd/systemd restart so existing
+            // installations keep working.
+            let restart_result: Result<()> = match tokio::runtime::Handle::try_current() {
+                Ok(h) => tokio::task::block_in_place(|| {
+                    h.block_on(async { crate::borgd_launcher::restart_service().await })
+                }),
+                Err(_) => Err(anyhow::anyhow!("no tokio runtime available")),
+            };
+            match restart_result {
+                Ok(()) => println!("Daemon restarted to activate {name} channel."),
+                Err(_) => println!("Gateway will start automatically when you run `borg`."),
+            }
         }
 
         // Print pairing hint for native channels

@@ -15,7 +15,10 @@
 pub mod backend;
 pub mod buffer;
 pub mod convert;
+pub mod executor;
 pub mod prompts;
+
+pub use executor::DaemonSessionExecutor;
 
 use anyhow::{anyhow, Result};
 use backend::SessionBackend;

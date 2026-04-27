@@ -807,18 +807,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_command_intercepted_via_in_flight_registry() {
-        // Simulates the handler.rs interception path: a /cancel message finds
-        // the session's in-flight token in the global registry and cancels it.
-        use tokio_util::sync::CancellationToken;
-        let session_id = "test-session-cancel-intercept";
-        let token = CancellationToken::new();
-        crate::in_flight::GLOBAL
-            .register(session_id, token.clone())
-            .await;
+    async fn cancel_command_intercepted_via_session_executor() {
+        // Simulates the handler.rs interception path: a /cancel message
+        // routes to `SessionExecutor::cancel(session_id)`. Real failure mode:
+        // a regression that fails to call `cancel` on the executor would let
+        // a runaway turn keep emitting tokens after the user typed `/cancel`.
+        use crate::session_executor::{InboundTurn, SessionExecutor};
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        struct StubExec(Arc<AtomicBool>);
+
+        #[async_trait]
+        impl SessionExecutor for StubExec {
+            async fn start_turn(
+                &self,
+                _t: InboundTurn,
+            ) -> anyhow::Result<(
+                tokio::sync::mpsc::Receiver<borg_core::agent::AgentEvent>,
+                tokio_util::sync::CancellationToken,
+            )> {
+                anyhow::bail!("not used in this test")
+            }
+            async fn cancel(&self, _id: &str) -> bool {
+                self.0.store(true, Ordering::SeqCst);
+                true
+            }
+            async fn cancel_all(&self) -> usize {
+                0
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let exec: Arc<dyn SessionExecutor> = Arc::new(StubExec(flag.clone()));
         assert!(is_cancel_command("/cancel"));
-        assert!(crate::in_flight::GLOBAL.cancel(session_id).await);
-        assert!(token.is_cancelled());
+        assert!(exec.cancel("test-session").await);
+        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]

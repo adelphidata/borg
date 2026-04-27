@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use borg_core::config::Config;
-use borg_core::session::SessionMeta;
+use borg_proto::admin::SessionSummary;
+
+use crate::daemon_client::DaemonClient;
 
 use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
@@ -19,7 +24,7 @@ pub enum SessionAction {
 
 pub struct SessionsPopup {
     visible: bool,
-    sessions: Vec<SessionMeta>,
+    sessions: Vec<SessionSummary>,
     cursor: usize,
 }
 
@@ -36,10 +41,21 @@ impl SessionsPopup {
         self.visible
     }
 
-    pub fn show(&mut self) {
+    pub fn show(&mut self, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
         self.cursor = 0;
-        self.sessions = borg_core::session::list_sessions().unwrap_or_default();
+        self.sessions = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut c = client.lock().await;
+                match c.list_sessions().await {
+                    Ok(list) => list.sessions,
+                    Err(e) => {
+                        tracing::warn!("SessionsPopup: list_sessions failed: {e}");
+                        Vec::new()
+                    }
+                }
+            })
+        });
     }
 
     pub fn dismiss(&mut self) {
@@ -113,7 +129,9 @@ impl SessionsPopup {
         }
 
         for (i, session) in self.sessions.iter().enumerate() {
-            let date = &session.updated_at[..16.min(session.updated_at.len())];
+            let date = chrono::DateTime::from_timestamp(session.updated_unix_ts as i64, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_default();
             let title: String = session.title.chars().take(40).collect();
             let label = format!("  {title:<40} {} messages  {date}", session.message_count);
 
@@ -171,12 +189,11 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    fn make_session(id: &str, title: &str) -> SessionMeta {
-        SessionMeta {
+    fn make_session(id: &str, title: &str) -> SessionSummary {
+        SessionSummary {
             id: id.to_string(),
             title: title.to_string(),
-            created_at: "2025-01-01T00:00:00Z".to_string(),
-            updated_at: "2025-01-01T00:00:00Z".to_string(),
+            updated_unix_ts: 1_735_689_600, // 2025-01-01T00:00:00Z
             message_count: 5,
         }
     }

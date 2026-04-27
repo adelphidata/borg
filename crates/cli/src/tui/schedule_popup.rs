@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use borg_core::config::Config;
-use borg_core::db::ScheduledTaskRow;
+use borg_proto::admin::ScheduledTask;
+
+use crate::daemon_client::DaemonClient;
 
 use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
@@ -26,7 +31,7 @@ pub struct SchedulePopup {
 }
 
 struct TaskItem {
-    task: ScheduledTaskRow,
+    task: ScheduledTask,
     original_status: String,
     original_schedule_expr: String,
     pending_delete: bool,
@@ -62,28 +67,37 @@ impl SchedulePopup {
         self.visible
     }
 
-    pub fn show(&mut self) {
+    pub fn show(&mut self, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
         self.cursor = 0;
         self.phase = SchedulePhase::Browsing;
         self.status_message = None;
 
-        self.tasks = match borg_core::db::Database::open().and_then(|db| db.list_tasks()) {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|task| {
-                    let original_status = task.status.clone();
-                    let original_schedule_expr = task.schedule_expr.clone();
-                    TaskItem {
-                        task,
-                        original_status,
-                        original_schedule_expr,
-                        pending_delete: false,
+        self.tasks = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut c = client.lock().await;
+                match c.list_scheduled_tasks().await {
+                    Ok(list) => list
+                        .tasks
+                        .into_iter()
+                        .map(|task| {
+                            let original_status = task.status.clone();
+                            let original_schedule_expr = task.schedule_expr.clone();
+                            TaskItem {
+                                task,
+                                original_status,
+                                original_schedule_expr,
+                                pending_delete: false,
+                            }
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!("SchedulePopup: list_scheduled_tasks failed: {e}");
+                        Vec::new()
                     }
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+                }
+            })
+        });
     }
 
     pub fn dismiss(&mut self) {
@@ -282,12 +296,13 @@ impl SchedulePopup {
                 _ => "-",
             };
 
-            let next_str = item
-                .task
-                .next_run
-                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
-                .map(|dt| format!("Next: {}", dt.format("%Y-%m-%d %H:%M UTC")))
-                .unwrap_or_default();
+            let next_str = if item.task.next_run_unix > 0 {
+                chrono::DateTime::from_timestamp(item.task.next_run_unix, 0)
+                    .map(|dt| format!("Next: {}", dt.format("%Y-%m-%d %H:%M UTC")))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
 
             let label = format!(
                 "  [{check}] {:<28} {} {}",
@@ -395,7 +410,7 @@ mod tests {
     #[test]
     fn dismiss_hides_popup() {
         let mut popup = SchedulePopup::new();
-        popup.show();
+        popup.visible = true;
         assert!(popup.is_visible());
         popup.dismiss();
         assert!(!popup.is_visible());
@@ -404,7 +419,7 @@ mod tests {
     #[test]
     fn esc_dismisses() {
         let mut popup = SchedulePopup::new();
-        popup.show();
+        popup.visible = true;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         popup.handle_key(esc);
@@ -414,7 +429,7 @@ mod tests {
     #[test]
     fn no_changes_enter_returns_none() {
         let mut popup = SchedulePopup::new();
-        popup.show();
+        popup.visible = true;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let result = popup.handle_key(enter);
@@ -425,7 +440,7 @@ mod tests {
         let mut popup = SchedulePopup::new();
         popup.visible = true;
         popup.tasks.push(TaskItem {
-            task: ScheduledTaskRow {
+            task: ScheduledTask {
                 id: "test-1".into(),
                 name: "test task".into(),
                 prompt: "do something".into(),
@@ -433,17 +448,11 @@ mod tests {
                 schedule_expr: "0 9 * * *".into(),
                 timezone: "UTC".into(),
                 status: status.into(),
-                next_run: None,
+                next_run_unix: 0,
                 created_at: 0,
-                max_retries: 0,
-                retry_count: 0,
-                retry_after: None,
-                last_error: None,
-                timeout_ms: 60000,
-                delivery_channel: None,
-                delivery_target: None,
-                allowed_tools: None,
                 task_type: "prompt".into(),
+                delivery_channel: String::new(),
+                delivery_target: String::new(),
             },
             original_status: status.into(),
             original_schedule_expr: "0 9 * * *".into(),

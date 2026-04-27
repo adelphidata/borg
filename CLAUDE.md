@@ -2,6 +2,8 @@
 
 AI personal assistant agent built in Rust. The agent itself is the plugin system — it writes its own tools at runtime. Single binary, all integrations compiled in. Data directory: `~/.borg/`.
 
+> **Active migration in progress.** Borg is moving from a single-binary in-process REPL/TUI agent to a daemonized platform (`borgd` + gRPC + mTLS-paired clients + Layer 5 ingress adapters). See "Redesign In Progress (v1: gRPC daemon + mTLS)" at the bottom of this file, and the full spec at `docs/redesign/`. Sections above describe shipped behavior that still works during the migration; prefer the new architecture when adding code that touches the agent loop, transport, or ingress.
+
 ## Architecture
 
 Cargo workspace with 7 crates:
@@ -274,3 +276,157 @@ Add `crates/core/skills/<name>/SKILL.md` with YAML frontmatter (name, descriptio
 ### New Native Channel
 
 Add directory `crates/gateway/src/<name>/` with types, parse, api, verify modules. Register in `crates/gateway/src/server.rs` routes and `crates/gateway/src/channel_init.rs`.
+
+> Note: under the v1 redesign, native channels move into `borgd` as Layer 5 ingress adapters. New channels added now should be structured to port cleanly into the daemon — see Task 03 below.
+
+## Redesign In Progress (v1: gRPC daemon + mTLS)
+
+**Status:** Task 01 (daemon kernel + proto + DaemonClient) partially landed. Spec at `docs/redesign/`. The old in-process REPL/TUI still works during migration; do not delete in-process paths until the migration item explicitly removes them.
+
+**When in doubt, read the spec:** `docs/redesign/architecture-redesign.md` (overall), `auth-and-onboarding.md` (mTLS + PAKE), `approvals.md` (tier system), `llm-providers.md` (provider trait + budgets), `data-handling.md` (retention + backups), `security-posture.md` (3-state posture + XP multiplier), `threat-model.md`, `mobile.md`, plus per-task plans `tasks/01-daemon-grpc-kernel.md` … `tasks/05-posture-data-cleanup.md`.
+
+### Architecture Shift
+
+**From:** Single `borg` binary running REPL/TUI in-process; agent loop runs inside CLI process.
+
+**To:** Headless daemon (`borgd`) owns the agent loop, scheduled tasks, heartbeat, hooks, all ingress adapters, and is the **single SQLite writer**. Multiple clients connect as peers over gRPC: TUI, OpenAI-compat HTTP, native channels, MCP server, future mobile.
+
+**Preserved invariants:** "The agent just executes" (no per-tool-call approval prompts). Catastrophic-command denylist at sandbox layer. Mouse-selection rules in TUI. Evolution gameplay (XP, vitals, heartbeat) untouched in semantics — wiring moves to daemon.
+
+### New & Modified Crates
+
+| Crate | Status | Purpose |
+|-------|--------|---------|
+| `crates/borgd` | **new, partial** | Daemon binary. Async tokio runtime, flock single-instance, UDS gRPC listener. Owns agent loop (lifted from `crates/core/src/agent.rs`), `SessionHost` per-session broadcast, `PromptRegistry`, scheduled tasks, heartbeat, hooks, all ingress. |
+| `crates/borg-proto` | **new, evolving** | tonic gRPC schema. Services: `Session`, `Status`, `Capability`, `Admin`. Codegen for Rust now; future TS/Swift/Kotlin for v2 mobile. |
+| `crates/borg-pki` | not started | Internal CA: issue/renew/revoke certs, OS-keychain wrapping (macOS Keychain / Linux Secret Service or TPM / Windows DPAPI). Private keys never on disk. |
+| `crates/cli` | **migrating** | TUI rewriting from in-process agent to gRPC client. New `daemon_client/` submodule with ergonomic wrappers (`send_message_with_images`, `get_state`, `compact`, `undo`, `rewind`, admin RPCs). `crates/cli/src/service/` and `in_flight.rs` will be deleted. |
+| `crates/gateway` | **migrating** | 8 native channel adapters port into `borgd`. Crate will downgrade to thin re-exports or be removed once Task 03 lands. |
+| `crates/core` | **library only, no breaking API** | Tests still link it; both `borgd` and `cli` link it. Agent loop logic only invoked by `borgd` post-migration. Do not add new in-process orchestration here. |
+
+### Transport: gRPC over HTTP/2
+
+- Default bind: Unix domain socket `$BORG_HOME/borgd.sock` (loopback mode).
+- `--listen 127.0.0.1:PORT` opt-in for loopback TCP.
+- Services (`crates/borg-proto/proto/`):
+  - `Session` — `Open`, `Send` (multimodal: text + `Vec<InlineImage>`), `Stream` (resumable token deltas + tool events).
+  - `Status` — `Vitals`, `Posture`, `Budget`, `Heartbeat`.
+  - `Capability` — bidi-stream; clients advertise capabilities, daemon dispatches invocations.
+  - `Admin` — `Pair`, pairing/approval requests, sessions, scheduled tasks, projects, agent control (compact/undo/rewind), popups.
+- **Resumable event log** is the central primitive: every turn's events (token deltas, tool-call start/result, capability invocations, audit entries, memory writes, system events) get a monotonic per-session cursor. Clients subscribe with last-seen cursor; daemon replays missed events from `SessionHost` ring buffer on reconnect.
+
+### Auth & Pairing (Task 02)
+
+mTLS with daemon-internal CA. **No PEM files for users — pairing is PAKE-based with a short code.**
+
+- Daemon on first start: generates self-signed root CA (Ed25519, 5y) + server cert (90d, auto-renewed at 14d remaining). CA private key wrapped by OS keychain.
+- `borg pair --host <daemon>`: daemon shows 8-char base32 code + QR (5-min TTL, rate-limited). Client and daemon run SPAKE2/CPace PAKE handshake; within that channel the client generates an Ed25519 keypair and sends a self-signed cert + device identity. Daemon stores `(device_id, fingerprint, scope, paired_at)` in `paired_devices`.
+- Subsequent connections: standard mTLS with pinned-fingerprint verification on both sides. No PAKE replay.
+- Silent renewal at 14d-to-expiry via `/internal/renew`.
+- **Verifiers (v1):** `TofuVerifier` (default — first connection pins) and `TailscaleVerifier` (opt-in — uses `tailscale whois`).
+
+**Scope tiers (audit categorization, NOT prompts — see Approvals below):**
+- `Read` (T0): `read_file`, `list_dir`, `web_fetch`, `memory_search`.
+- `Write` (T1): `apply_patch`, `write_memory`.
+- `Execute` (T2): `run_shell` in sandbox.
+- `Privileged` (T3): host fs outside `BORG_HOME`, network egress beyond approved hosts, credential mutation.
+
+Listener has `max_tier` ceiling. Even a `Privileged` device is capped by the listener it connected through. Channel senders never grant `Privileged`.
+
+### Capability Protocol & Layer 5 Ingress (Task 03)
+
+Clients advertise capabilities on connect; daemon's tool registry routes capability-tools to best-available client, falling back to daemon-side execution.
+
+**v1 capabilities:** `terminal.exec`, `file.pick`, `clipboard.read`, `clipboard.write` (TUI/future web); `host.run_shell` (daemon-side, sandboxed — default for `run_shell`); `host.read_file` (daemon-side).
+
+**Layer 5 adapters (all live in `borgd`):**
+1. **Native channels (8):** Telegram, Slack, Discord, Teams, Google Chat, Signal, Twilio, iMessage (macOS-only). Ported from `crates/gateway`. Webhook-signature auth, sender-approval flow, per-channel tier ceiling preserved.
+2. **OpenAI-compat HTTP:** `/v1/chat/completions` (stream + non-stream), `GET /v1/models`. Bearer token (mapped to paired-device cert) or direct mTLS. Unlocks ChatBox, Open WebUI, LobeChat, official OpenAI SDKs.
+3. **Generic webhook:** `POST /v1/webhook/{name}`, HMAC-SHA256, user-provided JSONPath for `sender_id`/`thread_id`/`body`.
+4. **MCP server:** Read-only tools (`memory_search`, `read_memory`, `web_fetch`, `web_search`) over stdio + HTTP.
+
+### LLM Providers & Budgets (Task 04)
+
+- Unified `Provider` trait. Compiled-in: OpenAI, Anthropic, Gemini, Groq, DeepSeek, OpenRouter, Ollama, Claude Code CLI, BYO-endpoint.
+- Categories: `PublicCloud`, `Local`, `BYOEndpoint`.
+- **Versioned `provider_rate_cards`** keyed by `(provider_id, model, effective_at)`. Bundled with binary; opt-in refresh via `borg providers refresh-rates` against signed manifest. **Never auto-fetch.** Replay computes historical USD with the rate card active at the time.
+- Pre-flight: `count_tokens` estimate + USD via rate card. Post-flight: reconcile with provider's actual token counts.
+- Budgets v1: single global `default` scope (soft $5, hard $20, daily reset; configurable). Soft cap = one toast per period. Hard cap = next call refused (current LLM call finishes — no mid-stream cancellation; `approvals.md` forbids it as token-wasting).
+- Air-gap: `[providers] outbound_allowed = false` rejects non-`Local` providers and contributes to `Boosted` posture.
+
+### Approvals — Hard Invariant Reaffirmed
+
+**No per-tool-call approval prompts. The agent just executes.** This survives the redesign unchanged.
+
+- Tier system above is **audit categorization only** in v1 — never blocks, never prompts.
+- T3 actions surface retroactively in `/status` and emit high-priority audit events. They do not interrupt the loop.
+- Catastrophic denylist (`rm -rf /`, `mkfs`, `dd if=/dev/zero`, `curl|sh`) enforced at sandbox layer, no override.
+- Budgets are the only blocker, and only at the boundary between LLM calls.
+- T3 user prompting is deferred to **v3 (Sentry)**, gated on a future cargo feature.
+
+### Posture v2 (Task 05)
+
+Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
+
+| State | Multiplier | Trigger |
+|-------|------------|---------|
+| `Reduced` | ×0.85 | Any deliberate downgrade: sandbox off, privileged channel, `blocked_paths` unset, denylist tampered, public listener with no auth. |
+| `Default` | ×1.00 | Fresh install. Loopback only, sandbox on, audit chain on, no privileged channels, denylist intact. |
+| `Boosted` | ×1.10 | All `Default` conditions plus ≥1 mTLS or Tailscale listener (daemon reachable from a paired remote device or tailnet). |
+
+- Posture transitions emit `security_posture_changed` events into the HMAC hash chain. Rate-limited 2/hr (anti-flip-flop XP farming).
+- Replay reads posture from the chain only, never live config — deterministic XP recomputation.
+- `xp_gain` events carry `xp_breakdown` (base, align bonus, state multiplier, pre/post-clamp, final) and `posture_event_seq` cross-reference.
+- UX: `/evolution` shows posture line; `/xp` header shows current posture + weekly avg multiplier; toast on transition. Discovery is opt-in.
+
+### Data Handling
+
+- Retention: global `retention_days` (default NULL = forever), `purge_policy` (auto / on_demand_only / never). Daily maintenance task purges messages, audit events, blobs past cutoff.
+- **Tombstone-on-purge in audit chain:** purge replaces `event_json` with `{purged: true, purged_at: ts}` while keeping `prev_hash`/`hash` intact. `borg audit verify` distinguishes `PurgedTombstone` (non-failure) from `Tampered`.
+- Backup unit (v1): single tarball of `$BORG_HOME` (SQLite, blobs, audit chain, config, internal CA + cert metadata). **mTLS private keys live in OS keychain and are NOT in the tarball** — restoring on a new host requires re-pairing.
+- Commands: `borg backup create [--passphrase-from <fd>]`, `borg backup verify <file>`, `borg backup restore <file> [--force]`.
+- Self-healing: weekly auto-backup, keep last 3 (configurable 0–52).
+
+### New Tables (v1)
+
+- `listeners(id, bind, auth_backend, max_tier, fail_closed, enabled, created_at, updated_at)`
+- `paired_devices(id, fingerprint, owner_label, key_storage_tier, scope_json, paired_at, last_seen_at, status, principal_id)`
+- `revoked_fingerprints(fingerprint, revoked_at, reason)`
+- `pairing_codes(code_hash, expires_at, intent, created_by)`
+- `audit_log_chain(seq, prev_hash, hash, event_json, ts, principal_id)` — hash-chained, blake3
+- `internal_ca_certs(serial, kind, pem, issued_at, expires_at, revoked_at)`
+- `provider_rate_cards(provider_id, model, effective_at, …)` — versioned, replay-safe
+
+### Task Status
+
+| Task | Scope | Status |
+|------|-------|--------|
+| **01** Daemon kernel + gRPC + TUI client migration | `borgd` binary, `borg-proto`, `DaemonClient`, port TUI off in-process agent | **Partial** — see below |
+| **02** mTLS + PAKE pairing + audit chain | `borg-pki`, pairing flow, verifiers, hash-chained audit | Not started (depends on 01) |
+| **03** Layer 5 adapters | Port 8 channels into `borgd`; OpenAI-compat HTTP; webhook; MCP server | Not started (depends on 01) |
+| **04** Provider trait + rate cards + budgets | Unified `Provider`, versioned rate cards, soft/hard budgets, air-gap | Not started |
+| **05** Posture v2 + data handling + cleanup | 3-state posture, retention, tombstone, backups, dead-code sweep, docs | Not started |
+
+**Task 01 — landed so far** (commits `81476b4` → `ad28b67`):
+- `borgd` daemon: flock single-instance, UDS listener, `Session`/`Capability`/`Status`/`Admin` services scaffolded.
+- `SessionHost` per-session broadcast + ring buffer for resumable events.
+- `PromptRegistry` for pairing/approval requests.
+- `crates/borg-proto` with extended `Session`/`Admin` (multimodal Send with `Vec<InlineImage>`, agent control, scheduling, projects, pairing, sessions, popups).
+- `DaemonClient` ergonomic wrappers (`send_message_with_images`, `get_state`, `compact`, `undo`, `rewind`, admin RPCs).
+- `borg ask` REPL one-shot migrated to `DaemonClient` + pb→core event adapter.
+- In-process gateway spawn from `service::` hooked into `borgd`.
+- Per-session turn serialization; `close` cancels in-flight; concurrent `Send` no longer silently stalls.
+
+**Task 01 — remaining:**
+- TUI runtime rewrite: replace agent lock + `run_event_loop` match arms with `DaemonClient` calls; popups read via admin RPCs (no direct DB).
+- `crates/gateway/src/handler.rs` → `DaemonClient`.
+- Heartbeat scheduler + gateway server spawn move into `borgd`.
+- Delete `crates/cli/src/service/` and `crates/gateway/src/in_flight.rs` once unused.
+- Compile-time guard tests: no `rusqlite` or `borg_core::db` import in `crates/cli`; single-writer flock; capability routing fallback path.
+
+### Forward Compatibility (v2 mobile, v3 multi-tenancy/Sentry)
+
+- **Every event carries `principal_id`** — defaulted to single device-owner in v1; v3 multi-tenancy is additive, not migrative.
+- **Posture has `schema_version`** — v3 5-bucket ladder won't break v1 hash chains.
+- **Capability protocol** — same protocol carries v2 mobile capabilities (camera, mic, biometric, location, push) and v3 enterprise verifiers (StaticX509, VaultPki, StepCa).
+- **No design choice in v1 should preclude:** workspaces (per-user memory), agency-PKI verifiers, FIPS 140-3, SCIM/LDAP JML, M-of-N admin quorum, Shamir KEK escrow, T3 approval prompts, per-workspace budgets, NIST 800-53 crosswalk, `sentry-strict` cargo feature.

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -5,11 +7,19 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use borg_core::config::Config;
 
+use crate::daemon_client::DaemonClient;
+
 use super::app::{AppAction, PopupHandler};
 use super::theme;
+
+/// Number of fixed banner lines (BORG / name / model) at the top of the
+/// Overview tab. Used by the resize path to splice in fresh body lines
+/// without clobbering the banner.
+const OVERVIEW_BANNER_LINES: usize = 3;
 
 /// Tabs available in the status popup. Each variant routes the body of the
 /// popup to a distinct content builder.
@@ -66,16 +76,15 @@ pub struct StatusPopup {
     visible: bool,
     scroll_offset: usize,
     lines: Vec<Line<'static>>,
-    /// Cached evolution state for rebuilding on resize (Overview tab only).
-    evo_state: Option<borg_core::evolution::EvolutionState>,
-    /// Index in `lines` where the evolution section starts (Overview tab only).
-    evo_line_start: usize,
-    /// Number of lines the evolution section occupies (Overview tab only).
-    evo_line_count: usize,
-    /// Last rendered inner width (for detecting resize).
+    /// Last rendered inner width (for detecting resize). 0 means "not yet
+    /// rendered"; on first render the Overview tab refetches at the real
+    /// width to size the evolution card correctly.
     last_width: u16,
     /// Which tab is currently displayed.
     current_tab: StatusTab,
+    /// Daemon client for status RPCs. `None` only in unit tests where the
+    /// popup is poked at via direct field access (no `show()` call).
+    client: Option<Arc<Mutex<DaemonClient>>>,
 }
 
 impl StatusPopup {
@@ -84,11 +93,9 @@ impl StatusPopup {
             visible: false,
             scroll_offset: 0,
             lines: Vec::new(),
-            evo_state: None,
-            evo_line_start: 0,
-            evo_line_count: 0,
             last_width: 0,
             current_tab: StatusTab::Overview,
+            client: None,
         }
     }
 
@@ -103,29 +110,28 @@ impl StatusPopup {
     }
 
     /// Open the popup on the default `Overview` tab.
-    pub fn show(&mut self, config: &Config) {
+    pub fn show(&mut self, config: &Config, client: &Arc<Mutex<DaemonClient>>) {
         self.current_tab = StatusTab::Overview;
+        self.client = Some(client.clone());
         self.reload(config);
     }
 
     /// Open the popup on a specific tab.
-    pub fn show_tab(&mut self, config: &Config, tab: StatusTab) {
+    pub fn show_tab(&mut self, config: &Config, tab: StatusTab, client: &Arc<Mutex<DaemonClient>>) {
         self.current_tab = tab;
+        self.client = Some(client.clone());
         self.reload(config);
     }
 
-    /// Rebuild the popup content for the current tab.
+    /// Rebuild the popup content for the current tab via daemon RPCs.
     fn reload(&mut self, config: &Config) {
         self.visible = true;
         self.scroll_offset = 0;
         self.lines.clear();
-        self.evo_state = None;
-        self.evo_line_start = 0;
-        self.evo_line_count = 0;
         self.last_width = 0;
 
         match self.current_tab {
-            StatusTab::Overview => self.build_overview(config),
+            StatusTab::Overview => self.build_overview(config, 0),
             StatusTab::Evolution => self.build_evolution(),
             StatusTab::Xp => self.build_xp(),
             StatusTab::ArchetypeScores => self.build_archetype_scores(config),
@@ -133,7 +139,31 @@ impl StatusPopup {
         }
     }
 
-    fn build_overview(&mut self, config: &Config) {
+    /// Run a daemon RPC from the sync popup-handler context. Mirrors the
+    /// pattern used by `projects_popup` etc.
+    fn block_on_rpc<F, T>(&self, f: F) -> Option<T>
+    where
+        F: for<'b> FnOnce(
+            &'b mut DaemonClient,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<T>> + Send + 'b>,
+        >,
+    {
+        let client = self.client.clone()?;
+        // `try_current` so unit tests that build an `App` outside the daemon
+        // event loop (no active tokio runtime in scope) don't panic; they
+        // simply skip the RPC and the popup falls back to its
+        // "Status unavailable." path.
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                let mut c = client.lock().await;
+                f(&mut c).await.ok()
+            })
+        })
+    }
+
+    fn build_overview(&mut self, config: &Config, card_width: u32) {
         let version = env!("CARGO_PKG_VERSION");
         let name = config.user.agent_name.as_deref().unwrap_or("Borg");
 
@@ -157,117 +187,44 @@ impl StatusPopup {
             Span::from(config.llm.model.clone()),
         ]));
 
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(_) => {
-                self.push_section("Database unavailable.");
+        let snap = self.block_on_rpc(move |c| Box::pin(c.get_status_overview_text(card_width)));
+        let snap = match snap {
+            Some(s) => s,
+            None => {
+                tracing::warn!("status_popup: overview RPC failed");
+                self.push_section("Status unavailable.");
                 return;
             }
         };
 
-        // Evolution (fetch once, reuse for multiple sections)
-        let evo_state = if config.evolution.enabled {
-            db.get_evolution_state().ok()
-        } else {
-            None
-        };
-
-        if let Some(ref evo) = evo_state {
-            let compact = borg_core::evolution::format_compact(evo);
+        if !snap.compact_class_line.is_empty() {
             self.lines.push(Line::from(vec![
                 Span::styled("class: ", theme::dim()),
-                Span::styled(compact, Style::default().fg(theme::CYAN)),
+                Span::styled(
+                    snap.compact_class_line,
+                    Style::default().fg(theme::CYAN),
+                ),
             ]));
             self.lines.push(Line::default());
-            self.evo_line_start = self.lines.len();
-            self.push_section(&borg_core::evolution::format_status_section(evo));
-            self.evo_line_count = self.lines.len() - self.evo_line_start;
-            self.evo_state = Some(evo.clone());
         }
-
-        // Vitals
-        let now = chrono::Utc::now();
-        if let Ok(state) = db.get_vitals_state() {
-            let state = borg_core::vitals::apply_decay(&state, now);
-            let mut drift = borg_core::vitals::detect_drift(&state, now);
-            let since = (now - chrono::Duration::days(7)).timestamp();
-            let events = db.vitals_events_since(since).unwrap_or_default();
-            if borg_core::vitals::detect_failure_drift(&events) {
-                drift.push(borg_core::vitals::DriftFlag::RepeatedFailures);
-            }
-            self.push_section(&borg_core::vitals::format_status(&state, &events, &drift));
-        }
-
-        // Bond
-        if let Ok(bond_events) = db.get_all_bond_events() {
-            let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
-            let bond_state = borg_core::bond::replay_events_with_key(&bond_key, &bond_events);
-            let correction_rate = borg_core::bond::compute_correction_rate(&db);
-            let routine_rate = borg_core::bond::compute_routine_success_rate(&db);
-            let pref_count = borg_core::bond::compute_preference_learning_count(&db);
-            let since = (now - chrono::Duration::days(7)).timestamp();
-            let recent = db.bond_events_since(since).unwrap_or_default();
-            self.push_section(&borg_core::bond::format_status(
-                &bond_state,
-                correction_rate,
-                routine_rate,
-                pref_count,
-                &recent,
-            ));
-        }
-
-        // Archetype scores
-        if let Some(ref evo) = evo_state {
-            self.push_section(&borg_core::evolution::format_archetype_scores(evo));
-        }
-
-        // Evolution history
-        if config.evolution.enabled {
-            if let Ok(events) = db.evolution_events_since(0) {
-                let mut events = events;
-                events.reverse();
-                self.push_section(&borg_core::evolution::format_history(&events));
-            }
-        }
+        self.push_section(&snap.text);
     }
 
     fn build_evolution(&mut self) {
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("status_popup: db open failed: {e}");
-                self.push_section("Database unavailable.");
-                return;
-            }
-        };
-        match borg_core::evolution::commands::dispatch(
-            borg_core::evolution::commands::EvolutionCommand::Evolution,
-            &db,
-        ) {
-            Ok(out) => self.push_section(&out.text),
-            Err(e) => {
-                tracing::warn!("status_popup: /evolution dispatch failed: {e}");
+        match self.block_on_rpc(|c| Box::pin(c.get_evolution_text())) {
+            Some(snap) => self.push_section(&snap.text),
+            None => {
+                tracing::warn!("status_popup: /evolution RPC failed");
                 self.push_section("Evolution unavailable.");
             }
         }
     }
 
     fn build_xp(&mut self) {
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("status_popup: db open failed: {e}");
-                self.push_section("Database unavailable.");
-                return;
-            }
-        };
-        match borg_core::evolution::commands::dispatch(
-            borg_core::evolution::commands::EvolutionCommand::Xp,
-            &db,
-        ) {
-            Ok(out) => self.push_section(&out.text),
-            Err(e) => {
-                tracing::warn!("status_popup: /xp dispatch failed: {e}");
+        match self.block_on_rpc(|c| Box::pin(c.get_xp_text())) {
+            Some(snap) => self.push_section(&snap.text),
+            None => {
+                tracing::warn!("status_popup: /xp RPC failed");
                 self.push_section("XP unavailable.");
             }
         }
@@ -278,18 +235,10 @@ impl StatusPopup {
             self.push_section("Evolution system is disabled.");
             return;
         }
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("status_popup: db open failed: {e}");
-                self.push_section("Database unavailable.");
-                return;
-            }
-        };
-        match db.get_evolution_state() {
-            Ok(state) => self.push_section(&borg_core::evolution::format_archetype_scores(&state)),
-            Err(e) => {
-                tracing::warn!("status_popup: evolution state unavailable: {e}");
+        match self.block_on_rpc(|c| Box::pin(c.get_archetype_scores_text())) {
+            Some(snap) => self.push_section(&snap.text),
+            None => {
+                tracing::warn!("status_popup: archetype-scores RPC failed");
                 self.push_section("Archetype scores unavailable.");
             }
         }
@@ -300,21 +249,10 @@ impl StatusPopup {
             self.push_section("Evolution system is disabled.");
             return;
         }
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("status_popup: db open failed: {e}");
-                self.push_section("Database unavailable.");
-                return;
-            }
-        };
-        match db.evolution_events_since(0) {
-            Ok(mut events) => {
-                events.reverse();
-                self.push_section(&borg_core::evolution::format_history(&events));
-            }
-            Err(e) => {
-                tracing::warn!("status_popup: history unavailable: {e}");
+        match self.block_on_rpc(|c| Box::pin(c.get_evolution_history_text())) {
+            Some(snap) => self.push_section(&snap.text),
+            None => {
+                tracing::warn!("status_popup: history RPC failed");
                 self.push_section("History unavailable.");
             }
         }
@@ -395,25 +333,32 @@ impl StatusPopup {
             inner.height.saturating_sub(1),
         );
 
-        // Rebuild evolution card section if width changed (Overview only).
+        // Refetch the Overview tab body at the real width on first render and
+        // any subsequent resize. The banner (BORG / name / model) stays
+        // intact; only the body lines (class + sections) are replaced.
         if self.current_tab == StatusTab::Overview && content.width != self.last_width {
             self.last_width = content.width;
-            let rebuilt = self.evo_state.as_ref().map(|evo| {
-                // Card width = inner width minus 2 chars indent on each side
-                let card_width = (content.width as usize).saturating_sub(4);
-                let section =
-                    borg_core::evolution::format_status_section_with_width(evo, card_width);
-                section
-                    .lines()
-                    .map(|l| Line::from(l.to_string()))
-                    .chain(std::iter::once(Line::default()))
-                    .collect::<Vec<Line<'static>>>()
-            });
-            if let Some(new_lines) = rebuilt {
-                let end = (self.evo_line_start + self.evo_line_count).min(self.lines.len());
-                let count = new_lines.len();
-                self.lines.splice(self.evo_line_start..end, new_lines);
-                self.evo_line_count = count;
+            let card_width = (content.width as u32).saturating_sub(4);
+            if let Some(snap) =
+                self.block_on_rpc(move |c| Box::pin(c.get_status_overview_text(card_width)))
+            {
+                // Preserve the first 3 banner lines built in `build_overview`.
+                self.lines.truncate(OVERVIEW_BANNER_LINES);
+                self.scroll_offset = 0;
+                if !snap.compact_class_line.is_empty() {
+                    self.lines.push(Line::from(vec![
+                        Span::styled("class: ", theme::dim()),
+                        Span::styled(
+                            snap.compact_class_line,
+                            Style::default().fg(theme::CYAN),
+                        ),
+                    ]));
+                    self.lines.push(Line::default());
+                }
+                for line in snap.text.lines() {
+                    self.lines.push(Line::from(line.to_string()));
+                }
+                self.lines.push(Line::default());
             }
         }
 
@@ -475,7 +420,10 @@ impl PopupHandler for StatusPopup {
         config: &mut Config,
     ) -> Result<Option<AppAction>> {
         if let Some(_new_tab) = self.handle_key(key) {
-            // Rebuild content for the newly-selected tab.
+            // Rebuild content for the newly-selected tab. `client` was set on
+            // `show()`; if the popup got here without a client, `reload` will
+            // log a warning and surface "Status unavailable." rather than
+            // panic.
             self.reload(config);
         }
         Ok(None)

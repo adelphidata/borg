@@ -1,8 +1,9 @@
 //! `borg export <session_id> [--format json|csv|txt] [--output PATH]`
 //!
-//! Thin wrapper over `borg_core::export::export_session`. The same function
-//! powers the TUI `/export` command and the `e` key in the `/sessions` popup,
-//! so formatting stays consistent across surfaces.
+//! Thin wrapper over `Admin.ExportSession` (daemon-side) which in turn calls
+//! `borg_core::export::export_session`. Routing through the daemon keeps the
+//! cli a single-writer client and matches the same code path used by the TUI
+//! `/export` command and the `e` key in the `/sessions` popup.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -10,27 +11,36 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
-use borg_core::db::Database;
-use borg_core::export::{export_session, ExportFormat, ExportOptions};
+use borg_core::export::ExportFormat;
+
+use crate::daemon_client::connect_or_spawn;
 
 /// Run `borg export`. With `output=None`, writes to stdout (pipeable).
 pub(crate) fn run_export(session_id: &str, format: &str, output: Option<PathBuf>) -> Result<()> {
-    let format = ExportFormat::from_str(format)?;
-    let db = Database::open().context("opening database")?;
-    let (rendered, _suggested) = export_session(&db, session_id, ExportOptions { format })?;
+    // Validate locally before the round-trip. The daemon validates again, but
+    // pre-validation keeps a typo on `--format` from showing up as an opaque
+    // tonic error and lets the format-rejection unit test stay synchronous.
+    let _ = ExportFormat::from_str(format)?;
+
+    let resp = tokio::runtime::Handle::current().block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.export_session(session_id, format).await
+    })?;
 
     match output {
         Some(path) => {
-            write_file_no_clobber(&path, &rendered)?;
+            write_file_no_clobber(&path, &resp.content)?;
             eprintln!("Exported session {session_id} → {}", path.display());
         }
         None => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            lock.write_all(rendered.as_bytes())
+            lock.write_all(&resp.content)
                 .context("writing export to stdout")?;
-            if !rendered.ends_with('\n') {
-                lock.write_all(b"\n").ok();
+            if !resp.content.ends_with(b"\n") {
+                // Best-effort newline so terminal prompts don't wedge on the
+                // last line; ignoring the error matches the prior behavior.
+                let _ = lock.write_all(b"\n");
             }
         }
     }
@@ -39,7 +49,7 @@ pub(crate) fn run_export(session_id: &str, format: &str, output: Option<PathBuf>
 
 /// Write `contents` to `path`, atomically refusing if the file already exists.
 /// `create_new` closes the TOCTOU window that `exists() + write()` opens.
-fn write_file_no_clobber(path: &std::path::Path, contents: &str) -> Result<()> {
+fn write_file_no_clobber(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -50,7 +60,7 @@ fn write_file_no_clobber(path: &std::path::Path, contents: &str) -> Result<()> {
                 path.display()
             )
         })?;
-    f.write_all(contents.as_bytes())
+    f.write_all(contents)
         .with_context(|| format!("writing export to {}", path.display()))?;
     Ok(())
 }
@@ -60,18 +70,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_format_is_rejected_before_db_work() {
-        // The validation must fire before Database::open — otherwise a typo
-        // on `--format` would produce a misleading "could not open DB" error.
-        let err = run_export("any-id", "yaml", None).unwrap_err();
-        assert!(err.to_string().contains("unsupported export format"));
+    fn unknown_format_is_rejected_before_daemon_round_trip() {
+        // The validation must fire BEFORE we try to spawn / connect to the
+        // daemon — otherwise a typo on `--format` would surface as a UDS
+        // connection error instead of a useful "unsupported format" message.
+        // Run on a single-threaded runtime so the assertion fires whether or
+        // not the harness already has one ambient.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let err = rt
+            .block_on(async { tokio::task::spawn_blocking(|| run_export("any-id", "yaml", None)).await })
+            .expect("spawn_blocking")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported export format"),
+            "expected format rejection, got: {err}"
+        );
     }
 
     #[test]
     fn write_no_clobber_creates_new_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.json");
-        write_file_no_clobber(&path, "hello").unwrap();
+        write_file_no_clobber(&path, b"hello").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
     }
 
@@ -80,7 +103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.json");
         std::fs::write(&path, "preexisting").unwrap();
-        let err = write_file_no_clobber(&path, "new").unwrap_err();
+        let err = write_file_no_clobber(&path, b"new").unwrap_err();
         assert!(
             err.to_string().contains("refusing to overwrite"),
             "expected overwrite refusal, got: {err}"

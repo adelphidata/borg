@@ -57,6 +57,56 @@ pub fn spawn_event_adapter(
     rx
 }
 
+/// Drain a `Streaming<PbEvent>` into an existing `mpsc::Sender<CoreEvent>`.
+///
+/// Variant of [`spawn_event_adapter`] for callers that already own the
+/// receiver end (e.g. the TUI's `App::event_rx`). Reuses the same `convert()`
+/// translator and the prompt-responder helpers, so prompts continue to
+/// round-trip through `Session.RespondToPrompt`.
+///
+/// Terminates when the upstream gRPC stream ends, errors, or `tx` is closed
+/// (the renderer dropped its receiver). The latter is important: a regression
+/// that swallowed `mpsc::send` errors caused this forwarder to spin after the
+/// renderer went away.
+pub async fn forward_event_stream(
+    client: DaemonClient,
+    session_id: String,
+    mut stream: Streaming<PbEvent>,
+    tx: mpsc::Sender<CoreEvent>,
+) {
+    loop {
+        match stream.message().await {
+            Ok(Some(pb)) => {
+                if !forward_one(pb, &client, &session_id, &tx).await {
+                    return;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = tx.send(CoreEvent::Error(e.to_string())).await;
+                break;
+            }
+        }
+    }
+}
+
+/// Convert + forward a single event. Returns `false` when the receiver has
+/// gone away (so the caller should stop pulling from the upstream stream).
+/// Returns `true` if the event was sent OR silently skipped (unknown variant).
+async fn forward_one(
+    pb: PbEvent,
+    client: &DaemonClient,
+    session_id: &str,
+    tx: &mpsc::Sender<CoreEvent>,
+) -> bool {
+    if let Some(core_evt) = convert(pb, client, session_id) {
+        if tx.send(core_evt).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Translate one wire event. Returns `None` for events we don't know how to
 /// represent (forward-compat: a future proto variant is silently skipped
 /// rather than crashing the render loop).
@@ -228,4 +278,100 @@ fn spawn_input_responder(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! Forwarder tests focus on `forward_one`, the per-event slice of
+    //! `forward_event_stream`. This is a deliberate decision:
+    //! `tonic::Streaming` has no public constructor, so a "real" forwarder
+    //! test would have to stand up a full gRPC server. `forward_one` is the
+    //! only piece with non-trivial behavior (convert + send + detect closed
+    //! receiver); the wrapper loop is mechanical.
+    //!
+    //! Regression guard: a previous version swallowed `mpsc::send` errors
+    //! and spun after the renderer dropped its receiver. The closed-receiver
+    //! test below would catch that recurring.
+    use super::*;
+    use borg_proto::session::{
+        agent_event::Kind as PbKind, AgentEvent as PbEvent, TextDelta, ToolExecuting, TurnComplete,
+    };
+
+    fn pb(kind: PbKind) -> PbEvent {
+        PbEvent {
+            kind: Some(kind),
+            event_seq: 0,
+        }
+    }
+
+    /// Build a DaemonClient wrapping a non-functional channel — the prompt
+    /// responder paths aren't exercised by the events used here, so the
+    /// channel is never actually called.
+    fn dummy_client() -> DaemonClient {
+        // `Channel::from_static(...).connect_lazy()` returns immediately and
+        // only fails on first RPC; safe to construct in tests.
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        DaemonClient::from_channel(channel)
+    }
+
+    #[tokio::test]
+    async fn forwards_three_events_in_order() {
+        let client = dummy_client();
+        let (tx, mut rx) = mpsc::channel::<CoreEvent>(16);
+
+        let events = vec![
+            pb(PbKind::TextDelta(TextDelta {
+                text: "hello".into(),
+            })),
+            pb(PbKind::ToolExecuting(ToolExecuting {
+                name: "shell".into(),
+                args_json: "{}".into(),
+            })),
+            pb(PbKind::TurnComplete(TurnComplete {})),
+        ];
+
+        for ev in events {
+            assert!(
+                forward_one(ev, &client, "sess-1", &tx).await,
+                "forward_one returned false before receiver was dropped"
+            );
+        }
+        drop(tx);
+
+        match rx.recv().await {
+            Some(CoreEvent::TextDelta(t)) => assert_eq!(t, "hello"),
+            _ => panic!("expected TextDelta"),
+        }
+        match rx.recv().await {
+            Some(CoreEvent::ToolExecuting { name, .. }) => assert_eq!(name, "shell"),
+            _ => panic!("expected ToolExecuting"),
+        }
+        match rx.recv().await {
+            Some(CoreEvent::TurnComplete) => {}
+            _ => panic!("expected TurnComplete"),
+        }
+        assert!(rx.recv().await.is_none(), "stream should be closed");
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_makes_forward_one_return_false() {
+        // Real failure mode: a previous version did `let _ = tx.send(...)`,
+        // so the forwarder kept pulling from a dead stream forever. This
+        // asserts the close signal is propagated.
+        let client = dummy_client();
+        let (tx, rx) = mpsc::channel::<CoreEvent>(1);
+        drop(rx);
+
+        let proceed = forward_one(
+            pb(PbKind::TextDelta(TextDelta { text: "x".into() })),
+            &client,
+            "sess-1",
+            &tx,
+        )
+        .await;
+        assert!(
+            !proceed,
+            "forward_one must return false once the receiver is dropped"
+        );
+    }
 }

@@ -5,9 +5,35 @@ use std::str::FromStr;
 use borg_core::config::Config;
 use borg_core::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
 use borg_core::provider::Provider;
+use borg_proto::admin::{
+    PluginInstallRequest, PluginInstalledChannel,
+};
+
+use crate::daemon_client;
 
 /// Standard subdirectories created under the Borg data directory.
 pub(crate) const BORG_SUBDIRS: &[&str] = &["memory", "tools", "skills", "logs", "cache"];
+
+/// Run `fut` to completion regardless of whether we're already inside a
+/// tokio runtime. Mirrors the helper in `api_key_store.rs` — `apply_onboarding`
+/// is a sync entry point reachable from `init_data_dir` (sync) which is
+/// itself called from `#[tokio::main]`. `block_in_place` releases the worker
+/// thread so the inner `block_on` can drive the gRPC connector.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => tokio::task::block_in_place(|| h.block_on(fut)),
+        Err(_) => {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => panic!("onboarding: failed to spin a tokio runtime: {e}"),
+            };
+            rt.block_on(fut)
+        }
+    }
+}
 
 /// Provider choices with display labels.
 pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
@@ -332,6 +358,11 @@ fn cleanup_tmp_files(data_dir: &std::path::Path) {
 
 /// Apply onboarding results: create directories, write config and identity files.
 /// Uses atomic writes (write to .tmp then rename) to prevent partial setups.
+///
+/// All settings/plugin/credential writes are routed through the daemon over
+/// gRPC — the cli no longer opens the SQLite DB directly. This keeps the
+/// daemon as the single writer and lets its in-memory caches stay coherent
+/// after onboarding completes.
 pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     let data_dir = Config::data_dir()?;
 
@@ -352,21 +383,24 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
     // Determine key storage automatically
     let use_keychain = result.api_key.is_some() && keychain_available();
 
-    // Write settings to DB
-    {
-        let db = borg_core::db::Database::open()
-            .context("Failed to open database for onboarding settings")?;
-        db.set_setting("provider", &result.provider)?;
-        db.set_setting("model", &result.model_id)?;
+    // Write settings via the daemon (single writer, cache-coherent).
+    block_on(async {
+        let mut client = daemon_client::connect_or_spawn()
+            .await
+            .context("connect to borgd for onboarding settings")?;
+        client.set_setting("provider", &result.provider).await?;
+        client.set_setting("model", &result.model_id).await?;
         if !result.user_name.is_empty() {
-            db.set_setting("user.name", &result.user_name)?;
+            client.set_setting("user.name", &result.user_name).await?;
         }
         if !result.agent_name.is_empty() {
-            db.set_setting("user.agent_name", &result.agent_name)?;
+            client
+                .set_setting("user.agent_name", &result.agent_name)
+                .await?;
         }
         // Sentinel that gates re-running the onboarding wizard on subsequent
         // launches. See `is_onboarded` in `crates/cli/src/main.rs`.
-        db.set_setting("onboarded", "true")?;
+        client.set_onboarding_complete().await?;
 
         if use_keychain {
             let secret_json = if cfg!(target_os = "macos") {
@@ -380,12 +414,16 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                     result.provider
                 )
             };
-            db.set_setting("llm.api_key", &secret_json)?;
+            client.set_setting("llm.api_key", &secret_json).await?;
         } else {
             let provider = Provider::from_str(&result.provider)?;
-            db.set_setting("llm.api_key_env", provider.default_env_var())?;
+            client
+                .set_setting("llm.api_key_env", provider.default_env_var())
+                .await?;
         }
-    }
+        anyhow::Ok(())
+    })
+    .context("Failed to persist onboarding settings via daemon")?;
 
     // Write IDENTITY.md (skip if already exists)
     let identity_path = data_dir.join(IDENTITY_FILE);
@@ -428,13 +466,19 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 Err(e) => {
                     eprintln!("  Warning: Failed to store in keychain: {e}");
                     eprintln!("  Falling back to .env file");
-                    // Update DB to use env var instead of keychain
-                    if let Ok(db) = borg_core::db::Database::open() {
-                        let provider = Provider::from_str(&result.provider)?;
-                        let _ = db.set_setting("llm.api_key_env", provider.default_env_var());
-                        let _ = db.delete_setting("llm.api_key");
-                    }
+                    // Update DB to use env var instead of keychain (via daemon).
                     let provider = Provider::from_str(&result.provider)?;
+                    let env_var_owned = provider.default_env_var().to_string();
+                    if let Err(e) = block_on(async {
+                        let mut client = daemon_client::connect_or_spawn().await?;
+                        client.set_setting("llm.api_key_env", &env_var_owned).await?;
+                        client.unset_setting("llm.api_key").await?;
+                        anyhow::Ok(())
+                    }) {
+                        tracing::warn!(
+                            "onboarding: failed to switch llm.api_key to env-var fallback: {e}"
+                        );
+                    }
                     let env_var = provider.default_env_var();
                     let env_path = data_dir.join(".env");
                     let clean_key = api_key.trim().replace(['\n', '\r'], "");
@@ -481,14 +525,13 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             }
         };
 
-        let db = match borg_core::db::Database::open() {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("  Warning: failed to open database for channel setup: {e}");
-                tracing::warn!("Database::open failed during channel install: {e}");
-                return Ok(());
-            }
-        };
+        // Pre-build per-plugin install requests; route credential persistence
+        // through the daemon at the end so the cli never opens the DB itself.
+        struct PendingInstall {
+            req: PluginInstallRequest,
+            display_name: &'static str,
+        }
+        let mut pending: Vec<PendingInstall> = Vec::new();
 
         for (plugin_id, credentials) in &result.channels {
             let Some(def) = borg_plugins::catalog::find_by_id(plugin_id) else {
@@ -527,46 +570,75 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 );
             }
 
-            // Record plugin + channel in DB
-            if let Err(e) = db.insert_plugin(
-                def.id,
-                def.name,
-                &def.kind.to_string(),
-                &def.category.to_string(),
-            ) {
-                tracing::warn!("Failed to record plugin: {e}");
-            }
             let channel_name = def.id.rsplit('/').next().unwrap_or(def.id);
             let runtime = if def.is_native { "native" } else { "python" };
             let webhook = format!("/webhook/{channel_name}");
-            if let Err(e) = db.insert_installed_channel(
-                channel_name,
-                def.description,
-                runtime,
-                def.id,
-                &webhook,
-            ) {
-                tracing::warn!("Failed to register channel: {e}");
-            }
-
-            println!(
-                "  Connected {0}. Send a message to the bot on {0} to get your pairing code, then run: /pairing approve <CODE>",
-                def.name
-            );
+            pending.push(PendingInstall {
+                req: PluginInstallRequest {
+                    plugin_id: def.id.to_string(),
+                    plugin_name: def.name.to_string(),
+                    kind: def.kind.to_string(),
+                    category: def.category.to_string(),
+                    file_hashes: Vec::new(),
+                    installed_tool: None,
+                    installed_channel: Some(PluginInstalledChannel {
+                        name: channel_name.to_string(),
+                        description: def.description.to_string(),
+                        runtime: runtime.to_string(),
+                        plugin_id: def.id.to_string(),
+                        webhook,
+                    }),
+                    // Per-plugin install RPCs leave credentials alone; we
+                    // overwrite the full credentials map once at the end.
+                    credentials_json: String::new(),
+                },
+                display_name: def.name,
+            });
         }
 
-        // Persist accumulated credentials to DB once
-        match serde_json::to_string(&cfg.credentials) {
-            Ok(json) => {
-                if let Err(e) = db.set_setting("credentials", &json) {
-                    eprintln!("  Warning: failed to save credentials to database: {e}");
-                    tracing::warn!("Failed to save credentials after channel install: {e}");
-                }
-            }
+        // Single round-trip: install each plugin row + persist the merged
+        // credentials map. The daemon owns the DB writes.
+        let credentials_json = match serde_json::to_string(&cfg.credentials) {
+            Ok(j) => j,
             Err(e) => {
                 eprintln!("  Warning: failed to serialize credentials: {e}");
                 tracing::warn!("serde_json::to_string failed for credentials: {e}");
+                String::new()
             }
+        };
+
+        let install_outcome: Result<()> = block_on(async {
+            let mut client = daemon_client::connect_or_spawn()
+                .await
+                .context("connect to borgd for channel install")?;
+            for p in &pending {
+                if let Err(e) = client.plugin_install(p.req.clone()).await {
+                    tracing::warn!(
+                        "plugin_install RPC failed for {}: {e}",
+                        p.req.plugin_id
+                    );
+                    eprintln!(
+                        "  Warning: failed to register plugin {}: {e}",
+                        p.req.plugin_id
+                    );
+                } else {
+                    println!(
+                        "  Connected {0}. Send a message to the bot on {0} to get your pairing code, then run: /pairing approve <CODE>",
+                        p.display_name
+                    );
+                }
+            }
+            if !credentials_json.is_empty() {
+                client
+                    .set_setting("credentials", &credentials_json)
+                    .await
+                    .context("Admin.SetSetting(credentials) failed")?;
+            }
+            Ok(())
+        });
+        if let Err(e) = install_outcome {
+            eprintln!("  Warning: channel install partly failed: {e}");
+            tracing::warn!("channel install daemon round-trip failed: {e}");
         }
     }
 

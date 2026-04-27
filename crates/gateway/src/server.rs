@@ -73,12 +73,22 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     /// Create a new gateway server with the given config and shutdown token.
+    ///
+    /// `executor` is the daemon's `SessionExecutorHandle`: when present, it
+    /// is installed as the process-wide handle so inbound channel messages
+    /// route through `borgd::session::SessionRegistry`. When `None`, inbound
+    /// agent invocations short-circuit with an error — the in-process spawns
+    /// from `cli` (which Stage D removes) currently pass `None`.
     pub fn new(
         config: Config,
         shutdown: CancellationToken,
         metrics: BorgMetrics,
         poke_tx: Option<mpsc::Sender<()>>,
+        executor: Option<crate::SessionExecutorHandle>,
     ) -> Result<Self> {
+        if let Some(exec) = executor {
+            crate::session_executor::set_global(exec);
+        }
         Ok(Self {
             config,
             shutdown,
@@ -836,9 +846,17 @@ async fn cancel_handler(
             axum::Json(serde_json::json!({"error": "localhost only"})),
         );
     }
-    let registry = &*crate::in_flight::GLOBAL;
+    let executor = match crate::session_executor::global() {
+        Some(exec) => exec,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({"error": "no session executor installed"})),
+            );
+        }
+    };
     if let Some(session_id) = params.get("session") {
-        let cancelled = registry.cancel(session_id).await;
+        let cancelled = executor.cancel(session_id).await;
         let count = if cancelled { 1 } else { 0 };
         (
             StatusCode::OK,
@@ -849,7 +867,7 @@ async fn cancel_handler(
             })),
         )
     } else {
-        let count = registry.cancel_all().await;
+        let count = executor.cancel_all().await;
         (
             StatusCode::OK,
             axum::Json(serde_json::json!({

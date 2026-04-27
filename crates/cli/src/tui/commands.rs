@@ -25,16 +25,20 @@ impl App<'_> {
             "/history" => return Some(self.cmd_history()),
             "/logs" => return Some(self.handle_logs_command(None)),
             "/status" | "/stats" => {
-                self.status_popup.show(&self.config);
+                let client = self.client.clone();
+                self.status_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::Continue));
             }
             "/xp" => {
-                self.status_popup.show_tab(&self.config, StatusTab::Xp);
+                let client = self.client.clone();
+                self.status_popup
+                    .show_tab(&self.config, StatusTab::Xp, &client);
                 return Some(Ok(AppAction::Continue));
             }
             "/evolution" => {
+                let client = self.client.clone();
                 self.status_popup
-                    .show_tab(&self.config, StatusTab::Evolution);
+                    .show_tab(&self.config, StatusTab::Evolution, &client);
                 return Some(Ok(AppAction::Continue));
             }
             "/card" => {
@@ -46,7 +50,8 @@ impl App<'_> {
             "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
             "/pairing" => {
                 if let Ok(data_dir) = borg_core::config::Config::data_dir() {
-                    self.pairing_popup.show(&self.config, &data_dir);
+                    let client = self.client.clone();
+                    self.pairing_popup.show(&self.config, &data_dir, &client);
                 } else {
                     self.push_system_message(
                         "Error: could not determine data directory".to_string(),
@@ -55,20 +60,24 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/settings" => {
-                self.settings_popup.show(&self.config);
+                let client = self.client.clone();
+                self.settings_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::Continue));
             }
             "/model" => {
-                self.model_popup.show(&self.config);
+                let client = self.client.clone();
+                self.model_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::Continue));
             }
             "/plugins" => return Some(self.cmd_plugins()),
             "/projects" => {
-                self.projects_popup.show();
+                let client = self.client.clone();
+                self.projects_popup.show(&client);
                 return Some(Ok(AppAction::Continue));
             }
             "/schedule-tasks" | "/schedule" => {
-                self.schedule_popup.show();
+                let client = self.client.clone();
+                self.schedule_popup.show(&client);
                 return Some(Ok(AppAction::Continue));
             }
             "/migrate" => {
@@ -87,7 +96,8 @@ impl App<'_> {
             "/usage" => return Some(Ok(AppAction::ShowUsage)),
             "/undo" => return Some(Ok(AppAction::UndoLastTurn)),
             "/sessions" => {
-                self.sessions_popup.show();
+                let client = self.client.clone();
+                self.sessions_popup.show(&client);
                 return Some(Ok(AppAction::Continue));
             }
             "/save" => return Some(Ok(AppAction::SaveSession)),
@@ -326,53 +336,46 @@ impl App<'_> {
     }
 
     fn cmd_pairing_approve(&mut self, code: &str) -> Result<AppAction> {
-        match borg_core::db::Database::open() {
-            Ok(db) => {
-                // Extract channel from prefix, or fall back to cross-channel lookup
-                let channel_name =
-                    if let Some((channel, _)) = borg_core::pairing::parse_prefixed_code(code) {
-                        channel.to_string()
-                    } else {
-                        match db.find_pending_by_code(code) {
-                            Ok(Some(row)) => row.channel_name,
-                            Ok(None) => {
-                                self.push_system_message(format!(
-                                    "No pending pairing request found for code '{}'",
-                                    code.to_uppercase()
-                                ));
-                                return Ok(AppAction::Continue);
-                            }
-                            Err(e) => {
-                                self.push_system_message(format!("Error looking up code: {e}"));
-                                return Ok(AppAction::Continue);
-                            }
-                        }
-                    };
+        let client = self.client.clone();
+        let result: std::result::Result<String, String> =
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let mut c = client.lock().await;
 
-                match db.approve_pairing(&channel_name, code) {
-                    Ok(row) => {
-                        let display = borg_core::pairing::channel_display_name(&row.channel_name);
-                        self.push_system_message(format!(
-                            "Approved: {} on {} (sender: {})",
-                            row.code, display, row.sender_id
-                        ));
+                    // Extract channel from prefix, or fall back to cross-channel lookup
+                    let channel_name =
+                        if let Some((channel, _)) = borg_core::pairing::parse_prefixed_code(code) {
+                            channel.to_string()
+                        } else {
+                            let list = c
+                                .list_pairing_requests(None)
+                                .await
+                                .map_err(|e| format!("Error looking up code: {e}"))?;
+                            match list.requests.iter().find(|r| {
+                                r.code.eq_ignore_ascii_case(code) && r.status == "pending"
+                            }) {
+                                Some(r) => r.channel_name.clone(),
+                                None => {
+                                    return Err(format!(
+                                        "No pending pairing request found for code '{}'",
+                                        code.to_uppercase()
+                                    ));
+                                }
+                            }
+                        };
 
-                        // Send LLM-generated greeting (fire-and-forget)
-                        let config = self.config.clone();
-                        let ch = row.channel_name;
-                        let sid = row.sender_id;
-                        tokio::spawn(async move {
-                            crate::service::send_approval_greeting(&config, &ch, &sid).await;
-                        });
-                    }
-                    Err(e) => {
-                        self.push_system_message(format!("Failed to approve: {e}"));
-                    }
-                }
-            }
-            Err(e) => {
-                self.push_system_message(format!("Database error: {e}"));
-            }
+                    c.approve_pairing(&channel_name, code)
+                        .await
+                        .map_err(|e| format!("Failed to approve: {e}"))?;
+
+                    let display = borg_core::pairing::channel_display_name(&channel_name);
+                    Ok(format!("Approved: {code} on {display}"))
+                })
+            });
+
+        match result {
+            Ok(msg) => self.push_system_message(msg),
+            Err(msg) => self.push_system_message(msg),
         }
         Ok(AppAction::Continue)
     }
@@ -539,14 +542,28 @@ impl App<'_> {
             return Ok(AppAction::Continue);
         }
 
-        // Persist to DB if available; log but don't fail the command if it's unavailable.
-        if let Ok(db) = borg_core::db::Database::open() {
-            if let Err(e) = db.set_setting("provider", provider) {
-                tracing::warn!("cmd_model_set: failed to persist provider: {e}");
-            }
-            if let Err(e) = db.set_setting("model", model) {
-                tracing::warn!("cmd_model_set: failed to persist model: {e}");
-            }
+        // Persist to the daemon. Failures log + warn but don't break the
+        // already-applied in-process config update. Spawned fire-and-forget so
+        // it works whether we're called from the TUI event loop (multi-thread
+        // runtime) or a unit test (no surrounding tokio context: skip).
+        let provider_owned = provider.to_string();
+        let model_owned = model.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let client = self.client.clone();
+            handle.spawn(async move {
+                let mut c = client.lock().await;
+                if let Err(e) = c.set_setting("provider", &provider_owned).await {
+                    tracing::warn!("cmd_model_set: failed to persist provider: {e}");
+                }
+                if let Err(e) = c.set_setting("model", &model_owned).await {
+                    tracing::warn!("cmd_model_set: failed to persist model: {e}");
+                }
+            });
+        } else {
+            tracing::debug!(
+                "cmd_model_set: no tokio runtime in scope (likely a unit test); \
+                 skipping daemon persistence"
+            );
         }
 
         self.push_system_message(format!("Updated: provider = {provider}, model = {model}"));
@@ -594,20 +611,19 @@ impl App<'_> {
     /// same routine the daemon fires nightly at 02:00, exposed for users who
     /// want to force a sweep without waiting.
     fn cmd_heal(&mut self) -> Result<AppAction> {
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!(error = %e, "on-demand /heal: failed to open database");
-                self.push_system_message(format!("Self-healing failed: {e}"));
-                return Ok(AppAction::Continue);
-            }
-        };
-        match borg_core::maintenance::run_daily_maintenance(&db, &self.config) {
+        let client = self.client.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.heal().await
+            })
+        });
+        match result {
             Ok(report) => {
-                self.push_system_message(format_heal_summary(&report));
+                self.push_system_message(format_heal_report(&report));
             }
             Err(e) => {
-                tracing::warn!(error = %e, "on-demand /heal: maintenance sweep failed");
+                tracing::warn!(error = %e, "on-demand /heal: daemon heal RPC failed");
                 self.push_system_message(format!("Self-healing failed: {e}"));
             }
         }
@@ -627,10 +643,32 @@ impl App<'_> {
     }
 }
 
+/// Render a daemon-side [`borg_proto::admin::HealReport`] as a system-message
+/// body. Mirrors the look of [`format_heal_summary`] but consumes the
+/// gRPC-friendly proto returned by `Admin.Heal` rather than the in-process
+/// MaintenanceReport.
+pub(super) fn format_heal_report(report: &borg_proto::admin::HealReport) -> String {
+    let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
+    text.push_str(&format!(
+        "Pruned {} log files, {} activity rows, evicted {} embeddings, healed {} stalled tasks",
+        report.pruned_logs, report.pruned_activity, report.evicted_embeddings, report.healed_tasks,
+    ));
+    if !report.warnings.is_empty() {
+        text.push_str("\n\nWarnings:");
+        for w in &report.warnings {
+            text.push_str("\n  • ");
+            text.push_str(w);
+        }
+    }
+    text
+}
+
 /// Render a [`MaintenanceReport`] as the multi-line system-message body
-/// shown after `/heal`. Kept separate from `cmd_heal` so the formatting is
-/// testable without standing up an `App`.
-pub(super) fn format_heal_summary(report: &borg_core::maintenance::MaintenanceReport) -> String {
+/// shown after `/heal`. Retained for tests covering the in-process formatter
+/// shape; the production `/heal` path now goes through [`format_heal_report`]
+/// against the daemon-side `HealReport`.
+#[cfg(test)]
+fn format_heal_summary(report: &borg_core::maintenance::MaintenanceReport) -> String {
     let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
     text.push_str(&report.activity_line());
     if !report.persistent_warnings.is_empty() {

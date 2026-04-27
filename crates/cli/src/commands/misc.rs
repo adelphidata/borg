@@ -11,10 +11,14 @@ pub(crate) enum MigrateSubcommand {
 
 #[derive(Subcommand)]
 pub(crate) enum ServiceAction {
+    /// Install the daemon as a launchd/systemd service
+    Install,
     /// Uninstall the daemon service
     Uninstall,
     /// Show the daemon service status
     Status,
+    /// Restart the daemon service
+    Restart,
 }
 
 /// Dispatch for `borg migrate ...` — either the interactive TUI or a direct
@@ -32,10 +36,12 @@ pub(crate) fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Result<()> 
 }
 
 /// Dispatch for `borg service ...`.
-pub(crate) fn dispatch_service(action: ServiceAction) -> Result<()> {
+pub(crate) async fn dispatch_service(action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Uninstall => crate::service::uninstall_service(),
-        ServiceAction::Status => crate::service::service_status(),
+        ServiceAction::Install => crate::borgd_launcher::install_service(),
+        ServiceAction::Uninstall => crate::borgd_launcher::uninstall_service(),
+        ServiceAction::Status => crate::borgd_launcher::service_status().await,
+        ServiceAction::Restart => crate::borgd_launcher::restart_service().await,
     }
 }
 
@@ -297,10 +303,10 @@ pub(crate) fn run_uninstall() -> Result<()> {
     std::io::stdin().read_line(&mut input)?;
 
     if confirm_uninstall(input.trim()) {
-        if let Err(e) = crate::service::uninstall_service() {
+        if let Err(e) = crate::borgd_launcher::uninstall_service() {
             tracing::debug!("Service uninstall skipped: {e}");
         }
-        crate::service::kill_other_borg_processes();
+        crate::borgd_launcher::kill_other_borg_processes();
 
         delete_data_dir(&data_dir)?;
 

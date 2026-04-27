@@ -89,17 +89,20 @@ pub(crate) fn run_pairing_approve(code: &str) -> Result<()> {
         request.channel_name, request.sender_id
     );
 
-    let config = match borg_core::config::Config::load_from_db() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("Failed to load config for approval greeting: {e}");
-            borg_core::config::Config::default()
-        }
-    };
+    let _ = borg_core::config::Config::load_from_db();
     let sid = request.sender_id;
     let ch = channel_name;
     tokio::runtime::Handle::current().block_on(async {
-        crate::service::send_approval_greeting(&config, &ch, &sid).await;
+        match crate::daemon_client::connect_or_spawn().await {
+            Ok(mut client) => {
+                if let Err(e) = client.send_approval_greeting(&ch, &sid).await {
+                    tracing::warn!("Approval greeting RPC failed: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Approval greeting: connect_or_spawn failed: {e}");
+            }
+        }
     });
 
     Ok(())

@@ -110,6 +110,78 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
     }
 }
 
+/// Translate a wire `pb::AgentEvent` back into a `core::AgentEvent` for
+/// in-process consumers (e.g. the gateway's `SessionExecutor` bridge).
+pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
+    use pb::agent_event::Kind;
+    let kind = event.kind?;
+    Some(match kind {
+        Kind::TextDelta(t) => CoreEvent::TextDelta(t.text),
+        Kind::ThinkingDelta(t) => CoreEvent::ThinkingDelta(t.text),
+        Kind::ToolExecuting(t) => CoreEvent::ToolExecuting {
+            name: t.name,
+            args: t.args_json,
+        },
+        Kind::ToolResult(t) => CoreEvent::ToolResult {
+            name: t.name,
+            result: t.result,
+        },
+        Kind::ToolOutputDelta(t) => CoreEvent::ToolOutputDelta {
+            name: t.name,
+            delta: t.delta,
+            is_stderr: t.is_stderr,
+        },
+        Kind::Usage(u) => CoreEvent::Usage(borg_core::llm::UsageData {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.input_tokens + u.output_tokens,
+            cached_input_tokens: u.cache_read_tokens,
+            cache_creation_tokens: u.cache_creation_tokens,
+            provider: String::new(),
+            model: String::new(),
+        }),
+        Kind::SubAgentUpdate(s) => CoreEvent::SubAgentUpdate {
+            agent_id: s.agent_id,
+            nickname: s.nickname,
+            status: s.status,
+        },
+        Kind::SteerReceived(s) => CoreEvent::SteerReceived { text: s.text },
+        Kind::PlanUpdated(p) => CoreEvent::PlanUpdated {
+            steps: p
+                .steps
+                .into_iter()
+                .map(|s| borg_core::types::PlanStep {
+                    title: s.text,
+                    status: match s.status.as_str() {
+                        "in_progress" => borg_core::types::PlanStepStatus::InProgress,
+                        "completed" => borg_core::types::PlanStepStatus::Completed,
+                        _ => borg_core::types::PlanStepStatus::Pending,
+                    },
+                })
+                .collect(),
+        },
+        Kind::Preparing(_) => CoreEvent::Preparing,
+        Kind::TurnComplete(_) => CoreEvent::TurnComplete,
+        Kind::HistoryCompacted(h) => CoreEvent::HistoryCompacted {
+            dropped: h.dropped as usize,
+            before_tokens: h.before_tokens as usize,
+            after_tokens: h.after_tokens as usize,
+            iterative: h.iterative,
+        },
+        Kind::Error(e) => CoreEvent::Error(e.message),
+        Kind::ShellConfirmation(sc) => {
+            tracing::warn!(prompt_id = %sc.prompt_id, command = %sc.command,
+                "from_proto: dropping ShellConfirmation");
+            return None;
+        }
+        Kind::UserInputRequest(ui) => {
+            tracing::warn!(prompt_id = %ui.prompt_id, prompt = %ui.prompt,
+                "from_proto: dropping UserInputRequest");
+            return None;
+        }
+    })
+}
+
 /// Returns true if the event terminates a turn (TurnComplete or Error). Used
 /// by `Session.Send` to know when to close the per-turn server-stream.
 pub fn is_terminal(event: &pb::AgentEvent) -> bool {

@@ -1,8 +1,9 @@
 use anyhow::Result;
+use borg_proto::admin::ScheduledTaskCreate;
 use clap::Subcommand;
-use uuid::Uuid;
 
 use super::{format_ts, short_id, truncate_str};
+use crate::daemon_client::connect_or_spawn;
 
 #[derive(Subcommand)]
 pub(crate) enum TasksAction {
@@ -128,6 +129,12 @@ pub(crate) enum CronAction {
     },
 }
 
+/// Block on a future from a sync context. Reuses the ambient tokio runtime
+/// (`main()` builds one in `crates/cli/src/main.rs`).
+fn block_on<F: std::future::Future<Output = R>, R>(fut: F) -> R {
+    tokio::runtime::Handle::current().block_on(fut)
+}
+
 /// Dispatch for `borg tasks ...`.
 pub(crate) fn dispatch_tasks(action: Option<TasksAction>) -> Result<()> {
     match action {
@@ -152,8 +159,8 @@ pub(crate) fn dispatch_tasks(action: Option<TasksAction>) -> Result<()> {
             delivery_target.as_deref(),
         ),
         Some(TasksAction::Delete { id }) => run_tasks_delete(&id),
-        Some(TasksAction::Pause { id }) => run_tasks_update_status(&id, "paused"),
-        Some(TasksAction::Resume { id }) => run_tasks_update_status(&id, "active"),
+        Some(TasksAction::Pause { id }) => run_tasks_pause(&id),
+        Some(TasksAction::Resume { id }) => run_tasks_resume(&id),
         Some(TasksAction::Run { id }) => run_tasks_run(&id),
         Some(TasksAction::Runs { id, count }) => run_tasks_runs(&id, count),
         Some(TasksAction::Status { id }) => run_tasks_status(&id),
@@ -190,8 +197,11 @@ pub(crate) fn dispatch_cron(action: Option<CronAction>) -> Result<()> {
 }
 
 pub(crate) fn run_tasks_list() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    let tasks = db.list_tasks()?;
+    let tasks = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        let resp = client.list_scheduled_tasks().await?;
+        Ok::<_, anyhow::Error>(resp.tasks)
+    })?;
 
     if tasks.is_empty() {
         println!("No scheduled tasks.");
@@ -201,10 +211,11 @@ pub(crate) fn run_tasks_list() -> Result<()> {
             "ID", "NAME", "TYPE", "STATUS", "SCHEDULE"
         );
         for task in &tasks {
-            let next_run = task
-                .next_run
-                .map(|ts| format_ts(ts, "%Y-%m-%d %H:%M:%S"))
-                .unwrap_or_else(|| "-".to_string());
+            let next_run = if task.next_run_unix > 0 {
+                format_ts(task.next_run_unix, "%Y-%m-%d %H:%M:%S")
+            } else {
+                "-".to_string()
+            };
             println!(
                 "{:8}  {:20}  {:8}  {:8}  {:20}  {}",
                 short_id(&task.id),
@@ -230,49 +241,65 @@ pub(crate) fn run_tasks_create(
     delivery_channel: Option<&str>,
     delivery_target: Option<&str>,
 ) -> Result<()> {
+    // Validate locally so we can fail fast with a useful error before the
+    // round-trip. The daemon revalidates on the way in.
     borg_core::tasks::validate_schedule(schedule_type, schedule)?;
     let tz = "local";
-    let next_run = borg_core::tasks::calculate_next_run(schedule_type, schedule, tz)?;
-    let id = Uuid::new_v4().to_string();
 
-    let db = borg_core::db::Database::open()?;
-    db.create_task(&borg_core::db::NewTask {
-        id: &id,
-        name,
-        prompt,
-        schedule_type,
-        schedule_expr: schedule,
-        timezone: tz,
-        next_run,
-        max_retries,
-        timeout_ms,
-        delivery_channel,
-        delivery_target,
-        allowed_tools: None,
-        task_type: "prompt",
+    let spec = ScheduledTaskCreate {
+        name: name.to_string(),
+        prompt: prompt.to_string(),
+        schedule_type: schedule_type.to_string(),
+        schedule_expr: schedule.to_string(),
+        timezone: tz.to_string(),
+        task_type: "prompt".to_string(),
+        delivery_channel: delivery_channel.unwrap_or("").to_string(),
+        delivery_target: delivery_target.unwrap_or("").to_string(),
+        next_run_unix: 0,
+        // Sentinel: <0 means "leave to DB default" so the daemon's
+        // ScheduledTaskCreate field maps cleanly to the underlying
+        // NewTask.max_retries: Option<i32> on the daemon side.
+        max_retries: max_retries.unwrap_or(-1),
+        timeout_ms: timeout_ms.unwrap_or(0),
+        allowed_tools: String::new(),
+    };
+
+    let task = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.create_scheduled_task(spec).await
     })?;
 
-    println!("Created task {} ({})", short_id(&id), name);
+    println!("Created task {} ({})", short_id(&task.id), task.name);
     Ok(())
 }
 
 pub(crate) fn run_tasks_run(id: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    match db.get_task_by_id(id)? {
-        Some(_task) => {
-            let now = chrono::Utc::now().timestamp();
-            db.update_task_next_run(id, Some(now))?;
-            db.clear_task_retry(id)?;
-            println!("Task {} queued for immediate execution.", short_id(id));
+    let result = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.run_scheduled_task_now(id).await
+    });
+    match result {
+        Ok(()) => println!("Task {} queued for immediate execution.", short_id(id)),
+        Err(e) => {
+            // NotFound from the daemon surfaces as an anyhow error wrapping the
+            // tonic Status; print a friendly message rather than failing.
+            if format!("{e:?}").contains("NotFound") {
+                println!("Task not found: {id}");
+            } else {
+                return Err(e);
+            }
         }
-        None => println!("Task not found: {id}"),
     }
     Ok(())
 }
 
 pub(crate) fn run_tasks_runs(id: &str, count: usize) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    let runs = db.task_run_history(id, count)?;
+    let runs = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        let limit = u32::try_from(count).unwrap_or(u32::MAX);
+        let resp = client.get_scheduled_task_runs(id, limit).await?;
+        Ok::<_, anyhow::Error>(resp.runs)
+    })?;
     if runs.is_empty() {
         println!("No runs recorded for task {}", short_id(id));
         return Ok(());
@@ -280,85 +307,142 @@ pub(crate) fn run_tasks_runs(id: &str, count: usize) -> Result<()> {
     println!("{:<20} {:<8} {:<10} Details", "Time", "Status", "Duration");
     println!("{}", "-".repeat(70));
     for run in &runs {
-        let when = format_ts(run.started_at, "%Y-%m-%d %H:%M");
+        let when = format_ts(run.started_at_unix, "%Y-%m-%d %H:%M");
         let status = borg_core::tasks::format_run_status(&run.status);
         let duration = format!("{}ms", run.duration_ms);
-        let details = run
-            .error
-            .as_deref()
-            .or(run.result.as_deref())
-            .unwrap_or("")
-            .chars()
-            .take(40)
-            .collect::<String>();
+        let details_src = if !run.error.is_empty() {
+            run.error.as_str()
+        } else {
+            run.result.as_str()
+        };
+        let details: String = details_src.chars().take(40).collect();
         println!("{when:<20} {status:<8} {duration:<10} {details}");
     }
     Ok(())
 }
 
 pub(crate) fn run_tasks_status(id: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    match db.get_task_by_id(id)? {
-        Some(task) => {
-            println!("{}", borg_core::tasks::format_task(&task));
-            println!("    Max retries: {}", task.max_retries);
-            println!("    Timeout: {}ms", task.timeout_ms);
-            if let Some(ref ch) = task.delivery_channel {
-                println!(
-                    "    Delivery: {} -> {}",
-                    ch,
-                    task.delivery_target.as_deref().unwrap_or("?")
-                );
-            }
-            if task.retry_count > 0 {
-                println!(
-                    "    Retry state: attempt {}/{}",
-                    task.retry_count, task.max_retries
-                );
-                if let Some(ref err) = task.last_error {
-                    println!("    Last error: {}", &err[..err.len().min(100)]);
-                }
-                if let Some(retry_at) = task.retry_after {
-                    let when = format_ts(retry_at, "%Y-%m-%d %H:%M UTC");
-                    println!("    Next retry: {when}");
-                }
-            }
-            if let Ok(Some(run)) = db.last_task_run(id) {
-                let when = format_ts(run.started_at, "%Y-%m-%d %H:%M UTC");
-                println!(
-                    "    Last run: {} at {when} ({}ms)",
-                    run.status, run.duration_ms
-                );
-            }
+    let detail = match block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.get_scheduled_task_detail(id).await
+    }) {
+        Ok(d) => d,
+        Err(e) if format!("{e:?}").contains("NotFound") => {
+            println!("Task not found: {id}");
+            return Ok(());
         }
-        None => println!("Task not found: {id}"),
+        Err(e) => return Err(e),
+    };
+
+    // Render directly from the proto so this command doesn't depend on any
+    // core DB types. Mirrors the layout that `borg_core::tasks::format_task`
+    // produces for the prompt/command head.
+    let task = detail
+        .task
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("ScheduledTaskDetail.task missing"))?;
+    let next_str = if task.next_run_unix > 0 {
+        format_ts(task.next_run_unix, "%Y-%m-%d %H:%M UTC")
+    } else {
+        "—".to_string()
+    };
+    let payload_label = if task.task_type == "command" {
+        "Command"
+    } else {
+        "Prompt"
+    };
+    println!(
+        "  {} [{}] ({})\n    Schedule: {} {}\n    Next run: {}\n    {}: {}",
+        task.name,
+        task.status,
+        short_id(&task.id),
+        task.schedule_type,
+        task.schedule_expr,
+        next_str,
+        payload_label,
+        truncate_str(&task.prompt, 80),
+    );
+    println!("    Max retries: {}", detail.max_retries);
+    println!("    Timeout: {}ms", detail.timeout_ms);
+    if !task.delivery_channel.is_empty() {
+        let target = if task.delivery_target.is_empty() {
+            "?"
+        } else {
+            task.delivery_target.as_str()
+        };
+        println!("    Delivery: {} -> {}", task.delivery_channel, target);
+    }
+    if detail.retry_count > 0 {
+        println!(
+            "    Retry state: attempt {}/{}",
+            detail.retry_count, detail.max_retries
+        );
+        if !detail.last_error.is_empty() {
+            let err = &detail.last_error;
+            println!("    Last error: {}", &err[..err.len().min(100)]);
+        }
+        if detail.retry_after_unix > 0 {
+            let when = format_ts(detail.retry_after_unix, "%Y-%m-%d %H:%M UTC");
+            println!("    Next retry: {when}");
+        }
+    }
+    if detail.has_last_run {
+        if let Some(run) = detail.last_run.as_ref() {
+            let when = format_ts(run.started_at_unix, "%Y-%m-%d %H:%M UTC");
+            println!(
+                "    Last run: {} at {when} ({}ms)",
+                run.status, run.duration_ms
+            );
+        }
     }
     Ok(())
 }
 
 pub(crate) fn run_tasks_delete(id: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    if db.delete_task(id)? {
-        println!("Deleted task {}", short_id(id));
-    } else {
-        println!("Task not found: {id}");
+    let result = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.delete_scheduled_task(id).await
+    });
+    match result {
+        Ok(()) => println!("Deleted task {}", short_id(id)),
+        Err(e) if format!("{e:?}").contains("NotFound") => println!("Task not found: {id}"),
+        Err(e) => return Err(e),
     }
     Ok(())
 }
 
-pub(crate) fn run_tasks_update_status(id: &str, status: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    if db.update_task_status(id, status)? {
-        println!("Task {} status: {status}", short_id(id));
-    } else {
-        println!("Task not found: {id}");
+pub(crate) fn run_tasks_pause(id: &str) -> Result<()> {
+    pause_or_resume(id, /* pause = */ true)
+}
+
+pub(crate) fn run_tasks_resume(id: &str) -> Result<()> {
+    pause_or_resume(id, /* pause = */ false)
+}
+
+fn pause_or_resume(id: &str, pause: bool) -> Result<()> {
+    let result = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        if pause {
+            client.pause_scheduled_task(id).await
+        } else {
+            client.resume_scheduled_task(id).await
+        }
+    });
+    let status = if pause { "paused" } else { "active" };
+    match result {
+        Ok(()) => println!("Task {} status: {status}", short_id(id)),
+        Err(e) if format!("{e:?}").contains("NotFound") => println!("Task not found: {id}"),
+        Err(e) => return Err(e),
     }
     Ok(())
 }
 
 pub(crate) fn run_cron_list() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    let tasks = db.list_tasks()?;
+    let tasks = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        let resp = client.list_scheduled_tasks().await?;
+        Ok::<_, anyhow::Error>(resp.tasks)
+    })?;
     let cron_jobs: Vec<_> = tasks.iter().filter(|t| t.task_type == "command").collect();
     if cron_jobs.is_empty() {
         println!("No cron jobs. Use `borg cron add` to create one.");
@@ -370,10 +454,11 @@ pub(crate) fn run_cron_list() -> Result<()> {
     );
     println!("{}", "-".repeat(90));
     for job in &cron_jobs {
-        let next = job
-            .next_run
-            .map(|ts| format_ts(ts, "%Y-%m-%d %H:%M"))
-            .unwrap_or_else(|| "—".to_string());
+        let next = if job.next_run_unix > 0 {
+            format_ts(job.next_run_unix, "%Y-%m-%d %H:%M")
+        } else {
+            "—".to_string()
+        };
         let sched_display = display_cron_5field(&job.schedule_expr);
         println!(
             "{:<10} {:<8} {:<20} {:<30} {}",
@@ -430,32 +515,38 @@ pub(crate) fn run_cron_add(
             format!("cron: {short_cmd}")
         });
 
-    let id = uuid::Uuid::new_v4().to_string();
     let next_run = borg_core::tasks::calculate_next_run("cron", &cron_7, "local")?;
 
-    let db = borg_core::db::Database::open()?;
-    db.create_task(&borg_core::db::NewTask {
-        id: &id,
-        name: &job_name,
-        prompt: &cmd,
-        schedule_type: "cron",
-        schedule_expr: &cron_7,
-        timezone: &chrono::Local::now().offset().to_string(),
-        next_run,
-        max_retries: Some(0),
-        timeout_ms,
-        delivery_channel,
-        delivery_target,
-        allowed_tools: None,
-        task_type: "command",
+    let spec = ScheduledTaskCreate {
+        name: job_name.clone(),
+        prompt: cmd.clone(),
+        schedule_type: "cron".to_string(),
+        schedule_expr: cron_7.clone(),
+        timezone: chrono::Local::now().offset().to_string(),
+        task_type: "command".to_string(),
+        delivery_channel: delivery_channel.unwrap_or("").to_string(),
+        delivery_target: delivery_target.unwrap_or("").to_string(),
+        next_run_unix: next_run.unwrap_or(0),
+        // Cron jobs explicitly opt out of retries (the original direct-DB
+        // path passed Some(0)). Use 0, not -1 sentinel.
+        max_retries: 0,
+        timeout_ms: timeout_ms.unwrap_or(0),
+        allowed_tools: String::new(),
+    };
+
+    let task = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.create_scheduled_task(spec).await
     })?;
 
-    let next_str = next_run
-        .map(|ts| format_ts(ts, "%Y-%m-%d %H:%M"))
-        .unwrap_or_else(|| "?".to_string());
+    let next_str = if task.next_run_unix > 0 {
+        format_ts(task.next_run_unix, "%Y-%m-%d %H:%M")
+    } else {
+        "?".to_string()
+    };
     println!(
         "Created cron job {} ({})\n  Schedule: {}\n  Command: {}\n  Next run: {}",
-        short_id(&id),
+        short_id(&task.id),
         job_name,
         display_cron_5field(&cron_7),
         cmd,
@@ -464,33 +555,51 @@ pub(crate) fn run_cron_add(
     Ok(())
 }
 
-/// Type-guarded cron job mutation. Verifies the task is a command-type before mutating.
+/// Type-guarded cron job mutation. Verifies the task is a command-type before
+/// mutating so a stray `borg cron remove <prompt-task-id>` doesn't silently
+/// nuke a prompt task — preserves the same guard the direct-DB version had.
 pub(crate) fn run_cron_mutate(id: &str, action: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    match db.get_task_by_id(id)? {
-        Some(task) if task.task_type == "command" => match action {
-            "delete" => {
-                db.delete_task(id)?;
-                println!("Deleted cron job {}", short_id(id));
-            }
-            "pause" => {
-                db.update_task_status(id, "paused")?;
-                println!("Cron job {} paused", short_id(id));
-            }
-            "resume" => {
-                db.update_task_status(id, "active")?;
-                println!("Cron job {} resumed", short_id(id));
-            }
-            "run" => {
-                let now = chrono::Utc::now().timestamp();
-                db.update_task_next_run(id, Some(now))?;
-                db.clear_task_retry(id)?;
-                println!("Cron job {} queued for immediate execution", short_id(id));
-            }
-            _ => unreachable!(),
-        },
-        Some(_) => println!("Not a cron job: {id} (use `borg tasks` for prompt tasks)"),
-        None => println!("Cron job not found: {id}"),
+    let outcome = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        let detail = match client.get_scheduled_task_detail(id).await {
+            Ok(d) => d,
+            Err(e) if format!("{e:?}").contains("NotFound") => return Ok(MutateOutcome::NotFound),
+            Err(e) => return Err(e),
+        };
+        let Some(task) = detail.task.as_ref() else {
+            return Err(anyhow::anyhow!("ScheduledTaskDetail.task missing"));
+        };
+        if task.task_type != "command" {
+            return Ok(MutateOutcome::WrongType);
+        }
+        match action {
+            "delete" => client.delete_scheduled_task(id).await?,
+            "pause" => client.pause_scheduled_task(id).await?,
+            "resume" => client.resume_scheduled_task(id).await?,
+            "run" => client.run_scheduled_task_now(id).await?,
+            other => unreachable!("unknown cron action: {other}"),
+        }
+        Ok(MutateOutcome::Ok)
+    })?;
+
+    match (outcome, action) {
+        (MutateOutcome::Ok, "delete") => println!("Deleted cron job {}", short_id(id)),
+        (MutateOutcome::Ok, "pause") => println!("Cron job {} paused", short_id(id)),
+        (MutateOutcome::Ok, "resume") => println!("Cron job {} resumed", short_id(id)),
+        (MutateOutcome::Ok, "run") => {
+            println!("Cron job {} queued for immediate execution", short_id(id))
+        }
+        (MutateOutcome::Ok, _) => unreachable!(),
+        (MutateOutcome::WrongType, _) => {
+            println!("Not a cron job: {id} (use `borg tasks` for prompt tasks)")
+        }
+        (MutateOutcome::NotFound, _) => println!("Cron job not found: {id}"),
     }
     Ok(())
+}
+
+enum MutateOutcome {
+    Ok,
+    WrongType,
+    NotFound,
 }

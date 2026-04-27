@@ -1,18 +1,22 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use anyhow::Result;
 
 use borg_core::config::Config;
-use borg_core::db::{ApprovedSenderRow, PairingRequestRow};
 use borg_core::pairing::channel_display_name;
 use borg_plugins::catalog::CATALOG;
 use borg_plugins::installer::is_installed;
+use borg_proto::admin::{ApprovedSender, PairingRequest};
+
+use crate::daemon_client::DaemonClient;
 
 use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
@@ -21,10 +25,10 @@ use super::theme;
 /// A unified item in the pairing popup list.
 enum PairingItem {
     Pending {
-        request: PairingRequestRow,
+        request: PairingRequest,
     },
     Approved {
-        sender: ApprovedSenderRow,
+        sender: ApprovedSender,
         pending_revoke: bool,
     },
     Unpaired {
@@ -59,22 +63,34 @@ impl PairingPopup {
         self.visible
     }
 
-    pub fn show(&mut self, _config: &Config, data_dir: &Path) {
+    pub fn show(&mut self, _config: &Config, data_dir: &Path, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
         self.cursor = 0;
         self.status_message = None;
         self.items.clear();
 
-        let db = match borg_core::db::Database::open() {
-            Ok(db) => db,
-            Err(e) => {
-                tracing::warn!("Failed to open database for pairing popup: {e}");
-                return;
-            }
-        };
-
-        let pending = db.list_pairings(None).unwrap_or_default();
-        let approved = db.list_approved_senders(None).unwrap_or_default();
+        let (pending, approved) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut c = client.lock().await;
+                let pending = c
+                    .list_pairing_requests(None)
+                    .await
+                    .map(|l| l.requests)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("PairingPopup: list_pairing_requests failed: {e}");
+                        Vec::new()
+                    });
+                let approved = c
+                    .list_approved_senders(None)
+                    .await
+                    .map(|l| l.senders)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("PairingPopup: list_approved_senders failed: {e}");
+                        Vec::new()
+                    });
+                (pending, approved)
+            })
+        });
 
         // Collect channel names that have pending or approved entries
         let active_channels: HashSet<String> = pending
@@ -258,7 +274,7 @@ impl PairingPopup {
                     pending_revoke,
                 } => {
                     let display = channel_display_name(&sender.channel_name);
-                    let name = sender.display_name.as_deref().unwrap_or("");
+                    let name = sender.display_name.as_str();
                     let label = if name.is_empty() {
                         format!("  {:<10} {}", display, sender.sender_id)
                     } else {
@@ -348,27 +364,26 @@ mod tests {
 
     fn make_pending(channel: &str, sender: &str, code: &str) -> PairingItem {
         PairingItem::Pending {
-            request: PairingRequestRow {
+            request: PairingRequest {
                 id: format!("req-{code}"),
                 channel_name: channel.to_string(),
                 sender_id: sender.to_string(),
                 code: code.to_string(),
                 status: "pending".to_string(),
-                display_name: None,
+                display_name: String::new(),
                 created_at: 1000,
                 expires_at: 9999999,
-                approved_at: None,
             },
         }
     }
 
     fn make_approved(channel: &str, sender: &str) -> PairingItem {
         PairingItem::Approved {
-            sender: ApprovedSenderRow {
+            sender: ApprovedSender {
                 id: 1,
                 channel_name: channel.to_string(),
                 sender_id: sender.to_string(),
-                display_name: None,
+                display_name: String::new(),
                 approved_at: 1000,
             },
             pending_revoke: false,

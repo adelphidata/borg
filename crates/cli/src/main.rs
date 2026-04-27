@@ -50,15 +50,14 @@ mod credentials;
 // land — the lints would otherwise force placeholder usage that drifts.
 #[allow(dead_code)]
 mod daemon_client;
-mod heartbeat_augmenters;
 mod logo;
 mod migrate_tui;
 mod onboarding;
 mod onboarding_tui;
 mod openrouter_catalog;
+mod borgd_launcher;
 mod plugins;
 mod repl;
-mod service;
 mod tui;
 
 #[derive(Parser)]
@@ -109,8 +108,6 @@ enum Commands {
     },
     /// Run diagnostics to check configuration, connectivity, and dependencies
     Doctor,
-    /// Run as a background daemon (executes scheduled tasks and heartbeat)
-    Daemon,
     /// Manage the daemon as a system service
     Service {
         #[command(subcommand)]
@@ -361,13 +358,10 @@ async fn async_main() -> Result<()> {
     // (skip commands that manage the service themselves)
     if !matches!(
         cli.command,
-        Some(Commands::Daemon)
-            | Some(Commands::Init)
-            | Some(Commands::Uninstall)
-            | Some(Commands::Service { .. })
+        Some(Commands::Init) | Some(Commands::Uninstall) | Some(Commands::Service { .. })
     ) {
-        if let Err(e) = service::ensure_service_running() {
-            tracing::warn!("Auto-start service: {e}");
+        if let Err(e) = borgd_launcher::ensure_running().await {
+            tracing::warn!("Auto-start borgd: {e}");
         }
     }
 
@@ -380,8 +374,8 @@ async fn async_main() -> Result<()> {
                 println!("Resume with: borg --resume {}", hint.short_id);
             }
         }
-        Some(Commands::Stop) => service::stop_service()?,
-        Some(Commands::Restart) => service::restart_service()?,
+        Some(Commands::Stop) => borgd_launcher::stop_service().await?,
+        Some(Commands::Restart) => borgd_launcher::restart_service().await?,
         Some(Commands::Init) => init_data_dir()?,
         Some(Commands::Ask {
             message,
@@ -392,8 +386,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Status { action }) => commands::status::dispatch_status(action)?,
         Some(Commands::Bond { action }) => commands::status::dispatch_bond(action)?,
         Some(Commands::Doctor) => commands::misc::run_doctor()?,
-        Some(Commands::Daemon) => service::run_daemon(shutdown).await?,
-        Some(Commands::Service { action }) => commands::misc::dispatch_service(action)?,
+        Some(Commands::Service { action }) => commands::misc::dispatch_service(action).await?,
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
         Some(Commands::Plugins) => plugins::list_plugins()?,
@@ -447,62 +440,52 @@ fn ensure_onboarded() -> Result<()> {
 
 /// Returns true if onboarding has already completed.
 ///
-/// Config is DB-only since the V32 migration; the previous filesystem check
-/// (presence of `config.toml`) was a stale signal that re-fired the wizard
-/// every launch (V32 renames `config.toml` → `.bak` after import). Source
-/// of truth is now the SQLite `settings` table — see `is_onboarded_from_db`.
+/// Routed through `borgd` over UDS — the daemon is the single source of
+/// truth for the `onboarded` settings-table sentinel. The cli no longer
+/// opens the DB itself.
 ///
-/// Returns false (and logs) if the DB can't be opened. That re-runs the
-/// wizard, which is intrusive on a transient lock — but it's the safer
-/// default than silently skipping onboarding for a genuinely fresh install.
-fn is_onboarded() -> bool {
+/// Returns false (and logs) on:
+/// - missing data dir / missing `borg.db` (genuinely fresh install)
+/// - daemon connect / RPC failure (intrusive but safer than silently
+///   skipping onboarding).
+async fn is_onboarded_async() -> bool {
     let Ok(data_dir) = borg_core::config::Config::data_dir() else {
         return false;
     };
-    // Fresh install: no DB → never onboarded. Avoid Database::open() here
-    // because it would create the file and run migrations on a fresh dir.
+    // Fresh install: no DB → never onboarded. Skip the daemon round-trip
+    // (which would otherwise spin up borgd and create the file) so the
+    // wizard runs cleanly on a brand-new system.
     if !data_dir.join("borg.db").exists() {
         return false;
     }
-    let db = match borg_core::db::Database::open() {
-        Ok(d) => d,
+    let mut client = match daemon_client::connect(None).await {
+        Ok(c) => c,
         Err(e) => {
-            tracing::warn!("is_onboarded: failed to open DB: {e}");
+            tracing::warn!("is_onboarded: daemon connect failed: {e}");
             return false;
         }
     };
-    is_onboarded_from_db(&db)
+    match client.get_onboarding_state().await {
+        Ok(state) => state.onboarded,
+        Err(e) => {
+            tracing::warn!("is_onboarded: GetOnboardingState failed: {e}");
+            false
+        }
+    }
 }
 
-/// Pure DB-side decision (extracted for testability against in-memory DBs).
-///
-/// Trade-offs:
-/// - **Partially-aborted onboarding** (DB created by some earlier write, then
-///   wizard cancelled): all settings still hold migration defaults
-///   (`provider="(auto-detect)"`, `model=""`), so this returns false and the
-///   user gets re-prompted. Intentional.
-/// - **Legacy users clearing `model` via `/settings`** would re-trigger the
-///   wizard on next launch. Users onboarded post-fix have the explicit
-///   `onboarded=true` flag, so they're insulated. Acceptable: the legacy
-///   cohort shrinks every time someone re-runs onboarding.
-fn is_onboarded_from_db(db: &borg_core::db::Database) -> bool {
-    if matches!(
-        db.get_setting("onboarded").ok().flatten().as_deref(),
-        Some("true")
-    ) {
-        return true;
+/// Sync wrapper used by `ensure_onboarded` (which is itself called from a
+/// sync clap dispatch).
+fn is_onboarded() -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => tokio::task::block_in_place(|| h.block_on(is_onboarded_async())),
+        Err(_) => {
+            // No tokio runtime — fall back to a fresh one. Should not
+            // happen in practice because main is `#[tokio::main]`.
+            tracing::warn!("is_onboarded: no tokio runtime; falling back to false");
+            false
+        }
     }
-    // Backfill for users who completed onboarding before the `onboarded`
-    // sentinel was introduced. Default-seeded settings populate `provider`
-    // and `model` rows even on fresh DBs (defaults: "(auto-detect)" and "")
-    // so we can't just check existence — we must check the *value*.
-    // Onboarding writes a non-empty `model` (`apply_onboarding` in
-    // `crates/cli/src/onboarding.rs`), so a non-empty `model` is the
-    // most reliable post-onboarding signal.
-    db.get_setting("model")
-        .ok()
-        .flatten()
-        .is_some_and(|m| !m.is_empty())
 }
 
 fn init_data_dir() -> Result<()> {
@@ -519,8 +502,16 @@ fn init_data_dir() -> Result<()> {
             let setup_path = data_dir.join("SETUP.md");
             let will_auto_launch = setup_path.exists() && std::io::stdin().is_terminal();
 
-            // Auto-start daemon service after successful onboarding (non-fatal)
-            if let Err(e) = service::ensure_service_running() {
+            // Auto-start daemon service after successful onboarding (non-fatal).
+            // `init_data_dir` is sync, so block on the async ensure_running via
+            // the current tokio handle.
+            let ensure_result: Result<()> = match tokio::runtime::Handle::try_current() {
+                Ok(h) => tokio::task::block_in_place(|| {
+                    h.block_on(async { borgd_launcher::ensure_running().await })
+                }),
+                Err(_) => Err(anyhow::anyhow!("no tokio runtime available")),
+            };
+            if let Err(e) = ensure_result {
                 tracing::warn!("Auto-start service during onboarding: {e}");
             }
 
@@ -634,44 +625,11 @@ mod tests {
         assert!(!commands::misc::confirm_uninstall("yy"));
     }
 
-    #[test]
-    fn is_onboarded_false_on_fresh_db_with_only_defaults() {
-        // Migrations seed every setting with a default, so a fresh DB has
-        // `provider="(auto-detect)"` and `model=""` rows present. The gate
-        // must NOT mistake these for completed onboarding.
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        let db = borg_core::db::Database::from_connection(conn).expect("init db");
-        assert!(!super::is_onboarded_from_db(&db));
-    }
-
-    #[test]
-    fn is_onboarded_true_with_explicit_flag() {
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        let db = borg_core::db::Database::from_connection(conn).expect("init db");
-        db.set_setting("onboarded", "true").unwrap();
-        assert!(super::is_onboarded_from_db(&db));
-    }
-
-    #[test]
-    fn is_onboarded_true_with_legacy_model_only() {
-        // Regression guard: users who completed onboarding before the
-        // `onboarded` sentinel was introduced still have a non-empty `model`
-        // written by `apply_onboarding`. They must not be re-onboarded.
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        let db = borg_core::db::Database::from_connection(conn).expect("init db");
-        db.set_setting("model", "anthropic/claude-sonnet-4")
-            .unwrap();
-        assert!(super::is_onboarded_from_db(&db));
-    }
-
-    #[test]
-    fn is_onboarded_false_when_flag_is_not_true() {
-        // Non-"true" values must not satisfy the gate (e.g. partially-aborted writes).
-        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory sqlite");
-        let db = borg_core::db::Database::from_connection(conn).expect("init db");
-        db.set_setting("onboarded", "false").unwrap();
-        assert!(!super::is_onboarded_from_db(&db));
-    }
+    // Onboarding-sentinel round-trip is covered in `borgd`'s
+    // `admin_rpc_smoke::onboarding_state_round_trips_through_settings_table`
+    // — that exercises the live daemon path the cli now uses, which is more
+    // honest than testing a since-removed `is_onboarded_from_db` helper
+    // against an in-memory DB.
 
     #[test]
     fn delete_data_dir_removes_directory() {

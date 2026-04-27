@@ -20,6 +20,8 @@ path = "src/main.rs"
 [dependencies]
 borg-proto = { path = "../borg-proto" }
 borg-core = { path = "../core" }
+borg-gateway = { path = "../gateway" }
+borg-heartbeat = { path = "../heartbeat" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -46,3 +48,4 @@ base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rusqlite = { workspace = true }

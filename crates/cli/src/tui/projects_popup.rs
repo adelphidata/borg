@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
+use tokio::sync::Mutex;
 
 use borg_core::config::Config;
-use borg_core::db::ProjectRow;
+use borg_proto::admin::Project;
+
+use crate::daemon_client::DaemonClient;
 
 use super::app::{AppAction, PopupHandler};
 use super::popup_utils;
@@ -48,7 +53,7 @@ pub struct ProjectsPopup {
 }
 
 struct ProjectItem {
-    project: ProjectRow,
+    project: Project,
     workflow_count: usize,
     original_name: String,
     original_description: String,
@@ -58,6 +63,10 @@ struct ProjectItem {
 
 pub enum ProjectAction {
     Create {
+        // Reserved: was used when creation went straight through the in-process
+        // DB. The daemon now allocates the id server-side; kept here so callers
+        // can stage local optimistic state if needed in the future.
+        #[allow(dead_code)]
         id: String,
         name: String,
         description: String,
@@ -93,38 +102,44 @@ impl ProjectsPopup {
         self.visible
     }
 
-    pub fn show(&mut self) {
+    pub fn show(&mut self, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
         self.cursor = 0;
         self.phase = Phase::Browsing;
         self.status_message = None;
 
-        self.projects = match borg_core::db::Database::open() {
-            Ok(db) => match db.list_projects(None) {
-                Ok(rows) => rows
-                    .into_iter()
-                    .map(|p| {
-                        let wf_count = db
-                            .list_workflows_by_project(&p.id)
-                            .map(|v| v.len())
-                            .unwrap_or(0);
-                        let original_name = p.name.clone();
-                        let original_description = p.description.clone();
-                        let original_status = p.status.clone();
-                        ProjectItem {
-                            project: p,
-                            workflow_count: wf_count,
-                            original_name,
-                            original_description,
-                            original_status,
-                            pending_delete: false,
-                        }
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            },
-            Err(_) => Vec::new(),
-        };
+        self.projects = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut c = client.lock().await;
+                let projects = match c.list_projects().await {
+                    Ok(list) => list.projects,
+                    Err(e) => {
+                        tracing::warn!("ProjectsPopup: list_projects failed: {e}");
+                        return Vec::new();
+                    }
+                };
+                let mut items = Vec::with_capacity(projects.len());
+                for p in projects {
+                    let wf_count = c
+                        .list_workflows_by_project(&p.id)
+                        .await
+                        .map(|w| w.workflows.len())
+                        .unwrap_or(0);
+                    let original_name = p.name.clone();
+                    let original_description = p.description.clone();
+                    let original_status = p.status.clone();
+                    items.push(ProjectItem {
+                        project: p,
+                        workflow_count: wf_count,
+                        original_name,
+                        original_description,
+                        original_status,
+                        pending_delete: false,
+                    });
+                }
+                items
+            })
+        });
     }
 
     pub fn dismiss(&mut self) {
@@ -536,7 +551,7 @@ mod tests {
         let mut popup = ProjectsPopup::new();
         popup.visible = true;
         popup.projects.push(ProjectItem {
-            project: ProjectRow {
+            project: Project {
                 id: "proj-1".into(),
                 name: "Test Project".into(),
                 description: "A test".into(),
@@ -796,7 +811,7 @@ mod tests {
     fn cursor_wraps() {
         let mut popup = make_popup_with_project("active");
         popup.projects.push(ProjectItem {
-            project: ProjectRow {
+            project: Project {
                 id: "proj-2".into(),
                 name: "Second".into(),
                 description: "".into(),
