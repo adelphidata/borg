@@ -142,7 +142,7 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     }
     match state.audit.verify() {
         AuditChainOutcome::Tampered { seq } => assert_eq!(seq, target_seq),
-        AuditChainOutcome::Ok => panic!("expected Tampered, got Ok"),
+        other => panic!("expected Tampered, got {other:?}"),
     }
 
     server.abort();

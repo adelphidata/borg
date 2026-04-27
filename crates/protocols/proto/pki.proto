@@ -67,8 +67,10 @@ message PairedDeviceList {
 }
 
 message VerifyAuditResponse {
-  // "ok" | "tampered"
+  // "ok" | "ok_with_tombstones" | "tampered"
   string outcome = 1;
-  // Populated when outcome == "tampered". -1 if outcome == "ok".
+  // Populated when outcome == "tampered". -1 otherwise.
   int64 tampered_seq = 2;
+  // Populated when outcome == "ok_with_tombstones". 0 otherwise.
+  int64 tombstone_count = 3;
 }

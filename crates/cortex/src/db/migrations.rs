@@ -1655,6 +1655,40 @@ impl Database {
         Ok(())
     }
 
+    /// V47 (Task 05): retention tombstone column + posture snapshots.
+    ///
+    /// `audit_log_chain.event_purged` — tombstone flag set by the retention
+    /// purge job. The chain hash includes this bit so flipping it without a
+    /// matching payload edit is detected as `Tampered` (see
+    /// `audit_chain::compute_row_hash`).
+    ///
+    /// `posture_snapshots` — denormalized index over the `security_posture_changed`
+    /// rows in `evolution_events`. The hash chain in `evolution_events` is
+    /// the audit root; this table exists so `/evolution`, `/xp`, and the
+    /// `Status` gRPC service don't have to scan the chain for the head state.
+    pub(super) fn migrate_v47(&self) -> Result<()> {
+        if !Self::has_column(&self.conn, "audit_log_chain", "event_purged") {
+            self.conn.execute_batch(
+                "ALTER TABLE audit_log_chain ADD COLUMN event_purged INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS posture_snapshots (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                evolution_event_id  INTEGER NOT NULL UNIQUE,
+                taken_at            INTEGER NOT NULL,
+                posture             TEXT NOT NULL,
+                source              TEXT NOT NULL,
+                schema_version      INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_posture_snapshots_taken_at
+                ON posture_snapshots(taken_at DESC);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

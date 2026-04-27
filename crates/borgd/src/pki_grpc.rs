@@ -225,10 +225,17 @@ impl Pki for PkiSvc {
             AuditChainOutcome::Ok => VerifyAuditResponse {
                 outcome: "ok".into(),
                 tampered_seq: -1,
+                tombstone_count: 0,
+            },
+            AuditChainOutcome::OkWithTombstones { count } => VerifyAuditResponse {
+                outcome: "ok_with_tombstones".into(),
+                tampered_seq: -1,
+                tombstone_count: count as i64,
             },
             AuditChainOutcome::Tampered { seq } => VerifyAuditResponse {
                 outcome: "tampered".into(),
                 tampered_seq: seq,
+                tombstone_count: 0,
             },
         };
         Ok(Response::new(resp))

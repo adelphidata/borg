@@ -15,12 +15,20 @@ pub async fn run_verify() -> Result<()> {
             println!("audit chain: OK");
             Ok(())
         }
+        "ok_with_tombstones" => {
+            println!(
+                "audit chain: OK ({} tombstone{})",
+                resp.tombstone_count,
+                if resp.tombstone_count == 1 { "" } else { "s" }
+            );
+            Ok(())
+        }
         "tampered" => {
             eprintln!("audit chain: TAMPERED at seq={}", resp.tampered_seq);
             std::process::exit(1);
         }
         other => {
-            eprintln!("audit chain: unexpected outcome {:?}", other);
+            eprintln!("audit chain: unexpected outcome {other:?}");
             std::process::exit(2);
         }
     }
