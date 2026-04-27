@@ -257,7 +257,10 @@ impl GatewayServer {
             .route("/webhook/slack/command", post(slack_command_handler))
             .route("/webhook/{name}", post(webhook_handler))
             .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
-            .with_state(state.clone());
+            .with_state(state.clone())
+            .merge(build_openai_compat_router(&self.config))
+            .merge(build_generic_webhook_router(&self.config))
+            .merge(build_mcp_http_router(&self.config));
 
         // Check if a gateway is already running on this port before attempting to bind
         let probe_ok = async {
@@ -701,6 +704,75 @@ impl GatewayServer {
 
         Ok(())
     }
+}
+
+/// Per-request DB factory used by the three v1 HTTP surfaces.
+///
+/// `Database` is `!Sync` (rusqlite's statement cache is `RefCell`), so
+/// each handler opens its own connection. `open_with_timeout` matches
+/// what the channel handlers use elsewhere in this crate.
+fn db_open_factory() -> Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> {
+    Arc::new(|| {
+        Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+            .map_err(|e| anyhow::anyhow!("open db: {e}"))
+    })
+}
+
+/// Build the shared `IngressGate` used by OpenAI-compat + generic
+/// webhook. Audit chain wiring is deferred to Task 02 — the
+/// `with_noop_audit` here will become `IngressGate::new(... audit ...)`
+/// once `audit_log_chain` ships.
+fn build_ingress_gate(config: &Config) -> Arc<cortex::ingress::IngressGate> {
+    let max_per_min = config.gateway.rate_limit_per_minute.max(1);
+    Arc::new(cortex::ingress::IngressGate::with_noop_audit(
+        max_per_min,
+        Duration::from_secs(60),
+    ))
+}
+
+/// Mount the OpenAI-compat router. Bearer auth, per-token sessions,
+/// streaming + non-stream `chat/completions`, `GET /v1/models`.
+///
+/// `/v1/models` advertises a small fixed alias set rather than every
+/// configured `gateway.bindings` row — bindings are routing rules
+/// (channel + sender → provider/model), not user-facing model names.
+/// `borg-default` and `borg-fast` are what ChatBox / Open WebUI / the
+/// official OpenAI SDK starter configs autocomplete to; the agent
+/// resolves the actual provider/model per its own config regardless
+/// of which alias the client picks.
+fn build_openai_compat_router(config: &Config) -> Router {
+    use crate::openai_compat::{router, OpenAiState};
+    router(OpenAiState {
+        db_open: db_open_factory(),
+        gate: build_ingress_gate(config),
+        dispatcher: crate::openai_compat::arc_dispatcher(),
+        model_aliases: Arc::new(vec!["borg-default".into(), "borg-fast".into()]),
+    })
+}
+
+/// Mount the generic-webhook router (`POST /v1/webhook/{name}`).
+fn build_generic_webhook_router(config: &Config) -> Router {
+    use crate::generic_webhook::{router, WebhookState};
+    router(WebhookState {
+        db_open: db_open_factory(),
+        gate: build_ingress_gate(config),
+        sink: crate::generic_webhook::arc_sink(),
+    })
+}
+
+/// Mount the MCP HTTP router (`POST /mcp`). Bearer-authenticated;
+/// exposes the read-only tool set built by
+/// [`crate::mcp::build_read_only_tools`].
+fn build_mcp_http_router(config: &Config) -> Router {
+    use crate::mcp::{build_read_only_tools, http_router, McpHttpState, McpServer};
+    let server = Arc::new(McpServer::new(
+        build_read_only_tools(config.clone()),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    http_router(McpHttpState {
+        db_open: db_open_factory(),
+        server,
+    })
 }
 
 async fn health_handler() -> impl IntoResponse {

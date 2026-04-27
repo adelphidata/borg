@@ -24,9 +24,11 @@
 //! intentionally requires updating that guard test (see the comment
 //! on `tools_list_only_exposes_read_only_tools` in `server.rs`).
 
+mod handlers;
 mod routes;
 mod server;
 pub mod stdio;
 
+pub use handlers::build_read_only_tools;
 pub use routes::{http_router, McpHttpState};
 pub use server::{McpError, McpServer, McpToolDescriptor, ReadOnlyToolHandler};

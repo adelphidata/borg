@@ -17,12 +17,14 @@
 //! agent-driven tool execution should let the agent run its tools
 //! server-side and consume the resulting text.
 
+mod agent_dispatcher;
 mod dispatcher;
 mod routes;
 mod types;
 
+pub use agent_dispatcher::{arc_dispatcher, AgentDispatcher};
 pub use dispatcher::{AgentEventChunk, ChatDispatcher};
-pub use routes::router;
+pub use routes::{router, OpenAiState};
 pub use types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, ModelInfo,
     ModelsList,

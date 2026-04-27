@@ -10,8 +10,10 @@
 //! Full JSONPath (filters, slices, recursive descent) is deferred to
 //! v2 — most webhook payloads have stable shapes that dot-paths cover.
 
+mod agent_sink;
 pub mod definitions;
 pub mod extract;
-mod routes;
+pub mod routes;
 
-pub use routes::{router, WebhookState};
+pub use agent_sink::{arc_sink, AgentSink};
+pub use routes::{router, AdmitSink, WebhookState};
