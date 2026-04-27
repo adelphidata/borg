@@ -98,6 +98,22 @@ impl Database {
         Self::init_connection(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
     }
 
+    /// Open (or create) a database at an arbitrary filesystem path. Runs
+    /// migrations. Used by [`crate::backup`] to inspect SQLite files
+    /// inside extracted tarballs without going through `Config::db_path`.
+    #[instrument(skip_all)]
+    pub fn open_at(path: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("Failed to open DB at {path:?}"))?;
+        Self::set_file_permissions(path);
+        Self::init_connection(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
+    }
+
     /// Open the database read-only. Skips migrations and writes — intended
     /// for read-only consumers (e.g. the cli reading config/settings). The
     /// single-writer invariant means only `borgd` may use [`open()`](Self::open)
@@ -424,7 +440,7 @@ impl Database {
         Ok(())
     }
 
-    fn schema_version(&self) -> Result<u32> {
+    pub fn schema_version(&self) -> Result<u32> {
         match self.get_meta("schema_version")? {
             Some(v) => match v.parse() {
                 Ok(n) => Ok(n),

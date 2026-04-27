@@ -249,6 +249,11 @@ enum Commands {
         #[command(subcommand)]
         action: AuditCmd,
     },
+    /// Create, verify, or restore a `BORG_HOME` backup tarball.
+    Backup {
+        #[command(subcommand)]
+        action: BackupCmd,
+    },
     /// Export a session to JSON (default), CSV, or TXT.
     ///
     /// With no `--output`, writes to stdout (pipeable into `jq`, files, etc.).
@@ -299,6 +304,26 @@ enum RevokeCmd {
 enum AuditCmd {
     /// Replay the audit chain and report Ok or Tampered(seq).
     Verify,
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Write a tarball of the current `BORG_HOME` to `~/.borg/backups/`.
+    Create,
+    /// Verify a backup tarball: digest, manifest, and embedded audit chain.
+    Verify {
+        /// Path to the `borg-backup-*.tar.zst` file.
+        file: std::path::PathBuf,
+    },
+    /// Restore a backup into `BORG_HOME`. Refuses to clobber existing
+    /// state without `--force` (which renames the existing dir to
+    /// `<BORG_HOME>.bak.<unix_ts>` first).
+    Restore {
+        /// Path to the `borg-backup-*.tar.zst` file.
+        file: std::path::PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// Runtime worker thread stack size.
@@ -506,6 +531,13 @@ async fn async_main() -> Result<()> {
         },
         Some(Commands::Audit { action }) => match action {
             AuditCmd::Verify => commands::audit::run_verify().await?,
+        },
+        Some(Commands::Backup { action }) => match action {
+            BackupCmd::Create => commands::backup::run_create()?,
+            BackupCmd::Verify { file } => commands::backup::run_verify(&file)?,
+            BackupCmd::Restore { file, force } => {
+                commands::backup::run_restore(&file, force)?
+            }
         },
     }
 

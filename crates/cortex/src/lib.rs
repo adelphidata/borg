@@ -39,6 +39,8 @@ pub mod agent;
 pub mod auth;
 /// Agent bond/relationship tracking.
 pub mod bond;
+/// `BORG_HOME` backup unit (Task 05): tar.zst create/verify/restore.
+pub mod backup;
 /// Headless Chrome automation via CDP.
 pub mod browser;
 /// USD budget engine with versioned rate cards and pre/post-flight enforcement.
