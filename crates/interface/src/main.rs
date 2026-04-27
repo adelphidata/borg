@@ -535,9 +535,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Backup { action }) => match action {
             BackupCmd::Create => commands::backup::run_create()?,
             BackupCmd::Verify { file } => commands::backup::run_verify(&file)?,
-            BackupCmd::Restore { file, force } => {
-                commands::backup::run_restore(&file, force)?
-            }
+            BackupCmd::Restore { file, force } => commands::backup::run_restore(&file, force)?,
         },
     }
 

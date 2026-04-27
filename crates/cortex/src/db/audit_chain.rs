@@ -126,7 +126,14 @@ impl Database {
             "INSERT INTO audit_log_chain
              (prev_hash, hash, event_type, event_json, ts, principal_id, event_purged)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![prev, hash.to_vec(), event_type, event_json, ts, principal_id],
+            params![
+                prev,
+                hash.to_vec(),
+                event_type,
+                event_json,
+                ts,
+                principal_id
+            ],
         )?;
         let seq = tx.last_insert_rowid();
         tx.commit()?;
@@ -213,8 +220,7 @@ impl Database {
                 // the unchanged stored_hash.
                 tombstone_count += 1;
             } else {
-                let computed =
-                    compute_row_hash(&prev_hash, &event_type, &event_json, ts, false);
+                let computed = compute_row_hash(&prev_hash, &event_type, &event_json, ts, false);
                 if computed.as_slice() != stored_hash.as_slice() {
                     return Ok(AuditChainOutcome::Tampered { seq });
                 }
@@ -318,20 +324,27 @@ mod tests {
     #[test]
     fn verify_empty_chain_ok() {
         let db = test_db();
-        assert_eq!(db.verify_audit_chain().expect("verify"), AuditChainOutcome::Ok);
+        assert_eq!(
+            db.verify_audit_chain().expect("verify"),
+            AuditChainOutcome::Ok
+        );
     }
 
     #[test]
     fn append_then_verify_ok_for_long_chain() {
         let db = test_db();
         append_n(&db, 50);
-        assert_eq!(db.verify_audit_chain().expect("verify"), AuditChainOutcome::Ok);
+        assert_eq!(
+            db.verify_audit_chain().expect("verify"),
+            AuditChainOutcome::Ok
+        );
     }
 
     #[test]
     fn first_row_uses_genesis_prev_hash() {
         let db = test_db();
-        db.append_audit_event("first", r#"{"a":1}"#, "p", 1_700_000_000).expect("append");
+        db.append_audit_event("first", r#"{"a":1}"#, "p", 1_700_000_000)
+            .expect("append");
         let rows = db.list_audit_events().expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].prev_hash, GENESIS_PREV_HASH.to_vec());
@@ -404,7 +417,8 @@ mod tests {
     fn tombstone_roundtrip_verifies_clean() {
         let db = test_db();
         append_n(&db, 10);
-        db.tombstone_audit_event(5, 1_700_000_999).expect("tombstone");
+        db.tombstone_audit_event(5, 1_700_000_999)
+            .expect("tombstone");
         match db.verify_audit_chain().expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 1),
             other => panic!("expected OkWithTombstones(1), got {other:?}"),
@@ -426,7 +440,8 @@ mod tests {
     fn tombstone_preserves_downstream_linkage() {
         let db = test_db();
         append_n(&db, 10);
-        db.tombstone_audit_event(5, 1_700_000_999).expect("tombstone");
+        db.tombstone_audit_event(5, 1_700_000_999)
+            .expect("tombstone");
         db.append_audit_event("post_tomb", r#"{"k":11}"#, "p", 1_700_000_011)
             .expect("append");
         match db.verify_audit_chain().expect("verify") {
@@ -444,7 +459,10 @@ mod tests {
         let db = test_db();
         append_n(&db, 6);
         db.conn()
-            .execute("UPDATE audit_log_chain SET event_purged = 1 WHERE seq = 3", [])
+            .execute(
+                "UPDATE audit_log_chain SET event_purged = 1 WHERE seq = 3",
+                [],
+            )
             .expect("flip bit");
         match db.verify_audit_chain().expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 3),
@@ -459,9 +477,13 @@ mod tests {
     fn tombstone_payload_without_purged_bit_is_tampered() {
         let db = test_db();
         append_n(&db, 6);
-        db.tombstone_audit_event(3, 1_700_000_999).expect("tombstone");
+        db.tombstone_audit_event(3, 1_700_000_999)
+            .expect("tombstone");
         db.conn()
-            .execute("UPDATE audit_log_chain SET event_purged = 0 WHERE seq = 3", [])
+            .execute(
+                "UPDATE audit_log_chain SET event_purged = 0 WHERE seq = 3",
+                [],
+            )
             .expect("clear bit");
         match db.verify_audit_chain().expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 3),
@@ -557,7 +579,8 @@ mod tests {
     fn rewriting_tombstone_payload_within_canonical_shape_is_not_detected() {
         let db = test_db();
         append_n(&db, 6);
-        db.tombstone_audit_event(3, 1_700_000_999).expect("tombstone");
+        db.tombstone_audit_event(3, 1_700_000_999)
+            .expect("tombstone");
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = ?1 WHERE seq = 3",

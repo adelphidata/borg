@@ -78,9 +78,8 @@ pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> R
     if !borg_home.is_dir() {
         bail!("borg_home {} is not a directory", borg_home.display());
     }
-    fs::create_dir_all(out_dir).with_context(|| {
-        format!("failed to create backup output dir {}", out_dir.display())
-    })?;
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create backup output dir {}", out_dir.display()))?;
     let now = chrono::Utc::now().timestamp();
     let dest = out_dir.join(format!("borg-backup-{now}.tar.zst"));
 
@@ -223,9 +222,8 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
             )
         })?;
     }
-    fs::create_dir_all(borg_home).with_context(|| {
-        format!("restore: create {}", borg_home.display())
-    })?;
+    fs::create_dir_all(borg_home)
+        .with_context(|| format!("restore: create {}", borg_home.display()))?;
 
     let tmp = tempfile::tempdir().context("restore: tempdir")?;
     let (_, body_tar) = extract_outer(file, tmp.path())?;
@@ -324,8 +322,8 @@ fn append_dir_filtered<W: Write>(
                 .append_dir(&archive_path, &entry)
                 .with_context(|| format!("append dir {}", entry.display()))?;
         } else if meta.is_file() {
-            let mut f = fs::File::open(&entry)
-                .with_context(|| format!("open {}", entry.display()))?;
+            let mut f =
+                fs::File::open(&entry).with_context(|| format!("open {}", entry.display()))?;
             builder
                 .append_file(&archive_path, &mut f)
                 .with_context(|| format!("append file {}", entry.display()))?;
@@ -345,9 +343,7 @@ fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn walk_dir_into(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for ent in fs::read_dir(current)
-        .with_context(|| format!("read_dir {}", current.display()))?
-    {
+    for ent in fs::read_dir(current).with_context(|| format!("read_dir {}", current.display()))? {
         let ent = ent?;
         let path = ent.path();
         let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -405,8 +401,7 @@ fn harden_archive<R: std::io::Read>(archive: &mut tar::Archive<R>) {
 /// `tar.zst` file into `out_dir`. Returns the parsed manifest and the
 /// path to the extracted `body.tar`.
 fn extract_outer(file: &Path, out_dir: &Path) -> Result<(BackupManifest, PathBuf)> {
-    let f = fs::File::open(file)
-        .with_context(|| format!("open backup {}", file.display()))?;
+    let f = fs::File::open(file).with_context(|| format!("open backup {}", file.display()))?;
     let dec = zstd::Decoder::new(BufReader::new(f)).context("init zstd decoder")?;
     let mut archive = tar::Archive::new(dec);
     harden_archive(&mut archive);
@@ -454,8 +449,7 @@ fn move_dir_contents(src: &Path, dst: &Path) -> Result<()> {
             // Cross-device errno (`EXDEV`) is 18 on macOS/Linux. Hard-code
             // it to avoid pulling `libc` just for the constant.
             const EXDEV: i32 = 18;
-            if e.kind() == io::ErrorKind::CrossesDevices
-                || matches!(e.raw_os_error(), Some(EXDEV))
+            if e.kind() == io::ErrorKind::CrossesDevices || matches!(e.raw_os_error(), Some(EXDEV))
             {
                 copy_recursive(&from, &to)?;
             } else {
@@ -621,7 +615,11 @@ mod tests {
         let bak = fs::read_dir(parent)
             .unwrap()
             .flatten()
-            .find(|e| e.file_name().to_string_lossy().starts_with("borg_home.bak."))
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("borg_home.bak.")
+            })
             .expect("expected a .bak.<ts> sibling dir");
         let preserved = fs::read(bak.path().join("hooks.json")).unwrap();
         assert_eq!(preserved, b"{\"before\":1}");

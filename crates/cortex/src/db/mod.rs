@@ -108,8 +108,8 @@ impl Database {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("Failed to open DB at {path:?}"))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("Failed to open DB at {path:?}"))?;
         Self::set_file_permissions(path);
         Self::init_connection(conn, Self::DEFAULT_BUSY_TIMEOUT_MS)
     }

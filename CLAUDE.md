@@ -387,14 +387,18 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 - Replay reads posture from the chain only, never live config — deterministic XP recomputation.
 - `xp_gain` events carry `xp_breakdown` (base, align bonus, state multiplier, pre/post-clamp, final) and `posture_event_seq` cross-reference.
 - UX: `/evolution` shows posture line; `/xp` header shows current posture + weekly avg multiplier; toast on transition. Discovery is opt-in.
+- v1 status: types/resolver/snapshot/emit + daemon-startup reconcile + `Status::GetPosture` gRPC all shipped at `crates/cortex/src/evolution/security/` and `crates/borgd/src/daemon.rs`. Live config → `PostureSnapshot` → `posture_snapshots` index + `audit_log_chain` event with 2/hr rate limit. `Status::GetPosture` reads the head of `posture_snapshots` (falls back to `Default × 1.00` on a fresh DB). Replay multiplier wiring into `xp_gain` and the `/evolution` + `/xp` UX surfaces are deferred follow-ups (the resolver and `XpBreakdown` types are ready to receive them).
 
 ### Data Handling
 
-- Retention: global `retention_days` (default NULL = forever), `purge_policy` (auto / on_demand_only / never). Daily maintenance task purges messages, audit events, blobs past cutoff.
-- **Tombstone-on-purge in audit chain:** purge replaces `event_json` with `{purged: true, purged_at: ts}` while keeping `prev_hash`/`hash` intact. `borg audit verify` distinguishes `PurgedTombstone` (non-failure) from `Tampered`.
-- Backup unit (v1): single tarball of `$BORG_HOME` (SQLite, blobs, audit chain, config, internal CA + cert metadata). **mTLS private keys live in OS keychain and are NOT in the tarball** — restoring on a new host requires re-pairing.
-- Commands: `borg backup create [--passphrase-from <fd>]`, `borg backup verify <file>`, `borg backup restore <file> [--force]`.
-- Self-healing: weekly auto-backup, keep last 3 (configurable 0–52).
+- Retention config in `[data]`: `retention_days` (default `None` = forever), `purge_policy` (`auto` / `on_demand_only` / `never`), `backup_keep_count` (default 3, range 0–52). `DataConfig::should_auto_purge` encapsulates the interaction.
+- Daily maintenance task (V37 cron `0 0 2 * * *`) calls `Database::purge_messages_before(cutoff)` (hard-delete) and `Database::tombstone_audit_events_before(cutoff, now)` (in-place tombstone) when `should_auto_purge()` is true. Counts surface on `MaintenanceReport.messages_purged` / `audit_events_tombstoned`.
+- **Tombstone-on-purge in audit chain (V47):** the purge rewrites `event_json` to `{"purged":1,"purged_at":<ts>,"original_type":"<t>"}` and sets the new `event_purged` column. `prev_hash` and `hash` stay untouched as a forensic anchor. `verify_audit_chain` returns `OkWithTombstones { count }` for a chain with at least one tombstone, distinct from `Ok` (no purge fired) and `Tampered { seq }`. The verifier also catches "set the bit / leave the bit" mask attacks (a tombstoned row must carry the canonical payload, and vice versa). `borg audit verify` prints `OK`, `OK (N tombstones)`, or `TAMPERED at seq=N`.
+- **Documented limitation:** an attacker with raw SQLite write access can edit `purged_at` inside a canonical tombstone payload without detection — by design (`hash` is the original anchor, not recomputed). Operators who need cryptographic detection of tombstone-payload edits compare against a backup taken before the purge.
+- Backup unit (v1): single `borg-backup-<unix>.tar.zst` of `$BORG_HOME` (SQLite, blobs, skills, channels, hooks, config). **Excluded:** `borgd.sock`, `*.lock`, `logs/`, `backups/`. **mTLS private keys live in OS keychain and are NOT in the tarball** — restoring on a new host requires re-pairing.
+- Tarball layout: outer `tar.zst` containing `metadata.json` (schema_version, created_at, sha256_pre_compress) + inner `body.tar` (the `borg_home/...` tree). `verify_backup` recomputes the sha256 over the inner tar before extracting and runs `verify_audit_chain` against the embedded SQLite. `restore_backup` refuses non-empty `BORG_HOME` without `--force`; `--force` renames existing dir to `.bak.<unix_ts>` and appends a `state_restored` audit event to the restored chain. Tar extraction is hardened (`set_overwrite(false)`, `set_preserve_permissions(false)`, `set_unpack_xattrs(false)`).
+- Commands: `borg backup create`, `borg backup verify <file>`, `borg backup restore <file> [--force]`. Passphrase-encrypted backups are deferred (per `data-handling.md` open question #1).
+- Self-healing: weekly auto-backup runs from the daily maintenance sweep when `backup_keep_count > 0` AND no backup exists in the last 7 days (`weekly_backup_due`). Older `borg-backup-*.tar.zst` files are pruned to `backup_keep_count` after a successful create. `backup_keep_count = 0` disables auto-backup and removes any stragglers. `MaintenanceReport.auto_backup_path` and `.backups_pruned` surface the result of each sweep.
 
 ### New Tables (v1)
 
@@ -402,7 +406,8 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 - `paired_devices(id, fingerprint, owner_label, key_storage_tier, scope_json, paired_at, last_seen_at, status, principal_id)`
 - `revoked_fingerprints(fingerprint, revoked_at, reason)`
 - `pairing_codes(code_hash, expires_at, intent, created_by)`
-- `audit_log_chain(seq, prev_hash, hash, event_json, ts, principal_id)` — hash-chained, blake3
+- `audit_log_chain(seq, prev_hash, hash, event_type, event_json, ts, principal_id, event_purged)` — hash-chained, blake3. `event_purged` (V47) marks tombstoned rows; chain hash includes the bit so flipping it without a matching payload edit is detected as `Tampered`.
+- `posture_snapshots(id, evolution_event_id, taken_at, posture, source, schema_version)` — V47 denormalized index over `security_posture_changed` rows in `audit_log_chain`.
 - `internal_ca_certs(serial, kind, pem, issued_at, expires_at, revoked_at)`
 - `provider_rate_cards(provider_id, model, effective_at, …)` — versioned, replay-safe
 
@@ -414,7 +419,7 @@ Three states, multiplier applied to per-event XP (per-event clamp at 3 stays):
 | **02** mTLS + PAKE pairing + audit chain | `identity`, pairing flow, verifiers, hash-chained audit | Not started (depends on 01) |
 | **03** Layer 5 adapters | Port 8 channels into `borgd`; OpenAI-compat HTTP; webhook; MCP server | Not started (depends on 01) |
 | **04** Provider trait + rate cards + budgets | Unified `Provider`, versioned rate cards, soft/hard budgets, air-gap | Not started |
-| **05** Posture v2 + data handling + cleanup | 3-state posture, retention, tombstone, backups, dead-code sweep, docs | Not started |
+| **05** Posture v2 + data handling + cleanup | 3-state posture, retention, tombstone, backups, dead-code sweep, docs | **Mostly landed** — posture types/resolver/snapshot/emit, V47 schema, tombstone-on-purge with mask-attack guards, `DataConfig` + retention purge, `borg backup create/verify/restore` (hardened tar extraction), daemon-startup posture reconcile, `Status::GetPosture` reading the live head, and weekly auto-backup with cadence guard all shipped. Replay multiplier wiring into `xp_gain` events and the `/evolution` + `/xp` posture surfaces are the remaining deferred follow-ups. |
 
 **Task 01 — landed so far** (commits `81476b4` → `ad28b67`):
 - `borgd` daemon: flock single-instance, UDS listener, `Session`/`Capability`/`Status`/`Admin` services scaffolded.
