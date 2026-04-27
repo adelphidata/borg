@@ -51,6 +51,9 @@ fn render_content_line(raw: &str, kind: DiffKind, ext: Option<&str>) -> Line<'st
         DiffKind::Remove => ('-', raw.get(1..).unwrap_or("")),
         DiffKind::Context => (' ', raw.get(1..).unwrap_or("")),
     };
+    // Codex-style: per-span foreground tint; the line-level `style(bg)` below
+    // paints the row background (including the trailing gutter past the last
+    // span), so we don't double-apply bg on the spans.
     let tint = match kind {
         DiffKind::Add => theme::diff_add_style(),
         DiffKind::Remove => theme::diff_remove_style(),
@@ -67,7 +70,11 @@ fn render_content_line(raw: &str, kind: DiffKind, ext: Option<&str>) -> Line<'st
         }
         _ => spans.push(Span::styled(body.to_string(), tint)),
     }
-    Line::from(spans)
+    Line::from(spans).style(match kind {
+        DiffKind::Add => ratatui::style::Style::default().bg(theme::diff_add_bg()),
+        DiffKind::Remove => ratatui::style::Style::default().bg(theme::diff_remove_bg()),
+        DiffKind::Context => ratatui::style::Style::default(),
+    })
 }
 
 /// Render a Borg patch DSL string as a vector of styled [`Line`]s.

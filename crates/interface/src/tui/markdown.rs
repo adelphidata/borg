@@ -31,15 +31,18 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
             Event::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
                     flush_line(&mut current_spans, &mut lines);
-                    let style = match level {
-                        pulldown_cmark::HeadingLevel::H1 => {
-                            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                        }
-                        pulldown_cmark::HeadingLevel::H2 => {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        }
-                        _ => Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                    // H4–H6 share the italic style (matching Codex), but each level
+                    // still prints its own number of `#` hashes for the marker prefix.
+                    let (style, hashes) = match level {
+                        pulldown_cmark::HeadingLevel::H1 => (theme::md_h1_style(), 1),
+                        pulldown_cmark::HeadingLevel::H2 => (theme::md_h2_style(), 2),
+                        pulldown_cmark::HeadingLevel::H3 => (theme::md_h3_style(), 3),
+                        pulldown_cmark::HeadingLevel::H4 => (theme::md_h4_style(), 4),
+                        pulldown_cmark::HeadingLevel::H5 => (theme::md_h4_style(), 5),
+                        pulldown_cmark::HeadingLevel::H6 => (theme::md_h4_style(), 6),
                     };
+                    // Codex-style: render the literal "#"/"##"/... marker before the heading text.
+                    current_spans.push(Span::styled(format!("{} ", "#".repeat(hashes)), style));
                     style_stack.push(style);
                 }
                 Tag::Paragraph => {
@@ -95,7 +98,9 @@ pub fn render_markdown(input: &str, width: u16) -> Vec<Line<'static>> {
                     let bullet = if let Some(ref mut idx) = ordered_index {
                         let b = format!("{indent}{idx}. ");
                         *idx += 1;
-                        current_spans.push(Span::styled(b.clone(), theme::code_style()));
+                        // Codex-style: ordered markers use light blue, not the cyan inline-code colour.
+                        current_spans
+                            .push(Span::styled(b.clone(), theme::md_ordered_marker_style()));
                         b
                     } else {
                         let b = format!("{indent}- ");
@@ -326,12 +331,12 @@ mod tests {
     #[test]
     fn heading_levels() {
         let lines = render_markdown("# H1\n## H2\n### H3", 80);
-        // Each heading followed by blank line
+        // Codex-style: each heading is rendered with its literal "#" prefix.
         let texts = text_of(&lines);
-        assert!(texts.contains(&"H1".to_string()));
-        assert!(texts.contains(&"H2".to_string()));
-        assert!(texts.contains(&"H3".to_string()));
-        // H1 should be bold+underlined
+        assert!(texts.iter().any(|t| t == "# H1"));
+        assert!(texts.iter().any(|t| t == "## H2"));
+        assert!(texts.iter().any(|t| t == "### H3"));
+        // H1 should be bold+underlined (style applied on the "#" prefix span).
         let h1_line = &lines[0];
         let style = h1_line.spans[0].style;
         assert!(style.add_modifier.contains(Modifier::BOLD));
@@ -367,6 +372,22 @@ mod tests {
         let texts = text_of(&lines);
         assert!(texts.iter().any(|t| t.contains("1. first")));
         assert!(texts.iter().any(|t| t.contains("2. second")));
+    }
+
+    #[test]
+    fn ordered_list_marker_uses_light_blue_not_cyan() {
+        // Regression guard: ordered markers were previously rendered with the
+        // cyan inline-code style; Codex skin uses light blue. If a future
+        // change reverts the colour this test fails before the visual hits
+        // production.
+        let lines = render_markdown("1. one", 40);
+        let marker_span = lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .find(|s| s.content.as_ref() == "1. ")
+            .expect("ordered marker span present");
+        assert_eq!(marker_span.style, theme::md_ordered_marker_style());
+        assert_ne!(marker_span.style, theme::code_style());
     }
 
     #[test]

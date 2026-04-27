@@ -8,13 +8,14 @@ pub const AMBER: Color = Color::Rgb(255, 191, 0);
 pub const DIM_WHITE: Color = Color::DarkGray;
 pub const BORDER: Color = Color::Rgb(3, 113, 113);
 
-pub const BULLET: &str = "●";
-pub const CHEVRON: &str = "❯";
+// Codex-style glyphs: lighter bullet (•) and single chevron (›) for message prefixes.
+pub const BULLET: &str = "•";
+pub const CHEVRON: &str = "›";
 pub const TREE_MID: &str = "├";
 pub const TREE_END: &str = "└";
 
 pub const TOOL_ACTIVE_GREEN: Color = Color::Rgb(0, 200, 0);
-pub const INPUT_PROMPT: &str = "❯ ";
+pub const INPUT_PROMPT: &str = "› ";
 
 pub const CHECK: &str = "✓";
 pub const CROSS: &str = "✗";
@@ -99,6 +100,7 @@ pub fn icon_style() -> Style {
     Style::default().fg(CYAN)
 }
 
+#[allow(dead_code)]
 pub fn thinking_border_style() -> Style {
     if super::colors::is_light_terminal() {
         Style::default().fg(Color::Rgb(150, 150, 150))
@@ -114,12 +116,67 @@ pub fn reasoning_style() -> Style {
     dim().add_modifier(Modifier::ITALIC)
 }
 
+// --- Codex-style markdown semantic styles ---
+
+/// Heading level 1: bold + underlined.
+pub fn md_h1_style() -> Style {
+    Style::default()
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+/// Heading level 2: bold.
+pub fn md_h2_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+/// Heading levels 3–6: italic (3 also bold).
+pub fn md_h3_style() -> Style {
+    Style::default()
+        .add_modifier(Modifier::BOLD)
+        .add_modifier(Modifier::ITALIC)
+}
+
+pub fn md_h4_style() -> Style {
+    Style::default().add_modifier(Modifier::ITALIC)
+}
+
+/// Ordered-list markers (e.g. `1.`): light blue.
+pub fn md_ordered_marker_style() -> Style {
+    Style::default().fg(Color::LightBlue)
+}
+
+/// Key-hint footer text (Codex-style "ctrl + c" labels).
+pub fn key_hint_style() -> Style {
+    dim()
+}
+
 pub fn diff_add_style() -> Style {
     Style::default().fg(TOOL_ACTIVE_GREEN)
 }
 
 pub fn diff_remove_style() -> Style {
     Style::default().fg(RED)
+}
+
+/// Codex-style adaptive backgrounds for diff add/remove rows.
+///
+/// Dark terminals: muted green (`#213A2B`) / red (`#4A221D`).
+/// Light terminals: pastel green (`#dafbe1`) / red (`#ffebe9`).
+pub fn diff_add_bg() -> Color {
+    if super::colors::is_light_terminal() {
+        Color::Rgb(218, 251, 225)
+    } else {
+        Color::Rgb(33, 58, 43)
+    }
+}
+
+pub fn diff_remove_bg() -> Color {
+    if super::colors::is_light_terminal() {
+        Color::Rgb(255, 235, 233)
+    } else {
+        Color::Rgb(74, 34, 29)
+    }
 }
 
 pub fn diff_header_style() -> Style {

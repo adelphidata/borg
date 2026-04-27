@@ -818,21 +818,35 @@ impl HistoryCell {
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
             HistoryCell::Card { lines } => lines.clone(),
             HistoryCell::Thinking { text } => {
-                // Don't render an empty thinking box
+                // Codex-style reasoning: dim + italic bullet block, no box.
+                // Header line: "• thinking" (dim, italic) — bullet matches assistant
+                // bullet width so wrapped continuation lines hang under the body.
                 if text.is_empty() {
                     return vec![];
                 }
-                let border = theme::thinking_border_style();
                 let content_style = theme::reasoning_style();
-                let inner_w = (width as usize).saturating_sub(2).max(1);
-                let inner_lines: Vec<Line<'static>> = text
-                    .lines()
-                    .map(|l| {
-                        let display = line_utils::truncate_str_to_width(l, inner_w);
-                        Line::from(Span::styled(display.to_string(), content_style))
-                    })
-                    .collect();
-                render_boxed_lines(inner_lines, border, Some(" thinking "), width, 0)
+                let bullet = Span::styled(format!("{} ", theme::BULLET), theme::dim());
+                let header = Line::from(vec![
+                    bullet.clone(),
+                    Span::styled("thinking", content_style),
+                ]);
+                let inner_w = (width as usize).saturating_sub(LIVE_PREFIX_COLS).max(1);
+                let mut body: Vec<Line<'static>> = Vec::new();
+                for line in text.lines() {
+                    if line.is_empty() {
+                        body.push(Line::default());
+                        continue;
+                    }
+                    for wrapped in super::wrapping::wrap(line, inner_w) {
+                        body.push(Line::from(vec![
+                            Span::raw("  "),
+                            Span::styled(wrapped.to_string(), content_style),
+                        ]));
+                    }
+                }
+                let mut out = vec![header];
+                out.extend(body);
+                out
             }
             HistoryCell::ToolStreaming {
                 lines: tool_lines, ..
@@ -1459,6 +1473,31 @@ mod tests {
             .collect();
         assert!(all_text.contains("thinking"));
         assert!(all_text.contains("pondering"));
+    }
+
+    #[test]
+    fn render_thinking_is_codex_style_not_boxed() {
+        // Codex skin: dim+italic bullet block, NOT a bordered box. Regression
+        // guard against the old `render_boxed_lines` rendering. Asserts the
+        // header reads `• thinking` and no box-drawing characters appear.
+        let cell = HistoryCell::Thinking {
+            text: "step one".to_string(),
+        };
+        let lines = cell.render(40, None);
+        let header_text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header_text.starts_with(theme::BULLET));
+        assert!(header_text.contains("thinking"));
+        let all_text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        for forbidden in ['│', '└', '╭', '╮', '╰', '╯'] {
+            assert!(
+                !all_text.contains(forbidden),
+                "box-drawing char {forbidden:?} leaked into thinking render"
+            );
+        }
     }
 
     #[test]

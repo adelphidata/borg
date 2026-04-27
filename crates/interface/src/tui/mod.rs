@@ -11,6 +11,7 @@ mod file_search;
 mod goodbye;
 mod highlight;
 mod history;
+mod key_hint;
 mod layout;
 mod line_utils;
 mod markdown;
