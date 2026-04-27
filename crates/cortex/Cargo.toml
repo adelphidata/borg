@@ -53,6 +53,7 @@ tar = { workspace = true }
 zstd = { workspace = true }
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
+bip39 = "2"
 
 [lints]
 workspace = true

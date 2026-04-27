@@ -34,6 +34,14 @@ pub(crate) enum ProvidersAction {
         #[arg(long, default_value = "byo")]
         category: String,
     },
+    /// Remove a BYO provider by id. Idempotent — succeeds even if the
+    /// row is already absent. Built-ins (openai, anthropic, …) cannot be
+    /// removed; they live in code, not in the providers table.
+    Remove {
+        /// Provider id to delete from the `providers` table.
+        #[arg(long)]
+        id: String,
+    },
     /// Pull the latest published rate-card manifest from the Borg
     /// release host. Opt-in only — never invoked from a timer.
     ///
@@ -58,8 +66,24 @@ pub(crate) fn dispatch(action: ProvidersAction) -> Result<()> {
             api_key_env,
             category,
         } => add(id, display_name, base_url, api_key_env, &category),
+        ProvidersAction::Remove { id } => remove(id),
         ProvidersAction::RefreshRates { manifest_url } => refresh_rates(manifest_url.as_deref()),
     }
+}
+
+fn remove(id: String) -> Result<()> {
+    if id.is_empty() {
+        bail!("--id must be non-empty");
+    }
+    tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .remove_provider(&id)
+            .await
+            .with_context(|| format!("removing provider '{id}'"))
+    })?;
+    println!("Removed provider '{id}' (no-op if it wasn't present).");
+    Ok(())
 }
 
 fn list() -> Result<()> {

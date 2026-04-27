@@ -31,7 +31,8 @@ fn create_and_find_pairing_request() {
         .expect("should exist");
     assert_eq!(found.channel_name, "telegram");
     assert_eq!(found.sender_id, "user123");
-    assert_eq!(found.code, "ABCD1234");
+    // Codes are normalized to lowercase on insert (BIP-39 phrase format).
+    assert_eq!(found.code, "abcd1234");
     assert_eq!(found.status, "pending");
 
     // Not found for wrong channel
@@ -51,7 +52,7 @@ fn find_pending_for_sender_reuses_code() {
         .find_pending_for_sender("telegram", "user123")
         .expect("find")
         .expect("should exist");
-    assert_eq!(found.code, "CODE1111");
+    assert_eq!(found.code, "code1111");
 }
 
 #[test]

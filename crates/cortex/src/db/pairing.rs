@@ -18,6 +18,9 @@ impl Database {
         let id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         let expires_at = now + ttl_secs;
+        // Lowercase on insert so the column is the canonical form regardless
+        // of how the caller assembled it.
+        let code = code.to_lowercase();
         self.conn.execute(
             "INSERT INTO pairing_requests (id, channel_name, sender_id, code, status, display_name, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7)",
@@ -56,6 +59,7 @@ impl Database {
         code: &str,
     ) -> Result<Option<PairingRequestRow>> {
         let now = chrono::Utc::now().timestamp();
+        let code = code.to_lowercase();
         let mut stmt = self.conn.prepare(
             "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
              FROM pairing_requests
@@ -86,7 +90,10 @@ impl Database {
     }
 
     pub fn approve_pairing(&self, channel_name: &str, code: &str) -> Result<PairingRequestRow> {
-        let code = code.to_uppercase();
+        // Pairing codes are now lowercase BIP-39 phrases (e.g.
+        // `tg/voyage-kitten-orbit-marble-cinder-pluto`); normalize to
+        // lowercase so the lookup matches whatever the user typed.
+        let code = code.to_lowercase();
         let now = chrono::Utc::now().timestamp();
 
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -180,7 +187,10 @@ impl Database {
 
     /// Find a pending pairing request by code alone (across all channels).
     pub fn find_pending_by_code(&self, code: &str) -> Result<Option<PairingRequestRow>> {
-        let code = code.to_uppercase();
+        // Pairing codes are now lowercase BIP-39 phrases (e.g.
+        // `tg/voyage-kitten-orbit-marble-cinder-pluto`); normalize to
+        // lowercase so the lookup matches whatever the user typed.
+        let code = code.to_lowercase();
         let now = chrono::Utc::now().timestamp();
         let mut stmt = self.conn.prepare(
             "SELECT id, channel_name, sender_id, code, status, display_name, created_at, expires_at, approved_at
@@ -284,7 +294,8 @@ mod tests {
         let req = found.unwrap();
         assert_eq!(req.channel_name, "telegram");
         assert_eq!(req.sender_id, "user1");
-        assert_eq!(req.code, "ABC123");
+        // Codes are stored lowercase (BIP-39 phrase format).
+        assert_eq!(req.code, "abc123");
         assert_eq!(req.status, "pending");
         assert_eq!(req.display_name.as_deref(), Some("Alice"));
     }
@@ -308,7 +319,7 @@ mod tests {
 
         let found = db.find_pending_for_sender("telegram", "user1").unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().code, "CODE1");
+        assert_eq!(found.unwrap().code, "code1");
 
         // Different sender returns None
         let other = db.find_pending_for_sender("telegram", "nobody").unwrap();

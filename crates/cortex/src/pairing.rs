@@ -1,31 +1,35 @@
 use anyhow::Result;
-use rand::Rng;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::constants;
 use crate::db::Database;
 
-/// Unambiguous character set (no 0/O/1/I/L/5/S).
-const CODE_CHARS: &[u8] = b"ABCDEFGHJKMNPQRTUVWXYZ2346789";
-const CODE_LENGTH: usize = 8;
+/// Number of words in a pairing phrase. Per `docs/redesign/tasks/02-mtls-pairing-audit.md`:
+/// "6-word phrase + QR". Sampled uniformly from the 2048-word BIP-39 English
+/// wordlist via `OsRng` → ~66 bits of entropy per code.
+const PHRASE_WORDS: usize = 6;
 
-/// Channel name → 2-letter prefix for self-describing pairing codes.
+/// Channel name → lowercase prefix for self-describing pairing codes.
 /// Each channel gets a unique prefix to avoid ambiguity during approval.
+/// Format is `<prefix>/<word>-<word>-...-<word>`, e.g.
+/// `tg/voyage-kitten-orbit-marble-cinder-pluto`.
 const CHANNEL_PREFIXES: &[(&str, &str)] = &[
-    ("telegram", "TG"),
-    ("slack", "SL"),
-    ("discord", "DC"),
-    ("teams", "TM"),
-    ("google_chat", "GC"),
-    ("signal", "SG"),
-    ("twilio", "TW"),
-    ("whatsapp", "WA"),
-    ("sms", "SM"),
-    ("imessage", "IM"),
+    ("telegram", "tg"),
+    ("slack", "sl"),
+    ("discord", "dc"),
+    ("teams", "tm"),
+    ("google_chat", "gc"),
+    ("signal", "sg"),
+    ("twilio", "tw"),
+    ("whatsapp", "wa"),
+    ("sms", "sm"),
+    ("imessage", "im"),
 ];
 
-/// Look up the 2-letter prefix for a channel name.
+/// Look up the 2-letter lowercase prefix for a channel name.
 pub fn channel_to_prefix(channel_name: &str) -> Option<&'static str> {
     let lower = channel_name.to_lowercase();
     CHANNEL_PREFIXES
@@ -34,26 +38,60 @@ pub fn channel_to_prefix(channel_name: &str) -> Option<&'static str> {
         .map(|(_, pfx)| *pfx)
 }
 
-/// Reverse lookup: 2-letter prefix → canonical channel name.
+/// Reverse lookup: 2-letter prefix → canonical channel name. Case-insensitive.
 pub fn prefix_to_channel(prefix: &str) -> Option<&'static str> {
-    let upper = prefix.to_uppercase();
+    let lower = prefix.to_lowercase();
     CHANNEL_PREFIXES
         .iter()
-        .find(|(_, pfx)| *pfx == upper)
+        .find(|(_, pfx)| *pfx == lower)
         .map(|(ch, _)| *ch)
 }
 
-/// Parse a prefixed code like `TG_H4BRWMRW` into `(channel_name, full_code)`.
-/// Returns `None` if the code has no valid prefix.
+/// Parse a prefixed code like `tg/voyage-kitten-orbit-marble-cinder-pluto`
+/// into `(channel_name, full_code)`. Returns `None` if the code has no valid
+/// prefix OR the suffix is not a well-formed 6-word BIP-39 phrase. Accepts
+/// `tg/` (canonical) and `tg_` (legacy underscore separator) but in both cases
+/// the phrase itself must validate — a hostile sender cannot route a 1-word
+/// stub like `tg_voyage` into the telegram approval path.
 pub fn parse_prefixed_code(code: &str) -> Option<(&'static str, &str)> {
-    let code_upper = code.to_uppercase();
-    if let Some(underscore) = code_upper.find('_') {
-        let prefix = &code_upper[..underscore];
-        if let Some(channel) = prefix_to_channel(prefix) {
-            return Some((channel, code));
+    let trimmed = code.trim();
+    let sep_pos = trimmed.find(['/', '_'])?;
+    let prefix = &trimmed[..sep_pos];
+    let channel = prefix_to_channel(prefix)?;
+    let suffix = &trimmed[sep_pos + 1..];
+    // Reject malformed suffixes at parse time so the routing layer never
+    // hands a junk code to the approval flow.
+    validate_phrase(suffix).ok()?;
+    Some((channel, code))
+}
+
+/// Validate that a pairing phrase is exactly `PHRASE_WORDS` BIP-39 English
+/// words. Hyphen and space separators both accepted (mobile keyboards
+/// often autocorrect hyphens to spaces). Returns the canonical
+/// hyphen-joined phrase on success.
+pub fn validate_phrase(phrase: &str) -> Result<String> {
+    let words: Vec<&str> = phrase
+        .split(['-', ' '])
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() != PHRASE_WORDS {
+        anyhow::bail!(
+            "pairing phrase must be {PHRASE_WORDS} words, got {}",
+            words.len()
+        );
+    }
+    let wordlist = bip39::Language::English.word_list();
+    for w in &words {
+        let lower = w.to_lowercase();
+        if !wordlist.contains(&lower.as_str()) {
+            anyhow::bail!("'{w}' is not a BIP-39 English word");
         }
     }
-    None
+    Ok(words
+        .into_iter()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join("-"))
 }
 
 /// Display name for a channel (capitalized).
@@ -97,24 +135,47 @@ pub enum AccessCheckResult {
     Denied { reason: String },
 }
 
-/// Generate a random 8-character base code (no prefix).
-fn generate_raw_code() -> String {
-    let mut rng = rand::rng();
-    (0..CODE_LENGTH)
+/// Generate a 6-word pairing phrase from the BIP-39 English wordlist using
+/// a cryptographically secure RNG. Output is hyphen-joined lowercase.
+///
+/// `expect` on `try_fill_bytes` is intentional: if `OsRng` fails, the
+/// process has no usable entropy source and there is no safe degraded
+/// behavior — emitting a deterministic pairing code would be worse than
+/// crashing. The workspace `expect_used` lint is overridden locally rather
+/// than globally so this remains the only entropy site that may panic.
+#[allow(clippy::expect_used)]
+fn generate_phrase() -> String {
+    let wordlist = bip39::Language::English.word_list();
+    let n = wordlist.len() as u32; // 2048
+    let mut rng = OsRng;
+    (0..PHRASE_WORDS)
         .map(|_| {
-            let idx = rng.random_range(0..CODE_CHARS.len());
-            CODE_CHARS[idx] as char
+            // Reject-sample to avoid modulo bias against the top of u32's
+            // range. With n = 2048 = 2^11 this is essentially never a retry,
+            // but the loop costs nothing and pins the invariant.
+            let bound = u32::MAX - (u32::MAX % n);
+            loop {
+                let mut buf = [0u8; 4];
+                rng.try_fill_bytes(&mut buf)
+                    .expect("OsRng must succeed for pairing code generation");
+                let v = u32::from_le_bytes(buf);
+                if v < bound {
+                    return wordlist[(v % n) as usize];
+                }
+            }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
-/// Generate a pairing code with channel prefix (e.g. `TG_H4BRWMRW`).
-/// Falls back to unprefixed code for unknown channels.
+/// Generate a pairing code with channel prefix
+/// (e.g. `tg/voyage-kitten-orbit-marble-cinder-pluto`).
+/// Falls back to unprefixed phrase for unknown channels.
 pub fn generate_code(channel_name: &str) -> String {
-    let raw = generate_raw_code();
+    let phrase = generate_phrase();
     match channel_to_prefix(channel_name) {
-        Some(prefix) => format!("{prefix}_{raw}"),
-        None => raw,
+        Some(prefix) => format!("{prefix}/{phrase}"),
+        None => phrase,
     }
 }
 
@@ -298,40 +359,93 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn test_generate_raw_code_length() {
-        let code = generate_raw_code();
-        assert_eq!(code.len(), CODE_LENGTH);
-    }
-
-    #[test]
-    fn test_generate_code_with_prefix() {
-        let code = generate_code("telegram");
-        assert!(code.starts_with("TG_"), "expected TG_ prefix, got: {code}");
-        assert_eq!(code.len(), 3 + CODE_LENGTH); // "TG_" + 8 chars
-    }
-
-    #[test]
-    fn test_generate_code_unknown_channel_no_prefix() {
-        let code = generate_code("custom_channel");
-        assert!(!code.contains('_'), "unknown channel should have no prefix");
-        assert_eq!(code.len(), CODE_LENGTH);
-    }
-
-    #[test]
-    fn test_generate_code_characters() {
-        let charset: HashSet<char> = std::str::from_utf8(CODE_CHARS).unwrap().chars().collect();
+    fn test_generate_phrase_is_six_bip39_words() {
+        // Real failure mode: a code-generator that emits non-wordlist
+        // tokens (typo'd words, mixed case, hex chars) would silently
+        // bypass the validate_phrase guard at the approval site. Sample
+        // 100 codes and assert every word is in the canonical wordlist.
+        let wordlist = bip39::Language::English.word_list();
         for _ in 0..100 {
-            let code = generate_raw_code();
-            for ch in code.chars() {
-                assert!(charset.contains(&ch), "unexpected char: {ch}");
+            let phrase = generate_phrase();
+            let words: Vec<&str> = phrase.split('-').collect();
+            assert_eq!(words.len(), PHRASE_WORDS, "got: {phrase}");
+            for w in words {
+                assert!(
+                    wordlist.iter().any(|listed| *listed == w),
+                    "word '{w}' from '{phrase}' not in BIP-39 wordlist"
+                );
             }
         }
     }
 
     #[test]
-    fn test_generate_code_uniqueness() {
-        let codes: HashSet<String> = (0..1000).map(|_| generate_raw_code()).collect();
-        assert_eq!(codes.len(), 1000, "expected 1000 unique codes");
+    fn test_generate_code_with_prefix() {
+        let code = generate_code("telegram");
+        assert!(code.starts_with("tg/"), "expected tg/ prefix, got: {code}");
+        // tg/ + 6 hyphen-joined words → at least 5 hyphens.
+        let phrase = code.strip_prefix("tg/").expect("prefix");
+        assert_eq!(phrase.split('-').count(), PHRASE_WORDS);
+    }
+
+    #[test]
+    fn test_generate_code_unknown_channel_no_prefix() {
+        let code = generate_code("custom_channel");
+        assert!(
+            !code.contains('/'),
+            "unknown channel should have no slash prefix: {code}"
+        );
+        assert_eq!(code.split('-').count(), PHRASE_WORDS);
+    }
+
+    #[test]
+    fn test_generate_phrase_uniqueness_2048_to_the_six() {
+        // Real failure mode: a non-CSPRNG source (or constant seed) collapses
+        // entropy. With ~66 bits, 1000 samples should be unique with
+        // overwhelming probability.
+        let codes: HashSet<String> = (0..1000).map(|_| generate_phrase()).collect();
+        assert_eq!(codes.len(), 1000, "expected 1000 unique phrases");
+    }
+
+    #[test]
+    fn test_validate_phrase_round_trip_generated() {
+        // Generated codes must always pass validation — guards the contract
+        // between the generator and the approval-side validator.
+        for _ in 0..50 {
+            let phrase = generate_phrase();
+            let canon = validate_phrase(&phrase).expect("generated phrase must validate");
+            assert_eq!(canon, phrase);
+        }
+    }
+
+    #[test]
+    fn test_validate_phrase_rejects_unknown_word() {
+        // Mostly-valid phrases with a single typo'd word must be rejected
+        // — that's the entire point of the BIP-39 wordlist.
+        let result = validate_phrase("voyage kitten orbit marble cinder NOTAWORD");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_phrase_accepts_space_or_hyphen() {
+        // Mobile keyboards autocorrect hyphens to spaces; both must work
+        // and produce the same canonical output.
+        let phrase = generate_phrase();
+        let with_spaces = phrase.replace('-', " ");
+        let canon_a = validate_phrase(&phrase).unwrap();
+        let canon_b = validate_phrase(&with_spaces).unwrap();
+        assert_eq!(canon_a, canon_b);
+    }
+
+    #[test]
+    fn test_validate_phrase_wrong_word_count_rejected() {
+        let phrase = generate_phrase();
+        let words: Vec<&str> = phrase.split('-').collect();
+        // Drop one word.
+        let short = words[..PHRASE_WORDS - 1].join("-");
+        assert!(validate_phrase(&short).is_err());
+        // Add an extra word.
+        let long = format!("{phrase}-marble");
+        assert!(validate_phrase(&long).is_err());
     }
 
     #[test]
@@ -386,8 +500,9 @@ mod tests {
         let result = check_sender_access(&db, &config, "telegram", "new_user", None).unwrap();
         match result {
             AccessCheckResult::Challenge { code, message } => {
-                assert!(code.starts_with("TG_"), "expected TG_ prefix, got: {code}");
-                assert_eq!(code.len(), 3 + CODE_LENGTH);
+                assert!(code.starts_with("tg/"), "expected tg/ prefix, got: {code}");
+                let phrase = code.strip_prefix("tg/").expect("prefix");
+                assert_eq!(phrase.split('-').count(), PHRASE_WORDS);
                 assert!(message.contains("new_user"));
                 assert!(message.contains(&code));
                 // Default agent name when None
@@ -542,54 +657,68 @@ mod tests {
     // ── Channel prefix tests ──
 
     #[test]
-    fn test_channel_to_prefix() {
-        assert_eq!(channel_to_prefix("telegram"), Some("TG"));
-        assert_eq!(channel_to_prefix("Telegram"), Some("TG"));
-        assert_eq!(channel_to_prefix("slack"), Some("SL"));
-        assert_eq!(channel_to_prefix("discord"), Some("DC"));
-        assert_eq!(channel_to_prefix("teams"), Some("TM"));
-        assert_eq!(channel_to_prefix("google_chat"), Some("GC"));
-        assert_eq!(channel_to_prefix("signal"), Some("SG"));
-        assert_eq!(channel_to_prefix("twilio"), Some("TW"));
-        assert_eq!(channel_to_prefix("whatsapp"), Some("WA"));
-        assert_eq!(channel_to_prefix("sms"), Some("SM"));
-        assert_eq!(channel_to_prefix("imessage"), Some("IM"));
+    fn test_channel_prefix_table_round_trips() {
+        // Table-driven (per CLAUDE.md): one row per channel, both directions.
+        // A typo in either map breaks routing — the per-channel parse_prefixed_code
+        // smoke test below pins the end-to-end shape.
+        for (channel, expected_prefix) in CHANNEL_PREFIXES {
+            assert_eq!(channel_to_prefix(channel), Some(*expected_prefix));
+            assert_eq!(prefix_to_channel(expected_prefix), Some(*channel));
+            // Case-insensitive parse on both sides.
+            assert_eq!(
+                channel_to_prefix(&channel.to_uppercase()),
+                Some(*expected_prefix)
+            );
+            assert_eq!(
+                prefix_to_channel(&expected_prefix.to_uppercase()),
+                Some(*channel)
+            );
+        }
         assert_eq!(channel_to_prefix("unknown"), None);
+        assert_eq!(prefix_to_channel("xx"), None);
     }
 
     #[test]
-    fn test_prefix_to_channel() {
-        assert_eq!(prefix_to_channel("TG"), Some("telegram"));
-        assert_eq!(prefix_to_channel("tg"), Some("telegram"));
-        assert_eq!(prefix_to_channel("SL"), Some("slack"));
-        assert_eq!(prefix_to_channel("DC"), Some("discord"));
-        assert_eq!(prefix_to_channel("TM"), Some("teams"));
-        assert_eq!(prefix_to_channel("GC"), Some("google_chat"));
-        assert_eq!(prefix_to_channel("SG"), Some("signal"));
-        assert_eq!(prefix_to_channel("TW"), Some("twilio"));
-        assert_eq!(prefix_to_channel("WA"), Some("whatsapp"));
-        assert_eq!(prefix_to_channel("SM"), Some("sms"));
-        assert_eq!(prefix_to_channel("IM"), Some("imessage"));
-        assert_eq!(prefix_to_channel("XX"), None);
+    fn test_parse_prefixed_code_canonical_slash() {
+        // Use real BIP-39 words so validate_phrase passes. "voyage", "kitten",
+        // "orbit", "marble", "cinder", "pluto" — let me pick verified ones:
+        // use a freshly generated phrase so the test never drifts from the
+        // wordlist.
+        let phrase = generate_phrase();
+        let tg = format!("tg/{phrase}");
+        let sl = format!("sl/{phrase}");
+        assert_eq!(parse_prefixed_code(&tg).unwrap().0, "telegram");
+        assert_eq!(parse_prefixed_code(&sl).unwrap().0, "slack");
     }
 
     #[test]
-    fn test_parse_prefixed_code() {
-        let (channel, _) = parse_prefixed_code("TG_H4BRWMRW").unwrap();
+    fn test_parse_prefixed_code_legacy_underscore_still_routes() {
+        // In-flight pairing requests minted by older daemons used `_` rather
+        // than `/`. We accept both as separators so a stale code isn't bricked
+        // mid-flight; new codes always emit `/`. The phrase itself still has
+        // to validate, so use a freshly generated one that's guaranteed to
+        // be in the BIP-39 wordlist.
+        let phrase = generate_phrase();
+        let code = format!("tg_{phrase}");
+        let (channel, _) = parse_prefixed_code(&code).unwrap();
         assert_eq!(channel, "telegram");
+    }
 
-        let (channel, _) = parse_prefixed_code("SL_ABCD1234").unwrap();
-        assert_eq!(channel, "slack");
-
-        // Case insensitive
-        let (channel, _) = parse_prefixed_code("tg_h4brwmrw").unwrap();
-        assert_eq!(channel, "telegram");
+    #[test]
+    fn test_parse_prefixed_code_rejects_malformed_suffix() {
+        // Real failure mode: a hostile sender crafts `tg_voyage` (or any
+        // prefixed-but-not-a-phrase string) and the parser hands it to
+        // telegram routing. Pre-validating the suffix at parse time means
+        // the approval layer never sees junk codes.
+        assert!(parse_prefixed_code("tg_voyage").is_none());
+        assert!(parse_prefixed_code("tg/voyage-kitten").is_none()); // 2 words
+        assert!(parse_prefixed_code("tg/AAAAA-BBBBB-CCCCC-DDDDD-EEEEE-FFFFF").is_none());
     }
 
     #[test]
     fn test_parse_prefixed_code_invalid() {
-        assert!(parse_prefixed_code("H4BRWMRW").is_none());
-        assert!(parse_prefixed_code("XX_H4BRWMRW").is_none());
+        assert!(parse_prefixed_code("voyage-kitten").is_none());
+        assert!(parse_prefixed_code("xx/voyage-kitten").is_none());
         assert!(parse_prefixed_code("").is_none());
     }
 
@@ -683,10 +812,10 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_all_channel_prefixes() {
+    fn test_generate_all_channel_prefixes_use_slash_separator() {
         for (channel, expected_prefix) in CHANNEL_PREFIXES {
             let code = generate_code(channel);
-            let prefix = format!("{expected_prefix}_");
+            let prefix = format!("{expected_prefix}/");
             assert!(
                 code.starts_with(&prefix),
                 "channel {channel}: expected prefix {prefix}, got: {code}"

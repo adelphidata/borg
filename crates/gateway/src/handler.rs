@@ -1527,8 +1527,8 @@ mod tests {
                     "challenge message must contain the pairing code"
                 );
                 assert!(
-                    code.starts_with("TG_"),
-                    "telegram pairing code must have TG_ prefix"
+                    code.starts_with("tg/"),
+                    "telegram pairing code must have tg/ prefix, got: {code}"
                 );
                 assert!(
                     message.contains("Borg's owner"),

@@ -103,6 +103,7 @@ service Admin {
 
   // BYO providers — writer-only RPCs. Reads can use Database::open_readonly.
   rpc AddProvider(AddProviderRequest) returns (Empty);
+  rpc RemoveProvider(RemoveProviderRequest) returns (Empty);
 
   // Generic webhook definitions — writer-only RPCs.
   rpc CreateWebhook(CreateWebhookRequest) returns (CreateWebhookResponse);
@@ -428,6 +429,10 @@ message AddProviderRequest {
   string base_url = 3;
   string api_key_env = 4;       // empty = none
   string category = 5;          // "byo" | "local" | "public_cloud"
+}
+
+message RemoveProviderRequest {
+  string id = 1;
 }
 
 // Webhook CRUD ──────────────────────────────────────────────────────────────

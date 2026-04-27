@@ -1,4 +1,46 @@
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
+
+/// Verifier strategy selected for the daemon's mTLS auth interceptor.
+///
+/// `Tofu` (default) trusts the first connection from a fingerprint that's
+/// already been paired and locks future connections to the same key. `Tailscale`
+/// additionally cross-checks the peer IP against `tailscale status` and refuses
+/// principals whose IP doesn't appear as a peer node — opt-in via the
+/// `security.verifier` setting.
+///
+/// External-CA verifiers (SCEP, EST, ACME, …) are explicitly v3-deferred per
+/// `docs/redesign/tasks/02-mtls-pairing-audit.md`; do not extend this enum
+/// for them yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifierKind {
+    #[default]
+    Tofu,
+    Tailscale,
+}
+
+impl FromStr for VerifierKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "tofu" => Ok(VerifierKind::Tofu),
+            "tailscale" => Ok(VerifierKind::Tailscale),
+            other => anyhow::bail!("Unknown verifier '{other}'. Valid: tofu, tailscale"),
+        }
+    }
+}
+
+impl std::fmt::Display for VerifierKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VerifierKind::Tofu => "tofu",
+            VerifierKind::Tailscale => "tailscale",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,6 +99,11 @@ pub struct SecurityConfig {
     pub action_limits: crate::rate_guard::ActionLimits,
     #[serde(default = "default_gateway_action_limits")]
     pub gateway_action_limits: crate::rate_guard::ActionLimits,
+    /// mTLS peer-cert verifier strategy. `Tofu` is the default; `Tailscale`
+    /// is opt-in per `docs/redesign/tasks/02-mtls-pairing-audit.md` and binds
+    /// pairs to a Tailscale node identity by cross-checking the peer IP.
+    #[serde(default)]
+    pub verifier: VerifierKind,
 }
 
 fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
@@ -80,6 +127,7 @@ impl Default for SecurityConfig {
             host_audit: true,
             action_limits: crate::rate_guard::ActionLimits::default(),
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
+            verifier: VerifierKind::Tofu,
         }
     }
 }
@@ -89,10 +137,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn verifier_kind_round_trip_through_str() {
+        // Real failure mode: a typo in `FromStr` (e.g. accepting "Tailscale"
+        // case-sensitively) silently leaves the daemon on TOFU when the user
+        // explicitly picked Tailscale. Round-trip every variant against the
+        // canonical lowercase form and a mixed-case form.
+        for (kind, canonical, mixed) in [
+            (VerifierKind::Tofu, "tofu", "ToFu"),
+            (VerifierKind::Tailscale, "tailscale", "TailScale"),
+        ] {
+            assert_eq!(kind.to_string(), canonical);
+            assert_eq!(VerifierKind::from_str(canonical).unwrap(), kind);
+            assert_eq!(VerifierKind::from_str(mixed).unwrap(), kind);
+        }
+        assert!(VerifierKind::from_str("nope").is_err());
+    }
+
+    #[test]
+    fn verifier_kind_serde_round_trip() {
+        // Persisted JSON must round-trip — tests pair this with the
+        // settings_table apply path so a saved value comes back identical.
+        for kind in [VerifierKind::Tofu, VerifierKind::Tailscale] {
+            let s = serde_json::to_string(&kind).unwrap();
+            let back: VerifierKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    #[test]
     fn security_config_defaults() {
         let cfg = SecurityConfig::default();
         assert!(cfg.secret_detection);
         assert!(cfg.host_audit);
+        assert_eq!(cfg.verifier, VerifierKind::Tofu);
         assert_eq!(cfg.blocked_paths.len(), 7);
         assert!(cfg.blocked_paths.contains(&".ssh".to_string()));
         assert!(cfg.blocked_paths.contains(&".aws".to_string()));

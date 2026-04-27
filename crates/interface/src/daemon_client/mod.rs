@@ -28,10 +28,11 @@ use protocols::admin::{
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
     PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse, Project,
-    ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RevokedClientToken, ScheduledTask,
-    ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
-    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SettingKey,
-    SettingMutation, SettingsSnapshot, WarningList, WebhookRef, WorkflowList,
+    ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RemoveProviderRequest,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
+    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, WarningList, WebhookRef,
+    WorkflowList,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -211,7 +212,7 @@ impl DaemonClient {
                     Code::Unimplemented | Code::Unauthenticated | Code::PermissionDenied => {
                         Ok(false)
                     }
-                    _ => Err(anyhow!("get_cert_lifecycle: {}", status)),
+                    _ => Err(anyhow!("get_cert_lifecycle: {status}")),
                 };
             }
         };
@@ -1167,6 +1168,16 @@ impl DaemonClient {
             })
             .await
             .context("Admin.AddProvider failed")?;
+        Ok(())
+    }
+
+    /// Remove a BYO provider row by id. Idempotent — succeeds even if the id
+    /// is already absent.
+    pub async fn remove_provider(&mut self, id: &str) -> Result<()> {
+        self.admin
+            .remove_provider(RemoveProviderRequest { id: id.to_string() })
+            .await
+            .context("Admin.RemoveProvider failed")?;
         Ok(())
     }
 

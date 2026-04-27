@@ -2,10 +2,25 @@
 //! Tailscale verifier (or any other transport-layer principal binder)
 //! can be added without touching call sites.
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use cortex::db::Database;
 use thiserror::Error;
+
+/// Per-connection peer context surfaced to verifier implementations.
+///
+/// The `Tofu` verifier ignores this; the `Tailscale` verifier uses
+/// `peer_ip` to cross-check against `tailscale status --json`. Threaded
+/// through the gRPC interceptor so every verify path has the same shape.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerCtx {
+    pub peer_ip: Option<IpAddr>,
+}
+
+impl PeerCtx {
+    pub const NONE: PeerCtx = PeerCtx { peer_ip: None };
+}
 
 /// Renewal window for client certs: the daemon flags any cert whose
 /// `not_after` falls inside the next `RENEWAL_WINDOW_SECS` so the client
@@ -28,10 +43,24 @@ pub enum VerifierError {
     },
     #[error("verifier db failure: {0}")]
     Db(String),
+    #[error("tailscale status query failed: {0}")]
+    Tailscale(String),
 }
 
 pub trait Verifier: Send + Sync {
     fn verify(&self, fingerprint: &str, san_uri: Option<&str>) -> Result<String, VerifierError>;
+
+    /// Verify with peer-connection context. Default delegates to `verify`
+    /// so existing impls keep working; verifiers that need transport-layer
+    /// info (e.g., Tailscale peer-IP pinning) override this.
+    fn verify_with_peer(
+        &self,
+        fingerprint: &str,
+        san_uri: Option<&str>,
+        _peer: PeerCtx,
+    ) -> Result<String, VerifierError> {
+        self.verify(fingerprint, san_uri)
+    }
 }
 
 /// Trust-on-first-use verifier — first connection from a given fingerprint

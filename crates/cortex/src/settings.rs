@@ -379,6 +379,38 @@ mod tests {
     }
 
     #[test]
+    fn security_verifier_round_trips_through_resolver() {
+        // Real failure mode: a custom_apply arm that swallows or mistypes the
+        // value silently leaves the daemon on TOFU when the user picked
+        // tailscale, undermining the security choice. Round-trip both
+        // variants and an invalid value through the resolver.
+        let resolver = test_resolver();
+
+        // Default is tofu.
+        let cfg = resolver.resolve().unwrap();
+        assert_eq!(cfg.security.verifier, crate::config::VerifierKind::Tofu);
+
+        resolver.set("security.verifier", "tailscale").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        assert_eq!(
+            cfg.security.verifier,
+            crate::config::VerifierKind::Tailscale
+        );
+
+        let (val, source) = resolver.get_with_source("security.verifier").unwrap();
+        assert_eq!(val, "tailscale");
+        assert_eq!(source, SettingSource::Database);
+
+        // Invalid values are rejected — never silently accepted.
+        assert!(resolver.set("security.verifier", "magic").is_err());
+
+        // Unset restores default.
+        resolver.unset("security.verifier").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        assert_eq!(cfg.security.verifier, crate::config::VerifierKind::Tofu);
+    }
+
+    #[test]
     fn evolution_enabled_round_trip() {
         let resolver = test_resolver();
         let (val, source) = resolver.get_with_source("evolution.enabled").unwrap();

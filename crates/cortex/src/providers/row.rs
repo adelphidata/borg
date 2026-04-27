@@ -66,6 +66,16 @@ impl ProviderRow {
         .with_context(|| format!("failed to load provider row '{id}'"))
     }
 
+    /// Hard-delete the row. Returns `true` when a row was deleted, `false`
+    /// when the id was not present (idempotent — `borg providers remove`
+    /// against an already-removed id is a no-op rather than an error).
+    pub fn delete(conn: &Connection, id: &str) -> Result<bool> {
+        let n = conn
+            .execute("DELETE FROM providers WHERE id = ?1", params![id])
+            .with_context(|| format!("failed to delete provider row '{id}'"))?;
+        Ok(n > 0)
+    }
+
     /// All enabled rows, ordered by id.
     pub fn list(conn: &Connection) -> Result<Vec<Self>> {
         let mut stmt = conn

@@ -143,6 +143,36 @@ fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
 }
 
 #[test]
+fn delete_removes_row_and_is_idempotent() {
+    // Real failure mode: a `delete` that returns Ok(true) for missing ids
+    // would mask "you typo'd the provider name" behind a green checkmark.
+    // We want true on first delete, false on second — and the row really
+    // gone from the registry's view.
+    let db = Database::test_db();
+    ProviderRow {
+        id: "to-remove".into(),
+        category: ProviderCategory::BYOEndpoint,
+        display_name: "Will be deleted".into(),
+        endpoint_url: "https://x.example.com/v1/chat/completions".into(),
+        api_key_env: None,
+        enabled: true,
+    }
+    .insert(db.conn())
+    .unwrap();
+
+    assert!(ProviderRegistry::resolve(db.conn(), "to-remove", true).is_ok());
+
+    assert!(ProviderRow::delete(db.conn(), "to-remove").unwrap());
+    // After delete, registry resolves to Unknown.
+    let err = ProviderRegistry::resolve(db.conn(), "to-remove", true).unwrap_err();
+    assert!(matches!(err, ResolveError::Unknown(_)));
+
+    // Idempotent: second delete returns false (no-op), no error.
+    assert!(!ProviderRow::delete(db.conn(), "to-remove").unwrap());
+    assert!(!ProviderRow::delete(db.conn(), "never-existed").unwrap());
+}
+
+#[test]
 fn category_db_round_trip_covers_all_variants() {
     // Catches a future variant addition that forgets to update either
     // `as_db_str` or `from_db_str`. Without this, an unknown variant

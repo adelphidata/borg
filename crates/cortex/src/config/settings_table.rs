@@ -76,6 +76,7 @@ define_settings! {
         "security.allowed_paths" => security.allowed_paths, json;
         "security.action_limits" => security.action_limits, json_set;
         "security.gateway_action_limits" => security.gateway_action_limits, json_set;
+        // security.verifier handled in custom_apply below (FromStr enum).
 
         // ── Budget ──
         "budget.monthly_token_limit" => budget.monthly_token_limit, parsed(u64);
@@ -298,6 +299,13 @@ define_settings! {
             Ok(format!("{key} = {value}"))
         };
 
+        // security.verifier: FromStr enum (tofu | tailscale)
+        "security.verifier" => |s, key, value| {
+            let kind: crate::config::VerifierKind = value.parse()?;
+            s.security.verifier = kind;
+            Ok(format!("{key} = {kind}"))
+        };
+
         // skills.budget_pct: Option<f32> in [0.0, 1.0]; empty string clears to None
         "skills.budget_pct" => |s, key, value| {
             if value.trim().is_empty() {
@@ -329,6 +337,7 @@ define_settings! {
         "tts.default_format" => |c| c.tts.default_format.clone();
         "workflow.enabled" => |c| c.workflow.enabled.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
+        "security.verifier" => |c| format!("{}", c.security.verifier);
         "skills.budget_pct" => |c| match c.skills.budget_pct {
             Some(pct) => format!("{pct}"),
             None => "(none)".to_string(),
@@ -373,6 +382,7 @@ define_settings! {
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
         "security.secret_detection" => "Secret detection", Bool, "Security";
+        "security.verifier" => "mTLS verifier", Select, "Security";
 
         // — Maintenance (self-healing) —
         "maintenance.enabled" => "Daily self-heal task", Bool, "Maintenance";
@@ -405,6 +415,7 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         &["tools_system_and_2", "system_and_3"],
     ),
     ("workflow.enabled", &["auto", "on", "off"]),
+    ("security.verifier", &["tofu", "tailscale"]),
 ];
 
 /// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in

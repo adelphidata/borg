@@ -8,7 +8,7 @@ use serde_json::json;
 use tonic::transport::server::TlsConnectInfo;
 use tonic::{Request, Status};
 
-use super::verifier::{Verifier, VerifierError};
+use super::verifier::{PeerCtx, Verifier, VerifierError};
 
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -21,14 +21,21 @@ pub fn auth_interceptor(
     audit: AuditWriter,
 ) -> impl Fn(Request<()>) -> Result<Request<()>, Status> + Clone + Send + Sync + 'static {
     move |mut req: Request<()>| {
-        let tcp_certs = req
+        // Peer IP only available on TCP; UDS connections leave it None. The
+        // Tailscale verifier needs it to enforce node-identity pinning;
+        // TOFU ignores it.
+        let tcp_info = req
             .extensions()
-            .get::<TlsConnectInfo<tonic::transport::server::TcpConnectInfo>>()
-            .and_then(|tls| tls.peer_certs());
+            .get::<TlsConnectInfo<tonic::transport::server::TcpConnectInfo>>();
+        let peer_ip = tcp_info
+            .and_then(|tls| tls.get_ref().remote_addr())
+            .map(|sa| sa.ip());
+
+        let tcp_certs = tcp_info.and_then(tonic::transport::server::TlsConnectInfo::peer_certs);
         let uds_certs = req
             .extensions()
             .get::<TlsConnectInfo<tonic::transport::server::UdsConnectInfo>>()
-            .and_then(|tls| tls.peer_certs());
+            .and_then(tonic::transport::server::TlsConnectInfo::peer_certs);
         let certs = tcp_certs.or(uds_certs);
 
         let leaf_der: Vec<u8> = certs
@@ -44,8 +51,9 @@ pub fn auth_interceptor(
             })?;
 
         let fingerprint = fingerprint_sha256(&leaf_der);
+        let peer_ctx = PeerCtx { peer_ip };
 
-        match verifier.verify(&fingerprint, None) {
+        match verifier.verify_with_peer(&fingerprint, None, peer_ctx) {
             Ok(principal_id) => {
                 let principal = Principal {
                     id: principal_id,

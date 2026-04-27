@@ -232,12 +232,12 @@ Every TUI action has a `borg <cmd>` CLI mirror (`borg device pair`, `borg device
 
 ### Pairing UX
 
-`/devices` → "Pair new device" generates an 8-char base32 PAKE code (`4F2-8KQ7`) and a QR (`borg-pair://host:port/?code=4F28KQ7P&fp=sha256:...`). Code expires in 5 minutes; rate-limited (3 wrong attempts → invalidate).
+`/devices` → "Pair new device" generates a 6-word BIP-39 PAKE phrase prefixed with the channel id (`tg/voyage-kitten-orbit-marble-cinder-pluto`) and a QR (`borg-pair://host:port/?code=tg/voyage-kitten-orbit-marble-cinder-pluto&fp=sha256:...`). Code expires in 5 minutes; rate-limited (3 wrong attempts → invalidate). Words are sampled from the BIP-39 English wordlist via `OsRng` (~66 bits entropy); hyphen and space separators are both accepted on input.
 
 ### Pairing handshake
 
 1. User: `borg pair --host mac-mini.tail-1234.ts.net` (or scan QR from a future mobile app).
-2. Client and daemon run SPAKE2/CPace PAKE handshake using the 8-char code as the shared secret. A network attacker without the code cannot recover the session key.
+2. Client and daemon run SPAKE2/CPace PAKE handshake using the 6-word phrase as the shared secret. A network attacker without the phrase cannot recover the session key.
 3. Within the PAKE-protected channel:
    - Client generates an Ed25519 (or P-256) keypair. Private key goes to OS keychain / Secure Enclave / TPM (best available, reported back).
    - Client sends a self-signed cert + a device-identity blob (suggested name, key-storage tier).

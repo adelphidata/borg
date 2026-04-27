@@ -21,10 +21,11 @@ use protocols::admin::{
     MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairRequest, PairResponse,
     PairingApproval, PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest,
     PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef, ProjectUpdate,
-    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
-    ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
-    SessionList, SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation,
-    SettingsSnapshot, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
+    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
+    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, WarningList,
+    WebhookRef, WorkflowList, WorkflowSummary,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1226,6 +1227,27 @@ impl Admin for AdminSvc {
         .await
         .map_err(|e| TStatus::internal(format!("add_provider task panicked: {e}")))?
         .map_err(|e| TStatus::internal(format!("add_provider '{id_for_err}' failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn remove_provider(
+        &self,
+        req: Request<RemoveProviderRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let id = req.into_inner().id;
+        if id.is_empty() {
+            return Err(TStatus::invalid_argument("id must be non-empty"));
+        }
+        let id_for_err = id.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let db = Database::open()?;
+            // Idempotent — `false` (already absent) is a successful no-op.
+            cortex::providers::ProviderRow::delete(db.conn(), &id)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("remove_provider task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("remove_provider '{id_for_err}' failed: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 
