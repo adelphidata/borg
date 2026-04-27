@@ -1,19 +1,26 @@
 //! Daemon lifecycle: lock acquisition, transport setup, graceful shutdown.
 
+use crate::auth::{ensure_root_ca, ensure_server_cert, ServerCertMaterial};
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
 use crate::grpc::session::SessionFactory;
 use crate::orchestrator;
+use crate::pairing::device::{BootstrapListener, BootstrapState};
 use crate::paths;
 use crate::pidlock::PidLock;
+use crate::pki_grpc::PkiSvc;
 use crate::session::backend::AgentBackend;
 use crate::session::{SessionHost, SessionRegistry};
 use anyhow::{Context, Result};
 use borg_core::config::Config as CoreConfig;
+use borg_core::db::{audit_events, AuditWriter, Database};
 use borg_core::telemetry::BorgMetrics;
+use borg_pki::KeychainStore;
+use borg_proto::pki::pki_server::PkiServer;
+use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::broadcast;
@@ -127,18 +134,75 @@ pub async fn run(cfg: Config) -> Result<()> {
             }
         }
     };
-    let services = grpc::build_services_with_extras(registry, factory, capability_router, extras);
+    // ── Task 02: PKI bootstrap ──
+    //
+    // Mint root CA + server cert on first run; load from DB+keychain on
+    // subsequent starts. We open a daemon-owned `Database` here and wrap it
+    // in `Arc<Mutex>` so the AuditWriter and Pki service share the single
+    // writer with the audit chain.
+    let db_for_pki = Database::open()
+        .context("opening DB for PKI bootstrap")?;
+    let pki_db = Arc::new(Mutex::new(db_for_pki));
+    let kek = Arc::new(KeychainStore::new());
+    let (ca_cert_pem, ca_key_pem) = {
+        let g = pki_db.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_root_ca(&g, kek.as_ref()).context("ensure root CA")?
+    };
+    let san_dns = vec!["localhost".to_string()];
+    let (server_cert_pem, server_key_pem, _server_serial) = {
+        let g = pki_db.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
+            .context("ensure server cert")?
+    };
+    let _server_tls_material = ServerCertMaterial {
+        server_cert_pem: server_cert_pem.clone(),
+        server_key_pem: server_key_pem.clone(),
+        ca_cert_pem: ca_cert_pem.clone(),
+    };
+    let audit = AuditWriter::new(pki_db.clone());
+    audit.emit(
+        audit_events::DAEMON_START,
+        "system",
+        &json!({"pid": std::process::id()}),
+    );
+
+    // Bootstrap pairing socket (plaintext, on its own UDS path). Always-on
+    // — code-validity gating happens inside the handshake (consume_pairing_code
+    // rejects unknown/expired/used codes). Cheaper than gating socket bind on
+    // active code count and no functional difference.
+    let pair_sock = paths::pairing_socket_path(&cfg.borg_home);
+    let bootstrap_state = BootstrapState {
+        db: pki_db.clone(),
+        audit: audit.clone(),
+        ca_cert_pem: ca_cert_pem.clone(),
+        ca_key_pem: ca_key_pem.clone(),
+    };
+    {
+        let listener = BootstrapListener::new(pair_sock.clone());
+        tokio::spawn(async move {
+            if let Err(e) = listener.serve(bootstrap_state).await {
+                tracing::warn!(error = %e, "pairing bootstrap listener exited");
+            }
+        });
+    }
+
+    let services =
+        grpc::build_services_with_extras(registry, factory, capability_router, extras);
 
     let uds_stream = UnixListenerStream::new(uds);
 
     let make_router = || {
-        // Cloning the generated Server wrapper shares the inner `Arc<Svc>`,
-        // so two transports observe identical state.
         tonic::transport::Server::builder()
             .add_service(services.status.clone())
             .add_service(services.admin.clone())
             .add_service(services.session.clone())
             .add_service(services.capability.clone())
+            .add_service(PkiServer::new(PkiSvc::new(
+                pki_db.clone(),
+                audit.clone(),
+                ca_cert_pem.clone(),
+                ca_key_pem.clone(),
+            )))
     };
 
     if let Some(addr) = cfg.listen_tcp {

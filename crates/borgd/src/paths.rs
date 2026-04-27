@@ -29,3 +29,10 @@ pub fn socket_path(borg_home: &Path) -> PathBuf {
 pub fn pid_path(borg_home: &Path) -> PathBuf {
     borg_home.join("borgd.pid")
 }
+
+/// Path to the plaintext bootstrap UDS used for SPAKE2 pairing only.
+/// Distinct from the main `borgd.sock` so a leaked-FD on the bootstrap
+/// socket cannot serve the rest of the gRPC surface.
+pub fn pairing_socket_path(borg_home: &Path) -> PathBuf {
+    borg_home.join("borgd-pair.sock")
+}

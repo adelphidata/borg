@@ -18,18 +18,20 @@ struct Args {
     #[arg(long, env = "BORG_HOME")]
     borg_home: Option<PathBuf>,
 
-    /// Permit unauthenticated connections over the UDS. Required in v1
-    /// until Task 02 wires up mTLS. Without this flag, the daemon refuses
-    /// to start in non-dev builds.
+    /// (Legacy) permit unauthenticated UDS connections. Task 02 now ships
+    /// the per-installation CA + paired-device flow, so the UDS no longer
+    /// requires this gate. Flag retained for backwards-compat invocation.
     #[arg(long)]
     insecure_uds: bool,
 
-    /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`).
-    /// Requires `--insecure-tcp` until Task 02 lands mTLS.
+    /// Optional loopback TCP listener address (e.g. `127.0.0.1:8009`). Task
+    /// 02 wires mTLS on this listener; clients must hold a paired-device
+    /// cert.
     #[arg(long)]
     listen: Option<String>,
 
-    /// Permit unauthenticated TCP connections (paired with `--listen`).
+    /// (Legacy, deprecated) permit unauthenticated TCP. Ignored — Task 02
+    /// always requires mTLS on the TCP listener.
     #[arg(long)]
     insecure_tcp: bool,
 }
@@ -43,12 +45,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-
-    if !args.insecure_uds {
-        anyhow::bail!("refusing to start without --insecure-uds (mTLS auth lands in Task 02)");
-    }
-    if args.listen.is_some() && !args.insecure_tcp {
-        anyhow::bail!("--listen requires --insecure-tcp until mTLS lands in Task 02");
+    if args.insecure_tcp {
+        tracing::warn!(
+            "--insecure-tcp is deprecated: TCP listener now requires mTLS unconditionally"
+        );
     }
 
     let home = paths::resolve_borg_home(args.borg_home.as_deref())?;
