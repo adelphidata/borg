@@ -17,13 +17,9 @@ pub async fn spawn_task_execution(
     semaphore: Arc<Semaphore>,
     config: Config,
 ) {
-    let permit = match semaphore.acquire_owned().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to acquire semaphore: {e}");
-            return;
-        }
-    };
+    // Acquire the permit *inside* the spawned task, not on the caller's
+    // dispatcher loop. If we awaited here while all permits were claimed, the
+    // scheduler dispatcher would stall and the watchdog would kill the daemon.
     let task_name = task.name.clone();
     let task_id = task.id.clone();
     let task_prompt = match task.id.as_str() {
@@ -44,24 +40,33 @@ pub async fn spawn_task_execution(
     let delivery_channel = task.delivery_channel.clone();
     let delivery_target = task.delivery_target.clone();
     let schedule_type = task.schedule_type.clone();
-    let task_type = task.task_type.clone();
+    let task_type = task.task_type;
 
     tokio::spawn(async move {
-        let _permit = permit;
-        if let Ok(adb) = borg_core::db::Database::open() {
-            let attempt = if is_retry {
-                format!(" (retry {retry_count})")
-            } else {
-                String::new()
-            };
-            borg_core::activity_log::log_activity(
-                &adb,
-                "info",
-                "task",
-                &format!("Task '{task_name}' started{attempt}"),
-            );
+        let _permit = match semaphore.acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Task '{task_name}': failed to acquire semaphore: {e}");
+                return;
+            }
+        };
+        match borg_core::db::Database::open() {
+            Ok(adb) => {
+                let attempt = if is_retry {
+                    format!(" (retry {retry_count})")
+                } else {
+                    String::new()
+                };
+                borg_core::activity_log::log_activity(
+                    &adb,
+                    "info",
+                    "task",
+                    &format!("Task '{task_name}' started{attempt}"),
+                );
+            }
+            Err(e) => tracing::warn!("Task '{task_name}': activity log DB open failed: {e}"),
         }
-        let started_at = chrono::Utc::now().timestamp();
+        let started_at_ms = chrono::Utc::now().timestamp_millis();
 
         let exec_ctx = TaskExecContext {
             task_name: task_name.clone(),
@@ -69,7 +74,7 @@ pub async fn spawn_task_execution(
             prompt_or_command: task_prompt,
             timeout: task_timeout,
             run_id,
-            started_at,
+            started_at_ms,
             retry_count,
             max_retries,
             schedule_type,
@@ -95,14 +100,19 @@ pub async fn spawn_task_execution(
                 .or_else(|| panic_err.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
             tracing::error!("Task '{task_name}' panicked: {panic_msg}");
-            if let Ok(db) = borg_core::db::Database::open() {
-                let duration_ms = (chrono::Utc::now().timestamp() - started_at) * 1000;
-                let _ = db.complete_task_run(
-                    run_id,
-                    duration_ms,
-                    None,
-                    Some(&format!("panic: {panic_msg}")),
-                );
+            match borg_core::db::Database::open() {
+                Ok(db) => {
+                    let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
+                    if let Err(e) = db.complete_task_run(
+                        run_id,
+                        duration_ms,
+                        None,
+                        Some(&format!("panic: {panic_msg}")),
+                    ) {
+                        tracing::warn!("Task '{task_name}': failed to record panic: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("Task '{task_name}': panic DB open failed: {e}"),
             }
         }
     });
@@ -117,13 +127,6 @@ pub async fn spawn_workflow_step(
     semaphore: Arc<Semaphore>,
     config: Config,
 ) {
-    let permit = match semaphore.acquire_owned().await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Failed to acquire semaphore for workflow step: {e}");
-            return;
-        }
-    };
     let step_id = step.id;
     let step_title = step.title.clone();
     let workflow_id = workflow.id.clone();
@@ -131,7 +134,14 @@ pub async fn spawn_workflow_step(
     let step_timeout = std::time::Duration::from_millis(step.timeout_ms as u64);
 
     tokio::spawn(async move {
-        let _permit = permit;
+        // Acquire inside the spawned task; see note in spawn_task_execution.
+        let _permit = match semaphore.acquire_owned().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Workflow step '{step_title}': failed to acquire semaphore: {e}");
+                return;
+            }
+        };
 
         let db = match borg_core::db::Database::open() {
             Ok(db) => db,
@@ -163,7 +173,9 @@ pub async fn spawn_workflow_step(
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("Failed to create LLM client for workflow step '{step_title}': {e}");
-                let _ = db.fail_workflow_step(step_id, &format!("{e}"));
+                if let Err(e2) = db.fail_workflow_step(step_id, &format!("{e}")) {
+                    tracing::warn!("Workflow step '{step_title}': failed to mark failure: {e2}");
+                }
                 return;
             }
         };
@@ -188,12 +200,16 @@ pub async fn spawn_workflow_step(
             Ok(Err(e)) => {
                 let error_msg = format!("{e}");
                 tracing::warn!("Workflow step failed: {workflow_title} — {error_msg}");
-                let _ = db.fail_workflow_step(step_id, &error_msg);
+                if let Err(e2) = db.fail_workflow_step(step_id, &error_msg) {
+                    tracing::warn!("Workflow step '{workflow_title}': failed to mark failure: {e2}");
+                }
             }
             Err(_) => {
                 let error_msg = format!("Step timed out after {}ms", step_timeout.as_millis());
                 tracing::warn!("Workflow step timed out: {workflow_title}");
-                let _ = db.fail_workflow_step(step_id, &error_msg);
+                if let Err(e2) = db.fail_workflow_step(step_id, &error_msg) {
+                    tracing::warn!("Workflow step '{workflow_title}': failed to mark timeout: {e2}");
+                }
             }
         }
     });
@@ -218,7 +234,7 @@ struct TaskExecContext {
     prompt_or_command: String,
     timeout: std::time::Duration,
     run_id: i64,
-    started_at: i64,
+    started_at_ms: i64,
     retry_count: i32,
     max_retries: i32,
     schedule_type: String,
@@ -232,7 +248,7 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
         task_name,
         task_id,
         run_id,
-        started_at,
+        started_at_ms,
         config,
         ..
     } = ctx;
@@ -244,7 +260,7 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     })
     .await;
 
-    let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+    let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
     let (summary, error_msg) = match result {
         Ok(Ok(report)) => {
             let summary = report.activity_line();
@@ -255,13 +271,18 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
         Err(e) => (None, Some(format!("maintenance task panicked: {e}"))),
     };
 
-    if let Ok(db) = borg_core::db::Database::open() {
-        if let Err(e) = db.complete_task_run(*run_id, duration_ms, summary.as_deref(), error_msg.as_deref()) {
-            tracing::warn!("maintenance: failed to finalize task_runs row {run_id}: {e}");
+    match borg_core::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(*run_id, duration_ms, summary.as_deref(), error_msg.as_deref()) {
+                tracing::warn!("maintenance: failed to finalize task_runs row {run_id}: {e}");
+            }
+            if error_msg.is_none() {
+                if let Err(e) = db.clear_task_retry(task_id) {
+                    tracing::warn!("maintenance: failed to clear task retry for {task_id}: {e}");
+                }
+            }
         }
-        if error_msg.is_none() {
-            let _ = db.clear_task_retry(task_id);
-        }
+        Err(e) => tracing::warn!("maintenance: DB open failed for finalize: {e}"),
     }
 }
 
@@ -272,7 +293,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         prompt_or_command: command,
         timeout,
         run_id,
-        started_at,
+        started_at_ms,
         retry_count,
         max_retries,
         schedule_type,
@@ -291,7 +312,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
 
     match result {
         Ok(Ok(output)) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = if stderr.is_empty() {
@@ -301,9 +322,16 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             };
 
             if output.status.success() {
-                if let Ok(db) = borg_core::db::Database::open() {
-                    let _ = db.complete_task_run(*run_id, duration_ms, Some(&combined), None);
-                    let _ = db.clear_task_retry(task_id);
+                match borg_core::db::Database::open() {
+                    Ok(db) => {
+                        if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&combined), None) {
+                            tracing::warn!("Task '{task_name}': failed to finalize run: {e}");
+                        }
+                        if let Err(e) = db.clear_task_retry(task_id) {
+                            tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("Task '{task_name}': DB open failed at success path: {e}"),
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                     deliver_task_result(ch, tgt, task_name, &combined, config).await;
@@ -311,13 +339,18 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             } else {
                 let exit_code = output.status.code().unwrap_or(-1);
                 let error_msg = format!("exit code {exit_code}");
-                if let Ok(db) = borg_core::db::Database::open() {
-                    let _ = db.complete_task_run(
-                        *run_id,
-                        duration_ms,
-                        Some(&combined),
-                        Some(&error_msg),
-                    );
+                match borg_core::db::Database::open() {
+                    Ok(db) => {
+                        if let Err(e) = db.complete_task_run(
+                            *run_id,
+                            duration_ms,
+                            Some(&combined),
+                            Some(&error_msg),
+                        ) {
+                            tracing::warn!("Task '{task_name}': failed to record exit-code failure: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("Task '{task_name}': DB open failed at failure path: {e}"),
                 }
                 if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                     deliver_task_result(
@@ -332,7 +365,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             }
         }
         Ok(Err(e)) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
                 task_id,
                 task_name,
@@ -349,7 +382,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
             .await;
         }
         Err(_) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
                 task_id,
                 task_name,
@@ -375,7 +408,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         prompt_or_command: task_prompt,
         timeout,
         run_id,
-        started_at,
+        started_at_ms,
         retry_count,
         max_retries,
         schedule_type,
@@ -402,8 +435,13 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
-            if let Ok(db) = borg_core::db::Database::open() {
-                let _ = db.complete_task_run(*run_id, 0, None, Some(&format!("{e}")));
+            match borg_core::db::Database::open() {
+                Ok(db) => {
+                    if let Err(e2) = db.complete_task_run(*run_id, 0, None, Some(&format!("{e}"))) {
+                        tracing::warn!("Task '{task_name}': failed to record LLM-init failure: {e2}");
+                    }
+                }
+                Err(e2) => tracing::warn!("Task '{task_name}': DB open failed at LLM-init: {e2}"),
             }
             return;
         }
@@ -412,18 +450,25 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
 
     match result {
         Ok(Ok(response)) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             let result_text = response.text_content().unwrap_or("");
-            if let Ok(db) = borg_core::db::Database::open() {
-                let _ = db.complete_task_run(*run_id, duration_ms, Some(result_text), None);
-                let _ = db.clear_task_retry(task_id);
+            match borg_core::db::Database::open() {
+                Ok(db) => {
+                    if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(result_text), None) {
+                        tracing::warn!("Task '{task_name}': failed to finalize prompt-task run: {e}");
+                    }
+                    if let Err(e) = db.clear_task_retry(task_id) {
+                        tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("Task '{task_name}': DB open failed at prompt-success: {e}"),
             }
             if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
                 deliver_task_result(ch, tgt, task_name, result_text, config).await;
             }
         }
         Ok(Err(e)) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
                 task_id, task_name, *run_id, duration_ms, *retry_count, *max_retries,
                 schedule_type, delivery_channel, delivery_target, config, &format!("{e}"),
@@ -431,7 +476,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
             .await;
         }
         Err(_) => {
-            let duration_ms = (chrono::Utc::now().timestamp() - *started_at) * 1000;
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
             handle_task_failure(
                 task_id, task_name, *run_id, duration_ms, *retry_count, *max_retries,
                 schedule_type, delivery_channel, delivery_target, config, "Task timed out",
@@ -455,22 +500,33 @@ async fn handle_task_failure(
     config: &Config,
     error: &str,
 ) {
-    if let Ok(db) = borg_core::db::Database::open() {
-        let _ = db.complete_task_run(run_id, duration_ms, None, Some(error));
-        if borg_core::tasks::is_transient_error(error) && retry_count < max_retries {
-            let next_attempt = retry_count + 1;
-            let delay = borg_core::tasks::retry_delay_secs(next_attempt);
-            let retry_at = chrono::Utc::now().timestamp() + delay;
-            let _ = db.set_task_retry(task_id, next_attempt, error, retry_at);
-            tracing::warn!(
-                "Task '{task_name}' failed (transient), retry {next_attempt}/{max_retries} in {delay}s: {error}"
-            );
-            return;
+    match borg_core::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
+                tracing::warn!("Task '{task_name}': failed to record failure: {e}");
+            }
+            if borg_core::tasks::is_transient_error(error) && retry_count < max_retries {
+                let next_attempt = retry_count + 1;
+                let delay = borg_core::tasks::retry_delay_secs(next_attempt);
+                let retry_at = chrono::Utc::now().timestamp() + delay;
+                if let Err(e) = db.set_task_retry(task_id, next_attempt, error, retry_at) {
+                    tracing::warn!("Task '{task_name}': failed to schedule retry: {e}");
+                }
+                tracing::warn!(
+                    "Task '{task_name}' failed (transient), retry {next_attempt}/{max_retries} in {delay}s: {error}"
+                );
+                return;
+            }
+            if let Err(e) = db.clear_task_retry(task_id) {
+                tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+            }
+            if schedule_type == "once" {
+                if let Err(e) = db.update_task_status(task_id, "completed") {
+                    tracing::warn!("Task '{task_name}': failed to mark completed: {e}");
+                }
+            }
         }
-        let _ = db.clear_task_retry(task_id);
-        if schedule_type == "once" {
-            let _ = db.update_task_status(task_id, "completed");
-        }
+        Err(e) => tracing::warn!("Task '{task_name}': DB open failed at handle_task_failure: {e}"),
     }
     tracing::warn!("Task '{task_name}' failed: {error}");
 

@@ -169,10 +169,19 @@ pub async fn stop_service() -> Result<()> {
     platform_stop()
 }
 
-/// Restart the daemon: stop (best-effort) then ensure it is running.
+/// Restart the daemon: stop (best-effort), wait for the UDS to drop, then
+/// ensure a fresh instance is up. Without the wait, `ensure_running` could
+/// observe the old daemon's still-open socket and short-circuit.
 pub async fn restart_service() -> Result<()> {
     if let Err(e) = stop_service().await {
         tracing::warn!("Stop during restart failed: {e}");
+    }
+    let drain_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < drain_deadline {
+        if !daemon_reachable().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     ensure_running().await
 }

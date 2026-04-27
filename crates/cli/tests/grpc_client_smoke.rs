@@ -58,38 +58,11 @@ use tower::service_fn;
 // Test 1: source-grep guard
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Files explicitly allowed to retain `borg_core::db::` / `Database::open(`
-/// references after PR-E5. Each entry pins an in-flight migration that
-/// cannot land in this PR without colliding with B-PR-B (which owns the
-/// popup files and may be running in parallel).
-///
-/// Shrink this list as follow-up PRs migrate each file to a `DaemonClient`
-/// admin RPC. When the list is empty, delete it AND the `is_allowlisted`
-/// helper — the bare grep is enough.
-const ALLOWLIST: &[&str] = &[
-    // FIXME(stage-E-followup): legacy CLI subcommands hold remaining direct
-    // `Database::open()` calls. Each has a corresponding admin RPC already
-    // wired in `DaemonClient` (CreateProject/UpdateProject/...,
-    // ApprovePairing/RevokeApprovedSender, etc.) — migration is mechanical
-    // but cuts across enough sites to warrant a dedicated PR. Until then
-    // these read/write the DB directly. Reads are safe (DB is WAL); writes
-    // race the daemon's writer and are the motivating reason to migrate.
-    "commands/status.rs",
-    "commands/pairing.rs",
-    "commands/projects.rs",
-    "commands/settings.rs",
-    // FIXME(stage-B-followup): TUI popups + app fixtures still pull
-    // settings/state from the DB directly in test paths. Production paths
-    // already go through DaemonClient; the popup tests construct in-memory
-    // DBs which trip the source-grep guard via `Database::open` in setup.
-    "tui/app/mod.rs",
-    "tui/settings_popup.rs",
-    "tui/model_popup.rs",
-    // Doc-only cross-references in the daemon_client wrapper. Comment
-    // matches are filtered above, but we pin the file so a future
-    // non-comment usage shows up cleanly in the diff.
-    "daemon_client/mod.rs",
-];
+/// Files explicitly allowed to retain `Database::open(` writer-handle
+/// references. The list shrinks monotonically as follow-up PRs migrate
+/// each file to a `DaemonClient` admin RPC. When the list is empty, the
+/// `is_allowlisted` helper becomes a no-op.
+const ALLOWLIST: &[&str] = &[];
 
 fn is_allowlisted(rel: &str) -> bool {
     ALLOWLIST.iter().any(|a| rel.ends_with(a))
@@ -112,13 +85,16 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
+#[allow(clippy::const_is_empty)]
 fn allowlist_is_shrink_only() {
-    // Hard upper bound: every PR that grows this list past 8 needs a code
-    // review. The list shrinks monotonically as follow-up PRs migrate each
-    // file to a `DaemonClient` admin RPC.
+    // Hard upper bound: every PR that grows this list needs a code review.
+    // The list shrinks monotonically as follow-up PRs migrate each file to
+    // a `DaemonClient` admin RPC. Currently the cli has zero direct writer
+    // openers — keep it that way. Clippy correctly notes the const is empty
+    // *right now*; that's the invariant we're locking in.
     assert!(
-        ALLOWLIST.len() <= 8,
-        "ALLOWLIST should shrink, not grow (len = {})",
+        ALLOWLIST.is_empty(),
+        "ALLOWLIST should remain empty (len = {}); migrate the offending file to a DaemonClient admin RPC instead of allowlisting it",
         ALLOWLIST.len()
     );
 }
@@ -195,7 +171,13 @@ fn crates_cli_src_has_no_direct_db_access() {
             // so it cannot race the daemon's writer. The single-writer
             // invariant is enforced at the rusqlite layer; this guard only
             // catches direct writer-handle openers.
-            if raw_line.contains("borg_core::db::") || raw_line.contains("Database::open(") {
+            //
+            // Plain `borg_core::db::` substring usages (e.g. row-type imports
+            // like `borg_core::db::ProjectRow`) are allowed — what we care
+            // about is the writer handle, which is `Database::open(`. The
+            // readonly handle is `Database::open_readonly(` and is a
+            // transitional escape hatch for read-only consumers.
+            if raw_line.contains("Database::open(") {
                 offenders.push(format!(
                     "{}:{} {}",
                     rel,

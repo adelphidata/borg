@@ -13,7 +13,7 @@
 //! directly. Same wire format, same handlers — the wrapper is a thin
 //! ergonomic layer (covered by the cli's own compile.)
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::type_complexity)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::type_complexity, clippy::await_holding_lock)]
 
 use borg_core::db::{Database, NewTask, NewWorkflowStep, UpdateTask};
 use borg_proto::admin::admin_client::AdminClient;

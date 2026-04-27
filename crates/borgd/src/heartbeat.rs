@@ -134,12 +134,16 @@ pub fn spawn(
                 evt = hb_rx.recv() => {
                     let Some(evt) = evt else { return };
                     if let SchedulerEvent::Fire = evt {
-                        let cfg = runner_config.clone();
-                        let bus = bus_for_runner.clone();
-                        let exec = runner_executor.clone();
-                        tokio::spawn(async move {
-                            run_and_broadcast(&exec, &cfg, HeartbeatSource::Scheduled, &bus).await;
-                        });
+                        // Serialize fires: dedup state (LAST_HASH/LAST_HASH_TIME)
+                        // is read-modify-write on two independent atomics, so
+                        // overlapping fires would race. Heartbeats are rare —
+                        // running sequentially is fine.
+                        run_and_broadcast(
+                            &runner_executor,
+                            &runner_config,
+                            HeartbeatSource::Scheduled,
+                            &bus_for_runner,
+                        ).await;
                     }
                 }
             }

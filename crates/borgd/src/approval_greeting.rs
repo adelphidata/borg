@@ -100,8 +100,9 @@ async fn generate_and_deliver(
     if greeting.is_empty() {
         anyhow::bail!("LLM returned empty greeting");
     }
-    let greeting = if greeting.len() > 500 {
-        format!("{}…", &greeting[..500])
+    let greeting = if greeting.chars().count() > 500 {
+        let truncated: String = greeting.chars().take(500).collect();
+        format!("{truncated}…")
     } else {
         greeting
     };

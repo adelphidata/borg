@@ -52,7 +52,7 @@ pub(crate) fn dispatch_bond(action: Option<BondAction>) -> Result<()> {
 pub(crate) fn run_status() -> Result<()> {
     let now = chrono::Utc::now();
     let config = borg_core::config::Config::load_from_db()?;
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
 
     if config.evolution.enabled {
         if let Ok(evo_state) = db.get_evolution_state() {
@@ -113,7 +113,7 @@ pub(crate) fn run_status_history() -> Result<()> {
         );
         return Ok(());
     }
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let events = db.evolution_events_since(0)?;
     let mut events = events;
     events.reverse();
@@ -122,7 +122,7 @@ pub(crate) fn run_status_history() -> Result<()> {
 }
 
 pub(crate) fn run_status_xp() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let output = borg_core::evolution::commands::dispatch(
         borg_core::evolution::commands::EvolutionCommand::Xp,
         &db,
@@ -132,7 +132,7 @@ pub(crate) fn run_status_xp() -> Result<()> {
 }
 
 pub(crate) fn run_status_evolution() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let output = borg_core::evolution::commands::dispatch(
         borg_core::evolution::commands::EvolutionCommand::Evolution,
         &db,
@@ -142,7 +142,7 @@ pub(crate) fn run_status_evolution() -> Result<()> {
 }
 
 pub(crate) fn run_status_card(out: Option<std::path::PathBuf>) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let output = borg_core::evolution::commands::dispatch(
         borg_core::evolution::commands::EvolutionCommand::Card { out },
         &db,
@@ -159,14 +159,14 @@ pub(crate) fn run_status_archetypes() -> Result<()> {
         );
         return Ok(());
     }
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let state = db.get_evolution_state()?;
     println!("{}", borg_core::evolution::format_archetype_scores(&state));
     Ok(())
 }
 
 pub(crate) fn run_bond_status() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let events = db.get_all_bond_events()?;
     let bond_key = db.derive_hmac_key(borg_core::bond::BOND_HMAC_DOMAIN);
     let state = borg_core::bond::replay_events_with_key(&bond_key, &events);
@@ -183,14 +183,14 @@ pub(crate) fn run_bond_status() -> Result<()> {
 }
 
 pub(crate) fn run_bond_history(count: usize) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let events = db.bond_events_recent(count)?;
     println!("{}", borg_core::bond::format_history(&events));
     Ok(())
 }
 
 pub(crate) fn run_usage() -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let total_tokens = db.monthly_token_total()?;
     let total_cost = db.monthly_total_cost()?;
     let by_model = db.monthly_usage_by_model()?;

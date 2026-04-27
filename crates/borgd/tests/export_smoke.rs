@@ -10,7 +10,7 @@
 //! Mirrors the harness pattern in `admin_rpc_smoke.rs` (process-global
 //! `BORG_DATA_DIR`, serialized via mutex).
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
 use borg_core::db::Database;
 use borg_proto::admin::admin_client::AdminClient;

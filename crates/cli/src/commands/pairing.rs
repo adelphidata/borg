@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 use super::format_ts;
+use crate::daemon_client::connect_or_spawn;
 
 #[derive(Subcommand)]
 pub(crate) enum PairingAction {
@@ -29,6 +30,12 @@ pub(crate) enum PairingAction {
     },
 }
 
+/// Block on a future from a sync context. Reuses the ambient tokio runtime
+/// (`main()` builds one in `crates/cli/src/main.rs`).
+fn block_on<F: std::future::Future<Output = R>, R>(fut: F) -> R {
+    tokio::runtime::Handle::current().block_on(fut)
+}
+
 /// Dispatch for `borg pairing ...`.
 pub(crate) fn dispatch_pairing(action: Option<PairingAction>) -> Result<()> {
     match action {
@@ -43,8 +50,11 @@ pub(crate) fn dispatch_pairing(action: Option<PairingAction>) -> Result<()> {
 }
 
 pub(crate) fn run_pairing_list(channel: Option<&str>) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    let requests = db.list_pairings(channel)?;
+    let resp = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.list_pairing_requests(channel).await
+    })?;
+    let requests = resp.requests;
     if requests.is_empty() {
         println!("No pending pairing requests.");
         return Ok(());
@@ -55,7 +65,7 @@ pub(crate) fn run_pairing_list(channel: Option<&str>) -> Result<()> {
     );
     println!("{}", "─".repeat(64));
     for r in &requests {
-        let expires = format_ts(r.expires_at, "%Y-%m-%d %H:%M UTC");
+        let expires = format_ts(r.expires_at as i64, "%Y-%m-%d %H:%M UTC");
         println!(
             "{:<12} {:<20} {:<10} {:<20}",
             r.channel_name, r.sender_id, r.code, expires
@@ -67,60 +77,87 @@ pub(crate) fn run_pairing_list(channel: Option<&str>) -> Result<()> {
 }
 
 pub(crate) fn run_pairing_approve(code: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    block_on(async {
+        let mut client = connect_or_spawn().await?;
 
-    let (channel_name, request) =
-        if let Some((channel, _)) = borg_core::pairing::parse_prefixed_code(code) {
-            let req = db.approve_pairing(channel, code)?;
-            (channel.to_string(), req)
+        // Resolve the channel: either the code carries a known prefix, or we
+        // search the pending pairing list for a matching code.
+        let channel_name = if let Some((channel, _)) =
+            borg_core::pairing::parse_prefixed_code(code)
+        {
+            channel.to_string()
         } else {
-            match db.find_pending_by_code(code)? {
-                Some(row) => {
-                    let ch = row.channel_name;
-                    let req = db.approve_pairing(&ch, code)?;
-                    (ch, req)
-                }
-                None => anyhow::bail!("No pending pairing request found for code '{code}'"),
-            }
+            let resp = client.list_pairing_requests(None).await?;
+            let row = resp
+                .requests
+                .into_iter()
+                .find(|r| r.code == code && r.status == "pending")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("No pending pairing request found for code '{code}'")
+                })?;
+            row.channel_name
         };
 
-    println!(
-        "Approved {} sender {}.",
-        request.channel_name, request.sender_id
-    );
+        client.approve_pairing(&channel_name, code).await?;
 
-    let _ = borg_core::config::Config::load_from_db();
-    let sid = request.sender_id;
-    let ch = channel_name;
-    tokio::runtime::Handle::current().block_on(async {
-        match crate::daemon_client::connect_or_spawn().await {
-            Ok(mut client) => {
-                if let Err(e) = client.send_approval_greeting(&ch, &sid).await {
-                    tracing::warn!("Approval greeting RPC failed: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Approval greeting: connect_or_spawn failed: {e}");
+        // Look up the sender id from the now-approved row so we can deliver
+        // a personalized greeting. Senders list contains it.
+        let approved = client.list_approved_senders(Some(&channel_name)).await?;
+        // Heuristic: most-recently-approved row for this channel.
+        let sender_id = approved
+            .senders
+            .iter()
+            .max_by_key(|s| s.approved_at)
+            .map(|s| s.sender_id.clone());
+
+        println!(
+            "Approved {} sender {}.",
+            channel_name,
+            sender_id.as_deref().unwrap_or("(unknown)")
+        );
+
+        if let Some(sid) = sender_id {
+            if let Err(e) = client.send_approval_greeting(&channel_name, &sid).await {
+                tracing::warn!("Approval greeting RPC failed: {e}");
             }
         }
-    });
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     Ok(())
 }
 
 pub(crate) fn run_pairing_revoke(channel: &str, sender_id: &str) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    if db.revoke_sender(channel, sender_id)? {
-        println!("Revoked {channel} sender {sender_id}.");
-    } else {
-        println!("No approved sender found for {channel} with ID {sender_id}.");
+    let result = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.revoke_approved_sender(channel, sender_id).await
+    });
+    match result {
+        Ok(()) => {
+            println!("Revoked {channel} sender {sender_id}.");
+            Ok(())
+        }
+        Err(e) => {
+            // not_found surfaces from the daemon as a tonic Status; surface
+            // the same UX as the previous direct-DB path: a friendly message
+            // rather than a stack-trace error.
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                println!("No approved sender found for {channel} with ID {sender_id}.");
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }
     }
-    Ok(())
 }
 
 pub(crate) fn run_pairing_approved(channel: Option<&str>) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
-    let senders = db.list_approved_senders(channel)?;
+    let resp = block_on(async {
+        let mut client = connect_or_spawn().await?;
+        client.list_approved_senders(channel).await
+    })?;
+    let senders = resp.senders;
     if senders.is_empty() {
         println!("No approved senders.");
         return Ok(());
@@ -131,8 +168,12 @@ pub(crate) fn run_pairing_approved(channel: Option<&str>) -> Result<()> {
     );
     println!("{}", "─".repeat(70));
     for s in &senders {
-        let approved = format_ts(s.approved_at, "%Y-%m-%d %H:%M UTC");
-        let name = s.display_name.as_deref().unwrap_or("—");
+        let approved = format_ts(s.approved_at as i64, "%Y-%m-%d %H:%M UTC");
+        let name = if s.display_name.is_empty() {
+            "—"
+        } else {
+            s.display_name.as_str()
+        };
         println!(
             "{:<12} {:<20} {:<16} {:<20}",
             s.channel_name, s.sender_id, name, approved

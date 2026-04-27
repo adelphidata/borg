@@ -92,7 +92,7 @@ pub(crate) fn run_logs(count: usize, verbose: bool) -> Result<()> {
 }
 
 pub(crate) fn run_activity_logs(count: usize, level: &str, category: Option<&str>) -> Result<()> {
-    let db = borg_core::db::Database::open()?;
+    let db = borg_core::db::Database::open_readonly()?;
     let entries = db.query_activity(count, Some(level), category)?;
     if entries.is_empty() {
         println!("No activity log entries.");
