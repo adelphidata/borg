@@ -32,5 +32,11 @@ pub mod admin {
     tonic::include_proto!("borg.admin.v1");
 }
 
+/// PKI / pairing / audit RPCs (Task 02).
+pub mod pki {
+    #![allow(missing_docs, clippy::all)]
+    tonic::include_proto!("borg.pki.v1");
+}
+
 /// Re-export tonic for downstream crates so they don't have to pin a version.
 pub use tonic;

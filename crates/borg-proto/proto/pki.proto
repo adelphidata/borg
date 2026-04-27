@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package borg.pki.v1;
+
+// Pki — Task 02 PKI surface. Lives in its own service (and its own .proto)
+// so this PR can land alongside parallel admin.proto changes without merge
+// conflicts. mTLS-required for every RPC.
+service Pki {
+  // Mints a fresh PAKE code, persists `sha256(code)` to `pairing_codes`, and
+  // returns the plaintext code to the caller. The actual SPAKE2 exchange runs
+  // over a separate plaintext bootstrap UDS socket — see borgd pairing module.
+  rpc StartPairing(StartPairingRequest) returns (StartPairingResponse);
+
+  // Renew a client cert that's ≤14d from expiry. Requires the renewing
+  // device's mTLS cert; the server verifies the active cert's fingerprint
+  // matches `request.fingerprint` before issuing.
+  rpc RenewCert(RenewCertRequest) returns (RenewCertResponse);
+
+  // Revoke a paired device's fingerprint and add it to `revoked_fingerprints`.
+  rpc RevokeDevice(RevokeDeviceRequest) returns (PkiEmpty);
+
+  rpc ListPairedDevices(PkiEmpty) returns (PairedDeviceList);
+
+  // Replay the audit chain. Pure (no clock, no network) — deterministic
+  // forensic verification.
+  rpc VerifyAuditChain(PkiEmpty) returns (VerifyAuditResponse);
+}
+
+message PkiEmpty {}
+
+message StartPairingRequest {
+  string device_label = 1;
+}
+
+message StartPairingResponse {
+  string code = 1;
+  int64 expires_at = 2;
+}
+
+message RenewCertRequest {
+  string fingerprint = 1;
+}
+
+message RenewCertResponse {
+  string new_cert_pem = 1;
+  string new_key_pkcs8_pem = 2;
+  int64 not_after = 3;
+}
+
+message RevokeDeviceRequest {
+  string fingerprint = 1;
+  string reason = 2;
+}
+
+message PairedDevice {
+  int64 id = 1;
+  string fingerprint = 2;
+  string device_label = 3;
+  int64 paired_at = 4;
+  int64 last_seen_at = 5;
+  string status = 6;
+  string principal_id = 7;
+}
+
+message PairedDeviceList {
+  repeated PairedDevice devices = 1;
+}
+
+message VerifyAuditResponse {
+  // "ok" | "tampered"
+  string outcome = 1;
+  // Populated when outcome == "tampered". -1 if outcome == "ok".
+  int64 tampered_seq = 2;
+}
