@@ -705,6 +705,7 @@ dependencies = [
  "borg-core",
  "borg-gateway",
  "borg-heartbeat",
+ "borg-pki",
  "borg-plugins",
  "borg-proto",
  "borgd",
