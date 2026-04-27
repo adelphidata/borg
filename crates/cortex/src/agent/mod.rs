@@ -1533,6 +1533,10 @@ Rules:
                             "Internal error: streaming task crashed".into(),
                         ))
                         .await;
+                    // Without this TurnComplete the TUI spinner hangs forever:
+                    // returning Err propagates up but the caller relies on the
+                    // event channel to know the turn is over.
+                    let _ = event_tx.send(AgentEvent::TurnComplete).await;
                     return Err(anyhow::anyhow!("LLM stream task panicked"));
                 }
             }
@@ -1573,6 +1577,17 @@ Rules:
                 },
             );
             self.hook_registry.dispatch(&hook_ctx);
+
+            // If the LLM stream errored mid-response, treat the turn as failed
+            // regardless of whether partial tool calls survived — their JSON
+            // arguments may be truncated and executing them risks running with
+            // half-parsed input. Persist the interrupted marker and emit
+            // TurnComplete so the TUI returns to the composer.
+            if stream_error.is_some() {
+                self.persist_discarded_tool_calls(&text_content, stream_error.take(), &event_tx)
+                    .await;
+                return Ok(());
+            }
 
             if tool_calls.is_empty() {
                 match self
@@ -2934,6 +2949,50 @@ mod tests {
             "StreamEvent::Error arm must clone the error into `stream_error` before \
              forwarding to the TUI; otherwise the error string is lost by the time \
              we persist the partial message"
+        );
+    }
+
+    #[test]
+    fn run_agent_loop_diverts_on_stream_error_before_tool_exec() {
+        // Invariant: when the LLM stream errors mid-response, the loop MUST NOT
+        // call execute_tool_calls — partial tool-call JSON may be truncated.
+        // Without this divert, a 429 / network blip that happened to flush
+        // partial tool deltas hangs the TUI: the loop executes garbage tools
+        // and re-loops without ever emitting TurnComplete. The fix is a
+        // `stream_error.is_some()` early-return to persist_discarded_tool_calls
+        // *before* the tool_calls / validate_tool_calls branches.
+        let exec_idx = AGENT_RS_SRC
+            .find("self.execute_tool_calls(")
+            .expect("execute_tool_calls call must exist in run_agent_loop");
+        let preceding = &AGENT_RS_SRC[..exec_idx];
+        let divert_idx = preceding
+            .rfind("if stream_error.is_some()")
+            .expect("run_agent_loop must short-circuit to persist_discarded_tool_calls when stream_error.is_some() — before reaching execute_tool_calls — or the TUI hangs on 429+partial-tool-call");
+        let divert_tail = &AGENT_RS_SRC[divert_idx..exec_idx];
+        assert!(
+            divert_tail.contains("persist_discarded_tool_calls"),
+            "the stream_error divert must call persist_discarded_tool_calls (which emits TurnComplete) before any tool execution"
+        );
+    }
+
+    #[test]
+    fn run_agent_loop_emits_turn_complete_on_stream_panic() {
+        // Invariant: the LLM-stream-task panic branch must emit TurnComplete
+        // before returning Err. The function's caller treats Err as a hard
+        // failure and propagates it up, but the TUI runtime listens on the
+        // event channel — without this TurnComplete the spinner hangs even
+        // though the agent has given up.
+        let panic_idx = AGENT_RS_SRC
+            .find("LLM stream task panicked: ")
+            .expect("panic-branch tracing::error message must exist");
+        let panic_tail = &AGENT_RS_SRC[panic_idx..];
+        let return_idx = panic_tail
+            .find("return Err(anyhow::anyhow!(\"LLM stream task panicked\"))")
+            .expect("panic branch must return Err");
+        let between = &panic_tail[..return_idx];
+        assert!(
+            between.contains("AgentEvent::TurnComplete"),
+            "panic branch must send AgentEvent::TurnComplete before returning Err"
         );
     }
 

@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
@@ -8,6 +8,27 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
+
+/// Provider-lifecycle log helper. Routes a single `tracing` call to `info!`
+/// when `verbose` is true (i.e. `[debug] llm_logging = true` in config), and
+/// `debug!` otherwise so `RUST_LOG=cortex::llm=debug` still surfaces them
+/// without touching config. Lets us record request → response-headers →
+/// first-byte → stream-end timings without spamming production logs.
+macro_rules! lc_log {
+    ($verbose:expr, $($arg:tt)*) => {{
+        if $verbose {
+            tracing::info!(target: "cortex::llm::lifecycle", $($arg)*);
+        } else {
+            tracing::debug!(target: "cortex::llm::lifecycle", $($arg)*);
+        }
+    }};
+}
+
+fn short_request_id() -> String {
+    let mut s = uuid::Uuid::new_v4().simple().to_string();
+    s.truncate(8);
+    s
+}
 
 use crate::config::{Config, LlmConfig};
 use crate::provider::Provider;
@@ -798,21 +819,82 @@ impl LlmClient {
             }
         }
 
-        let response = self.send_request(&request, cancel).await?;
+        let req_id = short_request_id();
+        let verbose = self.debug_logging;
+        let lc_start = Instant::now();
+        lc_log!(
+            verbose,
+            req_id = %req_id,
+            provider = %self.provider,
+            model = %model,
+            base_url = %self.effective_base_url(),
+            msg_count = messages.len(),
+            tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
+            "openai-compat: request start"
+        );
+
+        let response = match self.send_request(&request, cancel).await {
+            Ok(r) => {
+                lc_log!(
+                    verbose,
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "openai-compat: response headers received"
+                );
+                r
+            }
+            Err(e) => {
+                warn!(
+                    target: "cortex::llm::lifecycle",
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "openai-compat: request failed before stream: {e}"
+                );
+                return Err(e);
+            }
+        };
 
         let stream = response.bytes_stream();
         let provider_str = self.provider.as_str().to_string();
         let model_str = self.llm_config.model.clone();
 
-        crate::sse::process_sse_stream(
+        let mut first_byte_ms: Option<u64> = None;
+        let mut line_count: u64 = 0;
+        let result = crate::sse::process_sse_stream(
             stream,
             tx,
             cancel,
             self.llm_config.stream_chunk_timeout_secs,
             MAX_SSE_BUFFER,
-            |line| Self::parse_openai_sse_line(line, &provider_str, &model_str),
+            |line| {
+                if first_byte_ms.is_none() {
+                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                }
+                line_count += 1;
+                Self::parse_openai_sse_line(line, &provider_str, &model_str)
+            },
         )
-        .await
+        .await;
+
+        match &result {
+            Ok(()) => lc_log!(
+                verbose,
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "openai-compat: stream end ok"
+            ),
+            Err(e) => warn!(
+                target: "cortex::llm::lifecycle",
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "openai-compat: stream end err: {e}"
+            ),
+        }
+        result
     }
 
     /// Parse a single SSE line from an OpenAI-compatible provider.
@@ -1082,7 +1164,40 @@ impl LlmClient {
             }
         }
 
-        let response = self.send_request(&body, cancel).await?;
+        let req_id = short_request_id();
+        let verbose = self.debug_logging;
+        let lc_start = Instant::now();
+        lc_log!(
+            verbose,
+            req_id = %req_id,
+            provider = %self.provider,
+            model = %model,
+            base_url = %self.effective_base_url(),
+            msg_count = messages.len(),
+            tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
+            "anthropic: request start"
+        );
+
+        let response = match self.send_request(&body, cancel).await {
+            Ok(r) => {
+                lc_log!(
+                    verbose,
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "anthropic: response headers received"
+                );
+                r
+            }
+            Err(e) => {
+                warn!(
+                    target: "cortex::llm::lifecycle",
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "anthropic: request failed before stream: {e}"
+                );
+                return Err(e);
+            }
+        };
 
         let stream = response.bytes_stream();
         let provider_str = self.provider.as_str().to_string();
@@ -1098,14 +1213,20 @@ impl LlmClient {
         let mut pending_input_tokens: u64 = 0;
         let mut pending_cached_input_tokens: u64 = 0;
         let mut pending_cache_creation_tokens: u64 = 0;
+        let mut first_byte_ms: Option<u64> = None;
+        let mut line_count: u64 = 0;
 
-        crate::sse::process_sse_stream(
+        let result = crate::sse::process_sse_stream(
             stream,
             tx,
             cancel,
             self.llm_config.stream_chunk_timeout_secs,
             MAX_SSE_BUFFER,
             |line| {
+                if first_byte_ms.is_none() {
+                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                }
+                line_count += 1;
                 Self::parse_anthropic_sse_line(
                     line,
                     &provider_str,
@@ -1119,7 +1240,27 @@ impl LlmClient {
                 )
             },
         )
-        .await
+        .await;
+
+        match &result {
+            Ok(()) => lc_log!(
+                verbose,
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "anthropic: stream end ok"
+            ),
+            Err(e) => warn!(
+                target: "cortex::llm::lifecycle",
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "anthropic: stream end err: {e}"
+            ),
+        }
+        result
     }
 
     /// Parse a single SSE line from Anthropic's streaming API.

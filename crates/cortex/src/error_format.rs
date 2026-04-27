@@ -193,7 +193,7 @@ pub fn format_friendly_error(raw: &str) -> String {
     match category {
         ErrorCategory::RateLimit => {
             let hint = extract_retry_hint(raw);
-            match hint {
+            let base = match hint {
                 Some(h) => format!(
                     "The AI provider is temporarily rate-limited. {h} Please try again shortly."
                 ),
@@ -201,6 +201,10 @@ pub fn format_friendly_error(raw: &str) -> String {
                     "The AI provider is temporarily rate-limited. Please try again in a moment."
                         .to_string()
                 }
+            };
+            match extract_openrouter_byok_hint(raw) {
+                Some(extra) => format!("{base} {extra}"),
+                None => base,
             }
         }
 
@@ -372,6 +376,37 @@ fn extract_provider_name(raw: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Extract OpenRouter inference-provider rate-limit guidance.
+///
+/// When OpenRouter routes a request to an upstream inference provider (e.g.
+/// DeepInfra, Fireworks) that is rate-limited and the user hasn't added their
+/// own provider key (`is_byok=false`), the 429 metadata names the provider
+/// and points to OpenRouter Settings → Integrations. Surface that as an
+/// actionable second sentence — the right fix isn't always `/model`, it's
+/// adding the user's own key or restricting the model's allowed providers.
+fn extract_openrouter_byok_hint(raw: &str) -> Option<String> {
+    let prefix = raw.split_once(' ').map(|(w, _)| w).unwrap_or("");
+    if !prefix.eq_ignore_ascii_case("openrouter") {
+        return None;
+    }
+    if !raw.contains(r#""is_byok":false"#) {
+        return None;
+    }
+    let provider = raw
+        .split(r#""provider_name":""#)
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .filter(|s| !s.is_empty());
+    let lead = match provider {
+        Some(p) => format!("The upstream inference provider ({p}) is rate-limited."),
+        None => "The upstream inference provider is rate-limited.".to_string(),
+    };
+    Some(format!(
+        "{lead} Add your own provider key in OpenRouter → Settings → Integrations \
+         to use your own quota, or restrict the model to providers you've enabled."
+    ))
 }
 
 /// Extract a user-friendly transport error detail.
@@ -896,10 +931,39 @@ mod tests {
         assert!(tui_msg.contains("rate-limited"));
         assert!(tui_msg.contains("/model"));
         assert!(!tui_msg.contains(r#"{"error"#));
+        // BYOK guidance: name the upstream provider and point to OpenRouter
+        // Integrations so users learn the real fix.
+        assert!(
+            tui_msg.contains("DeepInfra"),
+            "expected upstream provider name in message, got: {tui_msg}"
+        );
+        assert!(
+            tui_msg.contains("OpenRouter") && tui_msg.contains("Integrations"),
+            "expected OpenRouter Integrations guidance, got: {tui_msg}"
+        );
 
         let gw_msg = format_error_with_context(raw, ErrorContext::Gateway);
         assert!(gw_msg.contains("rate-limited"));
         assert!(gw_msg.contains("switching to a different model"));
         assert!(!gw_msg.contains(r#"{"error"#));
+        assert!(gw_msg.contains("DeepInfra"));
+    }
+
+    #[test]
+    fn openrouter_byok_hint_skipped_when_byok_true() {
+        // If the user has their own provider key, the rate limit is theirs to
+        // own — don't tell them to add a key they already added.
+        let raw = r#"openrouter returned 429 (rate limited): {"error":{"metadata":{"provider_name":"DeepInfra","is_byok":true}}}"#;
+        let msg = format_error_with_context(raw, ErrorContext::Tui);
+        assert!(!msg.contains("Integrations"), "got: {msg}");
+        assert!(!msg.contains("DeepInfra"), "got: {msg}");
+    }
+
+    #[test]
+    fn openrouter_byok_hint_skipped_for_other_providers() {
+        // Only OpenRouter has the upstream-provider-routing concept.
+        let raw = r#"anthropic returned 429: {"error":{"metadata":{"provider_name":"DeepInfra","is_byok":false}}}"#;
+        let msg = format_error_with_context(raw, ErrorContext::Tui);
+        assert!(!msg.contains("OpenRouter"), "got: {msg}");
     }
 }
