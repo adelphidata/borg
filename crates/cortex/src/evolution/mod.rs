@@ -19,6 +19,7 @@ pub mod keychain;
 mod milestones;
 pub mod plan_emission;
 mod replay;
+pub mod security;
 pub mod share_card;
 pub mod signature;
 
