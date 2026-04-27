@@ -1,11 +1,44 @@
 //! Audit chain emitter — single-writer wrapper around `Database::append_audit_event`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use super::{AuditChainOutcome, Database};
+
+/// Process-global audit writer. Installed by `borgd::daemon::run` once the
+/// daemon-owned `Database` is open. Library call sites (shell handler,
+/// settings resolver, …) emit through this so they don't have to plumb an
+/// `AuditWriter` through every signature.
+///
+/// In CLI/REPL/test contexts the global stays uninstalled and emitters
+/// no-op — those paths don't share the daemon's writer-mutex and would
+/// otherwise contend on the SQLite file.
+static GLOBAL_AUDIT: OnceLock<AuditWriter> = OnceLock::new();
+
+/// Install the process-global audit writer. Returns true on first install,
+/// false if one was already installed (later calls are intentionally
+/// ignored — single-installer invariant). Calling this from a fresh test
+/// process is a no-op-safe operation.
+pub fn install_global_audit(writer: AuditWriter) -> bool {
+    GLOBAL_AUDIT.set(writer).is_ok()
+}
+
+/// Emit through the process-global writer if one is installed; otherwise
+/// silently no-op. Use this from library-only call sites that can't accept
+/// an `AuditWriter` parameter without churn (e.g. tool handlers that
+/// originate from both the daemon and CLI one-shots).
+pub fn try_emit_global<T: Serialize>(event_type: &str, principal_id: &str, payload: &T) {
+    if let Some(w) = GLOBAL_AUDIT.get() {
+        w.emit(event_type, principal_id, payload);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn global_audit_for_test() -> Option<AuditWriter> {
+    GLOBAL_AUDIT.get().cloned()
+}
 
 pub mod audit_events {
     pub const DAEMON_START: &str = "daemon_start";
@@ -120,6 +153,20 @@ mod tests {
         let w = make_writer();
         w.emit(audit_events::PAIRING_REQUESTED, "system", &Bad { _x: () });
         assert_eq!(w.verify(), AuditChainOutcome::Ok);
+    }
+
+    #[test]
+    fn try_emit_global_is_a_silent_noop_when_uninstalled() {
+        // Real failure mode: CLI/REPL/test contexts don't initialize the
+        // global audit writer. If `try_emit_global` panicked or unwrapped
+        // a `None`, every shell denial in a unit test would crash the
+        // process. Asserting silent no-op locks the contract in.
+        //
+        // We can't observe "nothing happened" directly, so we just call
+        // it and rely on this not panicking. The "actually emits when
+        // installed" path is covered indirectly by the daemon's
+        // `pairing_audit_e2e` tests.
+        try_emit_global(audit_events::SANDBOX_DENIAL, "system", &payload(&[]));
     }
 
     #[test]

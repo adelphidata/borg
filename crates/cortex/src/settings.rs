@@ -116,6 +116,51 @@ pub fn warn_invalid_setting_once(key: &str, err: &anyhow::Error) {
     }
 }
 
+/// True for keys whose change has security posture implications and should
+/// land in the hash-chained audit log.
+///
+/// Why: `audit_log_chain` is meant to bracket every security-relevant state
+/// change (Task 02 §"Hash-chained audit log"). Emitting on *every* settings
+/// write would bloat the chain with LLM-tuning noise (`temperature`,
+/// `theme`, …), so this allow-list scopes the firing to keys whose change
+/// would shift posture, sandbox boundaries, or retention behavior.
+pub fn is_security_relevant_setting(key: &str) -> bool {
+    const PREFIXES: &[&str] = &["security.", "sandbox.", "data."];
+    PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// Append a `SETTINGS_CHANGED` audit event when `key` is security-relevant
+/// and the value actually changed. Old/new values are truncated to keep
+/// the chain bounded — full values are still in the `settings` table.
+fn emit_settings_changed_if_relevant(key: &str, old: Option<&str>, new: Option<&str>) {
+    if !is_security_relevant_setting(key) {
+        return;
+    }
+    if old == new {
+        return;
+    }
+    crate::db::try_emit_global(
+        crate::db::audit_events::SETTINGS_CHANGED,
+        "system",
+        &serde_json::json!({
+            "key": key,
+            "old": old.map(truncate_setting_value_for_audit),
+            "new": new.map(truncate_setting_value_for_audit),
+        }),
+    );
+}
+
+fn truncate_setting_value_for_audit(v: &str) -> String {
+    const MAX: usize = 256;
+    if v.len() <= MAX {
+        v.to_string()
+    } else {
+        let mut s: String = v.chars().take(MAX).collect();
+        s.push_str("…<truncated>");
+        s
+    }
+}
+
 /// Merges settings from two layers: DB overrides → compiled defaults.
 pub struct SettingsResolver {
     db: Database,
@@ -151,7 +196,9 @@ impl SettingsResolver {
         // Validate by applying to a throwaway config
         let mut scratch = Config::default();
         let confirmation = scratch.apply_setting(key, value)?;
+        let prev = self.read_prior_for_audit(key);
         self.db.set_setting(key, value)?;
+        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value));
         Ok(confirmation)
     }
 
@@ -162,8 +209,28 @@ impl SettingsResolver {
         let defaults = Config::default();
         let default_value = config_value_for_key(&defaults, key)
             .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
+        let prev = self.read_prior_for_audit(key);
         self.db.set_setting(key, &default_value)?;
+        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value));
         Ok(())
+    }
+
+    /// Read the prior value of `key` for the `SETTINGS_CHANGED` audit row.
+    /// A read failure is non-fatal — we still want the write to land — but
+    /// CLAUDE.md's no-silent-swallowing invariant requires we log it so
+    /// operators can spot when audit fidelity is degraded.
+    fn read_prior_for_audit(&self, key: &str) -> Option<String> {
+        match self.db.get_setting(key) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    %key,
+                    error = %e,
+                    "settings: prior-value read failed; SETTINGS_CHANGED audit row will record old=null",
+                );
+                None
+            }
+        }
     }
 
     /// Get the effective value and its source for a single key.
@@ -229,6 +296,45 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory db");
         let db = Database::from_connection(conn).expect("db setup");
         SettingsResolver::new(db)
+    }
+
+    #[test]
+    fn is_security_relevant_setting_matches_security_sandbox_data_prefixes() {
+        // Real failure mode: someone adds a new `data.foo` retention knob
+        // without realizing `is_security_relevant_setting` is the gate
+        // for SETTINGS_CHANGED emission. Table-driven so adding a new
+        // category surfaces as a single failing row, not a fluff per-key
+        // test (per CLAUDE.md test-quality rules).
+        let cases: &[(&str, bool)] = &[
+            ("security.blocked_paths", true),
+            ("security.secret_detection", true),
+            ("sandbox.enabled", true),
+            ("sandbox.mode", true),
+            ("data.retention_days", true),
+            ("data.purge_policy", true),
+            ("temperature", false),
+            ("model", false),
+            ("llm.cache.enabled", false),
+            ("memory.embeddings.enabled", false),
+            ("conversation.max_iterations", false),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                is_security_relevant_setting(key),
+                *expected,
+                "{key} should map to {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_setting_value_for_audit_marks_overflows() {
+        let short = "abc";
+        assert_eq!(truncate_setting_value_for_audit(short), "abc");
+        let long = "a".repeat(1000);
+        let out = truncate_setting_value_for_audit(&long);
+        assert!(out.ends_with("<truncated>"));
+        assert!(out.len() < long.len());
     }
 
     #[test]

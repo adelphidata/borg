@@ -91,8 +91,10 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Single shutdown signal fanned out to every transport so SIGTERM drains
     // both UDS and TCP listeners in parallel rather than aborting the slower one.
+    // Signal-handler spawn is deferred until after the AuditWriter exists so the
+    // shutdown path can emit DAEMON_STOP into the same chain that bracketed
+    // DAEMON_START.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
-    tokio::spawn(forward_signals_to(shutdown_tx.clone()));
 
     // Bridge the broadcast shutdown into a CancellationToken for the
     // orchestrator subsystems (gateway, heartbeat scheduler, task dispatcher).
@@ -159,11 +161,22 @@ pub async fn run(cfg: Config) -> Result<()> {
         ca_cert_pem: ca_cert_pem.clone(),
     };
     let audit = AuditWriter::new(pki_db.clone());
+    // Install the process-global audit writer so library call sites that
+    // can't easily plumb an `AuditWriter` (shell-policy denial path,
+    // settings resolver, …) can emit through the same chain. This must
+    // happen before DAEMON_START so the install order is observable in
+    // tests if it ever regresses.
+    cortex::db::install_global_audit(audit.clone());
     audit.emit(
         audit_events::DAEMON_START,
         "system",
         &json!({"pid": std::process::id()}),
     );
+
+    // Wire shutdown-signal forwarding now that the audit writer is available.
+    // `forward_signals_to` blocks on the first signal, emits DAEMON_STOP, and
+    // then broadcasts the shutdown so listeners drain.
+    tokio::spawn(forward_signals_to(shutdown_tx.clone(), audit.clone()));
 
     // Reconcile security posture against live config before serving any
     // traffic. On a fresh DB this writes the bootstrap event;
@@ -265,6 +278,18 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// Install SIGTERM and SIGINT handlers; broadcast on either. If a handler
 /// can't be installed we log and continue with whichever one we got — the
 /// daemon is never left un-killable.
+///
+/// On signal: emits a `DAEMON_STOP` audit event with the triggering signal's
+/// name BEFORE broadcasting shutdown, so the row lands while the audit writer
+/// is still alive and the chain bookends `DAEMON_START` on every clean exit.
+async fn forward_signals_to(tx: broadcast::Sender<()>, audit: AuditWriter) {
+    let reason = wait_for_shutdown_signal().await;
+    emit_daemon_stop(&audit, reason);
+    // If all receivers were dropped (shutdown already in progress) the send
+    // fails harmlessly — there's no one left to notify.
+    let _ = tx.send(());
+}
+
 /// Format a posture transition for a `system_notice` toast. Pulled out so
 /// runtime triggers (config change / listener bind) can reuse the exact
 /// wording — the daemon-startup site is the only caller today.
@@ -280,7 +305,9 @@ pub(crate) fn format_posture_transition(
     )
 }
 
-async fn forward_signals_to(tx: broadcast::Sender<()>) {
+/// Block until SIGTERM or SIGINT fires; return a stable string identifying
+/// which signal triggered the shutdown so it can be recorded in the audit log.
+async fn wait_for_shutdown_signal() -> &'static str {
     let term = signal(SignalKind::terminate())
         .map_err(|e| tracing::warn!(error = %e, "failed to install SIGTERM handler"))
         .ok();
@@ -290,33 +317,78 @@ async fn forward_signals_to(tx: broadcast::Sender<()>) {
 
     match (term, int) {
         (Some(mut t), Some(mut i)) => tokio::select! {
-            _ = t.recv() => tracing::info!("received SIGTERM, draining"),
-            _ = i.recv() => tracing::info!("received SIGINT, draining"),
+            _ = t.recv() => { tracing::info!("received SIGTERM, draining"); "sigterm" }
+            _ = i.recv() => { tracing::info!("received SIGINT, draining"); "sigint" }
         },
         (Some(mut t), None) => {
             let _ = t.recv().await;
             tracing::info!("received SIGTERM, draining");
+            "sigterm"
         }
         (None, Some(mut i)) => {
             let _ = i.recv().await;
             tracing::info!("received SIGINT, draining");
+            "sigint"
         }
         (None, None) => {
             tracing::error!("no signal handlers installed; daemon will only stop on SIGKILL");
-            std::future::pending::<()>().await;
+            std::future::pending::<&'static str>().await
         }
     }
+}
 
-    // If all receivers were dropped (shutdown already in progress) the send
-    // fails harmlessly — there's no one left to notify.
-    let _ = tx.send(());
+/// Emit the `DAEMON_STOP` audit event. Pulled into its own function so the
+/// shutdown-side audit invariant is unit-testable without faking signals.
+pub(crate) fn emit_daemon_stop(audit: &AuditWriter, reason: &str) {
+    audit.emit(
+        audit_events::DAEMON_STOP,
+        "system",
+        &json!({"reason": reason, "pid": std::process::id()}),
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_uds, format_posture_transition};
+    use super::{bind_uds, emit_daemon_stop, format_posture_transition};
+    use cortex::db::{audit_events, AuditWriter, Database};
     use cortex::evolution::security::PostureState;
+    use rusqlite::Connection;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn emit_daemon_stop_appends_event_with_reason_to_audit_chain() {
+        // Real failure mode: graceful shutdowns that don't bookend the
+        // DAEMON_START row leave the audit chain ambiguous about whether the
+        // daemon exited cleanly or was killed mid-write. Spec §"Hash-chained
+        // audit log" mandates daemon start/stop events on by default.
+        let db =
+            Database::from_connection(Connection::open_in_memory().expect("db")).expect("init");
+        let writer = AuditWriter::new(Arc::new(Mutex::new(db)));
+        // Seed a DAEMON_START so we can also confirm chain integrity post-stop.
+        writer.emit(
+            audit_events::DAEMON_START,
+            "system",
+            &serde_json::json!({"pid": 1}),
+        );
+
+        emit_daemon_stop(&writer, "sigterm");
+
+        let outcome = writer.verify();
+        assert!(
+            matches!(outcome, cortex::db::AuditChainOutcome::Ok),
+            "chain should still verify after stop, got {outcome:?}"
+        );
+        let dbref = writer.db();
+        let g = dbref.lock().expect("lock");
+        let events = g.list_audit_events().expect("list");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, audit_events::DAEMON_START);
+        assert_eq!(events[1].event_type, audit_events::DAEMON_STOP);
+        let payload: serde_json::Value =
+            serde_json::from_str(&events[1].event_json).expect("payload json");
+        assert_eq!(payload["reason"], "sigterm");
+    }
 
     #[test]
     fn posture_transition_toast_text_includes_arrow_and_multiplier() {

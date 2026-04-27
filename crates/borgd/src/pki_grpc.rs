@@ -13,9 +13,9 @@ use identity::{
     fingerprint_sha256,
 };
 use protocols::pki::{
-    pki_server::Pki, PairedDevice as PbPairedDevice, PairedDeviceList, PkiEmpty, RenewCertRequest,
-    RenewCertResponse, RevokeDeviceRequest, StartPairingRequest, StartPairingResponse,
-    VerifyAuditResponse,
+    pki_server::Pki, CertLifecycleResponse, PairedDevice as PbPairedDevice, PairedDeviceList,
+    PkiEmpty, RenewCertRequest, RenewCertResponse, RevokeDeviceRequest, StartPairingRequest,
+    StartPairingResponse, VerifyAuditResponse,
 };
 use serde_json::json;
 use tonic::{Request, Response, Status};
@@ -214,6 +214,34 @@ impl Pki for PkiSvc {
             })
             .collect();
         Ok(Response::new(PairedDeviceList { devices }))
+    }
+
+    async fn get_cert_lifecycle(
+        &self,
+        req: Request<PkiEmpty>,
+    ) -> Result<Response<CertLifecycleResponse>, Status> {
+        let principal = req
+            .extensions()
+            .get::<Principal>()
+            .ok_or_else(|| Status::unauthenticated("no principal"))?
+            .clone();
+        let now = chrono::Utc::now().timestamp();
+        let not_after = {
+            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            g.paired_device_cert_expiry(&principal.fingerprint)
+                .map_err(|e| Status::internal(format!("db: {}", e)))?
+                .unwrap_or(0)
+        };
+        let renewal_due = if not_after == 0 {
+            false
+        } else {
+            let remaining = not_after.saturating_sub(now);
+            (0..=crate::auth::verifier::RENEWAL_WINDOW_SECS).contains(&remaining)
+        };
+        Ok(Response::new(CertLifecycleResponse {
+            not_after,
+            renewal_due,
+        }))
     }
 
     async fn verify_audit_chain(

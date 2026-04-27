@@ -24,6 +24,12 @@ service Pki {
   // Replay the audit chain. Pure (no clock, no network) — deterministic
   // forensic verification.
   rpc VerifyAuditChain(PkiEmpty) returns (VerifyAuditResponse);
+
+  // Inspect the calling device's cert lifecycle so the client can
+  // self-trigger a `RenewCert` when its cert is within the 14-day renewal
+  // window. Requires mTLS — the daemon answers based on the principal's
+  // own active cert (request body intentionally empty).
+  rpc GetCertLifecycle(PkiEmpty) returns (CertLifecycleResponse);
 }
 
 message PkiEmpty {}
@@ -64,6 +70,17 @@ message PairedDevice {
 
 message PairedDeviceList {
   repeated PairedDevice devices = 1;
+}
+
+message CertLifecycleResponse {
+  // Active cert's `not_after`, UNIX seconds. Zero if no active cert is
+  // associated with the calling principal (shouldn't happen for an
+  // mTLS-authenticated request).
+  int64 not_after = 1;
+  // True when the active cert is within the 14-day silent-renewal window.
+  // The client should call `RenewCert` opportunistically when this flips
+  // to true.
+  bool renewal_due = 2;
 }
 
 message VerifyAuditResponse {

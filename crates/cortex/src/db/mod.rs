@@ -25,7 +25,7 @@ mod workflow;
 mod tests;
 
 pub use audit_chain::{compute_row_hash, AuditChainOutcome, AuditChainRow, GENESIS_PREV_HASH};
-pub use audit_writer::{audit_events, AuditWriter};
+pub use audit_writer::{audit_events, install_global_audit, try_emit_global, AuditWriter};
 pub use device_pairing::{hash_pairing_code, ConsumeOutcome};
 pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};

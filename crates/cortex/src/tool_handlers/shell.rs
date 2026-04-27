@@ -96,6 +96,18 @@ pub async fn handle_run_shell(
 
     match policy.check(command) {
         crate::policy::PolicyDecision::Deny => {
+            // Audit the denial so post-hoc review can spot prompt-injection
+            // attempts hitting the catastrophic-command list. Free function
+            // no-ops outside the daemon (CLI/REPL/tests), avoiding contention
+            // on the SQLite writer mutex.
+            crate::db::try_emit_global(
+                crate::db::audit_events::SANDBOX_DENIAL,
+                "system",
+                &serde_json::json!({
+                    "tool": "run_shell",
+                    "command_redacted": redact_command_for_audit(command),
+                }),
+            );
             return Ok("Shell command denied by policy.".to_string());
         }
         crate::policy::PolicyDecision::AutoApprove => {}
@@ -170,8 +182,51 @@ pub async fn handle_run_shell(
     }
 }
 
+/// Bound the size of the command string we put in the audit chain. Keeps the
+/// hash-chained payload from ballooning if the model emits a multi-kilobyte
+/// shell command, and replaces control bytes so the JSON stays well-formed.
+///
+/// `MAX_CHARS` is a *char* count, not a byte count. Worst-case byte size of the
+/// truncated body is `MAX_CHARS × 4` (pure 4-byte UTF-8) plus the `…<truncated>`
+/// suffix — well within JSON-payload sanity.
+fn redact_command_for_audit(command: &str) -> String {
+    const MAX_CHARS: usize = 256;
+    let cleaned: String = command
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= MAX_CHARS {
+        cleaned
+    } else {
+        let mut s = cleaned.chars().take(MAX_CHARS).collect::<String>();
+        s.push_str("…<truncated>");
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::redact_command_for_audit;
+
+    #[test]
+    fn redact_truncates_long_commands_and_marks_them() {
+        // Real failure mode: a 5KB injected command would otherwise bloat
+        // every row in the hash-chained audit log.
+        let long = "echo ".to_string() + &"a".repeat(1000);
+        let redacted = redact_command_for_audit(&long);
+        assert!(redacted.len() < long.len());
+        assert!(redacted.ends_with("<truncated>"));
+    }
+
+    #[test]
+    fn redact_replaces_control_chars_so_json_stays_well_formed() {
+        let with_ctrl = "echo hi\nrm -rf /\0";
+        let redacted = redact_command_for_audit(with_ctrl);
+        assert!(!redacted.contains('\n'));
+        assert!(!redacted.contains('\0'));
+        assert!(redacted.contains("rm -rf /"));
+    }
+
     #[test]
     fn shell_command_constants_match_platform() {
         #[cfg(unix)]

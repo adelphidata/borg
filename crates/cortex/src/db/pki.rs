@@ -208,6 +208,28 @@ impl Database {
         Ok(())
     }
 
+    /// `not_after` (UNIX seconds) for the active cert of the active paired
+    /// device with `fingerprint`. Returns `None` when the fingerprint is
+    /// unknown, revoked, or has no active cert in `internal_ca_certs`. Used
+    /// by the auth interceptor to detect certs nearing expiry so it can
+    /// stamp a renewal-due hint on the response.
+    pub fn paired_device_cert_expiry(&self, fingerprint: &str) -> Result<Option<i64>> {
+        let row: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT c.not_after
+                 FROM paired_devices p
+                 JOIN internal_ca_certs c ON c.serial = p.cert_serial
+                 WHERE p.fingerprint = ?1
+                   AND p.status = 'active'
+                   AND c.status = 'active'",
+                params![fingerprint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn is_fingerprint_revoked(&self, fingerprint: &str) -> Result<bool> {
         let n: i64 = self.conn.query_row(
             "SELECT COUNT(1) FROM revoked_fingerprints WHERE fingerprint = ?1",

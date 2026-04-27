@@ -35,8 +35,8 @@ use protocols::admin::{
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
-    PairedDeviceList, PkiEmpty, RevokeDeviceRequest, StartPairingRequest, StartPairingResponse,
-    VerifyAuditResponse,
+    CertLifecycleResponse, PairedDeviceList, PkiEmpty, RenewCertRequest, RenewCertResponse,
+    RevokeDeviceRequest, StartPairingRequest, StartPairingResponse, VerifyAuditResponse,
 };
 use protocols::session::session_client::SessionClient;
 use protocols::session::{
@@ -139,6 +139,25 @@ impl DaemonClient {
 
     pub async fn verify_audit_chain(&mut self) -> Result<VerifyAuditResponse> {
         Ok(self.pki.verify_audit_chain(PkiEmpty {}).await?.into_inner())
+    }
+
+    /// Ask the daemon whether the calling client's mTLS cert is within the
+    /// 14-day silent-renewal window. Cheap call (single indexed lookup).
+    pub async fn get_cert_lifecycle(&mut self) -> Result<CertLifecycleResponse> {
+        Ok(self.pki.get_cert_lifecycle(PkiEmpty {}).await?.into_inner())
+    }
+
+    /// Ask the daemon to mint a fresh client cert for `fingerprint` (must
+    /// match the connection's principal — daemon enforces). Returned PEM
+    /// is the caller's responsibility to persist into the OS keychain.
+    pub async fn renew_cert(&mut self, fingerprint: &str) -> Result<RenewCertResponse> {
+        Ok(self
+            .pki
+            .renew_cert(RenewCertRequest {
+                fingerprint: fingerprint.to_string(),
+            })
+            .await?
+            .into_inner())
     }
 
     /// Open a fresh session (or resume the named one if `resume_id` is set).
