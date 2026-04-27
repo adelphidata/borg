@@ -111,6 +111,7 @@ impl AuditWriter {
     }
 }
 
+#[allow(dead_code)]
 pub fn payload(pairs: &[(&str, Value)]) -> Value {
     let mut map = serde_json::Map::with_capacity(pairs.len());
     for (k, v) in pairs {

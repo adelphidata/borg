@@ -67,9 +67,9 @@ impl Pki for PkiSvc {
         let expires_at = now + PAIRING_TTL_SECS;
 
         {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.create_pairing_code(&code, PAIRING_INTENT, PAIRING_TTL_SECS)
-                .map_err(|e| Status::internal(format!("create pairing code: {}", e)))?;
+                .map_err(|e| Status::internal(format!("create pairing code: {e}")))?;
         }
         self.audit.emit(
             audit_events::PAIRING_REQUESTED,
@@ -100,10 +100,10 @@ impl Pki for PkiSvc {
 
         // Look up the device + its current cert.
         let (device_label, _old_serial) = {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let dev = g
                 .find_active_paired_device(&principal.fingerprint)
-                .map_err(|e| Status::internal(format!("db: {}", e)))?
+                .map_err(|e| Status::internal(format!("db: {e}")))?
                 .ok_or_else(|| Status::not_found("device not paired"))?;
             (dev.device_label, dev.cert_serial)
         };
@@ -111,7 +111,7 @@ impl Pki for PkiSvc {
         // Mint replacement cert. Reuse a freshly-generated keypair on the
         // server side; the client should stash this and rotate.
         let new_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
-            .map_err(|e| Status::internal(format!("keypair: {}", e)))?;
+            .map_err(|e| Status::internal(format!("keypair: {e}")))?;
         let new_pub_pem = new_kp.serialize_pem();
         let issued = issue_client_cert(
             &self.ca_cert_pem,
@@ -123,11 +123,11 @@ impl Pki for PkiSvc {
                 validity_days: 90,
             },
         )
-        .map_err(|e| Status::internal(format!("issue cert: {}", e)))?;
+        .map_err(|e| Status::internal(format!("issue cert: {e}")))?;
         let new_fp = fingerprint_sha256(&issued.cert_der);
 
         let new_serial = {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let serial = g
                 .insert_internal_cert(
                     "client",
@@ -137,12 +137,12 @@ impl Pki for PkiSvc {
                     issued.not_before,
                     issued.not_after,
                 )
-                .map_err(|e| Status::internal(format!("persist new cert: {}", e)))?;
+                .map_err(|e| Status::internal(format!("persist new cert: {e}")))?;
             // The fingerprint-pinning model: on renewal the new cert has a
             // different fingerprint, but we keep the SAME paired_devices row
             // by updating its cert_serial. The client uses the new key+cert.
             g.insert_paired_device(&new_fp, &device_label, "{}", &principal.id, serial)
-                .map_err(|e| Status::internal(format!("update paired device: {}", e)))?;
+                .map_err(|e| Status::internal(format!("update paired device: {e}")))?;
             // Mark the old cert renewed.
             let _ = g.add_revoked_fingerprint(&principal.fingerprint, Some("renewed"));
             serial
@@ -180,9 +180,9 @@ impl Pki for PkiSvc {
             Some(r.reason.as_str())
         };
         {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.revoke_paired_device(&r.fingerprint, reason)
-                .map_err(|e| Status::internal(format!("revoke: {}", e)))?;
+                .map_err(|e| Status::internal(format!("revoke: {e}")))?;
         }
         self.audit.emit(
             audit_events::CERT_REVOKED,
@@ -197,9 +197,9 @@ impl Pki for PkiSvc {
         _req: Request<PkiEmpty>,
     ) -> Result<Response<PairedDeviceList>, Status> {
         let rows = {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.list_paired_devices()
-                .map_err(|e| Status::internal(format!("list: {}", e)))?
+                .map_err(|e| Status::internal(format!("list: {e}")))?
         };
         let devices = rows
             .into_iter()
@@ -227,9 +227,9 @@ impl Pki for PkiSvc {
             .clone();
         let now = chrono::Utc::now().timestamp();
         let not_after = {
-            let g = self.db.lock().unwrap_or_else(|p| p.into_inner());
+            let g = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             g.paired_device_cert_expiry(&principal.fingerprint)
-                .map_err(|e| Status::internal(format!("db: {}", e)))?
+                .map_err(|e| Status::internal(format!("db: {e}")))?
                 .unwrap_or(0)
         };
         let renewal_due = if not_after == 0 {

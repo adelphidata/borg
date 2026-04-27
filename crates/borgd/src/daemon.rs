@@ -146,12 +146,12 @@ pub async fn run(cfg: Config) -> Result<()> {
     let pki_db = Arc::new(Mutex::new(db_for_pki));
     let kek = Arc::new(KeychainStore::new());
     let (ca_cert_pem, ca_key_pem) = {
-        let g = pki_db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = pki_db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_root_ca(&g, kek.as_ref()).context("ensure root CA")?
     };
     let san_dns = vec!["localhost".to_string()];
     let (server_cert_pem, server_key_pem, _server_serial) = {
-        let g = pki_db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = pki_db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
             .context("ensure server cert")?
     };
@@ -184,7 +184,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     // logged and do NOT block daemon startup — XP writes will fall back
     // to `Default × 1.00` with `FallbackReason::PostureUndetermined`.
     {
-        let g = pki_db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = pki_db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let core_cfg = CoreConfig::load_from_db().unwrap_or_default();
         match cortex::evolution::security::maybe_emit_posture_change(
             &g,

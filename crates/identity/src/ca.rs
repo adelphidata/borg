@@ -103,7 +103,7 @@ pub fn issue_server_cert(
     let mut sans: Vec<SanType> = Vec::with_capacity(params_in.san_dns.len());
     for dns in params_in.san_dns {
         let ia5 = rcgen::Ia5String::try_from(dns.clone())
-            .map_err(|e| PkiError::Cert(format!("san dns {}: {}", dns, e)))?;
+            .map_err(|e| PkiError::Cert(format!("san dns {dns}: {e}")))?;
         sans.push(SanType::DnsName(ia5));
     }
     params.subject_alt_names = sans;
@@ -149,13 +149,13 @@ pub fn issue_client_cert(
     let issuer_cert = issuer_params.self_signed(&issuer_key)?;
 
     let client_pubkey = KeyPair::from_pem(params_in.client_public_key_pem)
-        .map_err(|e| PkiError::KeyGen(format!("client pubkey parse: {}", e)))?;
+        .map_err(|e| PkiError::KeyGen(format!("client pubkey parse: {e}")))?;
 
     let mut params = CertificateParams::default();
     params.distinguished_name = name(params_in.device_label);
     let san_uri = format!("borg-device:{}", params_in.device_id);
     let san_ia5 = rcgen::Ia5String::try_from(san_uri.clone())
-        .map_err(|e| PkiError::Cert(format!("san uri {}: {}", san_uri, e)))?;
+        .map_err(|e| PkiError::Cert(format!("san uri {san_uri}: {e}")))?;
     params.subject_alt_names = vec![SanType::URI(san_ia5)];
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
@@ -204,9 +204,8 @@ mod tests {
         let meta = parse_cert_metadata(&issued.cert_der).expect("parse");
         let span_days = (meta.not_after - meta.not_before) / 86_400;
         assert!(
-            span_days >= 89 && span_days <= 91,
-            "span_days = {}",
-            span_days
+            (89..=91).contains(&span_days),
+            "span_days = {span_days}"
         );
         assert_eq!(meta.subject_cn.as_deref(), Some("borgd"));
     }

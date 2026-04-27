@@ -29,7 +29,7 @@ impl KeychainStore {
 
     fn entry(account: &str) -> Result<keyring::Entry, PkiError> {
         keyring::Entry::new(SERVICE, account)
-            .map_err(|e| PkiError::Keychain(format!("entry({}): {}", account, e)))
+            .map_err(|e| PkiError::Keychain(format!("entry({account}): {e}")))
     }
 }
 
@@ -38,14 +38,14 @@ impl KekStore for KeychainStore {
         let entry = Self::entry(account)?;
         entry
             .set_secret(secret)
-            .map_err(|e| PkiError::Keychain(format!("set_secret({}): {}", account, e)))
+            .map_err(|e| PkiError::Keychain(format!("set_secret({account}): {e}")))
     }
 
     fn get(&self, account: &str) -> Result<Vec<u8>, PkiError> {
         let entry = Self::entry(account)?;
         entry.get_secret().map_err(|e| match e {
             keyring::Error::NoEntry => PkiError::NotFound(account.to_string()),
-            other => PkiError::Keychain(format!("get_secret({}): {}", account, other)),
+            other => PkiError::Keychain(format!("get_secret({account}): {other}")),
         })
     }
 
@@ -54,7 +54,7 @@ impl KekStore for KeychainStore {
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(PkiError::Keychain(format!("delete({}): {}", account, e))),
+            Err(e) => Err(PkiError::Keychain(format!("delete({account}): {e}"))),
         }
     }
 }
@@ -119,7 +119,7 @@ mod tests {
         let store = MemoryKekStore::new();
         match store.get("absent") {
             Err(PkiError::NotFound(s)) => assert_eq!(s, "absent"),
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 }

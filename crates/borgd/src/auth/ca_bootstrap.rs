@@ -38,7 +38,7 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
     if let Some(row) = db.latest_active_cert("root").context("query root ca")? {
         let key_bytes = kek
             .get(ROOT_CA_KEY)
-            .map_err(|e| anyhow!("load root CA key from keychain: {}", e))?;
+            .map_err(|e| anyhow!("load root CA key from keychain: {e}"))?;
         let key_pem = String::from_utf8(key_bytes).context("root CA key not utf-8 PEM")?;
         return Ok((row.pem, key_pem));
     }
@@ -56,7 +56,7 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
     )
     .context("persist root CA")?;
     kek.put(ROOT_CA_KEY, root.key_pkcs8_pem.as_bytes())
-        .map_err(|e| anyhow!("stash root CA key in keychain: {}", e))?;
+        .map_err(|e| anyhow!("stash root CA key in keychain: {e}"))?;
 
     Ok((root.cert_pem, root.key_pkcs8_pem))
 }
@@ -77,7 +77,7 @@ pub fn ensure_server_cert(
     {
         let key_bytes = kek
             .get(SERVER_CERT_KEY)
-            .map_err(|e| anyhow!("load server cert key from keychain: {}", e))?;
+            .map_err(|e| anyhow!("load server cert key from keychain: {e}"))?;
         let key_pem = String::from_utf8(key_bytes).context("server key not utf-8 PEM")?;
         let meta = CertMetadata {
             subject_cn: None,
@@ -131,7 +131,7 @@ fn persist_server_cert(
         issued.not_after,
     )?;
     kek.put(SERVER_CERT_KEY, key_pem.as_bytes())
-        .map_err(|e| anyhow!("stash server key: {}", e))?;
+        .map_err(|e| anyhow!("stash server key: {e}"))?;
     Ok(serial)
 }
 

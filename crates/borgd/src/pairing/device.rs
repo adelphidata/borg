@@ -115,7 +115,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
     // Validate code against DB before doing PAKE work — single-use semantics
     // are enforced via consume_pairing_code.
     let outcome = {
-        let g = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = state.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         g.consume_pairing_code(&code)?
     };
     if outcome != ConsumeOutcome::Accepted {
@@ -124,7 +124,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
             "system",
             &serde_json::json!({"reason": format!("{:?}", outcome)}),
         );
-        return Err(anyhow!("pairing code rejected: {:?}", outcome));
+        return Err(anyhow!("pairing code rejected: {outcome:?}"));
     }
 
     // SPAKE2 — daemon side.
@@ -143,7 +143,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
 
     let shared_key = daemon_state
         .finish(&client_msg)
-        .map_err(|e| anyhow!("spake2 finish: {:?}", e))?;
+        .map_err(|e| anyhow!("spake2 finish: {e:?}"))?;
     let aead = derive_aead(&shared_key)?;
 
     // Frame 4 (encrypted): client sends ClientHello.
@@ -151,7 +151,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
     let ct4 = read_frame(&mut stream).await.context("read ct4")?;
     let pt4 = aead
         .decrypt(Nonce::from_slice(&nonce4), ct4.as_ref())
-        .map_err(|e| anyhow!("decrypt client hello: {:?}", e))?;
+        .map_err(|e| anyhow!("decrypt client hello: {e:?}"))?;
     let hello: ClientHello = serde_json::from_slice(&pt4).context("parse client hello")?;
 
     // Issue client cert.
@@ -169,7 +169,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
 
     // Persist cert + paired_device.
     {
-        let g = state.db.lock().unwrap_or_else(|p| p.into_inner());
+        let g = state.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let serial = g.insert_internal_cert(
             "client",
             &issued.cert_pem,
@@ -207,7 +207,7 @@ pub async fn run_pairing_handshake(mut stream: UnixStream, state: &BootstrapStat
     let nonce5 = random_nonce();
     let ct5 = aead
         .encrypt(Nonce::from_slice(&nonce5), reply_pt.as_ref())
-        .map_err(|e| anyhow!("encrypt reply: {:?}", e))?;
+        .map_err(|e| anyhow!("encrypt reply: {e:?}"))?;
     write_frame(&mut stream, &nonce5).await?;
     write_frame(&mut stream, &ct5).await?;
 
@@ -232,7 +232,7 @@ fn derive_aead(shared: &[u8]) -> Result<ChaCha20Poly1305> {
     let hk = Hkdf::<Sha256>::new(Some(b"borg-pair"), shared);
     let mut okm = [0u8; 32];
     hk.expand(b"aead-key", &mut okm)
-        .map_err(|e| anyhow!("hkdf expand: {}", e))?;
+        .map_err(|e| anyhow!("hkdf expand: {e}"))?;
     Ok(ChaCha20Poly1305::new(Key::from_slice(&okm)))
 }
 
@@ -248,7 +248,7 @@ async fn read_frame(s: &mut UnixStream) -> Result<Vec<u8>> {
     s.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
     if n > 16 * 1024 {
-        return Err(anyhow!("frame too large: {}", n));
+        return Err(anyhow!("frame too large: {n}"));
     }
     let mut buf = vec![0u8; n];
     s.read_exact(&mut buf).await?;
@@ -284,7 +284,7 @@ pub mod client {
     ) -> Result<PairResult> {
         let mut stream = UnixStream::connect(socket_path)
             .await
-            .with_context(|| format!("connect bootstrap socket {:?}", socket_path))?;
+            .with_context(|| format!("connect bootstrap socket {socket_path:?}"))?;
 
         // Frame 1: send code.
         write_frame(&mut stream, code.as_bytes()).await?;
@@ -302,12 +302,12 @@ pub mod client {
         let daemon_msg = read_frame(&mut stream).await?;
         let shared_key = client_state
             .finish(&daemon_msg)
-            .map_err(|e| anyhow!("spake2 finish: {:?}", e))?;
+            .map_err(|e| anyhow!("spake2 finish: {e:?}"))?;
         let aead = derive_aead(&shared_key)?;
 
         // Generate our client keypair.
         let client_kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
-            .map_err(|e| anyhow!("client keypair: {}", e))?;
+            .map_err(|e| anyhow!("client keypair: {e}"))?;
         let client_pem = client_kp.serialize_pem();
 
         // Frame 4: send client hello.
@@ -319,7 +319,7 @@ pub mod client {
         let nonce = random_nonce();
         let ct = aead
             .encrypt(Nonce::from_slice(&nonce), pt.as_ref())
-            .map_err(|e| anyhow!("encrypt hello: {:?}", e))?;
+            .map_err(|e| anyhow!("encrypt hello: {e:?}"))?;
         write_frame(&mut stream, &nonce).await?;
         write_frame(&mut stream, &ct).await?;
 
@@ -328,7 +328,7 @@ pub mod client {
         let ct5 = read_frame(&mut stream).await?;
         let pt5 = aead
             .decrypt(Nonce::from_slice(&nonce5), ct5.as_ref())
-            .map_err(|e| anyhow!("decrypt reply: {:?}", e))?;
+            .map_err(|e| anyhow!("decrypt reply: {e:?}"))?;
         let reply: DaemonReply = serde_json::from_slice(&pt5)?;
 
         Ok(PairResult {

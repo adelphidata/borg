@@ -10,7 +10,7 @@ pub async fn run(fingerprint: &str, reason: Option<&str>) -> Result<()> {
         .revoke_device(fingerprint, reason.unwrap_or("manual revoke"))
         .await
         .context("revoke device")?;
-    println!("Revoked device {}", fingerprint);
+    println!("Revoked device {fingerprint}");
     Ok(())
 }
 
@@ -22,8 +22,8 @@ pub async fn run_list() -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<12} {:<30} {:<10} {:<20} {}",
-        "ID", "DEVICE", "STATUS", "LAST SEEN", "FINGERPRINT"
+        "{:<12} {:<30} {:<10} {:<20} FINGERPRINT",
+        "ID", "DEVICE", "STATUS", "LAST SEEN"
     );
     for d in list.devices {
         let last = if d.last_seen_at == 0 {

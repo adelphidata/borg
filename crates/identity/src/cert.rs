@@ -14,7 +14,7 @@ pub fn fingerprint_sha256(cert_der: &[u8]) -> String {
     let digest = hasher.finalize();
     digest.iter().fold(String::with_capacity(64), |mut acc, b| {
         use std::fmt::Write;
-        let _ = write!(&mut acc, "{:02x}", b);
+        let _ = write!(&mut acc, "{b:02x}");
         acc
     })
 }
@@ -37,13 +37,13 @@ pub struct CertMetadata {
 /// Parse cert metadata from DER bytes.
 pub fn parse_cert_metadata(cert_der: &[u8]) -> Result<CertMetadata, PkiError> {
     let (_, cert) = X509Certificate::from_der(cert_der)
-        .map_err(|e| PkiError::Parse(format!("der parse: {}", e)))?;
+        .map_err(|e| PkiError::Parse(format!("der parse: {e}")))?;
 
     let subject_cn = cert
         .subject()
         .iter_common_name()
         .next()
-        .and_then(|cn| cn.as_str().ok().map(|s| s.to_string()));
+        .and_then(|cn| cn.as_str().ok().map(std::string::ToString::to_string));
 
     let san_uri = cert
         .extensions()

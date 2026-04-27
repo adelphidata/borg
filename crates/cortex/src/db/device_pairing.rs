@@ -22,7 +22,7 @@ pub fn hash_pairing_code(code: &str) -> String {
     let digest = hasher.finalize();
     digest.iter().fold(String::with_capacity(64), |mut acc, b| {
         use std::fmt::Write;
-        let _ = write!(&mut acc, "{:02x}", b);
+        let _ = write!(&mut acc, "{b:02x}");
         acc
     })
 }

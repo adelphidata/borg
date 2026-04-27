@@ -84,7 +84,7 @@ impl Database {
             params![serial],
         )?;
         if n == 0 {
-            return Err(anyhow!("no internal cert with serial {}", serial));
+            return Err(anyhow!("no internal cert with serial {serial}"));
         }
         Ok(())
     }

@@ -30,7 +30,7 @@ pub async fn run_show() -> Result<()> {
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| resp.expires_at.to_string());
     println!("Pairing code: {}", resp.code);
-    println!("Expires at:   {} (5 minutes)", exp);
+    println!("Expires at:   {exp} (5 minutes)");
     println!();
     if let Ok(qr) = QrCode::encode_text(&resp.code, QrCodeEcc::Medium) {
         println!("{}", render_qr_ascii(&qr));
@@ -132,7 +132,7 @@ pub async fn run_complete(code: &str, device_label: &str, socket: Option<PathBuf
         .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| result.not_after.to_string());
     println!("Pairing complete.");
-    println!("Cert valid until {}", exp);
+    println!("Cert valid until {exp}");
     Ok(())
 }
 
