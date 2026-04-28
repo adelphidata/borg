@@ -53,9 +53,9 @@ Smaller crates (apply-patch, sandbox, heartbeat, plugins) enforce `#![warn(missi
 
 **Native click+drag text selection MUST work in the transcript with no modifier keys.** Has regressed multiple times.
 
-**Strategy:** xterm Alternate Scroll Mode (`?1007h`) only, via custom `EnableAlternateScroll` in `crates/interface/src/tui/mod.rs`. Terminal translates wheel events into arrow keys. No mouse tracking enabled.
+**Strategy:** inline viewport via `custom_terminal::Terminal::with_options` plus `tui_lifecycle::Tui::insert_history_lines`. The terminal's normal scrollback owns prior history; trackpad/wheel scrolls the terminal pane natively. xterm Alternate Scroll Mode (`?1007h`) is enabled on entry to alt-screen surfaces (transcript pager, large popups) so wheel events translate to arrow keys there.
 
-**Behavior:** Click+drag selects text natively. Wheel scrolls one line/tick. PageUp/Down = 20-line jumps. Up/Down navigate composer history (exception: when `scroll_offset > 0`, they scroll transcript). Ctrl+P/N always navigate history.
+**Behavior:** Click+drag selects text natively. Trackpad/wheel scrolls the terminal's scrollback. Up/Down always navigate composer history (no scroll-offset disambiguation). Ctrl+T opens transcript pager in alt-screen for full-text search. PageUp/PageDown/Home/End are no-ops at the app level — terminal handles them.
 
 **FORBIDDEN (will regress text selection):**
 - Escape sequences: `?1000h`, `?1002h`, `?1003h`, `?1006h`
