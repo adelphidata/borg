@@ -907,6 +907,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn is_blocked_path_resolves_symlink_chain_into_blocked() {
+        // Regression guard: protect against an attacker creating a chain of
+        // symlinks (`a -> b -> .ssh/id_rsa`) under a non-blocked directory and
+        // having the agent read the chain as if it were a benign file. This
+        // pins the realpath-style resolution we rely on — if a future change
+        // swaps `canonicalize()` for a single-hop resolver, this fails loudly.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocked_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&blocked_dir).expect("mkdir .ssh");
+        let target = blocked_dir.join("id_rsa");
+        std::fs::write(&target, b"PRIVATE").expect("seed target");
+
+        let mid = tmp.path().join("mid_link");
+        let entry = tmp.path().join("entry_link");
+        symlink(&target, &mid).expect("mid symlink");
+        symlink(&mid, &entry).expect("entry symlink");
+
+        let blocked = vec![".ssh".to_string()];
+        assert!(
+            is_blocked_path(&entry, &blocked, &[]),
+            "two-hop symlink into .ssh must canonicalize and be blocked"
+        );
+    }
+
+    #[test]
     fn apply_patch_unified_unknown_target() {
         let config = Config::default();
         let args = json!({"patch": "*** Begin Patch\n*** End Patch", "target": "invalid"});
