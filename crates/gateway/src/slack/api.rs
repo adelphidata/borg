@@ -77,10 +77,7 @@ pub struct SlackClient {
 impl SlackClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(GATEWAY_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build Slack HTTP client")?,
+            client: crate::http_retry::build_channel_client("Slack", GATEWAY_HTTP_TIMEOUT, None)?,
             token: token.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 TYPING_CB_FAILURE_THRESHOLD,

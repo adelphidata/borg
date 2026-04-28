@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine;
 use reqwest::Client;
 use std::time::Duration;
@@ -21,11 +21,11 @@ impl TwilioClient {
         );
 
         Ok(Self {
-            client: Client::builder()
-                .timeout(GATEWAY_HTTP_TIMEOUT)
-                .connect_timeout(Duration::from_secs(10))
-                .build()
-                .context("Failed to build Twilio HTTP client")?,
+            client: crate::http_retry::build_channel_client(
+                "Twilio",
+                GATEWAY_HTTP_TIMEOUT,
+                Some(Duration::from_secs(10)),
+            )?,
             account_sid: account_sid.to_string(),
             auth_header,
         })

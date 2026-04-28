@@ -35,11 +35,11 @@ pub struct SignalClient {
 impl SignalClient {
     pub fn new(base_url: &str, account: &str) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(SIGNAL_HTTP_CONNECT_TIMEOUT)
-                .timeout(RPC_TIMEOUT)
-                .build()
-                .context("Failed to build Signal HTTP client")?,
+            client: crate::http_retry::build_channel_client(
+                "Signal",
+                RPC_TIMEOUT,
+                Some(SIGNAL_HTTP_CONNECT_TIMEOUT),
+            )?,
             base_url: base_url.trim_end_matches('/').to_string(),
             account: account.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new(

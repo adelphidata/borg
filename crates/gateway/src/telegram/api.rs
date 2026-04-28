@@ -35,11 +35,11 @@ pub struct TelegramClient {
 impl TelegramClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .connect_timeout(HTTP_CONNECT_TIMEOUT)
-                .timeout(GATEWAY_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build Telegram HTTP client")?,
+            client: crate::http_retry::build_channel_client(
+                "Telegram",
+                GATEWAY_HTTP_TIMEOUT,
+                Some(HTTP_CONNECT_TIMEOUT),
+            )?,
             token: token.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
         })

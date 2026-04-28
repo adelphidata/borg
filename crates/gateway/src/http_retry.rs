@@ -1,7 +1,25 @@
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use reqwest::Client;
 use tracing::warn;
+
+/// Build a `reqwest::Client` for a native channel with optional connect/request
+/// timeouts. Centralizes the construction so error context strings stay
+/// uniform ("Failed to build {channel} HTTP client").
+pub fn build_channel_client(
+    channel: &str,
+    timeout: Duration,
+    connect_timeout: Option<Duration>,
+) -> Result<Client> {
+    let mut builder = Client::builder().timeout(timeout);
+    if let Some(ct) = connect_timeout {
+        builder = builder.connect_timeout(ct);
+    }
+    builder
+        .build()
+        .with_context(|| format!("Failed to build {channel} HTTP client"))
+}
 
 /// Configuration for HTTP 429 rate-limit retry behavior.
 pub struct RateLimitPolicy {

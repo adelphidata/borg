@@ -83,10 +83,7 @@ pub struct DiscordClient {
 impl DiscordClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(GATEWAY_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build Discord HTTP client")?,
+            client: crate::http_retry::build_channel_client("Discord", GATEWAY_HTTP_TIMEOUT, None)?,
             token: token.to_string(),
             application_id: None,
         })

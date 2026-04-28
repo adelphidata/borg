@@ -34,10 +34,7 @@ pub struct TeamsClient {
 impl TeamsClient {
     pub fn new(app_id: &str, app_secret: &str) -> Result<Self> {
         Ok(Self {
-            client: Client::builder()
-                .timeout(GATEWAY_HTTP_TIMEOUT)
-                .build()
-                .context("Failed to build Teams HTTP client")?,
+            client: crate::http_retry::build_channel_client("Teams", GATEWAY_HTTP_TIMEOUT, None)?,
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             token_cache: RwLock::new(None),

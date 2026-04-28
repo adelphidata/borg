@@ -95,6 +95,18 @@ const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
 
 const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
 
+/// Return the cached value if present; otherwise call `load`, store the result
+/// in `slot`, and return a clone. Used to memoize cache-friendly computations
+/// whose inputs don't change within a session (identity, skills context).
+fn cache_or_load<T: Clone, F: FnOnce() -> Result<T>>(slot: &mut Option<T>, load: F) -> Result<T> {
+    if let Some(v) = slot.as_ref() {
+        return Ok(v.clone());
+    }
+    let v = load()?;
+    *slot = Some(v.clone());
+    Ok(v)
+}
+
 /// Result of monthly token budget check.
 enum BudgetCheck {
     Ok,
@@ -112,6 +124,25 @@ enum TextOnlyOutcome {
     /// Loop again: the helper persisted a system nudge asking for a response.
     /// Caller must set `nudged_for_response = true` before continuing.
     NudgeAndContinue,
+}
+
+/// Result of processing a single `StreamEvent` from the LLM. `Terminal` means
+/// the stream ended (Done or Error); the inner loop should break.
+enum StreamEventOutcome {
+    Continue,
+    Terminal,
+}
+
+/// Result of the post-stream finalization helper. Mirrors the three control-flow
+/// branches at the end of `run_agent_loop`.
+enum IterationOutcome {
+    /// Exit `run_agent_loop` with `Ok(())`. All persistence and TurnComplete
+    /// events have already been emitted.
+    EndTurn,
+    /// Loop again with `nudged_for_response = true`.
+    NudgeAndContinue,
+    /// Loop again with `needs_response = true` (tool calls were executed).
+    ToolCallsExecuted,
 }
 
 /// Events emitted by the agent loop during a conversation turn.
@@ -780,15 +811,7 @@ impl Agent {
 
     #[instrument(skip_all)]
     async fn build_system_prompt(&mut self) -> Result<String> {
-        // Use cached identity or load + cache it
-        let identity = match &self.cached_identity {
-            Some(cached) => cached.clone(),
-            None => {
-                let id = load_identity()?;
-                self.cached_identity = Some(id.clone());
-                id
-            }
-        };
+        let identity = cache_or_load(&mut self.cached_identity, load_identity)?;
         let memory = self.load_memory_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
 
@@ -1474,54 +1497,22 @@ Rules:
                         return Ok(());
                     }
                     event = stream_rx.recv() => {
-                        match event {
-                            Some(StreamEvent::TextDelta(delta)) => {
-                                if let Some(filtered) = tag_filter.push(&delta) {
-                                    let redacted = self.maybe_redact(filtered);
-                                    let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
-                                }
-                            }
-                            Some(StreamEvent::ToolCallDelta {
-                                index, id, name, arguments_delta,
-                            }) => {
-                                if index >= MAX_TOOL_CALLS {
-                                    warn!("Tool call index {index} exceeds limit {MAX_TOOL_CALLS}, ignoring");
-                                } else {
-                                    while tool_calls.len() <= index {
-                                        tool_calls.push(PartialToolCall::default());
-                                    }
-                                    if let Some(id) = id {
-                                        tool_calls[index].id = id;
-                                    }
-                                    if let Some(name) = name {
-                                        tool_calls[index].name = name;
-                                    }
-                                    tool_calls[index].arguments.push_str(&arguments_delta);
-                                }
-                            }
-                            Some(StreamEvent::Usage(usage)) => {
-                                self.record_usage(&usage);
-                                let _ = event_tx.send(AgentEvent::Usage(usage)).await;
-                            }
-                            Some(StreamEvent::Done) => {
+                        let Some(event) = event else { break };
+                        match self
+                            .handle_stream_event(
+                                event,
+                                &mut tag_filter,
+                                &mut tool_calls,
+                                &mut stream_error,
+                                &event_tx,
+                            )
+                            .await
+                        {
+                            StreamEventOutcome::Continue => {}
+                            StreamEventOutcome::Terminal => {
                                 received_terminal = true;
                                 break;
                             }
-                            Some(StreamEvent::Error(e)) => {
-                                received_terminal = true;
-                                warn!("LLM stream emitted error mid-response: {e}");
-                                stream_error = Some(e.clone());
-                                if event_tx.send(AgentEvent::Error(e)).await.is_err() {
-                                    trace!("Event channel closed, could not deliver stream error");
-                                }
-                                break;
-                            }
-                            Some(StreamEvent::ThinkingDelta(delta)) => {
-                                if self.config.conversation.show_thinking {
-                                    let _ = event_tx.send(AgentEvent::ThinkingDelta(delta)).await;
-                                }
-                            }
-                            None => break,
                         }
                     }
                 }
@@ -1577,73 +1568,108 @@ Rules:
                 }
             }
 
-            // Flush any remaining buffered text from the internal-tag filter
-            if let Some(remaining) = tag_filter.flush() {
-                let redacted = self.maybe_redact(remaining);
-                let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
-            }
-            let text_content = tag_filter.full_clean();
-
-            // Fire AfterLlmResponse hook
-            let hook_ctx = self.hook_ctx(
-                HookPoint::AfterLlmResponse,
-                HookData::LlmResponse {
-                    has_tool_calls: !tool_calls.is_empty(),
-                    text_length: text_content.len(),
-                },
-            );
-            self.hook_registry.dispatch(&hook_ctx);
-
-            // If the LLM stream errored mid-response, treat the turn as failed
-            // regardless of whether partial tool calls survived — their JSON
-            // arguments may be truncated and executing them risks running with
-            // half-parsed input. Persist the interrupted marker and emit
-            // TurnComplete so the TUI returns to the composer.
-            if stream_error.is_some() {
-                self.persist_discarded_tool_calls(&text_content, stream_error.take(), &event_tx)
-                    .await;
-                return Ok(());
-            }
-
-            if tool_calls.is_empty() {
-                match self
-                    .handle_text_only_response(
-                        &text_content,
-                        stream_error.take(),
-                        needs_response,
-                        nudged_for_response,
-                        &event_tx,
-                    )
-                    .await
-                {
-                    TextOnlyOutcome::TerminateTurn => return Ok(()),
-                    TextOnlyOutcome::NudgeAndContinue => {
-                        nudged_for_response = true;
-                        continue;
-                    }
+            match self
+                .finish_iteration(
+                    tag_filter,
+                    tool_calls,
+                    stream_error.take(),
+                    needs_response,
+                    nudged_for_response,
+                    &event_tx,
+                    &cancel,
+                )
+                .await
+            {
+                IterationOutcome::EndTurn => return Ok(()),
+                IterationOutcome::NudgeAndContinue => {
+                    nudged_for_response = true;
+                }
+                IterationOutcome::ToolCallsExecuted => {
+                    needs_response = true;
                 }
             }
-
-            let tc = validate_tool_calls(&tool_calls);
-
-            if tc.is_empty() {
-                self.persist_discarded_tool_calls(&text_content, stream_error.take(), &event_tx)
-                    .await;
-                return Ok(());
-            }
-
-            // Track tool names for conditional tool loading (recent usage keeps groups active).
-            for t in &tc {
-                self.recent_tool_names.insert(t.function.name.clone());
-            }
-
-            self.execute_tool_calls(&tc, &text_content, &event_tx, &cancel)
-                .await;
-            needs_response = true;
-
-            // Drain any steer messages from the user at the tool boundary
-            self.drain_steers(&event_tx).await;
         }
+    }
+
+    /// Resolve a completed LLM stream into the next outer-loop step: persist a
+    /// truncation marker on stream error, run text-only handling when there are
+    /// no tool calls, or validate + execute tool calls. Returns the control
+    /// signal for `run_agent_loop`.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_iteration(
+        &mut self,
+        mut tag_filter: InternalTagFilter,
+        tool_calls: Vec<PartialToolCall>,
+        mut stream_error: Option<String>,
+        needs_response: bool,
+        nudged_for_response: bool,
+        event_tx: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> IterationOutcome {
+        // Flush any remaining buffered text from the internal-tag filter
+        if let Some(remaining) = tag_filter.flush() {
+            let redacted = self.maybe_redact(remaining);
+            let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
+        }
+        let text_content = tag_filter.full_clean();
+
+        // Fire AfterLlmResponse hook
+        let hook_ctx = self.hook_ctx(
+            HookPoint::AfterLlmResponse,
+            HookData::LlmResponse {
+                has_tool_calls: !tool_calls.is_empty(),
+                text_length: text_content.len(),
+            },
+        );
+        self.hook_registry.dispatch(&hook_ctx);
+
+        // If the LLM stream errored mid-response, treat the turn as failed
+        // regardless of whether partial tool calls survived — their JSON
+        // arguments may be truncated and executing them risks running with
+        // half-parsed input. Persist the interrupted marker and emit
+        // TurnComplete so the TUI returns to the composer.
+        if stream_error.is_some() {
+            self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
+                .await;
+            return IterationOutcome::EndTurn;
+        }
+
+        if tool_calls.is_empty() {
+            return match self
+                .handle_text_only_response(
+                    &text_content,
+                    stream_error.take(),
+                    needs_response,
+                    nudged_for_response,
+                    event_tx,
+                )
+                .await
+            {
+                TextOnlyOutcome::TerminateTurn => IterationOutcome::EndTurn,
+                TextOnlyOutcome::NudgeAndContinue => IterationOutcome::NudgeAndContinue,
+            };
+        }
+
+        let tc = validate_tool_calls(&tool_calls);
+
+        if tc.is_empty() {
+            self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
+                .await;
+            return IterationOutcome::EndTurn;
+        }
+
+        // Track tool names for conditional tool loading (recent usage keeps groups active).
+        for t in &tc {
+            self.recent_tool_names.insert(t.function.name.clone());
+        }
+
+        self.execute_tool_calls(&tc, &text_content, event_tx, cancel)
+            .await;
+
+        // Drain any steer messages from the user at the tool boundary
+        self.drain_steers(event_tx).await;
+
+        IterationOutcome::ToolCallsExecuted
     }
 
     /// Account for one `StreamEvent::Usage`: increment counters and persist to the
@@ -1726,6 +1752,67 @@ Rules:
         ) {
             warn!("Budget post-flight failed: {e}");
         }
+    }
+
+    /// Process one streamed `StreamEvent` from the LLM. Mutates the inner-loop
+    /// collectors and returns whether the inner loop should continue or break.
+    /// `Done` and `Error` are the only Terminal variants.
+    async fn handle_stream_event(
+        &mut self,
+        event: StreamEvent,
+        tag_filter: &mut InternalTagFilter,
+        tool_calls: &mut Vec<PartialToolCall>,
+        stream_error: &mut Option<String>,
+        event_tx: &mpsc::Sender<AgentEvent>,
+    ) -> StreamEventOutcome {
+        match event {
+            StreamEvent::TextDelta(delta) => {
+                if let Some(filtered) = tag_filter.push(&delta) {
+                    let redacted = self.maybe_redact(filtered);
+                    let _ = event_tx.send(AgentEvent::TextDelta(redacted)).await;
+                }
+            }
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                if index >= MAX_TOOL_CALLS {
+                    warn!("Tool call index {index} exceeds limit {MAX_TOOL_CALLS}, ignoring");
+                } else {
+                    while tool_calls.len() <= index {
+                        tool_calls.push(PartialToolCall::default());
+                    }
+                    if let Some(id) = id {
+                        tool_calls[index].id = id;
+                    }
+                    if let Some(name) = name {
+                        tool_calls[index].name = name;
+                    }
+                    tool_calls[index].arguments.push_str(&arguments_delta);
+                }
+            }
+            StreamEvent::Usage(usage) => {
+                self.record_usage(&usage);
+                let _ = event_tx.send(AgentEvent::Usage(usage)).await;
+            }
+            StreamEvent::Done => return StreamEventOutcome::Terminal,
+            StreamEvent::Error(e) => {
+                warn!("LLM stream emitted error mid-response: {e}");
+                *stream_error = Some(e.clone());
+                if event_tx.send(AgentEvent::Error(e)).await.is_err() {
+                    trace!("Event channel closed, could not deliver stream error");
+                }
+                return StreamEventOutcome::Terminal;
+            }
+            StreamEvent::ThinkingDelta(delta) => {
+                if self.config.conversation.show_thinking {
+                    let _ = event_tx.send(AgentEvent::ThinkingDelta(delta)).await;
+                }
+            }
+        }
+        StreamEventOutcome::Continue
     }
 
     /// Hot-reload config if the watcher has detected changes.
@@ -3050,15 +3137,19 @@ mod tests {
         // If the match arm regains an inline db.log_token_usage_with_cache(...)
         // call, the outer future's frame grows again and the record_usage
         // extraction loses its purpose.
-        let loop_start = AGENT_RS_SRC
-            .find("Some(StreamEvent::Usage(usage))")
-            .expect("Usage arm must exist in run_agent_loop");
-        let loop_tail_idx = loop_start + 400;
-        let loop_tail = &AGENT_RS_SRC[loop_start..loop_tail_idx.min(AGENT_RS_SRC.len())];
+        // Locate the Usage arm in `handle_stream_event`. The pattern is built
+        // with `concat!` so the test's own search literal can't match itself —
+        // otherwise the only hit would be this very line.
+        let pat = concat!("StreamEvent::Usage", "(usage) =>");
+        let arm_start = AGENT_RS_SRC
+            .find(pat)
+            .expect("Usage arm must exist in handle_stream_event");
+        let arm_tail_idx = arm_start + 400;
+        let arm_tail = &AGENT_RS_SRC[arm_start..arm_tail_idx.min(AGENT_RS_SRC.len())];
         assert!(
-            !loop_tail.contains("log_token_usage_with_cache"),
+            !arm_tail.contains("log_token_usage_with_cache"),
             "StreamEvent::Usage arm must delegate to self.record_usage; do not \
-             inline the DB + pricing call back into the tokio::select! body"
+             inline the DB + pricing call back into handle_stream_event"
         );
     }
 
