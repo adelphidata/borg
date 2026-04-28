@@ -508,7 +508,16 @@ impl<'a> App<'a> {
                 c.load_persistent_history();
                 c
             },
-            command_popup: CommandPopup::new(),
+            command_popup: {
+                let custom = match cortex::config::Config::data_dir() {
+                    Ok(dir) => super::custom_commands::load_from_dir(&dir.join("commands")),
+                    Err(err) => {
+                        tracing::warn!(%err, "data_dir lookup failed; skipping custom commands");
+                        Vec::new()
+                    }
+                };
+                CommandPopup::with_custom(custom)
+            },
             settings_popup: SettingsPopup::new(),
             model_popup: ModelPopup::new(),
             plugins_popup: PluginsPopup::new(),
@@ -792,12 +801,38 @@ impl<'a> App<'a> {
         Ok(AppAction::Continue)
     }
 
-    pub(super) fn handle_submit(&mut self, input: &str) -> Result<AppAction> {
-        let trimmed = input.trim();
+    /// If `trimmed` invokes a user-defined slash command (`/name [args]`),
+    /// return the expanded template body. Returns `None` for built-ins,
+    /// non-slash input, or unknown names — those proceed to the existing
+    /// dispatcher / user-message path.
+    fn expand_custom_command(&self, trimmed: &str) -> Option<String> {
+        if !trimmed.starts_with('/') {
+            return None;
+        }
+        let (name, args) = match trimmed.split_once(char::is_whitespace) {
+            Some((n, rest)) => (n, rest.trim_start()),
+            None => (trimmed, ""),
+        };
+        let cmd = self.command_popup.lookup(name)?;
+        let template = cmd.template.as_deref()?;
+        Some(super::custom_commands::expand_template(template, args))
+    }
 
-        // Try slash command dispatch (defined in commands.rs)
-        if let Some(result) = self.try_handle_command(trimmed) {
-            return result;
+    pub(super) fn handle_submit(&mut self, input: &str) -> Result<AppAction> {
+        // User-defined slash commands (`~/.borg/commands/<name>.md`) expand
+        // their template and flow down the normal user-message path. Must run
+        // BEFORE built-in dispatch so a custom command isn't rejected as
+        // "unknown command", and so it can never shadow a built-in (the
+        // popup already drops collisions; this is a second guard).
+        let expanded_owned = self.expand_custom_command(input.trim());
+        let input: &str = match &expanded_owned {
+            Some(s) => s.as_str(),
+            None => input,
+        };
+        if expanded_owned.is_none() {
+            if let Some(result) = self.try_handle_command(input.trim()) {
+                return result;
+            }
         }
 
         // New user turn: force-jump to bottom and re-engage follow mode

@@ -3,134 +3,66 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use super::custom_commands::CustomCommand;
 use super::theme;
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommandDef {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
+    /// `None` for built-in commands (handled by `try_handle_command`); `Some`
+    /// for user-defined commands loaded from `~/.borg/commands/<name>.md` —
+    /// the body is a prompt template substituted into the user message.
+    pub template: Option<String>,
 }
 
-const COMMANDS: &[SlashCommandDef] = &[
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     // Essentials
-    SlashCommandDef {
-        name: "/help",
-        description: "Show available commands",
-    },
-    SlashCommandDef {
-        name: "/settings",
-        description: "Configure settings",
-    },
-    SlashCommandDef {
-        name: "/usage",
-        description: "Show usage stats",
-    },
-    SlashCommandDef {
-        name: "/plan",
-        description: "Toggle plan mode",
-    },
-    SlashCommandDef {
-        name: "/mode",
-        description: "Switch collaboration mode",
-    },
+    ("/help", "Show available commands"),
+    ("/settings", "Configure settings"),
+    ("/usage", "Show usage stats"),
+    ("/plan", "Toggle plan mode"),
+    ("/mode", "Switch collaboration mode"),
     // Conversation
-    SlashCommandDef {
-        name: "/compact",
-        description: "Compact conversation history",
-    },
-    SlashCommandDef {
-        name: "/clear",
-        description: "Clear conversation",
-    },
-    SlashCommandDef {
-        name: "/undo",
-        description: "Undo last agent turn",
-    },
+    ("/compact", "Compact conversation history"),
+    ("/clear", "Clear conversation"),
+    ("/undo", "Undo last agent turn"),
     // Context
-    SlashCommandDef {
-        name: "/memory",
-        description: "Show memory context",
-    },
-    SlashCommandDef {
-        name: "/history",
-        description: "Show conversation history",
-    },
-    SlashCommandDef {
-        name: "/logs",
-        description: "Show activity log",
-    },
+    ("/memory", "Show memory context"),
+    ("/history", "Show conversation history"),
+    ("/logs", "Show activity log"),
     // Diagnostics
-    SlashCommandDef {
-        name: "/doctor",
-        description: "Run diagnostics",
-    },
-    SlashCommandDef {
-        name: "/heal",
-        description: "Run self-healing maintenance sweep",
-    },
-    SlashCommandDef {
-        name: "/stats",
-        description: "Show agent vitals",
-    },
-    SlashCommandDef {
-        name: "/evolution",
-        description: "Show evolution overview",
-    },
-    SlashCommandDef {
-        name: "/card",
-        description: "Print an ASCII share card",
-    },
-    SlashCommandDef {
-        name: "/pairing",
-        description: "Manage sender pairing",
-    },
-    SlashCommandDef {
-        name: "/update",
-        description: "Update borg to latest version",
-    },
+    ("/doctor", "Run diagnostics"),
+    ("/heal", "Run self-healing maintenance sweep"),
+    ("/stats", "Show agent vitals"),
+    ("/evolution", "Show evolution overview"),
+    ("/card", "Print an ASCII share card"),
+    ("/pairing", "Manage sender pairing"),
+    ("/update", "Update borg to latest version"),
     // Sessions
-    SlashCommandDef {
-        name: "/sessions",
-        description: "Browse and load saved sessions",
-    },
-    SlashCommandDef {
-        name: "/save",
-        description: "Save current session",
-    },
-    SlashCommandDef {
-        name: "/new",
-        description: "Start new session",
-    },
-    SlashCommandDef {
-        name: "/fork",
-        description: "Branch the current session into a new one",
-    },
+    ("/sessions", "Browse and load saved sessions"),
+    ("/save", "Save current session"),
+    ("/new", "Start new session"),
+    ("/fork", "Branch the current session into a new one"),
     // Integrations
-    SlashCommandDef {
-        name: "/plugins",
-        description: "Manage plugins and channels",
-    },
-    SlashCommandDef {
-        name: "/projects",
-        description: "List projects",
-    },
-    SlashCommandDef {
-        name: "/schedule",
-        description: "Manage schedules",
-    },
-    SlashCommandDef {
-        name: "/migrate",
-        description: "Import from another agent",
-    },
-    SlashCommandDef {
-        name: "/restart",
-        description: "Restart gateway server",
-    },
-    SlashCommandDef {
-        name: "/xp",
-        description: "Show XP summary and feed",
-    },
+    ("/plugins", "Manage plugins and channels"),
+    ("/projects", "List projects"),
+    ("/schedule", "Manage schedules"),
+    ("/migrate", "Import from another agent"),
+    ("/restart", "Restart gateway server"),
+    ("/xp", "Show XP summary and feed"),
 ];
+
+fn builtin_defs() -> Vec<SlashCommandDef> {
+    BUILTIN_COMMANDS
+        .iter()
+        .map(|(name, desc)| SlashCommandDef {
+            name: (*name).to_string(),
+            description: (*desc).to_string(),
+            template: None,
+        })
+        .collect()
+}
 
 /// True when every char of `needle` appears in `haystack` in order
 /// (not necessarily contiguously). Both inputs are expected lowercase.
@@ -181,14 +113,41 @@ pub struct CommandPopup {
     visible: bool,
     filter: String,
     selected: usize,
+    /// Built-ins followed by custom commands (in load order). Built-ins always
+    /// rank first within a tier so a stray `~/.borg/commands/help.md` cannot
+    /// shadow `/help`.
+    commands: Vec<SlashCommandDef>,
 }
 
 impl CommandPopup {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_custom(Vec::new())
+    }
+
+    /// Build a popup whose palette includes both the built-in commands and
+    /// the supplied user-defined ones. Custom commands whose name collides
+    /// with a built-in are dropped.
+    pub fn with_custom(custom: Vec<CustomCommand>) -> Self {
+        let mut commands = builtin_defs();
+        let builtin_names: std::collections::HashSet<String> =
+            commands.iter().map(|c| c.name.clone()).collect();
+        for c in custom {
+            if builtin_names.contains(&c.name) {
+                tracing::warn!(name = %c.name, "ignoring custom command: name collides with built-in");
+                continue;
+            }
+            commands.push(SlashCommandDef {
+                name: c.name,
+                description: c.description,
+                template: Some(c.template),
+            });
+        }
         Self {
             visible: false,
             filter: String::new(),
             selected: 0,
+            commands,
         }
     }
 
@@ -210,19 +169,20 @@ impl CommandPopup {
 
     pub fn filtered(&self) -> Vec<&SlashCommandDef> {
         if self.filter.is_empty() {
-            return COMMANDS.iter().collect();
+            return self.commands.iter().collect();
         }
 
         let filter_lower = self.filter.to_lowercase();
 
         // Three-tier ranking: exact match > prefix match > subsequence match.
-        // Within each tier, preserve the declaration order of COMMANDS so
-        // related commands stay grouped (e.g. /settings near /status).
+        // Within each tier, preserve declaration order so related commands
+        // stay grouped (e.g. /settings near /status). Built-ins are stored
+        // before custom commands, so they naturally rank first per tier.
         let mut exact = Vec::new();
         let mut prefix = Vec::new();
         let mut fuzzy = Vec::new();
 
-        for cmd in COMMANDS {
+        for cmd in &self.commands {
             let cmd_name = &cmd.name[1..]; // strip leading '/'
             let cmd_lower = cmd_name.to_lowercase();
             if cmd_lower == filter_lower {
@@ -262,6 +222,12 @@ impl CommandPopup {
     pub fn selected_command(&self) -> Option<&SlashCommandDef> {
         let items = self.filtered();
         items.get(self.selected).copied()
+    }
+
+    /// Look up a command by exact name (e.g. `"/standup"`). Used by the
+    /// submit path to detect custom commands that need template expansion.
+    pub fn lookup(&self, name: &str) -> Option<&SlashCommandDef> {
+        self.commands.iter().find(|c| c.name == name)
     }
 
     pub fn dismiss(&mut self) {
@@ -322,7 +288,7 @@ impl CommandPopup {
                 // Pad command to width 12 (leading space + name), then append description.
                 let mut spans: Vec<Span<'_>> = Vec::new();
                 spans.push(Span::styled(" ", base));
-                let matched = subsequence_match_positions(&filter_lower, cmd.name);
+                let matched = subsequence_match_positions(&filter_lower, &cmd.name);
                 let name_chars: Vec<char> = cmd.name.chars().collect();
                 for (idx, ch) in name_chars.iter().enumerate() {
                     let style = if matched.contains(&idx) {
@@ -334,7 +300,11 @@ impl CommandPopup {
                 }
                 let pad = 12usize.saturating_sub(name_chars.len());
                 spans.push(Span::styled(" ".repeat(pad + 1), base));
-                spans.push(Span::styled(cmd.description.to_string(), base));
+                spans.push(Span::styled(cmd.description.clone(), base));
+                if cmd.template.is_some() {
+                    // Mark user-defined commands so they can't be confused with built-ins.
+                    spans.push(Span::styled("  (user)", theme::dim()));
+                }
                 Line::from(spans)
             })
             .collect();
@@ -358,7 +328,7 @@ mod tests {
         let mut popup = CommandPopup::new();
         popup.update_filter("/");
         assert!(popup.is_visible());
-        assert_eq!(popup.filtered().len(), COMMANDS.len());
+        assert_eq!(popup.filtered().len(), BUILTIN_COMMANDS.len());
     }
 
     #[test]
@@ -368,7 +338,7 @@ mod tests {
         let items = popup.filtered();
         assert!(!items.is_empty());
         // The top result must be a prefix match (/help, /history), not fuzzy.
-        let first = items[0].name;
+        let first = &items[0].name;
         assert!(
             first.starts_with("/he"),
             "top match for /he should be a prefix match, got {first}"
@@ -433,7 +403,7 @@ mod tests {
 
     #[test]
     fn all_known_commands_present() {
-        let names: Vec<&str> = COMMANDS.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = BUILTIN_COMMANDS.iter().map(|(n, _)| *n).collect();
         let expected = [
             "/help",
             "/settings",
@@ -464,7 +434,11 @@ mod tests {
             "/migrate",
             "/restart",
         ];
-        assert_eq!(COMMANDS.len(), expected.len(), "COMMANDS count mismatch");
+        assert_eq!(
+            BUILTIN_COMMANDS.len(),
+            expected.len(),
+            "BUILTIN_COMMANDS count mismatch"
+        );
         for cmd in &expected {
             assert!(names.contains(cmd), "missing command: {cmd}");
         }
@@ -475,7 +449,7 @@ mod tests {
         let mut popup = CommandPopup::new();
         popup.update_filter("/st");
         let items = popup.filtered();
-        let names: Vec<&str> = items.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = items.iter().map(|c| c.name.as_str()).collect();
         // /stats has the prefix; /settings is a fuzzy subsequence (s…t) —
         // prefix matches must rank ahead of fuzzy matches.
         let stats_pos = names.iter().position(|n| *n == "/stats").unwrap();
@@ -492,7 +466,7 @@ mod tests {
         let mut popup = CommandPopup::new();
         popup.update_filter("/lo");
         let items = popup.filtered();
-        let names: Vec<&str> = items.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = items.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"/logs"), "should match /logs");
     }
 
@@ -501,7 +475,7 @@ mod tests {
         let mut popup = CommandPopup::new();
         popup.update_filter("/stg");
         let items = popup.filtered();
-        let names: Vec<&str> = items.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = items.iter().map(|c| c.name.as_str()).collect();
         assert!(
             names.contains(&"/settings"),
             "subsequence 'stg' should match /settings, got {names:?}"
@@ -545,6 +519,78 @@ mod tests {
         assert!(
             popup.filtered().is_empty(),
             "expected empty results for /zqxj"
+        );
+    }
+
+    // ── Custom command integration ──
+
+    fn custom(name: &str, desc: &str, body: &str) -> CustomCommand {
+        CustomCommand {
+            name: name.to_string(),
+            description: desc.to_string(),
+            template: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn with_custom_appends_user_commands() {
+        let popup = CommandPopup::with_custom(vec![custom("/standup", "Daily", "body")]);
+        let names: Vec<&str> = popup.commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"/standup"));
+        // Built-ins must still be present and come first.
+        assert_eq!(names[0], BUILTIN_COMMANDS[0].0);
+    }
+
+    #[test]
+    fn custom_command_appears_in_filter_results() {
+        let popup = CommandPopup::with_custom(vec![custom("/standup", "Daily", "body")]);
+        let mut popup = popup;
+        popup.update_filter("/sta");
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"/standup"), "got {names:?}");
+    }
+
+    #[test]
+    fn name_collision_with_builtin_drops_custom() {
+        let popup = CommandPopup::with_custom(vec![custom("/help", "shadowed", "x")]);
+        let help_descs: Vec<&str> = popup
+            .commands
+            .iter()
+            .filter(|c| c.name == "/help")
+            .map(|c| c.description.as_str())
+            .collect();
+        assert_eq!(help_descs, vec!["Show available commands"]);
+    }
+
+    #[test]
+    fn lookup_finds_builtin_and_custom() {
+        let popup = CommandPopup::with_custom(vec![custom("/standup", "Daily", "body")]);
+        assert!(popup.lookup("/help").is_some());
+        let st = popup.lookup("/standup").unwrap();
+        assert_eq!(st.template.as_deref(), Some("body"));
+        assert!(popup.lookup("/notathing").is_none());
+    }
+
+    #[test]
+    fn builtin_lookup_has_no_template() {
+        let popup = CommandPopup::new();
+        let help = popup.lookup("/help").unwrap();
+        assert!(help.template.is_none(), "built-ins must not have templates");
+    }
+
+    #[test]
+    fn builtins_rank_above_custom_in_prefix_tier() {
+        // Both `/setting-x` (custom) and `/settings` (builtin) prefix-match `/set`.
+        // Built-ins are stored first, so within the prefix tier they should win.
+        let popup = CommandPopup::with_custom(vec![custom("/setting-x", "user", "body")]);
+        let mut popup = popup;
+        popup.update_filter("/set");
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
+        let builtin_pos = names.iter().position(|n| *n == "/settings").unwrap();
+        let custom_pos = names.iter().position(|n| *n == "/setting-x").unwrap();
+        assert!(
+            builtin_pos < custom_pos,
+            "built-in /settings must rank above custom /setting-x; got {names:?}"
         );
     }
 }

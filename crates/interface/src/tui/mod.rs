@@ -4,6 +4,7 @@ mod colors;
 mod command_popup;
 mod commands;
 mod composer;
+mod custom_commands;
 mod diff_render;
 mod external_editor;
 mod file_popup;
