@@ -1682,7 +1682,25 @@ async fn run_event_loop(
                     }
                 });
             }
+            // EnterAltScreen / LeaveAltScreen are intentionally absorbed here
+            // and applied via the reconciliation step below. Going through the
+            // single reconciliation path keeps `tui.enter_alt_screen` (which
+            // saves the inline viewport) from being called twice in a row when
+            // an explicit emit is followed by the reconcile pass.
+            AppAction::EnterAltScreen | AppAction::LeaveAltScreen => {}
             AppAction::Continue => {}
+        }
+
+        // Reconcile alt-screen state with the App's desired surface. Single
+        // source of truth: any popup-show / pager-dismiss path that mutates
+        // visibility flips this on the next frame, no matter where it lives
+        // (slash commands, popup-internal key handlers, agent events).
+        let want_alt = app.wants_alt_screen();
+        let have_alt = tui.is_alt_screen_active();
+        if want_alt && !have_alt {
+            tui.enter_alt_screen()?;
+        } else if !want_alt && have_alt {
+            tui.leave_alt_screen()?;
         }
     }
 }

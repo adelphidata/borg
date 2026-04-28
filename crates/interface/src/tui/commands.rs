@@ -27,19 +27,19 @@ impl App<'_> {
             "/status" | "/stats" => {
                 let client = self.client.clone();
                 self.status_popup.show(&self.config, &client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/xp" => {
                 let client = self.client.clone();
                 self.status_popup
                     .show_tab(&self.config, StatusTab::Xp, &client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/evolution" => {
                 let client = self.client.clone();
                 self.status_popup
                     .show_tab(&self.config, StatusTab::Evolution, &client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/card" => {
                 self.push_borg_card();
@@ -52,17 +52,18 @@ impl App<'_> {
                 if let Ok(data_dir) = cortex::config::Config::data_dir() {
                     let client = self.client.clone();
                     self.pairing_popup.show(&self.config, &data_dir, &client);
+                    return Some(Ok(AppAction::EnterAltScreen));
                 } else {
                     self.push_system_message(
                         "Error: could not determine data directory".to_string(),
                     );
+                    return Some(Ok(AppAction::Continue));
                 }
-                return Some(Ok(AppAction::Continue));
             }
             "/settings" => {
                 let client = self.client.clone();
                 self.settings_popup.show(&self.config, &client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/model" => {
                 let client = self.client.clone();
@@ -73,16 +74,16 @@ impl App<'_> {
             "/projects" => {
                 let client = self.client.clone();
                 self.projects_popup.show(&client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/schedule-tasks" | "/schedule" => {
                 let client = self.client.clone();
                 self.schedule_popup.show(&client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/migrate" => {
                 self.migrate_popup.show();
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/poke" => return Some(self.cmd_poke()),
             "/cancel" | "/stop" | "/abort" => return Some(self.cmd_cancel()),
@@ -98,7 +99,7 @@ impl App<'_> {
             "/sessions" => {
                 let client = self.client.clone();
                 self.sessions_popup.show(&client);
-                return Some(Ok(AppAction::Continue));
+                return Some(Ok(AppAction::EnterAltScreen));
             }
             "/save" => return Some(Ok(AppAction::SaveSession)),
             "/export" => {
@@ -398,10 +399,11 @@ impl App<'_> {
     fn cmd_plugins(&mut self) -> Result<AppAction> {
         if let Ok(data_dir) = cortex::config::Config::data_dir() {
             self.plugins_popup.show(&self.config, &data_dir);
+            Ok(AppAction::EnterAltScreen)
         } else {
             self.push_system_message("Error: could not determine data directory".to_string());
+            Ok(AppAction::Continue)
         }
-        Ok(AppAction::Continue)
     }
 
     fn cmd_new(&mut self) -> Result<AppAction> {

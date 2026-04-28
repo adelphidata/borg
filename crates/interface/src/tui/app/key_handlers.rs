@@ -343,6 +343,7 @@ impl<'a> App<'a> {
             PagerAction::Dismiss => {
                 self.transcript_pager.dismiss();
                 self.state = AppState::Idle;
+                return Ok(AppAction::LeaveAltScreen);
             }
             PagerAction::None => {}
         }
@@ -562,7 +563,7 @@ impl<'a> App<'a> {
         if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.transcript_pager.show();
             self.state = AppState::TranscriptPager;
-            return Ok(AppAction::Continue);
+            return Ok(AppAction::EnterAltScreen);
         }
 
         // Ctrl+B / Ctrl+F / Ctrl+U intentionally fall through — the terminal

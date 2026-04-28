@@ -413,6 +413,14 @@ pub enum AppAction {
     ExportCurrentSession {
         format: cortex::export::ExportFormat,
     },
+    /// Signal that a full-screen surface has just opened (large popup or the
+    /// transcript pager). The event loop reconciles to alt-screen on the next
+    /// frame; the variant exists so the action surface documents the intent
+    /// and tests can assert which key paths request alt-screen.
+    EnterAltScreen,
+    /// Signal that the active alt-screen surface has just dismissed.
+    /// Reconciliation in the event loop restores the inline viewport.
+    LeaveAltScreen,
 }
 
 pub struct App<'a> {
@@ -665,6 +673,28 @@ impl<'a> App<'a> {
         }
         for_each_routed_popup!(self, check);
         false
+    }
+
+    /// Whether the TUI currently wants an alt-screen surface.
+    ///
+    /// True when any of the large popups in the spec's "alt-screen wrap audit"
+    /// is visible, or while the full-screen transcript pager is open. The
+    /// event loop reconciles this against [`super::tui_lifecycle::Tui::is_alt_screen_active`]
+    /// after every iteration; smaller popups (`command_popup`, `model_popup`,
+    /// `file_popup`, plan overlay, file search) stay inline.
+    pub fn wants_alt_screen(&self) -> bool {
+        if matches!(self.state, AppState::TranscriptPager) {
+            return true;
+        }
+        self.settings_popup.is_visible()
+            || self.pairing_popup.is_visible()
+            || self.projects_popup.is_visible()
+            || self.sessions_popup.is_visible()
+            || self.schedule_popup.is_visible()
+            || self.migrate_popup.is_visible()
+            || self.status_popup.is_visible()
+            || self.btw_popup.is_visible()
+            || self.plugins_popup.is_visible()
     }
 
     /// Toggle the collapsed state on the most recent collapsible tool result.
@@ -1228,6 +1258,68 @@ mod tests {
         app.handle_key(key(KeyCode::Esc)).unwrap();
         assert!(matches!(app.state, AppState::Idle));
         assert!(!app.transcript_pager.visible);
+    }
+
+    // ========================================================================
+    // Alt-screen wrap (Track D) — emit EnterAltScreen / LeaveAltScreen and
+    // surface the desired alt-screen state to the event loop.
+    //
+    // Regression guard: if any of these break, large popups will paint into
+    // the inline viewport and clip / overwrite the composer.
+    // ========================================================================
+
+    #[test]
+    fn ctrl_t_emits_enter_alt_screen() {
+        let mut app = make_app();
+        let action = app
+            .handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(
+            matches!(action, AppAction::EnterAltScreen),
+            "Ctrl+T must emit EnterAltScreen so run_event_loop can call tui.enter_alt_screen()"
+        );
+        assert!(app.wants_alt_screen());
+    }
+
+    #[test]
+    fn dismissing_pager_emits_leave_alt_screen() {
+        let mut app = make_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+            .unwrap();
+        let action = app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(
+            matches!(action, AppAction::LeaveAltScreen),
+            "Dismissing the pager must emit LeaveAltScreen so the inline viewport restores"
+        );
+        assert!(!app.wants_alt_screen());
+    }
+
+    #[test]
+    fn settings_popup_show_drives_wants_alt_screen() {
+        let mut app = make_app();
+        assert!(!app.wants_alt_screen());
+        let client = app.client.clone();
+        app.settings_popup.show(&app.config, &client);
+        assert!(
+            app.wants_alt_screen(),
+            "settings popup must request alt-screen surface"
+        );
+        app.settings_popup.dismiss();
+        assert!(!app.wants_alt_screen());
+    }
+
+    #[test]
+    fn small_popups_do_not_request_alt_screen() {
+        // command_popup / model_popup / file_popup / plan_overlay / file_search
+        // stay inline. Opening the model popup must not flip wants_alt_screen.
+        let mut app = make_app();
+        let client = app.client.clone();
+        app.model_popup.show(&app.config, &client);
+        assert!(app.model_popup.is_visible());
+        assert!(
+            !app.wants_alt_screen(),
+            "model_popup is inline; alt-screen must not be requested"
+        );
     }
 
     #[test]
