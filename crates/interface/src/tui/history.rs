@@ -827,7 +827,12 @@ impl HistoryCell {
                         .as_deref()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
                         .and_then(|v| v.get("patch").and_then(|p| p.as_str()).map(str::to_string))
-                        .map(|patch| diff_render::render_patch(&patch))
+                        .map(|patch| {
+                            // Reserve room for the cell's left bullet/indent
+                            // (~6 cols) so wrapped diff rows don't overrun.
+                            let inner = (width as usize).saturating_sub(6).max(20);
+                            diff_render::render_patch_wrapped(&patch, inner)
+                        })
                 } else {
                     None
                 };

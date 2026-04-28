@@ -518,10 +518,7 @@ pub fn load_all_skills(
                             // already loaded above; loading the disk copy as a
                             // "user skill" would trigger noisy collision/env-var
                             // warnings for nothing. Skip silently.
-                            if BUNDLED_SKILLS
-                                .iter()
-                                .any(|(_, c)| content.as_str() == *c)
-                            {
+                            if BUNDLED_SKILLS.iter().any(|(_, c)| content.as_str() == *c) {
                                 // Auto-installed copy of a bundled skill;
                                 // bundled in-memory version is already loaded.
                                 continue;

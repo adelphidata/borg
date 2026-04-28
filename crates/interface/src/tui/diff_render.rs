@@ -6,10 +6,18 @@
 //! the transcript. It never touches the filesystem — it is a pure TUI-side
 //! read of data we already have in the tool call args.
 
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthChar;
 
 use super::highlight;
 use super::theme;
+
+/// Tab stops are rendered as 4 columns wide (matches codex's diff view).
+const TAB_WIDTH: usize = 4;
+/// Continuation rows from line wrapping are indented by this many spaces so
+/// the wrap visually belongs to the row above.
+const WRAP_CONTINUATION_INDENT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffKind {
@@ -91,9 +99,20 @@ fn render_content_line(
     spans.push(Span::styled(fmt_lineno(new_lineno), gutter_style));
     spans.push(Span::styled(format!(" {marker} "), gutter_style));
 
+    // Syntax-highlight all three kinds when we know the file extension.
+    // Add lines keep syntect's colors as-is — the green row bg + `+` sign
+    // already signal insertion. Remove lines keep syntect's colors but
+    // overlay Modifier::DIM so the deletion cue stays readable against the
+    // red row bg without the syntax color overpowering it.
     match (kind, ext) {
-        (DiffKind::Context, Some(lang)) if !body.is_empty() => {
-            spans.extend(highlight::highlight_inline(body, lang));
+        (_, Some(lang)) if !body.is_empty() => {
+            let mut hl = highlight::highlight_inline(body, lang);
+            if matches!(kind, DiffKind::Remove) {
+                for span in hl.iter_mut() {
+                    span.style = span.style.add_modifier(Modifier::DIM);
+                }
+            }
+            spans.extend(hl);
         }
         _ => spans.push(Span::styled(body.to_string(), tint)),
     }
@@ -241,6 +260,100 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// Render a patch and then wrap any over-width logical line into multiple
+/// physical rows. Continuation rows inherit the source line's row background
+/// (so a wrapped insertion keeps its green column) and are prepended with a
+/// 2-space indent to visually attach them to the row above.
+pub fn render_patch_wrapped(patch: &str, width: usize) -> Vec<Line<'static>> {
+    wrap_lines(render_patch(patch), width)
+}
+
+/// Width of `c` in terminal columns: tab counts as 4, control/zero-width as 0.
+fn char_width(c: char) -> usize {
+    if c == '\t' {
+        TAB_WIDTH
+    } else {
+        UnicodeWidthChar::width(c).unwrap_or(0)
+    }
+}
+
+/// Total display width of a styled line's spans. Counts tabs as 4 cols.
+fn line_display_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|s| s.content.chars().map(char_width).sum::<usize>())
+        .sum()
+}
+
+/// Split a single styled line into rows ≤ `width` columns. The first row
+/// uses the full width; subsequent rows use `width - WRAP_CONTINUATION_INDENT`
+/// and get a 2-space indent prepended (carrying the row's background).
+fn wrap_one(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 || line_display_width(&line) <= width {
+        return vec![line];
+    }
+    let row_style = line.style;
+    let cont_width = width.saturating_sub(WRAP_CONTINUATION_INDENT).max(1);
+
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    let mut col = 0usize;
+    let mut limit = width;
+
+    for span in line.spans.into_iter() {
+        let style = span.style;
+        let mut buf = String::new();
+        for c in span.content.chars() {
+            let w = char_width(c);
+            // A zero-width char (combining mark) attaches to current row.
+            if w == 0 {
+                buf.push(c);
+                continue;
+            }
+            if col + w > limit && !buf.is_empty() {
+                // Flush current span fragment, then break to next row.
+                if let Some(last) = rows.last_mut() {
+                    last.push(Span::styled(std::mem::take(&mut buf), style));
+                }
+            }
+            if col + w > limit {
+                rows.push(Vec::new());
+                col = 0;
+                limit = cont_width;
+            }
+            buf.push(c);
+            col += w;
+        }
+        if !buf.is_empty() {
+            if let Some(last) = rows.last_mut() {
+                last.push(Span::styled(buf, style));
+            }
+        }
+    }
+
+    let indent_style = ratatui::style::Style::default();
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, mut spans)| {
+            if i > 0 {
+                let pad = " ".repeat(WRAP_CONTINUATION_INDENT);
+                spans.insert(0, Span::styled(pad, indent_style));
+            }
+            let mut l = Line::from(spans);
+            l.style = row_style;
+            l
+        })
+        .collect()
+}
+
+/// Wrap each over-width line; pass short lines through unchanged.
+pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        out.extend(wrap_one(line, width));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,15 +365,15 @@ mod tests {
             .collect::<String>()
     }
 
-    /// Find the first content span in a diff line — i.e. the span styled
-    /// with one of the diff foreground tints, skipping the line-number
-    /// gutter and sign column. Returns `None` for non-content lines.
-    fn first_content_span<'a>(line: &'a Line<'a>) -> Option<&'a Span<'a>> {
-        line.spans.iter().find(|s| {
-            s.style == theme::diff_add_style()
-                || s.style == theme::diff_remove_style()
-                || s.style == theme::dim()
-        })
+    /// Skip the 4 gutter spans (old lineno, separator, new lineno, sign) and
+    /// return the remaining content spans. Useful for asserting on body
+    /// styling without coupling tests to gutter formatting.
+    fn content_spans<'a>(line: &'a Line<'a>) -> &'a [Span<'a>] {
+        if line.spans.len() > 4 {
+            &line.spans[4..]
+        } else {
+            &[]
+        }
     }
 
     fn all_text(lines: &[Line<'_>]) -> String {
@@ -276,11 +389,10 @@ mod tests {
         assert!(line_text(&lines[0]).contains("Add:"));
         assert!(line_text(&lines[0]).contains("foo.rs"));
         assert!(line_text(&lines[1]).contains("fn main()"));
-        // the + body should be green-tinted (span after the gutter columns)
-        assert_eq!(
-            first_content_span(&lines[1]).map(|s| s.style),
-            Some(theme::diff_add_style())
-        );
+        // The body row carries the add-row background (the visual diff cue).
+        assert_eq!(lines[1].style.bg, Some(theme::diff_add_bg()));
+        // Sign column shows `+`.
+        assert!(line_text(&lines[1]).contains(" + "));
     }
 
     #[test]
@@ -294,23 +406,17 @@ mod tests {
         assert!(text.contains("old"));
         assert!(text.contains("new"));
 
-        // Find the +new and -old lines; verify styling.
+        // Find the +new and -old lines; verify row backgrounds.
         let plus_line = lines
             .iter()
             .find(|l| line_text(l).contains("new"))
             .expect("plus line present");
-        assert_eq!(
-            first_content_span(plus_line).map(|s| s.style),
-            Some(theme::diff_add_style())
-        );
+        assert_eq!(plus_line.style.bg, Some(theme::diff_add_bg()));
         let minus_line = lines
             .iter()
             .find(|l| line_text(l).contains("old"))
             .expect("minus line present");
-        assert_eq!(
-            first_content_span(minus_line).map(|s| s.style),
-            Some(theme::diff_remove_style())
-        );
+        assert_eq!(minus_line.style.bg, Some(theme::diff_remove_bg()));
     }
 
     #[test]
@@ -338,10 +444,7 @@ mod tests {
             .iter()
             .find(|l| line_text(l).contains("hello"))
             .unwrap();
-        assert_eq!(
-            first_content_span(body).map(|s| s.style),
-            Some(theme::diff_add_style())
-        );
+        assert_eq!(body.style.bg, Some(theme::diff_add_bg()));
     }
 
     #[test]
@@ -457,6 +560,166 @@ mod tests {
         // header, " line1", blank, "+added"
         assert_eq!(lines.len(), 4);
         assert!(lines[2].spans.is_empty());
+    }
+
+    #[test]
+    fn add_line_picks_up_syntax_highlight_color() {
+        // For a known extension, an inserted code line gets syntect spans
+        // (multiple distinct fgs) instead of a single flat green tint.
+        let patch = "*** Begin Patch\n*** Add File: foo.rs\n+let x = 1;\n*** End Patch";
+        let lines = render_patch(patch);
+        let body = lines
+            .iter()
+            .find(|l| line_text(l).contains("let x"))
+            .expect("body present");
+        let spans = content_spans(body);
+        assert!(
+            !spans.is_empty(),
+            "expected post-gutter content spans, got {:?}",
+            body.spans
+        );
+        // syntect typically classifies `let` separately from ` x = 1;`,
+        // producing >= 2 spans with at least one non-default fg.
+        assert!(
+            spans.len() >= 2 || spans.iter().any(|s| s.style.fg.is_some()),
+            "expected syntect-classified spans, got {:?}",
+            spans
+        );
+        // The dim modifier is reserved for remove lines — must not appear here.
+        for s in spans {
+            assert!(
+                !s.style.add_modifier.contains(Modifier::DIM),
+                "add line should not be dimmed: {:?}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn remove_line_carries_dim_modifier() {
+        let patch = "*** Begin Patch\n*** Update File: foo.rs\n@@\n-let x = 1;\n*** End Patch";
+        let lines = render_patch(patch);
+        let body = lines
+            .iter()
+            .find(|l| line_text(l).contains("let x"))
+            .expect("body present");
+        let spans = content_spans(body);
+        assert!(!spans.is_empty(), "expected post-gutter content spans");
+        for s in spans {
+            assert!(
+                s.style.add_modifier.contains(Modifier::DIM),
+                "remove span missing DIM: {:?}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn wraps_long_added_line_at_width() {
+        // 200-char identifier on a single +line; at width 80 it must wrap.
+        let big = "x".repeat(200);
+        let patch = format!("*** Begin Patch\n*** Add File: foo.txt\n+{big}\n*** End Patch");
+        let unwrapped = render_patch(&patch);
+        let unwrapped_body_count = unwrapped
+            .iter()
+            .filter(|l| l.style.bg == Some(theme::diff_add_bg()))
+            .count();
+        assert_eq!(unwrapped_body_count, 1, "render_patch should not wrap");
+
+        let wrapped = render_patch_wrapped(&patch, 80);
+        let body_rows: Vec<&Line<'_>> = wrapped
+            .iter()
+            .filter(|l| l.style.bg == Some(theme::diff_add_bg()))
+            .collect();
+        assert!(
+            body_rows.len() >= 2,
+            "expected wrapped into >=2 rows, got {}",
+            body_rows.len()
+        );
+        // Continuation rows preserve the add-row background so the green
+        // column visibly continues across the wrap.
+        for row in &body_rows[1..] {
+            assert_eq!(
+                row.style.bg,
+                Some(theme::diff_add_bg()),
+                "continuation row lost diff_add_bg: {:?}",
+                row
+            );
+            // First span on continuation rows is the 2-space indent.
+            assert_eq!(
+                row.spans[0].content.as_ref(),
+                "  ",
+                "expected 2-space continuation indent, got {:?}",
+                row.spans[0]
+            );
+        }
+        // No row exceeds the target width.
+        for row in &wrapped {
+            assert!(
+                line_display_width(row) <= 80,
+                "row exceeds width 80 ({}): {:?}",
+                line_display_width(row),
+                line_text(row)
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_preserves_unicode_width() {
+        // East Asian char `漢` is 2 cols wide; width should be measured in
+        // columns not bytes (each `漢` is 3 bytes in UTF-8).
+        let body: String = "漢".repeat(50); // 100 cols, 150 bytes
+        let patch = format!("*** Begin Patch\n*** Add File: foo.txt\n+{body}\n*** End Patch");
+        let wrapped = render_patch_wrapped(&patch, 30);
+        for row in &wrapped {
+            let w = line_display_width(row);
+            assert!(
+                w <= 30,
+                "row exceeds 30 cols (w={w}, bytes={}): {:?}",
+                line_text(row).len(),
+                line_text(row)
+            );
+        }
+        // We should have produced multiple rows (100 cols / ~28 cont width).
+        let body_rows = wrapped
+            .iter()
+            .filter(|l| line_text(l).contains('漢'))
+            .count();
+        assert!(
+            body_rows >= 4,
+            "expected >=4 wrapped rows for 100 cols at width 30, got {body_rows}"
+        );
+    }
+
+    #[test]
+    fn short_lines_pass_through_unchanged() {
+        // At a generous width, render_patch_wrapped is idempotent w/ render_patch.
+        let patch = "*** Begin Patch\n*** Update File: x.rs\n@@\n ctx\n-old\n+new\n*** End Patch";
+        let plain = render_patch(patch);
+        let wrapped = render_patch_wrapped(patch, 200);
+        assert_eq!(plain.len(), wrapped.len());
+        for (a, b) in plain.iter().zip(wrapped.iter()) {
+            assert_eq!(line_text(a), line_text(b));
+            assert_eq!(a.style.bg, b.style.bg);
+            assert_eq!(a.spans.len(), b.spans.len());
+        }
+    }
+
+    #[test]
+    fn wrap_one_handles_zero_width_continuation() {
+        // Combining marks (width 0) must not be split off onto their own
+        // continuation row — they attach to whatever fragment carries the
+        // base char. We feed a line of plain ASCII with a trailing combining
+        // acute and assert the combining char is on the same row as `e`.
+        let patch = "*** Begin Patch\n*** Add File: f.txt\n+abcdefe\u{0301}\n*** End Patch";
+        let wrapped = render_patch_wrapped(patch, 30);
+        // Find the body row (only one — short enough to fit).
+        let body = wrapped.iter().find(|l| line_text(l).contains('a')).unwrap();
+        let text = line_text(body);
+        assert!(
+            text.contains("e\u{0301}"),
+            "combining mark detached: {text:?}"
+        );
     }
 
     #[test]
