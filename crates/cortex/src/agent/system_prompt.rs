@@ -237,4 +237,70 @@ impl Agent {
             String::new()
         }
     }
+
+    /// Build the `<active_memory trust="retrieved">` section: per-turn hybrid
+    /// search of memory + past session transcripts, keyed off the last user
+    /// message. Returns an empty string when disabled, when no last user
+    /// message is available, or when the search returns no results.
+    ///
+    /// Lives in the dynamic suffix because the body changes per turn (would
+    /// otherwise invalidate prefix-cache hits on every turn).
+    pub(super) async fn build_active_memory_section(&self) -> String {
+        let cfg = &self.config.memory.active_injection;
+        if !cfg.enabled {
+            return String::new();
+        }
+        let query = self
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::types::Role::User)
+            .and_then(|m| m.text_content())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // Match `load_memory_with_ranking`'s threshold: short acks ("ok", "yes")
+        // produce noisy rankings.
+        if query.len() < 10 {
+            return String::new();
+        }
+        let args = serde_json::json!({
+            "query": query,
+            "max_results": cfg.top_k,
+            "sources": ["memory", "messages"],
+        });
+        let body = match crate::tool_handlers::handle_memory_search(&args, &self.config).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("active_memory search failed: {e}");
+                return String::new();
+            }
+        };
+        let trimmed = body.trim();
+        if trimmed.is_empty()
+            || trimmed == "No matching memories found."
+            || trimmed == "No matching messages found."
+        {
+            return String::new();
+        }
+        let truncated = if crate::tokenizer::estimate_tokens(trimmed) > cfg.max_tokens {
+            // Cheap char-based clamp: 4 chars/token rule of thumb. Safe upper
+            // bound — actual tokens will be ≤ cfg.max_tokens.
+            let cap = cfg.max_tokens.saturating_mul(4);
+            let mut cut = trimmed
+                .char_indices()
+                .take(cap)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(trimmed.len());
+            // Back off to the previous newline so we don't cut mid-result.
+            if let Some(nl) = trimmed[..cut].rfind('\n') {
+                cut = nl;
+            }
+            format!("{}\n…(truncated)", &trimmed[..cut])
+        } else {
+            trimmed.to_string()
+        };
+        format!("\n<active_memory trust=\"retrieved\">\n{truncated}\n</active_memory>\n")
+    }
 }

@@ -40,6 +40,9 @@ define_settings! {
         "memory.flush_min_messages" => memory.flush_min_messages, parsed(usize);
         "memory.flush_soft_threshold_tokens" => memory.flush_soft_threshold_tokens, parsed(usize);
         "memory.chunk_level_selection" => memory.chunk_level_selection, parsed(bool);
+        "memory.active_injection.enabled" => memory.active_injection.enabled, parsed(bool);
+        "memory.active_injection.top_k" => memory.active_injection.top_k, parsed(usize);
+        "memory.active_injection.max_tokens" => memory.active_injection.max_tokens, parsed(usize);
 
         // ── Memory embeddings ──
         "memory.embeddings.enabled" => memory.embeddings.enabled, parsed(bool);
@@ -365,6 +368,8 @@ define_settings! {
 
         // — Memory & Skills —
         "skills.enabled" => "Allow skills", Bool, "Memory & Skills";
+        "memory.active_injection.enabled" => "Active memory inject", Bool, "Memory & Skills";
+        "memory.active_injection.top_k" => "Active memory top-k", Uint, "Memory & Skills";
 
         // — Personality —
         "evolution.enabled" => "Evolution", Bool, "Personality";

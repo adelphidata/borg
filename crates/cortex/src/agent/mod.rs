@@ -889,6 +889,13 @@ impl Agent {
 
         // === DYNAMIC SUFFIX (per-turn, cache-invalidating) ===
 
+        // Active memory: per-turn hybrid search of memory + past sessions
+        // keyed off the latest user message. Placed at the start of the
+        // dynamic suffix so it sits adjacent to <working_memory> and after
+        // the stable <long_term_memory> prefix. Empty string when disabled
+        // or when the search returns no hits.
+        system.push_str(&self.build_active_memory_section().await);
+
         // Short-term working memory (session facts, active project)
         let working_memory = self.short_term_memory.render();
         if !working_memory.is_empty() {
@@ -2855,8 +2862,8 @@ mod tests {
         let start = AGENT_RS_SRC
             .find("async fn build_system_prompt")
             .expect("build_system_prompt must exist");
-        // Extract ~5KB following the signature — plenty to cover the body.
-        let end = (start + 5000).min(AGENT_RS_SRC.len());
+        // Extract ~6KB following the signature — plenty to cover the body.
+        let end = (start + 6000).min(AGENT_RS_SRC.len());
         &AGENT_RS_SRC[start..end]
     }
 
@@ -2934,6 +2941,27 @@ mod tests {
         assert!(
             wf_idx < env_idx,
             "workflow guidance must come before environment section",
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_active_memory_in_dynamic_suffix() {
+        // Cache-stability invariant: <active_memory> changes per turn (its
+        // content is keyed off the latest user message), so it MUST live in
+        // the DYNAMIC SUFFIX block — never before, where it would invalidate
+        // the prefix cache on every turn.
+        let body = extract_build_system_prompt_body();
+        let suffix_marker = body
+            .find("DYNAMIC SUFFIX")
+            .expect("DYNAMIC SUFFIX marker must exist");
+        let active_idx = body
+            .find("build_active_memory_section")
+            .expect("build_active_memory_section call must exist in build_system_prompt");
+        assert!(
+            active_idx > suffix_marker,
+            "active_memory must be pushed AFTER the DYNAMIC SUFFIX marker \
+             so it does not invalidate the prefix cache \
+             (active_idx={active_idx}, suffix_marker={suffix_marker})",
         );
     }
 

@@ -368,6 +368,35 @@ pub struct MemoryConfig {
     /// Maximum number of entries in the embedding cache. Oldest entries by
     /// last_accessed_at are pruned on startup. 0 = unlimited.
     pub cache_max_entries: usize,
+    /// Proactive ("active") memory injection: per-turn search of memory + past
+    /// session transcripts using the current user message as query, surfaced
+    /// in the system prompt as `<active_memory trust="retrieved">`.
+    #[serde(default)]
+    pub active_injection: ActiveInjectionConfig,
+}
+
+/// Settings for proactive memory injection (top-k hybrid search per turn).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ActiveInjectionConfig {
+    /// When true, every turn searches memory + past sessions with the user's
+    /// last message and injects top-k results into the system prompt's
+    /// dynamic suffix. The block is omitted entirely when no results match.
+    pub enabled: bool,
+    /// Number of results to fetch (passed as `max_results` to memory_search).
+    pub top_k: usize,
+    /// Hard cap on the injected block size; truncated mid-result if exceeded.
+    pub max_tokens: usize,
+}
+
+impl Default for ActiveInjectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            top_k: 5,
+            max_tokens: 1500,
+        }
+    }
 }
 
 impl Default for MemoryConfig {
@@ -383,6 +412,7 @@ impl Default for MemoryConfig {
             chunk_level_selection: false,
             cache_ttl_days: 30,
             cache_max_entries: 10_000,
+            active_injection: ActiveInjectionConfig::default(),
         }
     }
 }

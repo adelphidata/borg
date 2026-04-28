@@ -204,6 +204,23 @@ fn apply_setting_memory_max_context_tokens_rejects_zero() {
 }
 
 #[test]
+fn apply_setting_memory_active_injection_round_trip() {
+    // Guards the registry+apply+extractor wiring for the three new keys —
+    // a missing arm in `define_settings!` would silently drop the setter.
+    let mut cfg = Config::default();
+    assert!(cfg.memory.active_injection.enabled);
+    cfg.apply_setting("memory.active_injection.enabled", "false")
+        .expect("toggle off");
+    assert!(!cfg.memory.active_injection.enabled);
+    cfg.apply_setting("memory.active_injection.top_k", "12")
+        .expect("set top_k");
+    assert_eq!(cfg.memory.active_injection.top_k, 12);
+    cfg.apply_setting("memory.active_injection.max_tokens", "800")
+        .expect("set max_tokens");
+    assert_eq!(cfg.memory.active_injection.max_tokens, 800);
+}
+
+#[test]
 fn apply_setting_sandbox_mode_rejects_invalid() {
     let mut cfg = Config::default();
     assert!(cfg.apply_setting("sandbox.mode", "bogus").is_err());

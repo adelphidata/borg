@@ -81,6 +81,9 @@ bundled_skills! {
     "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
     "scheduler"      => "scheduler"      { category: "core",      default_enabled: true,  hidden: false },
     "paperclip"      => "paperclip"      { category: "developer", default_enabled: false, hidden: false },
+    "pdf"            => "pdf"            { category: "utilities", default_enabled: false, hidden: false },
+    "reminders"      => "reminders"      { category: "productivity", default_enabled: false, hidden: false },
+    "linear"         => "linear"         { category: "productivity", default_enabled: false, hidden: false },
 }
 
 /// Filter `SKILL_REGISTRY` to the names satisfying a predicate, all at compile time.
