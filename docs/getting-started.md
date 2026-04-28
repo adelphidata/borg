@@ -149,7 +149,7 @@ borg service status     # check service status
 | `borg stop` / `borg restart` | Daemon lifecycle |
 | `borg service install/uninstall/status` | System service management |
 | `borg migrate` | Migrate settings from Hermes Agent or OpenClaw |
-| `borg update` | Update borg to the latest release |
+| `borg update` | Update borg to the latest released version (`--prerelease`/`-p` for experimental builds, `--check`/`-c` to dry-run) |
 | `borg uninstall` | Delete all Borg data |
 
 ## What happens when you chat

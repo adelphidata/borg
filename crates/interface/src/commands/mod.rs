@@ -12,6 +12,7 @@ pub(crate) mod revoke;
 pub(crate) mod settings;
 pub(crate) mod status;
 pub(crate) mod tasks;
+pub(crate) mod update_args;
 pub(crate) mod webhook;
 
 pub(crate) fn format_ts(ts: i64, fmt: &str) -> String {

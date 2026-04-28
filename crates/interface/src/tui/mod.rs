@@ -565,6 +565,27 @@ async fn handle_export(
     app.push_system_message(format!("Exported session {} → {}", short, path.display()));
 }
 
+/// User-facing message after a `/update --check` (dry-run) completes.
+fn format_check_outcome(current: &str, latest: &str) -> String {
+    if cortex::update::is_newer(current, latest) {
+        format!("Update available: {current} → {latest} (not installed; run /update to apply)")
+    } else {
+        format!("Already up to date ({current})")
+    }
+}
+
+/// User-facing message after a `/update` install attempt completes.
+fn format_install_outcome(result: &cortex::update::UpdateResult) -> String {
+    match &result.status {
+        cortex::update::UpdateStatus::AlreadyUpToDate => {
+            format!("Already up to date ({})", result.current_version)
+        }
+        cortex::update::UpdateStatus::Updated { from, to } => {
+            format!("Updated borg: {from} → {to}\nPlease restart borg to use the new version.")
+        }
+    }
+}
+
 /// Format an integer with comma thousands separators (e.g. `3999` → `"3,999"`).
 /// Used by the `/usage` display so large token counts are scannable.
 fn fmt_commas(n: u64) -> String {
@@ -1520,28 +1541,38 @@ async fn run_event_loop(
                 let msg = restart_gateway(gateway_shutdown).await;
                 app.push_system_message(msg);
             }
-            AppAction::SelfUpdate { dev } => {
+            AppAction::SelfUpdate { prerelease, check } => {
                 app.push_system_message(format!(
                     "Checking for updates{}...",
-                    if dev { " (including pre-releases)" } else { "" }
+                    if prerelease {
+                        " (including pre-releases)"
+                    } else {
+                        ""
+                    }
                 ));
                 terminal.draw(|f| app.render(f))?;
-                match cortex::update::perform_update(dev).await {
-                    Ok(result) => match result.status {
-                        cortex::update::UpdateStatus::AlreadyUpToDate => {
-                            app.push_system_message(format!(
-                                "Already up to date ({})",
-                                result.current_version
-                            ));
+                if check {
+                    match cortex::update::fetch_latest_release(prerelease).await {
+                        Ok(release) => {
+                            let latest = release
+                                .tag_name
+                                .strip_prefix('v')
+                                .unwrap_or(&release.tag_name);
+                            let current = cortex::update::current_version();
+                            app.push_system_message(format_check_outcome(current, latest));
                         }
-                        cortex::update::UpdateStatus::Updated { from, to } => {
-                            app.push_system_message(format!(
-                                "Updated borg: {from} → {to}\nPlease restart borg to use the new version."
-                            ));
+                        Err(e) => {
+                            app.push_system_message(format!("Update check failed: {e}"));
                         }
-                    },
-                    Err(e) => {
-                        app.push_system_message(format!("Update failed: {e}"));
+                    }
+                } else {
+                    match cortex::update::perform_update(prerelease).await {
+                        Ok(result) => {
+                            app.push_system_message(format_install_outcome(&result));
+                        }
+                        Err(e) => {
+                            app.push_system_message(format!("Update failed: {e}"));
+                        }
                     }
                 }
             }
@@ -1723,6 +1754,69 @@ mod tests {
     // "Approve senders with: /pairing approve <CODE>" (confusing — didn't
     // explain the user must DM the bot first to generate the code).
     // ------------------------------------------------------------------------
+
+    // ------------------------------------------------------------------------
+    // /update outcome formatting
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn format_check_outcome_already_up_to_date() {
+        let msg = format_check_outcome("0.5.0", "0.5.0");
+        assert_eq!(msg, "Already up to date (0.5.0)");
+    }
+
+    #[test]
+    fn format_check_outcome_update_available() {
+        let msg = format_check_outcome("0.5.0", "0.6.0");
+        assert!(
+            msg.starts_with("Update available: 0.5.0 → 0.6.0"),
+            "missing version arrow: {msg}"
+        );
+        assert!(
+            msg.contains("not installed"),
+            "must clarify dry-run did not install: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_check_outcome_does_not_promote_downgrade() {
+        // is_newer is false when "latest" is older — message should be "up to date",
+        // never offer a downgrade.
+        let msg = format_check_outcome("1.0.0", "0.9.0");
+        assert!(msg.contains("Already up to date"), "{msg}");
+        assert!(!msg.contains("Update available"), "{msg}");
+    }
+
+    #[test]
+    fn format_install_outcome_already_up_to_date() {
+        let result = cortex::update::UpdateResult {
+            current_version: "0.5.0".into(),
+            latest_version: "0.5.0".into(),
+            status: cortex::update::UpdateStatus::AlreadyUpToDate,
+        };
+        assert_eq!(
+            format_install_outcome(&result),
+            "Already up to date (0.5.0)"
+        );
+    }
+
+    #[test]
+    fn format_install_outcome_updated_includes_restart_prompt() {
+        let result = cortex::update::UpdateResult {
+            current_version: "0.5.0".into(),
+            latest_version: "0.6.0".into(),
+            status: cortex::update::UpdateStatus::Updated {
+                from: "0.5.0".into(),
+                to: "0.6.0".into(),
+            },
+        };
+        let msg = format_install_outcome(&result);
+        assert!(msg.contains("0.5.0 → 0.6.0"), "{msg}");
+        assert!(
+            msg.contains("restart"),
+            "user must be told to restart: {msg}"
+        );
+    }
 
     #[test]
     fn fmt_commas_groups_digits() {

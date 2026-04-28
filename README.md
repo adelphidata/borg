@@ -55,7 +55,7 @@ Or download manually from [Releases](https://github.com/borganization/borg/relea
 | --------- | ----------------------------------------------------- |
 | `/doctor` | Run diagnostics on Borg and host environment          |
 | `/heal`   | Run the full self-healing maintenance sweep on demand |
-| `/update` | Update Borg to the latest release                     |
+| `/update` | Update Borg (`--prerelease` for experimental, `--check` to dry-run) |
 
 ...and many more. Type `/` in a conversation to browse them all.
 

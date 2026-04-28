@@ -47,7 +47,7 @@ impl App<'_> {
             }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
             "/heal" => return Some(self.cmd_heal()),
-            "/update" => return Some(Ok(AppAction::SelfUpdate { dev: false })),
+            // `/update` and `/update <flags>` are handled by the prefix block below.
             "/pairing" => {
                 if let Ok(data_dir) = cortex::config::Config::data_dir() {
                     let client = self.client.clone();
@@ -189,8 +189,22 @@ impl App<'_> {
             return Some(self.cmd_model_set(rest.trim()));
         }
 
-        if trimmed == "/update --dev" || trimmed == "/update dev" {
-            return Some(Ok(AppAction::SelfUpdate { dev: true }));
+        if trimmed == "/update" || trimmed.starts_with("/update ") {
+            let rest = trimmed.strip_prefix("/update").map(str::trim).unwrap_or("");
+            return Some(
+                match crate::commands::update_args::UpdateArgs::parse_slash(rest) {
+                    Ok(args) => Ok(AppAction::SelfUpdate {
+                        prerelease: args.prerelease,
+                        check: args.check,
+                    }),
+                    Err(e) => {
+                        // clap renders the message; trim trailing newline before showing.
+                        let msg = e.to_string();
+                        self.push_system_message(format!("/update: {}", msg.trim_end()));
+                        Ok(AppAction::Continue)
+                    }
+                },
+            );
         }
 
         // /pairing approve (no args) — show usage

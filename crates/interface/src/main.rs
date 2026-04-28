@@ -188,15 +188,8 @@ enum Commands {
         #[command(subcommand)]
         action: Option<MigrateSubcommand>,
     },
-    /// Update borg to the latest release
-    Update {
-        /// Install latest pre-release/dev build instead of stable
-        #[arg(long)]
-        dev: bool,
-        /// Only check for updates, don't install
-        #[arg(long)]
-        check: bool,
-    },
+    /// Update borg to the latest released version
+    Update(commands::update_args::UpdateArgs),
     /// Manage projects (group related workflows and workstreams)
     Projects {
         #[command(subcommand)]
@@ -502,7 +495,9 @@ async fn async_main() -> Result<()> {
         Some(Commands::Away { message }) => commands::misc::run_away(message).await?,
         Some(Commands::Available) => commands::misc::run_available().await?,
         Some(Commands::Migrate { action }) => commands::misc::dispatch_migrate(action)?,
-        Some(Commands::Update { dev, check }) => commands::misc::run_update(dev, check).await?,
+        Some(Commands::Update(args)) => {
+            commands::misc::run_update(args.prerelease, args.check).await?
+        }
         Some(Commands::ClientToken { action }) => {
             commands::client_token::dispatch_client_token(action)?
         }
@@ -771,6 +766,84 @@ mod tests {
     }
 
     // -- Clap parsing tests --
+
+    // -- `borg update` parsing --
+
+    fn parse_update(args: &[&str]) -> commands::update_args::UpdateArgs {
+        let mut full = vec!["borg", "update"];
+        full.extend_from_slice(args);
+        let cli = match Cli::try_parse_from(full) {
+            Ok(c) => c,
+            Err(e) => panic!("parse failed: {e}"),
+        };
+        match cli.command {
+            Some(Commands::Update(a)) => a,
+            _ => panic!("expected Update subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_update_no_flags_is_default() {
+        let a = parse_update(&[]);
+        assert!(!a.prerelease);
+        assert!(!a.check);
+    }
+
+    #[test]
+    fn parse_update_prerelease_flag() {
+        assert!(parse_update(&["--prerelease"]).prerelease);
+        assert!(parse_update(&["--pre"]).prerelease);
+        assert!(parse_update(&["-p"]).prerelease);
+    }
+
+    #[test]
+    fn parse_update_dev_alias_back_compat() {
+        // --dev must still work for users with old muscle memory.
+        let a = parse_update(&["--dev"]);
+        assert!(a.prerelease);
+        assert!(!a.check);
+    }
+
+    #[test]
+    fn parse_update_check_flag() {
+        assert!(parse_update(&["--check"]).check);
+        assert!(parse_update(&["-c"]).check);
+    }
+
+    #[test]
+    fn parse_update_combined_short_flags() {
+        let a = parse_update(&["-pc"]);
+        assert!(a.prerelease);
+        assert!(a.check);
+    }
+
+    #[test]
+    fn parse_update_rejects_unknown_flag() {
+        let err = match Cli::try_parse_from(["borg", "update", "--bogus"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--bogus must error"),
+        };
+        assert!(
+            err.to_string().contains("bogus"),
+            "error must name token: {err}"
+        );
+    }
+
+    #[test]
+    fn update_help_does_not_advertise_dev_alias() {
+        // --help text for the subcommand must not show --dev (it's a hidden alias).
+        let err = match Cli::try_parse_from(["borg", "update", "--help"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--help should short-circuit with help output"),
+        };
+        let help = err.to_string();
+        assert!(
+            help.contains("--prerelease"),
+            "missing --prerelease: {help}"
+        );
+        assert!(help.contains("--check"), "missing --check: {help}");
+        assert!(!help.contains("--dev"), "--dev should be hidden: {help}");
+    }
 
     #[test]
     fn test_parse_settings_show() {

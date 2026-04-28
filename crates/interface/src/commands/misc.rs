@@ -64,16 +64,20 @@ pub(crate) fn run_doctor() -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn run_update(dev: bool, check: bool) -> Result<()> {
+pub(crate) async fn run_update(prerelease: bool, check: bool) -> Result<()> {
     let current = cortex::update::current_version();
     println!("Current version: {current}");
     println!(
         "Checking for updates{}...",
-        if dev { " (including pre-releases)" } else { "" }
+        if prerelease {
+            " (including pre-releases)"
+        } else {
+            ""
+        }
     );
 
     if check {
-        let release = cortex::update::fetch_latest_release(dev).await?;
+        let release = cortex::update::fetch_latest_release(prerelease).await?;
         let latest = release
             .tag_name
             .strip_prefix('v')
@@ -86,7 +90,7 @@ pub(crate) async fn run_update(dev: bool, check: bool) -> Result<()> {
         return Ok(());
     }
 
-    match cortex::update::perform_update(dev).await? {
+    match cortex::update::perform_update(prerelease).await? {
         cortex::update::UpdateResult {
             status: cortex::update::UpdateStatus::AlreadyUpToDate,
             current_version,

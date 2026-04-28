@@ -392,7 +392,8 @@ pub enum AppAction {
         actions: Vec<MigrateAction>,
     },
     SelfUpdate {
-        dev: bool,
+        prerelease: bool,
+        check: bool,
     },
     Uninstall,
     RunDoctor,
@@ -2701,30 +2702,63 @@ mod tests {
 
     // --- Update command ---
 
-    #[test]
-    fn update_command_returns_self_update() {
+    fn assert_self_update(input: &str, want_pre: bool, want_check: bool) {
         let mut app = make_app();
-        let result = app.handle_submit("/update").unwrap();
+        let result = app.handle_submit(input).unwrap();
+        match result {
+            AppAction::SelfUpdate { prerelease, check } => {
+                assert_eq!(prerelease, want_pre, "input {input:?}: prerelease");
+                assert_eq!(check, want_check, "input {input:?}: check");
+            }
+            _ => panic!("input {input:?}: expected SelfUpdate"),
+        }
+    }
+
+    #[test]
+    fn update_command_full_flag_matrix() {
+        let cases: &[(&str, bool, bool)] = &[
+            ("/update", false, false),
+            ("/update --prerelease", true, false),
+            ("/update --pre", true, false),
+            ("/update --dev", true, false),
+            ("/update -p", true, false),
+            ("/update --check", false, true),
+            ("/update -c", false, true),
+            ("/update -pc", true, true),
+            ("/update --prerelease --check", true, true),
+            ("/update --check --dev", true, true),
+        ];
+        for (input, pre, check) in cases {
+            assert_self_update(input, *pre, *check);
+        }
+    }
+
+    #[test]
+    fn update_command_unknown_flag_does_not_invoke_update() {
+        let mut app = make_app();
+        let result = app.handle_submit("/update --bogus").unwrap();
         assert!(
-            matches!(result, AppAction::SelfUpdate { dev: false }),
-            "/update should return SelfUpdate {{ dev: false }}"
+            matches!(result, AppAction::Continue),
+            "unknown flag must not trigger SelfUpdate"
+        );
+        assert!(
+            app.cells.iter().any(|c| matches!(
+                c,
+                HistoryCell::System { text } if text.starts_with("/update:")
+            )),
+            "expected a /update error message in transcript"
         );
     }
 
     #[test]
-    fn update_dev_command_returns_self_update_dev() {
+    fn update_command_does_not_swallow_similar_prefix() {
+        // `/updateXYZ` (no space) must NOT be treated as `/update`. Otherwise the
+        // prefix handler would silently eat unrelated user input.
         let mut app = make_app();
-        let result = app.handle_submit("/update --dev").unwrap();
+        let result = app.handle_submit("/updateNOPE").unwrap();
         assert!(
-            matches!(result, AppAction::SelfUpdate { dev: true }),
-            "/update --dev should return SelfUpdate {{ dev: true }}"
-        );
-
-        let mut app2 = make_app();
-        let result2 = app2.handle_submit("/update dev").unwrap();
-        assert!(
-            matches!(result2, AppAction::SelfUpdate { dev: true }),
-            "/update dev should return SelfUpdate {{ dev: true }}"
+            !matches!(result, AppAction::SelfUpdate { .. }),
+            "/updateNOPE must not match /update"
         );
     }
 

@@ -109,6 +109,23 @@ async fn fetch_latest_release_with_base(base_url: &str, dev: bool) -> Result<Rel
     }
 }
 
+/// Locate the platform asset URL on a release, rejecting any non-HTTPS scheme.
+///
+/// Extracted from `perform_update` so the security guard is unit-testable
+/// without standing up a network mock.
+pub fn select_asset_url<'a>(release: &'a ReleaseInfo, asset_name: &str) -> Result<&'a str> {
+    let url = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset_name)
+        .map(|a| a.browser_download_url.as_str())
+        .with_context(|| format!("No release asset found for {asset_name}"))?;
+    if !url.starts_with("https://") {
+        bail!("Refusing to download from non-HTTPS URL: {url}");
+    }
+    Ok(url)
+}
+
 /// Compare two semver strings. Returns true if `latest` is newer than `current`.
 pub fn is_newer(current: &str, latest: &str) -> bool {
     let parse = |v: &str| -> (Vec<u64>, Option<String>) {
@@ -179,17 +196,7 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
     let from_version = current.clone();
 
     let asset_name = platform_asset_name()?;
-
-    let asset_url = release
-        .assets
-        .iter()
-        .find(|a| a.name == asset_name)
-        .map(|a| &a.browser_download_url)
-        .with_context(|| format!("No release asset found for {asset_name}"))?;
-
-    if !asset_url.starts_with("https://") {
-        bail!("Refusing to download from non-HTTPS URL: {asset_url}");
-    }
+    let asset_url = select_asset_url(&release, &asset_name)?;
 
     let checksums_url = release
         .assets
@@ -416,6 +423,59 @@ fedcba987654  checksums.txt
         assert!(!release.prerelease);
         assert_eq!(release.assets.len(), 2);
         assert_eq!(release.assets[0].name, "borg-darwin-arm64.tar.gz");
+    }
+
+    fn release_with(asset_name: &str, url: &str) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: "v0.2.0".into(),
+            prerelease: false,
+            assets: vec![ReleaseAsset {
+                name: asset_name.into(),
+                browser_download_url: url.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_select_asset_url_accepts_https() {
+        let r = release_with(
+            "borg-darwin-arm64.tar.gz",
+            "https://example.com/borg-darwin-arm64.tar.gz",
+        );
+        let url = select_asset_url(&r, "borg-darwin-arm64.tar.gz").unwrap();
+        assert!(url.starts_with("https://"));
+    }
+
+    #[test]
+    fn test_select_asset_url_rejects_http() {
+        let r = release_with(
+            "borg-darwin-arm64.tar.gz",
+            "http://example.com/borg-darwin-arm64.tar.gz",
+        );
+        let err = select_asset_url(&r, "borg-darwin-arm64.tar.gz").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("non-HTTPS"),
+            "must surface the security reason, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_select_asset_url_rejects_file_scheme() {
+        // Defense-in-depth: a malicious release manifest must not be able to
+        // point us at a local path.
+        let r = release_with("borg-darwin-arm64.tar.gz", "file:///etc/passwd");
+        assert!(select_asset_url(&r, "borg-darwin-arm64.tar.gz").is_err());
+    }
+
+    #[test]
+    fn test_select_asset_url_missing_asset() {
+        let r = release_with(
+            "borg-darwin-arm64.tar.gz",
+            "https://example.com/borg-darwin-arm64.tar.gz",
+        );
+        let err = select_asset_url(&r, "borg-windows-x86_64.tar.gz").unwrap_err();
+        assert!(format!("{err:#}").contains("No release asset"));
     }
 
     #[test]

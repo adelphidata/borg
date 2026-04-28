@@ -38,7 +38,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/evolution", "Show evolution overview"),
     ("/card", "Print an ASCII share card"),
     ("/pairing", "Manage sender pairing"),
-    ("/update", "Update borg to latest version"),
+    (
+        "/update",
+        "Update borg (--prerelease for experimental, --check to dry-run)",
+    ),
     // Sessions
     ("/sessions", "Browse and load saved sessions"),
     ("/save", "Save current session"),
