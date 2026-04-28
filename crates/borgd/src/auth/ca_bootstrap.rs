@@ -16,10 +16,15 @@ use identity::{
 /// Composite material the daemon hands to the gRPC TLS layer.
 #[derive(Debug, Clone)]
 pub struct CaMaterial {
+    /// Root CA certificate (PEM).
     pub ca_cert_pem: String,
+    /// Root CA private key (PKCS#8 PEM).
     pub ca_key_pkcs8_pem: String,
+    /// Server leaf certificate (PEM).
     pub server_cert_pem: String,
+    /// Server leaf private key (PKCS#8 PEM).
     pub server_key_pkcs8_pem: String,
+    /// Serial number of the server cert in `internal_ca_certs`.
     pub server_cert_serial: i64,
 }
 

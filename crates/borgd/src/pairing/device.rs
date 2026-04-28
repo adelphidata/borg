@@ -33,7 +33,6 @@ use spake2::{Ed25519Group, Identity as SpakeIdentity, Password, Spake2};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-const PAIRING_INTENT: &str = "device";
 /// Identity strings bound into SPAKE2 — must match between daemon and client.
 const ID_DAEMON: &[u8] = b"borg-pair-daemon";
 const ID_CLIENT: &[u8] = b"borg-pair-client";
@@ -56,9 +55,13 @@ struct DaemonReply {
 /// State the bootstrap listener needs to mint client certs.
 #[derive(Clone)]
 pub struct BootstrapState {
+    /// Shared database handle for paired-device + cert writes.
     pub db: Arc<Mutex<Database>>,
+    /// Audit writer for pairing-related events.
     pub audit: AuditWriter,
+    /// Root CA certificate (PEM) returned to clients on success.
     pub ca_cert_pem: String,
+    /// Root CA private key (PEM) used to sign issued client certs.
     pub ca_key_pem: String,
 }
 
@@ -68,6 +71,7 @@ pub struct BootstrapListener {
 }
 
 impl BootstrapListener {
+    /// Construct a listener bound to `socket_path` on `serve`.
     pub fn new(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }
@@ -277,12 +281,17 @@ pub mod client {
 
     /// Result of a successful pairing.
     pub struct PairResult {
+        /// Root CA certificate (PEM) the client should trust.
         pub ca_cert_pem: String,
+        /// Newly minted client certificate (PEM).
         pub client_cert_pem: String,
+        /// Locally generated client private key (PEM).
         pub client_key_pem: String,
+        /// Unix-seconds expiry of the issued client cert.
         pub not_after: i64,
     }
 
+    /// Drive the client side of the pairing handshake against `socket_path`.
     pub async fn run(
         socket_path: &std::path::Path,
         code: &str,

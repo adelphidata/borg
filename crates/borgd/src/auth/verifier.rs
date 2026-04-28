@@ -15,10 +15,12 @@ use thiserror::Error;
 /// through the gRPC interceptor so every verify path has the same shape.
 #[derive(Debug, Clone, Copy)]
 pub struct PeerCtx {
+    /// Peer IP for TCP connections; `None` over UDS.
     pub peer_ip: Option<IpAddr>,
 }
 
 impl PeerCtx {
+    /// Empty peer context — useful for in-process or test call sites.
     pub const NONE: PeerCtx = PeerCtx { peer_ip: None };
 }
 
@@ -29,25 +31,36 @@ impl PeerCtx {
 /// `crate::auth::ca_bootstrap`.
 pub const RENEWAL_WINDOW_SECS: i64 = 14 * 24 * 60 * 60;
 
+/// Errors returned by [`Verifier`] implementations.
 #[derive(Debug, Error)]
 pub enum VerifierError {
+    /// Fingerprint was found in the revocation list.
     #[error("revoked fingerprint: {0}")]
     Revoked(String),
+    /// Fingerprint is not present in `paired_devices`.
     #[error("unknown device fingerprint: {0}")]
     UnknownDevice(String),
+    /// Stored fingerprint for a principal differs from the one observed.
     #[error("tofu pin mismatch for principal {principal_id}: expected {expected}, got {observed}")]
     TofuMismatch {
+        /// Principal whose pin failed.
         principal_id: String,
+        /// Pin currently stored for the principal.
         expected: String,
+        /// Pin observed on the connection.
         observed: String,
     },
+    /// Database access failed during verification.
     #[error("verifier db failure: {0}")]
     Db(String),
+    /// Tailscale status query failed during peer-IP enforcement.
     #[error("tailscale status query failed: {0}")]
     Tailscale(String),
 }
 
+/// Authenticates a peer by certificate fingerprint and returns the principal.
 pub trait Verifier: Send + Sync {
+    /// Verify `fingerprint` (optionally with a SAN URI hint) and return the principal id.
     fn verify(&self, fingerprint: &str, san_uri: Option<&str>) -> Result<String, VerifierError>;
 
     /// Verify with peer-connection context. Default delegates to `verify`
@@ -71,6 +84,7 @@ pub struct TofuVerifier {
 }
 
 impl TofuVerifier {
+    /// Build a TOFU verifier backed by the shared database handle.
     pub fn new(db: Arc<Mutex<Database>>) -> Self {
         Self { db }
     }

@@ -139,6 +139,7 @@ struct CachedStatus {
     peer_ips: HashSet<IpAddr>,
 }
 
+/// Verifier that wraps [`TofuVerifier`] and pins peers to current Tailscale IPs.
 pub struct TailscaleVerifier {
     inner: TofuVerifier,
     source: Arc<dyn TailscaleStatusSource>,
@@ -147,6 +148,7 @@ pub struct TailscaleVerifier {
 }
 
 impl TailscaleVerifier {
+    /// Construct a new Tailscale verifier wrapping `inner` with peer IP enforcement.
     pub fn new(inner: TofuVerifier, source: Arc<dyn TailscaleStatusSource>) -> Self {
         Self {
             inner,

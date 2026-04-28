@@ -3,10 +3,14 @@
 use anyhow::{anyhow, Result};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
+/// Server-side TLS material needed to build the daemon's gRPC `ServerTlsConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerCertMaterial {
+    /// Server leaf certificate (PEM).
     pub server_cert_pem: String,
+    /// Server leaf private key (PEM).
     pub server_key_pem: String,
+    /// Root CA certificate trusted for client mTLS (PEM).
     pub ca_cert_pem: String,
 }
 

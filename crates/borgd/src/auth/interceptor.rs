@@ -10,12 +10,16 @@ use tonic::{Request, Status};
 
 use super::verifier::{PeerCtx, Verifier, VerifierError};
 
+/// Authenticated peer identity attached to each gRPC request.
 #[derive(Debug, Clone)]
 pub struct Principal {
+    /// Stable principal identifier (e.g. paired device label).
     pub id: String,
+    /// SHA-256 fingerprint of the peer's leaf certificate (hex).
     pub fingerprint: String,
 }
 
+/// Build the tonic interceptor that authenticates peers via mTLS + verifier.
 pub fn auth_interceptor(
     verifier: Arc<dyn Verifier>,
     audit: AuditWriter,

@@ -32,6 +32,7 @@ pub struct PkiSvc {
 }
 
 impl PkiSvc {
+    /// Build the PKI gRPC service from the shared DB handle, audit writer, and CA material.
     pub fn new(
         db: Arc<Mutex<Database>>,
         audit: AuditWriter,
