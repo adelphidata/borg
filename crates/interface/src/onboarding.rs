@@ -46,6 +46,11 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
     ("groq", "Groq", "Ultra-fast inference"),
     ("ollama", "Ollama", "Run models locally"),
+    (
+        "claude-cli",
+        "Claude Code CLI",
+        "Use your Claude subscription via the local `claude` binary",
+    ),
 ];
 
 /// Model choices per provider.
@@ -136,6 +141,12 @@ pub(crate) const GROQ_MODELS: &[(&str, &str)] = &[
     ("llama-3.1-8b-instant", "Llama 3.1 8B Instant (fastest)"),
 ];
 
+pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
+    ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5 (fast, cheap)"),
+];
+
 pub(crate) const OLLAMA_MODELS: &[(&str, &str)] = &[
     ("llama3.3", "Llama 3.3 70B (recommended)"),
     ("qwen3", "Qwen3 (versatile)"),
@@ -170,6 +181,7 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
         "ollama" => OLLAMA_MODELS,
+        "claude-cli" => CLAUDE_CLI_MODELS,
         "openrouter" => {
             if let Some(live) = crate::openrouter_catalog::cached_models() {
                 return live;
@@ -853,6 +865,34 @@ mod tests {
         for (id, _) in GROQ_MODELS {
             assert!(validate_model_id(id).is_ok(), "groq model id invalid: {id}");
         }
+        for (id, _) in CLAUDE_CLI_MODELS {
+            assert!(
+                validate_model_id(id).is_ok(),
+                "claude-cli model id invalid: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_cli_provider_visible_in_onboarding() {
+        // Regression guard: CLAUDE.md and provider.rs both treat ClaudeCli as a
+        // first-class provider, but it was previously hidden from the wizard,
+        // so users with a Claude subscription couldn't pick it during onboarding.
+        // This pins the wiring so a future PROVIDERS rewrite can't drop it.
+        assert!(
+            PROVIDERS.iter().any(|(id, _, _)| *id == "claude-cli"),
+            "claude-cli must appear in onboarding PROVIDERS"
+        );
+        let models = models_for_provider("claude-cli");
+        assert!(
+            !models.is_empty(),
+            "claude-cli must surface a non-empty model list"
+        );
+        let provider = Provider::from_str("claude-cli").expect("claude-cli parses");
+        assert!(
+            !provider.requires_api_key(),
+            "claude-cli must not require an API key (uses local binary)"
+        );
     }
 
     #[test]

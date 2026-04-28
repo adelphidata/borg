@@ -4,7 +4,7 @@ Borg is an AI personal assistant agent built in Rust. The agent writes its own t
 
 ## Prerequisites
 
-- **LLM API key**: One of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, or a running Ollama instance (no key needed)
+- **LLM provider**: any one of — `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`; a running Ollama instance (no key needed); or the `claude` Code CLI installed on PATH (uses your existing Claude subscription, no API key needed)
 - **Linux**: `bwrap` (bubblewrap) for tool sandboxing — install via your package manager
 - **macOS**: `sandbox-exec` is included with the OS
 
@@ -60,7 +60,7 @@ This launches an interactive wizard that walks you through setup:
 
 1. **Welcome** — Your name + agent name
 2. **Security** — Security warning acknowledgment (required)
-3. **Provider** — Select LLM provider (OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Ollama)
+3. **Provider** — Select LLM provider (OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Ollama, Claude Code CLI)
 4. **Model** — Select model for the chosen provider
 5. **API Key** — Enter API key (auto-detects existing keys)
 6. **Channels** — Configure messaging channels (Telegram, Slack, Discord, etc.)
