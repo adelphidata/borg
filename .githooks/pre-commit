@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Pre-commit gate: refuse to commit if code isn't formatted or doesn't pass clippy.
+# Skipped automatically for doc-only changes (*.md, docs/**) and merge commits.
+# Bypass with `git commit --no-verify` (use sparingly).
+
+set -euo pipefail
+
+# Skip during merges/rebases/cherry-picks — let the operation finish first.
+if [ -e .git/MERGE_HEAD ] || [ -e .git/REBASE_HEAD ] || [ -e .git/CHERRY_PICK_HEAD ]; then
+    exit 0
+fi
+
+# Doc-only diff? skip.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -n "$staged" ] && ! printf '%s\n' "$staged" | grep -qvE '(\.md$|^docs/)'; then
+    echo "pre-commit: doc-only change, skipping fmt+clippy"
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check && cargo clippy -- -D warnings"
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings

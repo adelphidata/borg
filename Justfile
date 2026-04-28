@@ -30,6 +30,11 @@ check:
     cargo fmt --check
     cargo clippy -- -D warnings
 
+# Install the repo pre-commit hook (one-time setup)
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "pre-commit hook active (.githooks/pre-commit). Bypass with --no-verify."
+
 # Install local CI helpers (cargo-audit, cargo-deny)
 install-ci-tools:
     RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
