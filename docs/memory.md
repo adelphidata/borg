@@ -1,64 +1,89 @@
 # Memory
 
-Borg has a two-tier memory system modeled on how human memory works: short-term working memory for the current session, and long-term persistent memory stored in SQLite.
+Borg uses a three-layer memory model:
 
-## Architecture
+| Layer | Storage | Lifetime | Prompt role |
+|------|---------|----------|-------------|
+| **Working memory** | In-memory (`ShortTermMemory`) | Current session only | Dynamic suffix via `<working_memory>` |
+| **Knowledge files** | `~/.borg/memory/*.md` and `~/.borg/memory/scopes/<scope>/*.md` | Persistent until edited/removed | Stable prompt block via `<knowledge_files>` |
+| **Long-term memory** | `memory_entries` plus embeddings/chunks in `borg.db` | Persistent across sessions | Stable prompt block via `<long_term_memory>` |
 
-| Tier | Storage | Lifetime | Loaded |
-|------|---------|----------|--------|
-| **Short-term** | In-memory (`ShortTermMemory` struct) | Current session only | Dynamic suffix of system prompt |
-| **Long-term** | SQLite `memory_entries` table | Persistent across sessions | Stable prefix of system prompt |
-| **Identity** | `~/.borg/IDENTITY.md` (file) | Persistent | Always (system prompt prefix) |
-| **Heartbeat** | `~/.borg/HEARTBEAT.md` (file) | Persistent | Heartbeat turns only |
+`IDENTITY.md` and `HEARTBEAT.md` remain separate persistent files with their own loading rules.
 
-All long-term memory entries live in the `memory_entries` table with a `scope` + `name` unique key. No filesystem memory files — SQLite is the single source of truth.
+## Working memory
 
-> **Size limits.** `write_memory` rejects entries larger than 20,000 tokens and warns at 8,000. Oversized entries are silently dropped by the token-budget loader, so the cap fails loud at write time. See [Self-Healing](./self-healing.md#memory-entry-size-limits) for details.
+Session-scoped working memory accumulates facts during the conversation:
+
+- Fact categories: `Decision`, `Preference`, `TaskOutcome`, `CodeFact`, `Correction`
+- Budget-aware: oldest facts are evicted when the token budget is exceeded
+- Active project: tracks project context from the projects tool
+- Rendered as `<working_memory>` only when non-empty
+
+Working memory is never edited directly. On session end it flushes to a daily long-term entry, which later consolidation jobs can turn into curated durable memory.
+
+## Knowledge files
+
+Knowledge files are curated markdown notes stored under `~/.borg/memory/`.
+
+- `~/.borg/memory/MEMORY.md` is treated as the top-level index when present
+- Additional topic files can live alongside it
+- Scoped knowledge files live under `~/.borg/memory/scopes/<scope>/`
+- Knowledge files are loaded by relevance, not all at once
+
+The loader always tries to include `MEMORY.md` first, then adds the most relevant markdown files for the current query until the knowledge-file token budget is exhausted.
+
+Knowledge files are also included in `memory_search`, so they can be recalled on demand even if they were not auto-loaded into the prompt.
 
 ## Long-term memory
 
-### How loading works
+Long-term memory is stored in the database as named entries with a `scope + name` key.
 
-Each turn, the agent builds a memory context within a token budget:
+- `write_memory` and `read_memory` operate on these entries
+- Embeddings and chunks are generated from long-term memory entries for semantic retrieval
+- The memory loader always tries to include the `INDEX` entry first
+- Remaining entries are loaded by semantic ranking when embeddings are available, otherwise by recency
 
-1. The **INDEX** entry is loaded first (always included if it fits)
-2. Remaining entries are ranked by semantic similarity to the user's query, blended with recency
-3. Entries are included one by one until the token budget is exhausted
-4. Rendered as `<long_term_memory trust="stored">` in the system prompt stable prefix
+### Scopes
 
-### Semantic search
+Borg resolves long-term memory and knowledge files using:
 
-Embeddings are generated on `write_memory` and stored in SQLite. Entries are ranked by cosine similarity to the user's query, blended with recency. The system uses hybrid search combining BM25 keyword matching (30%) with vector similarity (70%).
+1. `global`
+2. the active configured scope, if `memory.memory_scope` is set
 
-When no results match a multi-word query, the search falls back to individual term matching (with a 0.7x score discount so term-level hits rank below phrase hits).
+Project-scoped entries such as `project:abc` are first-class. Scoped entries participate in both prompt loading and `memory_search`.
 
-Auto-detects embedding provider from API keys (OpenAI -> OpenRouter -> Gemini). Falls back to recency-only ranking when no provider is available.
+## Prompt loading
 
-### Configuration
+Each turn, Borg assembles memory in this order:
 
-```sh
-borg settings set memory.max_context_tokens 8000
-borg settings set memory.embeddings.enabled true
-borg settings set memory.embeddings.recency_weight 0.2    # 0.0=pure similarity, 1.0=pure recency
-borg settings set memory.embeddings.bm25_weight 0.3
-borg settings set memory.embeddings.vector_weight 0.7
-```
+1. Long-term memory entries in `<long_term_memory trust="stored">`
+2. Knowledge files in `<knowledge_files trust="curated">`
+3. Active retrieved memory in `<active_memory trust="retrieved">`, when enabled
+4. Session working memory in `<working_memory>`
 
-## Short-term memory
+`<active_memory>` is a per-turn search block keyed off the latest user message. It can pull from long-term memory, knowledge files, and session transcripts.
 
-Session-scoped working memory that accumulates facts during the conversation:
+## Memory search
 
-- **Fact categories**: Decision, Preference, TaskOutcome, CodeFact, Correction
-- **Budget-aware**: Evicts oldest facts when token limit exceeded (default: 2000 tokens)
-- **Active project**: Tracks the current project context from the projects tool
-- Rendered as `<working_memory>` in the system prompt dynamic suffix
-- Omitted entirely when empty (zero token cost)
+`memory_search` can search:
 
-Short-term memory is never written directly to long-term storage. Instead, it flushes to a daily log entry on session end, which the nightly consolidation job processes.
+- Long-term memory entries
+- Knowledge files
+- Past session transcripts when `sources=["messages"]`
+
+When searching long-term memory, Borg uses hybrid retrieval:
+
+- BM25 keyword matching
+- Vector similarity from embeddings
+- Optional MMR reranking for diversity
+
+When no multi-word query hits are found, Borg falls back to term-level FTS matches with a score discount so phrase matches still rank higher.
+
+Knowledge files use lightweight relevance scoring over filenames and content and are returned in the same result stream, labeled with a `knowledge:` prefix internally.
 
 ## Writing memory
 
-The agent uses the `write_memory` tool:
+The agent uses `write_memory` to create or append long-term memory entries:
 
 ```json
 {
@@ -69,62 +94,65 @@ The agent uses the `write_memory` tool:
 }
 ```
 
-- `filename`: entry name (`.md` suffix stripped automatically for backward compatibility)
+- `filename`: entry name (`.md` suffix is stripped for backward compatibility)
 - `content`: text to write
-- `append`: if `true`, appends to existing content
-- `scope`: `"global"` (default) or `"project:{id}"` for project-scoped memory
+- `append`: append instead of overwrite
+- `scope`: `global` by default, or a scope such as `project:<id>`
 
-### Injection scanning
+### Safety checks
 
-All memory writes are scanned for prompt injection patterns before persisting:
+All long-term memory writes are scanned for prompt-injection patterns before they are persisted:
 
-- **Prompt override**: "ignore previous instructions", "you are now", "system prompt override"
-- **Exfiltration**: curl/wget with secrets, credential harvesting
-- **Invisible Unicode**: zero-width spaces (U+200B), RTL overrides (U+202E), BOM (U+FEFF)
+- Prompt override phrases
+- Secret-exfiltration patterns
+- Dangerous invisible Unicode
 
-Writes containing these patterns are rejected with an error.
+Writes are rejected when these patterns are detected.
+
+### Size limits
+
+`write_memory` rejects entries larger than 20,000 tokens and warns at 8,000 tokens. This prevents oversized entries from being silently skipped later by prompt-budget loading.
 
 ## Reading memory
 
-The agent uses the `read_memory` tool:
+`read_memory` fetches a long-term memory entry by name and optional scope:
 
 ```json
 {
-  "filename": "user-preferences"
+  "filename": "user-preferences",
+  "scope": "global"
 }
 ```
 
-Returns the entry content, or a "not found" message.
+It returns the entry content or a friendly not-found message.
 
 ## Consolidation
 
 Memory consolidation runs as scheduled tasks:
 
-### Nightly (3 AM)
+### Nightly
 
-Reviews the day's sessions, extracts durable information, and either appends to existing long-term entries, creates new topic entries, or skips if already captured. Never duplicates existing information.
+Reviews the day’s session output, extracts durable facts, and appends or creates long-term topic entries without duplicating existing knowledge.
 
-### Weekly (4 AM Sunday)
+### Weekly
 
-Reviews all long-term entries for duplicates, outdated info, entries to merge, and verbose entries to tighten. Also prunes the embedding cache (entries not accessed in 30 days).
+Reviews long-term memory for duplicates, stale information, and merge opportunities, and prunes the embedding cache.
 
 ## IDENTITY.md
 
-The personality file is the only memory that stays as a filesystem file — it's loaded as the first part of the system prompt. The agent can modify its own personality by writing to `IDENTITY.md`. Changes persist across sessions.
-
-Created by `borg init` based on the chosen personality style.
+`IDENTITY.md` is not part of the general memory stores. It is loaded at the front of the system prompt and defines the assistant’s persistent personality and behavior.
 
 ## HEARTBEAT.md
 
-Optional checklist at `~/.borg/HEARTBEAT.md`. When present, it is injected into heartbeat agent turns. See [Heartbeat](heartbeat.md).
+`HEARTBEAT.md` is an optional checklist used only during heartbeat turns.
 
 ## Session persistence
 
-Conversations are saved to the SQLite database (`borg.db`). Each message is written immediately (crash recovery). Sessions track full message history, token usage, model, and auto-generated title.
+Conversations are saved in `borg.db` immediately for crash recovery. Session transcripts are searchable through `memory_search` when `sources=["messages"]` is requested or when active memory injection searches both memory and messages.
 
 ## Tips
 
-- Keep the INDEX entry as a concise index of what the agent knows
-- The agent will naturally organize topic entries as you interact with it
-- With embeddings enabled, the most relevant memories are loaded regardless of recency
-- Use project-scoped memory to keep project-specific context separate
+- Keep `INDEX` concise and high-signal
+- Keep `MEMORY.md` as a curated map of important knowledge files
+- Use scoped memory for project- or channel-specific context
+- Prefer topic-sized long-term entries over one huge catch-all note

@@ -22,7 +22,10 @@ use crate::internal_tag_filter::InternalTagFilter;
 use crate::llm::{LlmClient, StreamEvent, UsageData};
 use crate::llm_error::{classify_error_text, FailoverReason};
 use crate::logging::log_message;
-use crate::memory::{load_memory_context_db, load_memory_context_db_ranked};
+use crate::memory::{
+    load_knowledge_context, load_memory_context_db_ranked_scoped, load_memory_context_db_scoped,
+    resolved_memory_scopes,
+};
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{RateDecision, SessionRateGuard};
 use crate::secrets::redact_secrets;
@@ -72,6 +75,10 @@ fn parse_template(source: &str) -> Template {
 
 static MEMORY_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     parse_template("\n<long_term_memory trust=\"stored\">\n{{ memory }}\n</long_term_memory>\n")
+});
+
+static KNOWLEDGE_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
+    parse_template("\n<knowledge_files trust=\"curated\">\n{{ knowledge }}\n</knowledge_files>\n")
 });
 
 static SKILLS_TEMPLATE: LazyLock<Template> =
@@ -813,6 +820,7 @@ impl Agent {
     async fn build_system_prompt(&mut self) -> Result<String> {
         let identity = cache_or_load(&mut self.cached_identity, load_identity)?;
         let memory = self.load_memory_with_ranking().await?;
+        let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
 
         // === STABLE PREFIX (cache-friendly) ===
@@ -874,6 +882,13 @@ impl Agent {
                 &MEMORY_TEMPLATE
                     .render([("memory", memory.as_str())])
                     .context("memory template render failed")?,
+            );
+        }
+        if !knowledge.is_empty() {
+            system.push_str(
+                &KNOWLEDGE_TEMPLATE
+                    .render([("knowledge", knowledge.as_str())])
+                    .context("knowledge template render failed")?,
             );
         }
 
@@ -962,18 +977,10 @@ impl Agent {
         let max_tokens = self.config.memory.max_context_tokens;
 
         if !self.config.memory.embeddings.enabled {
-            return load_memory_context_db(max_tokens);
+            return load_memory_context_db_scoped(&self.config, max_tokens);
         }
 
-        // Extract the last user message as the query
-        let query = self
-            .history
-            .iter()
-            .rev()
-            .find(|m| m.role == crate::types::Role::User)
-            .and_then(|m| m.text_content())
-            .unwrap_or("")
-            .to_string();
+        let query = self.latest_user_query();
 
         // Short/trivial queries (acks like "ok", "next", "yes") won't produce
         // meaningful semantic rankings — skip the embedding round-trip and fall
@@ -982,7 +989,7 @@ impl Agent {
         const MIN_QUERY_CHARS_FOR_RANKING: usize = 10;
         let trimmed = query.trim();
         if trimmed.len() < MIN_QUERY_CHARS_FOR_RANKING {
-            return load_memory_context_db(max_tokens);
+            return load_memory_context_db_scoped(&self.config, max_tokens);
         }
 
         // Generate query embedding once for ranking
@@ -991,33 +998,50 @@ impl Agent {
                 Ok(result) => result,
                 Err(e) => {
                     tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
-                    return load_memory_context_db(max_tokens);
+                    return load_memory_context_db_scoped(&self.config, max_tokens);
                 }
             };
 
         let recency_weight = self.config.memory.embeddings.recency_weight;
         let qe_global = query_embedding;
         let rw = recency_weight;
+        let scopes = resolved_memory_scopes(&self.config);
 
         let ranking_result = tokio::task::spawn_blocking(move || {
-            crate::embeddings::rank_embeddings_by_similarity(&qe_global, "global", rw)
+            crate::embeddings::rank_embeddings_by_similarity_scoped(&qe_global, &scopes, rw)
         })
         .await;
 
         let global_rankings = match ranking_result {
             Ok(Ok(r)) if !r.is_empty() => r,
-            Ok(Ok(_)) => return load_memory_context_db(max_tokens),
+            Ok(Ok(_)) => return load_memory_context_db_scoped(&self.config, max_tokens),
             Ok(Err(e)) => {
                 tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
-                return load_memory_context_db(max_tokens);
+                return load_memory_context_db_scoped(&self.config, max_tokens);
             }
             Err(e) => {
                 tracing::debug!("Ranking task panicked, falling back to recency: {e}");
-                return load_memory_context_db(max_tokens);
+                return load_memory_context_db_scoped(&self.config, max_tokens);
             }
         };
 
-        load_memory_context_db_ranked(max_tokens, &global_rankings)
+        load_memory_context_db_ranked_scoped(&self.config, max_tokens, &global_rankings)
+    }
+
+    #[instrument(skip_all)]
+    async fn load_knowledge_with_ranking(&self) -> Result<String> {
+        let query = self.latest_user_query();
+        load_knowledge_context(&self.config, &query, self.config.memory.max_context_tokens / 2)
+    }
+
+    fn latest_user_query(&self) -> String {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::types::Role::User)
+            .and_then(|m| m.text_content())
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Pre-compaction flush: extract durable information from messages about to be dropped

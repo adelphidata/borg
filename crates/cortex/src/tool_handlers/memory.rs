@@ -4,7 +4,10 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::db::Database;
 use crate::embeddings;
-use crate::memory::{read_memory_db_or_not_found, write_memory_db, WriteMode};
+use crate::memory::{
+    read_memory_db_or_not_found, resolved_memory_scopes, search_knowledge_files, write_memory_db,
+    WriteMode,
+};
 use crate::mmr;
 
 use super::{
@@ -141,7 +144,8 @@ fn search_scope(
         .collect()
 }
 
-/// Execute hybrid memory search (FTS + vector) across global and local scopes.
+/// Execute hybrid memory search across long-term memory, markdown
+/// knowledge files, and optionally past session transcripts.
 ///
 /// `sources` selects the backing stores:
 /// - `["memory"]` (default): curated long-term memory entries via `memory_chunks_fts`.
@@ -169,7 +173,12 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         ));
     }
 
-    let mut all_results = Vec::new();
+    let mut all_results = if search_memory {
+        search_knowledge_files(config, query, max_results * 2, min_score)?
+    } else {
+        Vec::new()
+    };
+    let scopes = resolved_memory_scopes(config);
 
     // Pre-compute query embedding once for all scopes
     let query_embedding = embeddings::generate_query_embedding(config, query)
@@ -181,7 +190,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         tracing::debug!("memory_search: no embedding provider, falling back to FTS-only");
     }
 
-    for scope in &["global", "local", "extra", "sessions"] {
+    for scope in &scopes {
         all_results.extend(search_scope(
             &db,
             scope,
@@ -200,7 +209,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         if terms.len() > 1 {
             let mut seen: std::collections::HashSet<(String, i64)> =
                 std::collections::HashSet::new();
-            for scope in &["global", "local", "extra", "sessions"] {
+            for scope in &scopes {
                 for term in &terms {
                     let fts_rows = match db.fts_search(scope, term, max_results) {
                         Ok(rows) => rows,

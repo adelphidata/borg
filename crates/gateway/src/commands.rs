@@ -78,7 +78,7 @@ pub const GATEWAY_COMMANDS: &[CommandDef] = &[
     },
     CommandDef {
         name: "memory",
-        description: "Show memory files",
+        description: "Show memory inventory",
         accepts_args: false,
         pass_through: false,
     },
@@ -286,7 +286,7 @@ pub fn try_handle_command(
         Command::Skill => return None, // Pass through to agent
         Command::Skills => handle_skills(config),
         Command::WhoAmI => handle_whoami(sender_id, channel_name, db),
-        Command::Memory => handle_memory(),
+        Command::Memory => handle_memory(config),
         Command::Doctor => handle_doctor(config),
         Command::Pairing => handle_pairing(db, channel_name, sender_id),
         // Handled out-of-band in the caller; see `is_cancel_command`.
@@ -414,20 +414,26 @@ fn handle_whoami(sender_id: &str, channel_name: &str, db: &Database) -> String {
     format!("Sender: {sender_id}\nChannel: {channel_name}\nPairing: {status}")
 }
 
-fn handle_memory() -> String {
-    match cortex::memory::list_memory_files() {
-        Ok(files) if files.is_empty() => "No memory files.".to_string(),
-        Ok(files) => {
-            let mut lines = vec![format!("Memory files ({}):", files.len())];
-            for f in &files {
-                let size_kb = f.size_bytes as f64 / 1024.0;
-                lines.push(format!("  {}  ({:.1} KB)", f.filename, size_kb));
+fn handle_memory(config: &Config) -> String {
+    match cortex::memory::list_memory_inventory(config) {
+        Ok(items) if items.is_empty() => "No memory entries or knowledge files.".to_string(),
+        Ok(items) => {
+            let mut lines = vec![format!("Memory inventory ({}):", items.len())];
+            for item in &items {
+                let size_kb = item.size_bytes as f64 / 1024.0;
+                lines.push(format!(
+                    "  [{}:{}] {} ({:.1} KB)",
+                    item.store.label(),
+                    item.scope,
+                    item.name,
+                    size_kb
+                ));
             }
             lines.join("\n")
         }
         Err(e) => {
-            warn!("Failed to list memory files: {e}");
-            "Failed to list memory files.".to_string()
+            warn!("Failed to list memory inventory: {e}");
+            "Failed to list memory inventory.".to_string()
         }
     }
 }
@@ -870,6 +876,24 @@ mod tests {
 
     fn gateway_test_db() -> Database {
         Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn handle_memory_lists_inventory_across_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("BORG_DATA_DIR", tmp.path());
+
+        let db = cortex::db::Database::open().unwrap();
+        db.upsert_memory_entry("global", "shared-note", "saved fact")
+            .unwrap();
+        std::fs::write(tmp.path().join("memory.md"), "knowledge file").unwrap();
+
+        let out = handle_memory(&Config::default());
+        assert!(out.contains("Memory inventory"));
+        assert!(out.contains("[long-term:global] shared-note"));
+        assert!(out.contains("[knowledge:global] global/memory.md"));
+
+        std::env::remove_var("BORG_DATA_DIR");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use tracing::{debug, instrument};
 
 use crate::config::Config;
 use crate::constants::{HEARTBEAT_FILE, MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
+use crate::db::MemoryEntryRow;
 use crate::sanitize::escape_xml_attr;
 use crate::tokenizer::estimate_tokens;
 
@@ -16,6 +17,70 @@ pub enum WriteMode {
     Overwrite,
     /// Append to the existing file contents.
     Append,
+}
+
+/// Backing store for inspectable memory items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryStoreKind {
+    /// SQLite-backed durable long-term entry.
+    LongTerm,
+    /// Markdown knowledge file under `~/.borg/memory/`.
+    KnowledgeFile,
+}
+
+impl MemoryStoreKind {
+    /// Human-readable label for UI surfaces.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LongTerm => "long-term",
+            Self::KnowledgeFile => "knowledge",
+        }
+    }
+}
+
+/// Metadata for a memory item shown in `/memory`-style inspection UIs.
+#[derive(Debug, Clone)]
+pub struct MemoryListItem {
+    /// Entry/file name rendered to the user.
+    pub name: String,
+    /// Store backing the item.
+    pub store: MemoryStoreKind,
+    /// Logical scope label.
+    pub scope: String,
+    /// Byte size of the content.
+    pub size_bytes: u64,
+    /// Last update timestamp if known.
+    pub modified_at: Option<chrono::DateTime<chrono::Local>>,
+}
+
+/// Single markdown knowledge file under `~/.borg/memory/`.
+#[derive(Debug, Clone)]
+pub struct KnowledgeFileInfo {
+    /// Display path relative to the knowledge root, prefixed by scope.
+    pub name: String,
+    /// Scope the file belongs to.
+    pub scope: String,
+    /// Absolute on-disk path.
+    pub path: std::path::PathBuf,
+    /// Byte size of the file.
+    pub size_bytes: u64,
+    /// Last modified timestamp if known.
+    pub modified_at: Option<chrono::DateTime<chrono::Local>>,
+}
+
+fn resolved_scopes(config: &Config) -> Vec<String> {
+    let mut scopes = vec!["global".to_string()];
+    if let Some(scope) = config.memory.memory_scope.as_deref() {
+        if !scope.trim().is_empty() && scope != "global" {
+            scopes.push(scope.to_string());
+        }
+    }
+    scopes
+}
+
+/// Resolve the active long-term/knowledge scopes for the current config.
+pub fn resolved_memory_scopes(config: &Config) -> Vec<String> {
+    resolved_scopes(config)
 }
 
 // ── DB-Backed Memory API ──
@@ -300,6 +365,194 @@ pub fn load_memory_context_db_ranked_with(
     }
 }
 
+fn tokens_for_entry_scoped(
+    db: &crate::db::Database,
+    entry: &MemoryEntryRow,
+    cache: &std::collections::HashMap<(String, String), i64>,
+) -> usize {
+    if let Some(&cached) = cache.get(&(entry.scope.clone(), entry.name.clone())) {
+        if cached >= 0 {
+            return cached as usize;
+        }
+    }
+    let computed = estimate_tokens(&entry.content);
+    if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed as i64) {
+        tracing::warn!(
+            "failed to cache estimated_tokens for {}/{}: {e}",
+            entry.scope,
+            entry.name
+        );
+    }
+    computed
+}
+
+fn render_long_term_entry(entry: &MemoryEntryRow) -> String {
+    let safe_name = escape_xml_attr(&entry.name);
+    let safe_scope = escape_xml_attr(&entry.scope);
+    format!(
+        "<memory_entry scope=\"{safe_scope}\" name=\"{safe_name}\">\n{}\n</memory_entry>",
+        entry.content
+    )
+}
+
+fn load_entries_for_scopes(
+    db: &crate::db::Database,
+    scopes: &[String],
+) -> Result<Vec<MemoryEntryRow>> {
+    let mut entries = Vec::new();
+    for scope in scopes {
+        entries.extend(db.list_memory_entries(scope)?);
+    }
+    entries.sort_by(|a, b| {
+        if a.name == "INDEX" && b.name != "INDEX" {
+            std::cmp::Ordering::Less
+        } else if a.name != "INDEX" && b.name == "INDEX" {
+            std::cmp::Ordering::Greater
+        } else {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.scope.cmp(&b.scope))
+                .then_with(|| a.name.cmp(&b.name))
+        }
+    });
+    Ok(entries)
+}
+
+fn token_cache_for_scopes(
+    db: &crate::db::Database,
+    scopes: &[String],
+) -> std::collections::HashMap<(String, String), i64> {
+    let mut cache = std::collections::HashMap::new();
+    for scope in scopes {
+        match db.list_memory_tokens_map(scope) {
+            Ok(map) => {
+                for (name, tokens) in map {
+                    cache.insert((scope.clone(), name), tokens);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to load cached token estimates for scope {scope}, will recompute: {e}"
+                );
+            }
+        }
+    }
+    cache
+}
+
+/// Load long-term SQLite memory for the configured scopes.
+#[instrument(skip_all, fields(token_budget = max_tokens))]
+pub fn load_memory_context_db_scoped(config: &Config, max_tokens: usize) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
+    let db = crate::db::Database::open()?;
+    load_memory_context_db_scoped_with(&db, &resolved_scopes(config), max_tokens)
+}
+
+/// DB-passing form of [`load_memory_context_db_scoped`].
+pub fn load_memory_context_db_scoped_with(
+    db: &crate::db::Database,
+    scopes: &[String],
+    max_tokens: usize,
+) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
+    let entries = load_entries_for_scopes(db, scopes)?;
+    let token_cache = token_cache_for_scopes(db, scopes);
+    let mut parts = Vec::new();
+    let mut estimated_tokens = 0usize;
+    let mut index_loaded = false;
+
+    for entry in &entries {
+        if entry.name == "INDEX" {
+            if index_loaded {
+                continue;
+            }
+            index_loaded = true;
+        }
+        let tokens = tokens_for_entry_scoped(db, entry, &token_cache);
+        if estimated_tokens + tokens > max_tokens {
+            continue;
+        }
+        parts.push(render_long_term_entry(entry));
+        estimated_tokens += tokens;
+    }
+
+    Ok(parts.join("\n\n"))
+}
+
+/// Load long-term SQLite memory with scope-aware ranking.
+#[instrument(skip_all, fields(token_budget = max_tokens))]
+pub fn load_memory_context_db_ranked_scoped(
+    config: &Config,
+    max_tokens: usize,
+    ranked: &[(String, String, f32)],
+) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
+    let db = crate::db::Database::open()?;
+    load_memory_context_db_ranked_scoped_with(&db, &resolved_scopes(config), max_tokens, ranked)
+}
+
+/// DB-passing form of [`load_memory_context_db_ranked_scoped`].
+pub fn load_memory_context_db_ranked_scoped_with(
+    db: &crate::db::Database,
+    scopes: &[String],
+    max_tokens: usize,
+    ranked: &[(String, String, f32)],
+) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
+    let entries = load_entries_for_scopes(db, scopes)?;
+    let token_cache = token_cache_for_scopes(db, scopes);
+    let by_key: std::collections::HashMap<(String, String), usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| ((entry.scope.clone(), entry.name.clone()), idx))
+        .collect();
+    let mut parts = Vec::new();
+    let mut estimated_tokens = 0usize;
+    let mut loaded = std::collections::HashSet::new();
+
+    let mut try_push = |entry: &MemoryEntryRow| {
+        let key = (entry.scope.clone(), entry.name.clone());
+        if loaded.contains(&key) {
+            return;
+        }
+        let tokens = tokens_for_entry_scoped(db, entry, &token_cache);
+        if estimated_tokens + tokens > max_tokens {
+            return;
+        }
+        parts.push(render_long_term_entry(entry));
+        estimated_tokens += tokens;
+        loaded.insert(key);
+    };
+
+    if let Some(index) = entries
+        .iter()
+        .find(|entry| entry.scope == "global" && entry.name == "INDEX")
+        .or_else(|| entries.iter().find(|entry| entry.name == "INDEX"))
+    {
+        try_push(index);
+    }
+
+    for (scope, name, _score) in ranked {
+        if let Some(&idx) = by_key.get(&(scope.clone(), name.clone())) {
+            try_push(&entries[idx]);
+        }
+    }
+
+    for entry in &entries {
+        try_push(entry);
+    }
+
+    Ok(parts.join("\n\n"))
+}
+
 /// Delete a memory entry from the database.
 pub fn delete_memory_db(name: &str, scope: &str) -> Result<bool> {
     let db = crate::db::Database::open()?;
@@ -343,6 +596,293 @@ pub struct MemoryFileInfo {
     pub size_bytes: u64,
     /// Last update timestamp.
     pub modified_at: Option<chrono::DateTime<chrono::Local>>,
+}
+
+fn file_modified_at(path: &std::path::Path) -> Option<chrono::DateTime<chrono::Local>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(chrono::DateTime::<chrono::Local>::from(modified))
+}
+
+fn memory_dir_for_scope(root: &std::path::Path, scope: &str) -> std::path::PathBuf {
+    if scope == "global" {
+        root.to_path_buf()
+    } else {
+        root.join("scopes").join(scope)
+    }
+}
+
+fn memory_dir_prefix(scope: &str) -> String {
+    if scope == "global" {
+        "global".to_string()
+    } else {
+        format!("scope:{scope}")
+    }
+}
+
+fn scan_knowledge_files_in(
+    memory_dir: &std::path::Path,
+    scopes: &[String],
+) -> Result<Vec<KnowledgeFileInfo>> {
+    let mut items = Vec::new();
+    for scope in scopes {
+        let dir = memory_dir_for_scope(memory_dir, scope);
+        let prefix = memory_dir_prefix(scope);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || !path.extension().is_some_and(|e| e == "md") {
+                continue;
+            }
+            let filename = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            items.push(KnowledgeFileInfo {
+                name: format!("{prefix}/{filename}"),
+                scope: scope.clone(),
+                path,
+                size_bytes,
+                modified_at: file_modified_at(&entry.path()),
+            });
+        }
+    }
+    items.sort_by(|a, b| {
+        a.modified_at
+            .cmp(&b.modified_at)
+            .then_with(|| a.scope.cmp(&b.scope))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(items)
+}
+
+/// List markdown knowledge files under `~/.borg/memory/` for the resolved scopes.
+pub fn list_knowledge_files(config: &Config) -> Result<Vec<KnowledgeFileInfo>> {
+    scan_knowledge_files_in(&Config::memory_dir()?, &resolved_scopes(config))
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| {
+            term.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|term| term.len() >= 3)
+        .collect()
+}
+
+fn score_knowledge_file(query: &str, file_name: &str, content: &str) -> f32 {
+    let trimmed = query.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return 0.0_f32;
+    }
+
+    let content_lower = content.to_ascii_lowercase();
+    let name_lower = file_name.to_ascii_lowercase();
+    let mut score: f32 = 0.0;
+
+    if content_lower.contains(&trimmed) {
+        score += 0.8;
+    }
+    if name_lower.contains(&trimmed) {
+        score += 1.0;
+    }
+
+    for term in query_terms(query) {
+        if name_lower.contains(&term) {
+            score += 0.6;
+        }
+        if content_lower.contains(&term) {
+            score += 0.3;
+        }
+    }
+
+    score.min(1.0_f32)
+}
+
+fn make_snippet(content: &str, query: &str, max_chars: usize) -> String {
+    let trimmed = query.trim().to_ascii_lowercase();
+    let lower = content.to_ascii_lowercase();
+    let start = if trimmed.is_empty() {
+        0
+    } else {
+        lower.find(&trimmed).unwrap_or(0)
+    };
+    let start = content[..start]
+        .char_indices()
+        .last()
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    let snippet: String = content[start..].chars().take(max_chars).collect();
+    if snippet.chars().count() == content[start..].chars().count() {
+        snippet
+    } else {
+        format!("{snippet}…")
+    }
+}
+
+fn search_knowledge_files_in(
+    memory_dir: &std::path::Path,
+    scopes: &[String],
+    query: &str,
+    max_results: usize,
+    min_score: f32,
+) -> Result<Vec<crate::embeddings::SearchResult>> {
+    let files = scan_knowledge_files_in(memory_dir, scopes)?;
+    let mut results = Vec::new();
+    for file in files {
+        let content = match std::fs::read_to_string(&file.path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::debug!("Failed to read knowledge file {}: {e}", file.path.display());
+                continue;
+            }
+        };
+        let score = score_knowledge_file(query, &file.name, &content);
+        if score < min_score {
+            continue;
+        }
+        results.push(crate::embeddings::SearchResult {
+            filename: format!("knowledge:{}", file.name),
+            chunk_index: 0,
+            start_line: None,
+            end_line: None,
+            score,
+            snippet: make_snippet(&content, query, 500),
+        });
+    }
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.filename.cmp(&b.filename))
+    });
+    results.truncate(max_results);
+    Ok(results)
+}
+
+/// Search markdown knowledge files for the resolved scopes.
+pub fn search_knowledge_files(
+    config: &Config,
+    query: &str,
+    max_results: usize,
+    min_score: f32,
+) -> Result<Vec<crate::embeddings::SearchResult>> {
+    search_knowledge_files_in(
+        &Config::memory_dir()?,
+        &resolved_scopes(config),
+        query,
+        max_results,
+        min_score,
+    )
+}
+
+fn load_knowledge_context_in(
+    memory_dir: &std::path::Path,
+    scopes: &[String],
+    query: &str,
+    max_tokens: usize,
+) -> Result<String> {
+    if max_tokens == 0 {
+        return Ok(String::new());
+    }
+    let files = scan_knowledge_files_in(memory_dir, scopes)?;
+    let mut by_name = std::collections::HashMap::new();
+    for file in files {
+        by_name.insert(file.name.clone(), file);
+    }
+
+    let mut ordered_names = Vec::new();
+    if by_name.contains_key("global/MEMORY.md") {
+        ordered_names.push("global/MEMORY.md".to_string());
+    }
+
+    let ranked = search_knowledge_files_in(memory_dir, scopes, query, 12, 0.15)?;
+    for hit in ranked {
+        let name = hit.filename.trim_start_matches("knowledge:").to_string();
+        if !ordered_names.contains(&name) {
+            ordered_names.push(name);
+        }
+    }
+
+    let mut estimated_tokens = 0usize;
+    let mut parts = Vec::new();
+    for name in ordered_names {
+        let Some(file) = by_name.get(&name) else { continue };
+        let content = match std::fs::read_to_string(&file.path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::debug!("Failed to read knowledge file {}: {e}", file.path.display());
+                continue;
+            }
+        };
+        let tokens = estimate_tokens(&content);
+        if estimated_tokens + tokens > max_tokens {
+            continue;
+        }
+        let safe_name = escape_xml_attr(&name);
+        parts.push(format!(
+            "<knowledge_file path=\"{safe_name}\">\n{content}\n</knowledge_file>"
+        ));
+        estimated_tokens += tokens;
+    }
+
+    Ok(parts.join("\n\n"))
+}
+
+/// Load relevant markdown knowledge files for the current query.
+pub fn load_knowledge_context(config: &Config, query: &str, max_tokens: usize) -> Result<String> {
+    load_knowledge_context_in(
+        &Config::memory_dir()?,
+        &resolved_scopes(config),
+        query,
+        max_tokens,
+    )
+}
+
+/// List SQLite long-term memory and markdown knowledge files for `/memory`.
+pub fn list_memory_inventory(config: &Config) -> Result<Vec<MemoryListItem>> {
+    let db = crate::db::Database::open()?;
+    let scopes = resolved_scopes(config);
+    let mut items = Vec::new();
+
+    for scope in &scopes {
+        for entry in db.list_memory_entries(scope)? {
+            items.push(MemoryListItem {
+                name: entry.name,
+                store: MemoryStoreKind::LongTerm,
+                scope: scope.clone(),
+                size_bytes: entry.content.len() as u64,
+                modified_at: chrono::DateTime::<chrono::Utc>::from_timestamp(entry.updated_at, 0)
+                    .map(|dt| dt.with_timezone(&chrono::Local)),
+            });
+        }
+    }
+
+    for file in list_knowledge_files(config)? {
+        items.push(MemoryListItem {
+            name: file.name,
+            store: MemoryStoreKind::KnowledgeFile,
+            scope: file.scope,
+            size_bytes: file.size_bytes,
+            modified_at: file.modified_at,
+        });
+    }
+
+    items.sort_by(|a, b| {
+        a.modified_at
+            .cmp(&b.modified_at)
+            .then_with(|| a.store.label().cmp(b.store.label()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(items)
 }
 
 /// Check whether any component of `path` exactly matches an entry in `blocked`.
@@ -754,6 +1294,30 @@ mod tests {
     }
 
     #[test]
+    fn load_memory_context_db_scoped_includes_global_and_active_scope() {
+        let db = crate::db::Database::test_db();
+        db.upsert_memory_entry("global", "shared", "global marker")
+            .unwrap();
+        db.upsert_memory_entry("project:abc", "scoped", "project marker")
+            .unwrap();
+        db.upsert_memory_entry("project:other", "other", "other marker")
+            .unwrap();
+
+        let out = load_memory_context_db_scoped_with(
+            &db,
+            &["global".to_string(), "project:abc".to_string()],
+            100_000,
+        )
+        .unwrap();
+
+        assert!(out.contains("global marker"));
+        assert!(out.contains("project marker"));
+        assert!(!out.contains("other marker"));
+        assert!(out.contains("scope=\"global\""));
+        assert!(out.contains("scope=\"project:abc\""));
+    }
+
+    #[test]
     fn load_memory_context_db_ranked_order() {
         let db = crate::db::Database::test_db();
         db.upsert_memory_entry("global", "_r_first_", "content for first ENT_FIRST")
@@ -779,6 +1343,33 @@ mod tests {
     }
 
     #[test]
+    fn load_memory_context_db_ranked_scoped_prioritizes_scoped_hits() {
+        let db = crate::db::Database::test_db();
+        db.upsert_memory_entry("global", "g1", "global one").unwrap();
+        db.upsert_memory_entry("project:abc", "p1", "project one")
+            .unwrap();
+        db.upsert_memory_entry("project:abc", "p2", "project two")
+            .unwrap();
+
+        let ranked = vec![
+            ("project:abc".to_string(), "p2".to_string(), 0.9),
+            ("global".to_string(), "g1".to_string(), 0.5),
+        ];
+        let out = load_memory_context_db_ranked_scoped_with(
+            &db,
+            &["global".to_string(), "project:abc".to_string()],
+            100_000,
+            &ranked,
+        )
+        .unwrap();
+
+        let pos_p2 = out.find("project two").unwrap();
+        let pos_g1 = out.find("global one").unwrap();
+        assert!(pos_p2 < pos_g1);
+        assert!(out.contains("project one"));
+    }
+
+    #[test]
     fn load_memory_context_db_respects_budget() {
         let db = crate::db::Database::test_db();
         let big = "budgetword ".repeat(5000);
@@ -801,6 +1392,86 @@ mod tests {
         assert!(out.is_empty());
         let out = load_memory_context_db_ranked(0, &[]).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolved_memory_scopes_appends_active_scope_once() {
+        let mut config = Config::default();
+        config.memory.memory_scope = Some("project:abc".into());
+        assert_eq!(
+            resolved_memory_scopes(&config),
+            vec!["global".to_string(), "project:abc".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_knowledge_files_includes_global_and_scoped_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("MEMORY.md"), "# Memory Index").unwrap();
+        std::fs::create_dir_all(tmp.path().join("scopes/project:abc")).unwrap();
+        std::fs::write(
+            tmp.path().join("scopes/project:abc/notes.md"),
+            "project notes",
+        )
+        .unwrap();
+
+        let files = scan_knowledge_files_in(
+            tmp.path(),
+            &["global".to_string(), "project:abc".to_string()],
+        )
+        .unwrap();
+        let names = files.into_iter().map(|f| f.name).collect::<Vec<_>>();
+        assert!(names.contains(&"global/MEMORY.md".to_string()));
+        assert!(names.contains(&"scope:project:abc/notes.md".to_string()));
+    }
+
+    #[test]
+    fn search_knowledge_files_finds_scoped_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("architecture.md"), "Rust service architecture").unwrap();
+        std::fs::create_dir_all(tmp.path().join("scopes/project:abc")).unwrap();
+        std::fs::write(
+            tmp.path().join("scopes/project:abc/deploy.md"),
+            "deploy checklist for borgd",
+        )
+        .unwrap();
+
+        let hits = search_knowledge_files_in(
+            tmp.path(),
+            &["global".to_string(), "project:abc".to_string()],
+            "deploy borgd",
+            5,
+            0.15,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].filename.contains("knowledge:scope:project:abc/deploy.md"));
+    }
+
+    #[test]
+    fn load_knowledge_context_loads_index_then_relevant_hits() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("MEMORY.md"), "# Memory Index").unwrap();
+        std::fs::write(
+            tmp.path().join("deploy.md"),
+            "Deployment guide for the gateway service",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("misc.md"), "Unrelated content").unwrap();
+
+        let out = load_knowledge_context_in(
+            tmp.path(),
+            &["global".to_string()],
+            "deployment gateway",
+            100_000,
+        )
+        .unwrap();
+
+        let pos_index = out.find("# Memory Index").unwrap();
+        let pos_deploy = out.find("Deployment guide").unwrap();
+        assert!(pos_index < pos_deploy);
+        assert!(!out.contains("Unrelated content"));
+        assert!(out.contains("<knowledge_file path=\"global/MEMORY.md\">"));
     }
 
     #[test]

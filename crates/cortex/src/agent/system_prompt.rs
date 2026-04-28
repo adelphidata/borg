@@ -67,11 +67,11 @@ impl Agent {
     /// Build the `<tooling>` section listing available tools with summaries.
     pub(super) fn build_tooling_section(&self) -> String {
         let tool_summaries: &[(&str, &str)] = &[
-            ("write_memory", "Write/append to memory files"),
-            ("read_memory", "Read a memory file"),
+            ("write_memory", "Write/append long-term memory entries"),
+            ("read_memory", "Read a long-term memory entry"),
             (
                 "memory_search",
-                "Semantic search across memory and sessions",
+                "Search long-term memory, knowledge files, and sessions",
             ),
             ("list", "List resources (skills, channels, agents)"),
             ("apply_patch", "Create/update/delete files via patch DSL"),

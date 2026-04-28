@@ -423,8 +423,29 @@ pub fn rank_embeddings_by_similarity(
     scope: &str,
     recency_weight: f32,
 ) -> Result<Vec<(String, f32)>> {
+    let scoped = rank_embeddings_by_similarity_scoped(
+        query_embedding,
+        &[scope.to_string()],
+        recency_weight,
+    )?;
+    Ok(scoped
+        .into_iter()
+        .map(|(_scope, filename, score)| (filename, score))
+        .collect())
+}
+
+/// Rank memory entries across one or more scopes by similarity to a
+/// pre-computed query embedding.
+pub fn rank_embeddings_by_similarity_scoped(
+    query_embedding: &[f32],
+    scopes: &[String],
+    recency_weight: f32,
+) -> Result<Vec<(String, String, f32)>> {
     let db = Database::open()?;
-    let stored = db.get_all_embeddings(scope)?;
+    let mut stored = Vec::new();
+    for scope in scopes {
+        stored.extend(db.get_all_embeddings(scope)?);
+    }
 
     if stored.is_empty() {
         return Ok(Vec::new());
@@ -435,12 +456,12 @@ pub fn rank_embeddings_by_similarity(
     let max_time = stored.iter().map(|r| r.created_at).max().unwrap_or(0);
     let time_range = (max_time - min_time) as f32;
 
-    let mut scored: Vec<(String, f32)> = stored
+    let mut scored: Vec<(String, String, f32)> = stored
         .iter()
         .map(|row| {
             let stored_emb = match bytes_to_embedding(&row.embedding) {
                 Ok(emb) => emb,
-                Err(_) => return (row.filename.clone(), 0.0),
+                Err(_) => return (row.scope.clone(), row.filename.clone(), 0.0),
             };
             let similarity = cosine_similarity(query_embedding, &stored_emb);
             let recency_score = if time_range > 0.0 {
@@ -449,11 +470,11 @@ pub fn rank_embeddings_by_similarity(
                 1.0
             };
             let score = blended_score(similarity, recency_score, recency_weight);
-            (row.filename.clone(), score)
+            (row.scope.clone(), row.filename.clone(), score)
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored)
 }
 

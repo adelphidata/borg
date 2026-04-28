@@ -489,30 +489,33 @@ impl App<'_> {
     }
 
     fn cmd_memory_cleanup(&mut self) -> Result<AppAction> {
-        match cortex::memory::list_memory_files() {
-            Ok(files) => {
-                if files.is_empty() {
-                    self.push_system_message("No memory entries found.".to_string());
+        match cortex::memory::list_memory_inventory(&self.config) {
+            Ok(items) => {
+                if items.is_empty() {
+                    self.push_system_message("No memory entries or knowledge files found.".to_string());
                 } else {
-                    let mut text = String::from("Memory entries (oldest first):\n");
-                    for f in &files {
-                        let modified = f
+                    let mut text = String::from("Memory inventory (oldest first):\n");
+                    for item in &items {
+                        let modified = item
                             .modified_at
                             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                             .unwrap_or_else(|| "unknown".to_string());
                         text.push_str(&format!(
-                            "  {} ({} bytes, updated: {modified})\n",
-                            f.filename, f.size_bytes
+                            "  [{}:{}] {} ({} bytes, updated: {modified})\n",
+                            item.store.label(),
+                            item.scope,
+                            item.name,
+                            item.size_bytes
                         ));
                     }
                     text.push_str(
-                        "\nTo delete or update an entry, ask the agent to use write_memory.",
+                        "\nTo update a saved memory entry, ask the agent to use write_memory.",
                     );
                     self.push_system_message(text.trim_end().to_string());
                 }
             }
             Err(e) => {
-                self.push_system_message(format!("Error listing memory files: {e}"));
+                self.push_system_message(format!("Error listing memory inventory: {e}"));
             }
         }
         Ok(AppAction::Continue)
