@@ -27,8 +27,16 @@ fn test_workflows_active_auto_uses_model_heuristic() {
     config.llm.model = "claude-sonnet-4".to_string();
     assert!(!crate::workflow::workflows_active(&config));
 
-    // GPT-4o → workflows
+    // GPT-4o → no workflows (OpenAI model)
     config.llm.model = "gpt-4o".to_string();
+    assert!(!crate::workflow::workflows_active(&config));
+
+    // o3 → no workflows (OpenAI reasoning model)
+    config.llm.model = "o3".to_string();
+    assert!(!crate::workflow::workflows_active(&config));
+
+    // Open-source model → workflows
+    config.llm.model = "llama-3.3-70b".to_string();
     assert!(crate::workflow::workflows_active(&config));
 
     // Unknown → workflows

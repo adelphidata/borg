@@ -143,7 +143,7 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 ### Workflows
 
-Multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn. Persists in SQLite. Claude models skip workflows. `crates/cortex/src/workflow/`, `crates/cortex/src/db/workflow.rs`.
+Multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn. Persists in SQLite. Claude and OpenAI models skip workflows. `crates/cortex/src/workflow/`, `crates/cortex/src/db/workflow.rs`.
 
 ### Heartbeat
 

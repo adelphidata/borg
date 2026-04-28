@@ -1,19 +1,27 @@
 //! Model tiering for workflow auto-enable.
 //!
-//! All Claude models (Anthropic native and via OpenRouter) are considered strong
-//! enough to handle complex multi-step tasks without workflow scaffolding.
-//! All other models get workflows enabled by default.
+//! All Claude and OpenAI models (native and via OpenRouter) are considered
+//! strong enough to handle complex multi-step tasks without workflow
+//! scaffolding. All other models get workflows enabled by default.
 //! Users can override via `workflow.enabled = "on"` or `"off"` in settings.
 
 /// Model prefixes that do NOT need workflow scaffolding.
-/// All Claude models are exempt — they reliably manage long-running
-/// multi-step tasks without explicit structure.
-const NO_WORKFLOW_PREFIXES: &[&str] = &["claude-", "anthropic/claude-"];
+/// All Claude and OpenAI models are exempt — they reliably manage
+/// long-running multi-step tasks without explicit structure.
+const NO_WORKFLOW_PREFIXES: &[&str] = &[
+    "claude-",
+    "anthropic/claude-",
+    "gpt-",
+    "openai/",
+    "o1",
+    "o3",
+    "o4",
+];
 
 /// Returns `true` if the given model needs workflow scaffolding.
 ///
-/// All Claude models return `false`. Everything else — GPT, open-source
-/// models, unknown models — returns `true`.
+/// All Claude and OpenAI models return `false`. Everything else —
+/// open-source models, unknown models — returns `true`.
 pub fn model_needs_workflows(model: &str) -> bool {
     let lower = model.to_lowercase();
 
@@ -58,19 +66,26 @@ mod tests {
     }
 
     #[test]
-    fn test_openai_models_need_workflows() {
+    fn test_openai_models_no_workflows() {
         let models = [
             "gpt-4o",
             "gpt-4.1",
             "gpt-4o-mini",
+            "gpt-5",
+            "o1",
+            "o1-mini",
+            "o1-preview",
             "o3",
+            "o3-mini",
             "o4-mini",
             "openai/gpt-4o",
+            "openai/gpt-4.1",
+            "openai/o3-mini",
         ];
         for model in models {
             assert!(
-                model_needs_workflows(model),
-                "Expected {model} to need workflows"
+                !model_needs_workflows(model),
+                "Expected {model} to NOT need workflows (OpenAI model)"
             );
         }
     }
@@ -106,6 +121,8 @@ mod tests {
         assert!(!model_needs_workflows("Claude-Opus-4"));
         assert!(!model_needs_workflows("Claude-Sonnet-4"));
         assert!(!model_needs_workflows("Claude-Haiku-4"));
-        assert!(model_needs_workflows("GPT-4O"));
+        assert!(!model_needs_workflows("GPT-4O"));
+        assert!(!model_needs_workflows("O3"));
+        assert!(!model_needs_workflows("OpenAI/GPT-4o"));
     }
 }
