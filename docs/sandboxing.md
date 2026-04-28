@@ -88,9 +88,8 @@ The resolved binary path is included in the sandbox command.
 
 To disable sandboxing globally:
 
-```toml
-[sandbox]
-enabled = false
+```sh
+borg settings set sandbox.enabled false
 ```
 
-When disabled, tools run directly as subprocesses without isolation.
+When disabled, tools run directly as subprocesses without isolation. Config is DB-only; there is no `config.toml`.

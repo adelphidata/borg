@@ -8,7 +8,7 @@ afternoons.
 ## The daily maintenance task
 
 A scheduled task with `task_type = 'maintenance'` fires at **02:00 UTC**
-every day (cron `0 0 2 * * *`, seeded in V37, id
+every day (cron `0 0 2 * * *`, id
 `00000000-0000-4000-8000-ada1ca1e0001`). Seeded rows store
 `timezone = "local"`, which `calculate_next_run` treats as UTC (along
 with `""` and `"UTC"`) to preserve the original fire-time semantics.
@@ -191,7 +191,7 @@ borg has no plugin-system install for skills, so the directory contents
 are whatever the user put there. To catch post-install tampering, every
 `borg doctor` run (and the daily maintenance sweep) hashes each
 `SKILL.md` with SHA-256 and compares against the previous hash recorded
-in the `skill_audit` table (added in V39).
+in the `skill_audit` table.
 
 Model:
 
@@ -205,8 +205,8 @@ Model:
   `review content for supply-chain tampering`.
 
 Uninstalling a skill is a manual operation today (`rm -rf`); call
-`db.forget_skill_audit(name)` from a migration if you need a reinstall
-to be treated as first-seen rather than modified.
+`db.forget_skill_audit(name)` if you need a reinstall to be treated as
+first-seen rather than modified.
 
 The helper that drives this is
 `cortex::skill_security::audit_user_skills(&db, &dir)` — pure function,

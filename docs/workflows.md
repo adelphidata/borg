@@ -119,4 +119,5 @@ borg settings set workflow.enabled auto
 | `crates/cortex/src/workflow/tier.rs` | Model tiering heuristic |
 | `crates/cortex/src/db/workflow.rs` | All DB operations (workflows, steps, projects) |
 | `crates/cortex/src/tool_handlers/schedule.rs` | Tool handler dispatch |
-| `crates/interface/src/service.rs` | Daemon step execution |
+| `crates/borgd/src/task_runner.rs` | Daemon step execution |
+| `crates/borgd/src/orchestrator.rs` | Workflow orchestration tick |

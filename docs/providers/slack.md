@@ -102,4 +102,4 @@ group_activation = "mention"   # mention (default) | always
 slack = "open"    # trust Slack workspace auth (no pairing needed)
 ```
 
-Options: `pairing` (default), `open`, `disabled`. See [Configuration](../configuration.md#gateway) for details.
+Options: `pairing` (default), `open`, `disabled`. Manage via `borg settings set gateway.channel_policies.slack <value>`.

@@ -106,14 +106,6 @@ Flags:
 - `--yes` / `-y` — auto-approve all tool executions (skip confirmation prompts)
 - `--json` / `-j` — output response as JSON
 
-### Daemon mode
-
-```sh
-borg daemon
-```
-
-Run the agent in the background for scheduled tasks, heartbeat check-ins, and messaging gateway without the interactive TUI.
-
 ### System service
 
 ```sh
@@ -130,10 +122,13 @@ borg service status     # check service status
 | `borg ask "message"` | One-shot query |
 | `borg init` | Interactive onboarding wizard |
 | `borg doctor` | Run diagnostics |
-| `borg daemon` | Run background service |
-| `borg gateway` | Start webhook gateway standalone |
+| `borg status` | Show agent vitals and status |
+| `borg bond` | Show bond status and trust metrics |
 | `borg poke` | Trigger immediate heartbeat check-in |
+| `borg cancel` | Cancel the in-progress agent turn |
 | `borg tasks list/create/run/runs/status/pause/resume/delete` | Manage scheduled tasks |
+| `borg cron …` | Manage cron jobs (shell commands on a schedule) |
+| `borg projects …` | Manage projects (group related workflows) |
 | `borg pairing list/approve/revoke/approved` | Manage sender access |
 | `borg settings get/set/unset` | Manage settings |
 | `borg logs` | Show conversation history |
@@ -141,10 +136,20 @@ borg service status     # check service status
 | `borg add <name>` | Set up an integration's credentials |
 | `borg remove <name>` | Remove an integration's credentials |
 | `borg plugins` | List available integrations |
+| `borg providers …` | Manage LLM providers (BYO endpoints, rate-card refresh) |
+| `borg client-token …` | Manage bearer tokens for OpenAI-compat HTTP / MCP HTTP |
+| `borg webhook …` | Manage signed webhook definitions for `/v1/webhook/{name}` |
+| `borg mcp` | Run Borg as a Model Context Protocol (MCP) server |
+| `borg pair` / `borg revoke` | Pair / revoke a remote device over the mTLS bootstrap socket |
+| `borg audit` | Verify integrity of the audit chain |
+| `borg backup` / `borg restore` | Create / verify / restore a `BORG_HOME` backup tarball |
+| `borg export <session>` | Export a session to JSON, CSV, or TXT |
 | `borg away [message]` | Enable auto-reply |
 | `borg available` | Disable auto-reply |
 | `borg stop` / `borg restart` | Daemon lifecycle |
 | `borg service install/uninstall/status` | System service management |
+| `borg migrate` | Migrate settings from Hermes Agent or OpenClaw |
+| `borg update` | Update borg to the latest release |
 | `borg uninstall` | Delete all Borg data |
 
 ## What happens when you chat
@@ -158,9 +163,10 @@ borg service status     # check service status
 
 ## Next steps
 
-- [Configuration](configuration.md) — customize the provider, model, timeouts, and all settings
 - [Skills](skills.md) — instruction bundles for teaching the agent CLI workflows
 - [Memory](memory.md) — how the agent remembers things across sessions
 - [Heartbeat](heartbeat.md) — proactive check-ins and daemon mode
-- [Architecture](architecture.md) — how the codebase is structured
+- [Development](development.md) — how the codebase is structured + build/test workflow
 - [Providers](providers/) — setup guides for Telegram, Slack, Discord, and more
+
+Tunable settings are managed via `borg settings get/set/unset` (DB-only — no `config.toml`).

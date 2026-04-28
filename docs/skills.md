@@ -12,7 +12,7 @@ Skills are instruction bundles that teach the agent how to use external CLI tool
 
 ## Built-in skills
 
-Fifteen skills are embedded in the binary:
+Eighteen skills are embedded in the binary:
 
 | Skill | Requirements | Description |
 |-------|-------------|-------------|
@@ -31,6 +31,9 @@ Fifteen skills are embedded in the binary:
 | `email` | varies | Email operations |
 | `scheduler` | -- | Scheduled task management |
 | `paperclip` | `npx`, `curl` | Orchestrate multi-agent autonomous companies via the Paperclip control plane |
+| `linear` | `curl`, `jq`, `LINEAR_API_KEY` | Manage Linear issues, projects, and cycles via the GraphQL API |
+| `pdf` | `pdftotext` | Read, extract, split, and merge PDF files |
+| `reminders` | `reminders` (CLI) | Manage native macOS Reminders via reminders-cli |
 
 ## User skills
 

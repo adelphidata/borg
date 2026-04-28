@@ -98,7 +98,7 @@ Returns the entry content, or a "not found" message.
 
 ## Consolidation
 
-Memory consolidation runs as scheduled tasks (seeded on first migration to V34):
+Memory consolidation runs as scheduled tasks:
 
 ### Nightly (3 AM)
 
@@ -121,10 +121,6 @@ Optional checklist at `~/.borg/HEARTBEAT.md`. When present, it is injected into 
 ## Session persistence
 
 Conversations are saved to the SQLite database (`borg.db`). Each message is written immediately (crash recovery). Sessions track full message history, token usage, model, and auto-generated title.
-
-## Migration from filesystem memory
-
-V34 migration automatically imports existing `~/.borg/MEMORY.md` and `~/.borg/memory/*.md` files into the `memory_entries` table. Original files are renamed to `.bak`. The `memory/daily/` directory files are also imported.
 
 ## Tips
 

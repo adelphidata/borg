@@ -96,7 +96,7 @@ group_activation = "mention"   # mention (default) | always
 telegram = "pairing"   # pairing (default) | open | disabled
 ```
 
-See [Configuration](../configuration.md#gateway) for details on the pairing system.
+Manage via `borg settings set gateway.channel_policies.telegram <value>`. See [getting-started.md](../getting-started.md) and `borg pairing --help` for the pairing flow.
 
 ### Telegram-specific tuning
 

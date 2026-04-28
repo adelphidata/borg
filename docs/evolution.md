@@ -28,7 +28,7 @@ gates transition at **Lvl.80** (lowered from 99 — the n^1.8 curve made 99 a
 hard cap**: levels past 99 cost a flat 50 XP each, giving long-term users an
 ongoing reason to engage.
 
-Autonomy is **not** derived from stage — it's a separate concept owned by the Bond module (`crates/cortex/src/bond.rs`, `AutonomyTier` with 5 variants: `ObserveOnly`, `Recommend`, `DraftAssist`, `GuidedAction`, `HighTrust`) driven by bond score. See `docs/bond.md`.
+Autonomy is **not** derived from stage — it's a separate concept owned by the Bond module (`crates/cortex/src/bond/`, `AutonomyTier` in `bond/types.rs` with 5 variants: `ObserveOnly`, `Recommend`, `DraftAssist`, `GuidedAction`, `HighTrust`) driven by bond score.
 
 Source: `crates/cortex/src/evolution/mod.rs` (`Stage` enum), `crates/cortex/src/evolution/share_card.rs`.
 
@@ -385,7 +385,7 @@ hmac_content = "{event_type}|{xp_delta}|{archetype}|{source}|{created_at}|{prev_
 | `mood_changed` | 0 | Ambient-header mood flipped. Metadata: `{from_mood, to_mood, reason}` |
 | `share_card_created` | 0 | `/card` rendered. Metadata: `{card_id, kind}` |
 
-### `evolution_events` Schema (V24)
+### `evolution_events` Schema
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -472,6 +472,6 @@ Always returns `Continue` except at `BeforeAgentStart` / `BeforeLlmCall`.
 | `crates/cortex/src/evolution/helpers.rs` | Mood computation, momentum windows |
 | `crates/cortex/src/evolution/hmac.rs` | HMAC chain helpers |
 | `crates/cortex/src/evolution/replay.rs` | Event replay → state |
-| `crates/cortex/src/db.rs` | V24 migration, `evolution_events` CRUD |
+| `crates/cortex/src/db/` | `evolution_events` schema + CRUD |
 | `crates/interface/src/main.rs` | `borg status` integration |
 | `crates/interface/src/tui/mod.rs`, `crates/interface/src/repl.rs` | `EvolutionHook` registration |
