@@ -37,10 +37,16 @@ impl Hook for ActivityHook {
         };
         match &ctx.data {
             HookData::SessionStart { .. } => {
-                let _ = db.log_activity("info", "session", "New session started", None);
+                if let Err(e) = db.log_activity("info", "session", "New session started", None) {
+                    tracing::debug!("activity_log: session_start record failed: {e}");
+                }
             }
             HookData::Error { message } => {
-                let _ = db.log_activity("error", "agent", &format!("Agent error: {message}"), None);
+                if let Err(e) =
+                    db.log_activity("error", "agent", &format!("Agent error: {message}"), None)
+                {
+                    tracing::debug!("activity_log: agent_error record failed: {e}");
+                }
             }
             _ => {}
         }
