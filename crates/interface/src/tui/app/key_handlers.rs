@@ -24,26 +24,25 @@ use super::{
 
 impl<'a> App<'a> {
     // ------------------------------------------------------------
-    // Scroll primitives.
+    // Scroll primitives — inert in inline-viewport mode.
     //
-    // Single source of truth for transcript scrolling. All handlers
-    // (Ctrl+B/F/U/D, PageUp/Down, Home/End, wheel via KeyCode::Up/Down,
-    // Rule B wheel-from-bottom) go through these to keep
-    // `scroll_offset` / `auto_scroll` / `max_scroll` in sync.
-    //   - `auto_scroll = true` iff `scroll_offset == 0` (at bottom).
-    //   - Scrolling up clamps to `max_scroll()`.
-    //   - Reaching offset 0 while scrolling down re-enables auto-scroll.
+    // The terminal owns scrollback now (xterm Alternate Scroll Mode +
+    // `insert_before`), so the app no longer maintains a scroll model.
+    // These methods are kept as no-ops so existing callers in
+    // render.rs/events.rs still compile while Track B finishes its
+    // cleanup pass; once those are migrated the methods can be deleted
+    // outright.
     // ------------------------------------------------------------
 
-    /// Max scrollable offset given current transcript area + total lines.
+    /// Inert: app-side scrolling is delegated to the terminal.
+    #[allow(dead_code)] // retained for symmetry with Ctrl+B/F/U/D callers
     fn max_scroll(&self) -> usize {
-        self.total_lines
-            .saturating_sub(self.transcript_area.height as usize)
+        0
     }
 
-    /// Viewport height (row count), minimum 1 to avoid zero-step scrolls.
+    /// Inert: viewport height is owned by the terminal.
     fn viewport_height(&self) -> usize {
-        (self.transcript_area.height as usize).max(1)
+        0
     }
 
     /// Half viewport height (ceiling), minimum 1.
@@ -51,39 +50,18 @@ impl<'a> App<'a> {
         ((self.transcript_area.height as usize).saturating_add(1) / 2).max(1)
     }
 
-    /// Scroll up by `lines`, clamped to `max_scroll()`. Disables auto-scroll
-    /// when the transcript is actually scrollable.
-    fn scroll_up_by(&mut self, lines: usize) {
-        let max = self.max_scroll();
-        if max == 0 {
-            return;
-        }
-        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
-        self.auto_scroll = false;
-    }
+    /// Inert no-op (see module comment).
+    fn scroll_up_by(&mut self, _lines: usize) {}
 
-    /// Scroll down by `lines`. Re-enables auto-scroll on reaching the bottom.
-    fn scroll_down_by(&mut self, lines: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
-        if self.scroll_offset == 0 {
-            self.auto_scroll = true;
-        }
-    }
+    /// Inert no-op (see module comment).
+    fn scroll_down_by(&mut self, _lines: usize) {}
 
-    /// Jump to the top of the transcript (max scroll offset).
-    fn scroll_to_top(&mut self) {
-        let max = self.max_scroll();
-        if max > 0 {
-            self.scroll_offset = max;
-            self.auto_scroll = false;
-        }
-    }
+    /// Inert no-op (see module comment).
+    #[allow(dead_code)] // End-key handler removed; kept for Track B parity
+    fn scroll_to_top(&mut self) {}
 
-    /// Jump to the bottom of the transcript, re-enabling auto-scroll.
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
-        self.auto_scroll = true;
-    }
+    /// Inert no-op (see module comment).
+    fn scroll_to_bottom(&mut self) {}
 
     /// Enter backtrack-selection mode if there are any past user messages.
     /// Returns `true` when the mode was entered.
@@ -699,90 +677,14 @@ impl<'a> App<'a> {
         }
 
         // ------------------------------------------------------------
-        // Up / Down arrow routing — three-tier heuristic.
+        // Up / Down / Page / Home / End fall through to the composer.
         // ------------------------------------------------------------
-        // ⚠ DO NOT collapse these tiers. The three-tier split is
-        // load-bearing: removing Rule B regresses trackpad/mouse-
-        // wheel scrolling (happened in bf78752). Removing Rule C
-        // regresses shell-style history recall.
-        //
-        // Mouse-wheel/trackpad events arrive as KeyCode::Up/Down
-        // via xterm Alternate Scroll Mode (?1007h) — they are
-        // **indistinguishable** from keyboard arrows. We use
-        // composer state to guess intent:
-        //
-        // Routing rules (evaluated top to bottom):
-        //   A. scroll_offset > 0 → Up/Down scroll the transcript
-        //      line-by-line (continue scrolling once started).
-        //   B. composer empty & not browsing history → Up starts
-        //      scrolling (wheel-from-bottom), Down is a no-op.
-        //      This makes trackpad/wheel work naturally from the
-        //      bottom of the transcript.
-        //   C. Otherwise (composer has text or is browsing history)
-        //      → Up/Down navigate composer history (shell-like
-        //      recall of previously sent messages).
-        //
-        // Escape hatches:
-        //   - Ctrl+P / Ctrl+N always navigate composer history,
-        //     regardless of scroll state or composer contents.
-        //   - PageUp / PageDown always scroll the transcript.
+        // Inline-viewport mode delegates transcript scrolling to the
+        // terminal (xterm Alternate Scroll Mode). The composer's
+        // history navigation handles Up/Down; PageUp/PageDown/Home/End
+        // are no-ops at the App level — the terminal owns scrolling.
+        // Ctrl+P / Ctrl+N remain the explicit history-recall keys.
         // ------------------------------------------------------------
-        match key.code {
-            KeyCode::End => {
-                self.scroll_to_bottom();
-                return Ok(AppAction::Continue);
-            }
-            KeyCode::Home => {
-                self.scroll_to_top();
-                return Ok(AppAction::Continue);
-            }
-            KeyCode::PageUp => {
-                self.scroll_up_by(self.viewport_height());
-                return Ok(AppAction::Continue);
-            }
-            KeyCode::PageDown => {
-                self.scroll_down_by(self.viewport_height());
-                return Ok(AppAction::Continue);
-            }
-            KeyCode::Up if key.modifiers.is_empty() && self.scroll_offset > 0 => {
-                if self.max_scroll() > 0 {
-                    self.scroll_up_by(1);
-                    return Ok(AppAction::Continue);
-                }
-                // No scrollable content — fall through to composer.
-            }
-            KeyCode::Down if key.modifiers.is_empty() && self.scroll_offset > 0 => {
-                self.scroll_down_by(1);
-                return Ok(AppAction::Continue);
-            }
-
-            // Rule B: composer idle at bottom → treat as wheel scroll.
-            // ⚠ REGRESSION GUARD — DO NOT REMOVE Rule B.
-            // Without this, trackpad/mouse-wheel scroll breaks: wheel
-            // events (delivered as KeyCode::Up/Down via ?1007h) would
-            // navigate composer history instead of scrolling the
-            // transcript. This regressed in bf78752. If you need
-            // keyboard Up to recall history from an empty composer,
-            // use Ctrl+P/Ctrl+N instead — those always work.
-            KeyCode::Up
-                if key.modifiers.is_empty()
-                    && self.composer.is_empty()
-                    && !self.composer.is_browsing_history() =>
-            {
-                self.scroll_up_by(1);
-                return Ok(AppAction::Continue);
-            }
-            KeyCode::Down
-                if key.modifiers.is_empty()
-                    && self.composer.is_empty()
-                    && !self.composer.is_browsing_history() =>
-            {
-                // Already at bottom with empty composer — nothing to do.
-                return Ok(AppAction::Continue);
-            }
-
-            _ => {}
-        }
 
         if let Some(text) = self.composer.handle_key(key) {
             return self.handle_submit(&text);

@@ -687,6 +687,7 @@ impl<'a> Composer<'a> {
     /// Returns `true` if the composer is in history-browse mode
     /// (i.e. the user pressed Up/Ctrl+P to browse previously submitted
     /// messages and has not yet edited or cleared the recalled text).
+    #[allow(dead_code)] // used only in tests after inline-viewport port stripped Rule A/B
     pub fn is_browsing_history(&self) -> bool {
         self.history.is_browsing()
     }
