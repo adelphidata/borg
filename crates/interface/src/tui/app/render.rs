@@ -858,10 +858,7 @@ pub(super) fn build_borg_card_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::history::HistoryCell;
     use cortex::config::Config;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
     use std::time::Instant;
 
     fn make_app() -> App<'static> {

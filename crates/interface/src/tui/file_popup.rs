@@ -368,10 +368,11 @@ mod tests {
         use ratatui::buffer::Buffer;
         let area = Rect::new(0, 0, 40, 10);
         let mut buffer = Buffer::empty(area);
-        let mut frame = super::super::custom_terminal::Frame::__test_new(&mut buffer);
         let composer_area = Rect::new(0, 8, 40, 2);
-        popup.render(&mut frame, composer_area);
-        drop(frame);
+        {
+            let mut frame = super::super::custom_terminal::Frame::__test_new(&mut buffer);
+            popup.render(&mut frame, composer_area);
+        }
 
         let mut found = false;
         for y in 0..buffer.area().height {

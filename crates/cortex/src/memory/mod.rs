@@ -635,7 +635,7 @@ fn scan_knowledge_files_in(
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if !path.is_file() || !path.extension().is_some_and(|e| e == "md") {
+            if !path.is_file() || path.extension().is_none_or(|e| e != "md") {
                 continue;
             }
             let filename = path
@@ -815,7 +815,9 @@ fn load_knowledge_context_in(
     let mut estimated_tokens = 0usize;
     let mut parts = Vec::new();
     for name in ordered_names {
-        let Some(file) = by_name.get(&name) else { continue };
+        let Some(file) = by_name.get(&name) else {
+            continue;
+        };
         let content = match std::fs::read_to_string(&file.path) {
             Ok(content) => content,
             Err(e) => {
@@ -1345,7 +1347,8 @@ mod tests {
     #[test]
     fn load_memory_context_db_ranked_scoped_prioritizes_scoped_hits() {
         let db = crate::db::Database::test_db();
-        db.upsert_memory_entry("global", "g1", "global one").unwrap();
+        db.upsert_memory_entry("global", "g1", "global one")
+            .unwrap();
         db.upsert_memory_entry("project:abc", "p1", "project one")
             .unwrap();
         db.upsert_memory_entry("project:abc", "p2", "project two")
@@ -1428,7 +1431,11 @@ mod tests {
     #[test]
     fn search_knowledge_files_finds_scoped_match() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("architecture.md"), "Rust service architecture").unwrap();
+        std::fs::write(
+            tmp.path().join("architecture.md"),
+            "Rust service architecture",
+        )
+        .unwrap();
         std::fs::create_dir_all(tmp.path().join("scopes/project:abc")).unwrap();
         std::fs::write(
             tmp.path().join("scopes/project:abc/deploy.md"),
@@ -1445,7 +1452,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].filename.contains("knowledge:scope:project:abc/deploy.md"));
+        assert!(hits[0]
+            .filename
+            .contains("knowledge:scope:project:abc/deploy.md"));
     }
 
     #[test]

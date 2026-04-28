@@ -1031,7 +1031,11 @@ impl Agent {
     #[instrument(skip_all)]
     async fn load_knowledge_with_ranking(&self) -> Result<String> {
         let query = self.latest_user_query();
-        load_knowledge_context(&self.config, &query, self.config.memory.max_context_tokens / 2)
+        load_knowledge_context(
+            &self.config,
+            &query,
+            self.config.memory.max_context_tokens / 2,
+        )
     }
 
     fn latest_user_query(&self) -> String {

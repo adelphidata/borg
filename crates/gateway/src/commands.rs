@@ -886,7 +886,9 @@ mod tests {
         let db = cortex::db::Database::open().unwrap();
         db.upsert_memory_entry("global", "shared-note", "saved fact")
             .unwrap();
-        std::fs::write(tmp.path().join("memory.md"), "knowledge file").unwrap();
+        let memory_dir = tmp.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("memory.md"), "knowledge file").unwrap();
 
         let out = handle_memory(&Config::default());
         assert!(out.contains("Memory inventory"));

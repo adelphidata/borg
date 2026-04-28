@@ -492,7 +492,9 @@ impl App<'_> {
         match cortex::memory::list_memory_inventory(&self.config) {
             Ok(items) => {
                 if items.is_empty() {
-                    self.push_system_message("No memory entries or knowledge files found.".to_string());
+                    self.push_system_message(
+                        "No memory entries or knowledge files found.".to_string(),
+                    );
                 } else {
                     let mut text = String::from("Memory inventory (oldest first):\n");
                     for item in &items {

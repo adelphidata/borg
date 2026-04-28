@@ -1717,7 +1717,6 @@ async fn run_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::Command;
 
     /// Forbidden escape-sequence modes. Presence of ANY of these in the code
     /// paths that emit ANSI to the terminal will break native text selection.

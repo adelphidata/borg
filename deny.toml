@@ -10,6 +10,10 @@ ignore = [
     # via tungstenite -> async-tungstenite -> chromiumoxide. Does not apply
     # to our usage; revisit when upstream chain updates.
     "RUSTSEC-2026-0097",
+    # rustls-pemfile is unmaintained — functionality moved into rustls-pki-types.
+    # Pulled transitively (reqwest/rustls-native-certs); revisit when upstream
+    # deps drop it.
+    "RUSTSEC-2025-0134",
 ]
 
 [licenses]
