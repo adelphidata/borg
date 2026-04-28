@@ -362,7 +362,7 @@ fn check_secrets(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                         let hint = if config.llm.api_key.is_some() {
                             "plaintext .env still present — consider removing it"
                         } else {
-                            "plaintext API keys in .env — move to the macOS keychain and set llm.api_key via a SecretRef exec source in settings (e.g., `security find-generic-password -s borg -w`)"
+                            "plaintext API keys in .env — move them into the OS keychain and set llm.api_key via a SecretRef keychain source in settings"
                         };
                         checks.push(DiagnosticCheck::warn(
                             "Secrets",

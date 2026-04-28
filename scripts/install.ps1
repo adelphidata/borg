@@ -35,19 +35,36 @@ function Write-Err     { param([string]$Msg) Write-Host "  $Msg" -ForegroundColo
 
 # ── Uninstall ──
 
+function Test-Interactive {
+    return [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+}
+
 if ($Uninstall) {
-    $binary = Join-Path $InstallDir $BinaryName
+    # Prefer the resolved binary on PATH; fall back to InstallDir.
+    $resolved = Get-Command $BinaryName -ErrorAction SilentlyContinue
+    $binary = if ($resolved) { $resolved.Source } else { Join-Path $InstallDir $BinaryName }
     if (Test-Path $binary) {
         Remove-Item $binary -Force
         Write-Success "Removed $binary"
+        $daemon = Join-Path (Split-Path $binary -Parent) "borgd.exe"
+        if (Test-Path $daemon) {
+            Remove-Item $daemon -Force
+            Write-Success "Removed $daemon"
+        }
     } else {
-        Write-Warn "No borg binary found at $binary"
+        Write-Warn "No borg binary found"
     }
-    $answer = Read-Host "  Remove data directory $DataDir? [y/N]"
-    if ($answer -eq "y") {
-        if (Test-Path $DataDir) {
-            Remove-Item $DataDir -Recurse -Force
-            Write-Success "Removed $DataDir"
+    if (Test-Path $DataDir) {
+        if (Test-Interactive) {
+            $answer = Read-Host "  Remove data directory $DataDir? [y/N]"
+            if ($answer -eq "y") {
+                Remove-Item $DataDir -Recurse -Force
+                Write-Success "Removed $DataDir"
+            } else {
+                Write-Info "Kept $DataDir"
+            }
+        } else {
+            Write-Info "Kept $DataDir (non-interactive mode)"
         }
     }
     exit 0
@@ -69,6 +86,21 @@ if ($Version -eq "latest") {
 
 Write-Info "Installing borg $tag..."
 
+# ── Existing-version short-circuit ──
+
+$existingBinary = Get-Command $BinaryName -ErrorAction SilentlyContinue
+if ($existingBinary) {
+    $existingVersion = (& $existingBinary.Source --version 2>$null) -split '\s+' | Select-Object -Index 1
+    if ($existingVersion) {
+        $tagNoV = $tag -replace '^v',''
+        if ($existingVersion -eq $tagNoV) {
+            Write-Success "Already installed and up to date (borg $existingVersion)"
+            exit 0
+        }
+        Write-Info "Found existing borg $existingVersion at $($existingBinary.Source)"
+    }
+}
+
 # ── Download ──
 
 $asset = "borg-windows-x86_64.zip"
@@ -82,24 +114,28 @@ $checksumPath = Join-Path $tmpDir "checksums.txt"
 Write-Info "Downloading $asset..."
 Invoke-WebRequest -Uri "$baseUrl/$asset" -OutFile $archivePath -UseBasicParsing
 
-# Checksum verification
+# Checksum verification — a missing checksums.txt likely means a tampered or
+# incomplete release, so treat network failure as fatal (matches install.sh).
 try {
     Invoke-WebRequest -Uri "$baseUrl/checksums.txt" -OutFile $checksumPath -UseBasicParsing
-    $checksumLine = Get-Content $checksumPath | Where-Object { $_ -match $asset }
-    if ($checksumLine) {
-        $expected = ($checksumLine -split "\s+")[0]
-        $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
-        if ($actual -ne $expected) {
-            Write-Err "Checksum mismatch! Expected: $expected Got: $actual"
-            exit 1
-        }
-        Write-Success "Checksum verified"
-    } else {
-        Write-Warn "No checksum entry for $asset -- skipping verification"
-    }
 } catch {
-    Write-Warn "Could not download checksums -- skipping verification"
+    Write-Err "Failed to download checksums.txt -- cannot verify binary integrity."
+    Write-Err "This may indicate a network issue or a tampered release."
+    exit 1
 }
+$checksumLine = Get-Content $checksumPath | Where-Object { $_ -match $asset }
+if (-not $checksumLine) {
+    Write-Err "No checksum entry found for $asset in checksums.txt"
+    Write-Err "The release may be incomplete or corrupted."
+    exit 1
+}
+$expected = ($checksumLine -split "\s+")[0]
+$actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $expected) {
+    Write-Err "Checksum mismatch! Expected: $expected Got: $actual"
+    exit 1
+}
+Write-Success "Checksum verified"
 
 # ── Extract & install ──
 
@@ -126,8 +162,9 @@ if (Test-Path $daemonBinary) {
 # ── PATH setup ──
 
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-$pathEntries = $userPath -split ";"
-if ($InstallDir -notin $pathEntries) {
+$normalizedTarget = $InstallDir.TrimEnd('\','/').ToLowerInvariant()
+$pathEntries = ($userPath -split ";") | ForEach-Object { $_.TrimEnd('\','/').ToLowerInvariant() }
+if ($normalizedTarget -notin $pathEntries) {
     [Environment]::SetEnvironmentVariable("PATH", "$userPath;$InstallDir", "User")
     $env:PATH = "$env:PATH;$InstallDir"
     Write-Success "Added $InstallDir to user PATH (restart your terminal to take effect)"
@@ -140,9 +177,16 @@ if ($InstallDir -notin $pathEntries) {
 Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # ── Onboarding ──
-
-if (-not $NoOnboarding) {
-    Write-Host ""
-    Write-Info "Running borg init..."
-    & (Join-Path $InstallDir $BinaryName) init
+# Settings live in ~/.borg/borg.db (DB-only). Use DB existence as the gate so
+# reinstalls don't re-launch the wizard over a configured system. Skip when
+# non-interactive (e.g. `iex` pipelines) — `borg init` would block on stdin.
+$dbPath = Join-Path $DataDir "borg.db"
+if (-not (Test-Path $dbPath)) {
+    if (-not $NoOnboarding -and (Test-Interactive)) {
+        Write-Host ""
+        Write-Info "Running borg init..."
+        & (Join-Path $InstallDir $BinaryName) init
+    } else {
+        Write-Info "Run 'borg init' to complete setup"
+    }
 }

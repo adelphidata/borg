@@ -61,6 +61,10 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
                 );
                 db.mark_cert_revoked(row.serial, Some("kek-key-missing-self-heal"))
                     .context("revoke orphaned root CA")?;
+                // Server-cert revocation is handled by the unconditional
+                // sweep below — running it on every fresh-root mint also
+                // covers crash recovery (process died between the two
+                // revoke calls).
             }
             Err(e) => return Err(anyhow!("load root CA key from keychain: {e}")),
         }
@@ -80,6 +84,21 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
         meta.not_after,
     )
     .context("persist root CA")?;
+
+    // Any active server cert here was issued by the previous root and is now
+    // chained to a revoked CA. Sweep it so the next `ensure_server_cert`
+    // mints a fresh leaf under the new root. Idempotent: a no-op on first
+    // boot when there are no server rows yet.
+    if let Some(srv) = db
+        .latest_active_cert("server")
+        .context("query server cert after root rotation")?
+    {
+        db.mark_cert_revoked(srv.serial, Some("root-ca-rotated-self-heal"))
+            .context("revoke server cert chained to rotated CA")?;
+        if let Err(e) = kek.delete(SERVER_CERT_KEY) {
+            tracing::warn!(error = %e, "drop orphaned server KEK key after root rotation");
+        }
+    }
 
     Ok((root.cert_pem, root.key_pkcs8_pem))
 }
@@ -226,6 +245,32 @@ mod tests {
             "old cert should no longer be the latest active"
         );
         assert_eq!(active.pem, new_pem);
+    }
+
+    #[test]
+    fn root_self_heal_also_revokes_server_cert() {
+        // If only the root key is missing but the server key is intact, the
+        // pre-fix code would mint a new CA, then `ensure_server_cert` would
+        // see a still-active server row + valid key and reuse it — yielding
+        // a leaf chained to a CA that no longer exists. The cascade in
+        // `ensure_root_ca` must revoke the server row too.
+        let kek = MemoryKekStore::new();
+        let d = db();
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let san = vec!["localhost".to_string()];
+        let (orig_server, _, orig_serial) =
+            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("server");
+
+        // Lose only the root CA key.
+        kek.delete(ROOT_CA_KEY).expect("wipe root key");
+
+        let (new_ca_pem, new_ca_key) = ensure_root_ca(&d, &kek).expect("self-heal ca");
+        assert_ne!(ca_pem, new_ca_pem);
+
+        let (new_server, _, new_serial) =
+            ensure_server_cert(&d, &kek, &new_ca_pem, &new_ca_key, &san).expect("server re-issue");
+        assert_ne!(orig_server, new_server, "server cert must be re-issued");
+        assert_ne!(orig_serial, new_serial);
     }
 
     #[test]

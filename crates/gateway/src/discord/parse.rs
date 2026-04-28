@@ -23,9 +23,8 @@ pub fn parse_interaction(interaction: &Interaction) -> Option<InboundMessage> {
 
     let text = match &interaction.interaction_type {
         InteractionType::ApplicationCommand => extract_command_text(interaction),
-        InteractionType::MessageComponent | InteractionType::ModalSubmit => {
-            interaction.data.as_ref().and_then(|d| d.custom_id.clone())
-        }
+        InteractionType::MessageComponent => extract_component_text(interaction),
+        InteractionType::ModalSubmit => extract_modal_text(interaction),
         InteractionType::ApplicationCommandAutocomplete | InteractionType::Unknown(_) => {
             return None;
         }
@@ -105,6 +104,49 @@ fn extract_command_text(interaction: &Interaction) -> Option<String> {
     data.name.clone()
 }
 
+fn extract_component_text(interaction: &Interaction) -> Option<String> {
+    let data = interaction.data.as_ref()?;
+    if let Some(values) = &data.values {
+        let selected: Vec<&str> = values
+            .iter()
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .collect();
+        if !selected.is_empty() {
+            return Some(selected.join("\n"));
+        }
+    }
+    data.custom_id.clone()
+}
+
+fn extract_modal_text(interaction: &Interaction) -> Option<String> {
+    let data = interaction.data.as_ref()?;
+    let custom_id = data.custom_id.as_deref()?;
+    let mut lines = vec![format!("[Modal: {custom_id}]")];
+    if let Some(rows) = &data.components {
+        for row in rows {
+            collect_modal_fields(&row.components, &mut lines);
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+fn collect_modal_fields(
+    components: &[crate::discord::types::InteractionComponent],
+    lines: &mut Vec<String>,
+) {
+    for component in components {
+        if component.component_type == 4 {
+            if let (Some(custom_id), Some(value)) = (&component.custom_id, &component.value) {
+                lines.push(format!("{custom_id}: {value}"));
+            }
+        }
+        if !component.components.is_empty() {
+            collect_modal_fields(&component.components, lines);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +189,8 @@ mod tests {
                 value: serde_json::Value::String("What is Rust?".into()),
             }]),
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -167,6 +211,8 @@ mod tests {
             name: Some("help".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -190,6 +236,8 @@ mod tests {
                 },
             ]),
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -207,6 +255,8 @@ mod tests {
                 value: serde_json::Value::Number(42.into()),
             }]),
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -214,13 +264,31 @@ mod tests {
     }
 
     #[test]
-    fn message_component_uses_custom_id() {
+    fn message_component_select_uses_values() {
+        let mut interaction = make_interaction(InteractionType::MessageComponent);
+        interaction.data = Some(InteractionData {
+            id: None,
+            name: None,
+            options: None,
+            custom_id: Some("select_topics".into()),
+            values: Some(vec!["rust".into(), "lifetimes".into()]),
+            components: None,
+        });
+
+        let msg = parse_interaction(&interaction).unwrap();
+        assert_eq!(msg.text, "rust\nlifetimes");
+    }
+
+    #[test]
+    fn message_component_button_falls_back_to_custom_id() {
         let mut interaction = make_interaction(InteractionType::MessageComponent);
         interaction.data = Some(InteractionData {
             id: None,
             name: None,
             options: None,
             custom_id: Some("btn_confirm".into()),
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -228,17 +296,70 @@ mod tests {
     }
 
     #[test]
-    fn modal_submit_uses_custom_id() {
+    fn modal_submit_formats_field_values() {
         let mut interaction = make_interaction(InteractionType::ModalSubmit);
         interaction.data = Some(InteractionData {
             id: None,
             name: None,
             options: None,
             custom_id: Some("feedback_form".into()),
+            values: None,
+            components: Some(vec![
+                InteractionComponentRow {
+                    components: vec![InteractionComponent {
+                        component_type: 4,
+                        custom_id: Some("name".into()),
+                        value: Some("Alice".into()),
+                        components: Vec::new(),
+                    }],
+                },
+                InteractionComponentRow {
+                    components: vec![InteractionComponent {
+                        component_type: 4,
+                        custom_id: Some("comment".into()),
+                        value: Some("Great build".into()),
+                        components: Vec::new(),
+                    }],
+                },
+            ]),
         });
 
         let msg = parse_interaction(&interaction).unwrap();
-        assert_eq!(msg.text, "feedback_form");
+        assert_eq!(
+            msg.text,
+            "[Modal: feedback_form]\nname: Alice\ncomment: Great build"
+        );
+    }
+
+    #[test]
+    fn modal_submit_ignores_non_text_components() {
+        let mut interaction = make_interaction(InteractionType::ModalSubmit);
+        interaction.data = Some(InteractionData {
+            id: None,
+            name: None,
+            options: None,
+            custom_id: Some("feedback_form".into()),
+            values: None,
+            components: Some(vec![InteractionComponentRow {
+                components: vec![
+                    InteractionComponent {
+                        component_type: 3,
+                        custom_id: Some("topic".into()),
+                        value: Some("rust".into()),
+                        components: Vec::new(),
+                    },
+                    InteractionComponent {
+                        component_type: 4,
+                        custom_id: Some("comment".into()),
+                        value: Some("Great build".into()),
+                        components: Vec::new(),
+                    },
+                ],
+            }]),
+        });
+
+        let msg = parse_interaction(&interaction).unwrap();
+        assert_eq!(msg.text, "[Modal: feedback_form]\ncomment: Great build");
     }
 
     #[test]
@@ -261,6 +382,8 @@ mod tests {
             name: Some("ask".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
         interaction.member = Some(GuildMember {
             user: Some(DiscordUser {
@@ -281,6 +404,8 @@ mod tests {
             name: Some("ask".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
         interaction.member = None;
         interaction.user = Some(DiscordUser {
@@ -306,6 +431,8 @@ mod tests {
             name: Some("hello".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         let msg = parse_interaction(&interaction).unwrap();
@@ -322,6 +449,8 @@ mod tests {
             name: Some("ask".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         assert!(parse_interaction(&interaction).is_none());
@@ -348,6 +477,8 @@ mod tests {
             name: Some("hello".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
         let group_msg = parse_interaction(&group).unwrap();
         assert_eq!(group_msg.peer_kind.as_deref(), Some(PEER_KIND_GROUP));
@@ -365,6 +496,8 @@ mod tests {
             name: Some("hello".into()),
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
         let dm_msg = parse_interaction(&dm).unwrap();
         assert_eq!(dm_msg.peer_kind.as_deref(), Some(PEER_KIND_DIRECT));
@@ -379,6 +512,8 @@ mod tests {
             name: None,
             options: None,
             custom_id: None,
+            values: None,
+            components: None,
         });
 
         assert!(parse_interaction(&interaction).is_none());

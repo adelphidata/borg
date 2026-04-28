@@ -103,7 +103,6 @@ borg ask "What's the weather in Tokyo?"
 Send a single message, get a response, and exit.
 
 Flags:
-- `--yes` / `-y` — auto-approve all tool executions (skip confirmation prompts)
 - `--json` / `-j` — output response as JSON
 
 ### System service

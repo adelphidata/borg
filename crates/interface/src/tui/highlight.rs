@@ -102,30 +102,6 @@ pub fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
     out
 }
 
-/// Highlight a single line of code. Returns the inline spans (no line wrapper).
-///
-/// Used by diff rendering to colorize context lines. Unknown languages
-/// return a single cyan span matching the current code-style treatment.
-pub fn highlight_inline(code: &str, lang: &str) -> Vec<Span<'static>> {
-    let ss = syntax_set();
-    let Some(syntax) = find_syntax(ss, lang) else {
-        return vec![Span::styled(code.to_string(), theme::dim())];
-    };
-    let theme_ref = active_theme();
-    let mut h = HighlightLines::new(syntax, theme_ref);
-    match h.highlight_line(code, ss) {
-        Ok(regions) => regions
-            .into_iter()
-            .map(|(style, text)| Span::styled(text.to_string(), conv_style(style)))
-            .filter(|s| !s.content.is_empty())
-            .collect(),
-        Err(e) => {
-            tracing::warn!(%e, "syntect inline highlight failed");
-            vec![Span::styled(code.to_string(), theme::dim())]
-        }
-    }
-}
-
 fn fallback_lines(code: &str) -> Vec<Line<'static>> {
     code.lines()
         .map(|l| Line::from(Span::styled(l.to_string(), theme::code_style())))
@@ -173,23 +149,6 @@ mod tests {
         let lines = highlight_code_block("", "rust");
         // Either no lines or a single empty line — never panic, never crash.
         assert!(lines.len() <= 1);
-    }
-
-    #[test]
-    fn inline_highlight_unknown_lang_returns_dim_span() {
-        let spans = highlight_inline("some text", "totally-fake");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].style, theme::dim());
-    }
-
-    #[test]
-    fn inline_highlight_rust_multi_span() {
-        let spans = highlight_inline("let x = 1;", "rust");
-        assert!(
-            spans.len() > 1,
-            "expected multiple spans for rust, got {}",
-            spans.len()
-        );
     }
 
     #[test]

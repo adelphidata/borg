@@ -87,9 +87,6 @@ enum Commands {
     Ask {
         /// The message to send
         message: String,
-        /// Auto-approve all tool/shell calls (no user prompts)
-        #[arg(long, short)]
-        yes: bool,
         /// Output raw JSON instead of streaming text
         #[arg(long, short)]
         json: bool,
@@ -459,10 +456,9 @@ async fn async_main() -> Result<()> {
         Some(Commands::Init) => init_data_dir()?,
         Some(Commands::Ask {
             message,
-            yes,
             json,
             mode,
-        }) => repl::one_shot(&message, yes, json, mode.as_deref()).await?,
+        }) => repl::one_shot(&message, json, mode.as_deref()).await?,
         Some(Commands::Status { action }) => commands::status::dispatch_status(action)?,
         Some(Commands::Bond { action }) => commands::status::dispatch_bond(action)?,
         Some(Commands::Doctor) => commands::misc::run_doctor()?,
@@ -576,28 +572,83 @@ async fn is_onboarded_async() -> bool {
     // boolean settings row — safe to do directly without migrations.
     match read_onboarded_sentinel(&db_path) {
         Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("is_onboarded: direct DB read failed: {e}");
+        Err(SentinelError::Transient(e)) => {
+            // Lock contention / IO blip: assume onboarded so a transient
+            // daemon-write race doesn't re-prompt the wizard and clobber
+            // existing state.
+            tracing::warn!("is_onboarded: transient DB read failure ({e}); assuming onboarded");
+            true
+        }
+        Err(SentinelError::Fatal(e)) => {
+            // Corrupt DB / missing schema / not-a-database: there's nothing
+            // to clobber, and re-running the wizard is the recovery path.
+            tracing::warn!("is_onboarded: DB unusable ({e}); will re-run onboarding");
             false
         }
     }
 }
 
+enum SentinelError {
+    /// SQLITE_BUSY / SQLITE_LOCKED / IO — likely recovers on next run.
+    Transient(anyhow::Error),
+    /// SQLITE_CORRUPT / SQLITE_NOTADB / missing `settings` table — DB is
+    /// effectively empty for our purposes; safe to re-onboard.
+    Fatal(anyhow::Error),
+}
+
+impl std::fmt::Display for SentinelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SentinelError::Transient(e) | SentinelError::Fatal(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Best-effort read of the `onboarded` settings row without running
-/// migrations or contending with the daemon's writer connection. Returns
-/// `false` if the table or row is missing (i.e. genuinely fresh install).
-fn read_onboarded_sentinel(db_path: &std::path::Path) -> anyhow::Result<bool> {
+/// migrations or contending with the daemon's writer connection.
+///
+/// Distinguishes three cases:
+/// - row present and "true" → onboarded
+/// - row absent or != "true" → not onboarded
+/// - DB locked / query error → returns `Err` (caller decides; see above)
+///
+/// Sets a busy_timeout so a mid-write daemon (BEGIN IMMEDIATE / checkpoint)
+/// doesn't immediately surface as `SQLITE_BUSY`.
+fn read_onboarded_sentinel(db_path: &std::path::Path) -> Result<bool, SentinelError> {
+    use rusqlite::ffi::ErrorCode;
+    let classify = |e: rusqlite::Error| -> SentinelError {
+        match &e {
+            rusqlite::Error::SqliteFailure(err, _) => match err.code {
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                    SentinelError::Transient(e.into())
+                }
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                    SentinelError::Fatal(e.into())
+                }
+                _ => SentinelError::Transient(e.into()),
+            },
+            // Missing `settings` table on a partially-initialized DB.
+            rusqlite::Error::SqlInputError { .. } => SentinelError::Fatal(e.into()),
+            _ => SentinelError::Transient(e.into()),
+        }
+    };
+
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'onboarded'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
+    )
+    .map_err(classify)?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(classify)?;
+    let value: Option<String> = match conn.query_row(
+        "SELECT value FROM settings WHERE key = 'onboarded'",
+        [],
+        |r| r.get::<_, String>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(classify(e)),
+    };
     Ok(matches!(value.as_deref(), Some("true")))
 }
 
@@ -1082,21 +1133,29 @@ mod tests {
 
     #[test]
     fn test_parse_ask_short_flags() {
-        let cli = Cli::try_parse_from(["borg", "ask", "-y", "-j", "hello"]).unwrap();
+        let cli = Cli::try_parse_from(["borg", "ask", "-j", "hello"]).unwrap();
         match cli.command {
             Some(Commands::Ask {
                 message,
-                yes,
                 json,
                 mode,
             }) => {
                 assert_eq!(message, "hello");
-                assert!(yes);
                 assert!(json);
                 assert!(mode.is_none());
             }
             _ => panic!("Expected Ask"),
         }
+    }
+
+    #[test]
+    fn test_parse_ask_rejects_removed_yes_flag() {
+        let err = match Cli::try_parse_from(["borg", "ask", "-y", "hello"]) {
+            Ok(_) => panic!("expected -y to be rejected"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("unexpected argument '-y'"), "got: {msg}");
     }
 
     #[test]

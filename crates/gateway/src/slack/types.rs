@@ -68,6 +68,8 @@ pub struct NestedSlackMessage {
     pub text: Option<String>,
     /// Timestamp of the nested message.
     pub ts: Option<String>,
+    /// Parent thread timestamp for threaded replies and threaded edit/delete events.
+    pub thread_ts: Option<String>,
 }
 
 /// File metadata attached to a Slack message event.

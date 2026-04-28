@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::agent::AgentEvent;
@@ -111,24 +111,6 @@ pub async fn handle_run_shell(
             return Ok("Shell command denied by policy.".to_string());
         }
         crate::policy::PolicyDecision::AutoApprove => {}
-        crate::policy::PolicyDecision::Prompt => {
-            let (confirm_tx, confirm_rx) = oneshot::channel();
-            let _ = event_tx
-                .send(AgentEvent::ShellConfirmation {
-                    command: command.to_string(),
-                    respond: confirm_tx,
-                })
-                .await;
-            match confirm_rx.await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Ok("Shell command denied by user.".to_string());
-                }
-                Err(_) => {
-                    return Ok("Shell command cancelled (no response).".to_string());
-                }
-            }
-        }
     }
 
     // Resolve credentials and filter to only those declared by skills
@@ -206,7 +188,11 @@ fn redact_command_for_audit(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_command_for_audit;
+    use super::{handle_run_shell, redact_command_for_audit};
+    use crate::agent::AgentEvent;
+    use crate::config::Config;
+    use crate::policy::{ExecutionPolicy, PolicyDecision};
+    use tokio::sync::mpsc;
 
     #[test]
     fn redact_truncates_long_commands_and_marks_them() {
@@ -240,6 +226,40 @@ mod tests {
             let (shell, flag) = ("cmd.exe", "/C");
             assert_eq!(shell, "cmd.exe");
             assert_eq!(flag, "/C");
+        }
+    }
+
+    #[test]
+    fn policy_never_requires_shell_confirmation() {
+        let policy = ExecutionPolicy {
+            auto_approve: vec!["echo *".to_string()],
+            deny: vec!["echo blocked".to_string()],
+        };
+        assert_eq!(policy.check("echo ok"), PolicyDecision::AutoApprove);
+        assert_eq!(policy.check("echo blocked"), PolicyDecision::Deny);
+        assert_eq!(
+            policy.check("printf 'still allowed\\n'"),
+            PolicyDecision::AutoApprove
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_shell_command_does_not_emit_shell_confirmation() {
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({ "command": "printf 'ok\\n'" });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+            .await
+            .expect("shell command should run");
+        assert!(result.contains("Exit code: 0"), "got: {result}");
+
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::ShellConfirmation { .. }),
+                "run_shell must not emit shell confirmations"
+            );
         }
     }
 }

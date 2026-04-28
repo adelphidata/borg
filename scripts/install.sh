@@ -462,13 +462,17 @@ main() {
     success "Borg installed successfully (borg $installed_version)"
     printf "\n"
 
-    # Onboarding
-    if [[ "$NO_ONBOARDING" == false ]] && is_interactive && [[ ! -f "$DATA_DIR/config.toml" ]]; then
-        info "Starting setup..."
-        printf "\n"
-        "$INSTALL_DIR/$BINARY_NAME" init
-    elif [[ ! -f "$DATA_DIR/config.toml" ]]; then
-        info "Run 'borg init' to complete setup"
+    # Onboarding — settings live in ~/.borg/borg.db (DB-only); the daemon
+    # writes the `onboarded` sentinel there. Use DB existence as the gate so
+    # reinstalls don't re-launch the wizard over a configured system.
+    if [[ ! -f "$DATA_DIR/borg.db" ]]; then
+        if [[ "$NO_ONBOARDING" == false ]] && is_interactive; then
+            info "Starting setup..."
+            printf "\n"
+            "$INSTALL_DIR/$BINARY_NAME" init
+        else
+            info "Run 'borg init' to complete setup"
+        fi
     fi
 }
 

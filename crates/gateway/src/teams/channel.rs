@@ -58,10 +58,13 @@ impl NativeChannel for TeamsChannel {
                         {
                             let welcome =
                                 "Hello! I'm now available in this conversation. How can I help?";
-                            let _ = self
+                            if let Err(e) = self
                                 .client
                                 .send_to_conversation(svc, &conv.id, welcome)
-                                .await;
+                                .await
+                            {
+                                tracing::warn!("Failed to send Teams welcome message: {e}");
+                            }
                         }
                     }
                 }

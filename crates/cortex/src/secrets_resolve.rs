@@ -104,6 +104,15 @@ pub enum SecretRef {
     Keychain { service: String, account: String },
 }
 
+/// Build a keychain secret reference using Borg's canonical service/account
+/// addressing for provider API keys.
+pub fn provider_api_key_secret_ref(provider_id: &str) -> SecretRef {
+    SecretRef::Keychain {
+        service: format!("borg-{provider_id}"),
+        account: "borg".to_string(),
+    }
+}
+
 /// Check that a command succeeded and return its stdout as a trimmed string.
 fn extract_secret(output: std::process::Output, fail_context: &str) -> Result<String> {
     if !output.status.success() {
@@ -198,11 +207,26 @@ impl SecretRef {
                         })?;
                     extract_secret(
                         output,
-                        &format!("secret-tool lookup failed for service={service} key={account}"),
+                        &format!(
+                            "secret-tool lookup failed for service={service} account={account}"
+                        ),
                     )
+                } else if cfg!(target_os = "windows") {
+                    let entry = keyring::Entry::new(service, account).with_context(|| {
+                        format!(
+                            "Failed to open Windows Credential Manager entry for service={service} account={account}"
+                        )
+                    })?;
+                    entry
+                        .get_password()
+                        .with_context(|| {
+                            format!(
+                                "Windows Credential Manager lookup failed for service={service} account={account}"
+                            )
+                        })
                 } else {
                     bail!(
-                        "Keychain lookup is not supported on this platform (only macOS and Linux)"
+                        "Keychain lookup is not supported on this platform (only macOS, Linux, and Windows)"
                     )
                 }
             }
@@ -529,6 +553,18 @@ mod tests {
             assert_eq!(account, "borg-acct");
         } else {
             panic!("expected Keychain variant");
+        }
+    }
+
+    #[test]
+    fn provider_api_key_secret_ref_uses_canonical_service_and_account() {
+        let secret_ref = provider_api_key_secret_ref("openrouter");
+        match secret_ref {
+            SecretRef::Keychain { service, account } => {
+                assert_eq!(service, "borg-openrouter");
+                assert_eq!(account, "borg");
+            }
+            other => panic!("expected Keychain variant, got {other:?}"),
         }
     }
 

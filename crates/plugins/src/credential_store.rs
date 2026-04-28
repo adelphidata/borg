@@ -123,6 +123,9 @@ fn read_keychain(service: &str, account: &str) -> Option<String> {
                 .ok()
                 .map(|s| s.trim().to_string());
         }
+    } else if cfg!(target_os = "windows") {
+        let entry = keyring::Entry::new(service, account).ok()?;
+        return entry.get_password().ok();
     }
     None
 }

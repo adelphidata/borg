@@ -6,6 +6,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use tracing::warn;
 
 use super::api::TeamsClient;
 use super::types::ReplyActivity;
@@ -67,17 +68,19 @@ impl<'a> TeamsStream<'a> {
             return Ok(());
         }
 
-        self.sequence += 1;
-        let activity = ReplyActivity::streaming_typing(&self.buffer, self.sequence);
+        let next_sequence = self.sequence + 1;
+        let activity = ReplyActivity::streaming_typing(&self.buffer, next_sequence);
 
-        // Best-effort: don't fail the stream on a transient send error
-        let _ = self
+        if let Err(e) = self
             .client
             .send_activity(&self.service_url, &self.conversation_id, &activity)
-            .await;
+            .await
+        {
+            warn!("Failed to send Teams streaming chunk: {e}");
+            return Ok(());
+        }
 
-        self.last_sent = Instant::now();
-        self.sent_first = true;
+        self.record_successful_send(next_sequence, Instant::now());
         Ok(())
     }
 
@@ -102,6 +105,12 @@ impl<'a> TeamsStream<'a> {
     /// Current sequence number.
     pub fn sequence(&self) -> u32 {
         self.sequence
+    }
+
+    fn record_successful_send(&mut self, sequence: u32, sent_at: Instant) {
+        self.sequence = sequence;
+        self.last_sent = sent_at;
+        self.sent_first = true;
     }
 }
 
@@ -177,5 +186,21 @@ mod tests {
     #[test]
     fn throttle_constant() {
         assert_eq!(STREAM_THROTTLE, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn record_successful_send_advances_stream_state() {
+        let client = TeamsClient::new("app-id", "app-secret").unwrap();
+        let mut stream = TeamsStream::new(
+            &client,
+            "https://smba.trafficmanager.net.botframework.com/",
+            "conv-1",
+            "act-1",
+        );
+        let sent_at = Instant::now();
+        stream.record_successful_send(3, sent_at);
+        assert_eq!(stream.sequence(), 3);
+        assert!(stream.has_content());
+        assert!(stream.last_sent >= sent_at);
     }
 }

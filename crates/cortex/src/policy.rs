@@ -1,15 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// Execution policy for shell commands — controls auto-approval and denial.
+/// Execution policy for shell commands — controls allow/deny behavior.
 ///
-/// This is a convenience feature to reduce approval fatigue for known-safe commands,
-/// **not** a security boundary. Commands can be obfuscated to bypass glob patterns.
+/// This is a convenience feature for shaping shell behavior, **not** a
+/// security boundary. Commands can be obfuscated to bypass glob patterns.
 /// Commands are normalized before matching (whitespace collapsed, common path prefixes
-/// stripped) but this is best-effort. In gateway mode, all unknown shell commands are
-/// auto-denied, which is the actual security boundary.
+/// stripped) but this is best-effort. The sandbox is the security boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionPolicy {
-    /// Commands matching these glob patterns are auto-approved (no user prompt).
+    /// Commands matching these glob patterns are allowed.
     #[serde(default)]
     pub auto_approve: Vec<String>,
     /// Commands matching these glob patterns are always denied.
@@ -159,39 +158,59 @@ fn strip_path_prefix(token: &str) -> &str {
     token
 }
 
+/// Split a shell command into coarse execution fragments so deny rules can
+/// inspect newline- or semicolon-separated subcommands without rejecting
+/// multiline heredocs outright. We intentionally do not split on `|` because
+/// some hardcoded deny patterns rely on seeing the full pipeline.
+fn command_fragments(command: &str) -> Vec<&str> {
+    command
+        .lines()
+        .flat_map(|line| line.split(';'))
+        .flat_map(|part| part.split("&&"))
+        .flat_map(|part| part.split("||"))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
 impl ExecutionPolicy {
-    /// Check whether a command should be auto-approved, denied, or needs prompting.
+    /// Check whether a command should be allowed or denied.
     /// Commands are normalized (whitespace collapsed, path prefixes stripped) before matching.
     pub fn check(&self, command: &str) -> PolicyDecision {
-        // Reject commands containing raw newlines or null bytes — these can
-        // bypass pattern matching by splitting the dangerous portion across
-        // lines (e.g. "echo hi\nrm -rf /").
-        if command.contains('\n') || command.contains('\r') || command.contains('\0') {
+        // Null bytes and carriage returns do not carry useful coding intent
+        // here and make command parsing ambiguous.
+        if command.contains('\r') || command.contains('\0') {
             return PolicyDecision::Deny;
         }
 
-        let normalized = normalize_command(command);
+        let mut candidates = Vec::with_capacity(command_fragments(command).len() + 1);
+        candidates.push(command.trim());
+        candidates.extend(command_fragments(command));
 
-        // Check hardcoded deny list first (cannot be overridden)
-        for pattern in HARDCODED_DENY {
-            if glob_match(pattern, &normalized) {
-                return PolicyDecision::Deny;
-            }
-        }
-
-        // Re-check after stripping the most common shell obfuscations
-        // (escapes, backticks, literal `$(...)` substitutions). Catches
-        // `r\m -rf /`, `` `rm` -rf / ``, and `$(rm) -rf /` without changing
-        // the meaning of legitimate commands like `git rev-parse $(...)`.
-        let deobfuscated = deobfuscate(command);
-        if deobfuscated != command {
-            let deob_normalized = normalize_command(&deobfuscated);
+        for candidate in candidates {
+            let normalized = normalize_command(candidate);
             for pattern in HARDCODED_DENY {
-                if glob_match(pattern, &deob_normalized) {
+                if glob_match(pattern, &normalized) {
                     return PolicyDecision::Deny;
                 }
             }
+
+            // Re-check after stripping the most common shell obfuscations
+            // (escapes, backticks, literal `$(...)` substitutions). Catches
+            // `r\m -rf /`, `` `rm` -rf / ``, and `$(rm) -rf /` without changing
+            // the meaning of legitimate commands like `git rev-parse $(...)`.
+            let deobfuscated = deobfuscate(candidate);
+            if deobfuscated != candidate {
+                let deob_normalized = normalize_command(&deobfuscated);
+                for pattern in HARDCODED_DENY {
+                    if glob_match(pattern, &deob_normalized) {
+                        return PolicyDecision::Deny;
+                    }
+                }
+            }
         }
+
+        let normalized = normalize_command(command);
 
         // Check user deny patterns (deny takes priority over approve)
         for pattern in &self.deny {
@@ -215,7 +234,6 @@ impl ExecutionPolicy {
 pub enum PolicyDecision {
     AutoApprove,
     Deny,
-    Prompt,
 }
 
 /// Simple glob matching supporting `*` as wildcard.
@@ -411,6 +429,25 @@ mod tests {
         let policy = ExecutionPolicy::default();
         // Double-space should be collapsed and denied
         assert_eq!(policy.check("rm  -rf /"), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn deny_multiline_bypass() {
+        let policy = ExecutionPolicy::default();
+        assert_eq!(policy.check("echo hi\nrm -rf /"), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn deny_semicolon_bypass() {
+        let policy = ExecutionPolicy::default();
+        assert_eq!(policy.check("echo hi; rm -rf /"), PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn multiline_heredoc_like_command_stays_allowed() {
+        let policy = ExecutionPolicy::default();
+        let command = "cat > /tmp/index.html << 'EOF'\n<html>\n<body>ok</body>\n</html>\nEOF";
+        assert_eq!(policy.check(command), PolicyDecision::AutoApprove);
     }
 
     #[test]

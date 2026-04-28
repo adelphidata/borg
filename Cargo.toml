@@ -52,7 +52,15 @@ tar = "0.4"
 zstd = "0.13"
 tiktoken-rs = "0.9"
 dotenvy = "0.15"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.29", features = [
+    "unstable-rendered-line-info",
+    "unstable-widget-ref",
+    "unstable-backend-writer",
+    "scrolling-regions",
+] }
+pretty_assertions = "1"
+url = "2"
+itertools = "0.13"
 tui-textarea = "0.7"
 pulldown-cmark = "0.12"
 textwrap = "0.16"

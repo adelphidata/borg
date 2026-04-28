@@ -71,6 +71,10 @@ pub struct InteractionData {
     pub options: Option<Vec<CommandOption>>,
     /// Custom ID (for message components and modals).
     pub custom_id: Option<String>,
+    /// Selected values from select-style components.
+    pub values: Option<Vec<String>>,
+    /// Nested submitted components for modal interactions.
+    pub components: Option<Vec<InteractionComponentRow>>,
 }
 
 /// A single command option (name + value).
@@ -80,6 +84,29 @@ pub struct CommandOption {
     pub name: String,
     /// Option value provided by the user.
     pub value: serde_json::Value,
+}
+
+/// A row of submitted components in a Discord interaction payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InteractionComponentRow {
+    /// Child components within this row.
+    #[serde(default)]
+    pub components: Vec<InteractionComponent>,
+}
+
+/// A submitted Discord interaction component.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InteractionComponent {
+    /// Component type (2=button, 3=string select, 4=text input, etc.).
+    #[serde(rename = "type")]
+    pub component_type: u8,
+    /// Developer-defined identifier for the component.
+    pub custom_id: Option<String>,
+    /// Submitted value for text inputs.
+    pub value: Option<String>,
+    /// Nested child components, when Discord wraps them in rows.
+    #[serde(default)]
+    pub components: Vec<InteractionComponent>,
 }
 
 /// A Discord guild member (may contain a nested user).
@@ -404,7 +431,7 @@ mod tests {
             "id": "789",
             "type": 3,
             "token": "tok",
-            "data": { "custom_id": "btn_confirm" },
+            "data": { "custom_id": "btn_confirm", "values": ["alpha", "beta"] },
             "user": { "id": "u2", "username": "bob" }
         }"#;
         let interaction: Interaction = serde_json::from_str(json).unwrap();
@@ -415,6 +442,10 @@ mod tests {
         assert_eq!(
             interaction.data.as_ref().unwrap().custom_id.as_deref(),
             Some("btn_confirm")
+        );
+        assert_eq!(
+            interaction.data.as_ref().unwrap().values.as_deref(),
+            Some(&["alpha".to_string(), "beta".to_string()][..])
         );
     }
 
@@ -474,11 +505,25 @@ mod tests {
             "id": "200",
             "type": 5,
             "token": "tok",
-            "data": { "custom_id": "feedback_form" },
+            "data": {
+                "custom_id": "feedback_form",
+                "components": [{
+                    "components": [
+                        { "type": 4, "custom_id": "name", "value": "Alice" },
+                        { "type": 4, "custom_id": "notes", "value": "Thanks" }
+                    ]
+                }]
+            },
             "user": { "id": "u3", "username": "carol" }
         }"#;
         let interaction: Interaction = serde_json::from_str(json).unwrap();
         assert_eq!(interaction.interaction_type, InteractionType::ModalSubmit);
+        let data = interaction.data.as_ref().unwrap();
+        let rows = data.components.as_ref().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].components.len(), 2);
+        assert_eq!(rows[0].components[0].custom_id.as_deref(), Some("name"));
+        assert_eq!(rows[0].components[0].value.as_deref(), Some("Alice"));
     }
 
     #[test]

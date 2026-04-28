@@ -18,6 +18,10 @@ const TAB_WIDTH: usize = 4;
 /// Continuation rows from line wrapping are indented by this many spaces so
 /// the wrap visually belongs to the row above.
 const WRAP_CONTINUATION_INDENT: usize = 2;
+/// Drawn between hunks within a single file. Single-character vertical
+/// ellipsis so the hunk break is visible without consuming a full row of
+/// horizontal space.
+const HUNK_SEPARATOR: char = '⋮';
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffKind {
@@ -52,18 +56,28 @@ fn path_ext(path: &str) -> Option<String> {
     name.rsplit_once('.').map(|(_, ext)| ext.to_lowercase())
 }
 
-fn render_content_line(
-    raw: &str,
+/// One body row buffered while we walk a hunk. The whole hunk's bodies are
+/// flushed in one syntect call so multi-line strings and block comments
+/// keep a single, consistent highlight color across consecutive rows
+/// (per-line highlighting would re-init parser state and lose context).
+struct BufferedBody {
     kind: DiffKind,
-    ext: Option<&str>,
+    body: String,
+    old_lineno: Option<u32>,
+    new_lineno: Option<u32>,
+}
+
+fn render_content_line(
+    kind: DiffKind,
+    body: &str,
+    body_spans: Option<Vec<Span<'static>>>,
     old_lineno: Option<u32>,
     new_lineno: Option<u32>,
 ) -> Line<'static> {
-    // Strip the leading prefix char (+, -, space); empty lines keep a marker for alignment.
-    let (marker, body) = match kind {
-        DiffKind::Add => ('+', raw.get(1..).unwrap_or("")),
-        DiffKind::Remove => ('-', raw.get(1..).unwrap_or("")),
-        DiffKind::Context => (' ', raw.get(1..).unwrap_or("")),
+    let marker = match kind {
+        DiffKind::Add => '+',
+        DiffKind::Remove => '-',
+        DiffKind::Context => ' ',
     };
     let tint = match kind {
         DiffKind::Add => theme::diff_add_style(),
@@ -99,14 +113,12 @@ fn render_content_line(
     spans.push(Span::styled(fmt_lineno(new_lineno), gutter_style));
     spans.push(Span::styled(format!(" {marker} "), gutter_style));
 
-    // Syntax-highlight all three kinds when we know the file extension.
     // Add lines keep syntect's colors as-is — the green row bg + `+` sign
     // already signal insertion. Remove lines keep syntect's colors but
     // overlay Modifier::DIM so the deletion cue stays readable against the
     // red row bg without the syntax color overpowering it.
-    match (kind, ext) {
-        (_, Some(lang)) if !body.is_empty() => {
-            let mut hl = highlight::highlight_inline(body, lang);
+    match body_spans {
+        Some(mut hl) if !hl.is_empty() => {
             if matches!(kind, DiffKind::Remove) {
                 for span in hl.iter_mut() {
                     span.style = span.style.add_modifier(Modifier::DIM);
@@ -121,6 +133,51 @@ fn render_content_line(
         line = line.style(ratatui::style::Style::default().bg(bg));
     }
     line
+}
+
+/// Highlight a hunk's body lines as a single block to preserve syntect
+/// parser state across consecutive lines, then emit one rendered line per
+/// buffered row. With no extension or on length mismatch (defensive: the
+/// highlighter should yield one Line per source line), falls back to the
+/// flat per-row tint.
+fn flush_body_buffer(buf: &mut Vec<BufferedBody>, ext: Option<&str>, out: &mut Vec<Line<'static>>) {
+    if buf.is_empty() {
+        return;
+    }
+    let rows = std::mem::take(buf);
+
+    let highlighted_per_row: Option<Vec<Vec<Span<'static>>>> = match ext {
+        Some(lang) => {
+            let joined = rows
+                .iter()
+                .map(|r| r.body.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let hl_lines = highlight::highlight_code_block(&joined, lang);
+            if hl_lines.len() == rows.len() {
+                Some(hl_lines.into_iter().map(|l| l.spans).collect())
+            } else {
+                tracing::warn!(
+                    rows = rows.len(),
+                    got = hl_lines.len(),
+                    "diff hunk highlight row-count mismatch; falling back to flat tint"
+                );
+                None
+            }
+        }
+        None => None,
+    };
+
+    for (i, r) in rows.into_iter().enumerate() {
+        let spans = highlighted_per_row.as_ref().map(|v| v[i].clone());
+        out.push(render_content_line(
+            r.kind,
+            &r.body,
+            spans,
+            r.old_lineno,
+            r.new_lineno,
+        ));
+    }
 }
 
 /// Parse a `@@ -old_start,old_count +new_start,new_count @@` hunk header.
@@ -161,9 +218,16 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
     let mut current_ext: Option<String> = None;
     let mut in_file = false;
     let mut recognized_anything = false;
+    // Hunks within a single file are separated by a dim `⋮` row so the
+    // visual break between two hunks doesn't look like the file ended.
+    let mut hunks_in_file: u32 = 0;
     // Line-number tracking: we increment per row inside a hunk.
     let mut old_lineno: u32 = 1;
     let mut new_lineno: u32 = 1;
+    // Body rows for the current hunk; flushed (and syntax-highlighted as a
+    // single block) at every hunk / file boundary so syntect parser state
+    // carries across consecutive lines.
+    let mut body_buf: Vec<BufferedBody> = Vec::new();
 
     for raw in patch.lines() {
         let trimmed = raw.trim();
@@ -174,11 +238,13 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
         }
 
         if let Some(header) = parse_file_header(trimmed) {
+            flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
             if !lines.is_empty() {
                 lines.push(Line::default());
             }
             current_ext = path_ext(&header.path);
             in_file = true;
+            hunks_in_file = 0;
             // Reset line counters at each file boundary; without an explicit
             // `@@` hunk header (e.g. plain Add File: bodies), this means the
             // first body line is "1".
@@ -193,20 +259,33 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
         }
 
         if trimmed.starts_with("@@") {
+            flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
+            // Only treat this row as a real hunk boundary when the header
+            // parses; otherwise it's malformed and we fall through to the
+            // generic body/dim path so we don't draw a stray ⋮ before an
+            // un-parseable header.
             if let Some((o, n)) = parse_hunk_header(raw) {
                 old_lineno = o;
                 new_lineno = n;
+                if hunks_in_file > 0 {
+                    lines.push(Line::from(Span::styled(
+                        HUNK_SEPARATOR.to_string(),
+                        theme::diff_hunk_style(),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    raw.to_string(),
+                    theme::diff_hunk_style(),
+                )));
+                hunks_in_file += 1;
+                recognized_anything = true;
+                continue;
             }
-            lines.push(Line::from(Span::styled(
-                raw.to_string(),
-                theme::diff_hunk_style(),
-            )));
-            recognized_anything = true;
-            continue;
         }
 
         // Blank or whitespace-only line → blank spacer, don't count as recognized DSL.
         if trimmed.is_empty() {
+            flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
             lines.push(Line::default());
             continue;
         }
@@ -214,6 +293,7 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
         // Content lines require a file context; outside one, we can't classify
         // a leading space as "context" (would swallow arbitrary prose).
         if !in_file {
+            flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
             lines.push(Line::from(Span::styled(raw.to_string(), theme::dim())));
             continue;
         }
@@ -232,7 +312,13 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
                     DiffKind::Remove => (Some(old_lineno), None),
                     DiffKind::Context => (Some(old_lineno), Some(new_lineno)),
                 };
-                lines.push(render_content_line(raw, k, current_ext.as_deref(), o, n));
+                let body = raw.get(1..).unwrap_or("").to_string();
+                body_buf.push(BufferedBody {
+                    kind: k,
+                    body,
+                    old_lineno: o,
+                    new_lineno: n,
+                });
                 match k {
                     DiffKind::Add => new_lineno += 1,
                     DiffKind::Remove => old_lineno += 1,
@@ -244,10 +330,13 @@ pub fn render_patch(patch: &str) -> Vec<Line<'static>> {
                 recognized_anything = true;
             }
             None => {
+                flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
                 lines.push(Line::from(Span::styled(raw.to_string(), theme::dim())));
             }
         }
     }
+
+    flush_body_buffer(&mut body_buf, current_ext.as_deref(), &mut lines);
 
     if !recognized_anything {
         tracing::warn!(bytes = patch.len(), "render_patch: no recognizable DSL");
@@ -357,6 +446,7 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -719,6 +809,101 @@ mod tests {
         assert!(
             text.contains("e\u{0301}"),
             "combining mark detached: {text:?}"
+        );
+    }
+
+    #[test]
+    fn hunk_separator_between_hunks() {
+        // Two `@@` hunks within one file: a `⋮` row separates them, but the
+        // first hunk has no leading separator. Locks the visual cue used to
+        // distinguish "two hunks in one file" from "two files".
+        let patch = "*** Begin Patch\n\
+            *** Update File: x.rs\n\
+            @@ -1,1 +1,1 @@\n\
+            -a\n\
+            +b\n\
+            @@ -10,1 +10,1 @@\n\
+            -c\n\
+            +d\n\
+            *** End Patch";
+        let lines = render_patch(patch);
+
+        let sep_count = lines
+            .iter()
+            .filter(|l| line_text(l).trim() == HUNK_SEPARATOR.to_string())
+            .count();
+        assert_eq!(sep_count, 1, "expected one separator between two hunks");
+
+        // Sanity: the separator sits between the two hunk headers, not before
+        // the first one.
+        let first_hunk = lines
+            .iter()
+            .position(|l| line_text(l).contains("@@ -1"))
+            .expect("first hunk header");
+        let second_hunk = lines
+            .iter()
+            .position(|l| line_text(l).contains("@@ -10"))
+            .expect("second hunk header");
+        let sep_idx = lines
+            .iter()
+            .position(|l| line_text(l).trim() == HUNK_SEPARATOR.to_string())
+            .expect("separator present");
+        assert!(
+            first_hunk < sep_idx && sep_idx < second_hunk,
+            "separator misplaced: first={first_hunk}, sep={sep_idx}, second={second_hunk}"
+        );
+    }
+
+    #[test]
+    fn first_hunk_has_no_leading_separator() {
+        let patch = "*** Begin Patch\n\
+            *** Update File: x.rs\n\
+            @@ -1,1 +1,1 @@\n\
+            +only\n\
+            *** End Patch";
+        let lines = render_patch(patch);
+        let sep_count = lines
+            .iter()
+            .filter(|l| line_text(l).trim() == HUNK_SEPARATOR.to_string())
+            .count();
+        assert_eq!(sep_count, 0, "single-hunk file must not have a separator");
+    }
+
+    #[test]
+    fn hunk_block_highlighting_preserves_state_across_lines() {
+        // A Rust block comment opens on one `+` line and closes on the next.
+        // Per-line highlighting would re-init syntect's parser on each row,
+        // dropping the "inside a comment" context, so `line` on row 2 would
+        // highlight as a plain identifier — visibly different fg from the
+        // `multi` comment-body on row 1. Hunk-block highlighting carries the
+        // parser state forward, so both bodies share the comment fg.
+        let patch = "*** Begin Patch\n\
+            *** Add File: foo.rs\n\
+            +/* multi\n\
+            +line */\n\
+            *** End Patch";
+        let lines = render_patch(patch);
+
+        let body_rows: Vec<&Line<'_>> = lines
+            .iter()
+            .filter(|l| l.style.bg == Some(theme::diff_add_bg()))
+            .collect();
+        assert_eq!(body_rows.len(), 2, "expected two add rows");
+
+        let span_text_fg = |spans: &[Span<'_>], needle: &str| -> Option<Color> {
+            spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .and_then(|s| s.style.fg)
+        };
+
+        let row1 = content_spans(body_rows[0]);
+        let row2 = content_spans(body_rows[1]);
+        let multi_fg = span_text_fg(row1, "multi").expect("`multi` span on row 1 has fg");
+        let line_fg = span_text_fg(row2, "line").expect("`line` span on row 2 has fg");
+        assert_eq!(
+            multi_fg, line_fg,
+            "row 2 must inherit the row 1 comment fg via hunk-block highlighting"
         );
     }
 

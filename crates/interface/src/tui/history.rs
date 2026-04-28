@@ -589,6 +589,19 @@ impl HistoryCell {
         )
     }
 
+    /// True when this cell is part of a tool-flow block (the call header,
+    /// its streaming output, or its result). Used by the render loop to
+    /// suppress the separator blank line between adjacent tool-flow cells
+    /// so back-to-back command runs read as a tight cluster.
+    pub fn is_tool_flow(&self) -> bool {
+        matches!(
+            self,
+            HistoryCell::ToolStart { .. }
+                | HistoryCell::ToolStreaming { .. }
+                | HistoryCell::ToolResult { .. }
+        )
+    }
+
     /// Flip the collapsed state on a `ToolResult` cell. No-op for other cells.
     pub fn toggle_collapsed(&mut self) -> bool {
         if let HistoryCell::ToolResult { collapsed, .. } = self {
@@ -659,8 +672,6 @@ impl HistoryCell {
                 // Inner content area sits inside `│ ... │` with 1-col padding each side.
                 let inner_w = w.saturating_sub(4).max(20);
                 let mut lines = Vec::new();
-                // Unstyled spacer above the box.
-                lines.push(Line::default());
                 // Top rule: ╭───────╮ across full width.
                 let rule_len = w.saturating_sub(2);
                 lines.push(Line::from(vec![
@@ -1225,10 +1236,11 @@ mod tests {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
-        // box: spacer + top rule + body + bottom rule = 4 lines.
-        assert_eq!(lines.len(), 4);
+        // box: top rule + body + bottom rule = 3 lines (spacer is owned by
+        // the render loop, not the cell).
+        assert_eq!(lines.len(), 3);
         // Top rule starts with ╭ and ends with ╮.
-        let top = &lines[1];
+        let top = &lines[0];
         assert_eq!(
             top.spans.first().unwrap().content.as_ref(),
             super::theme::BOX_TOP_LEFT
@@ -1318,6 +1330,63 @@ mod tests {
             text.contains("done"),
             "last line should contain rendered text, got: {text:?}"
         );
+    }
+
+    #[test]
+    fn user_cell_does_not_emit_leading_blank() {
+        // User cell used to push a leading `Line::default()` above its box;
+        // that duplicated the inter-cell spacer in `app/render.rs` and read
+        // as an extra "lit" empty row because the User box bg style spread
+        // across the row. The leading blank is now removed.
+        let cell = HistoryCell::User {
+            text: "hello".to_string(),
+        };
+        let lines = cell.render(40, None);
+        assert!(!lines.is_empty(), "User render produced no lines");
+        let first = &lines[0];
+        assert!(
+            !first.spans.is_empty(),
+            "first User line is unexpectedly blank: {first:?}"
+        );
+        let text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains(theme::BOX_TOP_LEFT) || text.contains(theme::BOX_TOP_RIGHT),
+            "first User line should be the top box rule, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tool_flow_classification() {
+        // The render loop hides the inter-cell spacer when both neighbors
+        // are tool-flow cells, so back-to-back command runs hug. Lock the
+        // classification down so adding a future variant doesn't silently
+        // break the spacing rule.
+        let tool_start = HistoryCell::ToolStart {
+            name: "run_shell".to_string(),
+            args: "{}".to_string(),
+            completed: false,
+            start_time: None,
+        };
+        let tool_result = HistoryCell::ToolResult {
+            output: "ok".to_string(),
+            is_error: false,
+            duration_ms: Some(10),
+            display_label: "run_shell".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        let tool_streaming = HistoryCell::ToolStreaming { lines: vec![] };
+        assert!(tool_start.is_tool_flow());
+        assert!(tool_result.is_tool_flow());
+        assert!(tool_streaming.is_tool_flow());
+
+        let assistant = HistoryCell::assistant("hi".to_string(), false);
+        let user = HistoryCell::User {
+            text: "hey".to_string(),
+        };
+        assert!(!assistant.is_tool_flow());
+        assert!(!user.is_tool_flow());
     }
 
     #[test]

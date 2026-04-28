@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 
-use cortex::config::Config;
+use cortex::config::{Config, CredentialValue};
+use cortex::secrets_resolve::SecretRef;
 
 pub struct PluginDef {
     pub name: &'static str,
@@ -14,6 +15,22 @@ pub struct CredentialSpec {
     pub key: &'static str,
     pub label: &'static str,
     pub help: &'static str,
+}
+
+impl PluginDef {
+    fn service_name(&self) -> String {
+        let plugin_id = match self.name {
+            "telegram" => "messaging/telegram",
+            "slack" => "messaging/slack",
+            "twilio" => "messaging/whatsapp",
+            "discord" => "messaging/discord",
+            "signal" => "messaging/signal",
+            "teams" => "messaging/teams",
+            "google-chat" => "messaging/google-chat",
+            other => other,
+        };
+        format!("borg-{}", plugin_id.replace('/', "-"))
+    }
 }
 
 pub const PLUGINS: &[PluginDef] = &[
@@ -190,17 +207,26 @@ fn is_configured(def: &PluginDef, config: &Config) -> bool {
     if def.credentials.is_empty() {
         return true;
     }
+    let service_name = def.service_name();
     def.credentials.iter().all(|cred| {
         config.resolve_credential_or_env(cred.key).is_some()
-            || plugins::keychain::check(&format!("borg-{}", def.name), cred.key)
+            || plugins::keychain::check(&service_name, &format!("borg-{}", cred.key))
     })
 }
 
-/// Set up a plugin: prompt for credentials, store in keychain, update config.
+/// Set up a plugin: prompt for credentials, store in keychain (or `.env`
+/// fallback), and persist the merged credentials map via the daemon.
+///
+/// All settings live in the SQLite settings table — this used to write
+/// `~/.borg/config.toml` directly, but migration V32 imports that file into
+/// the DB once and renames it to `.bak`, so post-migration writes were
+/// silently dropped. We now mirror the onboarding flow: store the secret
+/// locally, build a `CredentialValue::Ref`, and round-trip the full
+/// `credentials` map through `Admin.SetSetting`.
 pub fn add_plugin(name: &str) -> Result<()> {
     let def = find_plugin(name).ok_or_else(|| anyhow::anyhow!("Unknown plugin: {name}"))?;
 
-    let config = Config::load_from_db().unwrap_or_default();
+    let mut config = Config::load_from_db().unwrap_or_default();
 
     if is_configured(def, &config) {
         println!("{} is already configured.", def.description);
@@ -213,79 +239,25 @@ pub fn add_plugin(name: &str) -> Result<()> {
         return Ok(());
     }
 
-    let use_keychain = plugins::keychain::available();
     let data_dir = Config::data_dir()?;
-    let config_path = data_dir.join("config.toml");
-
-    // Read existing config TOML (or start fresh)
-    let mut config_str = if config_path.exists() {
-        std::fs::read_to_string(&config_path)?
-    } else {
-        String::new()
-    };
-
-    let service_name = format!("borg-{name}");
+    let service_name = def.service_name();
 
     for cred in def.credentials {
         eprint!("{} ({}): ", cred.label, cred.help);
         let value = read_line_masked()?;
+        let trimmed = value.trim();
 
-        if value.trim().is_empty() {
+        if trimmed.is_empty() {
             anyhow::bail!("Credential cannot be empty");
         }
 
-        if use_keychain {
-            plugins::keychain::store(&service_name, cred.key, value.trim())
-                .with_context(|| format!("Failed to store {} in keychain", cred.key))?;
-
-            // Add SecretRef to config
-            let entry = if cfg!(target_os = "macos") {
-                format!(
-                    "\n[credentials]\n{} = {{ source = \"exec\", command = \"security\", args = [\"find-generic-password\", \"-s\", \"{}\", \"-a\", \"{}\", \"-w\"] }}\n",
-                    cred.key, service_name, cred.key,
-                )
-            } else {
-                format!(
-                    "\n[credentials]\n{} = {{ source = \"exec\", command = \"secret-tool\", args = [\"lookup\", \"service\", \"{}\", \"account\", \"{}\"] }}\n",
-                    cred.key, service_name, cred.key,
-                )
-            };
-
-            if !config_str.contains(&format!("{} =", cred.key)) {
-                append_credential_to_config(&mut config_str, cred.key, &entry);
-            }
-        } else {
-            // Fall back to .env file
-            let env_path = data_dir.join(".env");
-            let mut env_content = if env_path.exists() {
-                std::fs::read_to_string(&env_path)?
-            } else {
-                String::new()
-            };
-            // Remove existing entry for this key to avoid duplicates
-            let prefix = format!("{}=", cred.key);
-            let filtered: String = env_content
-                .lines()
-                .filter(|line| !line.starts_with(&prefix))
-                .collect::<Vec<_>>()
-                .join("\n");
-            env_content = if filtered.is_empty() {
-                String::new()
-            } else {
-                filtered + "\n"
-            };
-            let clean_value = value.trim().replace(['\n', '\r'], "");
-            env_content.push_str(&format!("{}={}\n", cred.key, clean_value));
-            std::fs::write(&env_path, &env_content)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600));
-            }
-        }
+        let secret_ref = store_credential(&data_dir, &service_name, cred.key, trimmed)?;
+        config
+            .credentials
+            .insert(cred.key.to_string(), CredentialValue::Ref(secret_ref));
     }
 
-    std::fs::write(&config_path, &config_str)?;
+    persist_credentials(&config.credentials).context("failed to persist credentials via daemon")?;
 
     println!();
     println!("{} configured successfully.", def.description);
@@ -342,10 +314,10 @@ pub fn add_plugin(name: &str) -> Result<()> {
 pub fn remove_plugin(name: &str) -> Result<()> {
     let def = find_plugin(name).ok_or_else(|| anyhow::anyhow!("Unknown plugin: {name}"))?;
 
-    let service_name = format!("borg-{name}");
+    let service_name = def.service_name();
 
     for cred in def.credentials {
-        plugins::keychain::remove(&service_name, cred.key);
+        plugins::keychain::remove(&service_name, &format!("borg-{}", cred.key));
     }
 
     // Also clean up .env file if it exists
@@ -412,24 +384,68 @@ fn read_line_masked() -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-/// Append a credential entry to the config string, merging into existing `[credentials]` section if present.
-fn append_credential_to_config(config_str: &mut String, key: &str, entry: &str) {
-    if config_str.contains("[credentials]") {
-        // Find the [credentials] section and append after it
-        if let Some(pos) = config_str.find("[credentials]") {
-            // Find the end of the line after [credentials]
-            let after_header = pos + "[credentials]".len();
-            let insert_pos = config_str[after_header..]
-                .find('\n')
-                .map(|p| after_header + p + 1)
-                .unwrap_or(config_str.len());
-
-            // Extract just the key = value part (skip the \n[credentials]\n prefix)
-            let key_line = entry.lines().find(|l| l.starts_with(key)).unwrap_or(entry);
-            config_str.insert_str(insert_pos, &format!("{key_line}\n"));
+/// Store one credential locally, returning the `SecretRef` that should be
+/// recorded in the credentials map. Tries the OS keychain first; falls back
+/// to a 0600 `~/.borg/.env` line on headless hosts where keychain isn't
+/// available — same ladder as `apply_onboarding`. Reusing `append_env_file`
+/// keeps the two entry points from drifting on EnvironmentFile escaping.
+fn store_credential(
+    data_dir: &std::path::Path,
+    service: &str,
+    key: &str,
+    value: &str,
+) -> Result<SecretRef> {
+    let account = format!("borg-{key}");
+    if plugins::keychain::available() {
+        match plugins::keychain::store(service, &account, value) {
+            Ok(()) => {
+                return Ok(SecretRef::Keychain {
+                    service: service.to_string(),
+                    account,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Keychain store failed for {key}: {e}; falling back to .env");
+                eprintln!(
+                    "  · Keychain unavailable for {key}; storing in {}/.env",
+                    data_dir.display()
+                );
+            }
         }
-    } else {
-        config_str.push_str(entry);
+    }
+    crate::onboarding::append_env_file(data_dir, key, value)
+        .with_context(|| format!("write .env entry for {key}"))?;
+    Ok(SecretRef::Env {
+        var: key.to_string(),
+    })
+}
+
+/// Persist the merged credentials map through the daemon. Mirrors the single
+/// round-trip onboarding does at the end of channel install — the daemon owns
+/// the DB write so the CLI never opens the SQLite file directly.
+fn persist_credentials(
+    credentials: &std::collections::HashMap<String, CredentialValue>,
+) -> Result<()> {
+    let json = serde_json::to_string(credentials).context("serialize credentials map")?;
+    let fut = async move {
+        let mut client = crate::daemon_client::connect_or_spawn()
+            .await
+            .context("connect to borgd for credential persistence")?;
+        client
+            .set_setting("credentials", &json)
+            .await
+            .context("Admin.SetSetting(credentials) failed")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => tokio::task::block_in_place(|| h.block_on(fut)),
+        Err(_) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("spin tokio runtime for credential persistence")?;
+            rt.block_on(fut)
+        }
     }
 }
 
@@ -478,22 +494,65 @@ mod tests {
     }
 
     #[test]
-    fn append_credential_new_section() {
-        let mut config = "[llm]\nmodel = \"test\"\n".to_string();
-        let entry = "\n[credentials]\nMY_KEY = { source = \"env\", var = \"MY_KEY\" }\n";
-        append_credential_to_config(&mut config, "MY_KEY", entry);
-        assert!(config.contains("[credentials]"));
-        assert!(config.contains("MY_KEY"));
+    fn native_plugin_configuration_uses_canonical_keychain_address() {
+        // The keychain SecretRef built for a native channel must use the
+        // canonical `borg-{plugin-id}` / `borg-{KEY}` shape — onboarding,
+        // `borg add`, and the daemon's `read_credentials_file` fallback all
+        // expect this exact pair, so a drift here silently hides credentials.
+        let def = find_plugin("telegram").expect("telegram plugin");
+        let service = def.service_name();
+        let account = format!("borg-{}", def.credentials[0].key);
+        let secret_ref = SecretRef::Keychain {
+            service: service.clone(),
+            account: account.clone(),
+        };
+        match secret_ref {
+            SecretRef::Keychain { service, account } => {
+                assert_eq!(service, "borg-messaging-telegram");
+                assert_eq!(account, "borg-TELEGRAM_BOT_TOKEN");
+            }
+            other => panic!("expected Keychain variant, got {other:?}"),
+        }
     }
 
     #[test]
-    fn append_credential_existing_section() {
-        let mut config = "[llm]\nmodel = \"test\"\n\n[credentials]\nOLD = \"old\"\n".to_string();
-        let entry = "\n[credentials]\nNEW_KEY = { source = \"env\", var = \"NEW_KEY\" }\n";
-        append_credential_to_config(&mut config, "NEW_KEY", entry);
-        // Should only have one [credentials] section
-        assert_eq!(config.matches("[credentials]").count(), 1);
-        assert!(config.contains("NEW_KEY"));
-        assert!(config.contains("OLD"));
+    fn add_plugin_merges_into_existing_credentials_map() {
+        // Simulates the in-memory map mutation `add_plugin` performs after
+        // `store_credential` succeeds: a pre-existing credential from another
+        // plugin survives, and the new entries land as `Ref(Keychain)` keyed
+        // by the credential `key`. If this regresses (e.g. a refactor that
+        // overwrites the map), users would lose previously-configured
+        // channels every time they add a new one.
+        use std::collections::HashMap;
+        let mut map: HashMap<String, CredentialValue> = HashMap::new();
+        map.insert(
+            "EXISTING_KEY".into(),
+            CredentialValue::Ref(SecretRef::Env {
+                var: "EXISTING_KEY".into(),
+            }),
+        );
+
+        let def = find_plugin("slack").expect("slack plugin");
+        let service = def.service_name();
+        for cred in def.credentials {
+            map.insert(
+                cred.key.to_string(),
+                CredentialValue::Ref(SecretRef::Keychain {
+                    service: service.clone(),
+                    account: format!("borg-{}", cred.key),
+                }),
+            );
+        }
+
+        assert!(map.contains_key("EXISTING_KEY"));
+        assert!(map.contains_key("SLACK_BOT_TOKEN"));
+        assert!(map.contains_key("SLACK_SIGNING_SECRET"));
+        match map.get("SLACK_BOT_TOKEN") {
+            Some(CredentialValue::Ref(SecretRef::Keychain { service, account })) => {
+                assert_eq!(service, "borg-messaging-slack");
+                assert_eq!(account, "borg-SLACK_BOT_TOKEN");
+            }
+            other => panic!("expected Keychain Ref for SLACK_BOT_TOKEN, got {other:?}"),
+        }
     }
 }

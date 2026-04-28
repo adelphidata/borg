@@ -132,10 +132,13 @@ impl NativeChannel for TelegramChannel {
                                 .and_then(|id| id.parse().ok())
                                 .unwrap_or(0);
                             if echo_chat_id != 0 {
-                                let _ = self
+                                if let Err(e) = self
                                     .client
                                     .send_message(echo_chat_id, &transcript, None, None, None)
-                                    .await;
+                                    .await
+                                {
+                                    tracing::warn!("Failed to echo Telegram transcript: {e}");
+                                }
                             }
                         }
                     }

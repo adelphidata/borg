@@ -10,6 +10,27 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// need to compute usable content width. Replaces inline `width - 2` magic.
 pub const LIVE_PREFIX_COLS: usize = 2;
 
+/// Append a slice of lines into an owned Vec, cloning span content into
+/// `'static` ownership. Used by the wrapping helpers to bridge wrap output
+/// (lifetime-bound to the source) into long-lived collections.
+pub fn push_owned_lines<'a>(src: &[Line<'a>], out: &mut Vec<Line<'static>>) {
+    for line in src {
+        let spans: Vec<Span<'static>> = line
+            .spans
+            .iter()
+            .map(|s| Span {
+                style: s.style,
+                content: std::borrow::Cow::Owned(s.content.as_ref().to_string()),
+            })
+            .collect();
+        out.push(Line {
+            style: line.style,
+            alignment: line.alignment,
+            spans,
+        });
+    }
+}
+
 /// Display width of a [`Line`] (sum of its span contents, unicode-width aware).
 pub fn line_width(line: &Line<'_>) -> usize {
     line.iter()

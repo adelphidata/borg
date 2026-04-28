@@ -38,6 +38,24 @@ model = "anthropic/claude-sonnet-4"
 }
 
 #[test]
+fn parse_config_with_secret_ref_keychain() {
+    let toml_str = r#"
+[llm]
+provider = "openrouter"
+api_key = { source = "keychain", service = "borg-openrouter", account = "borg" }
+model = "anthropic/claude-sonnet-4"
+"#;
+    let cfg: Config = toml::from_str(toml_str).expect("should parse");
+    assert!(cfg.llm.api_key.is_some());
+    if let Some(SecretRef::Keychain { service, account }) = &cfg.llm.api_key {
+        assert_eq!(service, "borg-openrouter");
+        assert_eq!(account, "borg");
+    } else {
+        panic!("expected Keychain variant");
+    }
+}
+
+#[test]
 fn parse_config_with_api_keys_list() {
     let toml_str = r#"
 [llm]

@@ -13,9 +13,37 @@ fix crate="":
         cargo clippy --fix --all-features --tests --allow-dirty -p {{crate}}; \
     fi
 
-# Run all tests
+# Run lib + bin tests (fast feedback loop, mirrors CLAUDE.md). Uses nextest when available.
 test:
-    cargo test --all
+    @if command -v cargo-nextest >/dev/null 2>&1; then \
+        cargo nextest run --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log; \
+    else \
+        cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log; \
+    fi
+
+# Run the full workspace test suite (integration tests included). Use before shipping.
+test-all:
+    cargo test --workspace 2>&1 | tee /tmp/borg-test-all.log
+
+# Run tests for a single crate. Example: just test-crate cortex
+test-crate crate:
+    cargo test -p {{crate}} --lib 2>&1 | tee /tmp/borg-test-{{crate}}.log
+
+# Compile-check the workspace (fast; no codegen). Optional crate filter.
+check crate="":
+    @if [ -z "{{crate}}" ]; then \
+        cargo check --workspace --all-targets; \
+    else \
+        cargo check -p {{crate}} --all-targets; \
+    fi
+
+# Watch source files and re-run a cargo subcommand on save. Default: check.
+# Examples:
+#   just watch
+#   just watch "check -p cortex"
+#   just watch "test --workspace --lib --bins"
+watch cmd="check":
+    cargo watch -c -x "{{cmd}}"
 
 # Build debug
 build:
@@ -26,7 +54,7 @@ release:
     cargo build --release
 
 # Run format check + clippy (what pre-commit does)
-check:
+lint:
     cargo fmt --check
     cargo clippy -- -D warnings
 
@@ -35,10 +63,12 @@ install-hooks:
     git config core.hooksPath .githooks
     @echo "pre-commit hook active (.githooks/pre-commit). Bypass with --no-verify."
 
-# Install local CI helpers (cargo-audit, cargo-deny)
+# Install local CI helpers (cargo-audit, cargo-deny, cargo-nextest, cargo-watch)
 install-ci-tools:
     RUSTUP_TOOLCHAIN=stable cargo install cargo-audit --locked
     RUSTUP_TOOLCHAIN=stable cargo install cargo-deny --locked
+    RUSTUP_TOOLCHAIN=stable cargo install cargo-nextest --locked
+    RUSTUP_TOOLCHAIN=stable cargo install cargo-watch --locked
 
 # Security advisory scan (mirrors CI's Security Audit job)
 audit:
@@ -49,7 +79,7 @@ deny:
     cargo deny --all-features check
 
 # Run everything CI runs (format, clippy, test, build, audit, deny)
-ci: check
+ci: lint
     cargo test --workspace
     cargo build
     just audit

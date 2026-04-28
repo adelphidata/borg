@@ -201,9 +201,9 @@ fn evaluate_message(
     self_chat_cache: &mut SelfChatCache,
     group_allowlist: Option<&[String]>,
 ) -> InboundDecision {
-    let text = match &payload.text {
-        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => {
+    let body = match payload_body_text(payload) {
+        Some(text) => text,
+        None => {
             return InboundDecision::Drop {
                 reason: "empty text".to_string(),
             }
@@ -233,28 +233,28 @@ fn evaluate_message(
 
     // Gate 1: is_from_me — record in self-chat cache, then drop
     if payload.is_from_me {
-        self_chat_cache.remember(&text, &chat_id);
+        self_chat_cache.remember(&body, &chat_id);
         return InboundDecision::Drop {
             reason: "is_from_me".to_string(),
         };
     }
 
     // Gate 2: echo detection — did we recently send this exact text?
-    if echo_cache.is_echo(&text, None) {
+    if echo_cache.is_echo(&body, None) {
         return InboundDecision::Drop {
             reason: "echo of sent message".to_string(),
         };
     }
 
     // Gate 3: self-chat reflection — was this recently sent by us in the same chat?
-    if self_chat_cache.is_self_echo(&text, &chat_id) {
+    if self_chat_cache.is_self_echo(&body, &chat_id) {
         return InboundDecision::Drop {
             reason: "self-chat reflection".to_string(),
         };
     }
 
     // Gate 4: reflection guard — contains internal markers?
-    if let Some(marker) = reflection_guard::detect_reflected_content(&text) {
+    if let Some(marker) = reflection_guard::detect_reflected_content(&body) {
         return InboundDecision::Drop {
             reason: format!("reflected content: {marker}"),
         };
@@ -269,14 +269,32 @@ fn evaluate_message(
         .unwrap_or_else(|| "unknown".to_string());
 
     let dispatched_text = match &payload.reply_to {
-        Some(reply) => format_reply_quote(reply, &text),
-        None => text,
+        Some(reply) => format_reply_quote(reply, &body),
+        None => body,
     };
 
     InboundDecision::Dispatch {
         sender_id,
         text: dispatched_text,
         channel_id: chat_id,
+    }
+}
+
+fn payload_body_text(payload: &IMessagePayload) -> Option<String> {
+    match &payload.text {
+        Some(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        _ if !payload.attachments.is_empty() => {
+            Some(attachment_placeholder(payload.attachments.len()))
+        }
+        _ => None,
+    }
+}
+
+fn attachment_placeholder(attachment_count: usize) -> String {
+    if attachment_count == 1 {
+        "[Attachment]".to_string()
+    } else {
+        "[Attachments]".to_string()
     }
 }
 
@@ -374,7 +392,9 @@ fn poll_new_messages_with_conn(
          LEFT JOIN chat c ON c.ROWID = cmj.chat_id \
          LEFT JOIN message parent ON parent.guid = m.thread_originator_guid \
          LEFT JOIN handle ph ON parent.handle_id = ph.ROWID \
-         WHERE m.ROWID > ?1 AND m.text IS NOT NULL \
+         WHERE m.ROWID > ?1 AND (m.text IS NOT NULL OR EXISTS (\
+             SELECT 1 FROM message_attachment_join maj WHERE maj.message_id = m.ROWID\
+         )) \
          ORDER BY m.ROWID ASC \
          LIMIT 50",
     )?;
@@ -820,6 +840,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn evaluate_dispatches_attachment_only_message_with_placeholder() {
+        let mut payload = make_payload(1, None, Some("+1234"), false, Some("chat1"));
+        payload.attachments = vec![AttachmentMeta {
+            path: "/tmp/file.png".into(),
+            filename: Some("file.png".into()),
+            mime_type: Some("image/png".into()),
+        }];
+        let mut echo = EchoCache::new();
+        let mut self_chat = SelfChatCache::new();
+        match evaluate_message(&payload, &mut echo, &mut self_chat, no_allowlist()) {
+            InboundDecision::Dispatch { text, .. } => assert_eq!(text, "[Attachment]"),
+            InboundDecision::Drop { reason } => panic!("expected Dispatch, got Drop: {reason}"),
+        }
+    }
+
+    #[test]
+    fn evaluate_attachment_only_reply_keeps_quote_and_placeholder() {
+        let mut payload = make_payload(1, None, Some("+1234"), false, Some("chat1"));
+        payload.attachments = vec![
+            AttachmentMeta {
+                path: "/tmp/file-1.png".into(),
+                filename: Some("file-1.png".into()),
+                mime_type: Some("image/png".into()),
+            },
+            AttachmentMeta {
+                path: "/tmp/file-2.png".into(),
+                filename: Some("file-2.png".into()),
+                mime_type: Some("image/png".into()),
+            },
+        ];
+        payload.reply_to = Some(ReplyContext {
+            text: "see screenshot".into(),
+            sender: Some("alice@example.com".into()),
+        });
+        let mut echo = EchoCache::new();
+        let mut self_chat = SelfChatCache::new();
+        match evaluate_message(&payload, &mut echo, &mut self_chat, no_allowlist()) {
+            InboundDecision::Dispatch { text, .. } => {
+                assert!(text.contains("In reply to alice@example.com"));
+                assert!(text.contains("> see screenshot"));
+                assert!(text.ends_with("\n\n[Attachments]"));
+            }
+            InboundDecision::Drop { reason } => panic!("expected Dispatch, got Drop: {reason}"),
+        }
+    }
+
     // -- SQL fixture tests --
 
     /// Build a minimal chat.db schema sufficient to exercise poll_new_messages.
@@ -1006,6 +1073,44 @@ mod tests {
         assert_eq!(att.path, "/tmp/borg-test-image.png");
         assert_eq!(att.filename.as_deref(), Some("image.png"));
         assert_eq!(att.mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[test]
+    fn sql_attachment_only_message_with_null_text_is_included() {
+        let conn = build_fixture_db();
+        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (1, 'g', NULL, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO attachment (ROWID, filename, transfer_name, mime_type) \
+             VALUES (100, '/tmp/borg-test-image.png', 'image.png', 'image/png')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 100)",
+            [],
+        )
+        .unwrap();
+
+        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].text.is_none());
+        assert_eq!(msgs[0].attachments.len(), 1);
     }
 
     #[test]

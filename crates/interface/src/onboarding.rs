@@ -5,6 +5,7 @@ use std::str::FromStr;
 use cortex::config::Config;
 use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
 use cortex::provider::Provider;
+use cortex::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
 
 use crate::daemon_client;
@@ -81,6 +82,20 @@ pub(crate) const OPENROUTER_MODELS: &[(&str, &str)] = &[
         "anthropic/claude-haiku-4.5",
         "Claude Haiku 4.5 (fast, cheap)",
     ),
+    ("openai/gpt-5.5", "GPT-5.5"),
+    ("openai/gpt-5.5-pro", "GPT-5.5 Pro (reasoning)"),
+    ("openai/gpt-5.4-mini", "GPT-5.4 Mini (fast)"),
+    ("openai/gpt-5.4-nano", "GPT-5.4 Nano (cheap)"),
+    ("openai/gpt-5.1-codex", "GPT-5.1 Codex (coding)"),
+    ("openai/gpt-5", "GPT-5"),
+    ("openai/gpt-5-mini", "GPT-5 Mini"),
+    ("qwen/qwen3.6-max-preview", "Qwen3.6 Max"),
+    ("qwen/qwen3.6-flash", "Qwen3.6 Flash"),
+    ("qwen/qwen3-coder-next", "Qwen3 Coder Next (coding)"),
+    ("z-ai/glm-5.1", "GLM 5.1"),
+    ("z-ai/glm-4.7", "GLM 4.7"),
+    ("mistralai/mistral-large-2512", "Mistral Large 3"),
+    ("mistralai/devstral-2512", "Devstral 2 (coding)"),
 ];
 
 pub(crate) const OPENAI_MODELS: &[(&str, &str)] = &[
@@ -255,6 +270,18 @@ fn store_in_keychain(provider_id: &str, api_key: &str) -> Result<()> {
     plugins::keychain::store(&service_name, "borg", api_key)
 }
 
+fn keychain_api_key_toml(provider_id: &str) -> Result<String> {
+    let secret_ref = provider_api_key_secret_ref(provider_id);
+    let SecretRef::Keychain { service, account } = secret_ref else {
+        unreachable!("provider_api_key_secret_ref must return Keychain")
+    };
+    let service = escape_toml_string(&service);
+    let account = escape_toml_string(&account);
+    Ok(format!(
+        r#"api_key = {{ source = "keychain", service = "{service}", account = "{account}" }}"#
+    ))
+}
+
 /// Validate that a model ID is safe for TOML interpolation (alphanumeric, slashes, hyphens, dots).
 fn validate_model_id(model_id: &str) -> Result<()> {
     if model_id.is_empty() {
@@ -296,16 +323,7 @@ pub fn generate_config(
         // Keyless providers (e.g., Ollama) — no API key config needed
         "# No API key required for local provider\n# base_url = \"http://localhost:11434/v1/chat/completions\"  # uncomment to override".to_string()
     } else if use_keychain {
-        let service_name = format!("borg-{provider_id}");
-        if cfg!(target_os = "macos") {
-            format!(
-                r#"api_key = {{ source = "exec", command = "security", args = ["find-generic-password", "-s", "{service_name}", "-a", "borg", "-w"] }}"#,
-            )
-        } else {
-            format!(
-                r#"api_key = {{ source = "exec", command = "secret-tool", args = ["lookup", "service", "borg", "provider", "{provider_id}"] }}"#,
-            )
-        }
+        keychain_api_key_toml(provider_id)?
     } else {
         let env_var = provider.default_env_var();
         format!(r#"api_key_env = "{env_var}""#)
@@ -344,24 +362,33 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<()> {
 
 /// Build the .tmp path for a given file by appending ".tmp" to the full name.
 /// e.g. "config.toml" → "config.toml.tmp"
-/// Append (or replace) a `KEY=VALUE` line in `<data_dir>/.env`, then chmod
-/// the file to 0600. Used as the headless-VPS fallback when the OS keychain
-/// is unavailable for plugin credentials. Existing lines for the same key are
-/// rewritten in place rather than duplicated.
-fn append_env_file(data_dir: &std::path::Path, key: &str, value: &str) -> Result<()> {
+/// Append (or replace) a `KEY=VALUE` line in `<data_dir>/.env`. The temp file
+/// is created with mode 0600 from the start (Unix) so the secret never hits
+/// disk world-readable, even briefly between rename and chmod. Used as the
+/// headless-VPS fallback when the OS keychain is unavailable for plugin
+/// credentials. Existing lines for the same key are rewritten in place.
+pub(crate) fn append_env_file(data_dir: &std::path::Path, key: &str, value: &str) -> Result<()> {
     if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         bail!(
             "env var name {key:?} must be alphanumeric/underscore for systemd EnvironmentFile compatibility"
         );
     }
+    let clean_value = value.trim().replace(['\n', '\r', '\0'], "");
+    // systemd EnvironmentFile parses backslash escapes and quoted strings;
+    // reject characters that would break parsing or smuggle adjacent vars.
+    if clean_value.contains(['"', '\\', '`']) {
+        bail!(
+            "credential value for {key} contains characters unsafe for systemd EnvironmentFile (\", \\, `)"
+        );
+    }
     let path = data_dir.join(".env");
-    let clean_value = value.trim().replace(['\n', '\r'], "");
     let prefix = format!("{key}=");
     let mut new_contents = String::new();
     let mut replaced = false;
     if let Ok(existing) = std::fs::read_to_string(&path) {
         for line in existing.lines() {
-            if line.starts_with(&prefix) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(&prefix) {
                 new_contents.push_str(&format!("{key}={clean_value}\n"));
                 replaced = true;
             } else {
@@ -373,12 +400,43 @@ fn append_env_file(data_dir: &std::path::Path, key: &str, value: &str) -> Result
     if !replaced {
         new_contents.push_str(&format!("{key}={clean_value}\n"));
     }
-    atomic_write(&path, &new_contents)?;
+    write_secret_file(&path, &new_contents).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Atomically write `content` to `path` with mode 0600 from creation (Unix).
+/// The temp file is opened with `O_CREAT | O_EXCL` and explicit mode so the
+/// secret never lives on disk with permissive perms before chmod.
+fn write_secret_file(path: &std::path::Path, content: &str) -> Result<()> {
+    let tmp_path = tmp_path_for(path);
+    // If a stale tmp exists from a previous crash, remove it; O_EXCL would
+    // otherwise fail.
+    let _ = std::fs::remove_file(&tmp_path);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .with_context(|| format!("create {}", tmp_path.display()))?;
+        f.write_all(content.as_bytes())
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        if let Err(e) = f.sync_all() {
+            tracing::warn!("fsync {} failed: {e}", tmp_path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp_path, content)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e)
+            .with_context(|| format!("rename {} to {}", tmp_path.display(), path.display()));
     }
     Ok(())
 }
@@ -452,17 +510,8 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
         client.set_onboarding_complete().await?;
 
         if use_keychain {
-            let secret_json = if cfg!(target_os = "macos") {
-                format!(
-                    r#"{{"source":"exec","command":"security","args":["find-generic-password","-s","borg-{}","-a","borg","-w"]}}"#,
-                    result.provider
-                )
-            } else {
-                format!(
-                    r#"{{"source":"exec","command":"secret-tool","args":["lookup","service","borg","provider","{}"]}}"#,
-                    result.provider
-                )
-            };
+            let secret_json = serde_json::to_string(&provider_api_key_secret_ref(&result.provider))
+                .context("serialize onboarding keychain SecretRef")?;
             client.set_setting("llm.api_key", &secret_json).await?;
         } else {
             let provider = Provider::from_str(&result.provider)?;
@@ -531,32 +580,15 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                         );
                     }
                     let env_var = provider.default_env_var();
-                    let env_path = data_dir.join(".env");
-                    let clean_key = api_key.trim().replace(['\n', '\r'], "");
-                    atomic_write(&env_path, &format!("{env_var}={clean_key}\n"))?;
-                    println!("  Created {}", env_path.display());
+                    append_env_file(&data_dir, env_var, api_key)?;
+                    println!("  Updated {}", data_dir.join(".env").display());
                 }
             }
         } else {
             let provider = Provider::from_str(&result.provider)?;
             let env_var = provider.default_env_var();
-            let env_path = data_dir.join(".env");
-            let clean_key = api_key.trim().replace(['\n', '\r'], "");
-            atomic_write(&env_path, &format!("{env_var}={clean_key}\n"))?;
-            // Restrict permissions on .env file
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))
-                {
-                    eprintln!(
-                        "  Warning: could not restrict permissions on {}: {e}",
-                        env_path.display()
-                    );
-                }
-            }
-            println!("  Created {}", env_path.display());
+            append_env_file(&data_dir, env_var, api_key)?;
+            println!("  Updated {}", data_dir.join(".env").display());
         }
     }
 
@@ -863,7 +895,15 @@ mod tests {
         )
         .expect("valid");
         assert!(config.contains("api_key = {"));
-        assert!(config.contains("source = \"exec\""));
+        assert!(config.contains("source = \"keychain\""));
+        let parsed: cortex::config::Config = toml::from_str(&config).expect("parse config");
+        match parsed.llm.api_key {
+            Some(SecretRef::Keychain { service, account }) => {
+                assert_eq!(service, "borg-openrouter");
+                assert_eq!(account, "borg");
+            }
+            other => panic!("expected Keychain ref, got {other:?}"),
+        }
         // Should NOT contain api_key_env when using keychain
         assert!(!config.contains("api_key_env"));
     }

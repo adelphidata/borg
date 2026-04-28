@@ -106,6 +106,12 @@ pub async fn parse_event(
                 if text.is_empty() {
                     return None;
                 }
+                let message_id = nested.ts.clone();
+                let thread_ts = nested
+                    .thread_ts
+                    .clone()
+                    .or_else(|| event.thread_ts.clone())
+                    .or_else(|| message_id.clone());
                 let peer_kind = match event.channel_type.as_deref() {
                     Some("im") => Some(PEER_KIND_DIRECT.to_string()),
                     Some("channel") | Some("group") | Some("mpim") => {
@@ -117,9 +123,9 @@ pub async fn parse_event(
                     sender_id: sender,
                     text,
                     channel_id: event.channel.clone(),
-                    thread_id: nested.ts.clone(),
-                    message_id: nested.ts.clone(),
-                    thread_ts: nested.ts.clone(),
+                    thread_id: thread_ts.clone(),
+                    message_id,
+                    thread_ts,
                     attachments: Vec::new(),
                     reaction: None,
                     metadata: serde_json::json!({
@@ -135,7 +141,12 @@ pub async fn parse_event(
             "message_deleted" => {
                 let prev = event.previous_message.as_ref()?;
                 let sender = prev.user.as_deref()?.to_string();
-                let deleted_ts = event.deleted_ts.clone().or_else(|| prev.ts.clone());
+                let message_id = event.deleted_ts.clone().or_else(|| prev.ts.clone());
+                let thread_ts = prev
+                    .thread_ts
+                    .clone()
+                    .or_else(|| event.thread_ts.clone())
+                    .or_else(|| message_id.clone());
                 let peer_kind = match event.channel_type.as_deref() {
                     Some("im") => Some(PEER_KIND_DIRECT.to_string()),
                     Some("channel") | Some("group") | Some("mpim") => {
@@ -147,9 +158,9 @@ pub async fn parse_event(
                     sender_id: sender,
                     text: prev.text.clone().unwrap_or_default(),
                     channel_id: event.channel.clone(),
-                    thread_id: deleted_ts.clone(),
-                    message_id: deleted_ts.clone(),
-                    thread_ts: deleted_ts,
+                    thread_id: thread_ts.clone(),
+                    message_id,
+                    thread_ts,
                     attachments: Vec::new(),
                     reaction: None,
                     metadata: serde_json::json!({
@@ -396,11 +407,13 @@ mod tests {
             user: Some("U456".to_string()),
             text: Some("the new text".to_string()),
             ts: Some("1700000000.111".to_string()),
+            thread_ts: None,
         });
         event.previous_message = Some(NestedSlackMessage {
             user: Some("U456".to_string()),
             text: Some("the old text".to_string()),
             ts: Some("1700000000.111".to_string()),
+            thread_ts: None,
         });
         let cb = make_event(event);
         let msg = parse_event(&cb, None, None)
@@ -415,6 +428,7 @@ mod tests {
         // Edit threads to the original message timestamp so downstream handlers
         // can attribute the edit to a session.
         assert_eq!(msg.message_id.as_deref(), Some("1700000000.111"));
+        assert_eq!(msg.thread_id.as_deref(), Some("1700000000.111"));
     }
 
     #[tokio::test]
@@ -427,6 +441,7 @@ mod tests {
             user: Some("U456".to_string()),
             text: Some("the deleted text".to_string()),
             ts: Some("1700000000.222".to_string()),
+            thread_ts: None,
         });
         // No `message` (Slack doesn't send one for deletes).
         event.message = None;
@@ -438,6 +453,52 @@ mod tests {
         assert_eq!(msg.sender_id, "U456");
         assert_eq!(msg.metadata["event_type"], "message_deleted");
         assert_eq!(msg.message_id.as_deref(), Some("1700000000.222"));
+        assert_eq!(msg.thread_id.as_deref(), Some("1700000000.222"));
+    }
+
+    #[tokio::test]
+    async fn message_changed_in_thread_keeps_parent_thread_ts() {
+        use super::super::types::NestedSlackMessage;
+        let mut event = make_slack_event("message");
+        event.subtype = Some("message_changed".to_string());
+        event.thread_ts = Some("1700000000.000".to_string());
+        event.message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("edited thread reply".to_string()),
+            ts: Some("1700000000.111".to_string()),
+            thread_ts: Some("1700000000.000".to_string()),
+        });
+        event.previous_message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("old thread reply".to_string()),
+            ts: Some("1700000000.111".to_string()),
+            thread_ts: Some("1700000000.000".to_string()),
+        });
+
+        let msg = parse_event(&make_event(event), None, None).await.unwrap();
+        assert_eq!(msg.message_id.as_deref(), Some("1700000000.111"));
+        assert_eq!(msg.thread_id.as_deref(), Some("1700000000.000"));
+        assert_eq!(msg.thread_ts.as_deref(), Some("1700000000.000"));
+    }
+
+    #[tokio::test]
+    async fn message_deleted_in_thread_keeps_parent_thread_ts() {
+        use super::super::types::NestedSlackMessage;
+        let mut event = make_slack_event("message");
+        event.subtype = Some("message_deleted".to_string());
+        event.thread_ts = Some("1700000000.000".to_string());
+        event.deleted_ts = Some("1700000000.222".to_string());
+        event.previous_message = Some(NestedSlackMessage {
+            user: Some("U456".to_string()),
+            text: Some("deleted thread reply".to_string()),
+            ts: Some("1700000000.222".to_string()),
+            thread_ts: Some("1700000000.000".to_string()),
+        });
+
+        let msg = parse_event(&make_event(event), None, None).await.unwrap();
+        assert_eq!(msg.message_id.as_deref(), Some("1700000000.222"));
+        assert_eq!(msg.thread_id.as_deref(), Some("1700000000.000"));
+        assert_eq!(msg.thread_ts.as_deref(), Some("1700000000.000"));
     }
 
     #[tokio::test]

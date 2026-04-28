@@ -17,10 +17,13 @@ use anyhow::{Context, Result};
 
 use cortex::config::Config;
 use cortex::provider::Provider;
-use cortex::secrets_resolve::SecretRef;
+use cortex::secrets_resolve::provider_api_key_secret_ref;
 use protocols::admin::{api_key_value::Body as ApiKeyBody, ApiKeyValue, KeychainRef};
 
 use crate::daemon_client;
+
+#[cfg(test)]
+use cortex::secrets_resolve::SecretRef;
 
 /// Outcome of attempting to save an API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,29 +40,6 @@ pub enum ApiKeySaveOutcome {
 /// Keychain service name convention for a provider.
 pub fn keychain_service_name(provider_id: &str) -> String {
     format!("borg-{provider_id}")
-}
-
-/// Build the `SecretRef::Exec` JSON that reads the stored key back out.
-/// Matches the shape used by onboarding so keys persist uniformly.
-fn build_secret_ref_json(provider_id: &str) -> String {
-    let service = keychain_service_name(provider_id);
-    if cfg!(target_os = "macos") {
-        format!(
-            r#"{{"source":"exec","command":"security","args":["find-generic-password","-s","{service}","-a","borg","-w"]}}"#,
-        )
-    } else if cfg!(target_os = "linux") {
-        format!(
-            r#"{{"source":"exec","command":"secret-tool","args":["lookup","service","borg","provider","{provider_id}"]}}"#,
-        )
-    } else if cfg!(target_os = "windows") {
-        // Windows doesn't expose a stdout lookup for Credential Manager via
-        // `cmdkey`, so we fall back to letting the caller surface the
-        // keychain-unavailable hint. This branch is defensive — `save_api_key`
-        // gates on `keychain::available()` before calling this.
-        format!(r#"{{"source":"exec","command":"cmdkey","args":["/list:{service}/borg"]}}"#,)
-    } else {
-        String::new()
-    }
 }
 
 /// Run `fut` to completion regardless of whether we're already inside a
@@ -119,9 +99,9 @@ pub fn save_api_key<D>(
     plugins::keychain::store(&service, "borg", &clean_key)
         .with_context(|| format!("Failed to write API key to keychain (service={service})"))?;
 
-    let secret_json = build_secret_ref_json(provider_id);
-    let secret_ref: SecretRef =
-        serde_json::from_str(&secret_json).context("Failed to parse generated SecretRef JSON")?;
+    let secret_ref = provider_api_key_secret_ref(provider_id);
+    let secret_json =
+        serde_json::to_string(&secret_ref).context("Failed to serialize SecretRef JSON")?;
 
     // Persist routing metadata via the daemon. The keychain entry is the
     // source of truth for the secret; `credentials.{provider}` records WHERE
@@ -188,8 +168,21 @@ mod tests {
     }
 
     #[test]
-    fn secret_ref_json_is_valid() {
-        let json = build_secret_ref_json("openrouter");
+    fn provider_api_key_secret_ref_is_canonical_keychain_ref() {
+        let secret_ref = provider_api_key_secret_ref("openrouter");
+        match secret_ref {
+            SecretRef::Keychain { service, account } => {
+                assert_eq!(service, "borg-openrouter");
+                assert_eq!(account, "borg");
+            }
+            other => panic!("expected Keychain variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_api_key_secret_ref_json_is_valid() {
+        let secret_ref = provider_api_key_secret_ref("openrouter");
+        let json = serde_json::to_string(&secret_ref).expect("serialize");
         let parsed: Result<SecretRef, _> = serde_json::from_str(&json);
         assert!(parsed.is_ok(), "invalid JSON: {json}");
     }

@@ -17,18 +17,13 @@ pub async fn run(resume: Option<String>) -> Result<Option<crate::tui::ResumeHint
 }
 
 /// Send `message` to a fresh daemon session and stream the response to
-/// stdout. `auto_approve` answers shell-confirmation prompts; `json_output`
-/// buffers the full text and prints a JSON envelope at end-of-turn.
+/// stdout. `json_output` buffers the full text and prints a JSON envelope
+/// at end-of-turn.
 ///
 /// `mode` is currently informational — collaboration mode now lives in the
 /// daemon's persisted config; CLI-level mode override is reserved for a
 /// future Admin RPC and ignored here so the call still succeeds.
-pub async fn one_shot(
-    message: &str,
-    auto_approve: bool,
-    json_output: bool,
-    _mode: Option<&str>,
-) -> Result<()> {
+pub async fn one_shot(message: &str, json_output: bool, _mode: Option<&str>) -> Result<()> {
     let client = connect_or_spawn()
         .await
         .context("connect to borgd for one-shot")?;
@@ -75,19 +70,12 @@ pub async fn one_shot(
                 }
             }
             AgentEvent::ShellConfirmation { respond, command } => {
-                if auto_approve {
-                    if respond.send(true).is_err() {
-                        tracing::warn!("shell-approval channel closed before reply");
-                    } else if !json_output {
-                        eprintln!("[auto-approved] {command}");
-                    }
-                } else {
-                    if respond.send(false).is_err() {
-                        tracing::warn!("shell-deny channel closed before reply");
-                    }
-                    if !json_output {
-                        eprintln!("Shell command denied in one-shot mode. Use --yes to allow.");
-                    }
+                tracing::warn!("unexpected shell confirmation in one-shot mode: {command}");
+                if respond.send(false).is_err() {
+                    tracing::warn!("shell-deny channel closed before reply");
+                }
+                if !json_output {
+                    eprintln!("Shell command denied by daemon policy.");
                 }
             }
             AgentEvent::Error(e) => {

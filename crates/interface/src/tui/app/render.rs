@@ -135,7 +135,14 @@ impl<'a> App<'a> {
 
         for (i, cell) in self.cells.iter().enumerate() {
             if i > 0 && !cell.is_stream_continuation() {
-                all_lines.push(Line::default());
+                let prev = &self.cells[i - 1];
+                // Adjacent tool-flow cells (e.g. ToolResult → ToolStart for
+                // back-to-back command runs) hug each other; everywhere else
+                // a single unstyled blank separates blocks.
+                let hug = prev.is_tool_flow() && cell.is_tool_flow();
+                if !hug {
+                    all_lines.push(Line::default());
+                }
             }
             all_lines.extend(cell.render(width, throbber_state));
         }
