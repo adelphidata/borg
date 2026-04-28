@@ -455,7 +455,7 @@ fn style_indented_line(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), theme::dim()))
 }
 
-/// Render a parsed `run_shell` result in Codex's compact layout:
+/// Render a parsed `run_shell` result in a compact two-line layout:
 /// `└ Exit code: N`, then per-stream `--- stdout ---` / `--- stderr ---`
 /// sections (omitted when the stream is empty), each truncated to
 /// `SHELL_PREVIEW_LINES` post-wrap rows when `collapsed` is true,
@@ -813,7 +813,7 @@ impl HistoryCell {
                 // Contextual: apply_patch renders the raw patch as a colored diff
                 // instead of the plain success-text output. Only on success —
                 // errors show the usual dim preview so the error text is visible.
-                // run_shell uses Codex's compact layout: separate
+                // run_shell uses a compact two-line layout: separate
                 // └ Exit code row, per-stream `--- stdout/stderr ---`
                 // sections (omitted when empty), capped preview per
                 // stream. Falls through to the generic body path if
@@ -1997,11 +1997,11 @@ mod tests {
 
     #[test]
     fn style_system_line_tool_listing() {
-        let line = style_system_line("  write_memory       Write/append to memory files");
+        let line = style_system_line("  write_memory       Write/append long-term memory entries");
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[1].content.as_ref(), "write_memory");
         assert_eq!(line.spans[1].style.fg, Some(ratatui::style::Color::White));
-        // Description stays dim — no bold/white on the slash in "Write/append"
+        // Description stays dim — no bold/white emphasis on the description body.
         assert_eq!(line.spans[2].style, theme::dim());
     }
 

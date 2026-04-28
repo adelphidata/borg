@@ -57,6 +57,7 @@ impl<'a> App<'a> {
                     matches!(cell, HistoryCell::System { text } if text.contains(&format!("Analyzing {label}...")))
                 }) {
                     let pos = search_start + rel_pos;
+                    debug_assert!(pos >= self.cells_emitted, "mutating flushed cell at {pos}");
                     self.cells[pos] = HistoryCell::System { text: result_text };
                 } else {
                     self.push_system_message(result_text);
@@ -195,6 +196,7 @@ impl<'a> App<'a> {
         };
 
         if let Some(idx) = thinking_idx {
+            debug_assert!(idx >= self.cells_emitted, "mutating flushed cell at {idx}");
             if let HistoryCell::Thinking { text, .. } = &mut self.cells[idx] {
                 text.push_str(&delta);
             }
@@ -248,6 +250,7 @@ impl<'a> App<'a> {
         let mut duration_ms = None;
         let mut matched_args = None;
         let search_start = self.cells_emitted;
+        debug_assert!(search_start <= self.cells.len(), "watermark past end");
         for cell in self.cells[search_start..].iter_mut().rev() {
             if let HistoryCell::ToolStart {
                 name: ref start_name,
@@ -282,7 +285,9 @@ impl<'a> App<'a> {
             .iter()
             .rposition(|c| matches!(c, HistoryCell::ToolStreaming { .. }))
         {
-            self.cells.remove(search_start + rel_idx);
+            let pos = search_start + rel_idx;
+            debug_assert!(pos >= self.cells_emitted, "removing flushed cell at {pos}");
+            self.cells.remove(pos);
         }
         let is_error = result.starts_with("Error:");
         let line_count = result.lines().count();
@@ -409,6 +414,7 @@ impl<'a> App<'a> {
             .rposition(|c| matches!(c, HistoryCell::Plan { .. }))
             .map(|rel| search_start + rel);
         if let Some(idx) = existing {
+            debug_assert!(idx >= self.cells_emitted, "mutating flushed cell at {idx}");
             self.cells[idx] = HistoryCell::Plan { steps };
         } else {
             self.cells.push(HistoryCell::Plan { steps });
@@ -475,6 +481,7 @@ impl<'a> App<'a> {
             }
         };
         if let Some(idx) = target {
+            debug_assert!(idx >= self.cells_emitted, "mutating flushed cell at {idx}");
             if let HistoryCell::ToolStreaming { lines } = &mut self.cells[idx] {
                 let parts: Vec<&str> = delta.split('\n').collect();
                 for (i, part) in parts.iter().enumerate() {
