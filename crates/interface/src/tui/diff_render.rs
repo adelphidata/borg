@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthChar;
 use super::highlight;
 use super::theme;
 
-/// Tab stops are rendered as 4 columns wide (matches codex's diff view).
+/// Tab stops are rendered as 4 columns wide.
 const TAB_WIDTH: usize = 4;
 /// Continuation rows from line wrapping are indented by this many spaces so
 /// the wrap visually belongs to the row above.
