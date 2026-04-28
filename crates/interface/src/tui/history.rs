@@ -153,6 +153,33 @@ fn render_boxed_lines(
 pub const COLLAPSE_THRESHOLD: usize = 10;
 /// Preview budget (display rows) when a tool result is collapsed.
 pub const COLLAPSE_PREVIEW_LINES: usize = 8;
+/// Per-stream preview rows for `run_shell` results when collapsed,
+/// before emitting the `… +N lines (ctrl + t to view transcript)` footer.
+/// Stdout and stderr each get their own budget so a noisy stderr can't
+/// hide the head of stdout.
+pub const SHELL_PREVIEW_LINES: usize = 5;
+
+/// Parsed view of `run_shell`'s success-path output envelope:
+/// `"Exit code: {n}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"`.
+struct ShellOutput<'a> {
+    exit_code: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+/// Split the `run_shell` envelope into its three pieces. Returns `None`
+/// if any sentinel is missing so callers can fall back to the generic
+/// body renderer instead of producing a misleading layout.
+fn parse_shell_output(raw: &str) -> Option<ShellOutput<'_>> {
+    let after_prefix = raw.strip_prefix("Exit code: ")?;
+    let (exit_code, rest) = after_prefix.split_once("\n--- stdout ---\n")?;
+    let (stdout, stderr) = rest.split_once("\n--- stderr ---\n")?;
+    Some(ShellOutput {
+        exit_code,
+        stdout,
+        stderr,
+    })
+}
 
 #[derive(Clone)]
 pub enum ApprovalStatus {
@@ -428,6 +455,121 @@ fn style_indented_line(line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), theme::dim()))
 }
 
+/// Render a parsed `run_shell` result in Codex's compact layout:
+/// `└ Exit code: N`, then per-stream `--- stdout ---` / `--- stderr ---`
+/// sections (omitted when the stream is empty), each truncated to
+/// `SHELL_PREVIEW_LINES` post-wrap rows when `collapsed` is true,
+/// followed by the standard `✓ <label> • Ns` status row.
+fn render_shell_result(
+    parsed: ShellOutput<'_>,
+    display_label: &str,
+    duration_ms: Option<u64>,
+    collapsed: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let dim = theme::dim();
+    let hard_cap = (width as usize).saturating_sub(6).max(80);
+    let content_width = (width as usize).saturating_sub(4).max(1);
+    let row_cost = |line: &Line<'_>| -> usize {
+        let w = line_utils::line_width(line);
+        if w == 0 {
+            1
+        } else {
+            w.div_ceil(content_width)
+        }
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // └ Exit code: N — matches the styling of the `└ $ cmd` detail row
+    // emitted by `tool_detail_line` for ToolStart, so the two halves of
+    // the call read as a single block.
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {} ", theme::TREE_END), dim),
+        Span::styled(format!("Exit code: {}", parsed.exit_code), dim),
+    ]));
+
+    // Section: lays down a `--- {label} ---` header, then up to
+    // `SHELL_PREVIEW_LINES` post-wrap rows when collapsed, plus a
+    // `… +N lines (ctrl + t to view transcript)` footer if anything
+    // was elided. Empty streams render nothing.
+    let mut push_section = |label: &str, body: &str| {
+        let trimmed = body.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("    --- {label} ---"),
+            dim,
+        )));
+
+        let body_lines: Vec<Line<'static>> = trimmed
+            .lines()
+            .map(|l| {
+                let parsed = parse_ansi_line(l, dim);
+                line_utils::truncate_line_with_ellipsis(parsed, hard_cap)
+            })
+            .collect();
+        let total_rows: usize = body_lines.iter().map(|l| row_cost(l)).sum();
+
+        let (taken, rows_used) = if collapsed && total_rows > SHELL_PREVIEW_LINES {
+            let mut used = 0usize;
+            let mut n = 0usize;
+            for line in body_lines.iter() {
+                let cost = row_cost(line);
+                if used + cost > SHELL_PREVIEW_LINES && n > 0 {
+                    break;
+                }
+                used += cost;
+                n += 1;
+                if used >= SHELL_PREVIEW_LINES {
+                    break;
+                }
+            }
+            (n, used)
+        } else {
+            (body_lines.len(), total_rows)
+        };
+
+        for line in body_lines.iter().take(taken) {
+            let mut spans = vec![Span::styled("    ".to_string(), dim)];
+            spans.extend(line.spans.clone());
+            lines.push(Line::from(spans));
+        }
+
+        if collapsed && total_rows > SHELL_PREVIEW_LINES {
+            let extra = total_rows.saturating_sub(rows_used);
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {} +{extra} lines (ctrl + t to view transcript)",
+                    theme::ELLIPSIS
+                ),
+                dim,
+            )));
+        }
+    };
+
+    push_section("stdout", parsed.stdout);
+    push_section("stderr", parsed.stderr);
+
+    // Status footer mirrors the success branch of the generic ToolResult
+    // renderer (check + label + " • Ns"). Non-zero exit codes land in the
+    // generic error path (is_error = true), so we only need ✓ here.
+    let duration_str = match duration_ms {
+        Some(ms) => {
+            let secs_f = ms as f64 / 1000.0;
+            format!(" • {secs_f:.1}s")
+        }
+        None => String::new(),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {} ", theme::CHECK), theme::check_style()),
+        Span::styled(format!("{display_label}{duration_str}"), dim),
+    ]));
+
+    lines
+}
+
 impl HistoryCell {
     /// Construct an `Assistant` cell with an empty render cache.
     pub fn assistant(text: String, streaming: bool) -> Self {
@@ -660,6 +802,23 @@ impl HistoryCell {
                 // Contextual: apply_patch renders the raw patch as a colored diff
                 // instead of the plain success-text output. Only on success —
                 // errors show the usual dim preview so the error text is visible.
+                // run_shell uses Codex's compact layout: separate
+                // └ Exit code row, per-stream `--- stdout/stderr ---`
+                // sections (omitted when empty), capped preview per
+                // stream. Falls through to the generic body path if
+                // the envelope can't be parsed.
+                if !*is_error && tool_name == "run_shell" {
+                    if let Some(parsed) = parse_shell_output(output) {
+                        return render_shell_result(
+                            parsed,
+                            display_label,
+                            *duration_ms,
+                            *collapsed,
+                            width,
+                        );
+                    }
+                }
+
                 let rendered_body = if !*is_error
                     && tool_name == "apply_patch"
                     && args_json.is_some()
@@ -2019,5 +2178,100 @@ mod tests {
         assert_eq!(lines.len(), 1, "empty streaming cell => cursor line only");
         let rendered = flatten_plain(&lines);
         assert_eq!(rendered, "▊");
+    }
+
+    fn shell_tool_result(output: &str, collapsed: bool) -> HistoryCell {
+        HistoryCell::ToolResult {
+            output: output.to_string(),
+            is_error: false,
+            duration_ms: Some(3400),
+            display_label: "Ran `cat foo`".to_string(),
+            tool_name: "run_shell".to_string(),
+            args_json: Some(r#"{"command":"cat foo"}"#.to_string()),
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn render_shell_result_skips_empty_streams() {
+        // mkdir-style call: zero-byte stdout, zero-byte stderr — neither
+        // section header should leak through, only Exit code + status.
+        let cell = shell_tool_result("Exit code: 0\n--- stdout ---\n\n--- stderr ---\n", true);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(text.contains("└ Exit code: 0"), "got: {text}");
+        assert!(!text.contains("--- stdout ---"), "got: {text}");
+        assert!(!text.contains("--- stderr ---"), "got: {text}");
+        assert!(text.contains("✓"), "status row missing: {text}");
+        assert!(text.contains("• 3.4s"), "duration missing: {text}");
+    }
+
+    #[test]
+    fn render_shell_result_truncates_long_stdout() {
+        let body: String = (0..30).map(|i| format!("line{i}\n")).collect();
+        let raw = format!("Exit code: 0\n--- stdout ---\n{body}--- stderr ---\n");
+        let cell = shell_tool_result(&raw, true);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(text.contains("--- stdout ---"));
+        assert!(text.contains("line0"));
+        assert!(text.contains("line4"));
+        assert!(!text.contains("line29"), "tail should be elided");
+        assert!(
+            text.contains("ctrl + t to view transcript"),
+            "expected truncation footer, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_shell_result_expanded_shows_all_lines() {
+        let body: String = (0..30).map(|i| format!("line{i}\n")).collect();
+        let raw = format!("Exit code: 0\n--- stdout ---\n{body}--- stderr ---\n");
+        let cell = shell_tool_result(&raw, false);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(text.contains("line29"), "all rows expected when expanded");
+        assert!(
+            !text.contains("ctrl + t to view transcript"),
+            "no footer when expanded, got: {text}"
+        );
+    }
+
+    #[test]
+    fn render_shell_result_shows_stderr_when_present() {
+        let raw = "Exit code: 0\n--- stdout ---\nok\n--- stderr ---\nwarn: deprecated\n";
+        let cell = shell_tool_result(raw, true);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(text.contains("--- stdout ---"));
+        assert!(text.contains("ok"));
+        assert!(text.contains("--- stderr ---"));
+        assert!(text.contains("warn: deprecated"));
+    }
+
+    #[test]
+    fn render_shell_result_falls_back_on_unparseable() {
+        // No "Exit code:" prefix — the structured renderer must bail and
+        // hand the raw text to the generic body path so we don't lose it.
+        let cell = shell_tool_result("totally unstructured output text\n", true);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            text.contains("totally unstructured output text"),
+            "fallback must preserve raw text, got: {text}"
+        );
+    }
+
+    #[test]
+    fn parse_shell_output_returns_none_when_sentinels_missing() {
+        assert!(parse_shell_output("hello").is_none());
+        assert!(parse_shell_output("Exit code: 0\nno markers").is_none());
+        assert!(parse_shell_output("Exit code: 0\n--- stdout ---\nno stderr marker").is_none());
+        let parsed =
+            parse_shell_output("Exit code: 137\n--- stdout ---\nout\n--- stderr ---\nerr\n")
+                .expect("envelope should parse");
+        assert_eq!(parsed.exit_code, "137");
+        assert_eq!(parsed.stdout, "out");
+        assert_eq!(parsed.stderr, "err\n");
     }
 }
