@@ -99,15 +99,6 @@ pub fn icon_style() -> Style {
     Style::default().fg(CYAN)
 }
 
-#[allow(dead_code)]
-pub fn thinking_border_style() -> Style {
-    if super::colors::is_light_terminal() {
-        Style::default().fg(Color::Rgb(150, 150, 150))
-    } else {
-        Style::default().fg(Color::Rgb(80, 80, 80))
-    }
-}
-
 /// Italic + dim, used for reasoning/thinking bodies to visually separate
 /// chain-of-thought content from assistant responses. Shared so future
 /// cells can reuse the same look.

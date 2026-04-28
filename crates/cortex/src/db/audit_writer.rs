@@ -35,11 +35,6 @@ pub fn try_emit_global<T: Serialize>(event_type: &str, principal_id: &str, paylo
     }
 }
 
-#[cfg(test)]
-pub(crate) fn global_audit_for_test() -> Option<AuditWriter> {
-    GLOBAL_AUDIT.get().cloned()
-}
-
 pub mod audit_events {
     pub const DAEMON_START: &str = "daemon_start";
     pub const DAEMON_STOP: &str = "daemon_stop";

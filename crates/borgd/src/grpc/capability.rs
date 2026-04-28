@@ -45,9 +45,6 @@ pub enum InvocationResult {
 
 /// One connected client.
 struct ClientEntry {
-    /// Human-readable label for logs/admin debugging.
-    #[allow(dead_code)]
-    label: String,
     capabilities: Vec<String>,
     /// Outbound channel for `Invoke` messages.
     invoke_tx: mpsc::Sender<ServerMessage>,
@@ -70,12 +67,7 @@ impl CapabilityRouter {
         }
     }
 
-    fn register(
-        &self,
-        label: String,
-        capabilities: Vec<String>,
-        invoke_tx: mpsc::Sender<ServerMessage>,
-    ) -> u64 {
+    fn register(&self, capabilities: Vec<String>, invoke_tx: mpsc::Sender<ServerMessage>) -> u64 {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let mut g = self
             .clients
@@ -84,7 +76,6 @@ impl CapabilityRouter {
         g.insert(
             id,
             ClientEntry {
-                label,
                 capabilities,
                 invoke_tx,
             },
@@ -250,11 +241,7 @@ impl Capability for CapabilitySvc {
             _ => return Err(TStatus::invalid_argument("first message must be Advertise")),
         };
 
-        let client_id = self.router.register(
-            advertise.client_label,
-            advertise.capabilities,
-            out_tx.clone(),
-        );
+        let client_id = self.router.register(advertise.capabilities, out_tx.clone());
 
         // Send AdvertiseAck.
         let _ = out_tx
@@ -329,7 +316,7 @@ mod tests {
         // a result via the router, assert the `invoke()` future resolves.
         let r = Arc::new(CapabilityRouter::new());
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(8);
-        let _id = r.register("test-tui".into(), vec![CLIPBOARD_READ.into()], tx);
+        let _id = r.register(vec![CLIPBOARD_READ.into()], tx);
 
         let r2 = r.clone();
         let invoke_handle =

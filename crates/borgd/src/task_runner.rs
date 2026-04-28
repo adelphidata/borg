@@ -582,31 +582,17 @@ async fn handle_task_failure(
     }
 }
 
-struct DeliveryTarget {
-    sender: String,
-    #[allow(dead_code)]
-    thread_id: Option<String>,
-}
-
-fn parse_delivery_target(target: &str) -> DeliveryTarget {
+fn parse_sender(target: &str) -> String {
     if target.starts_with('{') {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(target) {
-            let sender = parsed
+            return parsed
                 .get("sender")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let thread_id = parsed
-                .get("thread_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            return DeliveryTarget { sender, thread_id };
         }
     }
-    DeliveryTarget {
-        sender: target.to_string(),
-        thread_id: None,
-    }
+    target.to_string()
 }
 
 async fn deliver_task_result(
@@ -620,9 +606,9 @@ async fn deliver_task_result(
         tracing::warn!("Task '{task_name}' has unresolved 'origin' delivery — dropping");
         return;
     }
-    let parsed = parse_delivery_target(target);
+    let sender = parse_sender(target);
     let msg = format!("[Task: {task_name}]\n{text}");
-    if let Err(e) = crate::channel_delivery::send(config, channel, &parsed.sender, &msg).await {
+    if let Err(e) = crate::channel_delivery::send(config, channel, &sender, &msg).await {
         tracing::warn!("Failed to deliver task result via {channel}: {e}");
     }
 }
