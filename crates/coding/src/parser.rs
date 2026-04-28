@@ -235,6 +235,13 @@ fn strip_heredoc_wrapper(lines: Vec<&str>) -> Vec<&str> {
 ///   `-` (remove), `+` (add). Lines without these prefixes terminate the hunk.
 /// - Delete File has no body.
 pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
+    if looks_like_unified_diff(input) {
+        return parse_unified_diff(input);
+    }
+    parse_patch_dsl(input)
+}
+
+fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
     let lines: Vec<&str> = input.lines().collect();
 
     // Heredoc tolerance: strip <<'EOF'...EOF wrapping that LLMs sometimes emit.
@@ -431,6 +438,239 @@ pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
     if operations.is_empty() {
         return Err(ParseError::InvalidFormat(
             "No operations found in patch".to_string(),
+        ));
+    }
+
+    Ok(Patch { operations })
+}
+
+// ── Unified-diff input fallback ──
+//
+// Many models (especially non-Anthropic) emit standard `git diff` output
+// instead of the Borg DSL: `--- a/path` / `+++ b/path` / `@@ -L,N +L,N @@`.
+// We detect those inputs and convert them into the same `Patch` AST the DSL
+// parser produces, so the applicator path is shared.
+
+/// True when the input contains the unmistakable signatures of a unified
+/// diff (`diff --git`, `--- ` + `+++ ` headers) and does NOT contain the DSL
+/// `*** Begin Patch` boundary. Conservative — DSL inputs that legitimately
+/// contain `@@` context hints must NOT misfire.
+fn looks_like_unified_diff(input: &str) -> bool {
+    if input.contains(BEGIN_PATCH_MARKER) {
+        return false;
+    }
+    let mut saw_minus_header = false;
+    let mut saw_plus_header = false;
+    for line in input.lines() {
+        if line.starts_with("diff --git ") {
+            return true;
+        }
+        if line.starts_with("--- ") {
+            saw_minus_header = true;
+        }
+        if line.starts_with("+++ ") {
+            saw_plus_header = true;
+        }
+        if saw_minus_header && saw_plus_header {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strip the `a/` or `b/` prefix that `git diff` adds to file paths. Returns
+/// the path unchanged if neither prefix is present.
+fn strip_git_path_prefix(p: &str) -> &str {
+    p.strip_prefix("a/")
+        .or_else(|| p.strip_prefix("b/"))
+        .unwrap_or(p)
+}
+
+/// Parse `--- ` or `+++ ` header value, returning the path or `None` for
+/// `/dev/null`. Trailing tab-separated metadata (timestamp) is dropped.
+fn parse_diff_header_path(rest: &str) -> Option<String> {
+    let path = rest.split('\t').next().unwrap_or(rest).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    Some(strip_git_path_prefix(path).to_string())
+}
+
+/// Parse a `@@ -oldStart[,oldCount] +newStart[,newCount] @@ optional context`
+/// line. Returns the optional context hint (None if absent or empty).
+fn parse_hunk_header(line: &str) -> Result<Option<String>, ParseError> {
+    let after = line
+        .strip_prefix("@@")
+        .ok_or_else(|| ParseError::InvalidFormat(format!("not a hunk header: {line:?}")))?;
+    // Find the closing "@@" — content after is the optional context hint.
+    let (_range, hint) = match after.split_once("@@") {
+        Some((range, hint)) => (range.trim(), hint.trim()),
+        None => (after.trim(), ""),
+    };
+    if hint.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(hint.to_string()))
+    }
+}
+
+/// Parse a unified-diff input into a `Patch`. Supports `diff --git`,
+/// `---`/`+++` file headers, `/dev/null` for add/delete, file rename via
+/// differing `a/`/`b/` paths, and standard `@@` hunk bodies.
+pub fn parse_unified_diff(input: &str) -> Result<Patch, ParseError> {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut operations = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Skip everything until we find a file section start.
+        if !line.starts_with("diff --git ") && !line.starts_with("--- ") {
+            i += 1;
+            continue;
+        }
+
+        // Optional `diff --git a/foo b/bar` line — a/path and b/path may
+        // differ on rename. We use the values from `---`/`+++` for the
+        // canonical paths but record both here so we can detect renames.
+        let (mut diff_old, mut diff_new) = (None, None);
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() == 2 {
+                diff_old = Some(strip_git_path_prefix(parts[0]).to_string());
+                diff_new = Some(strip_git_path_prefix(parts[1]).to_string());
+            }
+            i += 1;
+            // Skip extended headers (similarity, rename from/to, index, mode)
+            // until we reach `--- `, `+++ `, or end-of-section.
+            while i < lines.len()
+                && !lines[i].starts_with("--- ")
+                && !lines[i].starts_with("+++ ")
+                && !lines[i].starts_with("@@")
+                && !lines[i].starts_with("diff --git ")
+            {
+                i += 1;
+            }
+        }
+
+        // Expect `--- <oldpath>` then `+++ <newpath>`.
+        let old_path = if i < lines.len() && lines[i].starts_with("--- ") {
+            let p = parse_diff_header_path(&lines[i][4..]);
+            i += 1;
+            p
+        } else {
+            // Rename-only or mode-only with no body — fall back to git header
+            // paths if we have them. Without `@@` this is a no-op we can't
+            // represent; let it fall through and error below.
+            diff_old.clone()
+        };
+        let new_path = if i < lines.len() && lines[i].starts_with("+++ ") {
+            let p = parse_diff_header_path(&lines[i][4..]);
+            i += 1;
+            p
+        } else {
+            diff_new.clone()
+        };
+
+        // Collect hunks for this file.
+        let mut hunks: Vec<Hunk> = Vec::new();
+        let mut add_content_lines: Vec<&str> = Vec::new();
+        while i < lines.len() && lines[i].starts_with("@@") {
+            let hunk_line = i + 1;
+            let context_hint = parse_hunk_header(lines[i])?;
+            i += 1;
+
+            let mut search: Vec<&str> = Vec::new();
+            let mut replace: Vec<&str> = Vec::new();
+            while i < lines.len() {
+                let l = lines[i];
+                if l.starts_with("@@")
+                    || l.starts_with("--- ")
+                    || l.starts_with("+++ ")
+                    || l.starts_with("diff --git ")
+                {
+                    break;
+                }
+                // `\ No newline at end of file` marker — skip silently.
+                if l.starts_with('\\') {
+                    i += 1;
+                    continue;
+                }
+                if let Some(rest) = l.strip_prefix('+') {
+                    replace.push(rest);
+                    if old_path.is_none() {
+                        add_content_lines.push(rest);
+                    }
+                } else if let Some(rest) = l.strip_prefix('-') {
+                    search.push(rest);
+                } else if let Some(rest) = l.strip_prefix(' ') {
+                    search.push(rest);
+                    replace.push(rest);
+                } else if l.is_empty() {
+                    // Bare blank line = empty context line in many `git diff` outputs.
+                    search.push("");
+                    replace.push("");
+                } else {
+                    // Unknown content terminates the hunk.
+                    break;
+                }
+                i += 1;
+            }
+
+            // For an add-file (old=/dev/null) we'll consume hunks via
+            // add_content_lines; skip pushing an UpdateFile hunk.
+            if old_path.is_some() {
+                hunks.push(Hunk {
+                    context_hint,
+                    search: search.join("\n"),
+                    replace: replace.join("\n"),
+                    is_end_of_file: false,
+                    source_line: hunk_line,
+                });
+            }
+        }
+
+        match (old_path.as_deref(), new_path.as_deref()) {
+            (None, Some(p)) => {
+                operations.push(PatchOperation::AddFile {
+                    path: p.to_string(),
+                    content: add_content_lines.join("\n"),
+                });
+            }
+            (Some(p), None) => {
+                operations.push(PatchOperation::DeleteFile {
+                    path: p.to_string(),
+                });
+            }
+            (Some(old), Some(new)) => {
+                if hunks.is_empty() {
+                    return Err(ParseError::InvalidFormat(format!(
+                        "no hunks found for file {old:?}"
+                    )));
+                }
+                let move_to = if old != new {
+                    Some(new.to_string())
+                } else {
+                    None
+                };
+                operations.push(PatchOperation::UpdateFile {
+                    path: old.to_string(),
+                    move_to,
+                    hunks,
+                });
+            }
+            (None, None) => {
+                return Err(ParseError::InvalidFormat(
+                    "unified diff section is missing both --- and +++ headers".to_string(),
+                ));
+            }
+        }
+    }
+
+    if operations.is_empty() {
+        return Err(ParseError::InvalidFormat(
+            "no file sections found in unified diff".to_string(),
         ));
     }
 
@@ -1367,5 +1607,353 @@ not_a_diff_line
             }
             other => panic!("Expected AddFile, got {:?}", other),
         }
+    }
+
+    // ── Unified-diff input fallback ──
+
+    #[test]
+    fn unified_diff_detector_recognizes_git_diff_header() {
+        let input = "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(looks_like_unified_diff(input));
+    }
+
+    #[test]
+    fn unified_diff_detector_recognizes_minus_plus_headers_only() {
+        let input = "--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(looks_like_unified_diff(input));
+    }
+
+    #[test]
+    fn unified_diff_detector_skips_dsl_input() {
+        // DSL with @@ context hint must NOT be misclassified.
+        let input = "*** Begin Patch\n*** Update File: foo\n@@ fn main\n-old\n+new\n*** End Patch";
+        assert!(!looks_like_unified_diff(input));
+    }
+
+    #[test]
+    fn unified_diff_detector_skips_plain_text() {
+        assert!(!looks_like_unified_diff("just some text"));
+        assert!(!looks_like_unified_diff(""));
+        // A solitary `--- ` without `+++ ` is ambiguous; require both.
+        assert!(!looks_like_unified_diff("--- foo only"));
+    }
+
+    #[test]
+    fn parse_unified_simple_update() {
+        let input = "\
+--- a/file.txt
++++ b/file.txt
+@@ -1,3 +1,3 @@
+ keep
+-old
++new
+ trailing
+";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile {
+                path,
+                move_to,
+                hunks,
+            } => {
+                assert_eq!(path, "file.txt");
+                assert!(move_to.is_none());
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "keep\nold\ntrailing");
+                assert_eq!(hunks[0].replace, "keep\nnew\ntrailing");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_multi_hunk_update() {
+        let input = "\
+--- a/x
++++ b/x
+@@ -1,2 +1,2 @@
+-a
++A
+ b
+@@ -10,2 +10,2 @@
+ c
+-d
++D
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 2);
+                assert_eq!(hunks[0].search, "a\nb");
+                assert_eq!(hunks[0].replace, "A\nb");
+                assert_eq!(hunks[1].search, "c\nd");
+                assert_eq!(hunks[1].replace, "c\nD");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_add_via_dev_null() {
+        let input = "\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,3 @@
++line one
++line two
++line three
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::AddFile { path, content } => {
+                assert_eq!(path, "new.txt");
+                assert_eq!(content, "line one\nline two\nline three");
+            }
+            other => panic!("expected AddFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_delete_via_dev_null() {
+        let input = "\
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+--- a/gone.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-bye
+-cruel world
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::DeleteFile { path } => {
+                assert_eq!(path, "gone.txt");
+            }
+            other => panic!("expected DeleteFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_rename_via_differing_ab_paths() {
+        let input = "\
+diff --git a/old.rs b/new.rs
+similarity index 90%
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1 +1 @@
+-old
++new
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile {
+                path,
+                move_to,
+                hunks,
+            } => {
+                assert_eq!(path, "old.rs");
+                assert_eq!(move_to.as_deref(), Some("new.rs"));
+                assert_eq!(hunks.len(), 1);
+            }
+            other => panic!("expected UpdateFile with rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_multiple_files() {
+        let input = "\
+--- a/one
++++ b/one
+@@ -1 +1 @@
+-A
++a
+--- a/two
++++ b/two
+@@ -1 +1 @@
+-B
++b
+";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 2);
+        let paths: Vec<&str> = patch
+            .operations
+            .iter()
+            .filter_map(|op| match op {
+                PatchOperation::UpdateFile { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn parse_unified_preserves_context_hint() {
+        let input = "\
+--- a/f
++++ b/f
+@@ -1,2 +1,2 @@ fn main()
+-old
++new
+ same
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks[0].context_hint.as_deref(), Some("fn main()"));
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_handles_no_newline_marker() {
+        // git emits `\ No newline at end of file` after a hunk that ends
+        // a file without a trailing newline; we must skip it silently.
+        let input = "\
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks[0].search, "old");
+                assert_eq!(hunks[0].replace, "new");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_strips_timestamp_from_header() {
+        // Some `diff -u` outputs include tab-separated timestamps after the path.
+        let input = "\
+--- a/f\t2024-01-01 10:00:00.000000000 +0000
++++ b/f\t2024-01-02 11:00:00.000000000 +0000
+@@ -1 +1 @@
+-x
++y
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { path, .. } => assert_eq!(path, "f"),
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_paths_without_ab_prefix() {
+        // `diff -u` (non-git) does not prepend a/ b/.
+        let input = "\
+--- file.txt
++++ file.txt
+@@ -1 +1 @@
+-x
++y
+";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { path, .. } => assert_eq!(path, "file.txt"),
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_update_with_no_hunks_errors() {
+        let input = "\
+--- a/f
++++ b/f
+";
+        let err = parse_patch(input).expect_err("must error on missing hunks");
+        match err {
+            ParseError::InvalidFormat(msg) => assert!(msg.contains("no hunks")),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_empty_input_errors() {
+        // Looks-like-unified detector says false → falls to DSL → errors.
+        let err = parse_patch("").expect_err("empty input must error");
+        // Either parser is acceptable as the source of the error.
+        let _ = err;
+    }
+
+    #[test]
+    fn parse_unified_with_leading_garbage_is_skipped() {
+        // commit message preamble before the diff — should be ignored.
+        let input = "\
+commit 0123abc
+Author: someone
+Date: today
+
+    fix bug
+
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-x
++y
+";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { path, .. } => assert_eq!(path, "f"),
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_dsl_input_still_works_via_router() {
+        // The dispatcher must not steal DSL inputs that contain `@@`.
+        let input = "\
+*** Begin Patch
+*** Update File: file.txt
+@@
+-old
++new
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { path, hunks, .. } => {
+                assert_eq!(path, "file.txt");
+                assert_eq!(hunks[0].search, "old");
+                assert_eq!(hunks[0].replace, "new");
+            }
+            other => panic!("expected UpdateFile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_end_to_end_through_applicator() {
+        // Critical invariant: a unified diff produced by the standard tooling
+        // must round-trip through the applicator the same way the DSL would.
+        use crate::apply::apply_patch;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("greet.txt"), "hello\nworld\n").unwrap();
+        let diff = "\
+--- a/greet.txt
++++ b/greet.txt
+@@ -1,2 +1,2 @@
+-hello
++howdy
+ world
+";
+        let patch = parse_patch(diff).unwrap();
+        let affected = apply_patch(&patch, dir.path()).unwrap();
+        assert!(affected.modified.contains(&"greet.txt".to_string()));
+        let content = std::fs::read_to_string(dir.path().join("greet.txt")).unwrap();
+        assert_eq!(content, "howdy\nworld\n");
     }
 }
