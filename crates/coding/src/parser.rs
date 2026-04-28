@@ -273,6 +273,10 @@ pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
             // Collect content: every line MUST start with '+'.
             // Lines without '+' terminate the block (they belong to the
             // next operation or are the *** End Patch marker).
+            // Tolerance: a literal blank line ("") inside the block is treated
+            // as a '+'-prefixed blank line if more '+' content follows. LLMs
+            // commonly forget the '+' on blank separator lines; without this,
+            // the AddFile silently truncates at the first such line.
             // If a '+'-prefixed line is a DSL marker (e.g. +*** End Patch)
             // and no more '+' lines follow, it's an LLM error — strip it.
             let mut content = String::new();
@@ -289,6 +293,19 @@ pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
                         content.push('\n');
                     }
                     content.push_str(added);
+                    i += 1;
+                } else if lines[i].is_empty()
+                    && lines[i + 1..].iter().any(|l| l.starts_with('+'))
+                    && !lines[i + 1..]
+                        .iter()
+                        .take_while(|l| !l.starts_with('+'))
+                        .any(|l| !l.is_empty())
+                {
+                    // Bare blank line followed (after only more blanks) by more
+                    // '+' content — treat as a missing-'+' blank inside content.
+                    if !content.is_empty() {
+                        content.push('\n');
+                    }
                     i += 1;
                 } else {
                     break;
@@ -397,6 +414,15 @@ pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
             }
             operations.push(PatchOperation::DeleteFile { path });
             i += 1;
+        } else if lines[i].starts_with('+') {
+            // Orphaned '+' line at top level — almost always means a prior
+            // AddFile/UpdateFile block was truncated by a malformed line.
+            // Fail loudly rather than silently swallowing content.
+            return Err(ParseError::InvalidFormat(format!(
+                "Unexpected '+'-prefixed line at top level (line {}): {:?} — likely a missing '+' on a blank line truncated the previous block",
+                i + 1,
+                lines[i]
+            )));
         } else {
             i += 1;
         }
@@ -454,6 +480,51 @@ mod tests {
                 assert_eq!(content.lines().count(), 4);
             }
             other => panic!("Expected AddFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_add_file_tolerates_internal_blank_lines() {
+        // Regression: LLMs often forget the '+' on blank separator lines
+        // inside Add File content. Previously this truncated the file at
+        // the first such blank line; now blanks are preserved as real
+        // empty lines and the rest of the content is captured.
+        let input = "\
+*** Begin Patch
+*** Add File: src/foo.rs
++fn a() {}
+
++fn b() {}
+
++fn c() {}
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        assert_eq!(patch.operations.len(), 1);
+        match &patch.operations[0] {
+            PatchOperation::AddFile { content, .. } => {
+                assert_eq!(content, "fn a() {}\n\nfn b() {}\n\nfn c() {}");
+            }
+            other => panic!("Expected AddFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_orphaned_plus_line_at_top_level_errors() {
+        // A '+' line outside any block must fail loudly. Prior behavior
+        // silently dropped it, masking truncated AddFile/UpdateFile blocks
+        // and reporting "applied successfully" on corrupted patches.
+        let input = "\
+*** Begin Patch
+*** Add File: a.txt
++hello
+*** End Patch
++stray line";
+        let err = parse_patch(input).expect_err("orphaned + must error");
+        match err {
+            ParseError::InvalidFormat(msg) => {
+                assert!(msg.contains("'+'"), "error should mention '+': {msg}");
+            }
+            other => panic!("Expected InvalidFormat, got {other:?}"),
         }
     }
 

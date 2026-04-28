@@ -518,13 +518,12 @@ pub fn load_all_skills(
                             // already loaded above; loading the disk copy as a
                             // "user skill" would trigger noisy collision/env-var
                             // warnings for nothing. Skip silently.
-                            if let Some(bundled) = BUNDLED_SKILLS
+                            if BUNDLED_SKILLS
                                 .iter()
-                                .find_map(|(n, c)| (content.as_str() == *c).then_some(*n))
+                                .any(|(_, c)| content.as_str() == *c)
                             {
-                                debug!(
-                                    "Skipping disk copy of bundled skill '{bundled}' (byte-identical to embedded)"
-                                );
+                                // Auto-installed copy of a bundled skill;
+                                // bundled in-memory version is already loaded.
                                 continue;
                             }
                             match parse_skill_md(&content) {
