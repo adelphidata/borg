@@ -75,6 +75,9 @@ jobs:
         with:
           toolchain: "1.88.0"
           targets: ${{ matrix.target }}
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libdbus-1-dev pkg-config
       - uses: actions/cache@v4
         with:
           path: |
@@ -85,18 +88,20 @@ jobs:
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
       - name: Run tests
         run: cargo test --target ${{ matrix.target }}
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} --bin borg --bin borgd
       - name: Package
         shell: bash
         run: |
           mkdir -p dist
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             cp target/${{ matrix.target }}/release/borg.exe dist/
-            cd dist && 7z a ../${{ matrix.asset }}.zip borg.exe
+            cp target/${{ matrix.target }}/release/borgd.exe dist/
+            cd dist && 7z a ../${{ matrix.asset }}.zip borg.exe borgd.exe
           else
             cp target/${{ matrix.target }}/release/borg dist/
-            cd dist && tar czf ../${{ matrix.asset }}.tar.gz borg
+            cp target/${{ matrix.target }}/release/borgd dist/
+            cd dist && tar czf ../${{ matrix.asset }}.tar.gz borg borgd
           fi
       - uses: actions/upload-artifact@v4
         with:

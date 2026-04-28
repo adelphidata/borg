@@ -294,6 +294,46 @@ download_and_install() {
     mv "$TMPDIR_INSTALL/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
     success "Borg installed to $INSTALL_DIR/$BINARY_NAME"
+
+    # The borgd daemon binary ships alongside borg in the same archive.
+    # `borg service install` looks for it as a sibling of the borg binary.
+    if [[ -f "$TMPDIR_INSTALL/borgd" ]]; then
+        mv "$TMPDIR_INSTALL/borgd" "$INSTALL_DIR/borgd"
+        chmod +x "$INSTALL_DIR/borgd"
+        success "Borgd installed to $INSTALL_DIR/borgd"
+    fi
+}
+
+# ── Runtime dependencies ──
+#
+# borgd dynamically links libdbus-1.so.3 for the OS keychain backend. It is
+# pre-installed on Ubuntu/Debian desktops but missing on minimal server images
+# and most container bases. Install it so `borg service install` boots cleanly
+# on a stock VPS — the file-encrypted KEK fallback still needs the symbol
+# present at link time.
+ensure_runtime_deps() {
+    if [[ "$OS" != "linux" ]]; then
+        return 0
+    fi
+    if ldconfig -p 2>/dev/null | grep -q 'libdbus-1\.so\.3'; then
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "libdbus-1.so.3 not found and apt-get unavailable; install libdbus-1-3 manually if borgd fails to start."
+        return 0
+    fi
+    if [[ $EUID -ne 0 ]] && ! command -v sudo >/dev/null 2>&1; then
+        warn "libdbus-1-3 missing; rerun installer as root or install it manually."
+        return 0
+    fi
+    info "Installing runtime dependency libdbus-1-3..."
+    local sudo_prefix=""
+    [[ $EUID -ne 0 ]] && sudo_prefix="sudo"
+    if $sudo_prefix apt-get update -qq && $sudo_prefix apt-get install -y -qq libdbus-1-3; then
+        success "libdbus-1-3 installed"
+    else
+        warn "Failed to install libdbus-1-3; borgd may not start until it is present."
+    fi
 }
 
 # ── PATH setup ──
@@ -409,6 +449,7 @@ main() {
     # Install
     step "1/2" "Installing Borg"
     download_and_install
+    ensure_runtime_deps
 
     # PATH
     step "2/2" "Finalizing setup"

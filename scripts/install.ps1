@@ -117,6 +117,12 @@ if (-not (Test-Path $InstallDir)) {
 Copy-Item $extractedBinary (Join-Path $InstallDir $BinaryName) -Force
 Write-Success "Borg installed to $InstallDir\$BinaryName"
 
+$daemonBinary = Join-Path $tmpDir "borgd.exe"
+if (Test-Path $daemonBinary) {
+    Copy-Item $daemonBinary (Join-Path $InstallDir "borgd.exe") -Force
+    Write-Success "Borgd installed to $InstallDir\borgd.exe"
+}
+
 # ── PATH setup ──
 
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
