@@ -70,10 +70,7 @@ const RATE_LIMIT_DEFAULT: u32 = 10;
 
 /// Maximum events per bucket per hour during replay.
 pub(crate) fn rate_limit_for(event_type: &str) -> u32 {
-    RATE_LIMITS
-        .iter()
-        .find_map(|(k, v)| (*k == event_type).then_some(*v))
-        .unwrap_or(RATE_LIMIT_DEFAULT)
+    crate::hmac_chain::lookup_rate_limit(RATE_LIMITS, event_type, RATE_LIMIT_DEFAULT)
 }
 
 // ── Types ──

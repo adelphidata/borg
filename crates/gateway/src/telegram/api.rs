@@ -15,7 +15,9 @@ use super::types::{
 };
 use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
-use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
+use crate::constants::{
+    DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT, TELEGRAM_MAX_FILE_SIZE_BYTES,
+};
 
 const TELEGRAM_API_BASE: &str = crate::constants::TELEGRAM_API_BASE;
 const HTTP_CONNECT_TIMEOUT: Duration = crate::constants::TELEGRAM_HTTP_CONNECT_TIMEOUT;
@@ -602,10 +604,8 @@ impl TelegramClient {
     }
 
     /// Download a file by its file_path (obtained from get_file).
-    /// Limits download size to 25 MB to prevent memory exhaustion.
+    /// Limits download size to `TELEGRAM_MAX_FILE_SIZE_BYTES` to prevent memory exhaustion.
     pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
-        const MAX_FILE_SIZE: u64 = 25 * 1024 * 1024; // 25 MB
-
         let resp = self
             .client
             .get(self.file_url(file_path))
@@ -614,16 +614,16 @@ impl TelegramClient {
             .context("Failed to download file")?;
 
         if let Some(len) = resp.content_length() {
-            if len > MAX_FILE_SIZE {
-                bail!("File too large: {len} bytes (max {MAX_FILE_SIZE})");
+            if len > TELEGRAM_MAX_FILE_SIZE_BYTES {
+                bail!("File too large: {len} bytes (max {TELEGRAM_MAX_FILE_SIZE_BYTES})");
             }
         }
 
         let bytes = resp.bytes().await.context("Failed to read file bytes")?;
 
-        if bytes.len() as u64 > MAX_FILE_SIZE {
+        if bytes.len() as u64 > TELEGRAM_MAX_FILE_SIZE_BYTES {
             bail!(
-                "Downloaded file too large: {} bytes (max {MAX_FILE_SIZE})",
+                "Downloaded file too large: {} bytes (max {TELEGRAM_MAX_FILE_SIZE_BYTES})",
                 bytes.len()
             );
         }

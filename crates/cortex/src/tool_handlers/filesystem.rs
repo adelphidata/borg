@@ -117,16 +117,19 @@ fn extract_patch_paths(patch_text: &str) -> Vec<String> {
     paths
 }
 
+/// Patch DSL marker prefixes (each ends with a single trailing space before the path).
+const PATCH_DSL_MARKERS: &[&str] = &[
+    "*** Add File: ",
+    "*** Update File: ",
+    "*** Delete File: ",
+    "*** Move to: ",
+    "*** Move To: ",
+];
+
 /// Extract a file path from a patch DSL marker line, if present.
 fn extract_path_from_line(line: &str) -> Option<&str> {
     let trimmed = line.trim();
-    for prefix in &[
-        "*** Add File: ",
-        "*** Update File: ",
-        "*** Delete File: ",
-        "*** Move to: ",
-        "*** Move To: ",
-    ] {
+    for prefix in PATCH_DSL_MARKERS {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let path = rest.trim();
             if !path.is_empty() {
@@ -168,13 +171,7 @@ fn normalize_patch_paths(patch_text: &str, cwd: &std::path::Path) -> String {
 
 /// Split a patch DSL marker line into (prefix_with_space, path), if it's a path line.
 fn split_marker_line(line: &str) -> Option<(&str, &str)> {
-    for prefix in &[
-        "*** Add File: ",
-        "*** Update File: ",
-        "*** Delete File: ",
-        "*** Move to: ",
-        "*** Move To: ",
-    ] {
+    for prefix in PATCH_DSL_MARKERS {
         if let Some(idx) = line.find(prefix) {
             let prefix_end = idx + prefix.len();
             let path = line[prefix_end..].trim();

@@ -43,6 +43,17 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Look up a per-key rate-limit cap from a table, falling back to `default`.
+///
+/// Used by vitals/evolution/bond replay paths to convert a category or event-type
+/// string into the maximum allowed events per hour bucket.
+pub(crate) fn lookup_rate_limit(table: &[(&str, u32)], key: &str, default: u32) -> u32 {
+    table
+        .iter()
+        .find_map(|(k, v)| (*k == key).then_some(*v))
+        .unwrap_or(default)
+}
+
 /// Per-hour-bucket rate limiter for event replay.
 ///
 /// Tracks counts of events by (hour_bucket, category_key) and enforces

@@ -75,17 +75,22 @@ fn verify_event_hmac(key: &[u8], event: &VitalsEvent, expected_prev_hmac: &str) 
 
 // ── Rate Limiting ──
 
+/// Maximum events per category per hour during replay, indexed by category name.
+/// Categories not listed fall back to `RATE_LIMIT_DEFAULT`.
+const RATE_LIMITS: &[(&str, u32)] = &[
+    ("interaction", 5),
+    ("success", 8),
+    ("failure", 5),
+    ("correction", 3),
+    ("creation", 3),
+    ("negative_sentiment", 3),
+];
+
+const RATE_LIMIT_DEFAULT: u32 = 5;
+
 /// Maximum events per category per hour during replay.
 pub(crate) fn rate_limit_for(category: &str) -> u32 {
-    match category {
-        "interaction" => 5,
-        "success" => 8,
-        "failure" => 5,
-        "correction" => 3,
-        "creation" => 3,
-        "negative_sentiment" => 3,
-        _ => 5,
-    }
+    crate::hmac_chain::lookup_rate_limit(RATE_LIMITS, category, RATE_LIMIT_DEFAULT)
 }
 
 /// Create a rate limiter configured for vitals events.

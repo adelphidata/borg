@@ -51,6 +51,9 @@ pub const TELEGRAM_MAX_SEND_RETRIES: u32 = 5;
 /// Max retry_after seconds we'll honor from Telegram before giving up.
 pub const TELEGRAM_MAX_RETRY_AFTER_SECS: u64 = 300;
 
+/// Max bytes we'll download from Telegram's getFile endpoint to avoid memory exhaustion.
+pub const TELEGRAM_MAX_FILE_SIZE_BYTES: u64 = 25 * 1024 * 1024;
+
 // ── Slack ─────────────────────────────────────────────────────────
 
 /// Slack API base URL.
