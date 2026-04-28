@@ -24,8 +24,9 @@
 
 use super::{
     AuthBackend, GlobalSignals, ListenerBindKind, ListenerPosture, PostureSnapshot, PostureSource,
-    PostureState,
+    PostureState, SecretStorageBackend,
 };
+use crate::config::security::KekBackend;
 use crate::config::{Config, SecurityConfig};
 use crate::db::Database;
 
@@ -65,6 +66,21 @@ fn compute_global_signals(config: &Config) -> GlobalSignals {
         privileged_channels: Vec::new(),
         audit_chain_enabled: true,
         catastrophic_denylist_intact: true,
+        secret_storage_backend: secret_storage_backend(config.security.kek_backend),
+    }
+}
+
+/// Map the install-time config setting onto the posture-domain enum.
+///
+/// `Auto` means borgd hasn't booted yet (or persistence failed). We treat
+/// it as `OsKeychain` so a fresh install posts `Default` rather than
+/// `Reduced` — borgd will resolve and persist the real backend on first
+/// start; if it falls back to `File` it will rewrite the setting and the
+/// next snapshot tick reflects reality.
+fn secret_storage_backend(backend: KekBackend) -> SecretStorageBackend {
+    match backend {
+        KekBackend::OsKeychain | KekBackend::Auto => SecretStorageBackend::OsKeychain,
+        KekBackend::File => SecretStorageBackend::FileEncrypted,
     }
 }
 
@@ -185,6 +201,45 @@ mod tests {
             compute_live_snapshot(&fresh_config(), &db, PostureSource::ListenerBind).expect("snap");
         assert_eq!(snap.state, PostureState::Boosted);
         assert_eq!(snap.listeners.len(), 2, "loopback + paired device");
+    }
+
+    /// `kek_backend = file` flows from config into `secret_storage_backend
+    /// = FileEncrypted`, which forces Reduced. This is the headless-VPS
+    /// default path. Drift would silently grant the file backend the
+    /// `Default × 1.00` multiplier and remove the gameplay nudge toward
+    /// `--secure`.
+    #[test]
+    fn file_kek_backend_setting_propagates_and_forces_reduced() {
+        let db = Database::test_db();
+        let mut cfg = fresh_config();
+        cfg.security.kek_backend = KekBackend::File;
+        let snap = compute_live_snapshot(&cfg, &db, PostureSource::ConfigChange).expect("snap");
+        assert_eq!(
+            snap.global.secret_storage_backend,
+            SecretStorageBackend::FileEncrypted
+        );
+        assert_eq!(snap.state, PostureState::Reduced);
+    }
+
+    /// `kek_backend = auto` and `kek_backend = os_keychain` both surface
+    /// as `OsKeychain` in the snapshot. The `Auto` mapping keeps fresh
+    /// installs out of `Reduced` during the brief window between first
+    /// boot and the daemon's probe-and-persist; the actual backend gets
+    /// rewritten on the very next tick if `File` is chosen.
+    #[test]
+    fn auto_and_os_keychain_both_map_to_os_keychain() {
+        let db = Database::test_db();
+        for kind in [KekBackend::Auto, KekBackend::OsKeychain] {
+            let mut cfg = fresh_config();
+            cfg.security.kek_backend = kind;
+            let snap = compute_live_snapshot(&cfg, &db, PostureSource::ConfigChange).expect("snap");
+            assert_eq!(
+                snap.global.secret_storage_backend,
+                SecretStorageBackend::OsKeychain,
+                "{kind:?} must map to OsKeychain in posture"
+            );
+            assert_eq!(snap.state, PostureState::Default);
+        }
     }
 
     /// Revoked devices don't count toward Boosted (they're not active).

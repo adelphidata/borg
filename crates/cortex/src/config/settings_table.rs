@@ -323,6 +323,17 @@ define_settings! {
             Ok(format!("{key} = {kind}"))
         };
 
+        // security.kek_backend: FromStr enum (auto | os_keychain | file).
+        // Install-time choice; the daemon resolves `Auto` to a concrete
+        // value on first start and persists the result. Surfacing the
+        // setter lets `borg service install --secure` write the chosen
+        // backend before borgd boots.
+        "security.kek_backend" => |s, key, value| {
+            let kind: crate::config::security::KekBackend = value.parse()?;
+            s.security.kek_backend = kind;
+            Ok(format!("{key} = {kind}"))
+        };
+
         // skills.budget_pct: Option<f32> in [0.0, 1.0]; empty string clears to None
         "skills.budget_pct" => |s, key, value| {
             if value.trim().is_empty() {
@@ -358,6 +369,7 @@ define_settings! {
         "workflow.enabled" => |c| c.workflow.enabled.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
         "security.verifier" => |c| format!("{}", c.security.verifier);
+        "security.kek_backend" => |c| format!("{}", c.security.kek_backend);
         "skills.budget_pct" => |c| match c.skills.budget_pct {
             Some(pct) => format!("{pct}"),
             None => "(none)".to_string(),

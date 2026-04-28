@@ -103,6 +103,10 @@ Every tool's JSON schema is sent to the LLM every turn (~5KB+). Prefer adding ac
 
 `[security] blocked_paths` defaults: `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.env`, `credentials`, `private_key`. Filtered from `fs_read`/`fs_write` and checked in `list_dir`.
 
+### KEK Backend — Headless VPS Default
+
+`security.kek_backend` (`auto` | `os_keychain` | `file`, default `auto`). On `Auto`, `borgd` probes the OS keychain at first start; if unavailable (headless Linux without dbus + secret-service) it falls back to `FileKekStore` (passphrase-encrypted file at `~/.borg/secrets/kek.enc`, passphrase from `BORG_KEK_PASSPHRASE` env / systemd EnvironmentFile). The file backend posts as `Reduced` (×0.85 XP); `borg service install --secure` upgrades to gnome-keyring on Debian/Ubuntu and fires the one-time `secure_headless_setup` milestone (+100 XP). On non-Debian, `--secure` falls back to the file backend without erroring — the agent always boots.
+
 ## Systems Reference
 
 ### Tools

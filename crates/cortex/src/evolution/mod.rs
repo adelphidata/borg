@@ -41,7 +41,7 @@ pub use format::{
     format_xp_summary,
 };
 pub use helpers::{compute_momentum, compute_mood, compute_readiness, next_step_hints, render_bar};
-pub use milestones::{check_milestones, Milestone};
+pub use milestones::{check_milestones, Milestone, PostureContext};
 pub use replay::*;
 pub use share_card::render_ascii_card;
 
@@ -57,6 +57,10 @@ use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 /// Event types not listed fall back to `RATE_LIMIT_DEFAULT`.
 const RATE_LIMITS: &[(&str, u32)] = &[
     ("xp_gain", 15),
+    // Tight cap on milestone bonuses so a chain-tampering attempt can't
+    // mint many `milestone_bonus` rows in one hour. Each milestone is
+    // dedup'd at write-time, so legitimate flow needs at most 1/hr.
+    ("milestone_bonus", 3),
     ("evolution", 3),
     ("classification", 3),
     ("archetype_shift", 5),
@@ -390,9 +394,30 @@ const BONUS_XP_CREATION_ALIGNED: i32 = 1;
 const BASE_XP_INTERACTION: i32 = 1;
 /// Maximum XP delta allowed per event.
 pub(crate) const MAX_XP_DELTA: i32 = BASE_XP_CREATION + BONUS_XP_CREATION_ALIGNED;
+/// Maximum XP delta for `milestone_bonus` events. Lifted above
+/// [`MAX_XP_DELTA`] because milestone bonuses are one-shot, dedup-gated,
+/// and produced by deterministic transitions (e.g. posture upgrade) —
+/// the per-event cap exists to prevent tool-driven gaming, which doesn't
+/// apply to chain-derived bonuses.
+///
+/// Set well above any planned milestone bonus so a future "+250 XP for
+/// X" doesn't silently truncate against the cap. The cap is a safety
+/// net, not a budget.
+pub(crate) const MAX_MILESTONE_BONUS_XP: i32 = 500;
+/// XP awarded by the `secure_headless_setup` milestone when a headless
+/// install upgrades from the file-encrypted KEK to the OS keychain.
+pub(crate) const SECURE_HEADLESS_SETUP_XP: i32 = 100;
+// Compile-time guard: every named milestone bonus must fit under the
+// per-event cap. Add new `_BONUS_XP` consts to this assertion when
+// landing future milestone-bonus rewards.
+const _: () = assert!(
+    SECURE_HEADLESS_SETUP_XP <= MAX_MILESTONE_BONUS_XP,
+    "SECURE_HEADLESS_SETUP_XP exceeds MAX_MILESTONE_BONUS_XP"
+);
 /// Valid evolution event types.
 pub(crate) const VALID_EVOLUTION_EVENT_TYPES: &[&str] = &[
     "xp_gain",
+    "milestone_bonus",
     "evolution",
     "classification",
     "archetype_shift",
@@ -624,6 +649,29 @@ pub(crate) fn build_posture_aware_xp(db: &Database, base: i32, align_bonus: i32)
 fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
     let stage_str = next.stage.to_string();
 
+    // `secure_headless_setup` carries a +100 XP bonus on top of the
+    // ongoing posture multiplier difference. Emit the `milestone_bonus`
+    // event BEFORE the `milestone_unlocked` row so the feed renders
+    // bonus-then-marker in the natural order, and so an audit reader
+    // sees XP land before its dedup marker.
+    if milestone.id == "secure_headless_setup" {
+        let arch = milestone.archetype.map(|a| a.to_string());
+        if let Err(e) = db.record_evolution_event(
+            "milestone_bonus",
+            SECURE_HEADLESS_SETUP_XP,
+            arch.as_deref(),
+            "secure_headless_setup",
+            None,
+        ) {
+            tracing::warn!(
+                "evolution: failed to record milestone_bonus for {}: {e}",
+                milestone.id
+            );
+            // Continue — we still want the milestone_unlocked dedup row
+            // so we don't re-emit the bonus next tick on a write hiccup.
+        }
+    }
+
     // `level_*` ids get a paired `level_up` event so the XP feed has a row
     // to render at the exact level boundary.
     if milestone.id.starts_with("level_") {
@@ -789,20 +837,50 @@ impl EvolutionHook {
         // Suppress posture-derived milestones when no posture event exists yet
         // (fresh DB) — `current_posture_for_xp` falls back to `Default` for XP
         // math, but milestones must wait until live posture is real.
-        let posture_for_milestones = if fallback.is_some() {
+        let posture_ctx = if fallback.is_some() {
             None
         } else {
-            Some(current_posture_state)
+            // `previous_was_file_encrypted` is a "did this install ever
+            // run on FileEncrypted" question — answered authoritatively
+            // by the audit chain. Use the chain only for that.
+            let history = security::load_posture_history(db);
+            let previous_was_file_encrypted = history.iter().any(|s| {
+                s.global.secret_storage_backend == security::SecretStorageBackend::FileEncrypted
+            });
+            // For the *current* backend, prefer the live config: posture
+            // emission is rate-limited at 2/hr (see emit.rs), so the
+            // chain tail can lag the actual setting by minutes after a
+            // backend swap. Reading from `Config::load_from_db` matches
+            // what the next snapshot will record, so the milestone gate
+            // doesn't misfire on the boundary.
+            let current_backend = match crate::config::Config::load_from_db() {
+                Ok(c) => match c.security.kek_backend {
+                    crate::config::security::KekBackend::OsKeychain
+                    | crate::config::security::KekBackend::Auto => {
+                        security::SecretStorageBackend::OsKeychain
+                    }
+                    crate::config::security::KekBackend::File => {
+                        security::SecretStorageBackend::FileEncrypted
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "evolution: kek_backend lookup failed ({e}); falling back to chain tail"
+                    );
+                    history
+                        .last()
+                        .map(|s| s.global.secret_storage_backend)
+                        .unwrap_or(security::SecretStorageBackend::OsKeychain)
+                }
+            };
+            Some(milestones::PostureContext {
+                current: current_posture_state,
+                current_backend,
+                previous_was_file_encrypted,
+            })
         };
-        let unlocked = check_milestones(
-            prev,
-            next,
-            bond_prev,
-            bond_next,
-            &events,
-            now,
-            posture_for_milestones,
-        );
+        let unlocked =
+            check_milestones(prev, next, bond_prev, bond_next, &events, now, posture_ctx);
         for milestone in unlocked {
             emit_milestone(db, &milestone, next);
         }
@@ -3511,6 +3589,54 @@ mod tests {
             .filter(|e| e.event_type == "milestone_unlocked")
             .collect();
         assert_eq!(milestones.len(), 1);
+    }
+
+    #[test]
+    fn emit_milestone_secure_headless_setup_records_milestone_bonus_xp() {
+        // End-to-end check: emit_milestone for the headless-setup milestone
+        // must produce both a `milestone_bonus` row carrying the +100 XP and
+        // the `milestone_unlocked` dedup row. Drift here would silently
+        // award the milestone with no XP, defeating the gameplay reward.
+        let db = Database::test_db();
+        let next = EvolutionState {
+            stage: Stage::Base,
+            level: 5,
+            total_xp: 0,
+            xp_to_next_level: 0,
+            dominant_archetype: Some(Archetype::Builder),
+            evolution_name: None,
+            evolution_description: None,
+            archetype_scores: HashMap::new(),
+            lifetime_scores: HashMap::new(),
+            last_30d_scores: HashMap::new(),
+            dominant_history: Vec::new(),
+            total_events: 0,
+            chain_valid: true,
+            momentum: HashMap::new(),
+            level_up_events_recent: Vec::new(),
+            mood: None,
+            readiness: None,
+        };
+        let m = Milestone {
+            id: "secure_headless_setup".to_string(),
+            title: "Hardened Host".to_string(),
+            archetype: Some(Archetype::Guardian),
+        };
+        emit_milestone(&db, &m, &next);
+
+        let events = db.load_all_evolution_events().unwrap();
+        let bonus = events
+            .iter()
+            .find(|e| e.event_type == "milestone_bonus")
+            .expect("milestone_bonus row must be recorded");
+        assert_eq!(
+            bonus.xp_delta, SECURE_HEADLESS_SETUP_XP,
+            "expected +{SECURE_HEADLESS_SETUP_XP} XP, got {}",
+            bonus.xp_delta
+        );
+        assert_eq!(bonus.archetype.as_deref(), Some("guardian"));
+        assert_eq!(bonus.source, "secure_headless_setup");
+        assert!(events.iter().any(|e| e.event_type == "milestone_unlocked"));
     }
 
     #[test]

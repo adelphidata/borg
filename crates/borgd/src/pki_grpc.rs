@@ -49,7 +49,9 @@ impl PkiSvc {
 }
 
 const PAIRING_TTL_SECS: i64 = 300;
-const PAIRING_INTENT: &str = "device";
+// `pub(crate)` so the `pairing::device` test module can mint codes against
+// the same intent the server uses; otherwise tests get "inaccessible" errors.
+pub(crate) const PAIRING_INTENT: &str = "device";
 
 #[tonic::async_trait]
 impl Pki for PkiSvc {

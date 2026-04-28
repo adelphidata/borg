@@ -10,8 +10,28 @@
 
 use std::collections::HashSet;
 
-use super::security::PostureState;
+use super::security::{PostureState, SecretStorageBackend};
 use super::{Archetype, EvolutionEvent, EvolutionState, Stage};
+
+/// Live posture context passed to [`check_milestones`].
+///
+/// Carries everything posture-related the milestone detector needs in one
+/// shot so the function signature doesn't keep growing per new posture-
+/// derived milestone. `None` means "no live posture yet" (fresh DB before
+/// the bootstrap reconcile fires) and posture-derived milestones are
+/// suppressed in that case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostureContext {
+    /// Current resolved state.
+    pub current: PostureState,
+    /// Current KEK backend at rest.
+    pub current_backend: SecretStorageBackend,
+    /// True iff the audit chain holds at least one prior posture snapshot
+    /// with `secret_storage_backend = FileEncrypted`. Used to detect the
+    /// "I migrated from file to OS keychain" transition exactly once per
+    /// install. The caller is the single owner of the chain read.
+    pub previous_was_file_encrypted: bool,
+}
 
 /// Consecutive-day streak threshold for `aligned_streak_7d`.
 const ALIGNED_STREAK_DAYS: i64 = 7;
@@ -54,7 +74,7 @@ pub fn check_milestones(
     bond_next: u8,
     events: &[EvolutionEvent],
     now: i64,
-    current_posture: Option<PostureState>,
+    posture: Option<PostureContext>,
 ) -> Vec<Milestone> {
     let already_unlocked = collect_unlocked_ids(events);
     let mut out = Vec::new();
@@ -133,14 +153,54 @@ pub fn check_milestones(
     // First time live posture observed at Boosted. One-shot: only fires once
     // per install, regardless of how often the operator flips between Boosted
     // and the other states afterward.
-    if matches!(current_posture, Some(PostureState::Boosted))
-        && !already_unlocked.contains("posture_boosted_first")
+    if matches!(
+        posture,
+        Some(PostureContext {
+            current: PostureState::Boosted,
+            ..
+        })
+    ) && !already_unlocked.contains("posture_boosted_first")
     {
         out.push(Milestone {
             id: "posture_boosted_first".to_string(),
             title: "Boosted Posture".to_string(),
             archetype: next.dominant_archetype,
         });
+    }
+
+    // Secure headless setup: the install was once running on the
+    // file-encrypted KEK (i.e. a headless VPS that fell back to FileKek)
+    // and has now upgraded to the OS keychain via
+    // `borg service install --secure` or equivalent. One-shot per install.
+    //
+    // Why a milestone instead of letting the multiplier alone do the work:
+    // the ongoing ×1.00 vs ×0.85 difference is a slow drip that doesn't
+    // reward the action. A +100 XP burst at the moment of upgrade gives
+    // the user a visible, immediate "you did the right thing" signal —
+    // matches the rest of the milestone-as-celebration pattern.
+    //
+    // Eligibility:
+    //   - posture context exists (live posture is real, not fresh-DB fallback)
+    //   - current state is Default or Boosted (i.e. NOT still Reduced)
+    //   - current backend is OsKeychain (the rewarded backend)
+    //   - audit chain shows a prior FileEncrypted snapshot (we did migrate)
+    //
+    // The dominant `Guardian` archetype attribution surfaces this as a
+    // security win on the share card, regardless of what the user's
+    // dominant archetype is at the time of the upgrade.
+    if !already_unlocked.contains("secure_headless_setup") {
+        if let Some(ctx) = posture {
+            if ctx.previous_was_file_encrypted
+                && ctx.current_backend == SecretStorageBackend::OsKeychain
+                && matches!(ctx.current, PostureState::Default | PostureState::Boosted)
+            {
+                out.push(Milestone {
+                    id: "secure_headless_setup".to_string(),
+                    title: "Hardened Host".to_string(),
+                    archetype: Some(Archetype::Guardian),
+                });
+            }
+        }
     }
 
     // Aligned streak: 7 consecutive UTC days with ≥1 xp_gain event aligned
@@ -526,6 +586,18 @@ mod tests {
         assert!(second.iter().all(|m| m.id != "level_10_base"));
     }
 
+    fn posture(
+        state: PostureState,
+        backend: SecretStorageBackend,
+        prev_file: bool,
+    ) -> PostureContext {
+        PostureContext {
+            current: state,
+            current_backend: backend,
+            previous_was_file_encrypted: prev_file,
+        }
+    }
+
     #[test]
     fn posture_boosted_first_fires_once_then_dedups() {
         // Real failure mode: emitting the milestone every time the operator
@@ -533,7 +605,12 @@ mod tests {
         // honor the prior `milestone_unlocked` row.
         let prev = state(Stage::Base, 5, None);
         let next = state(Stage::Base, 5, None);
-        let first = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Boosted));
+        let ctx = Some(posture(
+            PostureState::Boosted,
+            SecretStorageBackend::OsKeychain,
+            false,
+        ));
+        let first = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
         assert!(
             first.iter().any(|m| m.id == "posture_boosted_first"),
             "first Boosted observation should fire the milestone"
@@ -543,7 +620,7 @@ mod tests {
             "milestone_unlocked",
             Some(r#"{"milestone_id":"posture_boosted_first"}"#),
         )];
-        let again = check_milestones(&prev, &next, 0, 0, &prior, 0, Some(PostureState::Boosted));
+        let again = check_milestones(&prev, &next, 0, 0, &prior, 0, ctx);
         assert!(
             again.iter().all(|m| m.id != "posture_boosted_first"),
             "milestone must not re-fire once already unlocked"
@@ -554,11 +631,129 @@ mod tests {
     fn posture_boosted_first_does_not_fire_on_default_or_reduced() {
         let prev = state(Stage::Base, 5, None);
         let next = state(Stage::Base, 5, None);
-        let out_default = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Default));
-        let out_reduced = check_milestones(&prev, &next, 0, 0, &[], 0, Some(PostureState::Reduced));
+        let mk = |s| Some(posture(s, SecretStorageBackend::OsKeychain, false));
+        let out_default = check_milestones(&prev, &next, 0, 0, &[], 0, mk(PostureState::Default));
+        let out_reduced = check_milestones(&prev, &next, 0, 0, &[], 0, mk(PostureState::Reduced));
         let out_none = check_milestones(&prev, &next, 0, 0, &[], 0, None);
         for set in [out_default, out_reduced, out_none] {
             assert!(set.iter().all(|m| m.id != "posture_boosted_first"));
         }
+    }
+
+    /// Canonical "fixed my headless deploy" path: posture upgraded from
+    /// Reduced → Default and the kek backend went from FileEncrypted to
+    /// OsKeychain. Milestone fires with Guardian archetype attribution.
+    #[test]
+    fn secure_headless_setup_fires_on_file_to_keychain_transition() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, Some(Archetype::Builder));
+        let ctx = Some(posture(
+            PostureState::Default,
+            SecretStorageBackend::OsKeychain,
+            true,
+        ));
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
+        let m = out
+            .iter()
+            .find(|m| m.id == "secure_headless_setup")
+            .expect("milestone must fire");
+        assert_eq!(m.title, "Hardened Host");
+        // Always tagged Guardian regardless of the user's dominant archetype —
+        // surfacing this as a security win in the share card.
+        assert_eq!(m.archetype, Some(Archetype::Guardian));
+    }
+
+    /// Boosted (the second rewarded posture, achieved when a Tailnet/mTLS
+    /// listener is also paired) is just as eligible as Default.
+    #[test]
+    fn secure_headless_setup_fires_on_transition_to_boosted() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let ctx = Some(posture(
+            PostureState::Boosted,
+            SecretStorageBackend::OsKeychain,
+            true,
+        ));
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
+        assert!(out.iter().any(|m| m.id == "secure_headless_setup"));
+    }
+
+    /// Fresh desktop install: never ran on file backend → the milestone
+    /// is irrelevant and must NOT fire on first boot.
+    #[test]
+    fn secure_headless_setup_does_not_fire_on_first_boot_with_keychain() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let ctx = Some(posture(
+            PostureState::Default,
+            SecretStorageBackend::OsKeychain,
+            false, // never was file
+        ));
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
+        assert!(out.iter().all(|m| m.id != "secure_headless_setup"));
+    }
+
+    /// Reverse direction: degrading from OS keychain to file must NOT
+    /// emit the milestone. The reward is for *upgrading*.
+    #[test]
+    fn secure_headless_setup_does_not_fire_on_reverse_transition() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let ctx = Some(posture(
+            PostureState::Reduced,
+            SecretStorageBackend::FileEncrypted,
+            // Even with `previous_was_file_encrypted = false` (this is the
+            // first observation of a file-encrypted state), no upgrade
+            // happened.
+            false,
+        ));
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
+        assert!(out.iter().all(|m| m.id != "secure_headless_setup"));
+    }
+
+    /// Still on file backend (Reduced + FileEncrypted): not eligible even
+    /// if at some point in the past we briefly tried OS keychain.
+    #[test]
+    fn secure_headless_setup_does_not_fire_while_still_on_file() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let ctx = Some(posture(
+            PostureState::Reduced,
+            SecretStorageBackend::FileEncrypted,
+            true,
+        ));
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, ctx);
+        assert!(out.iter().all(|m| m.id != "secure_headless_setup"));
+    }
+
+    /// Dedup: once `milestone_unlocked` is in the chain, the milestone
+    /// must not re-fire on subsequent calls. This prevents an operator
+    /// who toggles `--secure` repeatedly from farming +100 XP.
+    #[test]
+    fn secure_headless_setup_dedups_on_repeat() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let ctx = Some(posture(
+            PostureState::Default,
+            SecretStorageBackend::OsKeychain,
+            true,
+        ));
+        let prior = vec![ev(
+            "milestone_unlocked",
+            Some(r#"{"milestone_id":"secure_headless_setup"}"#),
+        )];
+        let out = check_milestones(&prev, &next, 0, 0, &prior, 0, ctx);
+        assert!(out.iter().all(|m| m.id != "secure_headless_setup"));
+    }
+
+    /// `None` posture (fresh DB before bootstrap reconcile fires) must
+    /// not produce the milestone — same defensive pattern as
+    /// `posture_boosted_first`.
+    #[test]
+    fn secure_headless_setup_suppressed_when_posture_unknown() {
+        let prev = state(Stage::Base, 5, None);
+        let next = state(Stage::Base, 5, None);
+        let out = check_milestones(&prev, &next, 0, 0, &[], 0, None);
+        assert!(out.iter().all(|m| m.id != "secure_headless_setup"));
     }
 }

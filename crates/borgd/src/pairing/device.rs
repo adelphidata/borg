@@ -376,6 +376,7 @@ pub fn mint_pairing_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pki_grpc::PAIRING_INTENT;
     use identity::{ca::generate_root_ca, MemoryKekStore};
     use rusqlite::Connection;
 

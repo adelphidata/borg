@@ -152,6 +152,25 @@ pub fn replay_events_with_keys_at(
                     last_dominant = current_dominant;
                 }
             }
+            "milestone_bonus" => {
+                // One-shot XP grants from `check_milestones` (e.g. the
+                // secure_headless_setup +100 bonus). No source decay — these
+                // are dedup'd at write-time and produced once per install,
+                // so the diminishing-returns curve doesn't apply. Per-event
+                // cap is enforced at write-time in `record_evolution_event`.
+                let xp = event.xp_delta.max(0) as u32;
+                total_xp = total_xp.saturating_add(xp);
+                if let Some(ref arch_str) = event.archetype {
+                    if let Some(arch) = Archetype::parse(arch_str) {
+                        let lt = lifetime_scores.entry(arch).or_insert(0);
+                        *lt = lt.saturating_add(xp);
+                        if event.created_at >= cutoff_30d {
+                            let rec = last_30d_scores.entry(arch).or_insert(0);
+                            *rec = rec.saturating_add(xp);
+                        }
+                    }
+                }
+            }
             "evolution" => {
                 // gates_verified was already validated above. Stage transition:
                 // reset XP, advance stage.

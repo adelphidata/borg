@@ -1386,20 +1386,31 @@ impl Database {
     /// the `hmac`/`prev_hmac` columns (semantic shift — column names retained
     /// to avoid cascading rename across the codebase).
     pub(super) fn migrate_v40(&self) -> Result<()> {
+        // ADD COLUMN guards: a 0.1.0-era DB may already carry these columns
+        // but lack the schema_version meta row, causing run_migrations to
+        // replay v40 on first 0.1.1 boot and fail with "duplicate column
+        // name". Idempotency here keeps the daemon bootable on any prior DB.
         self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS device_keys (
+            "CREATE TABLE IF NOT EXISTS device_keys (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 public_key  BLOB NOT NULL,
                 created_at  INTEGER NOT NULL
-            );
-            ALTER TABLE evolution_events ADD COLUMN session_id TEXT;
-            ALTER TABLE evolution_events ADD COLUMN pubkey_id INTEGER REFERENCES device_keys(id);
-            CREATE INDEX IF NOT EXISTS idx_evolution_events_session
+            );",
+        )?;
+        if !Self::has_column(&self.conn, "evolution_events", "session_id") {
+            self.conn
+                .execute_batch("ALTER TABLE evolution_events ADD COLUMN session_id TEXT;")?;
+        }
+        if !Self::has_column(&self.conn, "evolution_events", "pubkey_id") {
+            self.conn.execute_batch(
+                "ALTER TABLE evolution_events ADD COLUMN pubkey_id INTEGER REFERENCES device_keys(id);",
+            )?;
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_evolution_events_session
                 ON evolution_events(session_id);
             CREATE INDEX IF NOT EXISTS idx_evolution_events_pubkey
-                ON evolution_events(pubkey_id);
-            ",
+                ON evolution_events(pubkey_id);",
         )?;
         Ok(())
     }

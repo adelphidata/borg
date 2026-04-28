@@ -1,5 +1,6 @@
 //! Daemon lifecycle: lock acquisition, transport setup, graceful shutdown.
 
+use crate::auth::kek_factory::build_kek_store;
 use crate::auth::{ensure_root_ca, ensure_server_cert, ServerCertMaterial};
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
@@ -15,7 +16,6 @@ use anyhow::{Context, Result};
 use cortex::config::Config as CoreConfig;
 use cortex::db::{audit_events, AuditWriter, Database};
 use cortex::telemetry::BorgMetrics;
-use identity::KeychainStore;
 use protocols::pki::pki_server::PkiServer;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
@@ -144,7 +144,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     // writer with the audit chain.
     let db_for_pki = Database::open().context("opening DB for PKI bootstrap")?;
     let pki_db = Arc::new(Mutex::new(db_for_pki));
-    let kek = Arc::new(KeychainStore::new());
+    let kek = {
+        // Resolve KEK backend before locking pki_db for cert ops. The
+        // factory probes the OS keychain on `Auto`, falls back to the
+        // passphrase-encrypted file, and persists the resolved choice so
+        // posture snapshots see a concrete `kek_backend` value.
+        let pki_cfg =
+            CoreConfig::load_from_db().context("loading config for KEK backend selection")?;
+        let g = pki_db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_kek_store(&cfg.borg_home, &pki_cfg, &g).context("build KEK store")?
+    };
     let (ca_cert_pem, ca_key_pem) = {
         let g = pki_db
             .lock()

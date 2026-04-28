@@ -633,6 +633,14 @@ fn init_data_dir() -> Result<()> {
 
             println!();
             println!("You're all set! Run `borg` to start chatting.");
+
+            // Headless Linux servers ride the file-encrypted KEK fallback by
+            // default. Surface the secure-upgrade path so the user sees it
+            // exactly once at onboarding completion rather than discovering
+            // the Reduced posture multiplier mid-session.
+            if borgd_launcher::is_headless_linux() {
+                borgd_launcher::print_headless_setup_hint();
+            }
         }
         None => {
             // User cancelled — fall back to defaults so the directory is still usable

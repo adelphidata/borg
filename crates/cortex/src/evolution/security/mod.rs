@@ -24,6 +24,58 @@ pub use snapshot::compute_live_snapshot;
 
 use crate::db::Database;
 
+/// Read every `security_posture_changed` row from the audit chain in
+/// emission order, parsing each payload as a [`PostureSnapshot`]. Rows
+/// that fail to parse are skipped with a `tracing::warn!` rather than
+/// aborting the read — a corrupted chain link should degrade the
+/// milestone signal, not break the daemon.
+///
+/// Caller use case: deriving "did this install ever run on FileEncrypted?"
+/// for the `secure_headless_setup` milestone, plus the current backend.
+/// Both pieces of data live in `evolution_events.metadata_json` /
+/// `audit_log_chain.event_json`.
+pub fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
+    // Excluding `event_purged = 1` rows is defensive: today retention
+    // leaves `event_json` intact when it tombstones, but that's not part
+    // of the audit-chain contract and a future tombstone format that
+    // replaces the JSON would otherwise feed garbage to the parser.
+    let mut stmt = match db.conn().prepare(
+        "SELECT event_json FROM audit_log_chain
+         WHERE event_type = 'security_posture_changed' AND event_purged = 0
+         ORDER BY seq ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("posture history: prepare failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut rows = match stmt.query([]) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("posture history: query failed: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    while let Ok(Some(row)) = rows.next() {
+        let json: String = match row.get(0) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("posture history: read row failed: {e}");
+                continue;
+            }
+        };
+        match serde_json::from_str::<PostureSnapshot>(&json) {
+            Ok(snap) => out.push(snap),
+            Err(e) => {
+                tracing::warn!("posture history: parse failed: {e}");
+            }
+        }
+    }
+    out
+}
+
 /// Read the head of `posture_snapshots` for write-time XP multiplier
 /// resolution. Returns `(state, posture_event_seq, fallback)` — the seq is
 /// the `evolution_event_id` (audit_log_chain.seq in v1) of the
@@ -140,6 +192,29 @@ pub struct GlobalSignals {
     /// True when the catastrophic-command denylist (`rm -rf /`, `mkfs`,
     /// `dd if=/dev/zero`, `curl|sh`) is unmodified.
     pub catastrophic_denylist_intact: bool,
+    /// Backend currently storing the KEK (root CA + server cert keys).
+    /// `OsKeychain` is rewarded with `Default`/`Boosted`; `FileEncrypted`
+    /// (the headless-VPS fallback) forces `Reduced`. Default value via
+    /// `serde(default)` so v1 chains written before this field land back
+    /// as `OsKeychain` — matches the historical desktop assumption and
+    /// keeps replay deterministic.
+    #[serde(default)]
+    pub secret_storage_backend: SecretStorageBackend,
+}
+
+/// Where the daemon's KEK is currently persisted at rest. Surfaced into
+/// the posture resolver so a file-based KEK forces `Reduced` and the user
+/// is nudged toward the OS keychain via `borg service install --secure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorageBackend {
+    /// OS keychain (Apple, Windows, Linux secret-service).
+    #[default]
+    OsKeychain,
+    /// Passphrase-encrypted file at `~/.borg/secrets/kek.enc`.
+    FileEncrypted,
+    /// In-memory only — tests / never-persisted CI runs.
+    Memory,
 }
 
 /// Per-listener posture-relevant facts.

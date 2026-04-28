@@ -41,6 +41,50 @@ impl std::fmt::Display for VerifierKind {
     }
 }
 
+/// Backend storing the KEK (root CA + server cert keys at rest).
+///
+/// `Auto` is the install-time default — borgd probes the OS keychain on
+/// first start and falls back to `File` (passphrase-encrypted) when the
+/// keychain is unavailable (e.g. headless Linux without dbus). The
+/// resolved choice is persisted as `OsKeychain` or `File` so subsequent
+/// starts are deterministic and the posture system gets a stable signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KekBackend {
+    /// Probe `OsKeychain`, fall back to `File` on failure. Install default.
+    #[default]
+    Auto,
+    /// OS keychain via the `keyring` crate (Apple, Windows, secret-service).
+    /// Posture: contributes to `Default` / `Boosted`.
+    OsKeychain,
+    /// Passphrase-encrypted file at `~/.borg/secrets/kek.enc`. Posture:
+    /// forces `Reduced`. Always-works fallback for headless servers.
+    File,
+}
+
+impl FromStr for KekBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(KekBackend::Auto),
+            "os_keychain" | "os-keychain" | "keychain" => Ok(KekBackend::OsKeychain),
+            "file" => Ok(KekBackend::File),
+            other => anyhow::bail!("Unknown kek_backend '{other}'. Valid: auto, os_keychain, file"),
+        }
+    }
+}
+
+impl std::fmt::Display for KekBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            KekBackend::Auto => "auto",
+            KekBackend::OsKeychain => "os_keychain",
+            KekBackend::File => "file",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolPolicyConfig {
@@ -103,6 +147,10 @@ pub struct SecurityConfig {
     /// cross-checking the peer IP.
     #[serde(default)]
     pub verifier: VerifierKind,
+    /// KEK storage backend. `Auto` probes the OS keychain at first start
+    /// and persists the resolved choice (`OsKeychain` or `File`).
+    #[serde(default)]
+    pub kek_backend: KekBackend,
 }
 
 fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
@@ -127,6 +175,7 @@ impl Default for SecurityConfig {
             action_limits: crate::rate_guard::ActionLimits::default(),
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
             verifier: VerifierKind::Tofu,
+            kek_backend: KekBackend::Auto,
         }
     }
 }
@@ -164,11 +213,48 @@ mod tests {
     }
 
     #[test]
+    fn kek_backend_round_trip_through_str() {
+        for (kind, canonical, mixed, alt) in [
+            (KekBackend::Auto, "auto", "Auto", None),
+            (
+                KekBackend::OsKeychain,
+                "os_keychain",
+                "OS_KEYCHAIN",
+                Some("os-keychain"),
+            ),
+            (KekBackend::File, "file", "File", None),
+        ] {
+            assert_eq!(kind.to_string(), canonical);
+            assert_eq!(KekBackend::from_str(canonical).unwrap(), kind);
+            assert_eq!(KekBackend::from_str(mixed).unwrap(), kind);
+            if let Some(alt) = alt {
+                // os_keychain accepts os-keychain and `keychain` as aliases —
+                // necessary because shell/users will reach for either form.
+                assert_eq!(KekBackend::from_str(alt).unwrap(), kind);
+            }
+        }
+        assert_eq!(
+            KekBackend::from_str("keychain").unwrap(),
+            KekBackend::OsKeychain
+        );
+        assert!(KekBackend::from_str("nope").is_err());
+    }
+
+    #[test]
+    fn kek_backend_default_is_auto() {
+        // Install-time default. Must stay `Auto` so that fresh deploys probe
+        // the keychain rather than locking themselves into `File` and
+        // permanently posting `Reduced`.
+        assert_eq!(KekBackend::default(), KekBackend::Auto);
+    }
+
+    #[test]
     fn security_config_defaults() {
         let cfg = SecurityConfig::default();
         assert!(cfg.secret_detection);
         assert!(cfg.host_audit);
         assert_eq!(cfg.verifier, VerifierKind::Tofu);
+        assert_eq!(cfg.kek_backend, KekBackend::Auto);
         assert_eq!(cfg.blocked_paths.len(), 7);
         assert!(cfg.blocked_paths.contains(&".ssh".to_string()));
         assert!(cfg.blocked_paths.contains(&".aws".to_string()));

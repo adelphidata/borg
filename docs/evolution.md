@@ -268,6 +268,8 @@ Thresholds: **10, 25, 50, 75, 99**. ID format: `level_{threshold}_{stage}` (e.g.
 | `first_strong_bond` | Strong Bond | Bond score crosses 55 upward |
 | `archetype_stabilized` | Archetype Stabilized | Dominant archetype held ≥ 7 days |
 | `aligned_streak_7d` | 7-Day Aligned Streak | 7 consecutive UTC days with ≥ 1 archetype-aligned `xp_gain` |
+| `posture_boosted_first` | Boosted Posture | First time live posture observed at `Boosted` |
+| `secure_headless_setup` | Hardened Host | Posture transitions Reduced → Default/Boosted with `secret_storage_backend` upgrading from `FileEncrypted` to `OsKeychain`. Awards +100 XP via a `milestone_bonus` event (Guardian-archetype attributed). Fires once per install. |
 
 ---
 

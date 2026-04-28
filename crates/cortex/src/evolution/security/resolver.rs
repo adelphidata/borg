@@ -4,7 +4,7 @@
 //! State-resolution rule: `Reduced` wins on any single deliberate
 //! downgrade; `Boosted` requires the full positive set; otherwise `Default`.
 
-use super::{AuthBackend, ListenerBindKind, PostureSnapshot, PostureState};
+use super::{AuthBackend, ListenerBindKind, PostureSnapshot, PostureState, SecretStorageBackend};
 
 /// Resolve to `Reduced` / `Default` / `Boosted`.
 pub fn resolve_state(p: &PostureSnapshot) -> PostureState {
@@ -24,6 +24,15 @@ pub fn is_reduced(p: &PostureSnapshot) -> bool {
         || !p.global.privileged_channels.is_empty()
         || !p.global.blocked_paths_strict
         || !p.global.catastrophic_denylist_intact
+        // File-encrypted KEK is the headless-VPS fallback. Posture-wise
+        // it's strictly weaker than the OS keychain (the passphrase has
+        // to live on disk somewhere), so we register it as a Reduced
+        // trigger. Memory backend is treated as Reduced too — it implies
+        // a never-persisted install which is a non-production shape.
+        || matches!(
+            p.global.secret_storage_backend,
+            SecretStorageBackend::FileEncrypted | SecretStorageBackend::Memory
+        )
         // PublicTofu listener with `auth_backend = None` = anyone can connect.
         || p.listeners.iter().any(|l| {
             matches!(l.bind, ListenerBindKind::PublicTofu) && l.auth_backend == AuthBackend::None
@@ -56,7 +65,7 @@ pub fn is_boosted(p: &PostureSnapshot) -> bool {
 mod tests {
     use super::*;
     use crate::evolution::security::{
-        GlobalSignals, ListenerPosture, PostureSnapshot, PostureSource,
+        GlobalSignals, ListenerPosture, PostureSnapshot, PostureSource, SecretStorageBackend,
     };
 
     /// Default-fresh install — Default state, by construction. Anchor for
@@ -72,6 +81,7 @@ mod tests {
                 privileged_channels: vec![],
                 audit_chain_enabled: true,
                 catastrophic_denylist_intact: true,
+                secret_storage_backend: SecretStorageBackend::OsKeychain,
             },
             listeners: vec![ListenerPosture {
                 name: "loopback".into(),
@@ -199,6 +209,78 @@ mod tests {
         assert!(!is_reduced(&s));
         // Without a Tofu/Tailscale listener it stays Default, not Boosted.
         assert_eq!(resolve_state(&s), PostureState::Default);
+    }
+
+    /// `FileEncrypted` KEK forces Reduced even when every other signal is
+    /// pristine. This is the headless-VPS path: a `borg service install`
+    /// without `--secure` lands here. The posture multiplier (×0.85) is
+    /// the ongoing cost; the milestone bonus on transition to OsKeychain
+    /// is the one-time reward. Drift here would silently grant Default to
+    /// installs that have no OS-level secret protection.
+    #[test]
+    fn file_encrypted_kek_pushes_to_reduced() {
+        let mut s = fresh_install_snapshot();
+        s.global.secret_storage_backend = SecretStorageBackend::FileEncrypted;
+        assert!(is_reduced(&s));
+        assert!(!is_boosted(&s));
+        assert_eq!(resolve_state(&s), PostureState::Reduced);
+    }
+
+    /// Memory-only KEK is a non-production shape (test fixtures, ad-hoc
+    /// CI). Treated as Reduced so any accidental ship with the in-memory
+    /// keystore loudly drops the multiplier.
+    #[test]
+    fn memory_kek_is_reduced() {
+        let mut s = fresh_install_snapshot();
+        s.global.secret_storage_backend = SecretStorageBackend::Memory;
+        assert_eq!(resolve_state(&s), PostureState::Reduced);
+    }
+
+    /// `OsKeychain` + Tailnet listener on otherwise-pristine install →
+    /// Boosted. This is the "rewarded" headless path users reach via
+    /// `borg service install --secure`. If a future field on
+    /// `GlobalSignals` accidentally trips Reduced for OsKeychain installs,
+    /// this regression fires.
+    #[test]
+    fn os_keychain_with_mtls_listener_resolves_boosted() {
+        let mut s = fresh_install_snapshot();
+        s.global.secret_storage_backend = SecretStorageBackend::OsKeychain;
+        s.listeners.push(ListenerPosture {
+            name: "tailnet".into(),
+            bind: ListenerBindKind::Tailnet,
+            auth_backend: AuthBackend::Tailscale,
+        });
+        assert!(!is_reduced(&s));
+        assert!(is_boosted(&s));
+        assert_eq!(resolve_state(&s), PostureState::Boosted);
+    }
+
+    /// Defense-in-depth: a v1 chain that pre-dates this field deserializes
+    /// with `OsKeychain` (the `Default`). New code reading old snapshots
+    /// must NOT flip those installs to Reduced retroactively.
+    #[test]
+    fn pre_field_snapshot_deserializes_as_os_keychain() {
+        // The literal historical shape — no `secret_storage_backend` field.
+        let json = r#"{
+            "schema_version": 1,
+            "state": "Default",
+            "global": {
+                "sandbox_enabled": true,
+                "blocked_paths_strict": true,
+                "privileged_channels": [],
+                "audit_chain_enabled": true,
+                "catastrophic_denylist_intact": true
+            },
+            "listeners": [],
+            "computed_at": 1700000000,
+            "computed_from": "DaemonStartReconcile"
+        }"#;
+        let parsed: PostureSnapshot = serde_json::from_str(json).expect("legacy snapshot parses");
+        assert_eq!(
+            parsed.global.secret_storage_backend,
+            SecretStorageBackend::OsKeychain
+        );
+        assert!(!is_reduced(&parsed));
     }
 
     /// audit_chain_enabled=false is *not* a Reduced trigger in v1 (audit

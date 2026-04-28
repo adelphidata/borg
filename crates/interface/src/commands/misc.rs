@@ -12,7 +12,15 @@ pub(crate) enum MigrateSubcommand {
 #[derive(Subcommand)]
 pub(crate) enum ServiceAction {
     /// Install the daemon as a launchd/systemd service
-    Install,
+    Install {
+        /// Linux only: install gnome-keyring + dbus-user-session so the
+        /// daemon stores its KEK in the OS secret-service backend rather
+        /// than a passphrase-encrypted file. Requires apt-get; on
+        /// non-Debian systems, falls back to the file backend without
+        /// failing — the agent always boots.
+        #[clap(long)]
+        secure: bool,
+    },
     /// Uninstall the daemon service
     Uninstall,
     /// Show the daemon service status
@@ -38,7 +46,7 @@ pub(crate) fn dispatch_migrate(action: Option<MigrateSubcommand>) -> Result<()> 
 /// Dispatch for `borg service ...`.
 pub(crate) async fn dispatch_service(action: ServiceAction) -> Result<()> {
     match action {
-        ServiceAction::Install => crate::borgd_launcher::install_service(),
+        ServiceAction::Install { secure } => crate::borgd_launcher::install_service(secure),
         ServiceAction::Uninstall => crate::borgd_launcher::uninstall_service(),
         ServiceAction::Status => crate::borgd_launcher::service_status().await,
         ServiceAction::Restart => crate::borgd_launcher::restart_service().await,

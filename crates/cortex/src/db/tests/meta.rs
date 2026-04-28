@@ -65,6 +65,30 @@ fn open_with_custom_timeout() {
 }
 
 #[test]
+fn migrate_v40_is_idempotent_when_columns_already_present() {
+    // Regression: 0.1.0-era DBs on headless VPSes carry session_id /
+    // pubkey_id but lack a schema_version meta row. On 0.1.1 boot,
+    // schema_version() falls back to 1 and run_migrations replays v40,
+    // which used to fail with "duplicate column name: session_id".
+    // v40 must now no-op when the columns already exist.
+    let db = test_db();
+    // First call ran via test_db() bringing the DB to CURRENT_VERSION.
+    // Re-running v40 directly must not error.
+    db.migrate_v40().expect("re-run V40");
+    db.migrate_v40().expect("third run V40");
+    assert!(Database::has_column(
+        &db.conn,
+        "evolution_events",
+        "session_id"
+    ));
+    assert!(Database::has_column(
+        &db.conn,
+        "evolution_events",
+        "pubkey_id"
+    ));
+}
+
+#[test]
 fn default_open_uses_5s_timeout() {
     let conn = Connection::open_in_memory().expect("open in-memory db");
     let db = Database::init_connection(conn, 5000).expect("init with default timeout");

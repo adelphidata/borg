@@ -2724,8 +2724,10 @@ name = "identity"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
+ "hkdf",
  "keyring",
  "rand 0.9.4",
  "rcgen",

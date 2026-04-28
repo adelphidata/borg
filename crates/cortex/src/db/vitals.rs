@@ -627,10 +627,12 @@ impl Database {
                 "invalid evolution event_type: {event_type}"
             ));
         }
-        let max_delta = if event_type == "xp_gain" {
-            crate::evolution::MAX_XP_DELTA
-        } else {
-            0
+        let max_delta = match event_type {
+            "xp_gain" => crate::evolution::MAX_XP_DELTA,
+            // milestone_bonus has its own (higher) per-event cap; see
+            // MAX_MILESTONE_BONUS_XP doc on why this exists.
+            "milestone_bonus" => crate::evolution::MAX_MILESTONE_BONUS_XP,
+            _ => 0,
         };
         if xp_delta < 0 || xp_delta > max_delta {
             return Err(anyhow::anyhow!(

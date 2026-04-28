@@ -7,6 +7,7 @@
 
 pub mod ca_bootstrap;
 pub mod interceptor;
+pub mod kek_factory;
 pub mod tailscale_verifier;
 pub mod tls;
 pub mod verifier;

@@ -17,4 +17,4 @@ pub use cert::{
     expires_within, fingerprint_of_pem, fingerprint_sha256, parse_cert_metadata, CertMetadata,
 };
 pub use error::PkiError;
-pub use keychain::{KekStore, KeychainStore, MemoryKekStore};
+pub use keychain::{FileKekStore, KekStore, KeychainStore, MemoryKekStore};
