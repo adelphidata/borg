@@ -597,7 +597,7 @@ impl Config {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::debug!("Keychain fallback for {key} failed: {e}");
+                tracing::trace!("Keychain fallback for {key} failed: {e}");
             }
         }
 

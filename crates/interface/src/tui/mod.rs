@@ -1608,7 +1608,13 @@ async fn run_event_loop(
                         tracing::warn!("Admin.Poke failed: {e}");
                     }
                 });
-                app.push_system_message("[poke: sent to daemon]".to_string());
+                let borg_name = app
+                    .config
+                    .user
+                    .agent_name
+                    .clone()
+                    .unwrap_or_else(|| "Borg".to_string());
+                app.push_system_message(format!("*poked {borg_name}*"));
             }
             AppAction::RunDoctor => {
                 app.push_system_message("Borg Doctor\n───────────".to_string());

@@ -2818,8 +2818,9 @@ mod tests {
         assert!(result.is_some());
         let action = result.unwrap().unwrap();
         assert!(matches!(action, AppAction::Poke));
-        let sys = last_system_text(&app).unwrap();
-        assert!(sys.contains("sending to daemon"));
+        // No pre-send chatter — the confirmation is emitted by the
+        // AppAction::Poke handler in tui::mod.rs after the request fires,
+        // not by the command dispatcher.
     }
 
     #[test]

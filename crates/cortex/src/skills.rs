@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::config::{Config, SkillsConfig};
 use crate::sanitize::{self, ThreatLevel};
@@ -393,17 +393,17 @@ fn check_requirements(
     resolved_creds: &std::collections::HashMap<String, String>,
 ) -> bool {
     if !check_os_requirements(os) {
-        debug!("Skill requirement missing: unsupported OS (need {:?})", os);
+        trace!("Skill requirement missing: unsupported OS (need {:?})", os);
         return false;
     }
     for bin in &requires.bins {
         if which::which(bin).is_err() {
-            debug!("Skill requirement missing: binary '{bin}'");
+            trace!("Skill requirement missing: binary '{bin}'");
             return false;
         }
     }
     if !requires.any_bins.is_empty() && !requires.any_bins.iter().any(|b| which::which(b).is_ok()) {
-        debug!(
+        trace!(
             "Skill requirement missing: none of {:?} found",
             requires.any_bins
         );
@@ -411,7 +411,7 @@ fn check_requirements(
     }
     for var in &requires.env {
         if std::env::var(var).is_err() && !resolved_creds.contains_key(var) {
-            debug!("Skill requirement missing: env var '{var}'");
+            trace!("Skill requirement missing: env var '{var}'");
             return false;
         }
     }
@@ -511,90 +511,110 @@ pub fn load_all_skills(
                 let skill_file = entry.path().join("SKILL.md");
                 if skill_file.exists() {
                     match std::fs::read_to_string(&skill_file) {
-                        Ok(content) => match parse_skill_md(&content) {
-                            Ok((manifest, mut body)) => {
-                                let name = manifest.name.clone();
-                                let skill_dir = entry.path();
+                        Ok(content) => {
+                            // Auto-installed copies of bundled skills (written by
+                            // `install_default_skills`) are byte-identical to the
+                            // embedded version. The bundled in-memory skill is
+                            // already loaded above; loading the disk copy as a
+                            // "user skill" would trigger noisy collision/env-var
+                            // warnings for nothing. Skip silently.
+                            if let Some(bundled) = BUNDLED_SKILLS
+                                .iter()
+                                .find_map(|(n, c)| (content.as_str() == *c).then_some(*n))
+                            {
+                                debug!(
+                                    "Skipping disk copy of bundled skill '{bundled}' (byte-identical to embedded)"
+                                );
+                                continue;
+                            }
+                            match parse_skill_md(&content) {
+                                Ok((manifest, mut body)) => {
+                                    let name = manifest.name.clone();
+                                    let skill_dir = entry.path();
 
-                                // Load references from references/*.md
-                                let mut references = Vec::new();
-                                let refs_dir = skill_dir.join("references");
-                                if refs_dir.is_dir() {
-                                    if let Ok(ref_entries) = std::fs::read_dir(&refs_dir) {
-                                        for ref_entry in ref_entries.flatten() {
-                                            let ref_path = ref_entry.path();
-                                            if ref_path.extension().is_some_and(|e| e == "md") {
-                                                if let Ok(ref_content) =
-                                                    std::fs::read_to_string(&ref_path)
-                                                {
-                                                    let ref_name = ref_path
-                                                        .file_name()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy()
-                                                        .to_string();
-                                                    references.push((ref_name, ref_content));
+                                    // Load references from references/*.md
+                                    let mut references = Vec::new();
+                                    let refs_dir = skill_dir.join("references");
+                                    if refs_dir.is_dir() {
+                                        if let Ok(ref_entries) = std::fs::read_dir(&refs_dir) {
+                                            for ref_entry in ref_entries.flatten() {
+                                                let ref_path = ref_entry.path();
+                                                if ref_path.extension().is_some_and(|e| e == "md") {
+                                                    if let Ok(ref_content) =
+                                                        std::fs::read_to_string(&ref_path)
+                                                    {
+                                                        let ref_name = ref_path
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy()
+                                                            .to_string();
+                                                        references.push((ref_name, ref_content));
+                                                    }
                                                 }
                                             }
                                         }
                                     }
-                                }
 
-                                // Security validation for user skills
-                                let skill_config = skills_config.entries.get(&name);
-                                let outcome = skill_security::validate_user_skill(
-                                    &name,
-                                    &manifest,
-                                    &body,
-                                    &references,
-                                    &skill_file,
-                                    skill_config,
-                                );
-                                for f in &outcome.findings {
-                                    warn!("{}", f.message);
-                                }
-                                if !outcome.allowed {
-                                    debug!("Skipping user skill '{name}' due to security findings");
-                                    continue;
-                                }
-                                // Wrap body if flagged for injection
-                                if matches!(outcome.threat_level, ThreatLevel::Flagged { .. }) {
-                                    body = sanitize::wrap_with_injection_warning(&name, &body);
-                                }
+                                    // Security validation for user skills
+                                    let skill_config = skills_config.entries.get(&name);
+                                    let outcome = skill_security::validate_user_skill(
+                                        &name,
+                                        &manifest,
+                                        &body,
+                                        &references,
+                                        &skill_file,
+                                        skill_config,
+                                    );
+                                    for f in &outcome.findings {
+                                        warn!("{}", f.message);
+                                    }
+                                    if !outcome.allowed {
+                                        debug!(
+                                            "Skipping user skill '{name}' due to security findings"
+                                        );
+                                        continue;
+                                    }
+                                    // Wrap body if flagged for injection
+                                    if matches!(outcome.threat_level, ThreatLevel::Flagged { .. }) {
+                                        body = sanitize::wrap_with_injection_warning(&name, &body);
+                                    }
 
-                                // Detect scripts
-                                let mut scripts = Vec::new();
-                                let scripts_dir = skill_dir.join("scripts");
-                                if scripts_dir.is_dir() {
-                                    if let Ok(script_entries) = std::fs::read_dir(&scripts_dir) {
-                                        for script_entry in script_entries.flatten() {
-                                            scripts.push(script_entry.path());
+                                    // Detect scripts
+                                    let mut scripts = Vec::new();
+                                    let scripts_dir = skill_dir.join("scripts");
+                                    if scripts_dir.is_dir() {
+                                        if let Ok(script_entries) = std::fs::read_dir(&scripts_dir)
+                                        {
+                                            for script_entry in script_entries.flatten() {
+                                                scripts.push(script_entry.path());
+                                            }
                                         }
                                     }
+
+                                    let disabled = is_skill_disabled(&manifest.name, skills_config);
+                                    let available = !disabled
+                                        && check_requirements(
+                                            &manifest.requires,
+                                            &manifest.os,
+                                            resolved_creds,
+                                        );
+
+                                    skills.push(Skill {
+                                        manifest,
+                                        body,
+                                        source: SkillSource::User,
+                                        available,
+                                        disabled,
+                                        references,
+                                        scripts,
+                                    });
+                                    debug!("Loaded user skill: {name}");
                                 }
-
-                                let disabled = is_skill_disabled(&manifest.name, skills_config);
-                                let available = !disabled
-                                    && check_requirements(
-                                        &manifest.requires,
-                                        &manifest.os,
-                                        resolved_creds,
-                                    );
-
-                                skills.push(Skill {
-                                    manifest,
-                                    body,
-                                    source: SkillSource::User,
-                                    available,
-                                    disabled,
-                                    references,
-                                    scripts,
-                                });
-                                debug!("Loaded user skill: {name}");
+                                Err(e) => {
+                                    debug!("Failed to parse {}: {e}", skill_file.display());
+                                }
                             }
-                            Err(e) => {
-                                debug!("Failed to parse {}: {e}", skill_file.display());
-                            }
-                        },
+                        }
                         Err(e) => {
                             debug!("Failed to read {}: {e}", skill_file.display());
                         }

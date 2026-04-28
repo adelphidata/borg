@@ -593,8 +593,9 @@ impl App<'_> {
             }
             Ok(AppAction::Continue)
         } else {
-            // Daemon mode: no local scheduler, send via HTTP
-            self.push_system_message("[poke: sending to daemon...]".to_string());
+            // Daemon mode: no local scheduler, send via HTTP. The
+            // confirmation line is emitted by the AppAction::Poke handler
+            // once the spawn fires — keeping it as one line, not two.
             Ok(AppAction::Poke)
         }
     }

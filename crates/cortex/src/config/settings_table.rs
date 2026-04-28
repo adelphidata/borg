@@ -205,6 +205,10 @@ define_settings! {
     }
 
     registry_only {
+        // First-run onboarding sentinel — written directly via `db.set_setting`
+        // by the daemon/cli, not through `apply_setting`. Listed here so the
+        // settings reload doesn't emit "Unknown setting" for it.
+        "onboarded" => |_c| String::from("(sentinel)");
         // Gateway fields that are read-only (no apply_setting arm)
         "gateway.max_body_size" => |c| format!("{}", c.gateway.max_body_size);
         "gateway.telegram_poll_timeout_secs" => |c| format!("{}", c.gateway.telegram_poll_timeout_secs);
@@ -214,9 +218,12 @@ define_settings! {
     }
 
     custom_apply {
-        // llm.claude_cli_path: opt_string with custom "(auto-detect)" display
+        // llm.claude_cli_path: opt_string. Empty or the legacy "(auto-detect)"
+        // display sentinel both clear to None — earlier versions of the
+        // extractor returned the sentinel as the round-trip value, so this
+        // arm has to absorb whatever crept into the DB.
         "llm.claude_cli_path" => |s, key, value| {
-            s.llm.claude_cli_path = if value.is_empty() {
+            s.llm.claude_cli_path = if value.is_empty() || value == "(auto-detect)" {
                 None
             } else {
                 Some(value.to_string())
@@ -224,9 +231,16 @@ define_settings! {
             Ok(format!("{key} = {value}"))
         };
 
-        // provider: always wraps in Some (never None)
+        // provider: opt_string. Same sentinel-clearing rule as claude_cli_path
+        // — without this, an "unset" round-trip persisted "(auto-detect)" as
+        // the literal provider name, which then failed Provider::from_str at
+        // turn time with "Unknown provider: (auto-detect)".
         "provider" => |s, key, value| {
-            s.llm.provider = Some(value.to_string());
+            s.llm.provider = if value.is_empty() || value == "(auto-detect)" {
+                None
+            } else {
+                Some(value.to_string())
+            };
             Ok(format!("{key} = {value}"))
         };
 
@@ -323,11 +337,14 @@ define_settings! {
     }
 
     custom_extract {
+        // Round-trippable: empty string when None. The "(auto-detect)" string
+        // is for human display only and must never be persisted, since it is
+        // not a valid Provider name.
         "provider" => |c| {
-            c.llm.provider.as_deref().unwrap_or("(auto-detect)").to_string()
+            c.llm.provider.clone().unwrap_or_default()
         };
         "llm.claude_cli_path" => |c| {
-            c.llm.claude_cli_path.as_deref().unwrap_or("(auto-detect)").to_string()
+            c.llm.claude_cli_path.clone().unwrap_or_default()
         };
         "llm.api_key" => |c| {
             c.llm.api_key.as_ref()
