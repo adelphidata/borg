@@ -10,6 +10,7 @@ use cortex::db::Database;
 use identity::{
     ca::{generate_root_ca, issue_server_cert, ServerCertParams},
     cert::{expires_within, parse_cert_metadata, CertMetadata},
+    error::PkiError,
     fingerprint_sha256, KekStore,
 };
 
@@ -39,18 +40,37 @@ const RENEWAL_WINDOW_DAYS: u32 = 14;
 const SERVER_VALIDITY_DAYS: u32 = 90;
 
 /// Ensure a root CA exists in DB + keychain. Mints one if absent.
+///
+/// Self-heals when the DB has a CA cert but the KEK has no matching private
+/// key — happens after a KEK backend swap (e.g. lost passphrase, OS keychain
+/// → file fallback, or a non-atomic bootstrap that persisted the cert before
+/// the key write succeeded). The orphaned cert is revoked and a fresh CA is
+/// minted so the daemon boots instead of crash-looping.
 pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, String)> {
     if let Some(row) = db.latest_active_cert("root").context("query root ca")? {
-        let key_bytes = kek
-            .get(ROOT_CA_KEY)
-            .map_err(|e| anyhow!("load root CA key from keychain: {e}"))?;
-        let key_pem = String::from_utf8(key_bytes).context("root CA key not utf-8 PEM")?;
-        return Ok((row.pem, key_pem));
+        match kek.get(ROOT_CA_KEY) {
+            Ok(key_bytes) => {
+                let key_pem = String::from_utf8(key_bytes).context("root CA key not utf-8 PEM")?;
+                return Ok((row.pem, key_pem));
+            }
+            Err(PkiError::NotFound(_)) => {
+                tracing::warn!(
+                    serial = row.serial,
+                    fingerprint = %row.fingerprint,
+                    "root CA cert in DB but private key missing from KEK; revoking and minting fresh CA — paired devices will need to re-pair"
+                );
+                db.mark_cert_revoked(row.serial, Some("kek-key-missing-self-heal"))
+                    .context("revoke orphaned root CA")?;
+            }
+            Err(e) => return Err(anyhow!("load root CA key from keychain: {e}")),
+        }
     }
 
     let root = generate_root_ca("borgd-root").context("mint root CA")?;
     let fp = fingerprint_sha256(&root.cert_der);
     let meta = parse_cert_metadata(&root.cert_der).context("parse minted root CA")?;
+    kek.put(ROOT_CA_KEY, root.key_pkcs8_pem.as_bytes())
+        .map_err(|e| anyhow!("stash root CA key in keychain: {e}"))?;
     db.insert_internal_cert(
         "root",
         &root.cert_pem,
@@ -60,8 +80,6 @@ pub fn ensure_root_ca(db: &Database, kek: &dyn KekStore) -> Result<(String, Stri
         meta.not_after,
     )
     .context("persist root CA")?;
-    kek.put(ROOT_CA_KEY, root.key_pkcs8_pem.as_bytes())
-        .map_err(|e| anyhow!("stash root CA key in keychain: {e}"))?;
 
     Ok((root.cert_pem, root.key_pkcs8_pem))
 }
@@ -80,26 +98,36 @@ pub fn ensure_server_cert(
         .latest_active_cert("server")
         .context("query server cert")?
     {
-        let key_bytes = kek
-            .get(SERVER_CERT_KEY)
-            .map_err(|e| anyhow!("load server cert key from keychain: {e}"))?;
-        let key_pem = String::from_utf8(key_bytes).context("server key not utf-8 PEM")?;
-        let meta = CertMetadata {
-            subject_cn: None,
-            san_uri: None,
-            not_before: row.not_before,
-            not_after: row.not_after,
-            fingerprint: row.fingerprint.clone(),
-        };
-        if !expires_within(&meta, now, RENEWAL_WINDOW_DAYS) {
-            return Ok((row.pem, key_pem, row.serial));
+        match kek.get(SERVER_CERT_KEY) {
+            Ok(key_bytes) => {
+                let key_pem = String::from_utf8(key_bytes).context("server key not utf-8 PEM")?;
+                let meta = CertMetadata {
+                    subject_cn: None,
+                    san_uri: None,
+                    not_before: row.not_before,
+                    not_after: row.not_after,
+                    fingerprint: row.fingerprint.clone(),
+                };
+                if !expires_within(&meta, now, RENEWAL_WINDOW_DAYS) {
+                    return Ok((row.pem, key_pem, row.serial));
+                }
+                // Renew: mint new, mark old renewed.
+                let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
+                let serial = persist_server_cert(db, kek, &issued, &new_key)?;
+                db.mark_cert_renewed(row.serial)
+                    .context("mark old renewed")?;
+                return Ok((issued.cert_pem, new_key, serial));
+            }
+            Err(PkiError::NotFound(_)) => {
+                tracing::warn!(
+                    serial = row.serial,
+                    "server cert in DB but private key missing from KEK; revoking and re-issuing"
+                );
+                db.mark_cert_revoked(row.serial, Some("kek-key-missing-self-heal"))
+                    .context("revoke orphaned server cert")?;
+            }
+            Err(e) => return Err(anyhow!("load server cert key from keychain: {e}")),
         }
-        // Renew: mint new, mark old renewed.
-        let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
-        let serial = persist_server_cert(db, kek, &issued, &new_key)?;
-        db.mark_cert_renewed(row.serial)
-            .context("mark old renewed")?;
-        return Ok((issued.cert_pem, new_key, serial));
     }
 
     let (issued, new_key) = mint_server_cert(ca_cert_pem, ca_key_pem, san_dns)?;
@@ -127,6 +155,10 @@ fn persist_server_cert(
     key_pem: &str,
 ) -> Result<i64> {
     let fp = fingerprint_sha256(&issued.cert_der);
+    // KEK first so a mid-bootstrap crash leaves an orphan key (harmless) and
+    // no DB row, instead of an orphan cert that triggers self-heal next boot.
+    kek.put(SERVER_CERT_KEY, key_pem.as_bytes())
+        .map_err(|e| anyhow!("stash server key: {e}"))?;
     let serial = db.insert_internal_cert(
         "server",
         &issued.cert_pem,
@@ -135,8 +167,6 @@ fn persist_server_cert(
         issued.not_before,
         issued.not_after,
     )?;
-    kek.put(SERVER_CERT_KEY, key_pem.as_bytes())
-        .map_err(|e| anyhow!("stash server key: {e}"))?;
     Ok(serial)
 }
 
@@ -175,16 +205,42 @@ mod tests {
     }
 
     #[test]
-    fn missing_keychain_entry_fails_loud_when_db_has_cert() {
+    fn missing_keychain_entry_self_heals_with_fresh_ca() {
+        // Self-healing on KEK loss is what unblocks the daemon after a backend
+        // swap (e.g. losing kek.enc/passphrase on a headless VPS). Without it
+        // the orphaned cert in `internal_ca_certs` puts borgd in a crash loop.
         let kek = MemoryKekStore::new();
         let d = db();
-        ensure_root_ca(&d, &kek).expect("ca");
-        // Wipe the kek entry — simulates corrupt keychain.
+        let (orig_pem, orig_key) = ensure_root_ca(&d, &kek).expect("ca");
+        // Simulate KEK loss (e.g. file backend wiped, OS keychain swapped).
         kek.delete(ROOT_CA_KEY).expect("delete");
-        let res = ensure_root_ca(&d, &kek);
-        assert!(
-            res.is_err(),
-            "ensure_root_ca should fail when keychain entry missing"
+
+        let (new_pem, new_key) = ensure_root_ca(&d, &kek).expect("self-heal mints fresh CA");
+        assert_ne!(orig_pem, new_pem, "must mint a brand new CA");
+        assert_ne!(orig_key, new_key);
+
+        // The orphaned row must be revoked, not still active.
+        let active = d.latest_active_cert("root").expect("query").expect("row");
+        assert_ne!(
+            active.pem, orig_pem,
+            "old cert should no longer be the latest active"
         );
+        assert_eq!(active.pem, new_pem);
+    }
+
+    #[test]
+    fn server_cert_self_heals_when_key_missing() {
+        let kek = MemoryKekStore::new();
+        let d = db();
+        let (ca_pem, ca_key) = ensure_root_ca(&d, &kek).expect("ca");
+        let san = vec!["localhost".to_string()];
+        let (orig, _, orig_serial) =
+            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("first");
+        kek.delete(SERVER_CERT_KEY).expect("wipe server key");
+
+        let (fresh, _, fresh_serial) =
+            ensure_server_cert(&d, &kek, &ca_pem, &ca_key, &san).expect("self-heal");
+        assert_ne!(orig, fresh);
+        assert_ne!(orig_serial, fresh_serial);
     }
 }
