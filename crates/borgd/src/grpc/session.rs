@@ -1,7 +1,7 @@
 //! Session gRPC service.
 //!
 //! Wires the Session proto onto a [`SessionRegistry`] of live
-//! [`SessionHost`](crate::session::SessionHost)s. Construction is injection-
+//! [`SessionHost`]s. Construction is injection-
 //! based: the daemon decides how to build a backend (real `Agent` or test
 //! stub) and hands the registry + factory to this service.
 

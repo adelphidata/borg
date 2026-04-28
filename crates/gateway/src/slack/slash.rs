@@ -6,10 +6,10 @@
 //! routinely exceed 3 seconds, the flow is:
 //!
 //! 1. Verify signing secret on the form-encoded body.
-//! 2. Parse the form into [`SlashCommandPayload`](super::types::SlashCommandPayload).
+//! 2. Parse the form into `SlashCommandPayload` (see `super::types`).
 //! 3. Return an [`InboundMessage`] for the agent pipeline; the HTTP handler can
 //!    immediately respond with `200 OK` empty body.
-//! 4. When the agent's reply is ready, [`post_response_url`] sends it back to
+//! 4. When the agent's reply is ready, `post_response_url` sends it back to
 //!    Slack via the `response_url` from the original payload.
 //!
 //! Socket Mode skips the signing-secret check (the WebSocket itself is

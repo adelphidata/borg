@@ -348,7 +348,7 @@ mod tests {
         let shared = db();
         seed_paired(&shared, "fp-A", "alice");
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
-        let v = TailscaleVerifier::new(TofuVerifier::new(shared.clone()), source);
+        let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
         let ctx = PeerCtx {
             peer_ip: Some("100.64.0.99".parse().unwrap()),
@@ -366,7 +366,7 @@ mod tests {
         let shared = db();
         seed_paired(&shared, "fp-A", "alice");
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
-        let v = TailscaleVerifier::new(TofuVerifier::new(shared.clone()), source);
+        let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
         let ctx = PeerCtx {
             peer_ip: Some("100.64.0.2".parse().unwrap()),
@@ -387,7 +387,7 @@ mod tests {
                 .expect("revoke");
         }
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
-        let v = TailscaleVerifier::new(TofuVerifier::new(shared.clone()), source);
+        let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
         let ctx = PeerCtx {
             peer_ip: Some("100.64.0.2".parse().unwrap()),
@@ -409,7 +409,7 @@ mod tests {
         // Self must be non-empty (a logged-out tailscaled is now refused;
         // see `rejects_when_tailscale_status_has_no_self_node`).
         let source = StubSource::new(&status_with(&["100.64.0.1"], &["100.64.0.2"]));
-        let v = TailscaleVerifier::new(TofuVerifier::new(shared.clone()), source.clone())
+        let v = TailscaleVerifier::new(TofuVerifier::new(shared), source.clone())
             .with_ttl(Duration::from_millis(50));
 
         let ctx = PeerCtx {
@@ -442,7 +442,7 @@ mod tests {
         let shared = db();
         seed_paired(&shared, "fp-A", "alice");
         let source = StubSource::new(&status_with(&[], &["100.64.0.2"]));
-        let v = TailscaleVerifier::new(TofuVerifier::new(shared.clone()), source);
+        let v = TailscaleVerifier::new(TofuVerifier::new(shared), source);
 
         match v.verify("fp-A", None) {
             Err(VerifierError::Tailscale(_)) => {}

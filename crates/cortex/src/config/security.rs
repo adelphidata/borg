@@ -132,7 +132,7 @@ pub struct SecurityConfig {
     /// Path component names that, when present anywhere in a canonicalized
     /// file path, cause file-read/list operations to be denied.
     pub blocked_paths: Vec<String>,
-    /// Explicit allow list that overrides [`blocked_paths`]. Each entry is a
+    /// Explicit allow list that overrides `blocked_paths`. Each entry is a
     /// tilde-expandable prefix; any file whose canonical path starts with one
     /// of these is allowed regardless of blocklist matches.
     #[serde(default)]

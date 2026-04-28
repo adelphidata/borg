@@ -1,4 +1,4 @@
-//! Connection helpers for [`DaemonClient`](super::DaemonClient).
+//! Connection helpers for [`DaemonClient`].
 //!
 //! Two flavors:
 //! - [`connect`] — fail fast if the socket is missing. Use in production.

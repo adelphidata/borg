@@ -139,6 +139,7 @@ pub fn near_expiry(db: &Arc<Mutex<Database>>, fingerprint: &str, now: i64) -> Op
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
@@ -153,7 +154,7 @@ mod tests {
         let v = TofuVerifier::new(db());
         match v.verify("fp-stranger", None) {
             Err(VerifierError::UnknownDevice(fp)) => assert_eq!(fp, "fp-stranger"),
-            other => panic!("expected UnknownDevice, got {:?}", other),
+            other => panic!("expected UnknownDevice, got {other:?}"),
         }
     }
 
@@ -243,7 +244,7 @@ mod tests {
         let v = TofuVerifier::new(shared);
         match v.verify("fp-bad", None) {
             Err(VerifierError::Revoked(fp)) => assert_eq!(fp, "fp-bad"),
-            other => panic!("expected Revoked, got {:?}", other),
+            other => panic!("expected Revoked, got {other:?}"),
         }
     }
 }

@@ -15,7 +15,7 @@
 //!    `SoftWarn` (the engine has already debounced the warning toast for
 //!    this period).
 //!
-//! Post-flight reconcile is wired in [`crate::agent::Agent::record_usage`]
+//! Post-flight reconcile is wired in `crate::agent::Agent::record_usage`
 //! rather than in this hook — that's the single observation point for the
 //! provider's actual reported usage.
 

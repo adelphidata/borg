@@ -4,7 +4,7 @@
 //! lives in the OS keychain (see [`crate::evolution::keychain`]); the public
 //! key is stored in the `device_keys` table and referenced from each
 //! `evolution_events` row via `pubkey_id`. Legacy rows where `pubkey_id IS
-//! NULL` continue to verify via HMAC — see [`crate::evolution::hmac`].
+//! NULL` continue to verify via HMAC — see `crate::evolution::hmac`.
 //!
 //! The hashed payload format mirrors the HMAC v2 scheme so a future migration
 //! can re-sign legacy rows without changing the canonicalisation rules.

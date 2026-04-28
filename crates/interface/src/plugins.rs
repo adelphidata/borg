@@ -412,7 +412,7 @@ fn read_line_masked() -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-/// Append a credential entry to the config string, merging into existing [credentials] section if present.
+/// Append a credential entry to the config string, merging into existing `[credentials]` section if present.
 fn append_credential_to_config(config_str: &mut String, key: &str, entry: &str) {
     if config_str.contains("[credentials]") {
         // Find the [credentials] section and append after it

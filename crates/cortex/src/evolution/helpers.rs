@@ -143,7 +143,7 @@ pub fn render_bar(val: u32, max: u32, width: usize) -> String {
 /// Returns `None` at Stage 3 (terminal) or below Lvl.99 when the transition
 /// isn't imminent — the UI should surface readiness only when it is
 /// actionable. Stage 1→2 and Stage 2→3 re-use the same gates
-/// [`check_stage1_gates`]/[`check_stage2_gates`] as the authoritative
+/// `check_stage1_gates`/`check_stage2_gates` as the authoritative
 /// transition path, but return per-gate gaps instead of a single bool.
 pub fn compute_readiness(
     evo: &EvolutionState,

@@ -1,4 +1,4 @@
-//! Production [`ChatDispatcher`] — routes admitted ingress through the
+//! Production `ChatDispatcher` — routes admitted ingress through the
 //! daemon's globally-installed [`crate::session_executor::SessionExecutor`]
 //! and translates [`cortex::agent::AgentEvent`] into the OpenAI-shaped
 //! [`AgentEventChunk`] stream the route layer expects.

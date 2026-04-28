@@ -1,14 +1,14 @@
 //! Daily self-healing maintenance task.
 //!
 //! Runs as a seeded scheduled task with `task_type = 'maintenance'` — the
-//! dispatcher invokes [`run_daily_maintenance`] directly instead of the
+//! dispatcher invokes `run_daily_maintenance` directly instead of the
 //! LLM agent loop. The goal is routine self-care that the user would
 //! otherwise have to do by hand: prune old logs, verify health, surface
 //! persistent warnings.
 //!
 //! Failures in individual steps are logged and skipped; a single broken
 //! step never stops the rest of the sweep from running. The returned
-//! [`MaintenanceReport`] is persisted to the `doctor_runs` table so the
+//! `MaintenanceReport` is persisted to the `doctor_runs` table so the
 //! TUI / CLI can render history.
 
 use anyhow::Result;

@@ -8,7 +8,7 @@
 //!    `<attached_dir>` blocks appended to the user's message — this is what
 //!    the LLM sees. The LLM can answer in a single turn instead of deciding
 //!    to call `read_file` / `list_dir`.
-//! 2. A vector of [`MentionCard`] records the TUI renders as one-line rows
+//! 2. A vector of `MentionCard` records the TUI renders as one-line rows
 //!    (`Read foo.rs (42 lines)` / `Listed directory foo/`).
 //!
 //! Per-file cap of 50 KB; on overflow, a truncation

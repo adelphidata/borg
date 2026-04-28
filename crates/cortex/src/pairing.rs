@@ -351,6 +351,7 @@ async fn send_approval_notification_inner(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
@@ -368,7 +369,7 @@ mod tests {
             assert_eq!(words.len(), PHRASE_WORDS, "got: {phrase}");
             for w in words {
                 assert!(
-                    wordlist.iter().any(|listed| *listed == w),
+                    wordlist.contains(&w),
                     "word '{w}' from '{phrase}' not in BIP-39 wordlist"
                 );
             }

@@ -3,7 +3,7 @@
 //! Two variants carry an `oneshot::Sender` for the user's reply
 //! (`ShellConfirmation`, `UserInputRequest`). On the wire we replace the
 //! sender with a `prompt_id` and stash the sender in the per-session
-//! [`PromptRegistry`](super::prompts::PromptRegistry); the client later calls
+//! [`PromptRegistry`]; the client later calls
 //! `RespondToPrompt(prompt_id, value)` to deliver the reply.
 
 use super::prompts::{PendingPrompt, PromptRegistry};

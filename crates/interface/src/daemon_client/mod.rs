@@ -6,10 +6,10 @@
 //! `respond_to_prompt()`, `cancel()`, plus admin RPCs (`poke`, `heal`,
 //! settings I/O, list_sessions, get_session).
 //!
-//! Auto-spawn convenience: [`DaemonClient::connect_or_spawn`] launches a
+//! Auto-spawn convenience: `connect_or_spawn` launches a
 //! fresh `borgd` if no socket is present at the expected path (dev
 //! workflow). Production deployments should run `borgd` as a supervised
-//! service and connect via [`DaemonClient::connect`] which errors cleanly
+//! service and connect via `connect` which errors cleanly
 //! when the socket is missing.
 
 mod connect;

@@ -5,7 +5,7 @@
 //! live in the OS keychain and are deliberately *not* in the tarball — a
 //! restore on a fresh host triggers re-pairing.
 //!
-//! Excluded from the archive (see [`should_skip_entry`]):
+//! Excluded from the archive (see `should_skip_entry`):
 //! - The UDS socket `borgd.sock` (re-created by the daemon on next start).
 //! - `*.lock` flock sentinels.
 //! - `logs/` (transient; restoring stale logs would confuse `borg doctor`).
@@ -334,7 +334,7 @@ fn append_dir_filtered<W: Write>(
 }
 
 /// Recursive directory walk that yields every entry path. Filtering is
-/// done by the caller via [`should_skip_entry`]; we don't prune branches
+/// done by the caller via `should_skip_entry`; we don't prune branches
 /// here because skip rules are name-based, not depth-based.
 fn walk_dir(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();

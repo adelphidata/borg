@@ -1,7 +1,7 @@
 //! Pre-dispatch gate: rate-limit, sanitize, audit.
 //!
-//! Every ingress surface calls [`IngressGate::admit`] with a parsed
-//! [`IngressMessage`]. The gate enforces a per-principal sliding-window
+//! Every ingress surface calls `IngressGate::admit` with a parsed
+//! `IngressMessage`. The gate enforces a per-principal sliding-window
 //! rate limit, applies the existing prompt-injection sanitizer once
 //! (instead of duplicated per-surface), records the message to an audit
 //! sink, and returns a normalized payload the surface can hand to the

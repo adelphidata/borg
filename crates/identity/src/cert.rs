@@ -87,6 +87,7 @@ pub fn expires_within(meta: &CertMetadata, now_unix: i64, days: u32) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
 

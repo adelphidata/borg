@@ -116,6 +116,11 @@ pub fn payload(pairs: &[(&str, Value)]) -> Value {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::trivially_copy_pass_by_ref
+)]
 mod tests {
     use super::*;
     use rusqlite::Connection;

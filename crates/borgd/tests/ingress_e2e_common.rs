@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! Shared helpers for the ingress-surface e2e tests.
 //!
 //! Each test file (`openai_compat_e2e.rs`, `generic_webhook_e2e.rs`,

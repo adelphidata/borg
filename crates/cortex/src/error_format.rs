@@ -8,7 +8,7 @@ use std::fmt;
 
 /// Where the error is being displayed — determines which actionable hints to append.
 ///
-/// Adding a new context (e.g. `Api`) is one enum variant + rows in [`ACTION_HINTS`].
+/// Adding a new context (e.g. `Api`) is one enum variant + rows in `ACTION_HINTS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorContext {
     /// Interactive TUI — can reference `/settings` and slash commands.
@@ -313,7 +313,7 @@ const ACTION_HINTS: &[ActionHint] = &[
 
 /// Format a friendly error with context-specific actionable hints.
 ///
-/// Builds on [`format_friendly_error`] and appends a hint from [`ACTION_HINTS`]
+/// Builds on [`format_friendly_error`] and appends a hint from `ACTION_HINTS`
 /// when one matches the `(category, context)` pair.
 pub fn format_error_with_context(raw: &str, context: ErrorContext) -> String {
     let base = format_friendly_error(raw);

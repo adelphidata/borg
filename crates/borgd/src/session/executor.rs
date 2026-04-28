@@ -1,12 +1,12 @@
 //! Production [`SessionExecutor`] implementation.
 //!
-//! Looks up or creates a [`SessionHost`](super::SessionHost) per `session_key`
+//! Looks up or creates a [`SessionHost`] per `session_key`
 //! (the gateway computes that as `{sender_id}:{thread_id}`), drives
 //! `start_turn` on it, and forwards the host's broadcast events into a fresh
 //! `mpsc::Receiver<AgentEvent>` returned to the gateway. This is the
 //! replacement for the gateway's old per-message `Agent::new(...)` path —
 //! everything routes through the daemon's single-writer-per-session
-//! [`SessionRegistry`](super::SessionRegistry) now.
+//! [`SessionRegistry`] now.
 
 use crate::session::{
     backend::{AgentBackend, InlineImage as BackendImage},

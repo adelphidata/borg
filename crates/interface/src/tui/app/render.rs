@@ -201,7 +201,7 @@ impl<'a> App<'a> {
     /// Render the live streaming row (throbber + phase header + elapsed +
     /// optional details snippet). The header is driven by agent events
     /// (`stream_status.header`) — "Preparing", "Thinking", "Responding",
-    /// "Running <tool>" — so the user has phase-level evidence the turn is
+    /// "Running `<tool>`" — so the user has phase-level evidence the turn is
     /// still making progress even when text output hasn't started yet.
     fn render_streaming_status(&self, frame: &mut Frame, area: Rect, start: std::time::Instant) {
         use ratatui::text::Text;

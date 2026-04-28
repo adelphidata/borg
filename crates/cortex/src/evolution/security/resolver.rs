@@ -62,6 +62,7 @@ pub fn is_boosted(p: &PostureSnapshot) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::type_complexity)]
 mod tests {
     use super::*;
     use crate::evolution::security::{

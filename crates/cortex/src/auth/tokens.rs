@@ -32,15 +32,15 @@ pub struct TokenRow {
     pub scopes: String,
     /// Unix seconds when the token was issued.
     pub created_at: i64,
-    /// Unix seconds of the most recent successful [`verify`]. `None`
+    /// Unix seconds of the most recent successful `verify`. `None`
     /// for never-used tokens.
     pub last_used_at: Option<i64>,
     /// Unix seconds the token was revoked. `None` while live; `Some`
-    /// after [`revoke`]. A revoked token will never verify again.
+    /// after `revoke_by_label`. A revoked token will never verify again.
     pub revoked_at: Option<i64>,
 }
 
-/// Result of [`issue`]: the row that was written, plus the plaintext
+/// Result of `issue`: the row that was written, plus the plaintext
 /// token shown to the user. The plaintext is **only** available here —
 /// it's not stored and cannot be recovered from the database.
 #[derive(Debug)]
@@ -146,7 +146,7 @@ pub fn verify(db: &Database, plaintext: &str) -> Result<TokenRow> {
     Ok(row)
 }
 
-/// Revoke a token by label. Subsequent [`verify`] calls for that token
+/// Revoke a token by label. Subsequent `verify` calls for that token
 /// return `Err`. Idempotent: revoking an already-revoked token leaves
 /// `revoked_at` at its earliest value.
 pub fn revoke_by_label(db: &Database, label: &str) -> Result<TokenRow> {

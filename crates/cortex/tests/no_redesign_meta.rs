@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! Source-grep guard: the working-spec language from the v1 redesign
 //! (`Task NN`, `docs/redesign`, `Sentry mode`, `v3 deferred`,
 //! `architecture-redesign`) must not creep back into source comments. The

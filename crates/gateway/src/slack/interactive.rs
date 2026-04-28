@@ -3,7 +3,7 @@
 //!
 //! Interactive payloads arrive as `application/x-www-form-urlencoded` POSTs
 //! with a single `payload` field whose value is a JSON-encoded
-//! [`InteractionPayload`](super::types::InteractionPayload). Slack requires
+//! `InteractionPayload` (see `super::types`). Slack requires
 //! the receiver to respond within 3 seconds, with one of:
 //!
 //! - empty body (the default ack — closes modals, dismisses dialogs)
@@ -15,7 +15,7 @@
 //! be deferred via `response_url` (for messages) or `views.update` (for modal
 //! follow-ups).
 //!
-//! This module produces [`InteractiveOutcome`] which the HTTP layer translates
+//! This module produces `InteractiveOutcome` which the HTTP layer translates
 //! into the synchronous ack while forwarding the asynchronous part into the
 //! agent pipeline.
 

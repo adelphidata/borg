@@ -38,7 +38,7 @@ pub enum PreFlightDecision {
 }
 
 /// Reset cadence for a budget. Stored as a string in
-/// `budgets.reset_period`; parsed via [`Self::from_db`].
+/// `budgets.reset_period`; parsed via `Self::from_db`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetPeriod {
     /// 24-hour rolling window from `current_period_start`.

@@ -374,6 +374,7 @@ pub fn mint_pairing_code() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use crate::pki_grpc::PAIRING_INTENT;
@@ -403,7 +404,7 @@ mod tests {
         for _ in 0..50 {
             let code = mint_pairing_code();
             // Length 9 ("XXXX-XXXX"), dash at index 4.
-            assert_eq!(code.len(), 9, "code len: {}", code);
+            assert_eq!(code.len(), 9, "code len: {code}");
             assert_eq!(code.chars().nth(4), Some('-'));
             let alphabet: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
             for (i, c) in code.chars().enumerate() {
@@ -412,9 +413,7 @@ mod tests {
                 }
                 assert!(
                     alphabet.contains(&(c as u8)),
-                    "code {} contains illegal char {}",
-                    code,
-                    c
+                    "code {code} contains illegal char {c}"
                 );
             }
         }

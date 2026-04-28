@@ -4,7 +4,7 @@
 //! 1. A row into `posture_snapshots` (denormalized index, fast head lookup
 //!    for `GetPosture` / `/evolution`).
 //! 2. A `security_posture_changed` row into `audit_log_chain` carrying
-//!    the full [`PostureSnapshot`] JSON (forensic tamper-evident record).
+//!    the full `PostureSnapshot` JSON (forensic tamper-evident record).
 //!
 //! Rate limit: **2 transitions per hour**. Excess writes are dropped — the
 //! prior posture continues for any `xp_gain` written in the dropped

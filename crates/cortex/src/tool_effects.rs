@@ -6,10 +6,10 @@
 //! statically reason about falls back to a singleton group.
 //!
 //! The classifier recognizes three effect kinds:
-//! - [`ToolEffect::ReadOnly`] — does not mutate filesystem or agent state.
-//! - [`ToolEffect::Writes`] — mutates named filesystem paths (tracked so the
+//! - `ToolEffect::ReadOnly` — does not mutate filesystem or agent state.
+//! - `ToolEffect::Writes` — mutates named filesystem paths (tracked so the
 //!   planner can detect conflicts with concurrent writes to overlapping paths).
-//! - [`ToolEffect::Unknown`] — escapes static analysis (shell, browser, user
+//! - `ToolEffect::Unknown` — escapes static analysis (shell, browser, user
 //!   input, multi-agent, scheduling, generation). Always forces a sequential
 //!   boundary.
 //!
@@ -37,7 +37,7 @@ pub enum ToolEffect {
 /// Classify a tool call by its name and parsed arguments.
 ///
 /// The caller passes the arguments as a `serde_json::Value`. Unparseable args
-/// yield [`ToolEffect::Unknown`] from the planner via an earlier gate; this
+/// yield `ToolEffect::Unknown` from the planner via an earlier gate; this
 /// function assumes `args` has already deserialized cleanly.
 pub fn classify(name: &str, args: &Value) -> ToolEffect {
     match name {

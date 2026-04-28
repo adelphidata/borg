@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 //! End-to-end test: pairing → audit chain → revocation.
 //!
 //! Covers:
@@ -48,7 +49,7 @@ async fn wait_for_socket(p: &std::path::Path) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("socket {:?} did not appear", p);
+    panic!("socket {p:?} did not appear");
 }
 
 #[tokio::test]
@@ -87,13 +88,11 @@ async fn full_pair_then_revoke_then_audit_verify_round_trip() {
     let kinds: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
     assert!(
         kinds.contains(&audit_events::CERT_ISSUED),
-        "kinds: {:?}",
-        kinds
+        "kinds: {kinds:?}"
     );
     assert!(
         kinds.contains(&audit_events::PAIRING_APPROVED),
-        "kinds: {:?}",
-        kinds
+        "kinds: {kinds:?}"
     );
 
     // 2. paired_devices row exists.

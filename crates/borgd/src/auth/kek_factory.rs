@@ -132,6 +132,11 @@ fn persist_resolved_backend(db: &Database, backend: KekBackend) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::redundant_closure_for_method_calls
+)]
 mod tests {
     use super::*;
     use cortex::config::Config;

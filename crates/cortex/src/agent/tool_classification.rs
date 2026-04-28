@@ -27,7 +27,7 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
     )
 }
 
-/// Names of every tool that [`is_mutating_tool`] considers mutating.
+/// Names of every tool that `is_mutating_tool` considers mutating.
 ///
 /// Kept in sync with that function so callers (e.g. sub-agent delegation in
 /// Plan mode) can union this list into a child's tool blocklist without

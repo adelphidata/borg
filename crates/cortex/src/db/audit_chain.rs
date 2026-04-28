@@ -238,7 +238,7 @@ impl Database {
 
     /// Tombstone every `audit_log_chain` row whose `ts < cutoff` and which
     /// is not already tombstoned. Returns the count tombstoned. Each row
-    /// is tombstoned in its own transaction (see [`tombstone_audit_event`])
+    /// is tombstoned in its own transaction (see `tombstone_audit_event`)
     /// so a partial failure leaves the chain in a verifiable state.
     ///
     /// This is the daemon-side helper used by the daily retention sweep.

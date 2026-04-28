@@ -653,7 +653,7 @@ impl App<'_> {
 }
 
 /// Render a daemon-side [`protocols::admin::HealReport`] as a system-message
-/// body. Mirrors the look of [`format_heal_summary`] but consumes the
+/// body. Mirrors the look of `format_heal_summary` but consumes the
 /// gRPC-friendly proto returned by `Admin.Heal` rather than the in-process
 /// MaintenanceReport.
 pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> String {

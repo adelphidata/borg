@@ -1,7 +1,7 @@
 //! Task-local gateway origin context.
 //!
 //! When the gateway handler invokes the agent to respond to an inbound
-//! message, it wraps the call in [`scope`] so tool handlers (notably
+//! message, it wraps the call in `scope` so tool handlers (notably
 //! `schedule`) can recover the originating channel, sender, and thread. This
 //! lets scheduled tasks created mid-conversation default to replying back to
 //! the same thread they were spawned from (`delivery_channel = "origin"`).
