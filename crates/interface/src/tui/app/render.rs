@@ -1,8 +1,10 @@
 use ratatui::layout::Rect;
+use ratatui::layout::Size;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
-use ratatui::Frame;
+use ratatui::widgets::{Clear, Paragraph, Wrap};
+
+use super::super::custom_terminal::Frame;
 use throbber_widgets_tui::{Throbber, BRAILLE_EIGHT};
 use unicode_width::UnicodeWidthStr;
 
@@ -48,7 +50,11 @@ use super::{App, AppState, BacktrackPhase};
 use cortex::config::CollaborationMode;
 
 impl<'a> App<'a> {
-    pub fn render(&mut self, frame: &mut Frame) {
+    /// Render the inline viewport: only un-flushed cells (`[cells_emitted..]`)
+    /// plus chrome (status, composer, popups, footer, toasts). Cells already
+    /// emitted to scrollback via `insert_history_lines` are NEVER re-rendered
+    /// here — the terminal owns that history now.
+    pub fn render_viewport(&mut self, frame: &mut Frame) {
         let area = frame.area();
         let status_height = self.desired_status_height();
         let composer_height = self.composer.height();
@@ -56,7 +62,7 @@ impl<'a> App<'a> {
         let app_layout =
             layout::compute_layout(area, composer_height, status_height, queue_preview_height);
 
-        self.render_transcript(frame, app_layout.transcript);
+        self.render_pending_cells(frame, app_layout.transcript);
         if status_height > 0 {
             self.render_status(frame, app_layout.status);
         }
@@ -113,96 +119,40 @@ impl<'a> App<'a> {
         ((used as f64 / max as f64) * 100.0).min(100.0) as u8
     }
 
-    fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
-        self.transcript_area = area;
-        let width = area.width;
-        let mut all_lines: Vec<Line<'static>> = Vec::new();
+    /// Render only un-flushed cells (`[cells_emitted..]`) into the upper
+    /// transcript region. Cells `< cells_emitted` are already in terminal
+    /// scrollback (emitted via `insert_history_lines`) — the terminal owns
+    /// scrollback now, so nothing app-side scrolls them.
+    fn render_pending_cells(&mut self, frame: &mut Frame, area: Rect) {
+        self.last_viewport_width = area.width;
+        // Branded header is flushed exactly once into scrollback on the first
+        // frame, never rendered in the viewport itself.
+        self.flush_branded_header_once();
 
+        let width = area.width;
         let throbber_state = match &self.state {
             AppState::Streaming { .. } => Some(&self.throbber_state),
             _ => None,
         };
 
-        // Always show branded header — same component as `/card`.
-        let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
-        let ambient = if self.config.evolution.ambient_header_enabled {
-            self.ambient_status.as_ref()
-        } else {
-            None
-        };
-        all_lines.extend(build_borg_card_lines(name, &self.config.llm.model, ambient));
-        all_lines.push(Line::default());
-
-        for (i, cell) in self.cells.iter().enumerate() {
-            if i > 0 && !cell.is_stream_continuation() {
-                let prev = &self.cells[i - 1];
-                // Adjacent tool-flow cells (e.g. ToolResult → ToolStart for
-                // back-to-back command runs) hug each other; everywhere else
-                // a single unstyled blank separates blocks.
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let start = self.cells_emitted.min(self.cells.len());
+        for (offset, cell) in self.cells[start..].iter().enumerate() {
+            // Skip the inter-cell separator on the very first cell of this
+            // render pass — there's nothing above it in the viewport, even
+            // if there are flushed cells in scrollback.
+            if offset > 0 && !cell.is_stream_continuation() {
+                let prev = &self.cells[start + offset - 1];
                 let hug = prev.is_tool_flow() && cell.is_tool_flow();
                 if !hug {
-                    all_lines.push(Line::default());
+                    lines.push(Line::default());
                 }
             }
-            all_lines.extend(cell.render(width, throbber_state));
+            lines.extend(cell.render(width, throbber_state));
         }
 
-        let paragraph = Paragraph::new(all_lines).wrap(Wrap { trim: false });
-        self.total_lines = paragraph.line_count(width);
-
-        let visible_height = area.height as usize;
-        let max_scroll = self.total_lines.saturating_sub(visible_height);
-        self.scroll_offset = self.scroll_offset.min(max_scroll);
-        let scroll_pos = max_scroll.saturating_sub(self.scroll_offset);
-
-        // Clamp to u16 for ratatui's scroll API
-        let scroll_pos_u16 = u16::try_from(scroll_pos).unwrap_or(u16::MAX);
-
-        let paragraph = paragraph.scroll((scroll_pos_u16, 0));
-
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
-
-        if self.total_lines > visible_height {
-            let mut scrollbar_state =
-                ScrollbarState::new(max_scroll).position(max_scroll - self.scroll_offset);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                area,
-                &mut scrollbar_state,
-            );
-        }
-
-        self.render_autoscroll_hint(frame, area);
-    }
-
-    /// Overlay a "press End to follow" hint at the bottom-right of the transcript
-    /// when streaming content is arriving while the user is scrolled up.
-    fn render_autoscroll_hint(&self, frame: &mut Frame, area: Rect) {
-        let show_hint = !self.auto_scroll
-            && self.scroll_offset > 0
-            && matches!(self.state, AppState::Streaming { .. });
-        if !show_hint || area.height == 0 {
-            return;
-        }
-        let hint = " ↓ new output — End to follow ";
-        let hint_width = hint.chars().count() as u16;
-        if hint_width + 1 >= area.width {
-            return;
-        }
-        let hint_area = Rect {
-            x: area.x + area.width.saturating_sub(hint_width + 1),
-            y: area.y + area.height - 1,
-            width: hint_width,
-            height: 1,
-        };
-        let hint_para = Paragraph::new(Line::from(Span::styled(
-            hint,
-            Style::default()
-                .fg(theme::CYAN)
-                .add_modifier(Modifier::REVERSED),
-        )));
-        frame.render_widget(Clear, hint_area);
-        frame.render_widget(hint_para, hint_area);
     }
 
     /// Render the live streaming row (throbber + phase header + elapsed +
@@ -717,6 +667,124 @@ impl<'a> App<'a> {
 
         frame.render_widget(Paragraph::new(lines), area);
     }
+
+    /// Compute the desired inline-viewport height. The viewport sits at the
+    /// bottom of the terminal and holds chrome (status, composer, queue
+    /// preview, footer) plus a bounded streaming-tail preview of in-flight
+    /// cells. Capped at the terminal height.
+    #[allow(dead_code)] // wired up in run_event_loop in commit 3
+    pub fn compute_viewport_height(&self, terminal_size: Size) -> u16 {
+        let composer = self.composer.height();
+        let status = self.desired_status_height();
+        let queue = self.compute_queue_preview_height();
+        let footer: u16 = 1;
+        let pending = self.cells.len().saturating_sub(self.cells_emitted) as u16;
+        let max_tail = terminal_size.height / 2;
+        let tail = pending.min(max_tail);
+        // Reserve at least 3 rows for the streaming tail so a freshly opened
+        // session shows the live response without zero-height clipping.
+        let tail = tail.max(3);
+        let total = composer
+            .saturating_add(status)
+            .saturating_add(queue)
+            .saturating_add(footer)
+            .saturating_add(tail);
+        total.min(terminal_size.height)
+    }
+
+    /// Render lines for a single cell at index `idx`, with the same
+    /// inter-cell separator policy used by `render_pending_cells`.
+    fn render_cell_lines(&self, idx: usize, width: u16) -> Vec<Line<'static>> {
+        let cell = &self.cells[idx];
+        let mut out: Vec<Line<'static>> = Vec::new();
+        if idx > 0 && !cell.is_stream_continuation() {
+            let prev = &self.cells[idx - 1];
+            let hug = prev.is_tool_flow() && cell.is_tool_flow();
+            if !hug {
+                out.push(Line::default());
+            }
+        }
+        out.extend(cell.render(width, None));
+        out
+    }
+
+    /// Append the borg branded header to `pending_scrollback` exactly once,
+    /// so it renders into terminal scrollback above the very first viewport
+    /// frame and is never re-drawn.
+    pub fn flush_branded_header_once(&mut self) {
+        if self.banner_emitted {
+            return;
+        }
+        let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
+        let ambient = if self.config.evolution.ambient_header_enabled {
+            self.ambient_status.as_ref()
+        } else {
+            None
+        };
+        let mut lines = build_borg_card_lines(name, &self.config.llm.model, ambient);
+        lines.push(Line::default());
+        self.pending_scrollback.extend(lines);
+        self.banner_emitted = true;
+    }
+
+    /// Walk newly-stable cells out of the live viewport and into
+    /// `pending_scrollback`. A cell is stable iff it can no longer be
+    /// mutated by an in-flight stream (see the predicate in
+    /// `inline-viewport-port.md` §"Stability predicate").
+    ///
+    /// The current cell at `cells.len() - 1` is always treated as the live
+    /// tail and never flushed here — `handle_event_turn_complete` is the one
+    /// site that finalizes the tail.
+    pub fn flush_stable_cells(&mut self, width: u16) {
+        let len = self.cells.len();
+        if len == 0 || self.cells_emitted >= len {
+            return;
+        }
+        // Walk forward from `cells_emitted`; stop on the first non-stable
+        // cell or on the live tail. The tail (last cell) is always reserved.
+        let mut stable_end = self.cells_emitted;
+        while stable_end < len.saturating_sub(1) {
+            if !self.is_cell_stable(stable_end) {
+                break;
+            }
+            stable_end += 1;
+        }
+        // Also check whether earlier cells whose predicate fails would block
+        // later stable cells: by construction we only emit a contiguous
+        // prefix, so once we stop we stop.
+        for idx in self.cells_emitted..stable_end {
+            let lines = self.render_cell_lines(idx, width);
+            self.pending_scrollback.extend(lines);
+        }
+        self.cells_emitted = stable_end;
+    }
+
+    /// True if the cell at `idx` is no longer subject to mutation by an
+    /// in-flight stream.
+    fn is_cell_stable(&self, idx: usize) -> bool {
+        use super::super::history::HistoryCell;
+        match &self.cells[idx] {
+            // Thinking placeholders accept further deltas.
+            HistoryCell::Thinking { .. } => false,
+            // An open ToolStart can still be mutated by a later ToolResult.
+            HistoryCell::ToolStart { completed, .. } => *completed,
+            // ToolStreaming is bound to its preceding open ToolStart and is
+            // removed when the matching ToolResult arrives. It is only safe
+            // to flush if every preceding ToolStart in the run has completed.
+            HistoryCell::ToolStreaming { .. } => self.cells[..idx].iter().all(|c| {
+                !matches!(
+                    c,
+                    HistoryCell::ToolStart {
+                        completed: false,
+                        ..
+                    }
+                )
+            }),
+            // Streaming Assistant cells (still receiving deltas) are not stable.
+            HistoryCell::Assistant { streaming, .. } => !*streaming,
+            _ => true,
+        }
+    }
 }
 
 /// Format the value portion of the `class:` line.
@@ -802,104 +870,6 @@ mod tests {
         use tokio::sync::Mutex;
         let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
         App::new(Config::default(), None, None, None, client)
-    }
-
-    /// Populate the transcript with enough cells so that `total_lines > area.height`,
-    /// making `max_scroll > 0` so `scroll_offset` isn't clamped to 0 on render.
-    fn with_scrollable_content(app: &mut App<'static>) {
-        for i in 0..40 {
-            app.cells.push(HistoryCell::User {
-                text: format!("user message {i}"),
-            });
-        }
-    }
-
-    fn render_transcript_to_string(app: &mut App<'static>, w: u16, h: u16) -> String {
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = Rect::new(0, 0, w, h);
-                app.render_transcript(frame, area);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let mut out = String::new();
-        for y in 0..h {
-            for x in 0..w {
-                out.push_str(buffer[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    const HINT_SUBSTR: &str = "End to follow";
-
-    #[test]
-    fn paused_indicator_visible_while_streaming_and_scrolled_up() {
-        let mut app = make_app();
-        with_scrollable_content(&mut app);
-        app.state = AppState::Streaming {
-            start: Instant::now(),
-        };
-        app.auto_scroll = false;
-        app.scroll_offset = 5;
-
-        let rendered = render_transcript_to_string(&mut app, 80, 20);
-        assert!(
-            rendered.contains(HINT_SUBSTR),
-            "expected hint '{HINT_SUBSTR}' in transcript, got:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn paused_indicator_hidden_when_autoscroll_enabled() {
-        let mut app = make_app();
-        with_scrollable_content(&mut app);
-        app.state = AppState::Streaming {
-            start: Instant::now(),
-        };
-        app.auto_scroll = true;
-        app.scroll_offset = 5;
-
-        let rendered = render_transcript_to_string(&mut app, 80, 20);
-        assert!(
-            !rendered.contains(HINT_SUBSTR),
-            "hint must not appear when autoscroll is enabled"
-        );
-    }
-
-    #[test]
-    fn paused_indicator_hidden_when_not_streaming() {
-        let mut app = make_app();
-        with_scrollable_content(&mut app);
-        app.state = AppState::Idle;
-        app.auto_scroll = false;
-        app.scroll_offset = 5;
-
-        let rendered = render_transcript_to_string(&mut app, 80, 20);
-        assert!(
-            !rendered.contains(HINT_SUBSTR),
-            "hint must not appear when idle (no streaming)"
-        );
-    }
-
-    #[test]
-    fn paused_indicator_hidden_when_at_bottom() {
-        let mut app = make_app();
-        with_scrollable_content(&mut app);
-        app.state = AppState::Streaming {
-            start: Instant::now(),
-        };
-        app.auto_scroll = false;
-        app.scroll_offset = 0;
-
-        let rendered = render_transcript_to_string(&mut app, 80, 20);
-        assert!(
-            !rendered.contains(HINT_SUBSTR),
-            "hint must not appear when already at bottom"
-        );
     }
 
     use super::super::AmbientStatus;
@@ -1013,19 +983,17 @@ mod tests {
         assert_eq!(app.desired_status_height(), 1);
     }
 
-    /// Render the status bar into a TestBackend and return each row as a string.
+    /// Render the status bar into a buffer and return each row as a string.
     fn render_status_rows(app: &App<'static>, w: u16, h: u16) -> Vec<String> {
-        let backend = TestBackend::new(w, h);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = Rect::new(0, 0, w, h);
-                app.render_status(frame, area);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
+        use ratatui::buffer::Buffer;
+        let area = Rect::new(0, 0, w, h);
+        let mut buffer = Buffer::empty(area);
+        {
+            let mut frame = super::super::super::custom_terminal::Frame::__test_new(&mut buffer);
+            app.render_status(&mut frame, area);
+        }
         (0..h)
-            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .map(|y| (0..w).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
     }
 

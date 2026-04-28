@@ -1,7 +1,7 @@
+use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
-use ratatui::Frame;
 
 use anyhow::Result;
 

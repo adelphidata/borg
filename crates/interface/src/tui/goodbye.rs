@@ -1,12 +1,11 @@
 use anyhow::Result;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Terminal;
 
 use super::theme;
+use super::tui_lifecycle::Tui;
 
 const FAREWELL: &[&str] = &[
     r"oooooooooooo       .o.       ooooooooo.   oooooooooooo oooooo   oooooo     oooo oooooooooooo ooooo        ooooo       ",
@@ -98,7 +97,7 @@ const MESSAGES: &[&[&str]] = &[
 
 const SUBTITLE: &str = "Borg Decommissioned";
 
-pub fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+pub fn render(tui: &mut Tui) -> Result<()> {
     let idx = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as usize % MESSAGES.len())
@@ -108,7 +107,10 @@ pub fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Res
     let style = Style::default().fg(theme::CYAN);
     let dim = Style::default().fg(theme::DIM_WHITE);
 
-    terminal.draw(|f| {
+    // Use the alt screen so the goodbye art covers any prior viewport state.
+    tui.enter_alt_screen()?;
+    let height = tui.terminal_size()?.height;
+    tui.draw(height, |f| {
         let area = f.area();
         f.render_widget(ratatui::widgets::Clear, area);
 

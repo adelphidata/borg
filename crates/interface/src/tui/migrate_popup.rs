@@ -1,9 +1,9 @@
+use super::custom_terminal::Frame;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use cortex::config::Config;
 use cortex::migrate::{self, MigrationCategories, MigrationPlan, MigrationSource, SourceData};

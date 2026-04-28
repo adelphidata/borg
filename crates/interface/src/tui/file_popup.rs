@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
+use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use super::theme;
 
@@ -259,8 +259,6 @@ pub(crate) fn resolve_path_fragment(fragment: &str, cwd: &Path) -> Option<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
 
     #[test]
     fn new_popup_is_not_visible() {
@@ -365,17 +363,16 @@ mod tests {
         popup.set_pending_query("anything");
         assert!(popup.waiting && popup.results.is_empty());
 
-        // Terminal tall enough to fit the popup above the composer.
-        let backend = TestBackend::new(40, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| {
-                let composer_area = Rect::new(0, 8, 40, 2);
-                popup.render(f, composer_area);
-            })
-            .unwrap();
+        // Render directly into a buffer so we can sample the rendered cells.
+        // The popup uses `composer_area` as its anchor and draws above it.
+        use ratatui::buffer::Buffer;
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = super::super::custom_terminal::Frame::__test_new(&mut buffer);
+        let composer_area = Rect::new(0, 8, 40, 2);
+        popup.render(&mut frame, composer_area);
+        drop(frame);
 
-        let buffer = terminal.backend().buffer().clone();
         let mut found = false;
         for y in 0..buffer.area().height {
             let mut row = String::new();

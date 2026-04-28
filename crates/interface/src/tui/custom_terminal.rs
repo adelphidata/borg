@@ -21,6 +21,8 @@ use ratatui::layout::Rect;
 use ratatui::layout::Size;
 use ratatui::style::Color;
 use ratatui::style::Modifier;
+use ratatui::widgets::StatefulWidget;
+use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 use unicode_width::UnicodeWidthStr;
 
@@ -93,6 +95,26 @@ impl Frame<'_> {
         widget.render_ref(area, self.buffer);
     }
 
+    /// Render a [`Widget`] to the current buffer (consumes the widget). Mirrors
+    /// `ratatui::Frame::render_widget` so existing TUI callers compile against
+    /// this `Frame` without rewrite.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
+        widget.render(area, self.buffer);
+    }
+
+    /// Render a [`StatefulWidget`] to the current buffer. Mirrors
+    /// `ratatui::Frame::render_stateful_widget`.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn render_stateful_widget<W: StatefulWidget>(
+        &mut self,
+        widget: W,
+        area: Rect,
+        state: &mut W::State,
+    ) {
+        widget.render(area, self.buffer, state);
+    }
+
     /// After drawing this frame, make the cursor visible and put it at the specified (x, y)
     /// coordinates. If this method is not called, the cursor will be hidden.
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
@@ -102,6 +124,18 @@ impl Frame<'_> {
     /// Gets the buffer that this `Frame` draws into as a mutable reference.
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
+    }
+
+    /// Test-only constructor that wraps an existing `Buffer`. The viewport
+    /// area is inferred from `buffer.area()`. Production code obtains a Frame
+    /// via `Terminal::get_frame` or `Terminal::draw`.
+    #[cfg(test)]
+    pub fn __test_new(buffer: &'_ mut Buffer) -> Frame<'_> {
+        Frame {
+            cursor_position: None,
+            viewport_area: buffer.area,
+            buffer,
+        }
     }
 }
 

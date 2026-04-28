@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use super::custom_terminal::Frame;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 use tokio::sync::Mutex;
 
 use cortex::config::Config;

@@ -1,11 +1,11 @@
 use std::time::Instant;
 
+use super::custom_terminal::Frame;
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
-use ratatui::Frame;
 use tui_textarea::TextArea;
 
 use super::paste_burst::PasteBurst;

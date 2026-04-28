@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use ratatui::layout::Rect;
+use ratatui::text::Line;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -423,20 +423,23 @@ pub struct App<'a> {
     pub settings_popup: SettingsPopup,
     pub model_popup: ModelPopup,
     pub plugins_popup: PluginsPopup,
-    /// Legacy alt-screen scroll offset. Inline-viewport mode delegates
-    /// scrollback to the terminal, so this is held only for compatibility
-    /// with render.rs/events.rs callers pending Track B's cleanup.
-    pub scroll_offset: usize,
-    /// Legacy total wrapped-line count. See `scroll_offset`.
-    pub total_lines: usize,
     /// Number of history cells already emitted to the scrollback above the
-    /// inline viewport. Tracks `cells.len()` after each `insert_before` flush.
-    #[allow(dead_code)] // consumed by Track A's insert_history pipeline
+    /// inline viewport. Cells `< cells_emitted` were rendered into terminal
+    /// scrollback via `insert_history_lines` and must never be re-rendered
+    /// in the viewport or mutated again.
     pub cells_emitted: usize,
-    /// Lines staged for the next `insert_before` flush into the terminal's
-    /// native scrollback when the viewport scrolls past its bottom edge.
-    #[allow(dead_code)] // consumed by Track A's insert_history pipeline
-    pub pending_scrollback: Vec<ratatui::text::Line<'static>>,
+    /// Lines staged for the next `insert_history_lines` flush into the
+    /// terminal's native scrollback. Drained by the event loop between
+    /// `App::render_viewport` and `Tui::draw`.
+    pub pending_scrollback: Vec<Line<'static>>,
+    /// True once the branded header has been pushed into `pending_scrollback`.
+    /// The header is flushed exactly once on the first frame; the viewport
+    /// itself never re-renders it.
+    pub banner_emitted: bool,
+    /// Width of the transcript region from the most recent `render_viewport`,
+    /// used by `flush_stable_cells` to wrap cells consistently with the
+    /// upcoming viewport draw.
+    pub last_viewport_width: u16,
     pub config: Config,
     pub event_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>>,
@@ -448,7 +451,6 @@ pub struct App<'a> {
     pub heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>>,
     pub poke_tx: Option<mpsc::Sender<()>>,
     pub cancel_token: Option<CancellationToken>,
-    auto_scroll: bool,
     /// Accumulated token usage for the current session
     pub session_prompt_tokens: u64,
     pub session_completion_tokens: u64,
@@ -477,7 +479,6 @@ pub struct App<'a> {
     pub throbber_state: ThrobberState,
     /// Live header/details surfaced in the status row while streaming.
     pub stream_status: StreamStatus,
-    transcript_area: Rect,
     /// Channel for sending steer messages to the agent mid-turn.
     pub steer_tx: Option<mpsc::UnboundedSender<String>>,
     /// Steers queued in UI, cleared when agent confirms receipt.
@@ -534,17 +535,16 @@ impl<'a> App<'a> {
             settings_popup: SettingsPopup::new(),
             model_popup: ModelPopup::new(),
             plugins_popup: PluginsPopup::new(),
-            scroll_offset: 0,
-            total_lines: 0,
             cells_emitted: 0,
             pending_scrollback: Vec::new(),
+            banner_emitted: false,
+            last_viewport_width: 0,
             config,
             event_rx: None,
             heartbeat_rx,
             heartbeat_event_tx,
             poke_tx,
             cancel_token: None,
-            auto_scroll: true,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
             queued_messages: VecDeque::new(),
@@ -563,7 +563,6 @@ impl<'a> App<'a> {
             file_search,
             throbber_state: ThrobberState::default(),
             stream_status: StreamStatus::default(),
-            transcript_area: Rect::default(),
             steer_tx: None,
             pending_steers: VecDeque::new(),
             plan_steps: Vec::new(),
@@ -850,11 +849,6 @@ impl<'a> App<'a> {
             }
         }
 
-        // New user turn: force-jump to bottom and re-engage follow mode
-        // so streamed output is always visible even if the user was scrolled up.
-        self.scroll_offset = 0;
-        self.auto_scroll = true;
-
         // Separator between turns
         if !self.cells.is_empty() {
             self.cells.push(HistoryCell::Separator);
@@ -896,7 +890,6 @@ impl<'a> App<'a> {
         self.cancel_token = Some(cancel.clone());
 
         self.enter_streaming();
-        self.auto_scroll = true;
 
         Ok(AppAction::SendMessage {
             input: final_input,
@@ -915,10 +908,6 @@ impl<'a> App<'a> {
     /// The user message was already shown in the transcript when it was queued,
     /// so we skip the User cell push and only add Separator + Assistant cell.
     pub fn handle_queued_submit(&mut self, qm: QueuedMessage) -> Result<AppAction> {
-        // New user turn: force-jump to bottom so streamed output is visible.
-        self.scroll_offset = 0;
-        self.auto_scroll = true;
-
         // Add separator between turns (User cell was already shown when queued)
         if !self.cells.is_empty() {
             self.cells.push(HistoryCell::Separator);
@@ -944,7 +933,6 @@ impl<'a> App<'a> {
         self.cancel_token = Some(cancel.clone());
 
         self.enter_streaming();
-        self.auto_scroll = true;
 
         Ok(AppAction::SendMessage {
             input: final_input,
@@ -2142,10 +2130,10 @@ mod tests {
         let mut app = make_app();
         let _ = app.handle_submit("/status").unwrap();
         assert!(app.status_popup.is_visible());
-        // A random key should be consumed (not affect scroll_offset on app)
-        let initial_scroll = app.scroll_offset;
+        // A random key should be consumed by the popup, not the composer.
+        let initial_text = app.composer.text().to_string();
         app.handle_key(key(KeyCode::Char('a'))).unwrap();
-        assert_eq!(app.scroll_offset, initial_scroll);
+        assert_eq!(app.composer.text(), initial_text);
         assert!(app.status_popup.is_visible());
     }
 

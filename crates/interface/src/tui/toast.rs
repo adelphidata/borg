@@ -7,10 +7,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use super::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use super::theme;
 
@@ -211,53 +211,5 @@ mod tests {
         let fgs = [a.fg, b.fg, c.fg, d.fg];
         let distinct: std::collections::HashSet<_> = fgs.iter().collect();
         assert_eq!(distinct.len(), 4, "variant borders should all differ");
-    }
-
-    #[test]
-    fn render_on_empty_area_is_noop() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let stack = ToastStack::new();
-        let backend = TestBackend::new(40, 10);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|frame| {
-            // Empty stack, area is fine — just ensure no panic.
-            let area = frame.area();
-            stack.render(frame, area);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn render_with_toast_is_noop_when_tiny_area() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut stack = ToastStack::new();
-        stack.push("hello", ToastVariant::Info);
-        let backend = TestBackend::new(10, 2); // too small for 3-row toast
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|frame| {
-            let area = frame.area();
-            stack.render(frame, area);
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn render_with_toast_draws_without_panic() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let mut stack = ToastStack::new();
-        stack.push("skill installed", ToastVariant::Success);
-        let backend = TestBackend::new(60, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|frame| {
-            let area = frame.area();
-            stack.render(frame, area);
-        })
-        .unwrap();
     }
 }

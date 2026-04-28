@@ -390,10 +390,7 @@ fn split_host_and_port(host_port: &str) -> (&str, Option<&str>) {
     }
 
     if let Some((host, port)) = host_port.rsplit_once(':') {
-        if !host.is_empty()
-            && !port.is_empty()
-            && port.chars().all(|c| c.is_ascii_digit())
-        {
+        if !host.is_empty() && !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
             return (host, Some(port));
         }
     }

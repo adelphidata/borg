@@ -44,25 +44,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, EventStream};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use crossterm::ExecutableCommand;
+use crossterm::event::{Event, EventStream};
 
 // ============================================================================
 // IMPORTANT: Native text selection MUST work in this TUI. DO NOT regress.
 // ============================================================================
-// Users expect click+drag selection (for copy/paste) to work exactly like any
-// normal terminal, with no modifier keys required. Any form of mouse tracking
-// reported to the application breaks this, because the terminal hands click
-// events to us instead of engaging its own selection handler.
+// Click+drag selection (for copy/paste) must work exactly like any normal
+// terminal, with no modifier keys required. Any form of mouse tracking
+// reported to the application breaks this.
 //
-// Strategy: we enable ONLY xterm "Alternate Scroll Mode" (?1007h). In alt
-// screen, the terminal itself translates mouse-wheel events into CUR_UP /
-// CUR_DOWN key sequences that arrive as normal KeyCode::Up / KeyCode::Down.
-// We never enable any mouse tracking mode, so click+drag text selection stays
-// handled entirely by the terminal — exactly like in `less`, `vim`, etc.
+// Strategy: inline-viewport mode delegates scrollback to the terminal. xterm
+// Alternate Scroll Mode (?1007h) is enabled ONLY when transitioning into an
+// alt-screen surface (via `tui_lifecycle::Tui::enter_alt_screen`). Trackpad/
+// wheel events scroll the terminal's scrollback natively when the inline
+// viewport is active. We never enable any mouse tracking mode, so click+drag
+// text selection stays handled entirely by the terminal.
 //
 // FORBIDDEN — DO NOT ADD any of these (each one will regress text selection):
 //   - ?1000h  Normal button tracking — clicks go to app, breaks selection.
@@ -71,53 +67,12 @@ use crossterm::ExecutableCommand;
 //   - ?1006h  SGR extended coordinates — only meaningful with the above.
 //   - crossterm::event::EnableMouseCapture — it turns on ?1000h + ?1002h + ?1003h + ?1006h.
 //
-// Wheel-sourced arrow keys are routed to transcript scroll vs composer history
-// in App::handle_key using the existing scroll_offset state as disambiguator.
-//
-// This has regressed multiple times. Source-string guard tests in this module
-// and in app.rs will fail the build if any forbidden mode is reintroduced.
-// See CLAUDE.md "Mouse Interaction" for the full rationale.
-// Reference implementation:
+// Source-string guard tests below will fail the build if any forbidden mode
+// is reintroduced. See CLAUDE.md "Mouse Interaction" for the full rationale.
 // ============================================================================
 
-/// Enable xterm Alternate Scroll Mode (`?1007h`).
-///
-/// When active inside the alternate screen, the terminal translates
-/// mouse-wheel events into cursor-up / cursor-down key sequences. No mouse
-/// tracking is enabled, so native click+drag text selection is untouched.
-struct EnableAlternateScroll;
-
-impl crossterm::Command for EnableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        // ?1007h — xterm Alternate Scroll Mode. DO NOT add any other mode here.
-        f.write_str("\x1b[?1007h")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        // Windows consoles deliver wheel events through input records without
-        // needing an xterm-style mode switch, and there is no native equivalent
-        // to ?1007h. No-op is correct here.
-        Ok(())
-    }
-}
-
-/// Disable xterm Alternate Scroll Mode (`?1007l`).
-struct DisableAlternateScroll;
-
-impl crossterm::Command for DisableAlternateScroll {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str("\x1b[?1007l")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
@@ -247,14 +202,15 @@ async fn restart_gateway(gateway_shutdown: &Arc<Mutex<CancellationToken>>) -> St
 }
 
 /// Guard that restores terminal state on drop (both normal exit and early error return).
+///
+/// Inline-viewport mode never enters the alternate screen at startup, so the
+/// guard only needs to pop input modes (raw mode, bracketed paste, focus) —
+/// hence `restore_keep_raw`-style cleanup mirroring `tui_lifecycle::restore`.
 struct TerminalGuard;
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = stdout().execute(DisableBracketedPaste);
-        let _ = stdout().execute(DisableAlternateScroll);
-        let _ = disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = tui_lifecycle::restore();
     }
 }
 
@@ -373,10 +329,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // don't respond to the query inside alternate screen).
     colors::query_terminal_bg();
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    stdout().execute(EnableAlternateScroll)?;
-    stdout().execute(EnableBracketedPaste)?;
+    tui_lifecycle::set_modes()?;
 
     // Guard ensures terminal is restored on any exit path (error or normal)
     let _guard = TerminalGuard;
@@ -384,15 +337,13 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     // Install panic hook that restores terminal before printing panic
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
-        let _ = stdout().execute(DisableBracketedPaste);
-        let _ = stdout().execute(DisableAlternateScroll);
-        let _ = disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
+        let _ = tui_lifecycle::restore();
         original_hook(info);
     }));
 
     let backend = CrosstermBackend::new(stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let custom_terminal = custom_terminal::Terminal::with_options(backend)?;
+    let mut tui = tui_lifecycle::Tui::new(custom_terminal)?;
 
     let app_client = Arc::new(Mutex::new(client.clone()));
     let mut app = App::new(
@@ -443,7 +394,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let tick_rate = Duration::from_millis(100);
 
     run_event_loop(
-        &mut terminal,
+        &mut tui,
         &mut app,
         &mut client,
         &session_id,
@@ -589,6 +540,18 @@ fn format_install_outcome(result: &cortex::update::UpdateResult) -> String {
     }
 }
 
+/// Drain `app.pending_scrollback` into the terminal's native scrollback above
+/// the inline viewport, then redraw the viewport at the height computed from
+/// the current app state. Single source of truth for rendering — every call
+/// site in the event loop goes through here.
+fn draw_viewport(tui: &mut tui_lifecycle::Tui, app: &mut App<'_>) -> Result<()> {
+    let pending = std::mem::take(&mut app.pending_scrollback);
+    tui.insert_history_lines(pending);
+    let viewport_height = app.compute_viewport_height(tui.terminal_size()?);
+    tui.draw(viewport_height, |frame| app.render_viewport(frame))?;
+    Ok(())
+}
+
 /// Format an integer with comma thousands separators (e.g. `3999` → `"3,999"`).
 /// Used by the `/usage` display so large token counts are scannable.
 fn fmt_commas(n: u64) -> String {
@@ -606,7 +569,7 @@ fn fmt_commas(n: u64) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    tui: &mut tui_lifecycle::Tui,
     app: &mut App<'_>,
     client: &mut DaemonClient,
     session_id: &str,
@@ -618,7 +581,7 @@ async fn run_event_loop(
     let mut tick_interval = tokio::time::interval(tick_rate);
 
     loop {
-        terminal.draw(|frame| app.render(frame))?;
+        draw_viewport(tui, app)?;
 
         let action = tokio::select! {
             biased;
@@ -704,13 +667,13 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(Event::Key(key))) => app.handle_key(key)?,
                     Some(Ok(Event::Paste(text))) => app.handle_paste(text),
-                    // Intentionally NO `Event::Mouse` arm. We do not enable any
-                    // mouse tracking mode (see EnableAlternateScroll above), so
-                    // no mouse events should ever arrive here. Wheel events are
-                    // delivered as Up/Down key events via xterm ?1007h and are
-                    // handled in App::handle_key. DO NOT re-introduce a mouse
-                    // handler — it would require enabling ?1000h/?1002h/?1003h,
-                    // all of which break native text selection.
+                    // Intentionally NO `Event::Mouse` arm. We never enable
+                    // any mouse tracking mode (see `tui_lifecycle::set_modes`),
+                    // so no mouse events arrive. Inline-viewport mode delegates
+                    // scrollback to the terminal; alt-screen surfaces enable
+                    // xterm ?1007h so wheel events arrive as Up/Down keys.
+                    // DO NOT re-introduce a mouse handler — it would require
+                    // ?1000h/?1002h/?1003h, all of which break text selection.
                     Some(Ok(Event::Resize(_, _))) => AppAction::Continue,
                     Some(Err(_)) | None => AppAction::Quit,
                     _ => AppAction::Continue,
@@ -1015,16 +978,17 @@ async fn run_event_loop(
             }
             AppAction::LaunchExternalEditor => {
                 let current_text = app.composer.text();
-                // Leave alternate screen and disable raw mode for editor
-                let _ = disable_raw_mode();
-                let _ = stdout().execute(LeaveAlternateScreen);
+                // Inline-viewport mode: the external editor takes the full
+                // screen below the viewport naturally — no alt-screen bounce
+                // needed. Pop input modes so the editor sees a normal TTY,
+                // then re-arm them when control returns.
+                let _ = tui_lifecycle::restore();
 
                 let result = external_editor::open_external_editor(&current_text);
 
-                // Restore terminal
-                let _ = enable_raw_mode();
-                let _ = stdout().execute(EnterAlternateScreen);
-                terminal.clear()?;
+                let _ = tui_lifecycle::set_modes();
+                // Force a full repaint after the editor's screen output.
+                tui.terminal.invalidate_viewport();
 
                 match result {
                     Ok(text) => {
@@ -1553,7 +1517,7 @@ async fn run_event_loop(
                         ""
                     }
                 ));
-                terminal.draw(|f| app.render(f))?;
+                draw_viewport(tui, app)?;
                 if check {
                     match cortex::update::fetch_latest_release(prerelease).await {
                         Ok(release) => {
@@ -1582,7 +1546,7 @@ async fn run_event_loop(
             AppAction::Uninstall => {
                 // Step 1: Uninstall daemon service + kill any lingering borg processes
                 app.push_system_message("Stopping daemon...".to_string());
-                terminal.draw(|f| app.render(f))?;
+                draw_viewport(tui, app)?;
                 if let Err(e) = crate::borgd_launcher::uninstall_service() {
                     tracing::debug!("Service uninstall skipped: {e}");
                 }
@@ -1606,18 +1570,18 @@ async fn run_event_loop(
 
                 // Step 3: Data directory
                 app.push_system_message("Removing data directory (~/.borg/)...".to_string());
-                terminal.draw(|f| app.render(f))?;
+                draw_viewport(tui, app)?;
                 if let Ok(data_dir) = cortex::config::Config::data_dir() {
                     if let Err(e) = std::fs::remove_dir_all(&data_dir) {
                         tracing::warn!("Failed to remove data dir: {e}");
                         app.push_system_message(format!("Warning: failed to remove data dir: {e}"));
-                        terminal.draw(|f| app.render(f))?;
+                        draw_viewport(tui, app)?;
                     }
                 }
 
                 // Step 4: Binary
                 app.push_system_message("Removing binary...".to_string());
-                terminal.draw(|f| app.render(f))?;
+                draw_viewport(tui, app)?;
                 if let Ok(exe) = std::env::current_exe() {
                     let exe = exe.canonicalize().unwrap_or(exe);
                     if let Err(e) = std::fs::remove_file(&exe) {
@@ -1626,7 +1590,7 @@ async fn run_event_loop(
                 }
 
                 // Fullscreen ASCII art goodbye
-                goodbye::render(terminal)?;
+                goodbye::render(tui)?;
                 tokio::time::sleep(Duration::from_secs(3)).await;
 
                 // Final sweep: delete data dir again in case a background task
@@ -1921,62 +1885,10 @@ mod tests {
         assert!(should_fire_session_start_greeting(&config));
     }
 
-    #[test]
-    fn enable_alternate_scroll_emits_exactly_1007h() {
-        let mut buf = String::new();
-        EnableAlternateScroll.write_ansi(&mut buf).unwrap();
-        assert_eq!(
-            buf, "\x1b[?1007h",
-            "EnableAlternateScroll must emit exactly ?1007h (xterm Alternate \
-             Scroll Mode). Anything else risks breaking text selection."
-        );
-    }
-
-    #[test]
-    fn disable_alternate_scroll_emits_exactly_1007l() {
-        let mut buf = String::new();
-        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
-        assert_eq!(buf, "\x1b[?1007l");
-    }
-
-    #[test]
-    fn enable_alternate_scroll_contains_no_forbidden_modes() {
-        let mut buf = String::new();
-        EnableAlternateScroll.write_ansi(&mut buf).unwrap();
-        for mode in FORBIDDEN_MODES {
-            assert!(
-                !buf.contains(mode),
-                "EnableAlternateScroll must NOT emit {mode} — it breaks native text selection"
-            );
-        }
-    }
-
-    #[test]
-    fn disable_alternate_scroll_contains_no_forbidden_modes() {
-        let mut buf = String::new();
-        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
-        for mode in FORBIDDEN_MODES {
-            assert!(
-                !buf.contains(mode),
-                "DisableAlternateScroll must NOT reference {mode}"
-            );
-        }
-    }
-
-    #[test]
-    fn enable_and_disable_are_symmetric() {
-        let mut enable = String::new();
-        let mut disable = String::new();
-        EnableAlternateScroll.write_ansi(&mut enable).unwrap();
-        DisableAlternateScroll.write_ansi(&mut disable).unwrap();
-        // Strip the trailing `h`/`l` and compare — catches someone changing
-        // one side without the other.
-        assert_eq!(
-            enable.trim_end_matches('h'),
-            disable.trim_end_matches('l'),
-            "enable/disable sequences must target the same mode"
-        );
-    }
+    // The EnableAlternateScroll/DisableAlternateScroll command escape tests
+    // moved to `tui_lifecycle.rs` along with the structs themselves. The
+    // source-level forbidden-mode guards below cover the same invariants
+    // for this module.
 
     // ------------------------------------------------------------------------
     // Source-level guards — read this file and app.rs via include_str! and
@@ -2123,18 +2035,70 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // Lifecycle — dropping TerminalGuard must emit the disable sequence.
+    // Inline-viewport guards — Track B refactor.
     // ------------------------------------------------------------------------
 
     #[test]
-    fn disable_alternate_scroll_command_can_be_written_to_buffer() {
-        // Smoke test that the Command impl is still usable by crossterm.
-        // (TerminalGuard::drop writes to stdout which isn't capturable here;
-        // we verify the Command encoding instead, which is the only state
-        // the guard's drop reaches through.)
-        let mut buf = String::new();
-        DisableAlternateScroll.write_ansi(&mut buf).unwrap();
-        assert!(buf.ends_with('l'));
-        assert!(buf.contains("?1007"));
+    fn render_rs_does_not_import_scrollbar() {
+        let src = include_str!("app/render.rs");
+        assert!(
+            !src.contains("Scrollbar"),
+            "Scrollbar widget removed in inline-viewport refactor — terminal owns scrolling now"
+        );
+    }
+
+    #[test]
+    fn app_struct_has_no_scroll_offset() {
+        let src = include_str!("app/mod.rs");
+        let struct_section = src.split("pub struct App").nth(1).unwrap();
+        let struct_body = struct_section.split('}').next().unwrap();
+        assert!(
+            !struct_body.contains("scroll_offset"),
+            "scroll_offset field removed in inline-viewport refactor"
+        );
+        assert!(
+            !struct_body.contains("auto_scroll"),
+            "auto_scroll field removed in inline-viewport refactor"
+        );
+        assert!(
+            !struct_body.contains("transcript_area"),
+            "transcript_area field removed in inline-viewport refactor"
+        );
+    }
+
+    #[test]
+    fn tui_lifecycle_set_modes_does_not_enter_alt_screen() {
+        // set_modes is the canonical entry-mode setter for inline-viewport
+        // mode. It must NOT enter the alternate screen at startup — that
+        // would defeat the purpose of inline-viewport (the terminal must own
+        // scrollback, which only works in the main screen). Alt-screen entry
+        // is a per-popup action via `Tui::enter_alt_screen`.
+        let src = include_str!("tui_lifecycle.rs");
+        let needle = "pub fn set_modes()";
+        let start = src.find(needle).expect("set_modes not found");
+        let body_start = src[start..].find('{').expect("set_modes body") + start;
+        // Find the matching closing brace (depth tracking).
+        let bytes = src.as_bytes();
+        let mut depth: i32 = 0;
+        let mut end = body_start;
+        for (i, b) in bytes.iter().enumerate().skip(body_start) {
+            match *b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &src[body_start..=end];
+        assert!(
+            !body.contains("EnterAlternateScreen"),
+            "tui_lifecycle::set_modes must NOT enter the alternate screen — \
+             inline-viewport mode requires the main screen to own scrollback"
+        );
     }
 }

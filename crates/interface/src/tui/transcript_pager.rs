@@ -12,12 +12,12 @@
 //! terminal translates into Up/Down arrow keys (handled here as scroll input).
 //! See `crates/cli/src/tui/mod.rs` for the source-level guard tests.
 
+use super::custom_terminal::Frame;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use super::history::HistoryCell;
 use super::theme;

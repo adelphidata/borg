@@ -9,13 +9,34 @@ use heartbeat::scheduler::{HeartbeatEvent, HeartbeatResult, SkipReason};
 use super::super::history::{ApprovalStatus, HistoryCell};
 use super::{App, AppState, BtwResult, DoctorEvent};
 
+/// Default viewport width used by [`App::flush_after_event`] before the first
+/// frame has rendered (and `last_viewport_width` is still 0).
+const DEFAULT_FLUSH_WIDTH: u16 = 80;
+
 impl<'a> App<'a> {
     pub fn push_system_message(&mut self, text: String) {
         self.cells.push(HistoryCell::System { text });
     }
 
+    /// Flush newly-stable cells to the pending scrollback buffer using the
+    /// last-known viewport width (cached in `render_viewport`). Falls back to
+    /// `DEFAULT_FLUSH_WIDTH` before the first frame has rendered.
+    fn flush_after_event(&mut self) {
+        let width = if self.last_viewport_width > 0 {
+            self.last_viewport_width
+        } else {
+            DEFAULT_FLUSH_WIDTH
+        };
+        self.flush_stable_cells(width);
+    }
+
     /// Process a doctor event from the async diagnostics task.
     pub fn process_doctor_event(&mut self, event: DoctorEvent) {
+        self.process_doctor_event_inner(event);
+        self.flush_after_event();
+    }
+
+    fn process_doctor_event_inner(&mut self, event: DoctorEvent) {
         match event {
             DoctorEvent::Analyzing { label } => {
                 self.push_system_message(format!("⏳ Analyzing {label}..."));
@@ -28,10 +49,14 @@ impl<'a> App<'a> {
                     text.push('\n');
                 }
                 let result_text = text.trim_end().to_string();
-                // Find and replace the last Analyzing cell for this label
-                if let Some(pos) = self.cells.iter().rposition(|cell| {
+                // Find and replace the last Analyzing cell for this label.
+                // Bound the search to un-flushed cells: anything earlier is
+                // already in terminal scrollback and must not be mutated.
+                let search_start = self.cells_emitted;
+                if let Some(rel_pos) = self.cells[search_start..].iter().rposition(|cell| {
                     matches!(cell, HistoryCell::System { text } if text.contains(&format!("Analyzing {label}...")))
                 }) {
+                    let pos = search_start + rel_pos;
                     self.cells[pos] = HistoryCell::System { text: result_text };
                 } else {
                     self.push_system_message(result_text);
@@ -69,6 +94,11 @@ impl<'a> App<'a> {
     }
 
     pub fn process_agent_event(&mut self, event: AgentEvent) {
+        self.process_agent_event_inner(event);
+        self.flush_after_event();
+    }
+
+    fn process_agent_event_inner(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Preparing => self.handle_event_preparing(),
             AgentEvent::TextDelta(delta) => self.handle_event_text_delta(delta),
@@ -126,9 +156,6 @@ impl<'a> App<'a> {
         });
         self.stream_status.set_header("Preparing");
         self.stream_status.set_details(None);
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_event_text_delta(&mut self, delta: String) {
@@ -146,9 +173,6 @@ impl<'a> App<'a> {
         if self.stream_status.header != "Responding" {
             self.stream_status.set_header("Responding");
             self.stream_status.set_details(None);
-        }
-        if self.auto_scroll {
-            self.scroll_offset = 0;
         }
     }
 
@@ -194,9 +218,6 @@ impl<'a> App<'a> {
             self.stream_status.set_header("Thinking");
         }
         self.stream_status.set_details(Some(delta));
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_event_tool_executing(&mut self, name: String, args: String) {
@@ -218,16 +239,16 @@ impl<'a> App<'a> {
             completed: false,
             start_time: Some(Instant::now()),
         });
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_event_tool_result(&mut self, name: String, result: String) {
-        // Mark matching ToolStart as completed and compute duration + display label
+        // Mark matching ToolStart as completed and compute duration + display label.
+        // Bound the search to un-flushed cells — earlier ToolStarts are already
+        // in terminal scrollback as `completed: false` and cannot be mutated.
         let mut duration_ms = None;
         let mut matched_args = None;
-        for cell in self.cells.iter_mut().rev() {
+        let search_start = self.cells_emitted;
+        for cell in self.cells[search_start..].iter_mut().rev() {
             if let HistoryCell::ToolStart {
                 name: ref start_name,
                 args,
@@ -255,12 +276,13 @@ impl<'a> App<'a> {
         // The final ToolResult replaces the live-streaming preview for *this*
         // tool call only. Remove just the most recent ToolStreaming cell so a
         // second tool running concurrently doesn't have its preview wiped.
-        if let Some(idx) = self
-            .cells
+        // Bound the search to un-flushed cells.
+        let search_start = self.cells_emitted;
+        if let Some(rel_idx) = self.cells[search_start..]
             .iter()
             .rposition(|c| matches!(c, HistoryCell::ToolStreaming { .. }))
         {
-            self.cells.remove(idx);
+            self.cells.remove(search_start + rel_idx);
         }
         let is_error = result.starts_with("Error:");
         let line_count = result.lines().count();
@@ -278,9 +300,6 @@ impl<'a> App<'a> {
         // (thinking delta / text delta) decides the new header. If no further
         // event arrives before TurnComplete, "Working" is the honest label.
         self.stream_status.reset();
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
         // EvolutionHook ran alongside the tool result on the agent side;
         // the cached ambient-status header may now be stale (level, mood,
         // archetype, hint) — refresh off the updated DB state.
@@ -295,9 +314,6 @@ impl<'a> App<'a> {
         self.state = AppState::AwaitingApproval {
             respond: Some(respond),
         };
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_event_usage(&mut self, usage: cortex::llm::UsageData) {
@@ -311,17 +327,28 @@ impl<'a> App<'a> {
         self.pending_steers.clear();
         // Clean up any leftover empty thinking or assistant placeholders
         // (e.g. an Assistant cell whose text never arrived because the turn
-        // produced only a tool call).
-        self.cells.retain(|c| {
-            !matches!(c, HistoryCell::Thinking { text } if text.is_empty())
-                && !matches!(c, HistoryCell::Assistant { text, .. } if text.trim().is_empty())
-        });
-        for cell in self.cells.iter_mut().rev() {
+        // produced only a tool call). Only walk un-flushed cells — anything
+        // earlier is already in scrollback and must not be removed.
+        let split = self.cells_emitted.min(self.cells.len());
+        let tail: Vec<HistoryCell> = self.cells.split_off(split);
+        let kept_tail: Vec<HistoryCell> = tail
+            .into_iter()
+            .filter(|c| {
+                !matches!(c, HistoryCell::Thinking { text } if text.is_empty())
+                    && !matches!(c, HistoryCell::Assistant { text, .. } if text.trim().is_empty())
+            })
+            .collect();
+        self.cells.extend(kept_tail);
+        // Finalize any still-streaming Assistant cell in the un-flushed tail.
+        for cell in self.cells[split..].iter_mut().rev() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
                 break;
             }
         }
+        // Force the entire run into scrollback: at TurnComplete every cell
+        // is final, so flush them all on the next draw.
+        self.cells_emitted = self.cells.len();
         self.last_turn_errored = false;
         self.queue_pause_notified = false;
         if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
@@ -346,12 +373,16 @@ impl<'a> App<'a> {
                 cortex::error_format::ErrorContext::Tui,
             ),
         });
-        for cell in self.cells.iter_mut().rev() {
+        // Finalize any still-streaming Assistant cell in the un-flushed tail.
+        let split = self.cells_emitted.min(self.cells.len());
+        for cell in self.cells[split..].iter_mut().rev() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
                 break;
             }
         }
+        // Error finalizes the turn; flush everything to scrollback.
+        self.cells_emitted = self.cells.len();
         self.last_turn_errored = true;
         // If a transient Plan flow failed, roll back to the prior mode so the
         // user isn't left trapped with mutations blocked.
@@ -370,18 +401,17 @@ impl<'a> App<'a> {
 
     fn handle_event_plan_updated(&mut self, steps: Vec<cortex::types::PlanStep>) {
         self.plan_steps = steps.clone();
-        // Update existing Plan cell in-place, or insert a new one
-        let existing = self
-            .cells
+        // Update existing Plan cell in-place, or insert a new one. Bound the
+        // search to un-flushed cells so we never mutate scrollback content.
+        let search_start = self.cells_emitted;
+        let existing = self.cells[search_start..]
             .iter()
-            .rposition(|c| matches!(c, HistoryCell::Plan { .. }));
+            .rposition(|c| matches!(c, HistoryCell::Plan { .. }))
+            .map(|rel| search_start + rel);
         if let Some(idx) = existing {
             self.cells[idx] = HistoryCell::Plan { steps };
         } else {
             self.cells.push(HistoryCell::Plan { steps });
-        }
-        if self.auto_scroll {
-            self.scroll_offset = 0;
         }
     }
 
@@ -416,9 +446,6 @@ impl<'a> App<'a> {
             allow_custom,
             respond: Some(respond),
         };
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     fn handle_event_tool_output_delta(&mut self, delta: String, is_stderr: bool) {
@@ -462,15 +489,18 @@ impl<'a> App<'a> {
                 }
             }
         }
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        }
     }
 
     /// Handle the agent event channel closing (agent task finished or panicked).
     pub fn handle_agent_channel_closed(&mut self) {
+        self.handle_agent_channel_closed_inner();
+        self.flush_after_event();
+    }
+
+    fn handle_agent_channel_closed_inner(&mut self) {
         self.event_rx = None;
-        for cell in self.cells.iter_mut().rev() {
+        let split = self.cells_emitted.min(self.cells.len());
+        for cell in self.cells[split..].iter_mut().rev() {
             if let HistoryCell::Assistant { streaming, .. } = cell {
                 *streaming = false;
                 break;
@@ -492,6 +522,11 @@ impl<'a> App<'a> {
     }
 
     pub fn process_heartbeat(&mut self, event: HeartbeatEvent) {
+        self.process_heartbeat_inner(event);
+        self.flush_after_event();
+    }
+
+    fn process_heartbeat_inner(&mut self, event: HeartbeatEvent) {
         match event {
             HeartbeatEvent::Fire => {
                 // Fire events are handled by the TUI event loop (runs agent turn).
@@ -506,9 +541,6 @@ impl<'a> App<'a> {
             HeartbeatEvent::Result(result) => match result {
                 HeartbeatResult::Ran { message, .. } => {
                     self.cells.push(HistoryCell::Heartbeat { text: message });
-                    if self.auto_scroll {
-                        self.scroll_offset = 0;
-                    }
                 }
                 HeartbeatResult::Skipped { reason } => {
                     match &reason {

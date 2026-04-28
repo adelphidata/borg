@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use super::custom_terminal::Frame;
 use anyhow::Result;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 use tokio::sync::Mutex;
 
 use cortex::config::Config;

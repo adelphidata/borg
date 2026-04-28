@@ -2,13 +2,13 @@
 //! in-flight ephemeral side question. Dismissable with Esc; does not mutate
 //! `AppState`, so the main agent turn can keep streaming underneath.
 
+use super::custom_terminal::Frame;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use cortex::config::Config;
 

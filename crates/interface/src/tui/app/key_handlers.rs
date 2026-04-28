@@ -23,45 +23,11 @@ use super::{
 };
 
 impl<'a> App<'a> {
-    // ------------------------------------------------------------
-    // Scroll primitives — inert in inline-viewport mode.
-    //
-    // The terminal owns scrollback now (xterm Alternate Scroll Mode +
-    // `insert_before`), so the app no longer maintains a scroll model.
-    // These methods are kept as no-ops so existing callers in
-    // render.rs/events.rs still compile while Track B finishes its
-    // cleanup pass; once those are migrated the methods can be deleted
-    // outright.
-    // ------------------------------------------------------------
-
-    /// Inert: app-side scrolling is delegated to the terminal.
-    #[allow(dead_code)] // retained for symmetry with Ctrl+B/F/U/D callers
-    fn max_scroll(&self) -> usize {
-        0
-    }
-
-    /// Inert: viewport height is owned by the terminal.
-    fn viewport_height(&self) -> usize {
-        0
-    }
-
-    /// Half viewport height (ceiling), minimum 1.
-    fn half_viewport(&self) -> usize {
-        ((self.transcript_area.height as usize).saturating_add(1) / 2).max(1)
-    }
-
-    /// Inert no-op (see module comment).
-    fn scroll_up_by(&mut self, _lines: usize) {}
-
-    /// Inert no-op (see module comment).
-    fn scroll_down_by(&mut self, _lines: usize) {}
-
-    /// Inert no-op (see module comment).
-    #[allow(dead_code)] // End-key handler removed; kept for Track B parity
-    fn scroll_to_top(&mut self) {}
-
-    /// Inert no-op (see module comment).
-    fn scroll_to_bottom(&mut self) {}
+    // The terminal owns scrollback in inline-viewport mode (xterm Alternate
+    // Scroll Mode + `insert_history_lines`). The app no longer maintains a
+    // scroll model, so there are no scroll primitives here — wheel/trackpad
+    // events scroll the terminal natively, and Up/Down route to composer
+    // history.
 
     /// Enter backtrack-selection mode if there are any past user messages.
     /// Returns `true` when the mode was entered.
@@ -506,7 +472,6 @@ impl<'a> App<'a> {
                         .push_back(QueuedMessage { text, images });
                 }
                 self.composer.set_text("");
-                self.auto_scroll = true;
             }
         } else if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.toggle_last_collapsible();
@@ -586,7 +551,9 @@ impl<'a> App<'a> {
         // Ctrl+L — clear visual transcript
         if key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.cells.clear();
-            self.scroll_to_bottom();
+            self.cells_emitted = 0;
+            self.pending_scrollback.clear();
+            self.banner_emitted = false;
             self.toast_info("Transcript cleared");
             return Ok(AppAction::Continue);
         }
@@ -598,32 +565,9 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        // Ctrl+B / Ctrl+F — full-page scroll.
-        if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.scroll_up_by(self.viewport_height());
-            return Ok(AppAction::Continue);
-        }
-        if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.scroll_down_by(self.viewport_height());
-            return Ok(AppAction::Continue);
-        }
-
-        // Ctrl+U — half-page up.
-        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.scroll_up_by(self.half_viewport());
-            return Ok(AppAction::Continue);
-        }
-
-        // Ctrl+D — half-page down ONLY while scrolled up.
-        // When at bottom, fall through to the "quit when composer empty" handler
-        // below so the shell-style EOF shortcut is preserved.
-        if key.code == KeyCode::Char('d')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.scroll_offset > 0
-        {
-            self.scroll_down_by(self.half_viewport());
-            return Ok(AppAction::Continue);
-        }
+        // Ctrl+B / Ctrl+F / Ctrl+U intentionally fall through — the terminal
+        // owns scrollback in inline-viewport mode, so app-level page scrolls
+        // are no-ops. Trackpad/wheel scrolls the terminal pane natively.
 
         // Ctrl+D — quit when composer is empty (EOF)
         if key.code == KeyCode::Char('d')
@@ -748,7 +692,6 @@ impl<'a> App<'a> {
                     self.backtrack = BacktrackPhase::Inactive;
                     self.cells.truncate(cell_idx);
                     self.composer.set_text(&text);
-                    self.auto_scroll = true;
                     return Ok(Some(AppAction::RewindTo {
                         nth_user_message: nth,
                     }));
