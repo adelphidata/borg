@@ -9,17 +9,20 @@ Items uncovered by the 2026-04 pre-launch audit. Cleared items move out;
 unfinished items stay here so a future contributor can see what's left.
 
 - **Shell-policy bypass surface.** `crates/cortex/src/policy.rs` now
-  recovers escapes, backticks, and literal `$(cmd)` substitutions before
-  the deny recheck (commit `df6705a`). Substitutions whose value is
-  computed at runtime (`$(echo rm) -rf /`) still slip past — the policy
-  is documented best-effort and the sandbox is the real boundary, but a
-  future shell-words-based parser would close the residual gap.
+  recovers stacked backslash escapes, backticks (with recursive body
+  deobfuscation), and literal `$(cmd)` substitutions before the deny
+  recheck. Substitutions whose value is computed at runtime
+  (`$(echo rm) -rf /`) still slip past, and the deobfuscator is
+  quote-unaware, so a deny rule keying on later tokens could over-match
+  text inside `'...'`. The policy is documented best-effort and the
+  sandbox is the real boundary; a future `shell-words`-based parser
+  would close both gaps.
 - **TOCTOU on blocked-path checks.** `is_blocked_path()` resolves full
-  symlink chains via `canonicalize()`; a regression test pins the
-  behavior (commit `54fbc3b`). The window between check and open is
-  acknowledged in the threat model. A defense-in-depth pass using
-  `O_NOFOLLOW` on Linux opens or `/proc/self/fd` re-canonicalization
-  would close it; deferred until there's a credible exploit path.
+  symlink chains via `canonicalize()` and a regression test pins the
+  behavior. The window between check and open is acknowledged in the
+  threat model. A defense-in-depth pass using `O_NOFOLLOW` on Linux
+  opens or `/proc/self/fd` re-canonicalization would close it; deferred
+  until there's a credible exploit path.
 - **CI coverage gate.** CLAUDE.md targets 80%+ but `.github/workflows/`
   has no failing threshold. Add `cargo llvm-cov --fail-under-lines 80`
   once the daemon session executor and scheduler grow real coverage,

@@ -874,19 +874,23 @@ mod tests {
     }
 
     #[test]
-    fn claude_cli_provider_visible_in_onboarding() {
-        // Regression guard: CLAUDE.md and provider.rs both treat ClaudeCli as a
-        // first-class provider, but it was previously hidden from the wizard,
-        // so users with a Claude subscription couldn't pick it during onboarding.
-        // This pins the wiring so a future PROVIDERS rewrite can't drop it.
-        assert!(
-            PROVIDERS.iter().any(|(id, _, _)| *id == "claude-cli"),
-            "claude-cli must appear in onboarding PROVIDERS"
-        );
+    fn claude_cli_provider_wired_through_onboarding() {
+        // Real failure mode: the `match provider_id` in `models_for_provider`
+        // forgets a case for `claude-cli` and silently falls through to the
+        // OpenRouter list — the wizard would then offer Claude users a
+        // bunch of OpenRouter model IDs that won't resolve. The non-empty
+        // claude-cli list + the keyless requirement together exercise that
+        // dispatch arm and the Provider parsing.
         let models = models_for_provider("claude-cli");
         assert!(
             !models.is_empty(),
             "claude-cli must surface a non-empty model list"
+        );
+        let first_model = models[0].0.as_str();
+        assert_ne!(
+            first_model,
+            models_for_provider("openrouter")[0].0,
+            "claude-cli must not fall through to OpenRouter models"
         );
         let provider = Provider::from_str("claude-cli").expect("claude-cli parses");
         assert!(

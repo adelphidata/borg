@@ -55,28 +55,44 @@ const HARDCODED_DENY: &[&str] = &[
 /// Strip the simplest shell obfuscations so that `r\m`, `` `rm` ``, and
 /// `$(rm)` all normalize back to the literal verb the user wrote.
 ///
-/// **Scope:** unquoted backslash escapes outside string literals, paired
-/// backticks, and `$(...)` substitutions whose body is a literal command
-/// (not a pipeline whose output becomes the verb). This catches the
-/// trivially-obfuscated `r\m -rf /` and `` `rm` -rf / `` forms; it cannot
-/// defeat substitutions whose *value* is computed at runtime
-/// (`$(echo rm) -rf /`). That residual gap is by design — policy.rs is
-/// not a security boundary; the sandbox is.
+/// **Scope:** unquoted backslash escapes (dropped unconditionally —
+/// bash collapses `\rm`, `\\rm`, and `r\\m` all the way down to `rm`),
+/// paired backticks (body recursively deobfuscated), and `$(...)`
+/// substitutions whose body is a literal command. This catches the
+/// trivially-obfuscated `r\m -rf /`, `\\rm -rf /`, `` `r\m -rf /` ``,
+/// and `$(rm) -rf /` forms; it cannot defeat substitutions whose
+/// *value* is computed at runtime (`$(echo rm) -rf /`). That residual
+/// gap is by design — policy.rs is not a security boundary; the
+/// sandbox is. The function is also quote-unaware (single-quoted
+/// literals get rewritten alongside live syntax); that's fine for
+/// matching against a deny list keyed on first tokens.
 fn deobfuscate(command: &str) -> String {
     let mut out = String::with_capacity(command.len());
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\\' => {
-                if let Some(&next) = chars.peek() {
-                    if next != '\n' && next != '\r' {
-                        out.push(next);
-                        chars.next();
-                    }
-                }
-            }
+            // Drop backslashes unconditionally. Bash treats `\rm`,
+            // `r\m`, and `\\rm` all as `rm` once parsed, so leaving any
+            // of them in the output would let a determined caller
+            // outrun us by stacking escapes. We never preserve the
+            // following character — `\n` is rare in this path (a real
+            // newline trips the explicit-newline check in `check()`)
+            // and `\` before a token boundary collapses cleanly.
+            '\\' => {}
             '`' => {
-                // Drop bare backticks; the inner tokens stay inline.
+                // Recurse through the backtick body so escapes / nested
+                // substitutions inside `` `r\m` `` get collapsed too.
+                // Unterminated backticks are treated as if closed at
+                // EOF — defensible because the alternative (preserving
+                // the literal `` ` ``) is also a partial parse.
+                let mut body = String::new();
+                for inner in chars.by_ref() {
+                    if inner == '`' {
+                        break;
+                    }
+                    body.push(inner);
+                }
+                out.push_str(&deobfuscate(&body));
             }
             '$' if chars.peek() == Some(&'(') => {
                 chars.next(); // consume '('
@@ -510,6 +526,15 @@ mod tests {
         assert_eq!(deobfuscate("`rm` -rf /"), "rm -rf /");
         assert_eq!(deobfuscate("$(rm) -rf /"), "rm -rf /");
         assert_eq!(deobfuscate("$(echo rm) -rf /"), "echo rm -rf /");
+        // Stacked escapes — bash collapses these all the way to `rm`,
+        // so we must too. Without greedy backslash dropping, `\\rm`
+        // would leave a leading `\` and slip the deny match.
+        assert_eq!(deobfuscate(r"\rm -rf /"), "rm -rf /");
+        assert_eq!(deobfuscate(r"\\rm -rf /"), "rm -rf /");
+        assert_eq!(deobfuscate(r"r\\m -rf /"), "rm -rf /");
+        // Backtick body must also be deobfuscated, not just stripped.
+        assert_eq!(deobfuscate(r"`r\m` -rf /"), "rm -rf /");
+        assert_eq!(deobfuscate(r"`\rm` -rf /"), "rm -rf /");
         // Untouched: no obfuscation.
         assert_eq!(deobfuscate("git status"), "git status");
         // Nested $(): inner content surfaces.
@@ -525,6 +550,15 @@ mod tests {
         let policy = ExecutionPolicy::default();
         assert_eq!(policy.check(r"r\m -rf /"), PolicyDecision::Deny);
         assert_eq!(policy.check(r"r\m -rf ~"), PolicyDecision::Deny);
+        // Stacked-escape variants — bash still runs `rm`, so we must still
+        // deny. Caught a real bypass during code review where one-pass
+        // backslash handling left a residual `\` that defeated the match.
+        assert_eq!(policy.check(r"\rm -rf /"), PolicyDecision::Deny);
+        assert_eq!(policy.check(r"\\rm -rf /"), PolicyDecision::Deny);
+        assert_eq!(policy.check(r"r\\m -rf /"), PolicyDecision::Deny);
+        // Escape inside a backtick subshell — review caught that bare
+        // backticks were dropped without recursing into the body.
+        assert_eq!(policy.check(r"`r\m` -rf /"), PolicyDecision::Deny);
     }
 
     #[test]
