@@ -561,23 +561,44 @@ async fn is_onboarded_async() -> bool {
     // Fresh install: no DB → never onboarded. Skip the daemon round-trip
     // (which would otherwise spin up borgd and create the file) so the
     // wizard runs cleanly on a brand-new system.
-    if !data_dir.join("borg.db").exists() {
+    let db_path = data_dir.join("borg.db");
+    if !db_path.exists() {
         return false;
     }
-    let mut client = match daemon_client::connect(None).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("is_onboarded: daemon connect failed: {e}");
-            return false;
+    if let Ok(mut client) = daemon_client::connect(None).await {
+        if let Ok(state) = client.get_onboarding_state().await {
+            return state.onboarded;
         }
-    };
-    match client.get_onboarding_state().await {
-        Ok(state) => state.onboarded,
+    }
+    // Daemon unreachable (crash loop, never started, or just slow). Without
+    // this fallback every transient daemon outage re-prompts onboarding,
+    // which clobbers existing state. The sentinel is a single read of a
+    // boolean settings row — safe to do directly without migrations.
+    match read_onboarded_sentinel(&db_path) {
+        Ok(v) => v,
         Err(e) => {
-            tracing::warn!("is_onboarded: GetOnboardingState failed: {e}");
+            tracing::warn!("is_onboarded: direct DB read failed: {e}");
             false
         }
     }
+}
+
+/// Best-effort read of the `onboarded` settings row without running
+/// migrations or contending with the daemon's writer connection. Returns
+/// `false` if the table or row is missing (i.e. genuinely fresh install).
+fn read_onboarded_sentinel(db_path: &std::path::Path) -> anyhow::Result<bool> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'onboarded'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(matches!(value.as_deref(), Some("true")))
 }
 
 /// Sync wrapper used by `ensure_onboarded` (which is itself called from a

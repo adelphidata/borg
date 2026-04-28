@@ -344,6 +344,45 @@ fn atomic_write(path: &std::path::Path, content: &str) -> Result<()> {
 
 /// Build the .tmp path for a given file by appending ".tmp" to the full name.
 /// e.g. "config.toml" → "config.toml.tmp"
+/// Append (or replace) a `KEY=VALUE` line in `<data_dir>/.env`, then chmod
+/// the file to 0600. Used as the headless-VPS fallback when the OS keychain
+/// is unavailable for plugin credentials. Existing lines for the same key are
+/// rewritten in place rather than duplicated.
+fn append_env_file(data_dir: &std::path::Path, key: &str, value: &str) -> Result<()> {
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        bail!(
+            "env var name {key:?} must be alphanumeric/underscore for systemd EnvironmentFile compatibility"
+        );
+    }
+    let path = data_dir.join(".env");
+    let clean_value = value.trim().replace(['\n', '\r'], "");
+    let prefix = format!("{key}=");
+    let mut new_contents = String::new();
+    let mut replaced = false;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        for line in existing.lines() {
+            if line.starts_with(&prefix) {
+                new_contents.push_str(&format!("{key}={clean_value}\n"));
+                replaced = true;
+            } else {
+                new_contents.push_str(line);
+                new_contents.push('\n');
+            }
+        }
+    }
+    if !replaced {
+        new_contents.push_str(&format!("{key}={clean_value}\n"));
+    }
+    atomic_write(&path, &new_contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn tmp_path_for(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(".tmp");
@@ -552,34 +591,47 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
             };
 
             let service = def.service_name();
-            let mut stored_ok = true;
 
-            // Store credentials in keychain
+            // Try OS keychain first; on headless servers (no secret-service /
+            // dbus) it fails — fall back to a 0600 ~/.borg/.env file with an
+            // env-var SecretRef so the daemon still resolves the credential
+            // through systemd's `EnvironmentFile=`. Without this fallback the
+            // channel install was silently dropped on every Linux VPS.
             for (key, value) in credentials {
                 let account = format!("borg-{key}");
-                if let Err(e) = plugins::keychain::store(&service, &account, value) {
-                    eprintln!("  Warning: failed to store {key} in keychain: {e}");
-                    tracing::warn!("Keychain store failed for {key}: {e}");
-                    stored_ok = false;
+                match plugins::keychain::store(&service, &account, value) {
+                    Ok(()) => {
+                        cfg.credentials.insert(
+                            key.clone(),
+                            cortex::config::CredentialValue::Ref(
+                                cortex::secrets_resolve::SecretRef::Keychain {
+                                    service: service.clone(),
+                                    account,
+                                },
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Keychain store failed for {key}: {e}; falling back to .env"
+                        );
+                        eprintln!(
+                            "  · Keychain unavailable for {key}; storing in {}/.env",
+                            data_dir.display()
+                        );
+                        if let Err(e) = append_env_file(&data_dir, key, value) {
+                            eprintln!("  Warning: failed to write .env for {key}: {e}");
+                            tracing::warn!("append_env_file failed for {key}: {e}");
+                            continue;
+                        }
+                        cfg.credentials.insert(
+                            key.clone(),
+                            cortex::config::CredentialValue::Ref(
+                                cortex::secrets_resolve::SecretRef::Env { var: key.clone() },
+                            ),
+                        );
+                    }
                 }
-            }
-
-            if !stored_ok {
-                continue;
-            }
-
-            // Wire credential refs into shared config
-            for (key, _) in credentials {
-                let account = format!("borg-{key}");
-                cfg.credentials.insert(
-                    key.clone(),
-                    cortex::config::CredentialValue::Ref(
-                        cortex::secrets_resolve::SecretRef::Keychain {
-                            service: service.clone(),
-                            account,
-                        },
-                    ),
-                );
             }
 
             let channel_name = def.id.rsplit('/').next().unwrap_or(def.id);

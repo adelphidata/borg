@@ -68,6 +68,7 @@ Restart=on-failure
 RestartSec=5
 Environment=HOME={{HOME}}
 EnvironmentFile=-{{HOME}}/.borg/secrets/kek.env
+EnvironmentFile=-{{HOME}}/.borg/.env
 
 [Install]
 WantedBy=default.target
@@ -90,6 +91,7 @@ Restart=on-failure
 RestartSec=5
 Environment=HOME={{HOME}}
 EnvironmentFile=-{{HOME}}/.borg/secrets/kek.env
+EnvironmentFile=-{{HOME}}/.borg/.env
 
 [Install]
 WantedBy=multi-user.target
@@ -123,6 +125,7 @@ After=network.target
 Type=simple
 Environment=HOME={{HOME}}
 EnvironmentFile={{HOME}}/.borg/secrets/keyring.env
+EnvironmentFile=-{{HOME}}/.borg/.env
 ExecStart=/usr/bin/dbus-run-session -- /bin/sh -c 'test -n "$BORG_KEYRING_PASS" || { echo "BORG_KEYRING_PASS unset; refusing to unlock keyring with empty passphrase" >&2; exit 78; }; printf "%s" "$BORG_KEYRING_PASS" | gnome-keyring-daemon --foreground --components=secrets --unlock >/dev/null 2>&1 & exec {{BINARY_PATH}}'
 Restart=on-failure
 RestartSec=5
@@ -142,6 +145,7 @@ Type=simple
 User=root
 Environment=HOME={{HOME}}
 EnvironmentFile={{HOME}}/.borg/secrets/keyring.env
+EnvironmentFile=-{{HOME}}/.borg/.env
 ExecStart=/usr/bin/dbus-run-session -- /bin/sh -c 'test -n "$BORG_KEYRING_PASS" || { echo "BORG_KEYRING_PASS unset; refusing to unlock keyring with empty passphrase" >&2; exit 78; }; printf "%s" "$BORG_KEYRING_PASS" | gnome-keyring-daemon --foreground --components=secrets --unlock >/dev/null 2>&1 & exec {{BINARY_PATH}}'
 Restart=on-failure
 RestartSec=5

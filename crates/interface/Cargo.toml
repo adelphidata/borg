@@ -65,6 +65,7 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 qrcodegen = { workspace = true }
+rusqlite = { workspace = true }
 
 [features]
 # Exposes test-only constructors (e.g. `DaemonClient::lazy_for_tests`) outside
@@ -73,7 +74,6 @@ qrcodegen = { workspace = true }
 test-helpers = []
 
 [dev-dependencies]
-rusqlite = { workspace = true }
 wiremock = "0.5"
 async-trait = { workspace = true }
 
