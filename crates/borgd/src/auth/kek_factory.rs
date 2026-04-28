@@ -23,6 +23,12 @@ use identity::{FileKekStore, KekStore, KeychainStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Filename of the passphrase env file written under `<BORG_HOME>/secrets/`.
+/// Same path the systemd installer templates as `EnvironmentFile=`, so a
+/// passphrase auto-provisioned by `Auto` here is picked up by future
+/// systemd-managed restarts without a separate `borg service install` run.
+const KEK_ENV_FILE: &str = "kek.env";
+
 /// Account name used to probe the OS keychain. Distinct from the real
 /// CA / server-cert accounts so a half-broken keychain that read-only
 /// rejects some accounts but accepts others doesn't get a false positive.
@@ -67,7 +73,13 @@ pub fn build_kek_store(
                     posture will be Reduced; install gnome-keyring + dbus or \
                     run `borg service install --secure` to upgrade)"
                 );
-                let store = open_file_store(borg_home)?;
+                // Auto mode is the "always boots" guarantee. If the
+                // passphrase is missing we provision one rather than
+                // hard-fail — explicit `File` still hard-fails because
+                // a missing passphrase there means EnvironmentFile got
+                // lost, and silently rewriting it would invalidate the
+                // existing encrypted blob.
+                let store = open_file_store_auto(borg_home)?;
                 persist_resolved_backend(settings_db, KekBackend::File);
                 Ok(store)
             }
@@ -109,6 +121,95 @@ fn open_file_store(borg_home: &Path) -> Result<Arc<dyn KekStore>> {
     Ok(Arc::new(store))
 }
 
+/// File-store opener for the `Auto` fallback path. Differs from
+/// `open_file_store` in that a missing passphrase causes a fresh one to
+/// be generated and written to `<BORG_HOME>/secrets/kek.env` (0600)
+/// rather than hard-failing — this is what makes the "always boots"
+/// guarantee real on a host where neither systemd nor a prior installer
+/// has set up the env var. Reads from an existing kek.env if present.
+fn open_file_store_auto(borg_home: &Path) -> Result<Arc<dyn KekStore>> {
+    let passphrase = match std::env::var(PASSPHRASE_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => load_or_provision_passphrase(borg_home)?,
+    };
+    let path = kek_file_path(borg_home);
+    let store = FileKekStore::open(&path, passphrase.into_bytes())
+        .with_context(|| format!("open file KEK store at {}", path.display()))?;
+    Ok(Arc::new(store))
+}
+
+/// Read the passphrase from `<BORG_HOME>/secrets/kek.env` (parsing the
+/// systemd-style `BORG_KEK_PASSPHRASE=...` line) or generate a new one
+/// and write it. The env file is created at 0600 under a 0700 parent.
+fn load_or_provision_passphrase(borg_home: &Path) -> Result<String> {
+    let secrets_dir = borg_home.join("secrets");
+    let env_path = secrets_dir.join(KEK_ENV_FILE);
+    if let Ok(body) = std::fs::read_to_string(&env_path) {
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix(&format!("{PASSPHRASE_ENV}=")) {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    tracing::info!(
+                        "auto KEK fallback: loaded passphrase from {}",
+                        env_path.display()
+                    );
+                    return Ok(v.to_string());
+                }
+            }
+        }
+        tracing::warn!(
+            "auto KEK fallback: {} exists but does not declare {PASSPHRASE_ENV}; provisioning fresh",
+            env_path.display()
+        );
+    }
+    std::fs::create_dir_all(&secrets_dir)
+        .with_context(|| format!("create {}", secrets_dir.display()))?;
+    #[cfg(unix)]
+    set_unix_mode(&secrets_dir, 0o700)?;
+    let passphrase = generate_passphrase();
+    let body = format!("{PASSPHRASE_ENV}={passphrase}\n");
+    write_file_0600(&env_path, body.as_bytes())
+        .with_context(|| format!("write {}", env_path.display()))?;
+    tracing::warn!(
+        "auto KEK fallback: provisioned new passphrase at {} (0600). \
+        Back up this file — losing it will invalidate the encrypted KEK \
+        and require re-pairing devices.",
+        env_path.display()
+    );
+    Ok(passphrase)
+}
+
+fn generate_passphrase() -> String {
+    use base64::Engine;
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[cfg(unix)]
+fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("chmod {} {:o}", path.display(), mode))
+}
+
+fn write_file_0600(path: &Path, body: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(body)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 /// Best-effort persistence of the resolved backend.
 ///
 /// Race semantics: two daemons starting simultaneously (e.g. systemd
@@ -122,6 +223,24 @@ fn open_file_store(borg_home: &Path) -> Result<Arc<dyn KekStore>> {
 /// slower bootstrap. We log so a chronic write failure surfaces in
 /// `borg doctor`.
 fn persist_resolved_backend(db: &Database, backend: KekBackend) {
+    // Only commit if the stored setting is still `auto` — guards against
+    // a concurrent installer (`borg service install --secure`) writing
+    // `os_keychain` while a daemon-side probe transiently fails and
+    // would otherwise stomp it back to `file`. If the user has made an
+    // explicit choice, respect it.
+    match db.get_setting("security.kek_backend") {
+        Ok(Some(v)) if v != "auto" => {
+            tracing::debug!(
+                "kek_backend already set to {v}; skipping auto-resolve persist of {backend}"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!("read security.kek_backend before persist failed: {e}");
+            return;
+        }
+    }
     let value = backend.to_string();
     if let Err(e) = db.set_setting("security.kek_backend", &value) {
         tracing::warn!(
@@ -155,6 +274,94 @@ mod tests {
         let db = Database::from_connection(Connection::open_in_memory().expect("open in-mem db"))
             .expect("init test db");
         (tmp, db)
+    }
+
+    /// Auto fallback must auto-provision a passphrase + kek.env when
+    /// neither the env var nor a prior env file exist. Without this the
+    /// "always boots" headless guarantee breaks: a user who runs
+    /// `borgd` directly (no `borg service install`) on a CI/dev box
+    /// where the OS keychain isn't usable would see a hard error.
+    #[test]
+    fn auto_fallback_provisions_kek_env_when_missing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(PASSPHRASE_ENV);
+        let (home, _db) = fresh_db_and_home();
+        let store =
+            open_file_store_auto(home.path()).expect("auto fallback must provision and open");
+        store.put("ca-key", b"PEM").expect("put");
+        assert_eq!(store.get("ca-key").expect("get"), b"PEM".to_vec());
+        let env_path = home.path().join("secrets").join(KEK_ENV_FILE);
+        assert!(env_path.exists(), "auto must write kek.env");
+        let body = std::fs::read_to_string(&env_path).expect("read");
+        assert!(body.starts_with(&format!("{PASSPHRASE_ENV}=")));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&env_path)
+                .expect("stat")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// Auto fallback must REUSE an existing kek.env rather than
+    /// regenerate the passphrase — regenerating would invalidate the
+    /// already-encrypted KEK blob and re-mint the CA on every boot,
+    /// invalidating every paired device.
+    #[test]
+    fn auto_fallback_reads_existing_kek_env_without_regenerating() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var(PASSPHRASE_ENV);
+        let (home, _db) = fresh_db_and_home();
+        let secrets = home.path().join("secrets");
+        std::fs::create_dir_all(&secrets).unwrap();
+        let env_path = secrets.join(KEK_ENV_FILE);
+        std::fs::write(&env_path, format!("{PASSPHRASE_ENV}=preexisting-pass\n")).unwrap();
+
+        let store1 = open_file_store_auto(home.path()).expect("round 1");
+        store1.put("ca-key", b"PEM").expect("put");
+        drop(store1);
+
+        let body = std::fs::read_to_string(&env_path).unwrap();
+        assert_eq!(body, format!("{PASSPHRASE_ENV}=preexisting-pass\n"));
+
+        let store2 = open_file_store_auto(home.path()).expect("round 2");
+        assert_eq!(store2.get("ca-key").expect("get"), b"PEM".to_vec());
+    }
+
+    /// `persist_resolved_backend` MUST NOT overwrite an explicit
+    /// `os_keychain` or `file` setting. Without this guard, a transient
+    /// probe failure in a daemon restart loop could clobber the
+    /// installer's choice and flip the deploy into a state where it
+    /// can't find its passphrase.
+    #[test]
+    fn persist_resolved_backend_respects_explicit_setting() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, db) = fresh_db_and_home();
+        db.set_setting("security.kek_backend", "os_keychain")
+            .unwrap();
+        persist_resolved_backend(&db, KekBackend::File);
+        let stored = db.get_setting("security.kek_backend").unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("os_keychain"),
+            "explicit setting must survive a stale auto-resolve"
+        );
+    }
+
+    /// When the setting is still `auto`, persisting the resolved value
+    /// is allowed — that's how the very first daemon start records its
+    /// decision so subsequent boots skip the probe.
+    #[test]
+    fn persist_resolved_backend_writes_when_setting_is_auto() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_home, db) = fresh_db_and_home();
+        db.set_setting("security.kek_backend", "auto").unwrap();
+        persist_resolved_backend(&db, KekBackend::File);
+        let stored = db.get_setting("security.kek_backend").unwrap();
+        assert_eq!(stored.as_deref(), Some("file"));
     }
 
     #[test]

@@ -53,9 +53,9 @@ const LAUNCHD_PLIST_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </dict>
 </plist>"#;
 
-/// Default systemd unit. Used when the file-encrypted KEK backend is in
-/// effect (i.e. headless servers or non-Debian Linux). Pulls
-/// `BORG_KEK_PASSPHRASE` from a 0600 EnvironmentFile alongside the
+/// Default systemd unit (user scope). Used when the file-encrypted KEK
+/// backend is in effect (i.e. headless servers or non-Debian Linux).
+/// Pulls `BORG_KEK_PASSPHRASE` from a 0600 EnvironmentFile alongside the
 /// encrypted blob so the daemon can survive restarts unattended.
 const SYSTEMD_UNIT_TEMPLATE: &str = r#"[Unit]
 Description=Borg AI Assistant Daemon
@@ -71,6 +71,28 @@ EnvironmentFile=-{{HOME}}/.borg/secrets/kek.env
 
 [Install]
 WantedBy=default.target
+"#;
+
+/// System-wide systemd unit. Used when `borg service install` is run as
+/// root (the modal "fresh DigitalOcean / Hetzner droplet, ssh in as root,
+/// install borg" deploy shape). `systemctl --user` requires a logind
+/// user manager that root SSH sessions don't reliably get, so we drop
+/// to a `[Install] WantedBy=multi-user.target` system unit instead.
+const SYSTEMD_SYSTEM_UNIT_TEMPLATE: &str = r#"[Unit]
+Description=Borg AI Assistant Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart={{BINARY_PATH}}
+Restart=on-failure
+RestartSec=5
+Environment=HOME={{HOME}}
+EnvironmentFile=-{{HOME}}/.borg/secrets/kek.env
+
+[Install]
+WantedBy=multi-user.target
 "#;
 
 /// `--secure` systemd unit. The unit owns its own dbus + keyring
@@ -100,13 +122,32 @@ After=network.target
 [Service]
 Type=simple
 Environment=HOME={{HOME}}
-EnvironmentFile=-{{HOME}}/.borg/secrets/keyring.env
-ExecStart=/usr/bin/dbus-run-session -- /bin/sh -c 'printf "%s" "$BORG_KEYRING_PASS" | gnome-keyring-daemon --foreground --components=secrets --unlock >/dev/null 2>&1 & exec {{BINARY_PATH}}'
+EnvironmentFile={{HOME}}/.borg/secrets/keyring.env
+ExecStart=/usr/bin/dbus-run-session -- /bin/sh -c 'test -n "$BORG_KEYRING_PASS" || { echo "BORG_KEYRING_PASS unset; refusing to unlock keyring with empty passphrase" >&2; exit 78; }; printf "%s" "$BORG_KEYRING_PASS" | gnome-keyring-daemon --foreground --components=secrets --unlock >/dev/null 2>&1 & exec {{BINARY_PATH}}'
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=default.target
+"#;
+
+/// System-wide variant of the secure template. Same dbus / keyring
+/// wiring; differs only in `User=root` and the install target.
+const SYSTEMD_SYSTEM_UNIT_SECURE_TEMPLATE: &str = r#"[Unit]
+Description=Borg AI Assistant Daemon (secure / gnome-keyring)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME={{HOME}}
+EnvironmentFile={{HOME}}/.borg/secrets/keyring.env
+ExecStart=/usr/bin/dbus-run-session -- /bin/sh -c 'test -n "$BORG_KEYRING_PASS" || { echo "BORG_KEYRING_PASS unset; refusing to unlock keyring with empty passphrase" >&2; exit 78; }; printf "%s" "$BORG_KEYRING_PASS" | gnome-keyring-daemon --foreground --components=secrets --unlock >/dev/null 2>&1 & exec {{BINARY_PATH}}'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
 "#;
 
 /// Locate the `borgd` binary using the resolution order documented at the
@@ -541,14 +582,45 @@ fn stop_launchd() -> Result<()> {
 
 // ── Linux systemd ──
 
-fn systemd_unit_path() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    Ok(home
-        .join(".config")
-        .join("systemd")
-        .join("user")
-        .join("borg.service"))
+/// systemd scope. Root installs land in the system manager so the
+/// daemon survives ssh logout without needing `loginctl enable-linger`;
+/// non-root installs use the per-user manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemdScope {
+    System,
+    User,
+}
+
+impl SystemdScope {
+    fn detect() -> Self {
+        if is_root() {
+            Self::System
+        } else {
+            Self::User
+        }
+    }
+
+    fn unit_path(self) -> Result<PathBuf> {
+        match self {
+            Self::System => Ok(PathBuf::from("/etc/systemd/system/borg.service")),
+            Self::User => {
+                let home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+                Ok(home
+                    .join(".config")
+                    .join("systemd")
+                    .join("user")
+                    .join("borg.service"))
+            }
+        }
+    }
+
+    fn ctl_args(self) -> &'static [&'static str] {
+        match self {
+            Self::System => &[],
+            Self::User => &["--user"],
+        }
+    }
 }
 
 fn install_systemd(
@@ -556,7 +628,8 @@ fn install_systemd(
     home: &std::path::Path,
     mode: LinuxInstallMode,
 ) -> Result<()> {
-    let unit_path = systemd_unit_path()?;
+    let scope = SystemdScope::detect();
+    let unit_path = scope.unit_path()?;
     if let Some(parent) = unit_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -576,9 +649,13 @@ fn install_systemd(
         }
     }
 
-    let template = match mode {
-        LinuxInstallMode::FileBackend => SYSTEMD_UNIT_TEMPLATE,
-        LinuxInstallMode::SecureKeyring => SYSTEMD_UNIT_SECURE_TEMPLATE,
+    let template = match (scope, mode) {
+        (SystemdScope::User, LinuxInstallMode::FileBackend) => SYSTEMD_UNIT_TEMPLATE,
+        (SystemdScope::User, LinuxInstallMode::SecureKeyring) => SYSTEMD_UNIT_SECURE_TEMPLATE,
+        (SystemdScope::System, LinuxInstallMode::FileBackend) => SYSTEMD_SYSTEM_UNIT_TEMPLATE,
+        (SystemdScope::System, LinuxInstallMode::SecureKeyring) => {
+            SYSTEMD_SYSTEM_UNIT_SECURE_TEMPLATE
+        }
     };
     let content = template
         .replace("{{BINARY_PATH}}", binary_path)
@@ -587,10 +664,9 @@ fn install_systemd(
     std::fs::write(&unit_path, &content)
         .with_context(|| format!("Failed to write unit to {}", unit_path.display()))?;
 
-    match std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .output()
-    {
+    let mut reload = std::process::Command::new("systemctl");
+    reload.args(scope.ctl_args()).arg("daemon-reload");
+    match reload.output() {
         Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             tracing::warn!("systemctl daemon-reload failed: {stderr}");
@@ -599,13 +675,21 @@ fn install_systemd(
         _ => {}
     }
 
-    let output = std::process::Command::new("systemctl")
-        .args(["--user", "enable", "--now", "borg.service"])
-        .output()
-        .context("Failed to enable service")?;
+    let mut enable = std::process::Command::new("systemctl");
+    enable
+        .args(scope.ctl_args())
+        .args(["enable", "--now", "borg.service"]);
+    let output = enable.output().context("Failed to enable service")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!("systemctl enable --now failed: {stderr}");
+        anyhow::bail!(
+            "systemctl {}enable --now borg.service failed: {stderr}",
+            if scope == SystemdScope::User {
+                "--user "
+            } else {
+                ""
+            }
+        );
     }
 
     Ok(())
@@ -732,31 +816,42 @@ fn persist_kek_backend_setting(value: &str) {
 }
 
 fn uninstall_systemd() -> Result<()> {
-    let unit_path = systemd_unit_path()?;
-
-    match std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", "borg.service"])
-        .status()
-    {
-        Ok(s) if !s.success() => {
-            tracing::warn!("systemctl disable --now returned non-zero status")
+    // Try both scopes — a user may have installed under `--user` then
+    // re-run as root (or vice versa). Cleanly tearing down whichever
+    // exists keeps `borg service uninstall` idempotent across that
+    // mistake.
+    let mut tore_down_any = false;
+    for scope in [SystemdScope::System, SystemdScope::User] {
+        let Ok(unit_path) = scope.unit_path() else {
+            continue;
+        };
+        if !unit_path.exists() {
+            continue;
         }
-        Err(e) => tracing::warn!("systemctl disable --now failed: {e}"),
-        _ => {}
-    }
-
-    if unit_path.exists() {
+        let mut disable = std::process::Command::new("systemctl");
+        disable
+            .args(scope.ctl_args())
+            .args(["disable", "--now", "borg.service"]);
+        match disable.status() {
+            Ok(s) if !s.success() => {
+                tracing::warn!("systemctl disable --now returned non-zero status")
+            }
+            Err(e) => tracing::warn!("systemctl disable --now failed: {e}"),
+            _ => {}
+        }
         std::fs::remove_file(&unit_path)?;
-        match std::process::Command::new("systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-        {
+        let mut reload = std::process::Command::new("systemctl");
+        reload.args(scope.ctl_args()).arg("daemon-reload");
+        match reload.status() {
             Ok(s) if !s.success() => {
                 tracing::warn!("systemctl daemon-reload returned non-zero status")
             }
             Err(e) => tracing::warn!("systemctl daemon-reload failed: {e}"),
             _ => {}
         }
+        tore_down_any = true;
+    }
+    if tore_down_any {
         println!("Borg decommissioned.");
     } else {
         println!("Borg not installed.");
@@ -765,10 +860,10 @@ fn uninstall_systemd() -> Result<()> {
 }
 
 fn stop_systemd() -> Result<()> {
-    let status = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "borg.service"])
-        .status()
-        .context("Failed to run systemctl stop")?;
+    let scope = SystemdScope::detect();
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(scope.ctl_args()).args(["stop", "borg.service"]);
+    let status = cmd.status().context("Failed to run systemctl stop")?;
     if status.success() {
         println!("Service stopped.");
     } else {
@@ -811,6 +906,61 @@ mod tests {
         assert!(!content.contains("{{"));
     }
 
+    /// System-scope unit (root install on a VPS) must target
+    /// `multi-user.target`, run as root, and not depend on a per-user
+    /// systemd manager. Regression target: a fresh DigitalOcean droplet
+    /// SSH'd as root cannot use `systemctl --user`, so the install path
+    /// MUST drop to a system unit when running as root. Otherwise
+    /// `borg service install` silently no-ops and the daemon never
+    /// starts — the exact failure the headless-VPS feature exists to fix.
+    #[test]
+    fn systemd_system_template_targets_multi_user_and_root() {
+        let content = SYSTEMD_SYSTEM_UNIT_TEMPLATE
+            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{HOME}}", "/root");
+        assert!(content.contains("ExecStart=/usr/local/bin/borgd"));
+        assert!(content.contains("User=root"));
+        assert!(content.contains("WantedBy=multi-user.target"));
+        assert!(content.contains("EnvironmentFile=-/root/.borg/secrets/kek.env"));
+        assert!(!content.contains("WantedBy=default.target"));
+        assert!(!content.contains("{{"));
+    }
+
+    /// System-scope secure unit must inherit the same dbus / keyring
+    /// guards as the user-scope variant AND target the system manager.
+    #[test]
+    fn systemd_system_secure_template_keeps_dbus_guards_and_targets_root() {
+        let content = SYSTEMD_SYSTEM_UNIT_SECURE_TEMPLATE
+            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{HOME}}", "/root");
+        assert!(content.contains("User=root"));
+        assert!(content.contains("WantedBy=multi-user.target"));
+        assert!(content.contains("dbus-run-session"));
+        assert!(content.contains("--foreground"));
+        assert!(!content.contains("--replace"));
+        assert!(!content.contains("/tmp/"));
+        // Empty-passphrase guard: refuses to unlock with no pass.
+        assert!(content.contains("test -n \"$BORG_KEYRING_PASS\""));
+        assert!(!content.contains("{{"));
+    }
+
+    /// Empty BORG_KEYRING_PASS would otherwise feed an empty string into
+    /// `gnome-keyring-daemon --unlock`, which silently creates an
+    /// unlocked keyring with no master password. The secure template
+    /// MUST hard-fail with a clear error before reaching the unlock
+    /// pipeline.
+    #[test]
+    fn secure_systemd_template_guards_empty_keyring_pass() {
+        let content = SYSTEMD_UNIT_SECURE_TEMPLATE
+            .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
+            .replace("{{HOME}}", "/home/test");
+        assert!(
+            content.contains("test -n \"$BORG_KEYRING_PASS\""),
+            "must check non-empty keyring passphrase before unlock"
+        );
+        assert!(content.contains("exit 78"), "must exit on empty pass");
+    }
+
     /// File-backend template must reference the kek.env file so the
     /// passphrase reaches `borgd` via systemd EnvironmentFile rather than
     /// living in the unit text itself. Drift here would either expose the
@@ -845,7 +995,11 @@ mod tests {
         let content = SYSTEMD_UNIT_SECURE_TEMPLATE
             .replace("{{BINARY_PATH}}", "/usr/local/bin/borgd")
             .replace("{{HOME}}", "/home/test");
-        assert!(content.contains("EnvironmentFile=-/home/test/.borg/secrets/keyring.env"));
+        // No leading `-` on EnvironmentFile: secure mode requires the
+        // passphrase file (otherwise `gnome-keyring-daemon --unlock`
+        // would silently create an unlocked keyring with empty pass).
+        // Surface the missing-file as a systemd error instead.
+        assert!(content.contains("EnvironmentFile=/home/test/.borg/secrets/keyring.env"));
         assert!(content.contains("dbus-run-session"));
         assert!(content.contains("gnome-keyring-daemon"));
         assert!(content.contains("--components=secrets"));

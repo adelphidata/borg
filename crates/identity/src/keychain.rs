@@ -219,17 +219,23 @@ impl FileKekStore {
             }
         };
         // Open with create+truncate so a leftover `.tmp` from a previous
-        // crashed flush is overwritten cleanly (no append).
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| {
-                PkiError::Keychain(format!("FileKekStore: open {}: {e}", tmp_path.display()))
-            })?;
-        // Set perms before the write so the window where the file exists
-        // with default mode is as small as possible.
+        // crashed flush is overwritten cleanly (no append). On Unix we
+        // pass `mode(0o600)` to OpenOptions so the file is created with
+        // restrictive perms atomically with the open() syscall — no
+        // window where a concurrent reader (backup agent, etc.) can
+        // grab a 0644 ciphertext between create and chmod.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp_path).map_err(|e| {
+            PkiError::Keychain(format!("FileKekStore: open {}: {e}", tmp_path.display()))
+        })?;
+        // Belt-and-braces re-assert in case the file already existed
+        // (OpenOptions::mode only applies to newly created files).
         #[cfg(unix)]
         set_mode(&tmp_path, 0o600)?;
         use std::io::Write as _;
