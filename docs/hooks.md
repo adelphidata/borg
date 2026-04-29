@@ -20,14 +20,14 @@ The schema mirrors Claude Code's `hooks.json`.
 }
 ```
 
-Restart `borg`. Hooks are discovered at startup.
+Restart `borgd` (or any `borg` command that respawns it). Hooks are discovered when the daemon builds a session backend.
 
 ## Events
 
 | JSON name | Fires… |
 |---|---|
 | `SessionStart` | Once when a new session begins. |
-| `SessionEnd` | When a session ends. |
+| `SessionEnd` | When a session ends, including explicit session close. |
 | `UserPromptSubmit` | Before the agent starts processing a user message. |
 | `PreToolUse` | Before executing any tool call. Non-zero exit **skips** the tool call. |
 | `PostToolUse` | After a tool call completes. Observer — exit code ignored. |
@@ -78,7 +78,7 @@ Hooks **cannot break the agent.** Every failure path resolves to a safe default 
 - Subprocess spawn failure, timeout, non-zero exit, non-UTF-8 output, panic inside the runner → logged, action defaults to `Continue` (or `Skip` for PreToolUse on timeout/non-zero).
 - Hook output is capped at 8 KiB per stream. Stdout is discarded; stderr is logged.
 
-Check `~/.borg/logs/tui.log` for hook warnings.
+Check `~/.borg/logs/daemon.log` and `~/.borg/logs/daemon.err` for hook warnings.
 
 ## Configuration
 
@@ -87,7 +87,7 @@ borg settings set hooks.enabled true   # default: true
 borg settings set hooks.enabled false  # disable all user hooks
 ```
 
-Hooks are loaded once at startup. Edit `hooks.json` then restart `borg` to pick up changes.
+Hooks are loaded once when the daemon creates a session backend. Edit `hooks.json` then restart `borgd` to pick up changes.
 
 ## Unsupported
 

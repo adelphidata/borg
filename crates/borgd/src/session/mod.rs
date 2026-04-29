@@ -135,6 +135,13 @@ impl SessionHost {
         let token = self.inner.turn_state.lock().await.cancel.clone();
         token.cancel();
         self.inner.prompts.clear();
+        if let Err(e) = self.inner.backend.close_session().await {
+            tracing::warn!(
+                session_id = %self.inner.session_id,
+                error = %e,
+                "session backend close failed"
+            );
+        }
     }
 
     /// Compact the agent's conversation. Forwards to the backend.
@@ -285,22 +292,14 @@ impl SessionRegistry {
         guard.get(id).cloned()
     }
 
-    /// Remove (and close) a session. Cancellation/cleanup runs in the
-    /// background so this call stays sync.
-    pub fn remove(&self, id: &str) -> bool {
-        let removed = {
+    /// Remove and return a session host.
+    pub fn remove_host(&self, id: &str) -> Option<SessionHost> {
+        {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.remove(id)
-        };
-        match removed {
-            Some(host) => {
-                tokio::spawn(async move { host.close().await });
-                true
-            }
-            None => false,
         }
     }
 
@@ -339,6 +338,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use protocols::session::agent_event::Kind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Stub backend: emits N TextDelta events then TurnComplete, sleeping
@@ -347,6 +348,7 @@ mod tests {
         id: String,
         deltas: Vec<String>,
         step_delay: Duration,
+        close_calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -380,6 +382,11 @@ mod tests {
         fn session_id(&self) -> &str {
             &self.id
         }
+
+        async fn close_session(&self) -> Result<()> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     fn stub(id: &str, deltas: &[&str], delay_ms: u64) -> Arc<StubBackend> {
@@ -387,7 +394,23 @@ mod tests {
             id: id.into(),
             deltas: deltas.iter().map(ToString::to_string).collect(),
             step_delay: Duration::from_millis(delay_ms),
+            close_calls: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    async fn wait_for_close_calls(counter: &AtomicUsize, expected: usize) {
+        let start = tokio::time::Instant::now();
+        loop {
+            if counter.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(1),
+                "timed out waiting for close_calls={expected}, got {}",
+                counter.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn drain_until_terminal(
@@ -475,13 +498,16 @@ mod tests {
     #[tokio::test]
     async fn registry_replaces_session_and_closes_prior_host() {
         let registry = SessionRegistry::new();
-        let host_a = SessionHost::new(stub("dup", &["a"], 1));
+        let backend_a = stub("dup", &["a"], 1);
+        let close_calls = backend_a.close_calls.clone();
+        let host_a = SessionHost::new(backend_a);
         let host_b = SessionHost::new(stub("dup", &["b"], 1));
         registry.insert(host_a);
         registry.insert(host_b.clone());
         // Latest wins.
         let live = registry.get("dup").expect("present");
         assert!(Arc::ptr_eq(&live.inner, &host_b.inner));
+        wait_for_close_calls(&close_calls, 1).await;
     }
 
     #[tokio::test]
@@ -530,5 +556,54 @@ mod tests {
             }
             assert!(evt.event_seq > 0, "system notice must be sequenced");
         }
+    }
+
+    #[tokio::test]
+    async fn host_close_finalizes_backend_once() {
+        let backend = stub("s-close", &[], 1);
+        let close_calls = backend.close_calls.clone();
+        let host = SessionHost::new(backend);
+
+        host.close().await;
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+
+        host.close().await;
+        assert_eq!(close_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn registry_remove_host_returns_host_for_awaited_close() {
+        let registry = SessionRegistry::new();
+        let backend = stub("s-remove", &[], 1);
+        let close_calls = backend.close_calls.clone();
+        let host = SessionHost::new(backend);
+        registry.insert(host);
+
+        let removed = registry.remove_host("s-remove").expect("removed host");
+        assert!(registry.get("s-remove").is_none(), "host must be removed first");
+        removed.close().await;
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn host_close_cancels_turn_and_finalizes_backend() {
+        let backend = stub("s-close-active", &["a", "b", "c", "d"], 200);
+        let close_calls = backend.close_calls.clone();
+        let host = SessionHost::new(backend);
+        let mut rx = host.subscribe();
+        host.start_turn("go".into(), Vec::new()).await;
+
+        let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        host.close().await;
+        let evts = drain_until_terminal(&mut rx).await;
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        let last = evts.last().expect("at least one event");
+        assert!(
+            matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
+            "expected terminal Error('cancelled'), got {:?}",
+            last.kind
+        );
     }
 }

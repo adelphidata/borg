@@ -191,9 +191,10 @@ impl Session for SessionSvc {
 
     async fn close(&self, req: Request<CloseRequest>) -> Result<Response<CloseResponse>, TStatus> {
         let id = req.into_inner().session_id;
-        if !self.registry.remove(&id) {
+        let Some(host) = self.registry.remove_host(&id) else {
             return Err(TStatus::not_found(format!("session `{id}` not found")));
-        }
+        };
+        host.close().await;
         Ok(Response::new(CloseResponse {}))
     }
 

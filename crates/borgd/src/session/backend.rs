@@ -73,6 +73,14 @@ pub trait SessionBackend: Send + Sync + 'static {
     /// Stable session id (for logs / SessionRegistry indexing).
     fn session_id(&self) -> &str;
 
+    /// Finalize and close the backend session.
+    ///
+    /// Production backends should use this to flush any session-end lifecycle
+    /// work that must happen before the daemon reports the session closed.
+    async fn close_session(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     // ── Agent-control surface (default: not supported) ────────────────────
     //
     // These all return `Err(unsupported)` for stub backends; only `AgentBackend`
@@ -260,6 +268,12 @@ impl SessionBackend for AgentBackend {
 
     fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    async fn close_session(&self) -> anyhow::Result<()> {
+        let mut agent = self.agent.lock().await;
+        agent.end_session();
+        Ok(())
     }
 
     async fn compact(&self) -> anyhow::Result<(usize, usize)> {
