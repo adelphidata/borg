@@ -33,6 +33,29 @@ pub fn render_popup_frame(frame: &mut Frame, popup_area: Rect, title: &str) -> R
     inner
 }
 
+/// Compute a popup rectangle anchored above the composer, clamped to fit
+/// within the frame's viewport.
+///
+/// In inline-viewport mode the frame buffer's `area.y` may be > 0; popups
+/// must size against the gap between the composer and the viewport top, not
+/// against the absolute composer y. Returns `None` when there is not enough
+/// space above the composer for `min_height` rows.
+pub fn popup_rect_above(
+    viewport: Rect,
+    composer: Rect,
+    desired_height: u16,
+    min_height: u16,
+    width: u16,
+) -> Option<Rect> {
+    let available_above = composer.y.saturating_sub(viewport.y);
+    if available_above < min_height {
+        return None;
+    }
+    let height = desired_height.min(available_above).max(min_height);
+    let popup_y = composer.y - height;
+    Some(Rect::new(composer.x, popup_y, width, height))
+}
+
 /// Render a footer hint bar at the bottom of the inner area.
 pub fn render_footer(frame: &mut Frame, inner: Rect, hint: &str) {
     let footer_y = inner.y + inner.height - 1;
@@ -140,6 +163,41 @@ mod tests {
         assert_eq!(popup.width, 6);
         // height: 80% of 5 = 4, max(4, 12) = 12, min(12, 5-2=3) = 3
         assert_eq!(popup.height, 3);
+    }
+
+    #[test]
+    fn popup_rect_above_inline_viewport_stays_in_bounds() {
+        // Inline viewport: buffer occupies y=17..24 (height=7).
+        let viewport = Rect::new(0, 17, 102, 7);
+        // Composer near the bottom of the viewport.
+        let composer = Rect::new(0, 22, 102, 2);
+        // Want a tall popup (10 rows) but only 5 rows above the composer.
+        let popup = popup_rect_above(viewport, composer, 10, 3, 50).unwrap();
+        assert!(
+            popup.y >= viewport.y,
+            "popup at y={} must be >= viewport top {}",
+            popup.y,
+            viewport.y,
+        );
+        assert!(popup.y + popup.height <= composer.y);
+        assert_eq!(popup.height, 5); // clamped to available_above
+    }
+
+    #[test]
+    fn popup_rect_above_returns_none_when_insufficient_space() {
+        let viewport = Rect::new(0, 17, 102, 7);
+        // Composer one row below viewport top: only 1 row above.
+        let composer = Rect::new(0, 18, 102, 2);
+        assert!(popup_rect_above(viewport, composer, 10, 3, 50).is_none());
+    }
+
+    #[test]
+    fn popup_rect_above_full_screen_viewport() {
+        let viewport = Rect::new(0, 0, 100, 40);
+        let composer = Rect::new(0, 35, 100, 3);
+        let popup = popup_rect_above(viewport, composer, 6, 3, 50).unwrap();
+        assert_eq!(popup.y, 29);
+        assert_eq!(popup.height, 6);
     }
 
     #[test]

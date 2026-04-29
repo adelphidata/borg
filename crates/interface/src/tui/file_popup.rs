@@ -5,6 +5,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::popup_utils;
 use super::theme;
 
 pub struct FileMatch {
@@ -124,11 +125,6 @@ impl FileSearchPopup {
             return;
         }
 
-        let available_above = composer_area.y;
-        if available_above < 3 {
-            return;
-        }
-
         // Searching placeholder when we have no prior results to show.
         let show_searching_only = self.results.is_empty() && self.waiting;
 
@@ -137,12 +133,18 @@ impl FileSearchPopup {
         } else {
             self.results.len() as u16
         };
-        let popup_height = (item_count + 2).min(available_above);
-        let max_visible = (popup_height - 2) as usize;
         let popup_width = composer_area.width.min(60);
-
-        let popup_y = composer_area.y - popup_height;
-        let popup_area = Rect::new(composer_area.x, popup_y, popup_width, popup_height);
+        let Some(popup_area) = popup_utils::popup_rect_above(
+            frame.area(),
+            composer_area,
+            item_count + 2,
+            3,
+            popup_width,
+        ) else {
+            return;
+        };
+        let popup_height = popup_area.height;
+        let max_visible = (popup_height - 2) as usize;
 
         frame.render_widget(Clear, popup_area);
 

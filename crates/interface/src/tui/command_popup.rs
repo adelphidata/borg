@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use super::custom_commands::CustomCommand;
+use super::popup_utils;
 use super::theme;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,19 +250,20 @@ impl CommandPopup {
             return;
         }
 
-        let available_above = composer_area.y;
-        // Need at least 3 rows: top border + 1 item + bottom border
-        if available_above < 3 {
-            return;
-        }
-
         let item_count = items.len() as u16;
-        let popup_height = (item_count + 2).min(available_above); // +2 for border, clamp to space
-        let max_visible = (popup_height - 2) as usize; // items that fit inside borders
         let popup_width = composer_area.width.min(50);
-
-        let popup_y = composer_area.y - popup_height;
-        let popup_area = Rect::new(composer_area.x, popup_y, popup_width, popup_height);
+        // Need at least 3 rows: top border + 1 item + bottom border.
+        let Some(popup_area) = popup_utils::popup_rect_above(
+            frame.area(),
+            composer_area,
+            item_count + 2,
+            3,
+            popup_width,
+        ) else {
+            return;
+        };
+        let popup_height = popup_area.height;
+        let max_visible = (popup_height - 2) as usize; // items that fit inside borders
 
         frame.render_widget(Clear, popup_area);
 

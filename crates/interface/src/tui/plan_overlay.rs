@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::popup_utils;
 use super::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,14 +63,16 @@ impl PlanOverlay {
         }
 
         let popup_height: u16 = 5;
-        let available_above = composer_area.y;
-        if available_above < popup_height {
-            return;
-        }
-
         let popup_width = composer_area.width.min(60);
-        let popup_y = composer_area.y - popup_height;
-        let popup_area = Rect::new(composer_area.x, popup_y, popup_width, popup_height);
+        let Some(popup_area) = popup_utils::popup_rect_above(
+            frame.area(),
+            composer_area,
+            popup_height,
+            popup_height,
+            popup_width,
+        ) else {
+            return;
+        };
 
         frame.render_widget(Clear, popup_area);
 
