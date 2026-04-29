@@ -661,19 +661,18 @@ impl HistoryCell {
     ) -> Vec<Line<'static>> {
         match self {
             HistoryCell::User { text } => {
-                // dim border `╭─╮│╰─╯` around the user message,
-                // with the subtle bg tint preserved on the inner rows.
+                // User bubbles are rendered row-by-row so the tinted fill owns
+                // every interior cell, including trailing padding on wrapped rows.
                 let bg = theme::user_message_style();
                 let prefix_style =
                     bg.add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM);
                 let border_style = theme::dim();
-                let mention_style = theme::file_mention_style();
+                let mention_style = bg.patch(theme::file_mention_style());
                 let w = width as usize;
-                // Inner content area sits inside `│ ... │` with 1-col padding each side.
-                let inner_w = w.saturating_sub(4).max(20);
-                let mut lines = Vec::new();
-                // Top rule: ╭───────╮ across full width.
                 let rule_len = w.saturating_sub(2);
+                let content_width = w.saturating_sub(4).max(1);
+                let wrap_width = content_width.saturating_sub(2).max(1);
+                let mut lines = Vec::new();
                 lines.push(Line::from(vec![
                     Span::styled(theme::BOX_TOP_LEFT.to_string(), border_style),
                     Span::styled(theme::SEPARATOR.repeat(rule_len), border_style),
@@ -684,7 +683,7 @@ impl HistoryCell {
                     let wrapped = if line.is_empty() {
                         vec![std::borrow::Cow::Borrowed("")]
                     } else {
-                        super::wrapping::wrap(line, inner_w.saturating_sub(2).max(10))
+                        super::wrapping::wrap(line, wrap_width)
                     };
                     for wl in wrapped.iter() {
                         let prefix = if first {
@@ -699,14 +698,12 @@ impl HistoryCell {
                         row.push(Span::styled(" ", bg));
                         row.push(prefix);
                         row.extend(spans);
-                        let content_width: usize = row
+                        let used_width: usize = row
                             .iter()
-                            .skip(1) // skip border
+                            .skip(2)
                             .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                             .sum();
-                        // Pad to fill inner area (minus the leading ` `, which is in
-                        // content_width already).
-                        let pad = inner_w.saturating_sub(content_width.saturating_sub(1));
+                        let pad = content_width.saturating_sub(used_width);
                         if pad > 0 {
                             row.push(Span::styled(" ".repeat(pad), bg));
                         }
@@ -1307,6 +1304,33 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.content.as_ref().contains(super::theme::CHEVRON)));
+    }
+
+    #[test]
+    fn render_user_cell_paints_full_interior_width() {
+        let cell = HistoryCell::User {
+            text: "hello?".to_string(),
+        };
+        let width = 40;
+        let lines = cell.render(width, None);
+        let row = &lines[1];
+        let rendered_width: usize = row
+            .spans
+            .iter()
+            .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        assert_eq!(rendered_width, width as usize);
+        if let Some(bubble_bg) = theme::user_message_style().bg {
+            let fill_width: usize = row
+                .spans
+                .iter()
+                .skip(1)
+                .take(row.spans.len().saturating_sub(2))
+                .filter(|span| span.style.bg == Some(bubble_bg))
+                .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
+                .sum();
+            assert_eq!(fill_width, width as usize - 2);
+        }
     }
 
     #[test]

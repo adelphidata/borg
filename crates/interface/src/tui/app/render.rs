@@ -71,7 +71,9 @@ impl<'a> App<'a> {
         }
         self.composer.render(frame, app_layout.composer);
         self.render_choices_overlay(frame, app_layout.composer);
-        self.render_footer(frame, app_layout.footer);
+        if app_layout.footer.height > 0 {
+            self.render_footer(frame, app_layout.footer);
+        }
         self.plan_overlay.render(frame, app_layout.composer);
         self.command_popup.render(frame, app_layout.composer);
         self.file_popup.render(frame, app_layout.composer);
@@ -684,16 +686,15 @@ impl<'a> App<'a> {
         let queue = self.compute_queue_preview_height();
         let footer: u16 = 1;
         let pending = self.cells.len().saturating_sub(self.cells_emitted) as u16;
-        let max_tail = terminal_size.height / 2;
-        let tail = pending.min(max_tail);
-        // Reserve at least 3 rows for the streaming tail so a freshly opened
-        // session shows the live response without zero-height clipping.
-        let tail = tail.max(3);
-        let total = composer
-            .saturating_add(status)
-            .saturating_add(queue)
-            .saturating_add(footer)
-            .saturating_add(tail);
+        let chrome = composer
+            .saturating_add(status.min(1))
+            .saturating_add(if terminal_size.width < 72 { 0 } else { queue })
+            .saturating_add(if terminal_size.width < 56 { 0 } else { footer });
+        let available_tail = terminal_size.height.saturating_sub(chrome).max(1);
+        let max_tail = (terminal_size.height / 2).max(1).min(available_tail);
+        let min_tail = if available_tail >= 3 { 3 } else { 1 };
+        let tail = pending.min(max_tail).max(min_tail);
+        let total = chrome.saturating_add(tail);
         total.min(terminal_size.height)
     }
 
@@ -711,6 +712,15 @@ impl<'a> App<'a> {
         }
         out.extend(cell.render(width, None));
         out
+    }
+
+    pub(super) fn flush_cell_range_to_scrollback(&mut self, start: usize, end: usize, width: u16) {
+        let end = end.min(self.cells.len());
+        for idx in start.min(end)..end {
+            let lines = self.render_cell_lines(idx, width);
+            self.pending_scrollback.extend(lines);
+        }
+        self.cells_emitted = end;
     }
 
     /// Append the borg branded header to `pending_scrollback` exactly once,
@@ -762,11 +772,7 @@ impl<'a> App<'a> {
         // Also check whether earlier cells whose predicate fails would block
         // later stable cells: by construction we only emit a contiguous
         // prefix, so once we stop we stop.
-        for idx in self.cells_emitted..stable_end {
-            let lines = self.render_cell_lines(idx, width);
-            self.pending_scrollback.extend(lines);
-        }
-        self.cells_emitted = stable_end;
+        self.flush_cell_range_to_scrollback(self.cells_emitted, stable_end, width);
     }
 
     /// True if the cell at `idx` is no longer subject to mutation by an
@@ -1219,5 +1225,26 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|l| l == "update: v0.6.0 installed; restart required"));
+    }
+
+    #[test]
+    fn compute_viewport_height_uses_collapsed_narrow_chrome() {
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        app.stream_status
+            .set_details(Some("cargo test --workspace".into()));
+        app.queued_messages.push_back(super::super::QueuedMessage {
+            text: "queued".into(),
+            images: Vec::new(),
+        });
+
+        let viewport = app.compute_viewport_height(Size::new(60, 20));
+
+        // Narrow layout collapses the queue preview and status shrinks to one
+        // row. With no pending transcript cells, the viewport is just the
+        // collapsed chrome plus the 3-row minimum live tail.
+        assert_eq!(viewport, 8);
     }
 }

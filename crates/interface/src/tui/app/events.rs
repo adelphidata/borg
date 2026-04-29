@@ -327,6 +327,11 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_turn_complete(&mut self) {
+        let flush_width = if self.last_viewport_width > 0 {
+            self.last_viewport_width
+        } else {
+            DEFAULT_FLUSH_WIDTH
+        };
         // Clean up steer channel on turn completion
         self.steer_tx = None;
         self.pending_steers.clear();
@@ -351,9 +356,9 @@ impl<'a> App<'a> {
                 break;
             }
         }
-        // Force the entire run into scrollback: at TurnComplete every cell
-        // is final, so flush them all on the next draw.
-        self.cells_emitted = self.cells.len();
+        // Force the entire finalized tail into scrollback now so it cannot
+        // disappear from the live viewport before native scrollback owns it.
+        self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
         self.last_turn_errored = false;
         self.queue_pause_notified = false;
         if self.config.conversation.collaboration_mode == CollaborationMode::Plan {
@@ -372,6 +377,11 @@ impl<'a> App<'a> {
     }
 
     fn handle_event_error(&mut self, e: String) {
+        let flush_width = if self.last_viewport_width > 0 {
+            self.last_viewport_width
+        } else {
+            DEFAULT_FLUSH_WIDTH
+        };
         self.cells.push(HistoryCell::System {
             text: cortex::error_format::format_error_with_context(
                 &e,
@@ -386,8 +396,8 @@ impl<'a> App<'a> {
                 break;
             }
         }
-        // Error finalizes the turn; flush everything to scrollback.
-        self.cells_emitted = self.cells.len();
+        // Error finalizes the turn; hand the full tail to scrollback now.
+        self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
         self.last_turn_errored = true;
         // If a transient Plan flow failed, roll back to the prior mode so the
         // user isn't left trapped with mutations blocked.
@@ -505,6 +515,11 @@ impl<'a> App<'a> {
     }
 
     fn handle_agent_channel_closed_inner(&mut self) {
+        let flush_width = if self.last_viewport_width > 0 {
+            self.last_viewport_width
+        } else {
+            DEFAULT_FLUSH_WIDTH
+        };
         self.event_rx = None;
         let split = self.cells_emitted.min(self.cells.len());
         for cell in self.cells[split..].iter_mut().rev() {
@@ -513,6 +528,7 @@ impl<'a> App<'a> {
                 break;
             }
         }
+        self.flush_cell_range_to_scrollback(split, self.cells.len(), flush_width);
         // If a transient Plan flow was in flight, roll back to the prior mode.
         if let Some(prev) = self.previous_collab_mode.take() {
             self.config.conversation.collaboration_mode = prev;

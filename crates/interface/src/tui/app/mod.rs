@@ -2139,6 +2139,33 @@ mod tests {
         assert!(matches!(app.state, AppState::Idle));
     }
 
+    #[test]
+    fn turn_complete_moves_final_assistant_tail_into_pending_scrollback() {
+        let mut app = make_app();
+        app.last_viewport_width = 80;
+        app.cells
+            .push(HistoryCell::assistant("done".to_string(), true));
+
+        app.process_agent_event(AgentEvent::TurnComplete);
+
+        assert_eq!(app.cells_emitted, app.cells.len());
+        let pending_text = app
+            .pending_scrollback
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            pending_text.contains("done"),
+            "finalized assistant tail must move into pending scrollback, got: {pending_text:?}"
+        );
+    }
+
     // --- Update command ---
 
     fn assert_self_update(input: &str, want_pre: bool, want_check: bool) {

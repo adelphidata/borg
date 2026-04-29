@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::Rect;
 
 pub struct AppLayout {
     pub transcript: Rect,
@@ -14,21 +14,74 @@ pub fn compute_layout(
     status_height: u16,
     queue_preview_height: u16,
 ) -> AppLayout {
-    let chunks = Layout::vertical([
-        Constraint::Min(3),                       // transcript
-        Constraint::Length(status_height),        // status bar
-        Constraint::Length(queue_preview_height), // queue preview
-        Constraint::Length(composer_height),      // composer
-        Constraint::Length(1),                    // footer
-    ])
-    .split(area);
+    let narrow = area.width < 72;
+    let very_narrow = area.width < 56;
+
+    let mut composer = composer_height.min(area.height);
+    let composer_min = 3.min(composer.max(1));
+    if composer > composer_min && area.height < composer + status_height + queue_preview_height + 4
+    {
+        composer = composer_min;
+    }
+
+    let mut status = if narrow {
+        status_height.min(1)
+    } else {
+        status_height
+    };
+    let mut queue_preview = if narrow { 0 } else { queue_preview_height };
+    let mut footer = if very_narrow { 0 } else { 1 };
+
+    let transcript_min = 3.min(area.height);
+    let mut chrome = composer
+        .saturating_add(status)
+        .saturating_add(queue_preview)
+        .saturating_add(footer);
+
+    if chrome.saturating_add(transcript_min) > area.height {
+        let overflow = chrome.saturating_add(transcript_min) - area.height;
+        let reduce = queue_preview.min(overflow);
+        queue_preview -= reduce;
+        chrome -= reduce;
+    }
+    if chrome.saturating_add(transcript_min) > area.height {
+        let overflow = chrome.saturating_add(transcript_min) - area.height;
+        let reduce = footer.min(overflow);
+        footer -= reduce;
+        chrome -= reduce;
+    }
+    if chrome.saturating_add(transcript_min) > area.height {
+        let overflow = chrome.saturating_add(transcript_min) - area.height;
+        let reduce = status.min(overflow);
+        status -= reduce;
+        chrome -= reduce;
+    }
+    if chrome.saturating_add(transcript_min) > area.height {
+        let overflow = chrome.saturating_add(transcript_min) - area.height;
+        let reduce = composer.saturating_sub(composer_min).min(overflow);
+        composer -= reduce;
+        chrome -= reduce;
+    }
+
+    let transcript = area.height.saturating_sub(chrome);
+
+    let mut y = area.y;
+    let transcript_rect = Rect::new(area.x, y, area.width, transcript);
+    y = y.saturating_add(transcript);
+    let status_rect = Rect::new(area.x, y, area.width, status);
+    y = y.saturating_add(status);
+    let queue_preview_rect = Rect::new(area.x, y, area.width, queue_preview);
+    y = y.saturating_add(queue_preview);
+    let composer_rect = Rect::new(area.x, y, area.width, composer);
+    y = y.saturating_add(composer);
+    let footer_rect = Rect::new(area.x, y, area.width, footer);
 
     AppLayout {
-        transcript: chunks[0],
-        status: chunks[1],
-        queue_preview: chunks[2],
-        composer: chunks[3],
-        footer: chunks[4],
+        transcript: transcript_rect,
+        status: status_rect,
+        queue_preview: queue_preview_rect,
+        composer: composer_rect,
+        footer: footer_rect,
     }
 }
 
@@ -90,5 +143,24 @@ mod tests {
             layout.queue_preview.y + layout.queue_preview.height
         );
         assert_eq!(layout.footer.y, layout.composer.y + layout.composer.height);
+    }
+
+    #[test]
+    fn narrow_layout_drops_queue_preview_first() {
+        let layout = compute_layout(area(60, 18), 5, 2, 4);
+        assert_eq!(layout.queue_preview.height, 0);
+        assert_eq!(layout.status.height, 1);
+        assert_eq!(layout.footer.height, 1);
+        assert!(layout.transcript.height >= 3);
+    }
+
+    #[test]
+    fn tiny_layout_drops_footer_and_shrinks_composer() {
+        let layout = compute_layout(area(50, 7), 5, 2, 3);
+        assert_eq!(layout.footer.height, 0);
+        assert_eq!(layout.queue_preview.height, 0);
+        assert_eq!(layout.status.height, 1);
+        assert_eq!(layout.composer.height, 3);
+        assert_eq!(layout.transcript.height, 3);
     }
 }
