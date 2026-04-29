@@ -1,10 +1,6 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use axum::http::HeaderMap;
 use base64::Engine;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
 
 /// Verify a Microsoft Teams webhook request signature using HMAC-SHA256.
 ///
@@ -27,16 +23,7 @@ pub fn verify_teams_signature(headers: &HeaderMap, body: &[u8], secret: &str) ->
         .decode(secret)
         .map_err(|e| anyhow::anyhow!("Invalid base64 secret: {e}"))?;
 
-    let mut mac = HmacSha256::new_from_slice(&secret_bytes)
-        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
-    mac.update(body);
-    let computed = mac.finalize().into_bytes();
-
-    if !crate::crypto::constant_time_eq(&computed, &expected_sig) {
-        bail!("Teams signature verification failed");
-    }
-
-    Ok(())
+    crate::verify_common::hmac_sha256_verify(&secret_bytes, body, &expected_sig, "Teams")
 }
 
 #[cfg(test)]
@@ -50,10 +37,13 @@ mod tests {
     }
 
     fn compute_signature(secret_b64: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
         let secret_bytes = base64::engine::general_purpose::STANDARD
             .decode(secret_b64)
             .unwrap();
-        let mut mac = HmacSha256::new_from_slice(&secret_bytes).expect("HMAC accepts any key size");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&secret_bytes).expect("HMAC accepts any key size");
         mac.update(body);
         let result = mac.finalize().into_bytes();
         base64::engine::general_purpose::STANDARD.encode(result)

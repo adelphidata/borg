@@ -393,8 +393,8 @@ impl Default for ActiveInjectionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            top_k: 5,
-            max_tokens: 1500,
+            top_k: crate::constants::ACTIVE_INJECTION_DEFAULT_TOP_K,
+            max_tokens: crate::constants::ACTIVE_INJECTION_DEFAULT_MAX_TOKENS,
         }
     }
 }

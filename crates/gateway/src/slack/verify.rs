@@ -1,9 +1,5 @@
 use anyhow::{bail, Result};
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const TIMESTAMP_REPLAY_WINDOW_SECS: u64 = crate::constants::SLACK_REPLAY_WINDOW_SECS;
 
@@ -31,19 +27,20 @@ pub fn verify_slack_signature(headers: &HeaderMap, body: &str, signing_secret: &
     let expected_sig =
         crate::verify_common::required_header(headers, "x-slack-signature", "X-Slack-Signature")?;
 
+    // Slack format: `v0={hex(HMAC-SHA256(secret, "v0:{ts}:{body}"))}`
+    let expected_hex = expected_sig
+        .strip_prefix("v0=")
+        .ok_or_else(|| anyhow::anyhow!("X-Slack-Signature missing v0= prefix"))?;
+    let expected_bytes = hex::decode(expected_hex)
+        .map_err(|e| anyhow::anyhow!("Invalid hex in X-Slack-Signature: {e}"))?;
+
     let sig_basestring = format!("v0:{timestamp}:{body}");
-
-    let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())
-        .map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
-    mac.update(sig_basestring.as_bytes());
-    let result = mac.finalize();
-    let computed = format!("v0={}", hex::encode(result.into_bytes()));
-
-    if !crate::crypto::constant_time_eq(computed.as_bytes(), expected_sig.as_bytes()) {
-        bail!("Slack signature verification failed");
-    }
-
-    Ok(())
+    crate::verify_common::hmac_sha256_verify(
+        signing_secret.as_bytes(),
+        sig_basestring.as_bytes(),
+        &expected_bytes,
+        "Slack",
+    )
 }
 
 #[cfg(test)]
@@ -52,9 +49,11 @@ mod tests {
     use axum::http::HeaderValue;
 
     fn compute_signature(secret: &str, timestamp: &str, body: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
         let sig_basestring = format!("v0:{timestamp}:{body}");
         let mut mac =
-            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key size");
         mac.update(sig_basestring.as_bytes());
         let result = mac.finalize();
         format!("v0={}", hex::encode(result.into_bytes()))

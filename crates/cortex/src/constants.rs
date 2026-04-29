@@ -333,6 +333,27 @@ pub const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 300;
 /// SSE streaming buffer size (10 MB).
 pub const MAX_SSE_BUFFER: usize = 10 * 1024 * 1024;
 
+/// Cooldown base (seconds) for permanent provider faults: auth and billing.
+/// Larger than the transient base so the failover circuit does not flap on
+/// 401/403/payment errors that won't self-heal in a few seconds.
+pub const PROVIDER_COOLDOWN_AUTH_BASE_SECS: f64 = 300.0;
+
+/// Cooldown base (seconds) for transient provider faults (rate limit, 5xx,
+/// network). Short so a brief upstream blip yields back to the primary fast.
+pub const PROVIDER_COOLDOWN_TRANSIENT_BASE_SECS: f64 = 60.0;
+
+/// Max exponent applied to the auth/billing cooldown (2^N multiplier cap).
+pub const PROVIDER_COOLDOWN_AUTH_MAX_EXP: u32 = 3;
+
+/// Max exponent applied to the transient cooldown (2^N multiplier cap).
+pub const PROVIDER_COOLDOWN_TRANSIENT_MAX_EXP: u32 = 4;
+
+/// Default token budget for active memory injection into the system prompt.
+pub const ACTIVE_INJECTION_DEFAULT_MAX_TOKENS: usize = 1500;
+
+/// Default top-k for active memory injection search.
+pub const ACTIVE_INJECTION_DEFAULT_TOP_K: usize = 5;
+
 /// Hard upper bound on tool-call array indices during SSE stream parsing.
 /// Prevents OOM from malformed events. Distinct from `MAX_TOOL_CALLS_PER_RESPONSE`
 /// which caps how many tool calls are forwarded to execution.

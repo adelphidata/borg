@@ -4,8 +4,32 @@
 //! before doing channel-specific crypto. This module centralizes that
 //! extraction so the error messages stay uniform.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::http::HeaderMap;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Compute HMAC-SHA256 over `data` keyed by `key` and constant-time compare
+/// against the expected raw signature bytes. Used by Slack (hex-encoded
+/// expected) and Teams (base64-encoded expected); each caller decodes its
+/// transport encoding before invoking this.
+pub fn hmac_sha256_verify(
+    key: &[u8],
+    data: &[u8],
+    expected: &[u8],
+    label: &'static str,
+) -> Result<()> {
+    let mut mac =
+        HmacSha256::new_from_slice(key).map_err(|e| anyhow::anyhow!("HMAC key error: {e}"))?;
+    mac.update(data);
+    let computed = mac.finalize().into_bytes();
+    if !crate::crypto::constant_time_eq(&computed, expected) {
+        bail!("{label} signature verification failed");
+    }
+    Ok(())
+}
 
 /// Fetch a required header and decode it as UTF-8.
 ///
