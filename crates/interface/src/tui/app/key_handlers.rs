@@ -69,31 +69,6 @@ impl<'a> App<'a> {
         self.toast_info(format!("Mode → {next}"));
     }
 
-    /// Append the keyboard shortcuts reference card as a system message.
-    fn push_keyboard_help(&mut self) {
-        self.push_system_message(
-            "Keyboard Shortcuts:\n  \
-             Enter        — Send message\n  \
-             Shift+Enter  — New line\n  \
-             Up / Ctrl+P  — Previous history entry\n  \
-             Down / Ctrl+N — Next history entry\n  \
-             Esc          — Clear input / Rewind (when empty)\n  \
-             Ctrl+L       — Clear screen\n  \
-             Ctrl+D       — Half-page down (scrolled) / Quit (at bottom, empty)\n  \
-             Ctrl+G       — Open external editor ($EDITOR)\n  \
-             Enter        — Queue message while streaming\n  \
-             Alt+Up       — Edit last queued message\n  \
-             Ctrl+C       — Cancel / Quit\n  \
-             Shift+Tab    — Cycle mode (default/execute/plan)\n  \
-             PageUp/Down  — Scroll transcript (viewport height)\n  \
-             Ctrl+B / Ctrl+F — Full-page up / down\n  \
-             Ctrl+U / Ctrl+D — Half-page up / down\n  \
-             Home / End   — Jump to top / bottom\n  \
-             Mouse wheel  — Scroll transcript\n  \
-             /            — Show command menu"
-                .to_string(),
-        );
-    }
 
     // =========================================================================
     // NO MOUSE HANDLER.
@@ -610,15 +585,6 @@ impl<'a> App<'a> {
         }
         if let Some(action) = self.handle_file_popup_key(key)? {
             return Ok(action);
-        }
-
-        // ? — show keyboard shortcuts when composer is empty
-        if key.code == KeyCode::Char('?')
-            && key.modifiers == KeyModifiers::NONE
-            && self.composer.is_empty()
-        {
-            self.push_keyboard_help();
-            return Ok(AppAction::Continue);
         }
 
         // ------------------------------------------------------------
