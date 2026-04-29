@@ -1155,14 +1155,13 @@ fn render_security(frame: &mut ratatui::Frame, area: Rect, _state: &OnboardingSt
 
     lines.push(Line::default());
 
-    // "Run diagnostics anytime: borg doctor" with bold white on "borg doctor"
     lines.push(Line::from(vec![
         Span::styled(
             "  Run diagnostics anytime: ",
             Style::default().fg(theme::YELLOW),
         ),
         Span::styled(
-            "borg doctor",
+            "/doctor",
             Style::default()
                 .fg(ratatui::style::Color::White)
                 .add_modifier(Modifier::BOLD),

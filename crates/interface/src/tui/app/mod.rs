@@ -262,7 +262,7 @@ fn persistent_warning_notice_from_warnings(warnings: &[String]) -> Option<String
     let extra = total - shown;
     let mut lines = Vec::with_capacity(shown + 2);
     lines.push(format!(
-        "⚠ doctor: {total} persistent warning(s) — run `borg doctor` for details"
+        "⚠ doctor: {total} persistent warning(s) — run /doctor for details"
     ));
     for w in warnings.iter().take(shown) {
         lines.push(format!("  • {w}"));
@@ -1090,8 +1090,8 @@ mod tests {
             "expected warning text, got: {notice}"
         );
         assert!(
-            notice.contains("borg doctor"),
-            "expected CTA mentioning `borg doctor`, got: {notice}"
+            notice.contains("/doctor"),
+            "expected CTA mentioning `/doctor`, got: {notice}"
         );
     }
 
