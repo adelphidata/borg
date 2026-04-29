@@ -16,8 +16,8 @@ use cortex::constants::{
     STALLED_TASK_GRACE_SECS, STALLED_TASK_SCAN_INTERVAL, WATCHDOG_STALL_THRESHOLD,
     WATCHDOG_TICK_INTERVAL,
 };
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 /// Callback the dispatcher invokes for each claimed task. The cli's

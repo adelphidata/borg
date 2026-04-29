@@ -3,10 +3,10 @@
 
 use super::{simple_task, test_db};
 use crate::db::NewTask;
-use crate::maintenance::{MaintenanceReport, MAINTENANCE_TASK_ID};
+use crate::maintenance::{MAINTENANCE_TASK_ID, MaintenanceReport};
 use crate::tasks::{
-    calculate_next_run, heal_stalled_tasks, recover_wedged_runs, RUN_STATUS_FAILED,
-    RUN_STATUS_MISSED, RUN_STATUS_RUNNING, RUN_STATUS_SUCCESS,
+    RUN_STATUS_FAILED, RUN_STATUS_MISSED, RUN_STATUS_RUNNING, RUN_STATUS_SUCCESS,
+    calculate_next_run, heal_stalled_tasks, recover_wedged_runs,
 };
 use rusqlite::params;
 

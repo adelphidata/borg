@@ -28,8 +28,8 @@ use cortex::db::{Database, NewTask, NewWorkflowStep, UpdateTask};
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
-    api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ProjectRef, ScheduledTaskUpdate,
+    ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef, ProjectRef, ScheduledTaskUpdate,
+    api_key_value::Body as ApiKeyBody,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;

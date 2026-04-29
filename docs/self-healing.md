@@ -46,7 +46,17 @@ Each run does the following in order:
    experimental test workflows accumulate indefinitely and any left in
    `running` across a daemon restart burst-process all at once and spam
    the activity log.
-6. **Stalled-task scan.** Recomputes `next_run` for any recurring
+6. **Retention purge.** When `data.purge_policy = Auto` and
+   `data.retention_days` is set, deletes old `messages` rows and
+   tombstones old `audit_log_chain` rows in place so the hash chain
+   remains verifiable while older payloads age out.
+7. **Weekly auto-backup.** When `data.backup_keep_count > 0` and no
+   backup has been created in the last 7 days, writes a
+   `borg-backup-<timestamp>.tar.zst` snapshot under `~/.borg/backups/`
+   and prunes older backups past the keep count. When
+   `backup_keep_count = 0`, maintenance prunes any leftover auto-backup
+   files instead of creating new ones.
+8. **Stalled-task scan.** Recomputes `next_run` for any recurring
    scheduled task whose fire time has drifted more than one hour into
    the past (see below). When more than
    `CLOCK_JUMP_AGGREGATE_THRESHOLD` (5) tasks look stalled in a single
@@ -56,10 +66,13 @@ Each run does the following in order:
    is still recomputed for every task; only the audit entry is
    aggregated. `HealReport.aggregated` flags the case for the daemon
    log.
-7. **Persistent-warning surfacing.** Compares this run's Warn/Fail
-   checks against the previous run; any issue that appeared in both is
-   added to `MaintenanceReport.persistent_warnings`. Single-run flukes
-   do not escalate — only nags that stick. Because step 1 includes the
+9. **Wedged-run recovery.** Marks any `task_runs` row stuck in
+   `status='running'` past its timeout as `failed`, using the task's own
+   `timeout_ms` when present and the 1-hour default grace otherwise.
+10. **Persistent-warning surfacing.** Compares this run's Warn/Fail
+    checks against the previous run; any issue that appeared in both is
+    added to `MaintenanceReport.persistent_warnings`. Single-run flukes
+    do not escalate — only nags that stick. Because step 1 includes the
    SQLite integrity check, a genuinely corrupt database will surface
    as a persistent warning after two consecutive sweeps.
 
@@ -83,9 +96,10 @@ projection plus any persistent warnings inline.
 
 Unlike `/doctor` (read-only diagnostics, streamed), `/heal` executes
 the mutating steps: log truncation, activity-log pruning, embedding
-eviction, workflow pruning, stalled-task healing. Use `/doctor` when
-you want a quick health readout; use `/heal` when you want the sweep
-to actually do its housekeeping.
+eviction, workflow pruning, retention purge, backup creation/pruning,
+stalled-task healing, and wedged task-run recovery. Use `/doctor` when
+you want a quick health readout; use `/heal` when you want the sweep to
+actually do its housekeeping.
 
 ### Disabling
 
