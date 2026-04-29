@@ -13,26 +13,26 @@ use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
-    ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyEntry, ApiKeyList,
-    ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList,
-    ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest, CreateWebhookResponse, DaemonStatus,
-    Empty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
-    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    KeychainRef, LogActivityRequest, MessageView, MonthlyTokenTotal, MonthlyTotalCost,
-    OnboardingState, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
-    ProjectUpdate, RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
-    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
-    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
-    TriggerHeartbeatRequest, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
-    admin_server::Admin,
+    admin_server::Admin, ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus,
+    ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender,
+    ApprovedSenderList, ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest,
+    CreateWebhookResponse, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
+    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
+    IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
+    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
+    PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
+    Project, ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RemoveProviderRequest,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
+    SessionList, SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation,
+    SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef, WorkflowList,
+    WorkflowSummary,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc};
-use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::Stream;
 use tonic::{Request, Response, Status as TStatus};
 
 /// Admin service implementation.
@@ -627,7 +627,7 @@ impl Admin for AdminSvc {
         let session_id = req.session_id;
         let (rendered, suggested) =
             tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-                use cortex::export::{ExportFormat, ExportOptions, export_session};
+                use cortex::export::{export_session, ExportFormat, ExportOptions};
                 use std::str::FromStr;
                 let format = ExportFormat::from_str(&format_str)?;
                 let db = Database::open()?;

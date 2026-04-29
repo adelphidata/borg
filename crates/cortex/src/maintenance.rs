@@ -18,7 +18,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::doctor::{CheckStatus, DiagnosticCheck, run_diagnostics};
+use crate::doctor::{run_diagnostics, CheckStatus, DiagnosticCheck};
 
 /// Single source of truth for the seeded maintenance task's UUID. The V37
 /// migration inserts this id and the dispatcher matches against it.
