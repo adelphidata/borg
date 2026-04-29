@@ -44,7 +44,7 @@ CREATE TABLE workflows (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     goal TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',  -- pending | running | completed | failed | cancelled
+    status TEXT NOT NULL DEFAULT 'pending',  -- created workflows are inserted as running by the scheduler path
     current_step INTEGER NOT NULL DEFAULT 0,
     session_id TEXT REFERENCES sessions(id),
     project_id TEXT REFERENCES projects(id),
@@ -88,6 +88,8 @@ Workflows use the existing `schedule` tool with `type: "workflow"`:
 ```
 
 Actions: `create`, `list`, `get`, `cancel`
+
+New workflows are created in a runnable `running` state so the daemon can pick up step 1 on its next tick. `pending` remains a valid stored status but is not currently used by the creation path.
 
 ## Model-aware auto-enable
 

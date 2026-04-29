@@ -152,6 +152,14 @@ fn test_fail_retry_then_succeed_completes_workflow() {
     assert_eq!(s.retry_count, 1);
     db.complete_workflow_step(s.id, "success on retry").unwrap();
 
+    let all_steps = db.get_workflow_steps("wf-1").unwrap();
+    assert_eq!(all_steps[0].status, step_status::COMPLETED);
+    assert_eq!(all_steps[0].output.as_deref(), Some("success on retry"));
+    assert!(
+        all_steps[0].error.is_none(),
+        "completed retry should clear stale error state"
+    );
+
     let wf = db.get_workflow("wf-1").unwrap().unwrap();
     assert_eq!(wf.status, status::COMPLETED);
 }

@@ -202,6 +202,20 @@ impl Database {
     fn claim_next_workflow_step_inner(&self, workflow_id: &str) -> Result<Option<WorkflowStepRow>> {
         let now = chrono::Utc::now().timestamp();
 
+        let workflow_status: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT status FROM workflows WHERE id = ?1",
+                params![workflow_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if workflow_status.as_deref() != Some(status::RUNNING) {
+            self.conn.execute_batch("COMMIT")?;
+            return Ok(None);
+        }
+
         // Find the first pending step by index order
         let step_id: Option<i64> = self
             .conn
@@ -252,7 +266,7 @@ impl Database {
 
         // Only update if step is still running (guard against cancel race)
         let rows_affected = tx.execute(
-            "UPDATE workflow_steps SET status = ?1, output = ?2, completed_at = ?3
+            "UPDATE workflow_steps SET status = ?1, output = ?2, error = NULL, completed_at = ?3
              WHERE id = ?4 AND status = ?5",
             params![
                 step_status::COMPLETED,
