@@ -32,6 +32,15 @@ impl Default for StatusSvc {
     }
 }
 
+fn drift_notice_for_vitals(
+    raw: &cortex::vitals::VitalsState,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let decayed = cortex::vitals::apply_decay(raw, now);
+    let drift = cortex::vitals::detect_drift(&decayed, now);
+    cortex::vitals::format_drift_notice(&drift).unwrap_or_default()
+}
+
 #[tonic::async_trait]
 impl Status for StatusSvc {
     async fn get_vitals(&self, _req: Request<Empty>) -> Result<Response<Vitals>, TStatus> {
@@ -40,8 +49,7 @@ impl Status for StatusSvc {
             let raw = db.get_vitals_state()?;
             let now = chrono::Utc::now();
             let state = cortex::vitals::apply_decay(&raw, now);
-            let drift = cortex::vitals::detect_drift(&raw, now);
-            let drift_notice = cortex::vitals::format_drift_notice(&drift).unwrap_or_default();
+            let drift_notice = drift_notice_for_vitals(&raw, now);
             let evo = match db.get_evolution_state() {
                 Ok(e) => Some(e),
                 Err(e) => {
@@ -491,7 +499,21 @@ fn parse_interval_seconds(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_interval_seconds;
+    use super::{drift_notice_for_vitals, parse_interval_seconds};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn drift_notice_uses_decayed_state_thresholds() {
+        let mut state = cortex::vitals::baseline();
+        state.last_interaction_at = Utc::now() - Duration::hours(49);
+
+        let notice = drift_notice_for_vitals(&state, Utc::now());
+
+        assert!(
+            notice.contains("inactive"),
+            "expected inactivity drift from the decayed state, got {notice:?}"
+        );
+    }
 
     #[test]
     fn interval_parses_common_suffixes() {

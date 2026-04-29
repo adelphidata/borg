@@ -641,9 +641,9 @@ async fn status_rpcs_round_trip_evolution_bond_vitals_and_xp() {
     assert_eq!(v_events.events.len(), 1);
     let v = &v_events.events[0];
     assert_eq!(v.category, "interaction");
-    // Interaction category's canonical sync delta is +1; this asserts the
+    // Interaction category's canonical sync delta is +2; this asserts the
     // proto field translation didn't get crossed with another delta column.
-    assert_eq!(v.sync_delta, 1);
+    assert_eq!(v.sync_delta, 2);
 
     // GetXp: total_xp must match GetEvolution (single source of truth).
     let xp = status

@@ -282,38 +282,38 @@ pub fn deltas_for(category: EventCategory) -> StatDeltas {
     match category {
         EventCategory::Interaction => StatDeltas {
             stability: 0,
-            focus: 0,
-            sync: 1,
+            focus: 1,
+            sync: 2,
             growth: 0,
-            happiness: 0,
+            happiness: 1,
         },
         EventCategory::Success => StatDeltas {
             stability: 1,
-            focus: 0,
+            focus: 1,
             sync: 0,
             growth: 0,
-            happiness: 0,
+            happiness: 1,
         },
         EventCategory::Failure => StatDeltas {
-            stability: -1,
-            focus: 0,
+            stability: -2,
+            focus: -1,
             sync: 0,
-            growth: 0,
+            growth: -1,
             happiness: 0,
         },
         EventCategory::Correction => StatDeltas {
-            stability: -1,
-            focus: -1,
-            sync: 0,
+            stability: -3,
+            focus: -2,
+            sync: -1,
             growth: 0,
             happiness: -1,
         },
         EventCategory::Creation => StatDeltas {
-            stability: 1,
-            focus: 0,
-            sync: 0,
-            growth: 1,
-            happiness: 1,
+            stability: 2,
+            focus: 1,
+            sync: 1,
+            growth: 3,
+            happiness: 3,
         },
         EventCategory::NegativeSentiment => StatDeltas {
             stability: -2,
@@ -501,7 +501,7 @@ pub fn detect_drift(state: &VitalsState, now: DateTime<Utc>) -> Vec<DriftFlag> {
     if state.stability < 30 {
         flags.push(DriftFlag::LowStability);
     }
-    if state.sync < 35 {
+    if state.sync < 40 {
         flags.push(DriftFlag::LowSync);
     }
     if state.happiness < 30 {
@@ -521,7 +521,7 @@ pub fn detect_failure_drift(events: &[VitalsEvent]) -> bool {
 
 /// Deterministic recommendation based on current vitals.
 pub fn recommend(state: &VitalsState) -> Recommendation {
-    if state.sync < 35 {
+    if state.sync < 40 {
         return Recommendation {
             reason: "Sync is low",
             tip: "Have a conversation or start a task to restore sync",
@@ -809,31 +809,31 @@ mod tests {
         let d = deltas_for(EventCategory::Interaction);
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
-            (0, 0, 1, 0, 0)
+            (0, 1, 2, 0, 1)
         );
 
         let d = deltas_for(EventCategory::Success);
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
-            (1, 0, 0, 0, 0)
+            (1, 1, 0, 0, 1)
         );
 
         let d = deltas_for(EventCategory::Failure);
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
-            (-1, 0, 0, 0, 0)
+            (-2, -1, 0, -1, 0)
         );
 
         let d = deltas_for(EventCategory::Correction);
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
-            (-1, -1, 0, 0, -1)
+            (-3, -2, -1, 0, -1)
         );
 
         let d = deltas_for(EventCategory::Creation);
         assert_eq!(
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
-            (1, 0, 0, 1, 1)
+            (2, 1, 1, 3, 3)
         );
 
         let d = deltas_for(EventCategory::NegativeSentiment);
@@ -849,10 +849,10 @@ mod tests {
         let deltas = deltas_for(EventCategory::Interaction);
         apply_deltas(&mut state, &deltas);
         assert_eq!(state.stability, 40);
-        assert_eq!(state.focus, 40);
-        assert_eq!(state.sync, 41);
+        assert_eq!(state.focus, 41);
+        assert_eq!(state.sync, 42);
         assert_eq!(state.growth, 40);
-        assert_eq!(state.happiness, 40);
+        assert_eq!(state.happiness, 41);
     }
 
     #[test]
@@ -862,8 +862,8 @@ mod tests {
         state.growth = 99;
         let deltas = deltas_for(EventCategory::Creation);
         apply_deltas(&mut state, &deltas);
-        assert_eq!(state.stability, 100); // 100 + 1 clamped to 100
-        assert_eq!(state.growth, 100); // 99 + 1 = 100
+        assert_eq!(state.stability, 100); // 100 + 2 clamped to 100
+        assert_eq!(state.growth, 100); // 99 + 3 clamped to 100
     }
 
     #[test]
@@ -964,7 +964,7 @@ mod tests {
     fn test_drift_low_stats() {
         let mut state = baseline();
         state.stability = 25;
-        state.sync = 34;
+        state.sync = 39;
         state.happiness = 20;
         let drift = detect_drift(&state, Utc::now());
         assert!(drift.contains(&DriftFlag::LowStability));
@@ -1254,9 +1254,9 @@ mod tests {
         };
 
         let state = replay_events(&[legit, tampered]);
-        // Only the legit event should be applied (creation: +1 stab)
-        assert_eq!(state.stability, 41); // 40 + 1
-        assert_eq!(state.growth, 41); // 40 + 1
+        // Only the legit event should be applied (creation: +2 stability, +3 growth)
+        assert_eq!(state.stability, 42); // 40 + 2
+        assert_eq!(state.growth, 43); // 40 + 3
     }
 
     // ── Rate Limiting ──
@@ -1292,16 +1292,16 @@ mod tests {
 
         let state = replay_events(&events);
         // Category cap is 3, but source decay also applies (all same source "test"):
-        // count 1: 1.0 (full), count 2: 1.0 (full), count 3: 0.5 → floor(1*0.5)=0
-        // So only 2 creation events contribute their +1 stability/growth
-        assert_eq!(state.stability, 40 + 2 * 1); // 42
-        assert_eq!(state.growth, 40 + 2 * 1); // 42
+        // count 1: 1.0 (full), count 2: 1.0 (full), count 3: 0.5 → floor(+2*0.5)=+1,
+        // floor(+3*0.5)=+1, floor(+1*0.5)=0 for focus/sync, floor(+3*0.5)=+1 happiness.
+        assert_eq!(state.stability, 45); // 40 + 2 + 2 + 1
+        assert_eq!(state.growth, 47); // 40 + 3 + 3 + 1
     }
 
     #[test]
     fn test_source_decay_skips_repeated_success() {
         // 4 success events from same source "run_shell" in same hour
-        // Success delta: stability +1
+        // Success delta: stability/focus/happiness +1
         // Decay: count 1-2 full, count 3 floor(1*0.5)=0, count 4 floor(1*0.25)=0
         let deltas = deltas_for(EventCategory::Success);
         let hour_base: i64 = 3600;
@@ -1335,6 +1335,8 @@ mod tests {
         }
         let state = replay_events(&events);
         assert_eq!(state.stability, 42); // 40 + 2, not 40 + 4
+        assert_eq!(state.focus, 42);
+        assert_eq!(state.happiness, 42);
     }
 
     #[test]
@@ -1366,11 +1368,13 @@ mod tests {
         }
         let state = replay_events(&events);
         assert_eq!(state.stability, 44); // 40 + 4, all full credit
+        assert_eq!(state.focus, 44);
+        assert_eq!(state.happiness, 44);
     }
 
     #[test]
     fn test_decay_attenuates_negative_deltas() {
-        // Failure deltas: stability -1. Repeated same-source failures should also decay.
+        // Failure deltas: stability -2, focus -1, growth -1. Repeated same-source failures decay.
         let deltas = deltas_for(EventCategory::Failure);
         let hour_base: i64 = 3600;
         let mut events = Vec::new();
@@ -1402,8 +1406,10 @@ mod tests {
             prev = hmac;
         }
         let state = replay_events(&events);
-        // Failure stability: -1. Decay: count 1-2 full (-1 each), count 3 ceil(-1*0.5)=0, count 4: 0
-        assert_eq!(state.stability, 38); // 40 - 2, not 40 - 4
+        // Failure stability: -2. Decay: count 1-2 full (-2 each), count 3 ceil(-2*0.5)=-1, count 4: 0
+        assert_eq!(state.stability, 35); // 40 - 2 - 2 - 1
+        assert_eq!(state.focus, 38); // 40 - 1 - 1
+        assert_eq!(state.growth, 38); // 40 - 1 - 1
     }
 
     #[test]
@@ -1499,6 +1505,8 @@ mod tests {
         let state = replay_events(&[event1, event2, event3]);
         // Only event1 should be applied (success: stability +1)
         assert_eq!(state.stability, 41); // 40 + 1
+        assert_eq!(state.focus, 41);
+        assert_eq!(state.happiness, 41);
         assert!(!state.chain_valid);
     }
 
@@ -1536,21 +1544,21 @@ mod tests {
         // InactiveTooLong fires (>48h), plus stat-based drift flags from baseline=40
         let drift = detect_drift(&decayed, Utc::now());
         assert!(drift.contains(&DriftFlag::LowStability)); // 40-8-5=27 < 30
-        assert!(drift.contains(&DriftFlag::LowSync)); // 40-6=34 < 35
+        assert!(drift.contains(&DriftFlag::LowSync)); // 40-6=34 < 40
         assert!(!drift.contains(&DriftFlag::LowHappiness)); // 40-4=36 >= 30
     }
 
     #[test]
     fn test_all_negative_events_from_baseline() {
         let mut state = baseline();
-        let deltas = deltas_for(EventCategory::Correction); // -1,-1,0,0,-1
+        let deltas = deltas_for(EventCategory::Correction); // -3,-2,-1,0,-1
                                                             // Apply 50 corrections — should drive all affected stats to 0 without underflow
         for _ in 0..50 {
             apply_deltas(&mut state, &deltas);
         }
         assert_eq!(state.stability, 0);
         assert_eq!(state.focus, 0);
-        assert_eq!(state.sync, 40); // corrections don't affect sync
+        assert_eq!(state.sync, 0); // corrections now affect sync
         assert_eq!(state.growth, 40); // corrections don't affect growth
         assert_eq!(state.happiness, 0);
     }
@@ -1558,15 +1566,16 @@ mod tests {
     #[test]
     fn test_growth_from_baseline() {
         let mut state = baseline();
-        let deltas = deltas_for(EventCategory::Creation); // +1,0,0,+1,+1
-                                                          // Apply 60 creations — growth should hit 100 (40 + 60 = 100)
+        let deltas = deltas_for(EventCategory::Creation); // +2,+1,+1,+3,+3
+                                                          // Apply 60 creations — affected stats should saturate at 100
         for _ in 0..60 {
             apply_deltas(&mut state, &deltas);
         }
         assert_eq!(state.growth, 100);
         assert_eq!(state.happiness, 100); // 40 + 60 = 100
         assert_eq!(state.stability, 100); // 40 + 60 = 100
-        assert_eq!(state.focus, 40); // creation doesn't affect focus
+        assert_eq!(state.focus, 100);
+        assert_eq!(state.sync, 100);
     }
 
     #[test]
@@ -1824,9 +1833,9 @@ mod tests {
         let events = build_chain(&specs);
 
         let state = replay_events(&events);
-        // sync delta per interaction is +1. First 5 apply (+5), 6th dropped,
-        // 7th in next hour applies (+1) → sync = 40 + 6 = 46.
-        assert_eq!(state.sync, 46);
+        // sync delta per interaction is +2. First 5 apply (+10), 6th dropped,
+        // 7th in next hour applies (+2) → sync = 40 + 12 = 52.
+        assert_eq!(state.sync, 52);
     }
 
     #[test]

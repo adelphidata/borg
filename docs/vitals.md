@@ -39,6 +39,7 @@ Events are classified into broad categories. New tools and integrations automati
 | **Failure** | Any tool errors | stability -2, focus -1, growth -1 |
 | **Correction** | User corrects the agent ("that's wrong", "try again", etc.) | stability -3, focus -2, sync -1, happiness -1 |
 | **Creation** | write_memory, apply_patch, apply_skill_patch, create_channel | stability +2, focus +1, sync +1, growth +3, happiness +3 |
+| **Negative Sentiment** | Strong profanity or hostile frustration from the user | stability -2, focus -1, happiness -10 |
 
 ## Inactivity Decay
 
@@ -64,7 +65,8 @@ When stats drop below thresholds, drift warnings appear:
 
 - **Event-sourced**: There is no mutable state table. Vitals are computed by replaying all verified events from baseline. This prevents gaming via direct SQL manipulation.
 - **HMAC chain**: Each event carries an HMAC-SHA256 signature chained from the previous event. Tampered or injected events are detected and skipped during replay.
-- **Rate limiting**: During replay, each event category is capped per hour (e.g., max 10 interactions/hr, 5 creations/hr). Bulk-inserting events just hits the ceiling.
+- **Rate limiting**: Event categories are capped per hour at write time and replay time. Current caps are interaction 5/hr, success 8/hr, failure 5/hr, correction 3/hr, creation 3/hr, and negative_sentiment 3/hr.
+- **Diminishing returns**: Repeating the same source within the same hour yields reduced impact, so spammed identical events taper off even before category caps are hit.
 - Events are stored in an append-only ledger (`vitals_events` table in SQLite)
 - Tracking happens via a lifecycle hook (`VitalsHook`) registered on the agent
 - Decay is lazy — computed when vitals are read, not on a timer

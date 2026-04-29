@@ -102,6 +102,7 @@ fn multiple_categories_recorded() {
         "failure",
         "correction",
         "creation",
+        "negative_sentiment",
     ];
     for cat in &categories {
         let ec = EventCategory::parse(cat).expect("parse category");
@@ -260,6 +261,7 @@ fn event_category_parse_round_trip() {
         "failure",
         "correction",
         "creation",
+        "negative_sentiment",
     ];
     for name in &categories {
         let cat = EventCategory::parse(name).expect("parse");

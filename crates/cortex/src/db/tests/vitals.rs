@@ -20,11 +20,11 @@ fn record_and_replay_vitals_event() {
     db.record_vitals_event("creation", "create_tool", &deltas, None)
         .unwrap();
     let state = db.get_vitals_state().unwrap();
-    assert_eq!(state.stability, 41); // 40 + 1
-    assert_eq!(state.focus, 40); // 40 + 0
-    assert_eq!(state.sync, 40); // 40 + 0
-    assert_eq!(state.growth, 41); // 40 + 1
-    assert_eq!(state.happiness, 41); // 40 + 1
+    assert_eq!(state.stability, 42); // 40 + 2
+    assert_eq!(state.focus, 41); // 40 + 1
+    assert_eq!(state.sync, 41); // 40 + 1
+    assert_eq!(state.growth, 43); // 40 + 3
+    assert_eq!(state.happiness, 43); // 40 + 3
 }
 
 #[test]
@@ -53,9 +53,11 @@ fn vitals_event_ledger_appends() {
     let events = db.vitals_events_since(0).unwrap();
     assert_eq!(events.len(), 5);
     // State replayed from events with source decay (all same source "run_shell"):
-    // counts 1-2: full (+1 each), count 3+: floor(1*0.5)=0, so only 2 count
+    // counts 1-2: full (+1 each to stability/focus/happiness), count 3+: floor(1*0.5)=0
     let state = db.get_vitals_state().unwrap();
     assert_eq!(state.stability, 42);
+    assert_eq!(state.focus, 42);
+    assert_eq!(state.happiness, 42);
 }
 
 #[test]
@@ -72,7 +74,9 @@ fn vitals_hmac_chain_integrity() {
     assert!(!events[1].hmac.is_empty());
     // State should be valid (both events applied)
     let state = db.get_vitals_state().unwrap();
-    assert_eq!(state.sync, 42); // 40 + 1 + 1
+    assert_eq!(state.focus, 42); // 40 + 1 + 1
+    assert_eq!(state.sync, 44); // 40 + 2 + 2
+    assert_eq!(state.happiness, 42); // 40 + 1 + 1
 }
 
 // ── Bond DB Tests ──
@@ -830,6 +834,7 @@ fn vitals_accepts_correct_deltas_for_each_category() {
         "failure",
         "correction",
         "creation",
+        "negative_sentiment",
     ];
     for cat in &categories {
         let deltas = crate::vitals::deltas_for(match *cat {
@@ -838,12 +843,13 @@ fn vitals_accepts_correct_deltas_for_each_category() {
             "failure" => crate::vitals::EventCategory::Failure,
             "correction" => crate::vitals::EventCategory::Correction,
             "creation" => crate::vitals::EventCategory::Creation,
+            "negative_sentiment" => crate::vitals::EventCategory::NegativeSentiment,
             _ => unreachable!(),
         });
         db.record_vitals_event(cat, "test", &deltas, None).unwrap();
     }
     let events = db.vitals_events_since(0).unwrap();
-    assert_eq!(events.len(), 5, "all 5 valid categories should persist");
+    assert_eq!(events.len(), 6, "all valid categories should persist");
 }
 
 // ── Pending Celebrations ──
