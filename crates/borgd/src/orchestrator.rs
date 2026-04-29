@@ -5,6 +5,7 @@
 //! `service::run_daemon` shim — the latter remains until the legacy entry
 //! points are fully retired.
 
+use crate::heartbeat::HeartbeatTrigger;
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
@@ -51,7 +52,9 @@ fn spawn_gateway(
 pub struct OrchestratorHandles {
     /// Bus subscribers read for `Admin.SubscribeHeartbeatEvents`.
     pub heartbeat_bus: HeartbeatBus,
-    /// `Admin.Poke` sends `()` here to trigger an immediate heartbeat.
+    /// Admin RPCs send heartbeat requests here.
+    pub heartbeat_trigger_tx: mpsc::Sender<HeartbeatTrigger>,
+    /// Legacy poke endpoint sends `()` here to trigger an immediate heartbeat.
     pub poke_tx: mpsc::Sender<()>,
     /// Executor `Admin.SendApprovalGreeting` and the heartbeat scheduler share.
     pub executor: Arc<DaemonSessionExecutor>,
@@ -71,7 +74,7 @@ pub fn start(
         config.clone(),
         BorgMetrics::noop(),
     ));
-    let (heartbeat_bus, poke_tx) =
+    let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) =
         heartbeat::spawn(config.clone(), executor.clone(), shutdown.clone());
 
     // Gateway with respawn supervisor.
@@ -181,6 +184,7 @@ pub fn start(
 
     OrchestratorHandles {
         heartbeat_bus,
+        heartbeat_trigger_tx,
         poke_tx,
         executor,
     }

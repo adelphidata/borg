@@ -31,8 +31,8 @@ use protocols::admin::{
     ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RemoveProviderRequest,
     RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
     ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, WarningList, WebhookRef,
-    WorkflowList,
+    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, TriggerHeartbeatRequest,
+    WarningList, WebhookRef, WorkflowList,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -357,6 +357,22 @@ impl DaemonClient {
             .poke(AdminEmpty {})
             .await
             .context("Admin.Poke failed")?;
+        Ok(())
+    }
+
+    /// Trigger a specific heartbeat source on the daemon.
+    pub async fn trigger_heartbeat(
+        &mut self,
+        source: &str,
+        bypass_quiet_hours: bool,
+    ) -> Result<()> {
+        self.admin
+            .trigger_heartbeat(TriggerHeartbeatRequest {
+                source: source.to_string(),
+                bypass_quiet_hours,
+            })
+            .await
+            .context("Admin.TriggerHeartbeat failed")?;
         Ok(())
     }
 

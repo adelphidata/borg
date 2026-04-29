@@ -89,6 +89,8 @@ pub const AUGMENTERS: &[Augmenter] = &[
     },
 ];
 
+const SESSION_START_AUGMENTER_IDS: &[&str] = &["no_channels_configured"];
+
 /// Run every augmenter in [`AUGMENTERS`] and return the snippets that both
 /// fire and are past their cooldown.
 ///
@@ -98,9 +100,29 @@ pub const AUGMENTERS: &[Augmenter] = &[
 /// bypassed and every firing augmenter is returned — we prefer an extra
 /// nudge to a silent heartbeat.
 pub fn collect(config: &Config, db: Option<&Database>) -> Vec<String> {
+    collect_matching(config, db, |_| true)
+}
+
+/// Session-start greetings use a smaller proactive set than scheduled
+/// heartbeats. Today that means only the no-channels nudge so opening the TUI
+/// still teaches the user how to reach Borg proactively on the go.
+pub fn collect_session_start(config: &Config, db: Option<&Database>) -> Vec<String> {
+    collect_matching(config, db, |aug| {
+        SESSION_START_AUGMENTER_IDS.contains(&aug.id)
+    })
+}
+
+fn collect_matching(
+    config: &Config,
+    db: Option<&Database>,
+    include: impl Fn(&Augmenter) -> bool,
+) -> Vec<String> {
     let now = unix_now();
     let mut out = Vec::new();
     for aug in AUGMENTERS {
+        if !include(aug) {
+            continue;
+        }
         let Some(snippet) = (aug.check)(config) else {
             continue;
         };
@@ -256,6 +278,33 @@ mod tests {
             }
             Self { saved, _lock: lock }
         }
+    }
+
+    #[test]
+    fn collect_session_start_includes_no_channels_nudge() {
+        let _env = EnvGuard::clear_native();
+        let config = Config::default();
+        let nudges = collect_session_start(&config, None);
+        assert!(
+            nudges
+                .iter()
+                .any(|n| n.contains("No messaging channels are configured yet")),
+            "expected no-channels nudge, got: {nudges:?}"
+        );
+    }
+
+    #[test]
+    fn collect_session_start_excludes_security_nudge() {
+        let _env = EnvGuard::clear_native();
+        let mut config = Config::default();
+        config.security.host_audit = true;
+        let nudges = collect_session_start(&config, None);
+        assert!(
+            nudges
+                .iter()
+                .all(|n| !n.contains("Critical host security issues")),
+            "session-start should stay focused, got: {nudges:?}"
+        );
     }
 
     impl Drop for EnvGuard {

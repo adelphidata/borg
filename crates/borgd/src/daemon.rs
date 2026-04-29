@@ -120,7 +120,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             grpc::AdminExtras {
                 heartbeat_bus: Some(handles.heartbeat_bus),
                 executor: Some(handles.executor),
-                poke_tx: Some(handles.poke_tx),
+                heartbeat_trigger_tx: Some(handles.heartbeat_trigger_tx),
                 shutdown_tx: Some(shutdown_tx.clone()),
             }
         }
@@ -131,7 +131,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             grpc::AdminExtras {
                 heartbeat_bus: None,
                 executor: None,
-                poke_tx: None,
+                heartbeat_trigger_tx: None,
                 shutdown_tx: Some(shutdown_tx.clone()),
             }
         }

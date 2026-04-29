@@ -6,6 +6,7 @@ pub mod session;
 pub mod status;
 
 use crate::heartbeat::HeartbeatBus;
+use crate::heartbeat::HeartbeatTrigger;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use protocols::admin::admin_server::AdminServer;
 use protocols::capability::capability_server::CapabilityServer;
@@ -47,14 +48,14 @@ pub struct AdminExtras {
     pub heartbeat_bus: Option<HeartbeatBus>,
     /// Executor used by `Admin.SendApprovalGreeting`.
     pub executor: Option<Arc<DaemonSessionExecutor>>,
-    /// Channel `Admin.Poke` signals to trigger an immediate heartbeat.
-    pub poke_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Channel Admin RPCs signal to trigger an immediate heartbeat.
+    pub heartbeat_trigger_tx: Option<tokio::sync::mpsc::Sender<HeartbeatTrigger>>,
     /// Broadcaster `Admin.Shutdown` fires.
     pub shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
-/// bus, approval-greeting executor, poke + shutdown senders).
+/// bus, approval-greeting executor, heartbeat-trigger + shutdown senders).
 pub fn build_services_with_extras(
     registry: SessionRegistry,
     factory: Arc<dyn session::SessionFactory>,
@@ -68,8 +69,8 @@ pub fn build_services_with_extras(
     if let Some(executor) = extras.executor {
         admin_svc = admin_svc.with_executor(executor);
     }
-    if let Some(tx) = extras.poke_tx {
-        admin_svc = admin_svc.with_poke_sender(tx);
+    if let Some(tx) = extras.heartbeat_trigger_tx {
+        admin_svc = admin_svc.with_heartbeat_trigger_sender(tx);
     }
     if let Some(tx) = extras.shutdown_tx {
         admin_svc = admin_svc.with_shutdown_sender(tx);

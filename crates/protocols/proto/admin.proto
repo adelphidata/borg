@@ -6,6 +6,7 @@ package borg.admin.v1;
 // direct DB reads from the TUI popups.
 service Admin {
   rpc Poke(Empty) returns (Empty);
+  rpc TriggerHeartbeat(TriggerHeartbeatRequest) returns (Empty);
   rpc Heal(Empty) returns (HealReport);
   rpc Shutdown(Empty) returns (Empty);
 
@@ -147,6 +148,15 @@ message ApprovalGreetingRequest {
   string sender_id = 2;
 }
 
+message TriggerHeartbeatRequest {
+  // "scheduled" or "session_start"
+  string source = 1;
+  // When true, run even if quiet hours would normally suppress a scheduled
+  // heartbeat. Session-start greetings use this because opening the TUI is an
+  // explicit user action.
+  bool bypass_quiet_hours = 2;
+}
+
 message HeartbeatEvent {
   // "scheduled" or "session_start"
   string source = 1;
@@ -156,6 +166,8 @@ message HeartbeatEvent {
   string status = 4;
   string message = 5;
   double duration_ms = 6;
+  // "quiet_hours" | "empty_response" | "duplicate_response" | ""
+  string skip_reason = 7;
 }
 
 message OnboardingState {

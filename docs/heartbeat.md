@@ -6,10 +6,10 @@ The heartbeat system enables proactive check-ins -- the agent can reach out to y
 
 ## How it works
 
-1. A `HeartbeatScheduler` runs as a separate tokio task alongside the TUI or daemon
+1. A `HeartbeatScheduler` runs inside `borgd` as a separate tokio task
 2. At each interval tick (or cron fire), the agent sends a prompt to the LLM with its personality, memory context, and HEARTBEAT.md checklist
 3. If the LLM has something useful to say, it responds; otherwise it returns an empty message
-4. Heartbeat messages render in cyan as `[heartbeat]` prefix in the TUI
+4. `borgd` publishes heartbeat lifecycle events; the TUI subscribes and renders heartbeat messages in cyan as a `[heartbeat]` prefix
 5. Duplicate and empty responses are suppressed
 6. Responses can be delivered to messaging channels (Telegram, Slack, Discord)
 
@@ -20,7 +20,7 @@ borg settings set heartbeat.interval "30m"
 borg settings set heartbeat.cron "0 */30 * * * *"       # optional, overrides interval
 borg settings set heartbeat.quiet_hours_start "00:00"
 borg settings set heartbeat.quiet_hours_end "06:00"
-borg settings set heartbeat.channels '["telegram"]'     # empty = TUI only
+borg settings set heartbeat.channels '["telegram"]'     # empty = local TUI/transcript only
 ```
 
 ### Interval format
@@ -50,6 +50,17 @@ If quiet hours are not configured, heartbeats fire at every interval.
 
 When `channels` is set (e.g., `["telegram"]`), heartbeat responses are delivered to the owner's `sender_id` from the `approved_senders` table. This requires the gateway to be running and the owner to have paired with the channel.
 
+When `channels` is empty, heartbeats still run. They are simply rendered locally in the TUI transcript instead of being pushed to an external messaging provider.
+
+## Session-start greetings
+
+Opening the TUI can trigger a proactive `session_start` heartbeat even if no messaging provider is configured.
+
+- It uses a dedicated session-start prompt rather than the generic scheduled heartbeat prompt.
+- It respects `heartbeat.session_start_enabled` and `heartbeat.session_start_throttle_minutes`.
+- It bypasses quiet hours because opening the TUI is an explicit user action.
+- If no messaging channels are configured, Borg can proactively suggest installing one from `/plugins`.
+
 ### HEARTBEAT.md checklist
 
 Create an optional `~/.borg/HEARTBEAT.md` file with a checklist for the agent to follow during heartbeat turns. For example:
@@ -76,7 +87,7 @@ borg poke
 
 From the TUI, use `/poke`.
 
-This sends a poke signal to the heartbeat scheduler, triggering a heartbeat that bypasses quiet hours. The CLI sends an HTTP POST to `/internal/poke` on the gateway; the TUI sends directly via channel when it owns the scheduler.
+This sends a poke signal to the daemon, triggering a scheduled heartbeat that bypasses quiet hours. The CLI prefers the daemon gRPC API and falls back to the legacy HTTP `/internal/poke` gateway endpoint if needed.
 
 ## Daemon mode
 
@@ -86,7 +97,7 @@ For running heartbeat check-ins and scheduled tasks without the interactive TUI,
 borg daemon
 ```
 
-The daemon runs the heartbeat scheduler alongside the gateway server. It executes heartbeat check-ins, scheduled tasks, and handles messaging webhooks. Combine with `borg service install` to run it as a system service (launchd on macOS, systemd on Linux).
+The daemon runs the heartbeat scheduler alongside the gateway server. It executes heartbeat check-ins, session-start greetings, scheduled tasks, and messaging webhooks. Combine with `borg service install` to run it as a system service (launchd on macOS, systemd on Linux).
 
 ## Heartbeat prompt
 

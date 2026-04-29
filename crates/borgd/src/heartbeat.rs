@@ -41,6 +41,24 @@ impl HeartbeatSource {
             Self::SessionStart => "session_start",
         }
     }
+
+    /// Parse the wire-format string used by the proto event / admin RPC.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "scheduled" => Some(Self::Scheduled),
+            "session_start" => Some(Self::SessionStart),
+            _ => None,
+        }
+    }
+}
+
+/// External request to run a heartbeat turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatTrigger {
+    /// Why this turn is running.
+    pub source: HeartbeatSource,
+    /// When true, run even if quiet hours would normally suppress it.
+    pub bypass_quiet_hours: bool,
 }
 
 /// Daemon broadcast event for `Admin.SubscribeHeartbeatEvents`.
@@ -56,6 +74,8 @@ pub struct DaemonHeartbeatEvent {
     pub status: &'static str,
     /// User-visible message or skip/failure reason.
     pub message: String,
+    /// Structured skip reason for `"skipped"` events, when available.
+    pub skip_reason: Option<&'static str>,
     /// Wall-clock duration of the agent turn.
     pub duration_ms: f64,
 }
@@ -98,8 +118,9 @@ impl HeartbeatBus {
 }
 
 /// Spawn the heartbeat scheduler + an agent-turn runner. Returns the bus
-/// that `Admin.SubscribeHeartbeatEvents` reads from and the `poke_tx` channel
-/// the Admin.Poke handler signals.
+/// that `Admin.SubscribeHeartbeatEvents` reads from, the rich trigger channel
+/// Admin RPCs use, and the legacy `poke_tx` channel the HTTP gateway still
+/// signals.
 ///
 /// `shutdown` cancels both spawned tasks. `executor` is used to run each
 /// heartbeat turn through the daemon's session machinery (so heartbeats share
@@ -108,8 +129,13 @@ pub fn spawn(
     config: Config,
     executor: Arc<DaemonSessionExecutor>,
     shutdown: CancellationToken,
-) -> (HeartbeatBus, mpsc::Sender<()>) {
+) -> (
+    HeartbeatBus,
+    mpsc::Sender<HeartbeatTrigger>,
+    mpsc::Sender<()>,
+) {
     let (hb_tx, mut hb_rx) = mpsc::channel::<SchedulerEvent>(32);
+    let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
     let (poke_tx, poke_rx) = mpsc::channel::<()>(8);
 
     let tz = config.user_timezone();
@@ -131,57 +157,122 @@ pub fn spawn(
                 _ = runner_cancel.cancelled() => return,
                 evt = hb_rx.recv() => {
                     let Some(evt) = evt else { return };
-                    if let SchedulerEvent::Fire = evt {
-                        // Serialize fires: dedup state (LAST_HASH/LAST_HASH_TIME)
-                        // is read-modify-write on two independent atomics, so
-                        // overlapping fires would race. Heartbeats are rare —
-                        // running sequentially is fine.
-                        run_and_broadcast(
-                            &runner_executor,
-                            &runner_config,
-                            HeartbeatSource::Scheduled,
-                            &bus_for_runner,
-                        ).await;
+                    match evt {
+                        SchedulerEvent::Fire => {
+                            // Serialize fires: dedup state (LAST_HASH/LAST_HASH_TIME)
+                            // is read-modify-write on two independent atomics, so
+                            // overlapping fires would race. Heartbeats are rare —
+                            // running sequentially is fine.
+                            run_and_broadcast(
+                                &runner_executor,
+                                &runner_config,
+                                HeartbeatTrigger {
+                                    source: HeartbeatSource::Scheduled,
+                                    bypass_quiet_hours: false,
+                                },
+                                &bus_for_runner,
+                            ).await;
+                        }
+                        SchedulerEvent::Result(result) => {
+                            publish_scheduler_result(&bus_for_runner, HeartbeatSource::Scheduled, result);
+                        }
+                        SchedulerEvent::SchedulerStarted { .. } => {}
                     }
+                }
+                trigger = trigger_rx.recv() => {
+                    let Some(trigger) = trigger else { return };
+                    if should_skip_explicit_trigger(trigger, &runner_config) {
+                        publish_scheduler_result(
+                            &bus_for_runner,
+                            trigger.source,
+                            HeartbeatResult::Skipped {
+                                reason: SkipReason::QuietHours,
+                            },
+                        );
+                        continue;
+                    }
+                    run_and_broadcast(
+                        &runner_executor,
+                        &runner_config,
+                        trigger,
+                        &bus_for_runner,
+                    ).await;
                 }
             }
         }
     });
 
-    (bus, poke_tx)
+    (bus, trigger_tx, poke_tx)
 }
 
 /// Run a heartbeat turn and broadcast the result on `bus`. Fire-and-forget.
 pub async fn run_and_broadcast(
     executor: &DaemonSessionExecutor,
     config: &Config,
-    source: HeartbeatSource,
+    trigger: HeartbeatTrigger,
     bus: &HeartbeatBus,
 ) {
     let started = chrono::Utc::now().timestamp();
     let started_at = Instant::now();
-    let result = execute_heartbeat_turn(executor, config, source).await;
+    let result = execute_heartbeat_turn(executor, config, trigger.source).await;
     let finished = chrono::Utc::now().timestamp();
     let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
 
-    let (status, message) = match result {
+    let (status, message, skip_reason) = match result {
         HeartbeatResult::Ran { message, .. } => {
             // Deliver to configured channels (matches legacy
             // `daemon_heartbeat_turn` in service/mod.rs).
             deliver_to_channels(config, &message).await;
-            ("ran", message)
+            ("ran", message, None)
         }
-        HeartbeatResult::Skipped { reason } => ("skipped", reason.to_string()),
-        HeartbeatResult::Failed { error } => ("failed", error),
+        HeartbeatResult::Skipped { reason } => (
+            "skipped",
+            reason.to_string(),
+            Some(skip_reason_wire(&reason)),
+        ),
+        HeartbeatResult::Failed { error } => ("failed", error, None),
     };
 
     bus.publish(DaemonHeartbeatEvent {
-        source,
+        source: trigger.source,
         started_at_unix: started,
         finished_at_unix: finished,
         status,
         message,
+        skip_reason,
         duration_ms,
+    });
+}
+
+fn should_skip_explicit_trigger(trigger: HeartbeatTrigger, config: &Config) -> bool {
+    !trigger.bypass_quiet_hours
+        && trigger.source == HeartbeatSource::Scheduled
+        && is_quiet_hours(config)
+}
+
+fn publish_scheduler_result(bus: &HeartbeatBus, source: HeartbeatSource, result: HeartbeatResult) {
+    let (status, message, skip_reason) = match result {
+        HeartbeatResult::Ran {
+            message,
+            duration_ms: _,
+        } => ("ran", message, None),
+        HeartbeatResult::Skipped { reason } => (
+            "skipped",
+            reason.to_string(),
+            Some(skip_reason_wire(&reason)),
+        ),
+        HeartbeatResult::Failed { error } => ("failed", error, None),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    bus.publish(DaemonHeartbeatEvent {
+        source,
+        started_at_unix: now,
+        finished_at_unix: now,
+        status,
+        message,
+        skip_reason,
+        duration_ms: 0.0,
     });
 }
 
@@ -265,9 +356,14 @@ pub async fn execute_heartbeat_turn(
         };
     }
 
-    if let Ok(adb) = cortex::db::Database::open() {
-        if let Err(e) = adb.set_setting("heartbeat.last_fired_at", &now_secs.to_string()) {
-            tracing::warn!("Heartbeat: failed to persist last_fired_at: {e}");
+    match cortex::db::Database::open() {
+        Ok(adb) => {
+            if let Err(e) = adb.set_setting("heartbeat.last_fired_at", &now_secs.to_string()) {
+                tracing::warn!("Heartbeat: failed to persist last_fired_at: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Heartbeat: failed to open DB for last_fired_at persistence: {e}");
         }
     }
 
@@ -313,28 +409,24 @@ fn is_zero_info_heartbeat(response: &str) -> bool {
     })
 }
 
+fn skip_reason_wire(reason: &SkipReason) -> &'static str {
+    match reason {
+        SkipReason::QuietHours => "quiet_hours",
+        SkipReason::EmptyResponse => "empty_response",
+        SkipReason::DuplicateResponse => "duplicate_response",
+    }
+}
+
 fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
     let mut user_msg = "*heartbeat tick*".to_string();
     if let Some(cl) = cortex::memory::load_heartbeat_checklist() {
         user_msg.push_str("\n\n# Heartbeat Checklist\n");
         user_msg.push_str(&cl);
     }
-    // Proactive nudges: append LLM directives for heartbeat-only conditions
-    // (e.g. no messaging channels configured). Rate-limited via the `meta`
-    // table so each nudge fires at most once per its declared cooldown.
-    // See `crates/borgd/src/heartbeat_augmenters.rs` for how to add one.
-    let augmenter_db = cortex::db::Database::open().ok();
-    let nudges = crate::heartbeat_augmenters::collect(config, augmenter_db.as_ref());
-    if !nudges.is_empty() {
-        user_msg.push_str("\n\n<proactive_nudges>\n");
-        for n in &nudges {
-            user_msg.push_str("- ");
-            user_msg.push_str(n);
-            user_msg.push('\n');
-        }
-        user_msg.push_str("</proactive_nudges>");
-        tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
-    }
+    append_proactive_nudges(
+        &mut user_msg,
+        crate::heartbeat_augmenters::collect(config, open_heartbeat_db_for_nudges().as_ref()),
+    );
     user_msg
 }
 
@@ -384,7 +476,64 @@ fn build_session_start_prompt(config: &Config) -> String {
          continue. One or two sentences.\n",
     );
     msg.push_str("</instructions>");
+    append_proactive_nudges(
+        &mut msg,
+        crate::heartbeat_augmenters::collect_session_start(
+            config,
+            open_heartbeat_db_for_nudges().as_ref(),
+        ),
+    );
     msg
+}
+
+fn append_proactive_nudges(user_msg: &mut String, nudges: Vec<String>) {
+    if nudges.is_empty() {
+        return;
+    }
+    user_msg.push_str("\n\n<proactive_nudges>\n");
+    for n in &nudges {
+        user_msg.push_str("- ");
+        user_msg.push_str(n);
+        user_msg.push('\n');
+    }
+    user_msg.push_str("</proactive_nudges>");
+    tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
+}
+
+fn open_heartbeat_db_for_nudges() -> Option<cortex::db::Database> {
+    match cortex::db::Database::open() {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::warn!("Heartbeat: failed to open DB for proactive nudges: {e}");
+            None
+        }
+    }
+}
+
+fn is_quiet_hours(config: &Config) -> bool {
+    use chrono::{NaiveTime, Utc};
+
+    let Some(start_str) = config.heartbeat.quiet_hours_start.as_deref() else {
+        return false;
+    };
+    let Some(end_str) = config.heartbeat.quiet_hours_end.as_deref() else {
+        return false;
+    };
+    let Ok(start) = NaiveTime::parse_from_str(start_str, "%H:%M") else {
+        tracing::warn!("Invalid quiet_hours_start '{start_str}', expected HH:MM");
+        return false;
+    };
+    let Ok(end) = NaiveTime::parse_from_str(end_str, "%H:%M") else {
+        tracing::warn!("Invalid quiet_hours_end '{end_str}', expected HH:MM");
+        return false;
+    };
+
+    let now = Utc::now().with_timezone(&config.user_timezone()).time();
+    if start <= end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
 }
 
 /// Send `text` to every channel listed in `config.heartbeat.channels`.
@@ -458,5 +607,60 @@ mod tests {
         ] {
             assert!(!is_zero_info_heartbeat(msg), "expected '{msg}' real");
         }
+    }
+
+    #[test]
+    fn heartbeat_source_round_trips_wire_values() {
+        assert_eq!(
+            HeartbeatSource::from_wire("scheduled"),
+            Some(HeartbeatSource::Scheduled)
+        );
+        assert_eq!(
+            HeartbeatSource::from_wire("session_start"),
+            Some(HeartbeatSource::SessionStart)
+        );
+        assert_eq!(HeartbeatSource::from_wire("bogus"), None);
+    }
+
+    #[test]
+    fn skip_reason_wire_uses_stable_strings() {
+        assert_eq!(skip_reason_wire(&SkipReason::QuietHours), "quiet_hours");
+        assert_eq!(
+            skip_reason_wire(&SkipReason::EmptyResponse),
+            "empty_response"
+        );
+        assert_eq!(
+            skip_reason_wire(&SkipReason::DuplicateResponse),
+            "duplicate_response"
+        );
+    }
+
+    #[test]
+    fn explicit_trigger_quiet_hours_only_applies_to_scheduled_non_bypass_runs() {
+        let mut config = Config::default();
+        config.heartbeat.quiet_hours_start = Some("00:00".to_string());
+        config.heartbeat.quiet_hours_end = Some("23:59".to_string());
+
+        assert!(should_skip_explicit_trigger(
+            HeartbeatTrigger {
+                source: HeartbeatSource::Scheduled,
+                bypass_quiet_hours: false,
+            },
+            &config,
+        ));
+        assert!(!should_skip_explicit_trigger(
+            HeartbeatTrigger {
+                source: HeartbeatSource::Scheduled,
+                bypass_quiet_hours: true,
+            },
+            &config,
+        ));
+        assert!(!should_skip_explicit_trigger(
+            HeartbeatTrigger {
+                source: HeartbeatSource::SessionStart,
+                bypass_quiet_hours: false,
+            },
+            &config,
+        ));
     }
 }

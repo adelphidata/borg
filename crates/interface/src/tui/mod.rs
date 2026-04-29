@@ -72,6 +72,7 @@ use crossterm::event::{Event, EventStream};
 // ============================================================================
 
 use futures::StreamExt;
+use protocols::admin::HeartbeatEvent as PbHeartbeatEvent;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
@@ -287,18 +288,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                     next = stream.message() => {
                         match next {
                             Ok(Some(evt)) => {
-                                let result = match evt.status.as_str() {
-                                    "ran" => heartbeat::scheduler::HeartbeatResult::Ran {
-                                        message: evt.message,
-                                        duration_ms: evt.duration_ms as u64,
-                                    },
-                                    "skipped" => heartbeat::scheduler::HeartbeatResult::Skipped {
-                                        reason: heartbeat::scheduler::SkipReason::EmptyResponse,
-                                    },
-                                    _ => heartbeat::scheduler::HeartbeatResult::Failed {
-                                        error: evt.message,
-                                    },
-                                };
+                                let result = proto_heartbeat_result(evt);
                                 if hb_proto_tx
                                     .send(HeartbeatEvent::Result(result))
                                     .await
@@ -382,10 +372,13 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         // Daemon owns heartbeat scheduling + execution. Ask it to fire one
         // immediately; the proto event stream forwards the result back into
         // our existing `heartbeat_rx` rendering path.
-        let mut poke_client = client.clone();
+        let mut trigger_client = client.clone();
         tokio::spawn(async move {
-            if let Err(e) = poke_client.poke().await {
-                tracing::warn!("session-start poke failed: {e}");
+            if let Err(e) = trigger_client
+                .trigger_heartbeat("session_start", true)
+                .await
+            {
+                tracing::warn!("session-start heartbeat trigger failed: {e}");
             }
         });
     }
@@ -434,6 +427,32 @@ fn should_fire_session_start_greeting(config: &Config) -> bool {
     let now = chrono::Utc::now().timestamp();
     let last = config.heartbeat.last_fired_at;
     last <= 0 || now - last >= throttle_secs
+}
+
+fn proto_heartbeat_result(evt: PbHeartbeatEvent) -> heartbeat::scheduler::HeartbeatResult {
+    match evt.status.as_str() {
+        "ran" => heartbeat::scheduler::HeartbeatResult::Ran {
+            message: evt.message,
+            duration_ms: evt.duration_ms as u64,
+        },
+        "skipped" => heartbeat::scheduler::HeartbeatResult::Skipped {
+            reason: proto_skip_reason(&evt.skip_reason, &evt.message),
+        },
+        _ => heartbeat::scheduler::HeartbeatResult::Failed { error: evt.message },
+    }
+}
+
+fn proto_skip_reason(skip_reason: &str, message: &str) -> heartbeat::scheduler::SkipReason {
+    match skip_reason {
+        "quiet_hours" => heartbeat::scheduler::SkipReason::QuietHours,
+        "duplicate_response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
+        "empty_response" => heartbeat::scheduler::SkipReason::EmptyResponse,
+        _ => match message {
+            "quiet hours" => heartbeat::scheduler::SkipReason::QuietHours,
+            "duplicate response" => heartbeat::scheduler::SkipReason::DuplicateResponse,
+            _ => heartbeat::scheduler::SkipReason::EmptyResponse,
+        },
+    }
 }
 
 /// If the app just became idle and has queued messages, auto-submit the next one.
@@ -1904,6 +1923,86 @@ mod tests {
         config.heartbeat.session_start_throttle_minutes = 0;
         config.heartbeat.last_fired_at = chrono::Utc::now().timestamp();
         assert!(should_fire_session_start_greeting(&config));
+    }
+
+    #[test]
+    fn proto_heartbeat_result_preserves_skip_reason() {
+        let evt = PbHeartbeatEvent {
+            source: "scheduled".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "quiet hours".to_string(),
+            duration_ms: 0.0,
+            skip_reason: "quiet_hours".to_string(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::QuietHours
+            }
+        ));
+    }
+
+    #[test]
+    fn proto_heartbeat_result_maps_duplicate_response() {
+        let evt = PbHeartbeatEvent {
+            source: "scheduled".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "duplicate response".to_string(),
+            duration_ms: 0.0,
+            skip_reason: "duplicate_response".to_string(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::DuplicateResponse
+            }
+        ));
+    }
+
+    #[test]
+    fn proto_heartbeat_result_defaults_unknown_skip_reason_to_empty_response() {
+        let evt = PbHeartbeatEvent {
+            source: "scheduled".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "empty response".to_string(),
+            duration_ms: 0.0,
+            skip_reason: String::new(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::EmptyResponse
+            }
+        ));
+    }
+
+    #[test]
+    fn proto_heartbeat_result_falls_back_to_message_for_older_daemons() {
+        let evt = PbHeartbeatEvent {
+            source: "scheduled".to_string(),
+            started_at_unix: 0,
+            finished_at_unix: 0,
+            status: "skipped".to_string(),
+            message: "quiet hours".to_string(),
+            duration_ms: 0.0,
+            skip_reason: String::new(),
+        };
+        let result = proto_heartbeat_result(evt);
+        assert!(matches!(
+            result,
+            heartbeat::scheduler::HeartbeatResult::Skipped {
+                reason: heartbeat::scheduler::SkipReason::QuietHours
+            }
+        ));
     }
 
     // The EnableAlternateScroll/DisableAlternateScroll command escape tests

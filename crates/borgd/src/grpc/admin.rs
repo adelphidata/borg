@@ -4,10 +4,11 @@
 //! - `cortex::settings::SettingsResolver` for Get/Set/Unset.
 //! - `cortex::db::Database` for ListSessions / GetSession.
 //! - `cortex::maintenance::run_daily_maintenance` for Heal.
-//! - The daemon's `poke_tx` channel for Poke (set via `with_poke_sender`).
+//! - The daemon's heartbeat-trigger channel for Poke / TriggerHeartbeat
+//!   (set via `with_heartbeat_trigger_sender`).
 //! - The daemon's `shutdown_tx` for Shutdown (set via `with_shutdown_sender`).
 
-use crate::heartbeat::HeartbeatBus;
+use crate::heartbeat::{HeartbeatBus, HeartbeatSource, HeartbeatTrigger};
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
 use cortex::settings::SettingsResolver;
@@ -24,7 +25,8 @@ use protocols::admin::{
     RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
     ScheduledTaskRef, ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail,
     SessionList, SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation,
-    SettingsSnapshot, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
+    SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef, WorkflowList,
+    WorkflowSummary,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -36,7 +38,7 @@ use tonic::{Request, Response, Status as TStatus};
 /// Admin service implementation.
 pub struct AdminSvc {
     registry: SessionRegistry,
-    poke_tx: Mutex<Option<mpsc::Sender<()>>>,
+    heartbeat_trigger_tx: Mutex<Option<mpsc::Sender<HeartbeatTrigger>>>,
     shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
     heartbeat_bus: Mutex<Option<HeartbeatBus>>,
     executor: Mutex<Option<Arc<DaemonSessionExecutor>>>,
@@ -47,18 +49,18 @@ impl AdminSvc {
     pub fn new(registry: SessionRegistry) -> Self {
         Self {
             registry,
-            poke_tx: Mutex::new(None),
+            heartbeat_trigger_tx: Mutex::new(None),
             shutdown_tx: Mutex::new(None),
             heartbeat_bus: Mutex::new(None),
             executor: Mutex::new(None),
         }
     }
 
-    /// Wire a poke channel — `Admin.Poke` will send `()` on it. Optional;
-    /// without this, Poke returns `failed_precondition`.
-    pub fn with_poke_sender(self, tx: mpsc::Sender<()>) -> Self {
+    /// Wire a heartbeat trigger channel. `Admin.Poke` and
+    /// `Admin.TriggerHeartbeat` enqueue requests on it.
+    pub fn with_heartbeat_trigger_sender(self, tx: mpsc::Sender<HeartbeatTrigger>) -> Self {
         *self
-            .poke_tx
+            .heartbeat_trigger_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
         self
@@ -98,22 +100,54 @@ impl Admin for AdminSvc {
     async fn poke(&self, _req: Request<Empty>) -> Result<Response<Empty>, TStatus> {
         let tx = {
             let g = self
-                .poke_tx
+                .heartbeat_trigger_tx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             g.clone()
         };
         match tx {
             Some(tx) => {
-                tx.send(())
-                    .await
-                    .map_err(|e| TStatus::internal(format!("poke channel closed: {e}")))?;
+                tx.send(HeartbeatTrigger {
+                    source: HeartbeatSource::Scheduled,
+                    bypass_quiet_hours: true,
+                })
+                .await
+                .map_err(|e| TStatus::internal(format!("heartbeat trigger channel closed: {e}")))?;
                 Ok(Response::new(Empty {}))
             }
             None => Err(TStatus::failed_precondition(
                 "no heartbeat scheduler is wired",
             )),
         }
+    }
+
+    async fn trigger_heartbeat(
+        &self,
+        req: Request<TriggerHeartbeatRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let source = HeartbeatSource::from_wire(&req.source).ok_or_else(|| {
+            TStatus::invalid_argument(format!(
+                "invalid heartbeat source '{}'; expected 'scheduled' or 'session_start'",
+                req.source
+            ))
+        })?;
+        let tx = {
+            let g = self
+                .heartbeat_trigger_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.clone()
+        };
+        let tx =
+            tx.ok_or_else(|| TStatus::failed_precondition("no heartbeat scheduler is wired"))?;
+        tx.send(HeartbeatTrigger {
+            source,
+            bypass_quiet_hours: req.bypass_quiet_hours,
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("heartbeat trigger channel closed: {e}")))?;
+        Ok(Response::new(Empty {}))
     }
 
     async fn heal(&self, _req: Request<Empty>) -> Result<Response<HealReport>, TStatus> {
@@ -833,6 +867,7 @@ impl Admin for AdminSvc {
                             status: evt.status.to_string(),
                             message: evt.message,
                             duration_ms: evt.duration_ms,
+                            skip_reason: evt.skip_reason.unwrap_or_default().to_string(),
                         };
                         if tx.send(Ok(pb)).await.is_err() {
                             return; // client gone
