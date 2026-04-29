@@ -1529,16 +1529,20 @@ async fn run_event_loop(
                             app.push_system_message(format_check_outcome(current, latest));
                         }
                         Err(e) => {
-                            app.push_system_message(format!("Update check failed: {e}"));
+                            app.push_system_message(format!("Update check failed: {e:#}"));
                         }
                     }
                 } else {
                     match cortex::update::perform_update(prerelease).await {
                         Ok(result) => {
+                            if let cortex::update::UpdateStatus::Updated { to, .. } = &result.status
+                            {
+                                app.pending_update_version = Some(to.clone());
+                            }
                             app.push_system_message(format_install_outcome(&result));
                         }
                         Err(e) => {
-                            app.push_system_message(format!("Update failed: {e}"));
+                            app.push_system_message(format!("Update failed: {e:#}"));
                         }
                     }
                 }

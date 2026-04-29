@@ -106,7 +106,12 @@ impl<'a> App<'a> {
         } else {
             None
         };
-        let lines = build_borg_card_lines(name, &self.config.llm.model, ambient);
+        let lines = build_borg_card_lines(
+            name,
+            &self.config.llm.model,
+            ambient,
+            self.pending_update_version.as_deref(),
+        );
         self.cells.push(HistoryCell::Card { lines });
     }
 
@@ -721,7 +726,12 @@ impl<'a> App<'a> {
         } else {
             None
         };
-        let mut lines = build_borg_card_lines(name, &self.config.llm.model, ambient);
+        let mut lines = build_borg_card_lines(
+            name,
+            &self.config.llm.model,
+            ambient,
+            self.pending_update_version.as_deref(),
+        );
         lines.push(Line::default());
         self.pending_scrollback.extend(lines);
         self.banner_emitted = true;
@@ -824,6 +834,7 @@ pub(super) fn build_borg_card_lines(
     name: &str,
     model: &str,
     ambient: Option<&super::AmbientStatus>,
+    pending_update_version: Option<&str>,
 ) -> Vec<Line<'static>> {
     let version = env!("CARGO_PKG_VERSION");
     let teal = Style::default().fg(theme::CYAN);
@@ -842,6 +853,12 @@ pub(super) fn build_borg_card_lines(
         Span::styled("model: ", theme::dim()),
         Span::styled(model.to_string(), teal),
     ]));
+    if let Some(version) = pending_update_version {
+        lines.push(Line::from(vec![
+            Span::styled("update: ", theme::dim()),
+            Span::styled(format!("v{version} installed; restart required"), teal),
+        ]));
+    }
     if let Some(ambient) = ambient {
         lines.push(Line::from(vec![
             Span::styled("class: ", theme::dim()),
@@ -918,7 +935,7 @@ mod tests {
     #[test]
     fn borg_card_renders_mood_on_its_own_line() {
         let s = mk_ambient(Some("Oppenborger"), 2, Mood::Stable, Some(Archetype::Ops));
-        let lines = build_borg_card_lines("Oppenborger", "x-ai/grok", Some(&s));
+        let lines = build_borg_card_lines("Oppenborger", "x-ai/grok", Some(&s), None);
         let rendered: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -1129,7 +1146,7 @@ mod tests {
 
     #[test]
     fn borg_card_without_ambient_omits_class_and_mood() {
-        let lines = build_borg_card_lines("Borg", "x-ai/grok", None);
+        let lines = build_borg_card_lines("Borg", "x-ai/grok", None, None);
         let rendered: Vec<String> = lines
             .iter()
             .map(|l| {
@@ -1143,5 +1160,64 @@ mod tests {
         assert!(rendered.iter().any(|l| l == "name:  Borg"));
         assert!(rendered.iter().all(|l| !l.starts_with("class:")));
         assert!(rendered.iter().all(|l| !l.starts_with("mood:")));
+    }
+
+    #[test]
+    fn borg_card_shows_pending_update_line() {
+        let lines = build_borg_card_lines("Borg", "x-ai/grok", None, Some("0.6.0"));
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|l| l == "update: v0.6.0 installed; restart required"));
+    }
+
+    #[test]
+    fn push_borg_card_uses_pending_update_version() {
+        let mut app = make_app();
+        app.pending_update_version = Some("0.6.0".into());
+        app.push_borg_card();
+        let HistoryCell::Card { lines } = app.cells.last().expect("card cell") else {
+            panic!("expected card cell");
+        };
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|l| l == "update: v0.6.0 installed; restart required"));
+    }
+
+    #[test]
+    fn branded_header_uses_pending_update_version() {
+        let mut app = make_app();
+        app.pending_update_version = Some("0.6.0".into());
+        app.flush_branded_header_once();
+        let rendered: Vec<String> = app
+            .pending_scrollback
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rendered
+            .iter()
+            .any(|l| l == "update: v0.6.0 installed; restart required"));
     }
 }

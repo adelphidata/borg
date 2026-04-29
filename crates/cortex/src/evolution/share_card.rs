@@ -13,6 +13,7 @@ const INNER_WIDTH: usize = 48;
 ///
 /// Layout (48-char inner width, `╭── … ──╮` border):
 ///   - Header:      `BORG · {name} Lv.{level}`
+///   - Version:     `Version: vX.Y.Z`
 ///   - Stage:       `Stage: Base I|Evolved II|Final III`
 ///   - Archetype:   `Archetype: {Display}` or `Archetype: —`
 ///   - Description: one-line tagline (truncated to fit)
@@ -24,12 +25,14 @@ const INNER_WIDTH: usize = 48;
 /// stage-based tagline.
 pub fn render_ascii_card(evo: &EvolutionState) -> String {
     let name = card_display_name(evo);
+    let version = env!("CARGO_PKG_VERSION");
     let stage_label = stage_label(evo.stage);
     let archetype_label = archetype_label(evo.dominant_archetype);
     let mood_label = mood_label(evo.mood);
     let description = card_description(evo);
 
     let header = format!("BORG \u{00B7} {name} Lv.{}", evo.level);
+    let version_line = format!("Version: v{version}");
     let stage_line = format!("Stage: {stage_label}");
     let archetype_line = format!("Archetype: {archetype_label}");
     let mood_line = format!("Mood: {mood_label}");
@@ -39,6 +42,8 @@ pub fn render_ascii_card(evo: &EvolutionState) -> String {
     out.push_str(&top_border());
     out.push('\n');
     out.push_str(&box_line(&header));
+    out.push('\n');
+    out.push_str(&box_line(&version_line));
     out.push('\n');
     out.push_str(&box_line(&stage_line));
     out.push('\n');
@@ -198,6 +203,7 @@ mod tests {
         let card = render_ascii_card(&evo);
         assert_box_shape(&card);
         assert!(card.contains("BORG \u{00B7} Base Borg Lv.7"));
+        assert!(card.contains(&format!("Version: v{}", env!("CARGO_PKG_VERSION"))));
         assert!(card.contains("Stage: Base I"));
         assert!(card.contains("Archetype: \u{2014}"));
         assert!(card.contains("Mood: \u{2014}"));

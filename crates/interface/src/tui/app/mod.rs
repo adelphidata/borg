@@ -495,6 +495,8 @@ pub struct App<'a> {
     pub plan_steps: Vec<cortex::types::PlanStep>,
     /// Cached ambient-status line for the banner (class: ... header).
     pub ambient_status: Option<AmbientStatus>,
+    /// Version installed by `/update` in the current process, pending restart.
+    pub pending_update_version: Option<String>,
     pub status_popup: StatusPopup,
     pub btw_popup: BtwPopup,
     /// Cancel token for the currently-in-flight `/btw` background task, if
@@ -575,6 +577,7 @@ impl<'a> App<'a> {
             pending_steers: VecDeque::new(),
             plan_steps: Vec::new(),
             ambient_status: None,
+            pending_update_version: None,
             status_popup: StatusPopup::new(),
             btw_popup: BtwPopup::new(),
             btw_cancel: None,

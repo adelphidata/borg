@@ -1,4 +1,7 @@
 use anyhow::{bail, Context, Result};
+use chrono::TimeZone;
+use reqwest::header::HeaderMap;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -77,36 +80,150 @@ async fn fetch_latest_release_with_base(base_url: &str, dev: bool) -> Result<Rel
     let client = reqwest::Client::new();
 
     if dev {
-        let url = format!("{base_url}/releases?per_page=10");
-        let releases: Vec<ReleaseInfo> = client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "borg-updater")
-            .send()
-            .await
-            .context("Failed to fetch releases")?
-            .error_for_status()
-            .context("GitHub API error")?
-            .json()
-            .await
-            .context("Failed to parse releases JSON")?;
-
-        releases.into_iter().next().context("No releases found")
+        fetch_release_list(&client, base_url, ReleaseKind::Prerelease).await
     } else {
-        let url = format!("{base_url}/releases/latest");
-        client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "borg-updater")
-            .send()
-            .await
-            .context("Failed to fetch latest release")?
-            .error_for_status()
-            .context("GitHub API error")?
-            .json()
-            .await
-            .context("Failed to parse release JSON")
+        let latest_url = format!("{base_url}/releases/latest");
+        match get_github_json::<ReleaseInfo>(&client, &latest_url, "latest release").await {
+            Ok(release) => Ok(release),
+            Err(primary) => {
+                tracing::warn!(
+                    "latest release endpoint failed, falling back to release list: {primary:#}"
+                );
+                fetch_release_list(&client, base_url, ReleaseKind::Stable)
+                    .await
+                    .with_context(|| format!("Failed to resolve latest stable release after /releases/latest failed: {primary}"))
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseKind {
+    Stable,
+    Prerelease,
+}
+
+async fn fetch_release_list(
+    client: &reqwest::Client,
+    base_url: &str,
+    kind: ReleaseKind,
+) -> Result<ReleaseInfo> {
+    let url = format!("{base_url}/releases?per_page=10");
+    let releases: Vec<ReleaseInfo> = get_github_json(client, &url, "release list").await?;
+    select_release(releases, kind)
+}
+
+fn select_release(releases: Vec<ReleaseInfo>, kind: ReleaseKind) -> Result<ReleaseInfo> {
+    let mut saw_matching_channel = false;
+    for release in releases {
+        let matches_channel = match kind {
+            ReleaseKind::Stable => !release.prerelease,
+            ReleaseKind::Prerelease => true,
+        };
+        if !matches_channel {
+            continue;
+        }
+        saw_matching_channel = true;
+        if !release.assets.is_empty() {
+            return Ok(release);
+        }
+    }
+
+    match kind {
+        ReleaseKind::Stable if saw_matching_channel => {
+            bail!("No usable stable releases found")
+        }
+        ReleaseKind::Stable => bail!("No stable releases found"),
+        ReleaseKind::Prerelease if saw_matching_channel => {
+            bail!("No usable releases found")
+        }
+        ReleaseKind::Prerelease => bail!("No releases found"),
+    }
+}
+
+async fn get_github_json<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    url: &str,
+    resource: &str,
+) -> Result<T> {
+    let response = client
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "borg-updater")
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch {resource}"))?;
+    parse_github_json(response, resource).await
+}
+
+async fn parse_github_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    resource: &str,
+) -> Result<T> {
+    let status = response.status();
+    if !status.is_success() {
+        let headers = response.headers().clone();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<response body unavailable>".to_string());
+        bail!("{}", format_github_api_error(status, &headers, &body));
+    }
+    response
+        .json()
+        .await
+        .with_context(|| format!("Failed to parse {resource} JSON"))
+}
+
+fn format_github_api_error(status: reqwest::StatusCode, headers: &HeaderMap, body: &str) -> String {
+    let snippet = summarize_error_body(body);
+    let status_text = status.canonical_reason().unwrap_or("unknown status");
+    let mut msg = format!(
+        "GitHub API returned HTTP {} {}",
+        status.as_u16(),
+        status_text
+    );
+
+    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        let remaining = headers
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown");
+        msg = format!("GitHub API rate limit exceeded ({msg}, remaining {remaining})");
+        if let Some(reset) = headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_rate_limit_reset)
+        {
+            msg.push_str(&format!(", resets at {reset}"));
+        }
+    }
+
+    if !snippet.is_empty() {
+        msg.push_str(&format!(": {snippet}"));
+    }
+    msg
+}
+
+fn summarize_error_body(body: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let condensed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if condensed.chars().count() <= MAX_CHARS {
+        return condensed;
+    }
+    let mut out: String = condensed
+        .chars()
+        .take(MAX_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
+fn parse_rate_limit_reset(raw: &str) -> Option<String> {
+    let unix = raw.parse::<i64>().ok()?;
+    let dt = chrono::Utc.timestamp_opt(unix, 0).single()?;
+    Some(dt.to_rfc3339())
 }
 
 /// Locate the platform asset URL on a release, rejecting any non-HTTPS scheme.
@@ -317,6 +434,7 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[test]
     fn test_current_version() {
@@ -503,5 +621,72 @@ fedcba987654  checksums.txt
         // (tested via the API, not list parsing)
         let stable_pick = releases.iter().find(|r| !r.prerelease).unwrap();
         assert_eq!(stable_pick.tag_name, "v0.2.0");
+    }
+
+    fn release(tag: &str, prerelease: bool, assets: usize) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: tag.into(),
+            prerelease,
+            assets: (0..assets)
+                .map(|i| ReleaseAsset {
+                    name: format!("asset-{i}.tar.gz"),
+                    browser_download_url: format!("https://example.com/asset-{i}.tar.gz"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn select_release_stable_skips_prerelease_and_empty_assets() {
+        let release = select_release(
+            vec![
+                release("v0.4.0-dev.1", true, 1),
+                release("v0.3.0", false, 0),
+                release("v0.2.0", false, 1),
+            ],
+            ReleaseKind::Stable,
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "v0.2.0");
+        assert!(!release.prerelease);
+    }
+
+    #[test]
+    fn select_release_prerelease_ignores_entries_without_assets() {
+        let release = select_release(
+            vec![
+                release("v0.5.0-dev.1", true, 0),
+                release("v0.5.0-dev.2", true, 1),
+            ],
+            ReleaseKind::Prerelease,
+        )
+        .unwrap();
+        assert_eq!(release.tag_name, "v0.5.0-dev.2");
+    }
+
+    #[test]
+    fn github_http_errors_include_status_and_body() {
+        let msg = format_github_api_error(
+            reqwest::StatusCode::NOT_FOUND,
+            &HeaderMap::new(),
+            r#"{"message":"Repository renamed during migration"}"#,
+        );
+        assert!(msg.contains("HTTP 404"), "{msg}");
+        assert!(msg.contains("Repository renamed"), "{msg}");
+    }
+
+    #[test]
+    fn github_rate_limit_errors_are_specific() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        headers.insert("x-ratelimit-reset", HeaderValue::from_static("1777777777"));
+        let msg = format_github_api_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &headers,
+            r#"{"message":"API rate limit exceeded"}"#,
+        );
+        assert!(msg.contains("rate limit exceeded"), "{msg}");
+        assert!(msg.contains("remaining 0"), "{msg}");
+        assert!(msg.contains("resets at"), "{msg}");
     }
 }
