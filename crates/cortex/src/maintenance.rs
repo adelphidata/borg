@@ -58,6 +58,8 @@ pub struct MaintenanceReport {
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
+    #[serde(default)]
+    pub wedged_runs_recovered: usize,
     /// `messages` rows deleted by the retention purge. `0` when
     /// `data.retention_days` is `None` or `data.purge_policy != Auto`.
     #[serde(default)]
@@ -85,13 +87,22 @@ pub struct MaintenanceReport {
     pub current_issues: Vec<String>,
     /// Raw check lines (formatted) for display.
     pub check_summary: Vec<String>,
+    /// True when maintenance was skipped because `maintenance.enabled`
+    /// is false. The report still exists so callers can surface an
+    /// explicit "skipped" status instead of presenting a no-op run as
+    /// a successful sweep.
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 impl MaintenanceReport {
     /// Short one-line summary suitable for the activity log.
     pub fn activity_line(&self) -> String {
+        if self.skipped {
+            return "maintenance: skipped (maintenance.enabled = false)".to_string();
+        }
         format!(
-            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
+            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s), recovered {} wedged run(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
             self.pass_count,
             self.warn_count,
             self.fail_count,
@@ -101,6 +112,7 @@ impl MaintenanceReport {
             self.embeddings_pruned,
             self.workflows_pruned,
             self.stalled_tasks_healed,
+            self.wedged_runs_recovered,
             self.messages_purged,
             self.audit_events_tombstoned,
         )
@@ -118,6 +130,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     };
 
     if !config.maintenance.enabled {
+        report.skipped = true;
         tracing::info!("maintenance: disabled by config, skipping sweep");
         return Ok(report);
     }
@@ -235,6 +248,10 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
         Ok(h) => report.stalled_tasks_healed = h.reset,
         Err(e) => tracing::warn!("maintenance: stalled-task scan failed: {e}"),
+    }
+    match crate::tasks::recover_wedged_runs(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
+        Ok(n) => report.wedged_runs_recovered = n as usize,
+        Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
     }
 
     // 6. Compare against the previous run — warnings that persist across
@@ -358,15 +375,10 @@ fn truncate_file_keeping_tail(path: &Path, keep_bytes: u64) -> Result<u64> {
         .map(|i| i + 1)
         .unwrap_or(0);
     let trimmed = &tail[offset..];
-
-    // Replace the file contents atomically via a sibling tempfile rename.
-    let tmp = path.with_extension("trunc.tmp");
-    {
-        let mut out = fs::File::create(&tmp)?;
-        out.write_all(trimmed)?;
-        out.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(trimmed)?;
+    f.set_len(trimmed.len() as u64)?;
+    f.sync_all()?;
     Ok(trimmed.len() as u64)
 }
 
@@ -483,6 +495,7 @@ mod tests {
             activity_rows_deleted: 120,
             embeddings_pruned: 8,
             stalled_tasks_healed: 1,
+            wedged_runs_recovered: 3,
             ..Default::default()
         };
         let line = r.activity_line();
@@ -492,6 +505,17 @@ mod tests {
         assert!(line.contains("4321 bytes truncated"));
         assert!(line.contains("2 workflow"));
         assert!(line.contains("healed 1 stalled"));
+        assert!(line.contains("recovered 3 wedged"));
+    }
+
+    #[test]
+    fn report_activity_line_mentions_skip() {
+        let line = MaintenanceReport {
+            skipped: true,
+            ..Default::default()
+        }
+        .activity_line();
+        assert_eq!(line, "maintenance: skipped (maintenance.enabled = false)");
     }
 
     /// Writes a file with predictable line content and returns `(path, size)`.
@@ -557,6 +581,36 @@ mod tests {
         assert_eq!(freed, 0);
         let new_size = fs::metadata(&path).unwrap().len();
         assert_eq!(new_size, original, "file under cap must not change");
+    }
+
+    #[test]
+    fn truncate_oversized_logs_preserves_live_append_handles() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let path = dir.join("daemon.log");
+        let mut writer = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for n in 0..200_000 {
+            writeln!(writer, "line {n}").unwrap();
+        }
+        writer.flush().unwrap();
+
+        let freed = truncate_oversized_logs(dir, &["daemon.log"], 1024 * 1024, 256 * 1024).unwrap();
+        assert!(freed > 0, "oversized log should have been truncated");
+
+        writeln!(writer, "tail after truncation").unwrap();
+        writer.flush().unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("tail after truncation"),
+            "writes through the original append handle must still land in the visible log file"
+        );
     }
 
     #[test]
@@ -732,6 +786,75 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining_msgs, 1);
+    }
+
+    #[test]
+    fn run_daily_maintenance_recovers_wedged_runs() {
+        use crate::db::NewTask;
+        use crate::tasks::RUN_STATUS_RUNNING;
+        use rusqlite::params;
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        db.create_task(&NewTask {
+            id: "wedged-task",
+            name: "wedged",
+            prompt: "p",
+            schedule_type: "cron",
+            schedule_expr: "0 0 * * * *",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+        })
+        .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+                 VALUES (?1, ?2, 0, ?3)",
+                params!["wedged-task", now - 3600, RUN_STATUS_RUNNING],
+            )
+            .unwrap();
+
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert_eq!(report.wedged_runs_recovered, 1);
+
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM task_runs WHERE task_id = 'wedged-task' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, crate::tasks::RUN_STATUS_FAILED);
+    }
+
+    #[test]
+    fn run_daily_maintenance_reports_skip_without_side_effects() {
+        use crate::config::Config;
+
+        let db = crate::db::Database::test_db();
+        let mut config = Config::default();
+        config.maintenance.enabled = false;
+
+        let report = run_daily_maintenance(&db, &config).expect("sweep");
+        assert!(report.skipped, "disabled maintenance should surface a skip");
+        assert_eq!(report.log_files_deleted, 0);
+        assert_eq!(report.activity_rows_deleted, 0);
+
+        let doctor_runs: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM doctor_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            doctor_runs, 0,
+            "skipped sweep must not record doctor history"
+        );
     }
 
     #[test]

@@ -241,6 +241,14 @@ message HealReport {
   uint64 evicted_embeddings = 3;
   uint64 healed_tasks = 4;
   repeated string warnings = 5;
+  uint64 log_bytes_truncated = 6;
+  uint64 workflows_pruned = 7;
+  uint64 messages_purged = 8;
+  uint64 audit_events_tombstoned = 9;
+  uint64 wedged_runs_recovered = 10;
+  uint64 backups_pruned = 11;
+  string auto_backup_path = 12;
+  bool skipped = 13;
 }
 
 message SettingKey { string key = 1; }

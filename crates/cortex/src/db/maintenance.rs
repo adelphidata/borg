@@ -35,7 +35,7 @@ impl Database {
         let json: Option<String> = self
             .conn
             .query_row(
-                "SELECT report_json FROM doctor_runs ORDER BY ran_at DESC LIMIT 1",
+                "SELECT report_json FROM doctor_runs ORDER BY ran_at DESC, id DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -51,7 +51,7 @@ impl Database {
     pub fn prune_doctor_runs(&self, keep: usize) -> Result<usize> {
         let deleted = self.conn.execute(
             "DELETE FROM doctor_runs WHERE id NOT IN (
-                SELECT id FROM doctor_runs ORDER BY ran_at DESC LIMIT ?1
+                SELECT id FROM doctor_runs ORDER BY ran_at DESC, id DESC LIMIT ?1
             )",
             params![keep as i64],
         )?;

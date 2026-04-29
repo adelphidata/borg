@@ -165,6 +165,14 @@ impl Admin for AdminSvc {
             evicted_embeddings: report.embeddings_pruned as u64,
             healed_tasks: report.stalled_tasks_healed as u64,
             warnings: report.persistent_warnings,
+            log_bytes_truncated: report.log_bytes_truncated,
+            workflows_pruned: report.workflows_pruned as u64,
+            messages_purged: report.messages_purged as u64,
+            audit_events_tombstoned: report.audit_events_tombstoned as u64,
+            wedged_runs_recovered: report.wedged_runs_recovered as u64,
+            backups_pruned: report.backups_pruned as u64,
+            auto_backup_path: report.auto_backup_path.unwrap_or_default(),
+            skipped: report.skipped,
         }))
     }
 

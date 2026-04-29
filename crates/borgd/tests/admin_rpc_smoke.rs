@@ -264,6 +264,49 @@ async fn projects_admin_rpcs_round_trip_workflows_and_archive() {
         "must surface persistent_warnings, NOT current_issues"
     );
 
+    // Heal: returns the expanded maintenance projection, including
+    // wedged-run recovery and explicit skip=false for the default config.
+    // Real failure mode: adding fields to MaintenanceReport but forgetting
+    // to map them across the gRPC boundary, so the TUI silently renders
+    // zeros despite the daemon having done real work.
+    {
+        let db = Database::open().expect("db");
+        db.create_task(&NewTask {
+            id: "wedged-task",
+            name: "wedged",
+            prompt: "p",
+            schedule_type: "cron",
+            schedule_expr: "0 0 * * * *",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+        })
+        .expect("create wedged task");
+        let started_at = chrono::Utc::now().timestamp() - 3600;
+        db.conn()
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+                 VALUES ('wedged-task', ?1, 0, 'running')",
+                [started_at],
+            )
+            .expect("insert wedged run");
+    }
+    let heal = admin.heal(AdminEmpty {}).await.expect("heal").into_inner();
+    assert!(!heal.skipped, "default config should run maintenance");
+    assert_eq!(
+        heal.wedged_runs_recovered, 1,
+        "healed report must surface recovered wedged runs"
+    );
+    assert_eq!(
+        heal.log_bytes_truncated, 0,
+        "no oversized logs were seeded in this harness"
+    );
+
     // Scheduled task UpdateScheduledTask round-trip.
     // Real failure mode: a refactor that made all-empty UpdateTask fields
     // fail validation instead of being a no-op (regressed historically:

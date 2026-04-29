@@ -139,6 +139,7 @@ fn record_and_latest_doctor_run_roundtrip() {
         activity_rows_deleted: 5,
         embeddings_pruned: 0,
         stalled_tasks_healed: 0,
+        wedged_runs_recovered: 0,
         messages_purged: 0,
         audit_events_tombstoned: 0,
         auto_backup_path: None,
@@ -146,6 +147,7 @@ fn record_and_latest_doctor_run_roundtrip() {
         persistent_warnings: vec!["Gateway:reachable".into()],
         current_issues: vec!["Gateway:reachable".into()],
         check_summary: vec!["  ⚠ Gateway:reachable — down".into()],
+        skipped: false,
     };
     db.record_doctor_run(&report).expect("record");
 
@@ -488,4 +490,47 @@ fn prune_doctor_runs_keeps_n_newest() {
     assert_eq!(deleted, 3);
     let latest = db.latest_doctor_run().unwrap().unwrap();
     assert_eq!(latest.ran_at, 5);
+}
+
+#[test]
+fn latest_doctor_run_breaks_timestamp_ties_by_id() {
+    let db = test_db();
+    db.record_doctor_run(&MaintenanceReport {
+        ran_at: 42,
+        persistent_warnings: vec!["first".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    db.record_doctor_run(&MaintenanceReport {
+        ran_at: 42,
+        persistent_warnings: vec!["second".into()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let latest = db.latest_doctor_run().unwrap().unwrap();
+    assert_eq!(latest.persistent_warnings, vec!["second"]);
+}
+
+#[test]
+fn prune_doctor_runs_breaks_timestamp_ties_by_id() {
+    let db = test_db();
+    db.record_doctor_run(&MaintenanceReport {
+        ran_at: 42,
+        persistent_warnings: vec!["keep-oldest?".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    db.record_doctor_run(&MaintenanceReport {
+        ran_at: 42,
+        persistent_warnings: vec!["keep-newest".into()],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let deleted = db.prune_doctor_runs(1).unwrap();
+    assert_eq!(deleted, 1);
+
+    let latest = db.latest_doctor_run().unwrap().unwrap();
+    assert_eq!(latest.persistent_warnings, vec!["keep-newest"]);
 }

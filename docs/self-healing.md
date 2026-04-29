@@ -75,10 +75,11 @@ fire:
 /heal
 ```
 
-The slash command calls `run_daily_maintenance` directly — same code
-path as the scheduled task, same `doctor_runs` row written, same
-`MaintenanceReport` returned. The TUI shows a summary line plus any
-persistent warnings inline.
+The slash command goes through the daemon's `Admin.Heal` RPC, which
+invokes `run_daily_maintenance` server-side — same code path as the
+scheduled task, same `doctor_runs` row written, same underlying
+maintenance behavior. The TUI renders the daemon's `HealReport`
+projection plus any persistent warnings inline.
 
 Unlike `/doctor` (read-only diagnostics, streamed), `/heal` executes
 the mutating steps: log truncation, activity-log pruning, embedding
@@ -116,8 +117,9 @@ the daemon stays alive but a single task execution wedges (panic
 inside `spawn_blocking`, network hang past its timeout), the row sat
 in `running` forever until the next restart.
 
-The same 5-minute tick that runs the stalled-task scan now also calls
-`recover_wedged_runs(db, now, STALLED_TASK_GRACE_SECS)`. That marks
+The same 5-minute tick that runs the stalled-task scan also calls
+`recover_wedged_runs(db, now, STALLED_TASK_GRACE_SECS)`, and the daily
+maintenance sweep runs that same wedged-run recovery path. That marks
 any `running` task_run as `failed` when `started_at` is older than
 the task's own `timeout_ms` (in seconds), falling back to
 `default_grace_secs` (1h) when no per-task timeout is available. The
@@ -209,8 +211,8 @@ Uninstalling a skill is a manual operation today (`rm -rf`); call
 first-seen rather than modified.
 
 The helper that drives this is
-`cortex::skill_security::audit_user_skills(&db, &dir)` — pure function,
-takes an open DB and returns `Vec<SkillAuditFinding>`.
+`cortex::skill_security::audit_user_skills(&db, &dir)` — it records
+observations into `skill_audit` and returns `Vec<SkillAuditFinding>`.
 
 ## Persistent-warning notice on TUI open
 
@@ -233,7 +235,8 @@ neglect doesn't turn the startup notice into a wall of text. The report
 is always available in full via `borg doctor` or by querying
 `doctor_runs.report_json` directly.
 
-Implementation: `persistent_warning_notice_from_db` in
+Implementation: `load_persistent_warning_notice` /
+`persistent_warning_notice_from_warnings` in
 `crates/interface/src/tui/app/mod.rs`.
 
 ## Related systems

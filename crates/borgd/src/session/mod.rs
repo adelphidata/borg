@@ -580,7 +580,10 @@ mod tests {
         registry.insert(host);
 
         let removed = registry.remove_host("s-remove").expect("removed host");
-        assert!(registry.get("s-remove").is_none(), "host must be removed first");
+        assert!(
+            registry.get("s-remove").is_none(),
+            "host must be removed first"
+        );
         removed.close().await;
 
         assert_eq!(close_calls.load(Ordering::SeqCst), 1);

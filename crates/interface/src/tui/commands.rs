@@ -678,11 +678,32 @@ impl App<'_> {
 /// gRPC-friendly proto returned by `Admin.Heal` rather than the in-process
 /// MaintenanceReport.
 pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> String {
-    let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
-    text.push_str(&format!(
-        "Pruned {} log files, {} activity rows, evicted {} embeddings, healed {} stalled tasks",
-        report.pruned_logs, report.pruned_activity, report.evicted_embeddings, report.healed_tasks,
-    ));
+    let mut text = if report.skipped {
+        String::from("Self-healing sweep skipped\n───────────────────────────\n")
+    } else {
+        String::from("Self-healing sweep complete\n───────────────────────────\n")
+    };
+    if report.skipped {
+        text.push_str("maintenance.enabled is false");
+    } else {
+        text.push_str(&format!(
+            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, pruned {} workflows, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events, pruned {} backups",
+            report.pruned_logs,
+            report.log_bytes_truncated,
+            report.pruned_activity,
+            report.evicted_embeddings,
+            report.workflows_pruned,
+            report.healed_tasks,
+            report.wedged_runs_recovered,
+            report.messages_purged,
+            report.audit_events_tombstoned,
+            report.backups_pruned,
+        ));
+        if !report.auto_backup_path.is_empty() {
+            text.push_str("\nBackup created: ");
+            text.push_str(&report.auto_backup_path);
+        }
+    }
     if !report.warnings.is_empty() {
         text.push_str("\n\nWarnings:");
         for w in &report.warnings {
@@ -820,6 +841,43 @@ mod tests {
             out.contains("Data:SqliteIntegrity") && out.contains("Filesystem:LogDir"),
             "every persistent warning must be rendered: {out:?}"
         );
+    }
+
+    #[test]
+    fn format_heal_report_renders_expanded_counts() {
+        let out = format_heal_report(&protocols::admin::HealReport {
+            pruned_logs: 2,
+            pruned_activity: 5,
+            evicted_embeddings: 7,
+            healed_tasks: 11,
+            warnings: vec!["Skills:tamper audit".into()],
+            log_bytes_truncated: 1234,
+            workflows_pruned: 13,
+            messages_purged: 17,
+            audit_events_tombstoned: 19,
+            wedged_runs_recovered: 23,
+            backups_pruned: 29,
+            auto_backup_path: "/tmp/backup.tar.zst".into(),
+            skipped: false,
+        });
+        assert!(out.contains("1234 bytes truncated"), "{out:?}");
+        assert!(out.contains("13 workflows"), "{out:?}");
+        assert!(out.contains("recovered 23 wedged runs"), "{out:?}");
+        assert!(
+            out.contains("Backup created: /tmp/backup.tar.zst"),
+            "{out:?}"
+        );
+        assert!(out.contains("Skills:tamper audit"), "{out:?}");
+    }
+
+    #[test]
+    fn format_heal_report_renders_skip_state() {
+        let out = format_heal_report(&protocols::admin::HealReport {
+            skipped: true,
+            ..Default::default()
+        });
+        assert!(out.starts_with("Self-healing sweep skipped"), "{out:?}");
+        assert!(out.contains("maintenance.enabled is false"), "{out:?}");
     }
 
     #[test]
