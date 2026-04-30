@@ -75,6 +75,7 @@ bundled_skills! {
     "docker"         => "docker"         { category: "developer", default_enabled: false, hidden: false },
     "database"       => "database"       { category: "developer", default_enabled: false, hidden: false },
     "notes"          => "notes"          { category: "utilities", default_enabled: false, hidden: false },
+    "obsidian"       => "obsidian"       { category: "utilities", default_enabled: false, hidden: false },
     "calendar"       => "calendar"       { category: "core",      default_enabled: true,  hidden: false },
     "1password"      => "1password"      { category: "utilities", default_enabled: false, hidden: false },
     "browser"        => "browser"        { category: "core",      default_enabled: true,  hidden: false },
@@ -1032,6 +1033,7 @@ Short body.
         assert!(names.contains(&"docker"));
         assert!(names.contains(&"database"));
         assert!(names.contains(&"notes"));
+        assert!(names.contains(&"obsidian"));
         assert!(names.contains(&"calendar"));
         assert!(names.contains(&"1password"));
         assert!(names.contains(&"browser"));

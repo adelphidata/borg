@@ -34,6 +34,27 @@ The loader always tries to include `MEMORY.md` first, then adds the most relevan
 
 Knowledge files are also included in `memory_search`, so they can be recalled on demand even if they were not auto-loaded into the prompt.
 
+### Obsidian workflow
+
+Obsidian support is optional and layered on top of the existing knowledge-file store.
+
+- `~/.borg/memory/` is Borg's primary Obsidian-facing markdown surface
+- Borg does not create a separate `~/.borg/vault/` directory
+- Users who want an Obsidian workflow should point Obsidian at the relevant markdown surface instead of expecting a storage migration
+- `MEMORY.md` remains the top-level curated map for markdown knowledge files
+
+This does not change the long-term memory backend. SQLite remains the source of truth for `write_memory` and `read_memory`.
+
+When Borg maintains markdown intended for Obsidian, it should prefer deterministic managed regions inside mixed-ownership files:
+
+```md
+<!-- borg:managed:start name=summary -->
+... Borg-managed content ...
+<!-- borg:managed:end name=summary -->
+```
+
+Content inside those markers may be rewritten by Borg. Content outside them should be preserved unless the file is explicitly agent-owned.
+
 ## Long-term memory
 
 Long-term memory is stored in the database as named entries with a `scope + name` key.
@@ -99,6 +120,8 @@ The agent uses `write_memory` to create or append long-term memory entries:
 - `append`: append instead of overwrite
 - `scope`: `global` by default, or a scope such as `project:<id>`
 
+`write_memory` does not write markdown knowledge files. Those remain plain files under `~/.borg/memory/` for curated, Obsidian-friendly notes.
+
 ### Safety checks
 
 All long-term memory writes are scanned for prompt-injection patterns before they are persisted:
@@ -149,6 +172,8 @@ Reviews long-term memory for duplicates, stale information, and merge opportunit
 ## Session persistence
 
 Conversations are saved in `borg.db` immediately for crash recovery. Session transcripts are searchable through `memory_search` when `sources=["messages"]` is requested or when active memory injection searches both memory and messages.
+
+Working memory itself remains in RAM for the current session. Obsidian-oriented markdown artifacts should be treated as filed outputs or curated knowledge notes, not as the live short-term memory store.
 
 ## Tips
 
