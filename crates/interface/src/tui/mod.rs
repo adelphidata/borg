@@ -564,6 +564,18 @@ fn format_install_outcome(result: &cortex::update::UpdateResult) -> String {
 /// the current app state. Single source of truth for rendering — every call
 /// site in the event loop goes through here.
 fn draw_viewport(tui: &mut tui_lifecycle::Tui, app: &mut App<'_>) -> Result<()> {
+    // Push any newly-stable cells (e.g. the User cell pushed by
+    // `handle_submit`) to terminal scrollback BEFORE drawing. The inline
+    // viewport's live tail is bounded — without this flush, freshly-pushed
+    // user messages stay clipped inside the small viewport area until the
+    // first agent event arrives, producing a multi-second perceived lag
+    // between hitting Enter and seeing the message.
+    let flush_width = if app.last_viewport_width > 0 {
+        app.last_viewport_width
+    } else {
+        tui.terminal_size()?.width.max(1)
+    };
+    app.flush_stable_cells(flush_width);
     let pending = std::mem::take(&mut app.pending_scrollback);
     tui.insert_history_lines(pending);
     let viewport_height = app.compute_viewport_height(tui.terminal_size()?);
