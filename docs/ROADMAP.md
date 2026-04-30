@@ -34,6 +34,23 @@ unfinished items stay here so a future contributor can see what's left.
 
 ## Self-healing — Tier 2 / Tier 3
 
+- **Provider failover / degraded mode.** Deferred. Add structured
+  provider error classification plus bounded failover to fallback
+  providers / Claude CLI / Ollama so primary-provider auth, rate-limit,
+  or overload incidents degrade gracefully instead of dead-ending the
+  agent loop.
+- **Browser recovery loops.** Deferred. Attach automatic restart /
+  reconnect behavior to recoverable browser-health failures so stale CDP
+  sessions, crashed tabs, and disconnected browser processes repair
+  themselves without waiting for a manual restart.
+- **Plugin / skill quarantine.** Deferred. Integrity and tamper checks
+  currently surface warnings; a future pass should mark compromised
+  plugins or user skills untrusted, stop loading them automatically, and
+  require explicit re-trust with a visible audit trail.
+- **Backup verification.** Deferred. Weekly auto-backups exist, but the
+  sweep does not yet verify restoreability. Add archive verification,
+  manifest/hash checks, and periodic test-restore drills into a temp
+  directory so "backup succeeded" also means "restore is likely to work."
 - **CVE advisory integration.** Deferred. Pulling rustsec / OSV advisories
   on a cadence would mean an outbound git/HTTP fetch from a background
   task, which is unwelcome on airgapped or locked-down deployments and

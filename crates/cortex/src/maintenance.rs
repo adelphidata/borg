@@ -15,10 +15,11 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::doctor::{run_diagnostics, CheckStatus, DiagnosticCheck};
+use crate::doctor::{run_diagnostics, CheckStatus, DiagnosticCheck, RemediationKind};
 
 /// Single source of truth for the seeded maintenance task's UUID. The V37
 /// migration inserts this id and the dispatcher matches against it.
@@ -78,13 +79,34 @@ pub struct MaintenanceReport {
     #[serde(default)]
     pub backups_pruned: usize,
     /// Doctor checks persisted across runs (subset of `current_issues`
-    /// that were also issues in the previous run).
+    /// whose issue-state rows are still open with `consecutive_count >= 2`.
     pub persistent_warnings: Vec<String>,
     /// Every Warn/Fail check this run, keyed `"Category:Name"`. Used as
     /// the structured input to persistent-warning detection on the next
     /// sweep — do not format for display, the text lives in `check_summary`.
     #[serde(default)]
     pub current_issues: Vec<String>,
+    /// Issues auto-fixed during this sweep.
+    #[serde(default)]
+    pub auto_fixed_issues: Vec<String>,
+    /// Issues still open after all safe repairs ran.
+    #[serde(default)]
+    pub unhealed_issues: Vec<String>,
+    /// Number of non-pass issues marked detect-only this sweep.
+    #[serde(default)]
+    pub detect_only_issues: usize,
+    /// Number of non-pass issues marked manual-only this sweep.
+    #[serde(default)]
+    pub manual_only_issues: usize,
+    /// Number of non-pass issues whose auto-fix attempt failed this sweep.
+    #[serde(default)]
+    pub auto_fix_failed_issues: usize,
+    /// Number of memory entries whose embedding state was repaired.
+    #[serde(default)]
+    pub embeddings_repaired_files: usize,
+    /// Number of chunk rows rebuilt during embedding repair.
+    #[serde(default)]
+    pub embeddings_repaired_chunks: usize,
     /// Raw check lines (formatted) for display.
     pub check_summary: Vec<String>,
     /// True when maintenance was skipped because `maintenance.enabled`
@@ -102,7 +124,7 @@ impl MaintenanceReport {
             return "maintenance: skipped (maintenance.enabled = false)".to_string();
         }
         format!(
-            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} embedding(s), {} workflow(s), healed {} stalled task(s), recovered {} wedged run(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
+            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} cache embedding(s), {} workflow(s), healed {} stalled task(s), recovered {} wedged run(s), repaired {} embedding file(s)/{} chunk(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
             self.pass_count,
             self.warn_count,
             self.fail_count,
@@ -113,10 +135,34 @@ impl MaintenanceReport {
             self.workflows_pruned,
             self.stalled_tasks_healed,
             self.wedged_runs_recovered,
+            self.embeddings_repaired_files,
+            self.embeddings_repaired_chunks,
             self.messages_purged,
             self.audit_events_tombstoned,
         )
     }
+}
+
+#[derive(Debug, Clone)]
+struct IssueSnapshot {
+    issue_key: String,
+    status: &'static str,
+    remediation_kind: RemediationKind,
+    remediation_key: Option<&'static str>,
+}
+
+#[derive(Debug, Default)]
+struct EmbeddingRepairReport {
+    repaired_files: usize,
+    repaired_chunks: usize,
+    failed: bool,
+    fixed_issue_keys: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct RepairExecution {
+    fixed_issues: BTreeSet<String>,
+    failed_issues: BTreeSet<String>,
 }
 
 /// Run the full daily maintenance sweep. Never propagates errors from
@@ -148,18 +194,9 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         tracing::warn!("maintenance: ensure_global_index failed: {e}");
     }
 
-    // 1. Headless doctor sweep. Persist results so we can compare across
-    //    runs and only escalate warnings that stick.
-    let diag = run_diagnostics(config);
-    let (pass, warn, fail) = diag.counts();
-    report.pass_count = pass;
-    report.warn_count = warn;
-    report.fail_count = fail;
-    report.check_summary = diag
-        .checks
-        .iter()
-        .map(DiagnosticCheck::format_line)
-        .collect();
+    // 1. Headless doctor sweep, before bounded auto-repairs.
+    let initial_diag = run_diagnostics(config);
+    let initial_issues = issue_snapshots(&initial_diag.checks);
 
     // 2. Prune filesystem logs. Best-effort — missing dir is fine.
     if let Ok(logs_dir) = Config::logs_dir() {
@@ -267,18 +304,123 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
     }
 
-    // 6. Compare against the previous run — warnings that persist across
-    //    two consecutive sweeps are escalated. A single flaky run doesn't
-    //    page the user.
-    report.current_issues = diag
+    // 6. Run bounded auto-remediations exactly once per remediation key.
+    let mut repair_execution = RepairExecution::default();
+    let grouped = group_issues_by_remediation(&initial_issues);
+    for (key, issues) in grouped {
+        let result = match key {
+            "data.ensure_subdirs" => Config::data_dir()
+                .and_then(|dir| ensure_data_subdirs(&dir))
+                .map(|_| (true, None)),
+            "memory.ensure_global_index" => ensure_global_index(db)
+                .map(|changed| (changed, None)),
+            "embeddings.repair" => repair_embedding_backlog(db, config)
+                .map(|r| {
+                    report.embeddings_repaired_files += r.repaired_files;
+                    report.embeddings_repaired_chunks += r.repaired_chunks;
+                    (r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed, Some(r))
+                }),
+            _ => Ok((false, None)),
+        };
+        match result {
+            Ok((changed, maybe_embedding_report)) => {
+                if let Some(embedding_report) = maybe_embedding_report {
+                    for issue in embedding_report.fixed_issue_keys {
+                        repair_execution.fixed_issues.insert(issue);
+                    }
+                    if embedding_report.failed {
+                        for issue in &issues {
+                            repair_execution.failed_issues.insert(issue.issue_key.clone());
+                        }
+                    }
+                } else if changed {
+                    for issue in &issues {
+                        repair_execution.fixed_issues.insert(issue.issue_key.clone());
+                    }
+                }
+                for issue in &issues {
+                    if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    {
+                        tracing::warn!("maintenance: issue-state observe failed: {e}");
+                    }
+                    let outcome = if repair_execution.failed_issues.contains(&issue.issue_key) {
+                        "failed"
+                    } else {
+                        "attempted"
+                    };
+                    if let Err(e) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, outcome) {
+                        tracing::warn!("maintenance: issue auto-fix attempt record failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("maintenance: remediation {key} failed: {e}");
+                for issue in &issues {
+                    repair_execution.failed_issues.insert(issue.issue_key.clone());
+                    if let Err(se) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    {
+                        tracing::warn!("maintenance: issue-state observe failed: {se}");
+                    }
+                    if let Err(se) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, "failed") {
+                        tracing::warn!("maintenance: issue auto-fix attempt record failed: {se}");
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Re-run diagnostics so the recorded report reflects post-repair state.
+    let diag = run_diagnostics(config);
+    let (pass, warn, fail) = diag.counts();
+    report.pass_count = pass;
+    report.warn_count = warn;
+    report.fail_count = fail;
+    report.check_summary = diag
         .checks
         .iter()
-        .filter(|c| !matches!(c.status, CheckStatus::Pass))
-        .map(|c| format!("{}:{}", c.category, c.name))
+        .map(DiagnosticCheck::format_line)
         .collect();
-    report.persistent_warnings = compute_persistent_warnings(db, &report.current_issues);
+    let final_issues = issue_snapshots(&diag.checks);
+    report.current_issues = final_issues.iter().map(|i| i.issue_key.clone()).collect();
+    report.unhealed_issues = report.current_issues.clone();
+    report.auto_fixed_issues = repair_execution.fixed_issues.into_iter().collect();
+    report.auto_fix_failed_issues = repair_execution.failed_issues.len();
+    report.detect_only_issues = final_issues
+        .iter()
+        .filter(|i| i.remediation_kind == RemediationKind::None)
+        .count();
+    report.manual_only_issues = final_issues
+        .iter()
+        .filter(|i| i.remediation_kind == RemediationKind::Manual)
+        .count();
 
-    // 7. Persist the run (best-effort; losing the audit row must not
+    for issue in &initial_issues {
+        if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status) {
+            tracing::warn!("maintenance: issue-state observe failed: {e}");
+        }
+    }
+    let final_keys: BTreeSet<String> = final_issues.iter().map(|i| i.issue_key.clone()).collect();
+    for issue in &final_issues {
+        if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status) {
+            tracing::warn!("maintenance: issue-state final observe failed: {e}");
+        }
+    }
+    let initial_keys: BTreeSet<String> = initial_issues.iter().map(|i| i.issue_key.clone()).collect();
+    for resolved in initial_keys.difference(&final_keys) {
+        if let Err(e) = db.resolve_issue_state(resolved, now) {
+            tracing::warn!("maintenance: issue-state resolve failed: {e}");
+        }
+    }
+    let resolved_cutoff = now - (config.maintenance.issue_state_keep_days as i64) * SECS_PER_DAY;
+    if let Err(e) = db.prune_resolved_issue_state_before(resolved_cutoff) {
+        tracing::warn!("maintenance: issue-state prune failed: {e}");
+    }
+    report.persistent_warnings = db
+        .list_persistent_open_issues()
+        .map(|rows| rows.into_iter().map(|r| r.issue_key).collect())
+        .unwrap_or_default();
+
+    // 8. Persist the run (best-effort; losing the audit row must not
     //    block the sweep).
     if let Err(e) = db.record_doctor_run(&report) {
         tracing::warn!("maintenance: failed to record doctor_runs row: {e}");
@@ -481,26 +623,160 @@ pub fn ensure_global_index(db: &Database) -> Result<bool> {
     Ok(true)
 }
 
-/// Return the subset of current Warn/Fail issues that were ALSO present
-/// in the most recent prior `doctor_runs` row. Transient warnings that
-/// only appeared on this run are excluded — the point is to surface
-/// nags, not flukes.
-///
-/// Compares structured `"Category:Name"` keys directly; no text parsing.
-fn compute_persistent_warnings(db: &Database, current_issues: &[String]) -> Vec<String> {
-    if current_issues.is_empty() {
-        return Vec::new();
-    }
-    let Ok(Some(prior)) = db.latest_doctor_run() else {
-        return Vec::new();
-    };
-    let prior_set: std::collections::HashSet<&str> =
-        prior.current_issues.iter().map(String::as_str).collect();
-    current_issues
+fn issue_snapshots(checks: &[DiagnosticCheck]) -> Vec<IssueSnapshot> {
+    checks
         .iter()
-        .filter(|issue| prior_set.contains(issue.as_str()))
-        .cloned()
+        .filter_map(|check| match &check.status {
+            CheckStatus::Pass => None,
+            CheckStatus::Warn(_) => Some(IssueSnapshot {
+                issue_key: check.issue_key(),
+                status: "warn",
+                remediation_kind: check.remediation_kind,
+                remediation_key: check.remediation_key,
+            }),
+            CheckStatus::Fail(_) => Some(IssueSnapshot {
+                issue_key: check.issue_key(),
+                status: "fail",
+                remediation_kind: check.remediation_kind,
+                remediation_key: check.remediation_key,
+            }),
+        })
         .collect()
+}
+
+fn group_issues_by_remediation<'a>(
+    issues: &'a [IssueSnapshot],
+) -> BTreeMap<&'static str, Vec<&'a IssueSnapshot>> {
+    let mut out: BTreeMap<&'static str, Vec<&IssueSnapshot>> = BTreeMap::new();
+    for issue in issues {
+        if issue.remediation_kind != RemediationKind::AutoSafe {
+            continue;
+        }
+        if let Some(key) = issue.remediation_key {
+            out.entry(key).or_default().push(issue);
+        }
+    }
+    out
+}
+
+fn embedding_scopes(db: &Database, config: &Config) -> Vec<String> {
+    let mut scopes = crate::memory::resolved_memory_scopes(config);
+    if let Ok(mut db_scopes) = db.list_memory_scopes() {
+        scopes.append(&mut db_scopes);
+    }
+    scopes.sort();
+    scopes.dedup();
+    scopes
+}
+
+fn count_stale_chunks(
+    expected_chunks: &[crate::chunker::Chunk],
+    existing_chunks: &[crate::db::ChunkRow],
+) -> usize {
+    if expected_chunks.is_empty() {
+        return 0;
+    }
+    expected_chunks
+        .iter()
+        .enumerate()
+        .filter(|(idx, expected)| {
+            existing_chunks
+                .get(*idx)
+                .is_none_or(|existing| {
+                    existing.content_hash != crate::embeddings::content_hash(&expected.content)
+                        || existing.embedding.is_none()
+                })
+        })
+        .count()
+}
+
+fn repair_embedding_backlog(db: &Database, config: &Config) -> Result<EmbeddingRepairReport> {
+    let mut report = EmbeddingRepairReport::default();
+    if !config.maintenance.embedding_repair_enabled || !config.memory.embeddings.enabled {
+        return Ok(report);
+    }
+    if crate::embeddings::get_or_init_provider(&config.memory.embeddings).is_none() {
+        report.failed = true;
+        return Ok(report);
+    }
+
+    let max_files = config.maintenance.embedding_repair_max_files as usize;
+    let max_chunks = config.maintenance.embedding_repair_max_chunks as usize;
+    let scopes = embedding_scopes(db, config);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    for scope in scopes {
+        let entries = db.list_memory_entries(&scope)?;
+        for entry in entries {
+            if report.repaired_files >= max_files {
+                return Ok(report);
+            }
+            let whole_missing = db
+                .get_embedding(&scope, &entry.name)?
+                .is_none_or(|row| row.content_hash != entry.content_hash);
+            let expected_chunks = crate::chunker::chunk_content(
+                &entry.content,
+                config.memory.embeddings.chunk_size_tokens,
+                config.memory.embeddings.chunk_overlap_tokens,
+            );
+            let existing_chunks = db.get_chunks_for_file(&scope, &entry.name)?;
+            let stale_chunk_count = count_stale_chunks(&expected_chunks, &existing_chunks);
+            let chunk_missing = expected_chunks.is_empty()
+                || existing_chunks.len() != expected_chunks.len()
+                || stale_chunk_count > 0;
+            if !whole_missing && !chunk_missing {
+                continue;
+            }
+            if chunk_missing {
+                let needed_chunks = stale_chunk_count;
+                if report.repaired_chunks + needed_chunks > max_chunks {
+                    continue;
+                }
+            }
+
+            let scope_clone = scope.clone();
+            let name_clone = entry.name.clone();
+            let content_clone = entry.content.clone();
+            let config_clone = config.clone();
+            runtime.block_on(async {
+                if whole_missing {
+                    crate::embeddings::embed_memory_file(
+                        &config_clone,
+                        &name_clone,
+                        &content_clone,
+                        &scope_clone,
+                    )
+                    .await?;
+                }
+                if chunk_missing {
+                    crate::embeddings::embed_memory_file_chunked(
+                        &config_clone,
+                        &name_clone,
+                        &content_clone,
+                        &scope_clone,
+                    )
+                    .await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+
+            report.repaired_files += 1;
+            if chunk_missing {
+                report.repaired_chunks += stale_chunk_count;
+                report
+                    .fixed_issue_keys
+                    .push("Embeddings:chunk coverage".to_string());
+            }
+            if whole_missing {
+                report
+                    .fixed_issue_keys
+                    .push("Embeddings:whole-entry coverage".to_string());
+            }
+        }
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -751,38 +1027,30 @@ mod tests {
     }
 
     #[test]
-    fn compute_persistent_warnings_intersects_with_previous_run() {
-        let db = crate::db::Database::test_db();
-        // Seed a prior run with two issues.
-        let prior = MaintenanceReport {
-            ran_at: 1,
-            current_issues: vec!["Data:database integrity".into(), "Gateway:reachable".into()],
-            ..Default::default()
-        };
-        db.record_doctor_run(&prior).unwrap();
-
-        // Current sweep overlaps on one issue and introduces a new one.
-        let current = vec![
-            "Data:database integrity".to_string(),
-            "Provider:reachable".to_string(),
+    fn group_issues_by_remediation_deduplicates_auto_safe_keys() {
+        let issues = vec![
+            IssueSnapshot {
+                issue_key: "Embeddings:chunk coverage".into(),
+                status: "warn",
+                remediation_kind: RemediationKind::AutoSafe,
+                remediation_key: Some("embeddings.repair"),
+            },
+            IssueSnapshot {
+                issue_key: "Embeddings:whole-entry coverage".into(),
+                status: "warn",
+                remediation_kind: RemediationKind::AutoSafe,
+                remediation_key: Some("embeddings.repair"),
+            },
+            IssueSnapshot {
+                issue_key: "Gateway:channel manifest".into(),
+                status: "fail",
+                remediation_kind: RemediationKind::Manual,
+                remediation_key: None,
+            },
         ];
-        let persistent = compute_persistent_warnings(&db, &current);
-        assert_eq!(
-            persistent,
-            vec!["Data:database integrity".to_string()],
-            "only issues present in BOTH runs should be flagged as persistent"
-        );
-    }
-
-    #[test]
-    fn compute_persistent_warnings_empty_when_no_prior_run() {
-        let db = crate::db::Database::test_db();
-        let current = vec!["Data:database integrity".to_string()];
-        let persistent = compute_persistent_warnings(&db, &current);
-        assert!(
-            persistent.is_empty(),
-            "first run has nothing to compare against"
-        );
+        let grouped = group_issues_by_remediation(&issues);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped["embeddings.repair"].len(), 2);
     }
 
     /// Integration test: feeding a real `Config` with `data.retention_days
@@ -980,15 +1248,90 @@ mod tests {
     }
 
     #[test]
-    fn compute_persistent_warnings_empty_when_current_is_empty() {
+    fn run_daily_maintenance_populates_issue_state_persistence() {
         let db = crate::db::Database::test_db();
-        let prior = MaintenanceReport {
-            ran_at: 1,
-            current_issues: vec!["Data:database integrity".into()],
-            ..Default::default()
-        };
-        db.record_doctor_run(&prior).unwrap();
-        let persistent = compute_persistent_warnings(&db, &[]);
-        assert!(persistent.is_empty());
+        let mut config = Config::default();
+        config.memory.embeddings.enabled = false;
+        let first = run_daily_maintenance(&db, &config).expect("first");
+        let second = run_daily_maintenance(&db, &config).expect("second");
+        assert!(
+            second
+                .persistent_warnings
+                .iter()
+                .any(|w| w == "Embeddings:semantic memory search"),
+            "repeated unresolved issue should become persistent"
+        );
+        assert!(
+            first.persistent_warnings.is_empty(),
+            "single-run warnings should not be persistent"
+        );
+    }
+
+    #[test]
+    fn repair_embedding_backlog_no_provider_is_bounded_failure() {
+        let db = crate::db::Database::test_db();
+        let mut config = Config::default();
+        config.memory.embeddings.enabled = true;
+        config.memory.embeddings.provider = Some("openai".into());
+        config.memory.embeddings.api_key_env = Some("BORG_TEST_MISSING_EMBED_KEY".into());
+        std::env::remove_var("BORG_TEST_MISSING_EMBED_KEY");
+
+        let report = repair_embedding_backlog(&db, &config).expect("repair");
+        assert!(report.failed, "missing provider creds should skip repair");
+        assert_eq!(report.repaired_files, 0);
+        assert_eq!(report.repaired_chunks, 0);
+    }
+
+    #[test]
+    fn count_stale_chunks_only_counts_missing_or_stale_entries() {
+        let expected_chunks = vec![
+            crate::chunker::Chunk {
+                content: "alpha".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+            crate::chunker::Chunk {
+                content: "beta".into(),
+                start_line: 2,
+                end_line: 2,
+            },
+            crate::chunker::Chunk {
+                content: "gamma".into(),
+                start_line: 3,
+                end_line: 3,
+            },
+        ];
+        let existing_chunks = vec![
+            crate::db::ChunkRow {
+                id: 1,
+                scope: "global".into(),
+                filename: "doc".into(),
+                chunk_index: 0,
+                start_line: Some(1),
+                end_line: Some(1),
+                content: "alpha".into(),
+                content_hash: crate::embeddings::content_hash("alpha"),
+                embedding: Some(vec![1, 2, 3]),
+                created_at: 0,
+            },
+            crate::db::ChunkRow {
+                id: 2,
+                scope: "global".into(),
+                filename: "doc".into(),
+                chunk_index: 1,
+                start_line: Some(2),
+                end_line: Some(2),
+                content: "beta".into(),
+                content_hash: crate::embeddings::content_hash("beta"),
+                embedding: None,
+                created_at: 0,
+            },
+        ];
+
+        assert_eq!(
+            count_stale_chunks(&expected_chunks, &existing_chunks),
+            2,
+            "only the missing tail chunk and the stale middle chunk should count against the budget"
+        );
     }
 }

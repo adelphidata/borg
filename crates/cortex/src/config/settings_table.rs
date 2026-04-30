@@ -202,6 +202,10 @@ define_settings! {
         "maintenance.activity_retention_days" => maintenance.activity_retention_days, parsed(u32);
         "maintenance.doctor_runs_keep" => maintenance.doctor_runs_keep, parsed(u32);
         "maintenance.workflow_retention_days" => maintenance.workflow_retention_days, parsed(u32);
+        "maintenance.embedding_repair_enabled" => maintenance.embedding_repair_enabled, parsed(bool);
+        "maintenance.embedding_repair_max_files" => maintenance.embedding_repair_max_files, parsed(u32);
+        "maintenance.embedding_repair_max_chunks" => maintenance.embedding_repair_max_chunks, parsed(u32);
+        "maintenance.issue_state_keep_days" => maintenance.issue_state_keep_days, parsed(u32);
     }
 
     registry_only {
@@ -424,6 +428,10 @@ define_settings! {
         "maintenance.activity_retention_days" => "Activity retention (days)", Uint, "Maintenance";
         "maintenance.doctor_runs_keep" => "Doctor runs kept", Uint, "Maintenance";
         "maintenance.workflow_retention_days" => "Workflow retention (days)", Uint, "Maintenance";
+        "maintenance.embedding_repair_enabled" => "Repair embeddings", Bool, "Maintenance";
+        "maintenance.embedding_repair_max_files" => "Embed repair files", Uint, "Maintenance";
+        "maintenance.embedding_repair_max_chunks" => "Embed repair chunks", Uint, "Maintenance";
+        "maintenance.issue_state_keep_days" => "Issue state retention", Uint, "Maintenance";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

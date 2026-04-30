@@ -19,6 +19,15 @@ pub struct MaintenanceConfig {
     /// Delete workflows (and their steps) in a terminal status
     /// (`completed` / `failed` / `cancelled`) older than this many days.
     pub workflow_retention_days: u32,
+    /// Whether the maintenance sweep should repair missing/stale memory
+    /// embeddings and chunk indexes.
+    pub embedding_repair_enabled: bool,
+    /// Maximum number of memory entries to repair in one sweep.
+    pub embedding_repair_max_files: u32,
+    /// Maximum number of chunks to repair in one sweep.
+    pub embedding_repair_max_chunks: u32,
+    /// Drop resolved issue-state rows older than this many days.
+    pub issue_state_keep_days: u32,
 }
 
 impl Default for MaintenanceConfig {
@@ -29,6 +38,10 @@ impl Default for MaintenanceConfig {
             activity_retention_days: 30,
             doctor_runs_keep: 30,
             workflow_retention_days: 7,
+            embedding_repair_enabled: true,
+            embedding_repair_max_files: 16,
+            embedding_repair_max_chunks: 256,
+            issue_state_keep_days: 30,
         }
     }
 }
@@ -45,6 +58,10 @@ mod tests {
         assert_eq!(cfg.activity_retention_days, 30);
         assert_eq!(cfg.doctor_runs_keep, 30);
         assert_eq!(cfg.workflow_retention_days, 7);
+        assert!(cfg.embedding_repair_enabled);
+        assert_eq!(cfg.embedding_repair_max_files, 16);
+        assert_eq!(cfg.embedding_repair_max_chunks, 256);
+        assert_eq!(cfg.issue_state_keep_days, 30);
     }
 
     #[test]
@@ -55,6 +72,10 @@ mod tests {
             activity_retention_days = 14
             doctor_runs_keep = 90
             workflow_retention_days = 3
+            embedding_repair_enabled = false
+            embedding_repair_max_files = 4
+            embedding_repair_max_chunks = 64
+            issue_state_keep_days = 10
         "#;
         let cfg: MaintenanceConfig = toml::from_str(toml_str).expect("parse");
         assert!(!cfg.enabled);
@@ -62,5 +83,9 @@ mod tests {
         assert_eq!(cfg.activity_retention_days, 14);
         assert_eq!(cfg.doctor_runs_keep, 90);
         assert_eq!(cfg.workflow_retention_days, 3);
+        assert!(!cfg.embedding_repair_enabled);
+        assert_eq!(cfg.embedding_repair_max_files, 4);
+        assert_eq!(cfg.embedding_repair_max_chunks, 64);
+        assert_eq!(cfg.issue_state_keep_days, 10);
     }
 }

@@ -3,6 +3,19 @@ use crate::db::Database;
 use crate::provider::Provider;
 use crate::skills::load_all_skills;
 
+/// How a detected issue can be remediated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationKind {
+    /// No automated or guided remediation metadata.
+    None,
+    /// Safe to repair automatically during `/heal` / maintenance.
+    AutoSafe,
+    /// Potentially automatable later, but intentionally not in the current sweep.
+    AutoGuarded,
+    /// Requires explicit manual user action.
+    Manual,
+}
+
 /// Result status for a single diagnostic check.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckStatus {
@@ -20,6 +33,9 @@ pub struct DiagnosticCheck {
     pub category: &'static str,
     pub name: String,
     pub status: CheckStatus,
+    pub remediation_kind: RemediationKind,
+    pub remediation_key: Option<&'static str>,
+    pub user_hint: Option<String>,
 }
 
 impl DiagnosticCheck {
@@ -29,6 +45,9 @@ impl DiagnosticCheck {
             category,
             name: name.into(),
             status: CheckStatus::Pass,
+            remediation_kind: RemediationKind::None,
+            remediation_key: None,
+            user_hint: None,
         }
     }
 
@@ -38,6 +57,9 @@ impl DiagnosticCheck {
             category,
             name: name.into(),
             status: CheckStatus::Warn(msg.into()),
+            remediation_kind: RemediationKind::None,
+            remediation_key: None,
+            user_hint: None,
         }
     }
 
@@ -47,6 +69,9 @@ impl DiagnosticCheck {
             category,
             name: name.into(),
             status: CheckStatus::Fail(msg.into()),
+            remediation_kind: RemediationKind::None,
+            remediation_key: None,
+            user_hint: None,
         }
     }
 
@@ -60,7 +85,28 @@ impl DiagnosticCheck {
             category,
             name: name.into(),
             status,
+            remediation_kind: RemediationKind::None,
+            remediation_key: None,
+            user_hint: None,
         }
+    }
+
+    /// Attach remediation metadata to a check.
+    pub fn with_remediation(
+        mut self,
+        remediation_kind: RemediationKind,
+        remediation_key: &'static str,
+        user_hint: impl Into<String>,
+    ) -> Self {
+        self.remediation_kind = remediation_kind;
+        self.remediation_key = Some(remediation_key);
+        self.user_hint = Some(user_hint.into());
+        self
+    }
+
+    /// Stable issue key persisted by maintenance.
+    pub fn issue_key(&self) -> String {
+        format!("{}:{}", self.category, self.name)
     }
 
     /// Create a check from a Result: pass on Ok, fail on Err.
@@ -77,10 +123,16 @@ impl DiagnosticCheck {
 
     /// Format a single check result line with status icon.
     pub fn format_line(&self) -> String {
+        let suffix = match self.remediation_kind {
+            RemediationKind::AutoSafe => " [auto-fixable]",
+            RemediationKind::AutoGuarded => " [guarded]",
+            RemediationKind::Manual => " [manual]",
+            RemediationKind::None => "",
+        };
         match &self.status {
             CheckStatus::Pass => format!("  ✓ {}", self.name),
-            CheckStatus::Warn(msg) => format!("  ⚠ {} — {msg}", self.name),
-            CheckStatus::Fail(msg) => format!("  ✗ {} — {msg}", self.name),
+            CheckStatus::Warn(msg) => format!("  ⚠ {}{suffix} — {msg}", self.name),
+            CheckStatus::Fail(msg) => format!("  ✗ {}{suffix} — {msg}", self.name),
         }
     }
 }
@@ -529,11 +581,14 @@ fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
                         "no entries in DB yet",
                     ));
                 } else {
-                    checks.push(DiagnosticCheck::warn(
-                        "Memory",
-                        format!("{total} memory entries"),
-                        "no INDEX entry",
-                    ));
+                    checks.push(
+                        DiagnosticCheck::warn("Memory", "memory index", "INDEX entry missing")
+                            .with_remediation(
+                                RemediationKind::AutoSafe,
+                                "memory.ensure_global_index",
+                                "run /heal to seed global/INDEX from existing entries",
+                            ),
+                    );
                 }
             }
             Err(e) => {
@@ -594,11 +649,18 @@ fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
                     }
                 }
             } else {
-                checks.push(DiagnosticCheck::warn(
-                    "Data",
-                    "data directory exists",
-                    "~/.borg not found — run `borg init`",
-                ));
+                checks.push(
+                    DiagnosticCheck::warn(
+                        "Data",
+                        "data directory exists",
+                        "~/.borg not found — run `/heal` or `borg init`",
+                    )
+                    .with_remediation(
+                        RemediationKind::AutoSafe,
+                        "data.ensure_subdirs",
+                        "run /heal to recreate the runtime subdirectories",
+                    ),
+                );
             }
         }
         Err(e) => {
@@ -1096,20 +1158,85 @@ fn check_agents(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
 /// Pulled out as a pure function so the threshold can be exercised in unit
 /// tests without spinning up a real `Database`.
 fn classify_embedding_lag(global_count: usize, entry_count: usize) -> DiagnosticCheck {
-    let name = format!("embeddings: {global_count}/{entry_count} memory entries indexed");
+    let detail = format!("{global_count}/{entry_count} memory entries indexed");
     if entry_count == 0 || global_count >= entry_count {
-        return DiagnosticCheck::pass("Embeddings", name);
+        return DiagnosticCheck::pass("Embeddings", format!("whole-entry coverage: {detail}"));
     }
     let gap = entry_count - global_count;
     if gap <= EMBEDDING_LAG_WARN_THRESHOLD {
-        DiagnosticCheck::pass("Embeddings", format!("{name} (pending backfill)"))
+        DiagnosticCheck::pass("Embeddings", format!("whole-entry coverage: {detail} (pending backfill)"))
     } else {
         DiagnosticCheck::warn(
             "Embeddings",
-            name,
-            format!("{gap} entries lag behind — embedder may be stuck"),
+            "whole-entry coverage",
+            format!("{detail} — {gap} entries lag behind"),
+        )
+        .with_remediation(
+            RemediationKind::AutoSafe,
+            "embeddings.repair",
+            "run /heal to backfill stale or missing embeddings",
         )
     }
+}
+
+#[derive(Default)]
+struct ChunkCoverage {
+    total_entries: usize,
+    fully_indexed_entries: usize,
+    entries_missing_chunks: usize,
+    entries_missing_chunk_embeddings: usize,
+}
+
+fn classify_chunk_coverage(coverage: ChunkCoverage) -> DiagnosticCheck {
+    let detail = format!(
+        "{}/{} entries fully chunk-indexed",
+        coverage.fully_indexed_entries, coverage.total_entries
+    );
+    if coverage.total_entries == 0 || coverage.fully_indexed_entries == coverage.total_entries {
+        return DiagnosticCheck::pass("Embeddings", format!("chunk coverage: {detail}"));
+    }
+    let mut issues = Vec::new();
+    if coverage.entries_missing_chunks > 0 {
+        issues.push(format!("{} missing chunk rows", coverage.entries_missing_chunks));
+    }
+    if coverage.entries_missing_chunk_embeddings > 0 {
+        issues.push(format!(
+            "{} missing chunk embeddings",
+            coverage.entries_missing_chunk_embeddings
+        ));
+    }
+    DiagnosticCheck::warn("Embeddings", "chunk coverage", format!("{detail} — {}", issues.join(", ")))
+        .with_remediation(
+            RemediationKind::AutoSafe,
+            "embeddings.repair",
+            "run /heal to rebuild stale chunk indexes",
+        )
+}
+
+fn collect_chunk_coverage(db: &Database, scopes: &[String]) -> ChunkCoverage {
+    let mut coverage = ChunkCoverage::default();
+    for scope in scopes {
+        let Ok(entries) = db.list_memory_entries(scope) else {
+            continue;
+        };
+        for entry in entries {
+            coverage.total_entries += 1;
+            let Ok(chunks) = db.get_chunks_for_file(scope, &entry.name) else {
+                coverage.entries_missing_chunks += 1;
+                continue;
+            };
+            if chunks.is_empty() {
+                coverage.entries_missing_chunks += 1;
+                continue;
+            }
+            if chunks.iter().any(|c| c.embedding.is_none()) {
+                coverage.entries_missing_chunk_embeddings += 1;
+                continue;
+            }
+            coverage.fully_indexed_entries += 1;
+        }
+    }
+    coverage
 }
 
 fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
@@ -1144,13 +1271,24 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
 
     match Database::open() {
         Ok(db) => {
-            let global_count = db.count_embeddings("global").unwrap_or(0);
-            let entry_count = db
-                .list_memory_entries("global")
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let scopes = {
+                let mut scopes = crate::memory::resolved_memory_scopes(config);
+                if let Ok(mut db_scopes) = db.list_memory_scopes() {
+                    scopes.append(&mut db_scopes);
+                }
+                scopes.sort();
+                scopes.dedup();
+                scopes
+            };
+            let mut global_count = 0usize;
+            let mut entry_count = 0usize;
+            for scope in &scopes {
+                global_count += db.count_embeddings(scope).unwrap_or(0);
+                entry_count += db.list_memory_entries(scope).map(|v| v.len()).unwrap_or(0);
+            }
 
             checks.push(classify_embedding_lag(global_count, entry_count));
+            checks.push(classify_chunk_coverage(collect_chunk_coverage(&db, &scopes)));
         }
         Err(e) => {
             checks.push(DiagnosticCheck::warn(
@@ -1367,6 +1505,18 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_check_with_remediation_formats_fixability() {
+        let check = DiagnosticCheck::warn("Embeddings", "chunk coverage", "backlog")
+            .with_remediation(
+                RemediationKind::AutoSafe,
+                "embeddings.repair",
+                "run /heal",
+            );
+        assert_eq!(check.issue_key(), "Embeddings:chunk coverage");
+        assert!(check.format_line().contains("[auto-fixable]"));
+    }
+
+    #[test]
     fn report_format_groups_consecutive_same_category() {
         let report = DiagnosticReport {
             checks: vec![
@@ -1408,6 +1558,27 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].status, CheckStatus::Warn(_)));
         assert_eq!(checks[0].category, "Browser");
+    }
+
+    #[test]
+    fn classify_embedding_lag_warns_with_auto_fix_metadata() {
+        let check = classify_embedding_lag(1, 10);
+        assert_eq!(check.name, "whole-entry coverage");
+        assert_eq!(check.remediation_kind, RemediationKind::AutoSafe);
+        assert_eq!(check.remediation_key, Some("embeddings.repair"));
+    }
+
+    #[test]
+    fn classify_chunk_coverage_warns_when_entries_lack_chunks() {
+        let check = classify_chunk_coverage(ChunkCoverage {
+            total_entries: 3,
+            fully_indexed_entries: 1,
+            entries_missing_chunks: 1,
+            entries_missing_chunk_embeddings: 1,
+        });
+        assert_eq!(check.name, "chunk coverage");
+        assert!(matches!(check.status, CheckStatus::Warn(_)));
+        assert_eq!(check.remediation_kind, RemediationKind::AutoSafe);
     }
 
     #[test]

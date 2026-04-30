@@ -148,6 +148,7 @@ fn record_and_latest_doctor_run_roundtrip() {
         current_issues: vec!["Gateway:reachable".into()],
         check_summary: vec!["  ⚠ Gateway:reachable — down".into()],
         skipped: false,
+        ..Default::default()
     };
     db.record_doctor_run(&report).expect("record");
 

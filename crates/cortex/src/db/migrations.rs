@@ -1741,6 +1741,34 @@ impl Database {
         Ok(())
     }
 
+    /// V49: Maintenance issue lifecycle state.
+    ///
+    /// Tracks issue persistence across sweeps independently of the raw
+    /// `doctor_runs` snapshots so maintenance can record consecutive counts,
+    /// auto-fix attempts, and explicit resolution timestamps.
+    pub(super) fn migrate_v49(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS maintenance_issue_state (
+                issue_key            TEXT PRIMARY KEY,
+                first_seen_at        INTEGER NOT NULL,
+                last_seen_at         INTEGER NOT NULL,
+                consecutive_count    INTEGER NOT NULL DEFAULT 0,
+                last_status          TEXT NOT NULL,
+                auto_fix_attempts    INTEGER NOT NULL DEFAULT 0,
+                last_auto_fix_at     INTEGER,
+                last_auto_fix_result TEXT,
+                resolved_at          INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_open
+                ON maintenance_issue_state(last_status, consecutive_count, issue_key);
+            CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_resolved
+                ON maintenance_issue_state(resolved_at);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

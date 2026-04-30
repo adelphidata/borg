@@ -23,11 +23,16 @@ costs zero tokens.
 
 Each run does the following in order:
 
-1. **Headless doctor sweep.** Runs the same 17 check categories as
+1. **Bootstrap repair.** Recreates the expected runtime subdirectories
+   under `~/.borg/` (`channels`, `skills`, `hooks`, `backups`, `logs`)
+   and seeds `global/INDEX` when long-term memory entries exist without
+   an index. These are idempotent, cheap repairs that make fresh installs
+   and "user deleted a subdir by hand" incidents self-correcting.
+2. **Headless doctor sweep.** Runs the same 17 check categories as
    `borg doctor` (including a `PRAGMA integrity_check` under the
    **Data** category) and persists the full result to the `doctor_runs`
    table.
-2. **Log rotation.** Deletes `~/.borg/logs/*.jsonl` files older than
+3. **Log rotation.** Deletes `~/.borg/logs/*.jsonl` files older than
    `maintenance.logs_retention_days` (default 30). In the same step,
    head-truncates the append-only logs `daemon.log`, `daemon.err`, and
    `tui.log` when they exceed 5 MB, keeping the last ~1 MB starting at a
@@ -35,28 +40,28 @@ Each run does the following in order:
    noisy warn loop once ballooned `daemon.log` past 20 MB in under two
    weeks; the cap prevents recurrence. Bytes freed are reported via
    `MaintenanceReport.log_bytes_truncated`.
-3. **Activity-log pruning.** Deletes `activity_log` rows older than
+4. **Activity-log pruning.** Deletes `activity_log` rows older than
    `maintenance.activity_retention_days` (default 30).
-4. **Embedding-cache pruning.** Evicts embeddings not accessed in the
+5. **Embedding-cache pruning.** Evicts embeddings not accessed in the
    last 30 days.
-5. **Workflow pruning.** Deletes `completed`/`failed`/`cancelled`
+6. **Workflow pruning.** Deletes `completed`/`failed`/`cancelled`
    workflows (and their steps) whose `completed_at` is older than
    `maintenance.workflow_retention_days` (default 7). Active workflows
    (`pending`/`running`) are untouched regardless of age. Without this,
    experimental test workflows accumulate indefinitely and any left in
    `running` across a daemon restart burst-process all at once and spam
    the activity log.
-6. **Retention purge.** When `data.purge_policy = Auto` and
+7. **Retention purge.** When `data.purge_policy = Auto` and
    `data.retention_days` is set, deletes old `messages` rows and
    tombstones old `audit_log_chain` rows in place so the hash chain
    remains verifiable while older payloads age out.
-7. **Weekly auto-backup.** When `data.backup_keep_count > 0` and no
+8. **Weekly auto-backup.** When `data.backup_keep_count > 0` and no
    backup has been created in the last 7 days, writes a
    `borg-backup-<timestamp>.tar.zst` snapshot under `~/.borg/backups/`
    and prunes older backups past the keep count. When
    `backup_keep_count = 0`, maintenance prunes any leftover auto-backup
    files instead of creating new ones.
-8. **Stalled-task scan.** Recomputes `next_run` for any recurring
+9. **Stalled-task scan.** Recomputes `next_run` for any recurring
    scheduled task whose fire time has drifted more than one hour into
    the past (see below). When more than
    `CLOCK_JUMP_AGGREGATE_THRESHOLD` (5) tasks look stalled in a single
@@ -66,18 +71,55 @@ Each run does the following in order:
    is still recomputed for every task; only the audit entry is
    aggregated. `HealReport.aggregated` flags the case for the daemon
    log.
-9. **Wedged-run recovery.** Marks any `task_runs` row stuck in
+10. **Wedged-run recovery.** Marks any `task_runs` row stuck in
    `status='running'` past its timeout as `failed`, using the task's own
    `timeout_ms` when present and the 1-hour default grace otherwise.
-10. **Persistent-warning surfacing.** Compares this run's Warn/Fail
-    checks against the previous run; any issue that appeared in both is
-    added to `MaintenanceReport.persistent_warnings`. Single-run flukes
-    do not escalate — only nags that stick. Because step 1 includes the
-   SQLite integrity check, a genuinely corrupt database will surface
-   as a persistent warning after two consecutive sweeps.
+11. **Remediation registry.** Any doctor issue marked `AutoSafe` is
+    eligible for one bounded repair attempt during this sweep. Current
+    safe remediations are recreating runtime subdirs, seeding
+    `global/INDEX`, and repairing stale/missing memory embeddings and
+    chunk indexes.
+12. **Issue lifecycle update.** Warn/Fail checks are written into
+    `maintenance_issue_state`, which tracks `first_seen_at`,
+    `last_seen_at`, `consecutive_count`, and the last auto-fix attempt.
+    `MaintenanceReport.persistent_warnings` is derived from that table:
+    only still-open issues with `consecutive_count >= 2` are surfaced as
+    persistent warnings. Single-run flukes do not escalate.
 
-The run is recorded to `doctor_runs`, and the table is capped at
-`maintenance.doctor_runs_keep` (default 30) rows.
+The run is still recorded to `doctor_runs`, and the table is capped at
+`maintenance.doctor_runs_keep` (default 30) rows. `doctor_runs` remains
+the immutable per-sweep audit snapshot; `maintenance_issue_state` is the
+mutable "latest lifecycle state" index across sweeps.
+
+## Remediation model
+
+Each doctor check may declare one of four remediation modes:
+
+- `None` — pure diagnostics, no remediation metadata.
+- `AutoSafe` — safe to repair during `/heal` or the nightly sweep.
+- `AutoGuarded` — candidates for automation later, intentionally manual today.
+- `Manual` — requires explicit operator action.
+
+`borg doctor` shows fixability inline (`[auto-fixable]`, `[manual]`, etc.)
+so the user can see whether a warning is expected to clear on the next
+maintenance sweep or needs real intervention.
+
+## Embedding repair
+
+The maintenance sweep now repairs memory embedding backlog in addition to
+pruning the embedding cache.
+
+- Coverage is checked across all memory scopes known to the config or DB,
+  not just `global`.
+- The sweep repairs both `memory_embeddings` rows (whole-entry coverage)
+  and `memory_chunks` rows / chunk embeddings (the retrieval path used by
+  hybrid search).
+- Repairs are bounded by two settings so `/heal` never turns into an
+  unbounded background reindex:
+  `maintenance.embedding_repair_max_files` and
+  `maintenance.embedding_repair_max_chunks`.
+- If no embedding-capable provider is available, maintenance records the
+  issue but skips repair rather than failing the whole sweep.
 
 ### On-demand sweep
 
@@ -95,11 +137,12 @@ maintenance behavior. The TUI renders the daemon's `HealReport`
 projection plus any persistent warnings inline.
 
 Unlike `/doctor` (read-only diagnostics, streamed), `/heal` executes
-the mutating steps: log truncation, activity-log pruning, embedding
-eviction, workflow pruning, retention purge, backup creation/pruning,
-stalled-task healing, and wedged task-run recovery. Use `/doctor` when
-you want a quick health readout; use `/heal` when you want the sweep to
-actually do its housekeeping.
+the mutating steps: bootstrap repair, log truncation, activity-log
+pruning, embedding eviction, embedding backfill, workflow pruning,
+retention purge, backup creation/pruning, stalled-task healing, and
+wedged task-run recovery. Use `/doctor` when you want a quick health
+readout; use `/heal` when you want the sweep to actually do its
+housekeeping.
 
 ### Disabling
 
@@ -119,8 +162,12 @@ returns immediately after logging a skip message.
 | `maintenance.activity_retention_days` | `30` | `activity_log` rows older than this are deleted. |
 | `maintenance.workflow_retention_days` | `7` | Terminal-status workflows (`completed`/`failed`/`cancelled`) older than this are deleted along with their steps. |
 | `maintenance.doctor_runs_keep` | `30` | Keep at most this many `doctor_runs` history rows. |
+| `maintenance.embedding_repair_enabled` | `true` | Whether maintenance repairs stale/missing memory embeddings and chunk indexes. |
+| `maintenance.embedding_repair_max_files` | `16` | Maximum memory entries repaired in one sweep. |
+| `maintenance.embedding_repair_max_chunks` | `256` | Maximum chunks rebuilt in one sweep. |
+| `maintenance.issue_state_keep_days` | `30` | Resolved `maintenance_issue_state` rows older than this are pruned. |
 
-All five are wired through `/settings` under the **Maintenance**
+All nine are wired through `/settings` under the **Maintenance**
 section.
 
 ## Wedged-run recovery inside the daemon loop

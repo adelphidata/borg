@@ -3,6 +3,7 @@ mod audit_chain;
 mod audit_writer;
 mod delivery;
 mod device_pairing;
+mod issue_state;
 mod maintenance;
 mod memory;
 mod meta;
@@ -28,6 +29,7 @@ mod tests;
 pub use audit_chain::{compute_row_hash, AuditChainOutcome, AuditChainRow, GENESIS_PREV_HASH};
 pub use audit_writer::{audit_events, install_global_audit, try_emit_global, AuditWriter};
 pub use device_pairing::{hash_pairing_code, ConsumeOutcome};
+pub use issue_state::IssueStateRow;
 pub use models::*;
 pub use pki::{InternalCertRow, PairedDeviceRow};
 pub use sessions::MessageFtsHit;
@@ -313,7 +315,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 48;
+    const CURRENT_VERSION: u32 = 49;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -400,6 +402,7 @@ impl Database {
             Database::migrate_v46,
             Database::migrate_v47,
             Database::migrate_v48,
+            Database::migrate_v49,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.
