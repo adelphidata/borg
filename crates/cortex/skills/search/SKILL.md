@@ -1,6 +1,11 @@
 ---
 name: search
 description: "Find files and search content via ripgrep and fd"
+triggers:
+  - "find this in the codebase"
+  - "search the repo"
+  - "ripgrep"
+  - "find matching files"
 requires:
   bins: ["rg"]
 ---

@@ -2,6 +2,11 @@
 name: calendar
 description: "Check schedule and events via icalBuddy (macOS) or gcalcli (Google Calendar)"
 category: core
+triggers:
+  - "check my calendar"
+  - "show upcoming events"
+  - "what's on my schedule"
+  - "calendar agenda"
 requires:
   any_bins: ["icalBuddy", "gcalcli"]
 install:

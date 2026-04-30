@@ -2,6 +2,11 @@
 name: email
 description: "Manage emails via himalaya CLI. Read, send, reply, forward, search, and organize emails across Gmail, Outlook, Yahoo, iCloud, or any IMAP/SMTP provider."
 category: core
+triggers:
+  - "check my email"
+  - "send an email"
+  - "draft a reply"
+  - "email inbox"
 requires:
   bins: ["himalaya"]
 ---

@@ -1,6 +1,11 @@
 ---
 name: browser
 description: "Browse the web, interact with pages, take screenshots"
+triggers:
+  - "browse this site"
+  - "click through the page"
+  - "take a screenshot"
+  - "inspect the web page"
 requires:
   bins: ["agent-browser"]
 ---

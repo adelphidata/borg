@@ -303,6 +303,7 @@ mod tests {
         SkillManifest {
             name: name.to_string(),
             description: "Test skill".to_string(),
+            triggers: vec![],
             requires: SkillRequires {
                 bins: vec![],
                 env,

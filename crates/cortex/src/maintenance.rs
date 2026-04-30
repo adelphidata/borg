@@ -13,9 +13,9 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::Config;
 use crate::db::Database;
@@ -312,14 +312,15 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             "data.ensure_subdirs" => Config::data_dir()
                 .and_then(|dir| ensure_data_subdirs(&dir))
                 .map(|_| (true, None)),
-            "memory.ensure_global_index" => ensure_global_index(db)
-                .map(|changed| (changed, None)),
-            "embeddings.repair" => repair_embedding_backlog(db, config)
-                .map(|r| {
-                    report.embeddings_repaired_files += r.repaired_files;
-                    report.embeddings_repaired_chunks += r.repaired_chunks;
-                    (r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed, Some(r))
-                }),
+            "memory.ensure_global_index" => ensure_global_index(db).map(|changed| (changed, None)),
+            "embeddings.repair" => repair_embedding_backlog(db, config).map(|r| {
+                report.embeddings_repaired_files += r.repaired_files;
+                report.embeddings_repaired_chunks += r.repaired_chunks;
+                (
+                    r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed,
+                    Some(r),
+                )
+            }),
             _ => Ok((false, None)),
         };
         match result {
@@ -330,16 +331,21 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
                     }
                     if embedding_report.failed {
                         for issue in &issues {
-                            repair_execution.failed_issues.insert(issue.issue_key.clone());
+                            repair_execution
+                                .failed_issues
+                                .insert(issue.issue_key.clone());
                         }
                     }
                 } else if changed {
                     for issue in &issues {
-                        repair_execution.fixed_issues.insert(issue.issue_key.clone());
+                        repair_execution
+                            .fixed_issues
+                            .insert(issue.issue_key.clone());
                     }
                 }
                 for issue in &issues {
-                    if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    if let Err(e) =
+                        db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
                     {
                         tracing::warn!("maintenance: issue-state observe failed: {e}");
                     }
@@ -348,7 +354,8 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
                     } else {
                         "attempted"
                     };
-                    if let Err(e) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, outcome) {
+                    if let Err(e) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, outcome)
+                    {
                         tracing::warn!("maintenance: issue auto-fix attempt record failed: {e}");
                     }
                 }
@@ -356,12 +363,17 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             Err(e) => {
                 tracing::warn!("maintenance: remediation {key} failed: {e}");
                 for issue in &issues {
-                    repair_execution.failed_issues.insert(issue.issue_key.clone());
-                    if let Err(se) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    repair_execution
+                        .failed_issues
+                        .insert(issue.issue_key.clone());
+                    if let Err(se) =
+                        db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
                     {
                         tracing::warn!("maintenance: issue-state observe failed: {se}");
                     }
-                    if let Err(se) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, "failed") {
+                    if let Err(se) =
+                        db.record_issue_auto_fix_attempt(&issue.issue_key, now, "failed")
+                    {
                         tracing::warn!("maintenance: issue auto-fix attempt record failed: {se}");
                     }
                 }
@@ -405,7 +417,8 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             tracing::warn!("maintenance: issue-state final observe failed: {e}");
         }
     }
-    let initial_keys: BTreeSet<String> = initial_issues.iter().map(|i| i.issue_key.clone()).collect();
+    let initial_keys: BTreeSet<String> =
+        initial_issues.iter().map(|i| i.issue_key.clone()).collect();
     for resolved in initial_keys.difference(&final_keys) {
         if let Err(e) = db.resolve_issue_state(resolved, now) {
             tracing::warn!("maintenance: issue-state resolve failed: {e}");
@@ -680,12 +693,10 @@ fn count_stale_chunks(
         .iter()
         .enumerate()
         .filter(|(idx, expected)| {
-            existing_chunks
-                .get(*idx)
-                .is_none_or(|existing| {
-                    existing.content_hash != crate::embeddings::content_hash(&expected.content)
-                        || existing.embedding.is_none()
-                })
+            existing_chunks.get(*idx).is_none_or(|existing| {
+                existing.content_hash != crate::embeddings::content_hash(&expected.content)
+                    || existing.embedding.is_none()
+            })
         })
         .count()
 }

@@ -150,6 +150,17 @@ impl Agent {
         </tool_call_style>\n"
     }
 
+    /// Build the skill usage guidance section.
+    pub(super) fn build_skill_usage_section() -> &'static str {
+        "\n<skill_usage>\n\
+        Skills teach reusable workflows and external CLI/API usage.\n\
+        When a task clearly matches an available skill, use that skill's workflow instead of reinventing it from scratch.\n\
+        If the task points at an integration or reusable workflow and the right skill is unclear, use the list tool with what=\"skills\".\n\
+        Create a new user skill only when the workflow is reusable, non-trivial, and not already covered by existing tools or skills.\n\
+        Do not create skills for one-off trivial tasks.\n\
+        </skill_usage>\n"
+    }
+
     /// Build the silent reply protocol section.
     pub(super) fn build_silent_reply_section() -> String {
         let token = constants::SILENT_REPLY_TOKEN;

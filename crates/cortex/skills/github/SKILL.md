@@ -1,6 +1,11 @@
 ---
 name: github
 description: "GitHub issues, PRs, CI, and code review via gh CLI"
+triggers:
+  - "github issue"
+  - "pull request"
+  - "open a pr"
+  - "review this github change"
 requires:
   bins: ["gh"]
 ---

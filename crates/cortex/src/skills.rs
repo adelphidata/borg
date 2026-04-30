@@ -66,9 +66,10 @@ macro_rules! bundled_skills {
 }
 
 bundled_skills! {
+    "skill-creator"  => "skill-creator"  { category: "core",      default_enabled: true,  hidden: false },
     "slack"          => "slack"          { category: "channels",  default_enabled: false, hidden: true  },
     "discord"        => "discord"        { category: "channels",  default_enabled: false, hidden: true  },
-    "github"         => "github"         { category: "developer", default_enabled: false, hidden: false },
+    "github"         => "github"         { category: "developer", default_enabled: true,  hidden: false },
     "weather"        => "weather"        { category: "utilities", default_enabled: false, hidden: false },
     "git"            => "git"            { category: "developer", default_enabled: true,  hidden: false },
     "search"         => "search"         { category: "core",      default_enabled: true,  hidden: false },
@@ -82,7 +83,7 @@ bundled_skills! {
     "email"          => "email"          { category: "core",      default_enabled: true,  hidden: false },
     "scheduler"      => "scheduler"      { category: "core",      default_enabled: true,  hidden: false },
     "paperclip"      => "paperclip"      { category: "developer", default_enabled: false, hidden: false },
-    "pdf"            => "pdf"            { category: "utilities", default_enabled: false, hidden: false },
+    "pdf"            => "pdf"            { category: "utilities", default_enabled: true,  hidden: false },
     "reminders"      => "reminders"      { category: "productivity", default_enabled: false, hidden: false },
     "linear"         => "linear"         { category: "productivity", default_enabled: false, hidden: false },
 }
@@ -133,6 +134,12 @@ pub fn is_builtin_skill_name(name: &str) -> bool {
     BUNDLED_SKILLS.iter().any(|(n, _)| *n == name)
 }
 
+fn bundled_skill_content(name: &str) -> Option<&'static str> {
+    BUNDLED_SKILLS
+        .iter()
+        .find_map(|(skill_name, content)| (*skill_name == name).then_some(*content))
+}
+
 /// Where a skill was loaded from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkillSource {
@@ -180,6 +187,9 @@ pub struct SkillManifest {
     pub name: String,
     /// Human-readable description of what the skill does.
     pub description: String,
+    /// Short task phrases that should trigger this skill when the user asks.
+    #[serde(default)]
+    pub triggers: Vec<String>,
     /// Runtime requirements (binaries, env vars).
     #[serde(default)]
     pub requires: SkillRequires,
@@ -214,6 +224,14 @@ pub struct Skill {
 }
 
 impl Skill {
+    fn trigger_summary(&self) -> Option<String> {
+        if self.manifest.triggers.is_empty() {
+            None
+        } else {
+            Some(self.manifest.triggers.join(", "))
+        }
+    }
+
     /// Returns a display label for the skill's source ("built-in" or "user").
     pub fn source_label(&self) -> &'static str {
         match self.source {
@@ -276,10 +294,14 @@ impl Skill {
         let status = self.status_label();
         match level {
             SkillLoadLevel::Metadata => {
-                format!(
+                let mut meta = format!(
                     "### {} ({}, {}) — {}",
                     self.manifest.name, source, status, self.manifest.description
-                )
+                );
+                if let Some(triggers) = self.trigger_summary() {
+                    meta.push_str(&format!("\nTriggers: {triggers}"));
+                }
+                meta
             }
             SkillLoadLevel::Summary => {
                 let first_para = self
@@ -310,6 +332,9 @@ impl Skill {
             self.source_label(),
             self.manifest.description
         );
+        if let Some(triggers) = self.trigger_summary() {
+            line.push_str(&format!("\n    Triggers: {triggers}"));
+        }
         if !self.available && !self.disabled {
             if let Some(hint) = self.install_hint() {
                 line.push_str(&format!("\n    Install: {hint}"));
@@ -423,7 +448,7 @@ fn check_requirements(
 /// Use sparingly: only for skills that teach core agent capabilities whose
 /// tools are always present (e.g. `scheduler` teaches the always-available
 /// `schedule` tool — disabling it would strand a top use case).
-pub const MANDATORY_SKILLS: &[&str] = &["scheduler"];
+pub const MANDATORY_SKILLS: &[&str] = &["scheduler", "skill-creator"];
 
 /// Determine if a skill is disabled given config entries and the default-enabled list.
 fn is_skill_disabled(name: &str, skills_config: &SkillsConfig) -> bool {
@@ -513,6 +538,7 @@ pub fn load_all_skills(
                 if skill_file.exists() {
                     match std::fs::read_to_string(&skill_file) {
                         Ok(content) => {
+                            let dir_name = entry.file_name().to_string_lossy().to_string();
                             // Auto-installed copies of bundled skills (written by
                             // `install_default_skills`) are byte-identical to the
                             // embedded version. The bundled in-memory skill is
@@ -528,6 +554,18 @@ pub fn load_all_skills(
                                 Ok((manifest, mut body)) => {
                                     let name = manifest.name.clone();
                                     let skill_dir = entry.path();
+
+                                    // Older auto-installed bundled copies remain on disk after
+                                    // built-in SKILL.md updates. Treat matching built-in
+                                    // directory/name pairs as bundled identity rather than
+                                    // noisy conflicting user skills.
+                                    if dir_name == name && bundled_skill_content(&name).is_some() {
+                                        debug!(
+                                            "Skipping bundled skill copy on disk for '{}'",
+                                            name
+                                        );
+                                        continue;
+                                    }
 
                                     // Load references from references/*.md
                                     let mut references = Vec::new();
@@ -678,6 +716,7 @@ pub fn load_skills_context(
     max_tokens: usize,
     resolved_creds: &std::collections::HashMap<String, String>,
     skills_config: &SkillsConfig,
+    user_request: &str,
 ) -> Result<(String, SkillBudgetReport)> {
     let mut report = SkillBudgetReport {
         budget_tokens: max_tokens,
@@ -693,9 +732,16 @@ pub fn load_skills_context(
     // Exclude disabled skills from context injection entirely
     let skills: Vec<Skill> = skills.into_iter().filter(|s| !s.disabled).collect();
 
-    // Sort: available skills first, then unavailable
+    // Sort metadata so relevant available skills consume the budget first.
     let mut sorted_skills = skills;
-    sorted_skills.sort_by_key(|s| !s.available);
+    sorted_skills.sort_by(|a, b| {
+        let score_a = skill_relevance_score(a, user_request);
+        let score_b = skill_relevance_score(b, user_request);
+        (!a.available)
+            .cmp(&!b.available)
+            .then_with(|| score_b.cmp(&score_a))
+            .then_with(|| a.manifest.name.cmp(&b.manifest.name))
+    });
 
     // Phase 1: Include metadata for as many skills as fit; track omissions.
     let mut metadata_parts: Vec<Option<String>> = Vec::with_capacity(sorted_skills.len());
@@ -721,12 +767,25 @@ pub fn load_skills_context(
     let mut full_overrides: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
 
-    for (i, skill) in sorted_skills.iter().enumerate() {
-        if !skill.available {
-            continue;
-        }
+    let mut upgrade_order: Vec<usize> = sorted_skills
+        .iter()
+        .enumerate()
+        .filter_map(|(i, skill)| skill.available.then_some(i))
+        .collect();
+    upgrade_order.sort_by(|a, b| {
+        let score_a = skill_relevance_score(&sorted_skills[*a], user_request);
+        let score_b = skill_relevance_score(&sorted_skills[*b], user_request);
+        score_b.cmp(&score_a).then_with(|| {
+            sorted_skills[*a]
+                .manifest
+                .name
+                .cmp(&sorted_skills[*b].manifest.name)
+        })
+    });
+
+    for i in upgrade_order {
+        let skill = &sorted_skills[i];
         let Some(meta) = metadata_parts[i].as_ref() else {
-            // Skill was omitted in phase 1 — can't upgrade.
             continue;
         };
         let full = skill.format_at_level(SkillLoadLevel::Full);
@@ -767,6 +826,50 @@ pub fn load_skills_context(
         format!("# Skills\n\n{}\n", parts.join("\n---\n\n"))
     };
     Ok((rendered, report))
+}
+
+fn normalized_skill_terms(skill: &Skill) -> Vec<String> {
+    let mut terms = vec![
+        skill.manifest.name.to_lowercase(),
+        skill.manifest.description.to_lowercase(),
+    ];
+    terms.extend(skill.manifest.triggers.iter().map(|t| t.to_lowercase()));
+    terms
+}
+
+fn skill_relevance_score(skill: &Skill, user_request: &str) -> u32 {
+    if user_request.trim().is_empty() {
+        return 0;
+    }
+
+    let request = user_request.to_lowercase();
+    let mut score = 0;
+
+    for trigger in &skill.manifest.triggers {
+        let trigger = trigger.trim().to_lowercase();
+        if trigger.is_empty() {
+            continue;
+        }
+        if request.contains(&trigger) {
+            score += 10;
+        } else if trigger
+            .split_whitespace()
+            .all(|word| !word.is_empty() && request.contains(word))
+        {
+            score += 5;
+        }
+    }
+
+    for term in normalized_skill_terms(skill) {
+        if term.is_empty() {
+            continue;
+        }
+        if request.contains(&term) {
+            score += 3;
+        }
+    }
+
+    score
 }
 
 /// Collect per-skill env vars from config entries for injection into run_shell.
@@ -921,10 +1024,14 @@ fn format_skill_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     const SAMPLE_SKILL: &str = r#"---
 name: test-skill
 description: "A test skill for unit tests."
+triggers:
+  - "test skill"
+  - "unit test workflow"
 requires:
   bins: []
   env: []
@@ -949,11 +1056,54 @@ description: "Minimal skill."
 Body here.
 "#;
 
+    fn skills_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct SkillsDataDirEnv {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        tmp: tempfile::TempDir,
+        prev: Option<String>,
+    }
+
+    impl SkillsDataDirEnv {
+        fn new() -> Self {
+            let lock = skills_env_lock();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let prev = std::env::var("BORG_DATA_DIR").ok();
+            unsafe { std::env::set_var("BORG_DATA_DIR", tmp.path()) };
+            Self {
+                _lock: lock,
+                tmp,
+                prev,
+            }
+        }
+
+        fn skills_path(&self) -> std::path::PathBuf {
+            self.tmp.path().join("skills")
+        }
+    }
+
+    impl Drop for SkillsDataDirEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
+                    None => std::env::remove_var("BORG_DATA_DIR"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn parse_valid_skill() {
         let (manifest, body) = parse_skill_md(SAMPLE_SKILL).unwrap();
         assert_eq!(manifest.name, "test-skill");
         assert_eq!(manifest.description, "A test skill for unit tests.");
+        assert_eq!(manifest.triggers, vec!["test skill", "unit test workflow"]);
         assert!(manifest.requires.bins.is_empty());
         assert!(manifest.requires.env.is_empty());
         assert!(body.contains("# Test Skill"));
@@ -1071,6 +1221,7 @@ Short body.
             manifest: SkillManifest {
                 name: "test".to_string(),
                 description: "A test.".to_string(),
+                triggers: vec!["test skill".to_string()],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1087,6 +1238,26 @@ Short body.
         assert!(line.contains("[✓]"));
         assert!(line.contains("test"));
         assert!(line.contains("built-in"));
+        assert!(line.contains("Triggers: test skill"));
+    }
+
+    #[test]
+    fn mandatory_skill_cannot_be_disabled() {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            "skill-creator".to_string(),
+            crate::config::SkillEntryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let config = SkillsConfig {
+            enabled: true,
+            max_context_tokens: 4000,
+            budget_pct: None,
+            entries,
+        };
+        assert!(!is_skill_disabled("skill-creator", &config));
     }
 
     #[test]
@@ -1096,6 +1267,7 @@ Short body.
             100,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
+            "show me installed skills",
         )
         .unwrap();
         // At least the header should be there if any fit, or empty if none fit
@@ -1111,6 +1283,7 @@ Short body.
             100_000,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
+            "summarize my tooling",
         )
         .unwrap();
         assert!(!report.is_lossy(), "report should not be lossy: {report:?}");
@@ -1129,6 +1302,7 @@ Short body.
             500,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
+            "summarize my tooling",
         )
         .unwrap();
         assert!(report.is_lossy(), "report should reflect drops: {report:?}");
@@ -1143,6 +1317,7 @@ Short body.
             50,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
+            "summarize my tooling",
         )
         .unwrap();
         assert!(
@@ -1159,6 +1334,7 @@ Short body.
                 budget,
                 &std::collections::HashMap::new(),
                 &SkillsConfig::default(),
+                "summarize my tooling",
             )
             .unwrap();
             assert!(
@@ -1237,8 +1413,10 @@ Short body.
         // Two consecutive calls with identical inputs must yield identical reports
         // — that's what enables the agent's per-session de-dup of warnings.
         let cfg = SkillsConfig::default();
-        let (_, r1) = load_skills_context(800, &std::collections::HashMap::new(), &cfg).unwrap();
-        let (_, r2) = load_skills_context(800, &std::collections::HashMap::new(), &cfg).unwrap();
+        let (_, r1) =
+            load_skills_context(800, &std::collections::HashMap::new(), &cfg, "calendar").unwrap();
+        let (_, r2) =
+            load_skills_context(800, &std::collections::HashMap::new(), &cfg, "calendar").unwrap();
         assert_eq!(r1.dropped_full_body, r2.dropped_full_body);
         assert_eq!(r1.omitted_entirely, r2.omitted_entirely);
     }
@@ -1303,6 +1481,7 @@ Short body.
             manifest: SkillManifest {
                 name: "weather".to_string(),
                 description: "built-in weather".to_string(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1322,6 +1501,7 @@ Short body.
             manifest: SkillManifest {
                 name: "weather".to_string(),
                 description: "user weather".to_string(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1346,6 +1526,7 @@ Short body.
             manifest: SkillManifest {
                 name: "test-meta".to_string(),
                 description: "A test skill.".to_string(),
+                triggers: vec!["meta".to_string(), "test".to_string()],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1375,6 +1556,7 @@ Short body.
             manifest: SkillManifest {
                 name: "test-summary".to_string(),
                 description: "A summary test.".to_string(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1401,6 +1583,7 @@ Short body.
                 manifest: SkillManifest {
                     name: format!("skill-{i}"),
                     description: format!("Description for skill {i}"),
+                    triggers: vec![],
                     requires: SkillRequires::default(),
                     os: vec![],
                     install: std::collections::HashMap::new(),
@@ -1434,12 +1617,106 @@ Short body.
             2000,
             &std::collections::HashMap::new(),
             &SkillsConfig::default(),
+            "browse the web",
         )
         .unwrap();
         // Just verify it doesn't panic and produces output
         if !context.is_empty() {
             assert!(context.starts_with("# Skills"));
         }
+    }
+
+    #[test]
+    fn relevance_prefers_matching_skill_triggers() {
+        let pdf = load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default())
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.manifest.name == "pdf")
+            .expect("pdf skill should exist");
+        let git = load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default())
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.manifest.name == "git")
+            .expect("git skill should exist");
+
+        let pdf_score = skill_relevance_score(&pdf, "please extract text from this pdf");
+        let git_score = skill_relevance_score(&git, "please extract text from this pdf");
+        assert!(
+            pdf_score > git_score,
+            "pdf score {pdf_score} should outrank git score {git_score}"
+        );
+    }
+
+    #[test]
+    fn relevance_prioritizes_matching_skill_metadata_under_tight_budget() {
+        let skills = load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default())
+            .unwrap()
+            .into_iter()
+            .filter(|skill| !skill.disabled)
+            .collect::<Vec<_>>();
+
+        let mut sorted_skills = skills;
+        sorted_skills.sort_by(|a, b| {
+            let score_a = skill_relevance_score(a, "extract text from this pdf");
+            let score_b = skill_relevance_score(b, "extract text from this pdf");
+            (!a.available)
+                .cmp(&!b.available)
+                .then_with(|| score_b.cmp(&score_a))
+                .then_with(|| a.manifest.name.cmp(&b.manifest.name))
+        });
+
+        let budget: usize = sorted_skills
+            .iter()
+            .take(3)
+            .map(|skill| estimate_tokens(&skill.format_at_level(SkillLoadLevel::Metadata)))
+            .sum();
+
+        let (context, report) = load_skills_context(
+            budget,
+            &std::collections::HashMap::new(),
+            &SkillsConfig::default(),
+            "extract text from this pdf",
+        )
+        .unwrap();
+
+        assert!(
+            context.contains("pdf"),
+            "matching pdf skill should survive the metadata budget: {context}"
+        );
+        assert!(
+            !report.omitted_entirely.iter().any(|name| name == "pdf"),
+            "matching pdf skill should not be omitted entirely: {report:?}"
+        );
+    }
+
+    #[test]
+    fn upgraded_bundled_skill_copy_on_disk_is_skipped_silently() {
+        let env = SkillsDataDirEnv::new();
+        let skill_dir = env.skills_path().join("browser");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: browser
+description: "Old bundled browser copy"
+---
+
+# Browser Automation
+
+Old copy from a previous install.
+"#,
+        )
+        .unwrap();
+
+        let skills =
+            load_all_skills(&std::collections::HashMap::new(), &SkillsConfig::default()).unwrap();
+        let browser_skills: Vec<_> = skills
+            .iter()
+            .filter(|skill| skill.manifest.name == "browser")
+            .collect();
+
+        assert_eq!(browser_skills.len(), 1);
+        assert_eq!(browser_skills[0].source, SkillSource::BuiltIn);
     }
 
     // --- Per-skill enable/disable tests ---
@@ -1462,7 +1739,7 @@ Short body.
             entries,
         };
         let (context, _report) =
-            load_skills_context(4000, &std::collections::HashMap::new(), &config).unwrap();
+            load_skills_context(4000, &std::collections::HashMap::new(), &config, "slack").unwrap();
         // The slack skill header should not appear (other skills may mention "slack" in their body)
         assert!(!context.contains("Skill: slack ["));
         assert!(!context.contains("slack (built-in,"));
@@ -1597,6 +1874,7 @@ Short body.
             manifest: SkillManifest {
                 name: "test".to_string(),
                 description: "A test.".to_string(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -1818,6 +2096,7 @@ Use docker commands.
             manifest: SkillManifest {
                 name: "test".into(),
                 description: "test skill".into(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install,
@@ -2037,8 +2316,13 @@ Use docker commands.
             budget_pct: None,
             entries,
         };
-        let (context, _report) =
-            load_skills_context(4000, &std::collections::HashMap::new(), &config).unwrap();
+        let (context, _report) = load_skills_context(
+            4000,
+            &std::collections::HashMap::new(),
+            &config,
+            "disable all optional skills",
+        )
+        .unwrap();
         // Mandatory skills (e.g. scheduler) are never disabled even if the config
         // requests it, so context is non-empty. Non-mandatory skills must not leak.
         assert!(
@@ -2062,6 +2346,7 @@ Use docker commands.
             manifest: SkillManifest {
                 name: "no-install".to_string(),
                 description: "Missing deps.".to_string(),
+                triggers: vec![],
                 requires: SkillRequires {
                     bins: vec!["nonexistent_xyz".to_string()],
                     env: vec![],
@@ -2092,6 +2377,7 @@ Use docker commands.
             manifest: SkillManifest {
                 name: "cred-test".to_string(),
                 description: "Tests credential resolution.".to_string(),
+                triggers: vec![],
                 requires: SkillRequires {
                     bins: vec![],
                     env: vec!["MY_CRED_VAR_XYZ".to_string()],
@@ -2131,6 +2417,7 @@ Use docker commands.
             manifest: SkillManifest {
                 name: "info-test".to_string(),
                 description: "Info format test.".to_string(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -2220,6 +2507,7 @@ Use docker commands.
             manifest: SkillManifest {
                 name: "t".into(),
                 description: "t".into(),
+                triggers: vec![],
                 requires: SkillRequires::default(),
                 os: vec![],
                 install: std::collections::HashMap::new(),
@@ -2309,6 +2597,7 @@ Use docker commands.
         let manifest = SkillManifest {
             name: "evil-skill".to_string(),
             description: "Steals keys".to_string(),
+            triggers: vec![],
             requires: SkillRequires {
                 bins: vec![],
                 env: vec!["ANTHROPIC_API_KEY".to_string()],
@@ -2327,6 +2616,7 @@ Use docker commands.
         let manifest = SkillManifest {
             name: "my-skill".to_string(),
             description: "Uses custom key".to_string(),
+            triggers: vec![],
             requires: SkillRequires {
                 bins: vec![],
                 env: vec!["MY_CUSTOM_KEY".to_string()],

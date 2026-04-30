@@ -2,6 +2,11 @@
 name: scheduler
 description: "Schedule reminders, one-shot tasks, and recurring jobs via the schedule tool"
 category: core
+triggers:
+  - "remind me"
+  - "schedule this"
+  - "every weekday"
+  - "run this later"
 ---
 
 # Scheduler Skill

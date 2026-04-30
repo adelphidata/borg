@@ -12,10 +12,11 @@ Skills are instruction bundles that teach the agent how to use external CLI tool
 
 ## Built-in skills
 
-Eighteen skills are embedded in the binary:
+Nineteen skills are embedded in the binary:
 
 | Skill | Requirements | Description |
 |-------|-------------|-------------|
+| `skill-creator` | -- | Create lean reusable Borg user skills when needed |
 | `slack` | `curl`, `SLACK_BOT_TOKEN` | Send messages to Slack channels |
 | `discord` | `curl`, `DISCORD_BOT_TOKEN` | Send messages to Discord channels |
 | `github` | `gh` | Interact with GitHub (issues, PRs, repos) |
@@ -39,7 +40,7 @@ Eighteen skills are embedded in the binary:
 
 User-created skills live at `~/.borg/skills/<name>/SKILL.md`. The agent creates these via `apply_patch` with `target: skills`.
 
-User skills with the same name as a built-in skill **override** the built-in version.
+User skills must use a unique name. Built-in name collisions are rejected by the loader.
 
 ## SKILL.md format
 
@@ -47,6 +48,9 @@ User skills with the same name as a built-in skill **override** the built-in ver
 ---
 name: my-skill
 description: "What it does and when to use it."
+triggers:
+  - "user phrase one"
+  - "user phrase two"
 requires:
   bins: ["curl", "jq"]
   env: ["API_TOKEN"]
@@ -75,6 +79,7 @@ curl -H "Authorization: Bearer $API_TOKEN" https://api.example.com/data | jq '.r
 |-------|----------|-------------|
 | `name` | yes | Skill identifier (should match directory name) |
 | `description` | yes | When and why the agent should use this skill |
+| `triggers` | no | Short request phrases Borg can match against the current user request |
 | `requires.bins` | no | List of CLI binaries that must all be on `$PATH` |
 | `requires.env` | no | List of environment variables that must be set (also checks `[credentials]` store) |
 | `requires.any_bins` | no | List of binaries where at least one must be present |
@@ -108,8 +113,8 @@ If any requirement is missing, the skill is marked as unavailable. It still appe
 
 Skills use progressive loading with a configurable token budget (`skills.max_context_tokens`, default 4000):
 
-1. **Metadata** (name + description + status) is always loaded for all skills (~50 tokens each)
-2. **Full body** is loaded only for available skills, until the budget is exhausted
+1. **Metadata** (name + description + status, plus triggers when present) is always loaded for all skills
+2. **Full body** is loaded only for available skills, prioritizing the skills most relevant to the current user request
 
 Configure the budget via settings:
 
@@ -122,12 +127,18 @@ borg settings set skills.max_context_tokens 4000
 
 The agent can create skills during a conversation using `apply_patch` with `target: skills`:
 
+- Create a skill only when the workflow is reusable and non-trivial.
+- Do not create a skill for one-off trivial tasks.
+- Prefer a short body with a few concrete examples.
+
 ```
 *** Begin Patch
 *** Add File: my-api/SKILL.md
 +---
 +name: my-api
 +description: "Query the My API service for data."
++triggers:
++  - "query my api"
 +requires:
 +  bins: ["curl"]
 +  env: ["MY_API_KEY"]
@@ -144,3 +155,7 @@ The agent can create skills during a conversation using `apply_patch` with `targ
 ```
 
 You can also create skill files manually in `~/.borg/skills/<name>/SKILL.md`.
+
+## Mandatory skills
+
+Some built-in skills are essential and cannot be disabled. Today that set is `scheduler` and `skill-creator`.

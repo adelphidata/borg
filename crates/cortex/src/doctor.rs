@@ -1164,7 +1164,10 @@ fn classify_embedding_lag(global_count: usize, entry_count: usize) -> Diagnostic
     }
     let gap = entry_count - global_count;
     if gap <= EMBEDDING_LAG_WARN_THRESHOLD {
-        DiagnosticCheck::pass("Embeddings", format!("whole-entry coverage: {detail} (pending backfill)"))
+        DiagnosticCheck::pass(
+            "Embeddings",
+            format!("whole-entry coverage: {detail} (pending backfill)"),
+        )
     } else {
         DiagnosticCheck::warn(
             "Embeddings",
@@ -1197,7 +1200,10 @@ fn classify_chunk_coverage(coverage: ChunkCoverage) -> DiagnosticCheck {
     }
     let mut issues = Vec::new();
     if coverage.entries_missing_chunks > 0 {
-        issues.push(format!("{} missing chunk rows", coverage.entries_missing_chunks));
+        issues.push(format!(
+            "{} missing chunk rows",
+            coverage.entries_missing_chunks
+        ));
     }
     if coverage.entries_missing_chunk_embeddings > 0 {
         issues.push(format!(
@@ -1205,12 +1211,16 @@ fn classify_chunk_coverage(coverage: ChunkCoverage) -> DiagnosticCheck {
             coverage.entries_missing_chunk_embeddings
         ));
     }
-    DiagnosticCheck::warn("Embeddings", "chunk coverage", format!("{detail} — {}", issues.join(", ")))
-        .with_remediation(
-            RemediationKind::AutoSafe,
-            "embeddings.repair",
-            "run /heal to rebuild stale chunk indexes",
-        )
+    DiagnosticCheck::warn(
+        "Embeddings",
+        "chunk coverage",
+        format!("{detail} — {}", issues.join(", ")),
+    )
+    .with_remediation(
+        RemediationKind::AutoSafe,
+        "embeddings.repair",
+        "run /heal to rebuild stale chunk indexes",
+    )
 }
 
 fn collect_chunk_coverage(db: &Database, scopes: &[String]) -> ChunkCoverage {
@@ -1288,7 +1298,9 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             }
 
             checks.push(classify_embedding_lag(global_count, entry_count));
-            checks.push(classify_chunk_coverage(collect_chunk_coverage(&db, &scopes)));
+            checks.push(classify_chunk_coverage(collect_chunk_coverage(
+                &db, &scopes,
+            )));
         }
         Err(e) => {
             checks.push(DiagnosticCheck::warn(
@@ -1507,11 +1519,7 @@ mod tests {
     #[test]
     fn diagnostic_check_with_remediation_formats_fixability() {
         let check = DiagnosticCheck::warn("Embeddings", "chunk coverage", "backlog")
-            .with_remediation(
-                RemediationKind::AutoSafe,
-                "embeddings.repair",
-                "run /heal",
-            );
+            .with_remediation(RemediationKind::AutoSafe, "embeddings.repair", "run /heal");
         assert_eq!(check.issue_key(), "Embeddings:chunk coverage");
         assert!(check.format_line().contains("[auto-fixable]"));
     }

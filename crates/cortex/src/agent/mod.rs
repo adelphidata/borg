@@ -269,8 +269,10 @@ pub struct Agent {
     tts_synthesizer: Option<crate::tts::TtsSynthesizer>,
     config_rx: Option<tokio::sync::watch::Receiver<Config>>,
     db: Mutex<Option<Database>>,
-    /// Cached skills context string, invalidated on config reload.
+    /// Cached skills context string, keyed by the latest user request text.
     cached_skills_context: Option<String>,
+    /// Latest user request text used to build `cached_skills_context`.
+    cached_skills_request: Option<String>,
     /// Sorted set of skill names dropped/omitted on the last budget pass.
     /// Used to suppress duplicate warnings when the dropped set hasn't changed.
     last_skill_drop_signature: Option<Vec<String>>,
@@ -379,6 +381,42 @@ impl Agent {
         }
     }
 
+    fn latest_user_message_text(&self) -> &str {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::types::Role::User)
+            .and_then(|m| m.text_content())
+            .unwrap_or("")
+    }
+
+    fn refresh_skill_runtime_state(&mut self) {
+        self.cached_skills_context = None;
+        self.cached_skills_request = None;
+        self.last_skill_drop_signature = None;
+        self.ensure_credentials_cached();
+        self.skill_env_allowlist = crate::skills::collect_required_env_vars(
+            self.credentials_cached(),
+            &self.config.skills,
+        );
+    }
+
+    fn maybe_refresh_skills_after_tool(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        output: &str,
+    ) {
+        let touched_skills = match tool_name {
+            tn::APPLY_SKILL_PATCH => true,
+            tn::APPLY_PATCH => args["target"].as_str() == Some("skills"),
+            _ => false,
+        };
+        if touched_skills && output.contains("applied successfully") {
+            self.refresh_skill_runtime_state();
+        }
+    }
+
     /// Borrow the cached credentials, falling back to an empty map if the cache
     /// was not populated yet. Callers inside this module always invoke
     /// [`Self::ensure_credentials_cached`] first; the fallback keeps the
@@ -420,6 +458,7 @@ impl Agent {
             config_rx: None,
             db: Mutex::new(common.db),
             cached_skills_context: None,
+            cached_skills_request: None,
             last_skill_drop_signature: None,
             ghost_commit: None,
             git_repo_root,
@@ -515,14 +554,11 @@ impl Agent {
         self.policy = new_config.policy.clone();
         self.rate_guard
             .update_limits(new_config.security.action_limits.clone());
-        self.cached_skills_context = None; // invalidate on config change
-        self.last_skill_drop_signature = None; // re-warn on next budget pass
         let resolved_creds = new_config.resolve_credentials();
         self.cached_credentials = Some(resolved_creds.clone());
-        self.skill_env_allowlist =
-            crate::skills::collect_required_env_vars(&resolved_creds, &new_config.skills);
         self.config_arc = Arc::new(new_config.clone());
         self.config = new_config;
+        self.refresh_skill_runtime_state();
     }
 
     /// Create a sub-agent that shares the parent's config but has its own session.
@@ -838,6 +874,7 @@ impl Agent {
 
         // Tool call style guidance
         system.push_str(Self::build_tool_call_style_section());
+        system.push_str(Self::build_skill_usage_section());
 
         // Safety / security policy
         use std::fmt::Write as _;
@@ -847,9 +884,15 @@ impl Agent {
         );
 
         if self.config.skills.enabled {
-            let skills = match &self.cached_skills_context {
-                Some(cached) => cached.clone(),
-                None => {
+            let user_request = self.latest_user_message_text().to_string();
+            let skills = match (
+                self.cached_skills_context.as_ref(),
+                self.cached_skills_request.as_ref(),
+            ) {
+                (Some(cached), Some(cached_request)) if cached_request == &user_request => {
+                    cached.clone()
+                }
+                _ => {
                     self.ensure_credentials_cached();
                     let budget = crate::skills::effective_skill_budget(
                         &self.config.skills,
@@ -859,12 +902,11 @@ impl Agent {
                         budget,
                         self.credentials_cached(),
                         &self.config.skills,
+                        &user_request,
                     )?;
                     self.warn_skill_budget_loss(&report);
-                    // Populate the cache so subsequent turns reuse this work.
-                    // Previously this branch dropped the result on the floor,
-                    // forcing every cache-miss path to re-parse SKILL.md files.
                     self.cached_skills_context = Some(rendered.clone());
+                    self.cached_skills_request = Some(user_request);
                     rendered
                 }
             };
@@ -2082,18 +2124,25 @@ Rules:
 
     /// Warm the skills context cache on first call (avoids re-parsing every turn).
     fn warm_skills_cache(&mut self) {
-        if self.cached_skills_context.is_none() && self.config.skills.enabled {
+        let user_request = self.latest_user_message_text().to_string();
+        let cache_stale = self.cached_skills_request.as_deref() != Some(user_request.as_str());
+        if (self.cached_skills_context.is_none() || cache_stale) && self.config.skills.enabled {
             self.ensure_credentials_cached();
             let budget = crate::skills::effective_skill_budget(
                 &self.config.skills,
                 Some(self.active_context_window()),
             );
-            let result =
-                load_skills_context(budget, self.credentials_cached(), &self.config.skills);
+            let result = load_skills_context(
+                budget,
+                self.credentials_cached(),
+                &self.config.skills,
+                &user_request,
+            );
             match result {
                 Ok((ctx, report)) => {
                     self.warn_skill_budget_loss(&report);
                     self.cached_skills_context = Some(ctx);
+                    self.cached_skills_request = Some(user_request);
                 }
                 Err(e) => warn!("Failed to load skills context: {e}"),
             }
@@ -2807,7 +2856,9 @@ Rules:
             }
             _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
         };
-        text_result.map(ToolOutput::Text)
+        let text = text_result?;
+        self.maybe_refresh_skills_after_tool(name, &args, &text);
+        Ok(ToolOutput::Text(text))
     }
 
     fn fire_after_tool_hook(
@@ -3286,6 +3337,59 @@ mod tests {
         assert!(!is_mutating_tool("memory_search"));
         assert!(!is_mutating_tool("web_fetch"));
         assert!(!is_mutating_tool("web_search"));
+    }
+
+    #[test]
+    fn skill_tool_write_refreshes_cached_skill_state() {
+        let config = Config::default();
+        let session = Session::new();
+        let session_id = session.meta.id.clone();
+        let mut agent = Agent {
+            config: config.clone(),
+            history: Vec::new(),
+            session,
+            policy: config.policy.clone(),
+            hook_registry: HookRegistry::new(),
+            turn_count: 0,
+            rate_guard: SessionRateGuard::new(config.security.action_limits.clone()),
+            agent_control: None,
+            spawn_depth: 0,
+            tools_filter: None,
+            skill_env_allowlist: std::collections::HashSet::new(),
+            metrics: BorgMetrics::default(),
+            browser_session: None,
+            tts_synthesizer: None,
+            config_rx: None,
+            db: Mutex::new(None),
+            cached_skills_context: Some("cached".to_string()),
+            cached_skills_request: Some("old request".to_string()),
+            last_skill_drop_signature: Some(vec!["pdf".to_string()]),
+            ghost_commit: None,
+            git_repo_root: None,
+            cached_project_docs: None,
+            cached_identity: None,
+            cached_credentials: Some(HashMap::new()),
+            config_arc: Arc::new(config),
+            steer_rx: None,
+            recent_tool_names: std::collections::HashSet::new(),
+            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            previous_summary: None,
+            setup_just_consumed: false,
+        };
+
+        agent.maybe_refresh_skills_after_tool(
+            tn::APPLY_PATCH,
+            &serde_json::json!({"target": "skills"}),
+            "Patch applied successfully.",
+        );
+
+        assert!(agent.cached_skills_context.is_none());
+        assert!(agent.cached_skills_request.is_none());
+        assert!(agent.last_skill_drop_signature.is_none());
+        assert!(
+            agent.skill_env_allowlist.contains("SLACK_BOT_TOKEN"),
+            "skill env allowlist should be recomputed from loaded skills"
+        );
     }
 
     #[test]

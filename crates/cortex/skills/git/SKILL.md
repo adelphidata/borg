@@ -1,6 +1,11 @@
 ---
 name: git
 description: "Git operations: commit, branch, diff, log, rebase"
+triggers:
+  - "git commit"
+  - "git branch"
+  - "show me the diff"
+  - "inspect git history"
 requires:
   bins: ["git"]
 ---

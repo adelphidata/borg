@@ -58,36 +58,46 @@ impl Database {
     }
 
     /// Upsert the lifecycle state for an issue observed this sweep.
-    pub fn upsert_issue_state_observed(&self, issue_key: &str, now: i64, status: &str) -> Result<()> {
+    pub fn upsert_issue_state_observed(
+        &self,
+        issue_key: &str,
+        now: i64,
+        status: &str,
+    ) -> Result<()> {
         let prior = self.get_issue_state(issue_key)?;
         let status_is_open = status != "resolved";
-        let (first_seen_at, consecutive_count, auto_fix_attempts, last_auto_fix_at, last_auto_fix_result) =
-            if let Some(prior) = prior {
-                let next = if prior.last_seen_at == now {
-                    if !status_is_open {
-                        0
-                    } else if prior.consecutive_count > 0 {
-                        prior.consecutive_count
-                    } else {
-                        1
-                    }
-                } else if prior.last_status != "resolved" && status_is_open {
-                    prior.consecutive_count + 1
-                } else if !status_is_open {
+        let (
+            first_seen_at,
+            consecutive_count,
+            auto_fix_attempts,
+            last_auto_fix_at,
+            last_auto_fix_result,
+        ) = if let Some(prior) = prior {
+            let next = if prior.last_seen_at == now {
+                if !status_is_open {
                     0
+                } else if prior.consecutive_count > 0 {
+                    prior.consecutive_count
                 } else {
                     1
-                };
-                (
-                    prior.first_seen_at,
-                    next,
-                    prior.auto_fix_attempts,
-                    prior.last_auto_fix_at,
-                    prior.last_auto_fix_result,
-                )
+                }
+            } else if prior.last_status != "resolved" && status_is_open {
+                prior.consecutive_count + 1
+            } else if !status_is_open {
+                0
             } else {
-                (now, if status_is_open { 1 } else { 0 }, 0, None, None)
+                1
             };
+            (
+                prior.first_seen_at,
+                next,
+                prior.auto_fix_attempts,
+                prior.last_auto_fix_at,
+                prior.last_auto_fix_result,
+            )
+        } else {
+            (now, if status_is_open { 1 } else { 0 }, 0, None, None)
+        };
         let resolved_at = if status_is_open { None } else { Some(now) };
         self.conn.execute(
             "INSERT INTO maintenance_issue_state

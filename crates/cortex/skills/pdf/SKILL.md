@@ -1,6 +1,11 @@
 ---
 name: pdf
 description: "Read, extract, split, and merge PDF files"
+triggers:
+  - "read this pdf"
+  - "extract text from pdf"
+  - "split the pdf"
+  - "merge pdfs"
 requires:
   bins: ["pdftotext"]
 ---
