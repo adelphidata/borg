@@ -22,6 +22,20 @@ pub fn run_host_security_checks(checks: &mut Vec<DiagnosticCheck>) {
     check_running_services(checks);
 }
 
+/// True when the current process has effective uid 0. The macOS PF check
+/// requires root — running it as a normal user always fails and produces
+/// a permanent unactionable warning, so we skip it entirely off-root.
+#[cfg(unix)]
+fn is_effective_root() -> bool {
+    // SAFETY: `geteuid` is async-signal-safe and has no preconditions.
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn is_effective_root() -> bool {
+    false
+}
+
 const CATEGORY: &str = "Host Security";
 
 /// macOS `socketfilterfw` is not on `$PATH`. Use the absolute path Apple
@@ -36,11 +50,23 @@ const MACOS_SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilte
 #[cfg(any(target_os = "macos", test))]
 const MACOS_PFCTL: &str = "/sbin/pfctl";
 
+/// Concrete next-step block appended to the ALF-disabled warning so the
+/// heartbeat surfaces an actionable fix, not just the symptom.
+#[cfg(any(target_os = "macos", test))]
+const ALF_DISABLED_HINT: &str = "Next step: enable in System Settings → Network → Firewall, or run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on";
+
 // ---------------------------------------------------------------------------
 // Firewall
 // ---------------------------------------------------------------------------
 
 pub fn check_firewall(checks: &mut Vec<DiagnosticCheck>) {
+    check_firewall_with_root(checks, is_effective_root());
+}
+
+/// Test seam — same as [`check_firewall`] but lets callers force the
+/// "running as root" branch on/off without elevating the process.
+#[allow(unused_variables)]
+pub fn check_firewall_with_root(checks: &mut Vec<DiagnosticCheck>, is_root: bool) {
     #[cfg(target_os = "macos")]
     {
         match run_cmd(MACOS_SOCKETFILTERFW, &["--getglobalstate"]) {
@@ -52,21 +78,28 @@ pub fn check_firewall(checks: &mut Vec<DiagnosticCheck>) {
             Err(e) => checks.push(DiagnosticCheck::warn(
                 CATEGORY,
                 "Application Firewall",
-                format!("could not check: {e}"),
+                format!(
+                    "could not check: {e} — run 'borg doctor -v' for raw socketfilterfw output"
+                ),
             )),
         }
 
-        match run_cmd(MACOS_PFCTL, &["-s", "info"]) {
-            Ok(output) => checks.push(DiagnosticCheck::with_status(
-                CATEGORY,
-                "PF packet filter",
-                parse_pf_status(&output),
-            )),
-            Err(_) => checks.push(DiagnosticCheck::warn(
-                CATEGORY,
-                "PF packet filter",
-                "could not query pfctl (needs root)",
-            )),
+        // pfctl -s info requires root. Off-root the check is unactionable
+        // noise (PF is also not the user-facing firewall on macOS — ALF is).
+        // Skip emitting any DiagnosticCheck unless we're effectively root.
+        if is_root {
+            match run_cmd(MACOS_PFCTL, &["-s", "info"]) {
+                Ok(output) => checks.push(DiagnosticCheck::with_status(
+                    CATEGORY,
+                    "PF packet filter",
+                    parse_pf_status(&output),
+                )),
+                Err(_) => checks.push(DiagnosticCheck::warn(
+                    CATEGORY,
+                    "PF packet filter",
+                    "could not query pfctl",
+                )),
+            }
         }
     }
 
@@ -516,9 +549,17 @@ fn parse_macos_firewall(output: &str) -> CheckStatus {
     if output.contains("enabled") {
         CheckStatus::Pass
     } else if output.contains("disabled") {
-        CheckStatus::Warn("Application Firewall is disabled".to_string())
+        // Inline the fix in the same message — there's no structured
+        // user_hint field on this branch, so the heartbeat / doctor
+        // formatter picks up the next step verbatim.
+        CheckStatus::Warn(format!(
+            "Application Firewall is off — incoming connections to listening apps aren't filtered. {ALF_DISABLED_HINT}"
+        ))
     } else {
-        CheckStatus::Warn(format!("unexpected output: {}", output.trim()))
+        CheckStatus::Warn(format!(
+            "unexpected socketfilterfw output: {}",
+            first_line(output)
+        ))
     }
 }
 
@@ -527,7 +568,10 @@ fn parse_pf_status(output: &str) -> CheckStatus {
     if output.contains("Status: Enabled") {
         CheckStatus::Pass
     } else if output.contains("Status: Disabled") {
-        CheckStatus::Warn("PF is disabled".to_string())
+        CheckStatus::Warn(
+            "PF is disabled (default on stock macOS) — only meaningful if you've configured anchors; ALF handles app-level filtering"
+                .to_string(),
+        )
     } else {
         CheckStatus::Warn(format!("unexpected pfctl output: {}", first_line(output)))
     }
@@ -655,10 +699,73 @@ mod tests {
 
     #[test]
     fn parse_macos_firewall_disabled() {
-        assert!(matches!(
-            parse_macos_firewall("Firewall is disabled. (State = 0)"),
-            CheckStatus::Warn(_),
-        ));
+        let status = parse_macos_firewall("Firewall is disabled. (State = 0)");
+        match status {
+            CheckStatus::Warn(msg) => {
+                assert!(
+                    msg.contains("Application Firewall is off"),
+                    "warning should state ALF status: {msg}"
+                );
+                assert!(
+                    msg.contains("incoming connections"),
+                    "warning should explain the impact: {msg}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_pf_disabled_message_is_informational_not_alarming() {
+        // PF being off is the *default* on stock macOS — the warning text
+        // must not read as a critical incident. Guards against someone
+        // reverting to the bare "PF is disabled" wording.
+        let status = parse_pf_status("Status: Disabled");
+        match status {
+            CheckStatus::Warn(msg) => {
+                assert!(
+                    msg.contains("default on stock macOS"),
+                    "PF-disabled message should clarify it's the default: {msg}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn check_firewall_with_root_false_omits_pf_check() {
+        // The macOS PF check requires root. Off-root we must skip it
+        // entirely — emitting a warning the user can never act on is
+        // exactly the noise this gate exists to prevent.
+        let mut checks = Vec::new();
+        check_firewall_with_root(&mut checks, false);
+        assert!(
+            checks.iter().all(|c| c.name != "PF packet filter"),
+            "off-root PF check should be skipped, got: {:?}",
+            checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_macos_firewall_disabled_includes_actionable_hint() {
+        // Heartbeat surfaces only the warning message, so the fix has to
+        // live inside it: both the GUI path and the CLI fallback. Guards
+        // against someone reverting to the bare "is disabled" wording.
+        let status = parse_macos_firewall("Firewall is disabled. (State = 0)");
+        match status {
+            CheckStatus::Warn(msg) => {
+                assert!(
+                    msg.contains("System Settings"),
+                    "message should reference the GUI fix: {msg}"
+                );
+                assert!(
+                    msg.contains("socketfilterfw"),
+                    "message should include the CLI fallback: {msg}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
     }
 
     #[test]

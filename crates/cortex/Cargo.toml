@@ -56,6 +56,9 @@ ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 bip39 = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [lints]
 workspace = true
 

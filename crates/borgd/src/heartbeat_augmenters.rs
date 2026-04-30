@@ -68,10 +68,14 @@ pub struct Augmenter {
     /// Enforced by [`collect`] via the `meta` table — the `check` fn
     /// itself is stateless.
     pub cooldown_secs: u64,
-    /// Pure predicate. Returns `Some(snippet)` when the nudge should be
+    /// Predicate. Returns `Some(snippet)` when the nudge should be
     /// considered for this tick; `None` to stay silent. The snippet is an
     /// instruction to the LLM about what to proactively tell the user.
-    pub check: fn(&Config) -> Option<String>,
+    /// `db` is `Some` when DB-backed state (e.g. the `/doctor` squelch
+    /// list) should influence the decision; `None` if the DB failed to
+    /// open, in which case the check should fall back to its
+    /// no-DB-available behavior.
+    pub check: fn(&Config, Option<&Database>) -> Option<String>,
 }
 
 /// Ordered list of heartbeat augmenters. Append new entries here to add
@@ -123,7 +127,7 @@ fn collect_matching(
         if !include(aug) {
             continue;
         }
-        let Some(snippet) = (aug.check)(config) else {
+        let Some(snippet) = (aug.check)(config, db) else {
             continue;
         };
         if let Some(db) = db {
@@ -159,7 +163,7 @@ fn meta_key(id: &str) -> String {
 }
 
 /// No messaging channels configured — nudge the user to run `borg add`.
-fn check_no_channels(config: &Config) -> Option<String> {
+fn check_no_channels(config: &Config, _db: Option<&Database>) -> Option<String> {
     if config.has_any_native_channel() {
         return None;
     }
@@ -180,8 +184,10 @@ repeat yourself if you've already raised this recently.";
 
 /// Critical host security issues — runs a subset of `borg doctor` checks
 /// (firewall, risky ports, SSH config) and nudges only when issues are found.
-/// Respects the `security.host_audit` config toggle.
-fn check_critical_host_security(config: &Config) -> Option<String> {
+/// Respects the `security.host_audit` config toggle. Findings the user has
+/// squelched via `/doctor` are filtered out here so they don't fire the
+/// nudge; the squelch is the user's "I see it, stop reminding me" signal.
+fn check_critical_host_security(config: &Config, db: Option<&Database>) -> Option<String> {
     if !config.security.host_audit {
         return None;
     }
@@ -189,6 +195,17 @@ fn check_critical_host_security(config: &Config) -> Option<String> {
     cortex::host_audit::check_firewall(&mut checks);
     cortex::host_audit::check_listening_ports(&mut checks);
     cortex::host_audit::check_ssh_config(&mut checks);
+
+    if let Some(db) = db {
+        let now = unix_now() as i64;
+        if let Ok(squelches) = db.doctor_squelch_list_active(now) {
+            let active: std::collections::HashSet<(String, String)> = squelches
+                .into_iter()
+                .map(|r| (r.category, r.name))
+                .collect();
+            checks.retain(|c| !active.contains(&(c.category.to_string(), c.name.clone())));
+        }
+    }
 
     build_security_nudge(&checks)
 }
@@ -219,8 +236,10 @@ fn build_security_nudge(checks: &[cortex::doctor::DiagnosticCheck]) -> Option<St
         nudge.push('\n');
     }
     nudge.push_str(
-        "Suggest running `borg doctor` for a full report. \
-         Keep it brief — list the issues and the command, don't over-explain.",
+        "Each item above already includes the concrete next step (e.g. a \
+         settings path or shell command) — relay it to the user verbatim, \
+         don't paraphrase or omit it. Also mention they can squelch a \
+         finding from `/doctor` if it's intentional. Keep it brief.",
     );
     Some(nudge)
 }
@@ -328,7 +347,7 @@ mod tests {
         let _guard = EnvGuard::clear_native();
         std::env::set_var("TELEGRAM_BOT_TOKEN", "test-token");
         let cfg = Config::default();
-        assert!(check_no_channels(&cfg).is_none());
+        assert!(check_no_channels(&cfg, None).is_none());
         std::env::remove_var("TELEGRAM_BOT_TOKEN");
     }
 
@@ -340,7 +359,7 @@ mod tests {
         if cfg.has_any_native_channel() {
             return;
         }
-        let snippet = check_no_channels(&cfg).expect("nudge should fire");
+        let snippet = check_no_channels(&cfg, None).expect("nudge should fire");
         assert!(snippet.contains("/plugins"));
         assert!(snippet.contains("borg plugins"));
     }
@@ -447,7 +466,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.security.host_audit = false;
         assert!(
-            check_critical_host_security(&cfg).is_none(),
+            check_critical_host_security(&cfg, None).is_none(),
             "should return None when host_audit is disabled"
         );
     }
@@ -457,10 +476,14 @@ mod tests {
         let _guard = EnvGuard::clear_native();
         let mut cfg = Config::default();
         cfg.security.host_audit = true;
-        let result = check_critical_host_security(&cfg);
+        let result = check_critical_host_security(&cfg, None);
         if let Some(ref snippet) = result {
-            assert!(snippet.contains("borg doctor"));
             assert!(snippet.contains("Critical host security"));
+            // Trailer must point the user at the actionable hint baked
+            // into each finding, and at the squelch escape hatch — losing
+            // either drops the user back into vague-reminder territory.
+            assert!(snippet.contains("next step"));
+            assert!(snippet.contains("squelch"));
         }
     }
 
@@ -500,7 +523,7 @@ mod tests {
         assert!(nudge.contains("Critical host security issues detected"));
         assert!(nudge.contains("Application Firewall is disabled"));
         assert!(nudge.contains("risky port open on all interfaces"));
-        assert!(nudge.contains("borg doctor"));
+        assert!(nudge.contains("squelch"));
         // Pass items should NOT appear in the nudge text
         assert!(!nudge.contains("SSH daemon config"));
     }
@@ -514,7 +537,7 @@ mod tests {
         )];
         let nudge = build_security_nudge(&checks).expect("should fire with failures");
         assert!(nudge.contains("no firewall detected"));
-        assert!(nudge.contains("borg doctor"));
+        assert!(nudge.contains("next step"));
     }
 
     #[test]
@@ -544,7 +567,37 @@ mod tests {
         let nudge = build_security_nudge(&checks).expect("should fire");
         assert!(nudge.starts_with("Critical host security issues detected"));
         assert!(nudge.contains("  - FileVault is disabled\n"));
-        assert!(nudge.ends_with("don't over-explain."));
+        assert!(nudge.ends_with("Keep it brief."));
+    }
+
+    #[test]
+    fn squelching_alf_drops_it_from_the_security_nudge() {
+        // Regression: a squelched (category, name) pair must not surface
+        // through `check_critical_host_security` even if the underlying
+        // host check still flags it. We can't force ALF off in tests, but
+        // we can pre-populate the squelch table so any ALF finding is
+        // filtered, then verify the augmenter's nudge doesn't mention it.
+        let _guard = EnvGuard::clear_native();
+        let mut cfg = Config::default();
+        cfg.security.host_audit = true;
+        let db = in_memory_db();
+
+        let now = unix_now() as i64;
+        db.doctor_squelch_set(
+            "Host Security",
+            "Application Firewall",
+            now,
+            now + 60_000,
+            Some("test-ack"),
+        )
+        .unwrap();
+
+        if let Some(snippet) = check_critical_host_security(&cfg, Some(&db)) {
+            assert!(
+                !snippet.contains("Application Firewall"),
+                "squelched finding leaked into nudge: {snippet}"
+            );
+        }
     }
 
     #[test]

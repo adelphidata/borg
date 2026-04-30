@@ -28,6 +28,11 @@ pub struct MaintenanceConfig {
     pub embedding_repair_max_chunks: u32,
     /// Drop resolved issue-state rows older than this many days.
     pub issue_state_keep_days: u32,
+    /// How long a `/doctor` squelch persists before the daily sweep prunes
+    /// it and the warning resumes. Bounded on purpose — security findings
+    /// the user has acknowledged should re-surface periodically rather
+    /// than disappear forever.
+    pub security_squelch_ttl_days: u32,
 }
 
 impl Default for MaintenanceConfig {
@@ -42,6 +47,7 @@ impl Default for MaintenanceConfig {
             embedding_repair_max_files: 16,
             embedding_repair_max_chunks: 256,
             issue_state_keep_days: 30,
+            security_squelch_ttl_days: 30,
         }
     }
 }
@@ -62,6 +68,7 @@ mod tests {
         assert_eq!(cfg.embedding_repair_max_files, 16);
         assert_eq!(cfg.embedding_repair_max_chunks, 256);
         assert_eq!(cfg.issue_state_keep_days, 30);
+        assert_eq!(cfg.security_squelch_ttl_days, 30);
     }
 
     #[test]

@@ -1769,6 +1769,31 @@ impl Database {
         Ok(())
     }
 
+    /// V50: User-managed squelch list for doctor findings. Each row
+    /// suppresses one `(category, name)` pair from the heartbeat security
+    /// nudge and the daily maintenance sweep until `expires_at` passes —
+    /// at which point the daily prune in [`crate::db::doctor_squelch`]
+    /// removes the row and the warning resumes. Security squelches are
+    /// intentionally bounded so a once-acknowledged risk doesn't fall off
+    /// the radar permanently.
+    pub(super) fn migrate_v50(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS doctor_squelches (
+                category    TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                squelched_at INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL,
+                reason      TEXT,
+                PRIMARY KEY (category, name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_doctor_squelches_expires_at
+                ON doctor_squelches(expires_at);
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.

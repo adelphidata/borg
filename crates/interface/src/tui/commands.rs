@@ -46,6 +46,10 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/doctor" => return Some(Ok(AppAction::RunDoctor)),
+            "/doctor squelches" => return Some(self.cmd_doctor_squelch_list()),
+            "/doctor squelch" | "/doctor unsquelch" => {
+                return Some(self.cmd_doctor_squelch_help());
+            }
             "/heal" => return Some(self.cmd_heal()),
             // `/update` and `/update <flags>` are handled by the prefix block below.
             "/pairing" => {
@@ -182,6 +186,13 @@ impl App<'_> {
             return Some(self.cmd_memory_cleanup());
         }
 
+        if let Some(rest) = trimmed.strip_prefix("/doctor squelch ") {
+            return Some(self.cmd_doctor_squelch_set(rest.trim()));
+        }
+        if let Some(rest) = trimmed.strip_prefix("/doctor unsquelch ") {
+            return Some(self.cmd_doctor_squelch_clear(rest.trim()));
+        }
+
         if let Some(rest) = trimmed.strip_prefix("/settings ") {
             return Some(self.cmd_settings_set(rest));
         }
@@ -278,6 +289,9 @@ impl App<'_> {
              /history   - Show conversation history\n  \
              /logs      - Show activity log (error|warn|info|debug|all|raw)\n  \
              /doctor    - Run diagnostics\n  \
+             /doctor squelches - List active doctor squelches\n  \
+             /doctor squelch <Category>:<Name>   - Suppress a finding from heartbeat / heal\n  \
+             /doctor unsquelch <Category>:<Name> - Resume reminders for it\n  \
              /heal      - Run the self-healing maintenance sweep on demand\n  \
              /status    - Show agent vitals\n  \
              /poke      - Trigger immediate heartbeat\n  \
@@ -660,6 +674,105 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
+    /// Squelch a doctor finding so it stops firing in the heartbeat
+    /// security nudge and the daily maintenance sweep, until the TTL set
+    /// by `maintenance.security_squelch_ttl_days` (default 30) elapses.
+    /// Argument format: `<Category>:<Name>` — the same key shown next to
+    /// each finding in `/doctor` output.
+    fn cmd_doctor_squelch_set(&mut self, arg: &str) -> Result<AppAction> {
+        let Some((category, name)) = arg.split_once(':') else {
+            self.push_system_message(
+                "Usage: /doctor squelch <Category>:<Name>\n\
+                 Example: /doctor squelch Host Security:Application Firewall\n\
+                 (Find the exact key under each finding in /doctor.)"
+                    .to_string(),
+            );
+            return Ok(AppAction::Continue);
+        };
+        let category = category.trim();
+        let name = name.trim();
+        if category.is_empty() || name.is_empty() {
+            self.push_system_message("Usage: /doctor squelch <Category>:<Name>".to_string());
+            return Ok(AppAction::Continue);
+        }
+        let ttl_secs = (self.config.maintenance.security_squelch_ttl_days as i64) * 86_400;
+        let now = chrono::Utc::now().timestamp();
+        let expires_at = now.saturating_add(ttl_secs);
+        match doctor_squelch_db()
+            .and_then(|db| db.doctor_squelch_set(category, name, now, expires_at, None))
+        {
+            Ok(()) => self.push_system_message(format!(
+                "✓ squelched {category}:{name} for {} days — will resume after",
+                self.config.maintenance.security_squelch_ttl_days
+            )),
+            Err(e) => self.push_system_message(format!("/doctor squelch failed: {e}")),
+        }
+        Ok(AppAction::Continue)
+    }
+
+    /// Drop a previously-set squelch so the finding starts firing again.
+    fn cmd_doctor_squelch_clear(&mut self, arg: &str) -> Result<AppAction> {
+        let Some((category, name)) = arg.split_once(':') else {
+            self.push_system_message("Usage: /doctor unsquelch <Category>:<Name>".to_string());
+            return Ok(AppAction::Continue);
+        };
+        let category = category.trim();
+        let name = name.trim();
+        match doctor_squelch_db().and_then(|db| db.doctor_squelch_clear(category, name)) {
+            Ok(true) => self.push_system_message(format!("✓ unsquelched {category}:{name}")),
+            Ok(false) => self.push_system_message(format!(
+                "no active squelch for {category}:{name} — nothing to clear"
+            )),
+            Err(e) => self.push_system_message(format!("/doctor unsquelch failed: {e}")),
+        }
+        Ok(AppAction::Continue)
+    }
+
+    /// Show the active squelch list, with how long each one has left.
+    fn cmd_doctor_squelch_list(&mut self) -> Result<AppAction> {
+        let now = chrono::Utc::now().timestamp();
+        match doctor_squelch_db().and_then(|db| db.doctor_squelch_list_active(now)) {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    self.push_system_message(
+                        "No active squelches. Use /doctor squelch <Category>:<Name> to suppress \
+                         a finding from heartbeat reminders for the next 30 days."
+                            .to_string(),
+                    );
+                } else {
+                    let mut text =
+                        String::from("Active /doctor squelches\n────────────────────────\n");
+                    for r in rows {
+                        let days_left = ((r.expires_at - now).max(0) / 86_400) + 1;
+                        text.push_str(&format!(
+                            "  {}:{}  ({}d left)\n",
+                            r.category, r.name, days_left
+                        ));
+                    }
+                    text.push_str("Use /doctor unsquelch <Category>:<Name> to drop one.");
+                    self.push_system_message(text);
+                }
+            }
+            Err(e) => self.push_system_message(format!("/doctor squelches failed: {e}")),
+        }
+        Ok(AppAction::Continue)
+    }
+
+    /// Inline help for the squelch sub-commands. Triggered when a user
+    /// types `/doctor squelch` or `/doctor unsquelch` without the key.
+    fn cmd_doctor_squelch_help(&mut self) -> Result<AppAction> {
+        self.push_system_message(
+            "/doctor squelch <Category>:<Name>    Suppress a finding from heartbeat / heal\n\
+             /doctor unsquelch <Category>:<Name>  Resume reminders for it\n\
+             /doctor squelches                    List active squelches\n\
+             \n\
+             Squelches expire after maintenance.security_squelch_ttl_days (default 30 days).\n\
+             Find each finding's key in the /doctor output."
+                .to_string(),
+        );
+        Ok(AppAction::Continue)
+    }
+
     fn cmd_uninstall(&mut self) -> Result<AppAction> {
         self.push_system_message(
             "⚠ WARNING: This will permanently delete all Borg data (~/.borg/)\n\
@@ -671,6 +784,14 @@ impl App<'_> {
         self.state = AppState::ConfirmingUninstall;
         Ok(AppAction::Continue)
     }
+}
+
+/// Open `~/.borg/borg.db` for `/doctor squelch …` commands. The TUI
+/// otherwise routes everything through the daemon RPC, but the squelch
+/// table is small, append-mostly, and SQLite WAL is concurrent-safe — so
+/// adding a one-off RPC just to flip a row would be over-engineering.
+fn doctor_squelch_db() -> Result<cortex::db::Database> {
+    cortex::db::Database::open()
 }
 
 /// Render a daemon-side [`protocols::admin::HealReport`] as a system-message

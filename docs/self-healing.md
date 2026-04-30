@@ -84,7 +84,42 @@ Each run does the following in order:
     `last_seen_at`, `consecutive_count`, and the last auto-fix attempt.
     `MaintenanceReport.persistent_warnings` is derived from that table:
     only still-open issues with `consecutive_count >= 2` are surfaced as
-    persistent warnings. Single-run flukes do not escalate.
+    persistent warnings. Single-run flukes do not escalate. Findings the
+    user has squelched via `/doctor squelch` (see below) are filtered
+    out here so they do not surface.
+13. **Doctor-squelch expiry.** Removes rows from `doctor_squelches`
+    whose `expires_at` has passed. The corresponding finding starts
+    firing again on the next heartbeat / sweep — security squelches are
+    intentionally bounded so an acknowledged risk doesn't fall off the
+    radar permanently. TTL is
+    `maintenance.security_squelch_ttl_days` (default 30).
+
+## Doctor squelches
+
+Some `/doctor` findings are intentional on a given host — e.g. the user
+runs without macOS Application Firewall because they're behind a
+hardware firewall. To stop those from re-surfacing in every heartbeat
+without losing the signal entirely, the user can squelch a finding by
+its `Category:Name` key:
+
+```
+/doctor                                 # find the key (printed under each Warn/Fail)
+/doctor squelch Host Security:Application Firewall
+/doctor squelches                       # show what's currently muted
+/doctor unsquelch Host Security:Application Firewall
+```
+
+A squelch persists in the `doctor_squelches` SQLite table and is
+filtered from:
+
+- the heartbeat security nudge (`heartbeat_augmenters::check_critical_host_security`),
+- the persistent-warning surface in the daily maintenance sweep.
+
+It is **not** filtered from the explicit `/doctor` output — that
+command always shows everything, with the squelch state visible in
+`/doctor squelches`. Squelches auto-expire after
+`maintenance.security_squelch_ttl_days` so a once-acknowledged risk
+periodically returns for review.
 
 The run is still recorded to `doctor_runs`, and the table is capped at
 `maintenance.doctor_runs_keep` (default 30) rows. `doctor_runs` remains

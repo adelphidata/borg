@@ -81,6 +81,11 @@ pub struct MaintenanceReport {
     /// Doctor checks persisted across runs (subset of `current_issues`
     /// whose issue-state rows are still open with `consecutive_count >= 2`.
     pub persistent_warnings: Vec<String>,
+    /// `/doctor` squelches whose TTL elapsed and were removed this sweep.
+    /// The corresponding warnings will resume on the next heartbeat /
+    /// doctor run.
+    #[serde(default)]
+    pub squelches_expired: usize,
     /// Every Warn/Fail check this run, keyed `"Category:Name"`. Used as
     /// the structured input to persistent-warning detection on the next
     /// sweep — do not format for display, the text lives in `check_summary`.
@@ -230,6 +235,15 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS) {
         Ok(n) => report.embeddings_pruned = n,
         Err(e) => tracing::warn!("maintenance: embedding prune failed: {e}"),
+    }
+
+    // 4a. Expire `/doctor` squelches whose TTL has passed. Once pruned,
+    //     the corresponding warning re-surfaces in subsequent heartbeats —
+    //     security findings the user has acknowledged are intentionally
+    //     bounded so they don't disappear from the radar forever.
+    match db.doctor_squelch_prune_expired(now) {
+        Ok(n) => report.squelches_expired = n,
+        Err(e) => tracing::warn!("maintenance: doctor-squelch prune failed: {e}"),
     }
 
     // 4b. Prune old completed/failed/cancelled workflows. Without this,
@@ -428,9 +442,26 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     if let Err(e) = db.prune_resolved_issue_state_before(resolved_cutoff) {
         tracing::warn!("maintenance: issue-state prune failed: {e}");
     }
+    // Active /doctor squelches drop their findings out of persistent_warnings
+    // — that's the user's "I see this, stop nagging" signal. The squelch
+    // expires per `maintenance.security_squelch_ttl_days`, after which the
+    // warning resumes.
+    let active_squelches: std::collections::HashSet<String> = db
+        .doctor_squelch_list_active(now)
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| format!("{}:{}", r.category, r.name))
+                .collect()
+        })
+        .unwrap_or_default();
     report.persistent_warnings = db
         .list_persistent_open_issues()
-        .map(|rows| rows.into_iter().map(|r| r.issue_key).collect())
+        .map(|rows| {
+            rows.into_iter()
+                .map(|r| r.issue_key)
+                .filter(|k| !active_squelches.contains(k))
+                .collect()
+        })
         .unwrap_or_default();
 
     // 8. Persist the run (best-effort; losing the audit row must not

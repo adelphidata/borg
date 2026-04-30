@@ -3,6 +3,7 @@ mod audit_chain;
 mod audit_writer;
 mod delivery;
 mod device_pairing;
+pub mod doctor_squelch;
 mod issue_state;
 mod maintenance;
 mod memory;
@@ -315,7 +316,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 49;
+    const CURRENT_VERSION: u32 = 50;
 
     /// Check if a column exists on a table via `PRAGMA table_info`.
     /// Safer than catching ALTER TABLE errors by string matching.
@@ -403,6 +404,7 @@ impl Database {
             Database::migrate_v47,
             Database::migrate_v48,
             Database::migrate_v49,
+            Database::migrate_v50,
         ];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.
