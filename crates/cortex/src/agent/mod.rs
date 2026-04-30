@@ -555,7 +555,7 @@ impl Agent {
         self.rate_guard
             .update_limits(new_config.security.action_limits.clone());
         let resolved_creds = new_config.resolve_credentials();
-        self.cached_credentials = Some(resolved_creds.clone());
+        self.cached_credentials = Some(resolved_creds);
         self.config_arc = Arc::new(new_config.clone());
         self.config = new_config;
         self.refresh_skill_runtime_state();

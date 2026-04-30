@@ -369,6 +369,7 @@ pub enum HistoryCell {
     MentionCard {
         label: String,
     },
+    #[allow(dead_code)]
     Separator,
 }
 

@@ -688,9 +688,9 @@ fn issue_snapshots(checks: &[DiagnosticCheck]) -> Vec<IssueSnapshot> {
         .collect()
 }
 
-fn group_issues_by_remediation<'a>(
-    issues: &'a [IssueSnapshot],
-) -> BTreeMap<&'static str, Vec<&'a IssueSnapshot>> {
+fn group_issues_by_remediation(
+    issues: &[IssueSnapshot],
+) -> BTreeMap<&'static str, Vec<&IssueSnapshot>> {
     let mut out: BTreeMap<&'static str, Vec<&IssueSnapshot>> = BTreeMap::new();
     for issue in issues {
         if issue.remediation_kind != RemediationKind::AutoSafe {
