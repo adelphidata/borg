@@ -1114,7 +1114,7 @@ impl HistoryCell {
             HistoryCell::Heartbeat { text } => {
                 vec![Line::from(vec![
                     Span::styled("[heartbeat] ", theme::code_style()),
-                    Span::styled(text.clone(), theme::code_style()),
+                    Span::raw(text.clone()),
                 ])]
             }
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
