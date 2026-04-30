@@ -1,11 +1,13 @@
 //! Filesystem applicator — takes parsed patches and applies them to disk.
 
 use anyhow::{bail, Context, Result};
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::parser::{Hunk, Patch, PatchOperation};
-use crate::seek_sequence::seek_sequence;
+use crate::seek_sequence::{seek_sequence, MatchOutcome};
 
 /// Maximum size (in bytes) for any single file created or modified by a patch.
 /// Prevents disk exhaustion from LLM-generated oversized patches.
@@ -44,6 +46,30 @@ impl AffectedPaths {
     }
 }
 
+/// Successful patch application details.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyPatchResult {
+    /// Files affected by the patch.
+    pub affected: AffectedPaths,
+    /// Unified-diff style rendering of applied changes.
+    pub diff: String,
+}
+
+impl ApplyPatchResult {
+    /// Format the affected paths summary.
+    pub fn format_summary(&self) -> String {
+        self.affected.format_summary()
+    }
+}
+
+impl Deref for ApplyPatchResult {
+    type Target = AffectedPaths;
+
+    fn deref(&self) -> &Self::Target {
+        &self.affected
+    }
+}
+
 /// Validate that `path` stays within `base_dir` after canonicalization.
 ///
 /// NOTE: This function enforces base_dir containment. Cross-directory support
@@ -60,11 +86,9 @@ fn validate_patch_path(path: &str, base_dir: &Path) -> Result<()> {
             base_dir.display()
         )
     })?;
-    // For new files, canonicalize as far as possible then check prefix
     let resolved = if full.exists() {
         std::fs::canonicalize(&full)?
     } else {
-        // Walk up to find an existing ancestor, then append the rest
         let mut existing = full;
         let mut tail = Vec::new();
         while !existing.exists() {
@@ -103,53 +127,20 @@ enum FileSnapshot {
     DidNotExist,
 }
 
+enum CommitAction {
+    Write { path: String, content: String },
+    Delete { path: String },
+}
+
+struct PreparedPatch {
+    result: ApplyPatchResult,
+    actions: Vec<CommitAction>,
+}
+
 /// Apply a parsed patch to the filesystem under `base_dir`.
-pub fn apply_patch(patch: &Patch, base_dir: &Path) -> Result<AffectedPaths> {
-    // Validate all paths up front before making any changes
-    for op in &patch.operations {
-        match op {
-            PatchOperation::AddFile { path, .. } => {
-                validate_patch_path(path, base_dir)?;
-            }
-            PatchOperation::UpdateFile { path, move_to, .. } => {
-                validate_patch_path(path, base_dir)?;
-                if let Some(dest) = move_to {
-                    validate_patch_path(dest, base_dir)?;
-                }
-            }
-            PatchOperation::DeleteFile { path } => {
-                validate_patch_path(path, base_dir)?;
-            }
-        }
-    }
-
-    let mut affected = AffectedPaths::default();
-    let mut snapshots: Vec<(String, FileSnapshot)> = Vec::new();
-
-    let result = apply_patch_inner(patch, base_dir, &mut affected, &mut snapshots);
-
-    if let Err(e) = result {
-        // Rollback: restore all snapshotted files
-        info!("Patch failed, rolling back {} files", snapshots.len());
-        for (path, snapshot) in snapshots.into_iter().rev() {
-            let full_path = base_dir.join(&path);
-            match snapshot {
-                FileSnapshot::Existed(content) => {
-                    if let Err(e) = std::fs::write(&full_path, &content) {
-                        warn!("Rollback: failed to restore {}: {e}", full_path.display());
-                    }
-                }
-                FileSnapshot::DidNotExist => {
-                    if let Err(e) = std::fs::remove_file(&full_path) {
-                        warn!("Rollback: failed to remove {}: {e}", full_path.display());
-                    }
-                }
-            }
-        }
-        return Err(e);
-    }
-
-    Ok(affected)
+pub fn apply_patch(patch: &Patch, base_dir: &Path) -> Result<ApplyPatchResult> {
+    let prepared = prepare_patch(patch, base_dir)?;
+    commit_prepared_patch(prepared, base_dir)
 }
 
 /// Refuse to write through symlinks to prevent TOCTOU attacks.
@@ -163,128 +154,324 @@ fn reject_symlink(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn apply_patch_inner(
-    patch: &Patch,
-    base_dir: &Path,
-    affected: &mut AffectedPaths,
-    snapshots: &mut Vec<(String, FileSnapshot)>,
-) -> Result<()> {
+fn prepare_patch(patch: &Patch, base_dir: &Path) -> Result<PreparedPatch> {
+    let mut errors = Vec::new();
+    let mut overlay: HashMap<String, Option<String>> = HashMap::new();
+    let mut actions = Vec::new();
+    let mut affected = AffectedPaths::default();
+    let mut diffs = Vec::new();
+
     for op in &patch.operations {
         match op {
             PatchOperation::AddFile { path, content } => {
+                if let Err(err) = validate_patch_path(path, base_dir) {
+                    errors.push(err.to_string());
+                    continue;
+                }
                 if content.len() > MAX_PATCH_FILE_SIZE {
-                    bail!(
+                    errors.push(format!(
                         "File '{path}' exceeds maximum size ({} bytes > {} bytes)",
                         content.len(),
                         MAX_PATCH_FILE_SIZE
-                    );
+                    ));
+                    continue;
                 }
-                let full_path = base_dir.join(path);
-                reject_symlink(&full_path)
-                    .with_context(|| format!("Symlink check failed for {path}"))?;
-                // Snapshot existing file if it exists (overwrite case)
-                if full_path.exists() {
-                    let existing = std::fs::read_to_string(&full_path)
-                        .with_context(|| format!("Failed to read existing {path}"))?;
-                    snapshots.push((path.clone(), FileSnapshot::Existed(existing)));
-                } else {
-                    snapshots.push((path.clone(), FileSnapshot::DidNotExist));
+
+                match virtual_file_state(path, base_dir, &overlay) {
+                    Ok(previous) => {
+                        overlay.insert(path.clone(), Some(content.clone()));
+                        actions.push(CommitAction::Write {
+                            path: path.clone(),
+                            content: content.clone(),
+                        });
+                        affected.added.push(path.clone());
+                        let from = if previous.is_some() {
+                            format!("a/{path}")
+                        } else {
+                            "/dev/null".to_string()
+                        };
+                        diffs.push(render_unified_diff(
+                            previous.as_deref(),
+                            Some(content),
+                            &from,
+                            &format!("b/{path}"),
+                        ));
+                    }
+                    Err(err) => errors.push(err.to_string()),
                 }
-                if let Some(parent) = full_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("Failed to create directory for {path}"))?;
-                }
-                std::fs::write(&full_path, content)
-                    .with_context(|| format!("Failed to write {path}"))?;
-                info!("Added file: {path}");
-                affected.added.push(path.clone());
             }
             PatchOperation::UpdateFile {
                 path,
                 move_to,
                 hunks,
             } => {
-                let full_path = base_dir.join(path);
-                if !full_path.exists() {
-                    bail!("Cannot update non-existent file: {path}");
+                if let Err(err) = validate_patch_path(path, base_dir) {
+                    errors.push(err.to_string());
+                    continue;
+                }
+                if let Some(dest) = move_to {
+                    if let Err(err) = validate_patch_path(dest, base_dir) {
+                        errors.push(err.to_string());
+                        continue;
+                    }
                 }
 
-                let original = std::fs::read_to_string(&full_path)
-                    .with_context(|| format!("Failed to read {path}"))?;
-                snapshots.push((path.clone(), FileSnapshot::Existed(original.clone())));
+                let original = match virtual_file_state(path, base_dir, &overlay) {
+                    Ok(Some(content)) => content,
+                    Ok(None) => {
+                        errors.push(format!("Cannot update non-existent file: {path}"));
+                        continue;
+                    }
+                    Err(err) => {
+                        errors.push(err.to_string());
+                        continue;
+                    }
+                };
 
-                let content = apply_hunks(&original, hunks, path)?;
+                let updated = match apply_hunks(&original, hunks, path) {
+                    Ok(content) => content,
+                    Err(err) => {
+                        errors.push(format!("{err:#}"));
+                        continue;
+                    }
+                };
 
-                if content.len() > MAX_PATCH_FILE_SIZE {
-                    bail!(
+                if updated.len() > MAX_PATCH_FILE_SIZE {
+                    errors.push(format!(
                         "Updated file '{path}' exceeds maximum size ({} bytes > {} bytes)",
-                        content.len(),
+                        updated.len(),
                         MAX_PATCH_FILE_SIZE
-                    );
+                    ));
+                    continue;
                 }
 
                 if let Some(dest) = move_to {
-                    // Move/rename: write to destination, delete original
-                    let dest_path = base_dir.join(dest);
-                    reject_symlink(&dest_path)
-                        .with_context(|| format!("Symlink check failed for {dest}"))?;
-                    if let Some(parent) = dest_path.parent() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("Failed to create directory for {dest}"))?;
+                    if dest != path {
+                        match virtual_file_state(dest, base_dir, &overlay) {
+                            Ok(Some(_)) => {
+                                errors.push(format!(
+                                    "Move destination already exists: {dest} (refusing to overwrite)"
+                                ));
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                errors.push(err.to_string());
+                                continue;
+                            }
+                        }
                     }
-                    // Snapshot destination if it exists
-                    if dest_path.exists() {
-                        let existing = std::fs::read_to_string(&dest_path)
-                            .with_context(|| format!("Failed to read existing {dest}"))?;
-                        snapshots.push((dest.clone(), FileSnapshot::Existed(existing)));
+
+                    overlay.insert(path.clone(), None);
+                    overlay.insert(dest.clone(), Some(updated.clone()));
+                    actions.push(CommitAction::Write {
+                        path: dest.clone(),
+                        content: updated.clone(),
+                    });
+                    if dest != path {
+                        actions.push(CommitAction::Delete { path: path.clone() });
+                        affected.moved.push((path.clone(), dest.clone()));
                     } else {
-                        snapshots.push((dest.clone(), FileSnapshot::DidNotExist));
+                        affected.modified.push(path.clone());
                     }
-                    std::fs::write(&dest_path, &content)
-                        .with_context(|| format!("Failed to write {dest}"))?;
-                    std::fs::remove_file(&full_path)
-                        .with_context(|| format!("Failed to delete original {path}"))?;
-                    info!("Moved file: {path} -> {dest}");
-                    affected.moved.push((path.clone(), dest.clone()));
+
+                    let mut diff = String::new();
+                    if dest != path {
+                        diff.push_str(&format!("# Moved: {path} -> {dest}\n"));
+                    }
+                    let rendered = render_unified_diff(
+                        Some(&original),
+                        Some(&updated),
+                        &format!("a/{path}"),
+                        &format!("b/{dest}"),
+                    );
+                    if !rendered.is_empty() {
+                        diff.push_str(&rendered);
+                    }
+                    if !diff.trim().is_empty() {
+                        diffs.push(diff.trim_end().to_string());
+                    }
                 } else {
-                    reject_symlink(&full_path)
-                        .with_context(|| format!("Symlink check failed for {path}"))?;
-                    std::fs::write(&full_path, &content)
-                        .with_context(|| format!("Failed to write {path}"))?;
-                    info!("Updated file: {path}");
+                    overlay.insert(path.clone(), Some(updated.clone()));
+                    actions.push(CommitAction::Write {
+                        path: path.clone(),
+                        content: updated.clone(),
+                    });
                     affected.modified.push(path.clone());
+                    diffs.push(render_unified_diff(
+                        Some(&original),
+                        Some(&updated),
+                        &format!("a/{path}"),
+                        &format!("b/{path}"),
+                    ));
                 }
             }
             PatchOperation::DeleteFile { path } => {
-                let full_path = base_dir.join(path);
-                if full_path.exists() {
-                    let content = std::fs::read_to_string(&full_path)
-                        .with_context(|| format!("Failed to read {path} for snapshot"))?;
-                    snapshots.push((path.clone(), FileSnapshot::Existed(content)));
-                    std::fs::remove_file(&full_path)
-                        .with_context(|| format!("Failed to delete {path}"))?;
-                    info!("Deleted file: {path}");
-                } else {
-                    debug!("File already absent: {path}");
+                if let Err(err) = validate_patch_path(path, base_dir) {
+                    errors.push(err.to_string());
+                    continue;
                 }
-                affected.deleted.push(path.clone());
+
+                match virtual_file_state(path, base_dir, &overlay) {
+                    Ok(Some(previous)) => {
+                        overlay.insert(path.clone(), None);
+                        actions.push(CommitAction::Delete { path: path.clone() });
+                        affected.deleted.push(path.clone());
+                        diffs.push(render_unified_diff(
+                            Some(&previous),
+                            None,
+                            &format!("a/{path}"),
+                            "/dev/null",
+                        ));
+                    }
+                    Ok(None) => {
+                        debug!("File already absent during preflight: {path}");
+                        affected.deleted.push(path.clone());
+                    }
+                    Err(err) => errors.push(err.to_string()),
+                }
             }
         }
     }
 
-    Ok(())
+    if !errors.is_empty() {
+        bail!(
+            "Patch validation failed (no files were modified):\n{}",
+            errors
+                .into_iter()
+                .map(|err| format!("  • {err}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    Ok(PreparedPatch {
+        result: ApplyPatchResult {
+            affected,
+            diff: diffs
+                .into_iter()
+                .filter(|diff| !diff.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        },
+        actions,
+    })
 }
 
-/// A computed replacement: the matched line range and the new lines to substitute.
+fn commit_prepared_patch(prepared: PreparedPatch, base_dir: &Path) -> Result<ApplyPatchResult> {
+    let mut snapshots: Vec<(String, FileSnapshot)> = Vec::new();
+    let mut snapshotted = HashSet::new();
+
+    for action in &prepared.actions {
+        let path = match action {
+            CommitAction::Write { path, .. } | CommitAction::Delete { path } => path,
+        };
+        if snapshotted.insert(path.clone()) {
+            snapshots.push((path.clone(), snapshot_file_state(path, base_dir)?));
+        }
+    }
+
+    let result = (|| -> Result<()> {
+        for action in &prepared.actions {
+            match action {
+                CommitAction::Write { path, content } => {
+                    let full_path = base_dir.join(path);
+                    reject_symlink(&full_path)
+                        .with_context(|| format!("Symlink check failed for {path}"))?;
+                    if let Some(parent) = full_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("Failed to create directory for {path}"))?;
+                    }
+                    std::fs::write(&full_path, content)
+                        .with_context(|| format!("Failed to write {path}"))?;
+                    info!("Wrote file: {path}");
+                }
+                CommitAction::Delete { path } => {
+                    let full_path = base_dir.join(path);
+                    if full_path.exists() {
+                        std::fs::remove_file(&full_path)
+                            .with_context(|| format!("Failed to delete {path}"))?;
+                        info!("Deleted file: {path}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        info!(
+            "Patch failed during commit, rolling back {} files",
+            snapshots.len()
+        );
+        for (path, snapshot) in snapshots.into_iter().rev() {
+            let full_path = base_dir.join(&path);
+            match snapshot {
+                FileSnapshot::Existed(content) => {
+                    if let Some(parent) = full_path.parent() {
+                        if let Err(err) = std::fs::create_dir_all(parent) {
+                            warn!(
+                                "Rollback: failed to recreate parent for {}: {err}",
+                                full_path.display()
+                            );
+                            continue;
+                        }
+                    }
+                    if let Err(err) = std::fs::write(&full_path, &content) {
+                        warn!("Rollback: failed to restore {}: {err}", full_path.display());
+                    }
+                }
+                FileSnapshot::DidNotExist => {
+                    if let Err(err) = std::fs::remove_file(&full_path) {
+                        if err.kind() != std::io::ErrorKind::NotFound {
+                            warn!("Rollback: failed to remove {}: {err}", full_path.display());
+                        }
+                    }
+                }
+            }
+        }
+        return Err(e);
+    }
+
+    Ok(prepared.result)
+}
+
+fn virtual_file_state(
+    path: &str,
+    base_dir: &Path,
+    overlay: &HashMap<String, Option<String>>,
+) -> Result<Option<String>> {
+    if let Some(value) = overlay.get(path) {
+        return Ok(value.clone());
+    }
+    let full_path = base_dir.join(path);
+    if full_path.exists() {
+        return Ok(Some(
+            std::fs::read_to_string(&full_path)
+                .with_context(|| format!("Failed to read {path}"))?,
+        ));
+    }
+    Ok(None)
+}
+
+fn snapshot_file_state(path: &str, base_dir: &Path) -> Result<FileSnapshot> {
+    let full_path = base_dir.join(path);
+    if full_path.exists() {
+        Ok(FileSnapshot::Existed(
+            std::fs::read_to_string(&full_path)
+                .with_context(|| format!("Failed to read existing {path}"))?,
+        ))
+    } else {
+        Ok(FileSnapshot::DidNotExist)
+    }
+}
+
 struct Replacement {
     start_idx: usize,
     old_line_count: usize,
     new_lines: Vec<String>,
 }
 
-/// Apply all hunks to content using two-phase approach:
-/// 1. Compute phase: find match positions in original content
-/// 2. Apply phase: apply replacements in descending order
 fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String> {
     if hunks.is_empty() {
         return Ok(content.to_string());
@@ -294,76 +481,66 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
     let mut replacements: Vec<Replacement> = Vec::new();
     let mut cursor = 0usize;
 
-    // Compute phase: find each hunk's match position in the original content
     for hunk in hunks {
         if hunk.search.is_empty() {
-            // Append mode: place at end of file
+            let insertion_idx = if let Some(ref hint) = hunk.context_hint {
+                find_context_anchor(&content_lines, hint, cursor).with_context(|| {
+                    format!("In file '{file_path}' (patch line {})", hunk.source_line)
+                })? + 1
+            } else {
+                content_lines.len()
+            };
+
+            let new_lines: Vec<String> = hunk.replace.lines().map(String::from).collect();
+            cursor = insertion_idx;
             replacements.push(Replacement {
-                start_idx: content_lines.len(),
+                start_idx: insertion_idx,
                 old_line_count: 0,
-                new_lines: hunk.replace.lines().map(String::from).collect(),
+                new_lines,
             });
             continue;
         }
 
         let search_lines: Vec<String> = hunk.search.lines().map(String::from).collect();
-
-        // If context_hint is present, try to find the context line first to narrow search
+        let new_lines_vec: Vec<String> = hunk.replace.lines().map(String::from).collect();
         let search_start = if let Some(ref hint) = hunk.context_hint {
-            find_context_hint(&content_lines, hint, cursor).unwrap_or(cursor)
+            find_optional_context_anchor(&content_lines, hint, cursor)
+                .with_context(|| {
+                    format!(
+                        "In file '{file_path}' (patch line {}) while resolving context hint",
+                        hunk.source_line
+                    )
+                })?
+                .unwrap_or(cursor)
         } else {
             cursor
         };
 
-        let mut found = seek_sequence(
+        let (matched_idx, matched_search, matched_replace) = match locate_hunk_match(
             &content_lines,
             &search_lines,
+            &new_lines_vec,
             search_start,
-            hunk.is_end_of_file,
-        );
-
-        // Trailing empty line retry: when split('\n') produces a trailing empty
-        // string that doesn't exist in content.lines(), retry without it.
-        let mut effective_search = search_lines.as_slice();
-        let new_lines_vec: Vec<String> = hunk.replace.lines().map(String::from).collect();
-        let mut effective_new = new_lines_vec.as_slice();
-
-        if found.is_none() && effective_search.last().is_some_and(String::is_empty) {
-            effective_search = &search_lines[..search_lines.len() - 1];
-            if effective_new.last().is_some_and(String::is_empty) {
-                effective_new = &new_lines_vec[..new_lines_vec.len() - 1];
+            hunk,
+        ) {
+            Ok(found) => found,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("In file '{file_path}' (patch line {})", hunk.source_line)
+                });
             }
-            found = seek_sequence(
-                &content_lines,
-                effective_search,
-                search_start,
-                hunk.is_end_of_file,
-            );
-        }
+        };
 
-        if let Some(idx) = found {
-            cursor = idx + effective_search.len();
-            replacements.push(Replacement {
-                start_idx: idx,
-                old_line_count: effective_search.len(),
-                new_lines: effective_new.to_vec(),
-            });
-        } else {
-            bail!(
-                "Could not find search text in file '{}' (patch line {}):\n---\n{}\n---",
-                file_path,
-                hunk.source_line,
-                hunk.search
-            );
-        }
+        cursor = matched_idx + matched_search.len();
+        replacements.push(Replacement {
+            start_idx: matched_idx,
+            old_line_count: matched_search.len(),
+            new_lines: matched_replace.to_vec(),
+        });
     }
 
-    // Apply phase: sort by descending start_idx so earlier replacements don't shift later ones
     replacements.sort_by(|a, b| b.start_idx.cmp(&a.start_idx));
-
-    // Validate no overlapping replacements
     for window in replacements.windows(2) {
-        // window[0] has higher start_idx, window[1] has lower
         let earlier = &window[1];
         let later = &window[0];
         if earlier.start_idx + earlier.old_line_count > later.start_idx {
@@ -379,9 +556,9 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
     }
 
     let mut result_lines = content_lines;
-    for rep in replacements {
-        let end = rep.start_idx + rep.old_line_count;
-        result_lines.splice(rep.start_idx..end, rep.new_lines);
+    for replacement in replacements {
+        let end = replacement.start_idx + replacement.old_line_count;
+        result_lines.splice(replacement.start_idx..end, replacement.new_lines);
     }
 
     let mut result = result_lines.join("\n");
@@ -391,10 +568,161 @@ fn apply_hunks(content: &str, hunks: &[Hunk], file_path: &str) -> Result<String>
     Ok(result)
 }
 
-/// Find a context hint line in content, starting from cursor.
-fn find_context_hint(lines: &[String], hint: &str, cursor: usize) -> Option<usize> {
+fn locate_hunk_match<'a>(
+    content_lines: &[String],
+    search_lines: &'a [String],
+    replacement_lines: &'a [String],
+    search_start: usize,
+    hunk: &Hunk,
+) -> Result<(usize, &'a [String], &'a [String])> {
+    let mut outcome = seek_sequence(
+        content_lines,
+        search_lines,
+        search_start,
+        hunk.is_end_of_file,
+    );
+    let mut effective_search = search_lines;
+    let mut effective_replace = replacement_lines;
+
+    if matches!(outcome, MatchOutcome::NotFound)
+        && effective_search.last().is_some_and(String::is_empty)
+    {
+        effective_search = &search_lines[..search_lines.len() - 1];
+        if effective_replace.last().is_some_and(String::is_empty) {
+            effective_replace = &replacement_lines[..replacement_lines.len() - 1];
+        }
+        outcome = seek_sequence(
+            content_lines,
+            effective_search,
+            search_start,
+            hunk.is_end_of_file,
+        );
+    }
+
+    match outcome {
+        MatchOutcome::Unique(idx) => Ok((idx, effective_search, effective_replace)),
+        MatchOutcome::Ambiguous { count, strategy } => bail!(
+            "Search text matched {count} locations via {strategy}; provide more surrounding context:\n---\n{}\n---",
+            hunk.search
+        ),
+        MatchOutcome::NotFound => bail!("Could not find search text:\n---\n{}\n---", hunk.search),
+    }
+}
+
+fn find_context_anchor(lines: &[String], hint: &str, cursor: usize) -> Result<usize> {
     let hint_trimmed = hint.trim();
-    (cursor..lines.len()).find(|&i| lines[i].trim().contains(hint_trimmed))
+    let mut positions = Vec::new();
+    for (idx, line) in lines.iter().enumerate().skip(cursor) {
+        if line.trim().contains(hint_trimmed) {
+            positions.push(idx);
+        }
+    }
+
+    match positions.as_slice() {
+        [idx] => Ok(*idx),
+        [] => bail!("addition-only hunk context hint '{hint_trimmed}' not found"),
+        many => bail!(
+            "addition-only hunk context hint '{hint_trimmed}' is ambiguous ({} occurrences); provide a more unique hint",
+            many.len()
+        ),
+    }
+}
+
+fn find_optional_context_anchor(
+    lines: &[String],
+    hint: &str,
+    cursor: usize,
+) -> Result<Option<usize>> {
+    let hint_trimmed = hint.trim();
+    let mut positions = Vec::new();
+    for (idx, line) in lines.iter().enumerate().skip(cursor) {
+        if line.trim().contains(hint_trimmed) {
+            positions.push(idx);
+        }
+    }
+
+    match positions.as_slice() {
+        [] => Ok(None),
+        [idx] => Ok(Some(*idx)),
+        many => {
+            debug!(
+                "Context hint '{}' matched {} locations; falling back to full-file search",
+                hint_trimmed,
+                many.len()
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn render_unified_diff(
+    old: Option<&str>,
+    new: Option<&str>,
+    from_file: &str,
+    to_file: &str,
+) -> String {
+    let old_text = old.unwrap_or("");
+    let new_text = new.unwrap_or("");
+    if old_text == new_text {
+        return String::new();
+    }
+
+    let old_lines: Vec<&str> = if old_text.is_empty() {
+        Vec::new()
+    } else {
+        old_text.lines().collect()
+    };
+    let new_lines: Vec<&str> = if new_text.is_empty() {
+        Vec::new()
+    } else {
+        new_text.lines().collect()
+    };
+
+    let mut prefix = 0usize;
+    while prefix < old_lines.len()
+        && prefix < new_lines.len()
+        && old_lines[prefix] == new_lines[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < old_lines.len().saturating_sub(prefix)
+        && suffix < new_lines.len().saturating_sub(prefix)
+        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+
+    let old_changed_end = old_lines.len().saturating_sub(suffix);
+    let new_changed_end = new_lines.len().saturating_sub(suffix);
+    let old_start = prefix + 1;
+    let new_start = prefix + 1;
+
+    let mut diff = String::new();
+    diff.push_str(&format!("--- {from_file}\n"));
+    diff.push_str(&format!("+++ {to_file}\n"));
+    diff.push_str(&format!(
+        "@@ -{},{} +{},{} @@\n",
+        old_start,
+        old_changed_end.saturating_sub(prefix),
+        new_start,
+        new_changed_end.saturating_sub(prefix)
+    ));
+
+    for line in &old_lines[..prefix] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    for line in &old_lines[prefix..old_changed_end] {
+        diff.push_str(&format!("-{line}\n"));
+    }
+    for line in &new_lines[prefix..new_changed_end] {
+        diff.push_str(&format!("+{line}\n"));
+    }
+    for line in &old_lines[old_changed_end..] {
+        diff.push_str(&format!(" {line}\n"));
+    }
+    diff.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -1229,5 +1557,240 @@ EOF";
         );
         let result = crate::apply_patch_to_dir(&patch, dir.path());
         assert!(result.is_err(), "should reject write through symlink");
+    }
+
+    #[test]
+    fn ambiguous_search_text_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("dup.txt"),
+            "alpha\nsame\nomega\nbeta\nsame\nomega\n",
+        )
+        .unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: dup.txt
+@@
+ same
+-omega
++OMEGA
+*** End Patch";
+
+        let err = crate::apply_patch_to_dir(patch_text, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matched 2 locations"), "got: {err}");
+        assert!(
+            err.contains("provide more surrounding context"),
+            "got: {err}"
+        );
+        let content = std::fs::read_to_string(dir.path().join("dup.txt")).unwrap();
+        assert!(content.contains("same\nomega"));
+        assert!(!content.contains("OMEGA"));
+    }
+
+    #[test]
+    fn multi_hunk_matching_uses_original_file_content() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("chain.txt"), "a\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "chain.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("a", "b"), simple_hunk("b", "c")],
+        }]);
+
+        let err = apply_patch(&patch, dir.path()).unwrap_err().to_string();
+        assert!(err.contains("Could not find search text"), "got: {err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("chain.txt")).unwrap(),
+            "a\n"
+        );
+    }
+
+    #[test]
+    fn addition_only_hunk_with_unique_hint_inserts_at_anchor() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("app.py"), "def main():\n    pass\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: app.py
+@@ def main @@
++def helper():
++    return 42
+*** End Patch";
+
+        let result = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("app.py")).unwrap();
+        assert!(content.contains("def main():\ndef helper():\n    return 42\n    pass"));
+        assert!(result.diff.contains("+++ b/app.py"));
+    }
+
+    #[test]
+    fn addition_only_hunk_with_ambiguous_hint_fails() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("app.py"),
+            "def main():\n    pass\n\ndef main():\n    pass\n",
+        )
+        .unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: app.py
+@@ def main @@
++def helper():
++    return 42
+*** End Patch";
+
+        let err = crate::apply_patch_to_dir(patch_text, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("addition-only hunk context hint 'def main' is ambiguous"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicated_context_hint_falls_back_to_full_file_search() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("main.py"),
+            "def main():\n    alpha()\n\ndef main_helper():\n    beta()\n",
+        )
+        .unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "main.py".to_string(),
+            move_to: None,
+            hunks: vec![Hunk {
+                context_hint: Some("def main".to_string()),
+                search: "def main_helper():\n    beta()".to_string(),
+                replace: "def main_helper():\n    gamma()".to_string(),
+                is_end_of_file: false,
+                source_line: 9,
+            }],
+        }]);
+
+        apply_patch(&patch, dir.path()).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("main.py")).unwrap();
+        assert!(content.contains("def main_helper():\n    gamma()"));
+        assert!(content.contains("def main():\n    alpha()"));
+    }
+
+    #[test]
+    fn move_destination_overwrite_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("src.txt"), "source\n").unwrap();
+        std::fs::write(dir.path().join("dest.txt"), "dest\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: src.txt
+*** Move to: dest.txt
+@@
+-source
++SOURCE
+*** End Patch";
+
+        let err = crate::apply_patch_to_dir(patch_text, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Move destination already exists"),
+            "got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src.txt")).unwrap(),
+            "source\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("dest.txt")).unwrap(),
+            "dest\n"
+        );
+    }
+
+    #[test]
+    fn preflight_aggregates_errors_without_writing_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("dup.txt"), "same\nblock\nsame\nblock\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Add File: new.txt
++new file
+*** Update File: dup.txt
+@@
+ same
+-block
++BLOCK
+*** Update File: missing.txt
+@@
+-old
++new
+*** End Patch";
+
+        let err = crate::apply_patch_to_dir(patch_text, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matched 2 locations"), "got: {err}");
+        assert!(
+            err.contains("Cannot update non-existent file: missing.txt"),
+            "got: {err}"
+        );
+        assert!(
+            !dir.path().join("new.txt").exists(),
+            "preflight should prevent partial writes"
+        );
+    }
+
+    #[test]
+    fn apply_result_includes_diff() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {\n    old();\n}\n").unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: main.rs
+@@
+-    old();
++    new();
+*** End Patch";
+
+        let result = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
+        assert!(
+            result.diff.contains("--- a/main.rs"),
+            "got: {}",
+            result.diff
+        );
+        assert!(
+            result.diff.contains("+++ b/main.rs"),
+            "got: {}",
+            result.diff
+        );
+        assert!(result.diff.contains("-    old();"), "got: {}", result.diff);
+        assert!(result.diff.contains("+    new();"), "got: {}", result.diff);
+    }
+
+    #[test]
+    fn apply_result_diff_uses_one_based_hunk_headers() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("diff-lines.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "diff-lines.txt".to_string(),
+            move_to: None,
+            hunks: vec![simple_hunk("three", "THREE")],
+        }]);
+
+        let result = apply_patch(&patch, dir.path()).unwrap();
+        assert!(
+            result.diff.contains("@@ -3,1 +3,1 @@"),
+            "got diff: {}",
+            result.diff
+        );
     }
 }

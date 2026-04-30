@@ -73,6 +73,7 @@ const END_PATCH_MARKER: &str = "*** End Patch";
 const ADD_FILE_MARKER: &str = "*** Add File: ";
 const DELETE_FILE_MARKER: &str = "*** Delete File: ";
 const UPDATE_FILE_MARKER: &str = "*** Update File: ";
+const MOVE_FILE_MARKER: &str = "*** Move File: ";
 const MOVE_TO_MARKER: &str = "*** Move to: ";
 const EOF_MARKER: &str = "*** End of File";
 
@@ -90,6 +91,7 @@ fn is_dsl_marker(text: &str) -> bool {
         || t.starts_with(ADD_FILE_MARKER)
         || t.starts_with(UPDATE_FILE_MARKER)
         || t.starts_with(DELETE_FILE_MARKER)
+        || t.starts_with(MOVE_FILE_MARKER)
         || t.starts_with(MOVE_TO_MARKER)
         || t == EOF_MARKER
 }
@@ -412,6 +414,25 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                 move_to,
                 hunks,
             });
+        } else if let Some(rest) = line.strip_prefix(MOVE_FILE_MARKER) {
+            let Some((src, dst)) = rest.split_once("->") else {
+                return Err(ParseError::InvalidFormat(
+                    "Malformed Move File syntax; expected '*** Move File: src -> dst'".to_string(),
+                ));
+            };
+            let path = src.trim().to_string();
+            let move_to = dst.trim().to_string();
+            if path.is_empty() || move_to.is_empty() {
+                return Err(ParseError::InvalidFormat(
+                    "Move File requires both source and destination paths".to_string(),
+                ));
+            }
+            operations.push(PatchOperation::UpdateFile {
+                path,
+                move_to: Some(move_to),
+                hunks: Vec::new(),
+            });
+            i += 1;
         } else if let Some(path) = line.strip_prefix(DELETE_FILE_MARKER) {
             let path = path.trim().to_string();
             if path.is_empty() {
@@ -1150,6 +1171,38 @@ mod tests {
             }
             other => panic!("Expected UpdateFile, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_standalone_move_file() {
+        let input = "\
+*** Begin Patch
+*** Move File: old.rs -> new.rs
+*** End Patch";
+        let patch = parse_patch(input).unwrap();
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile {
+                path,
+                move_to,
+                hunks,
+                ..
+            } => {
+                assert_eq!(path, "old.rs");
+                assert_eq!(move_to.as_deref(), Some("new.rs"));
+                assert!(hunks.is_empty());
+            }
+            other => panic!("Expected UpdateFile, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_standalone_move_file_requires_destination() {
+        let input = "\
+*** Begin Patch
+*** Move File: old.rs
+*** End Patch";
+        let err = parse_patch(input).unwrap_err();
+        assert!(err.to_string().contains("Malformed Move File syntax"));
     }
 
     #[test]

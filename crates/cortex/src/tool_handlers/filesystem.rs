@@ -17,9 +17,9 @@ fn apply_patch_to(
     let patch = require_str_param(args, "patch")?;
     std::fs::create_dir_all(base_dir)?;
     match coding::apply_patch_to_dir(patch, base_dir) {
-        Ok(affected) => Ok(format!(
-            "{label} patch applied successfully.\n{}",
-            affected.format_summary()
+        Ok(result) => Ok(format_patch_success(
+            &format!("{label} patch applied successfully."),
+            &result,
         )),
         Err(e) => Ok(format!("Error applying {label} patch: {e}")),
     }
@@ -76,28 +76,34 @@ pub fn handle_apply_patch(args: &serde_json::Value, config: &Config) -> Result<S
         // Normalize all paths to absolute so we can use "/" as base_dir
         let normalized = normalize_patch_paths(patch_text, &cwd);
         match coding::apply_patch_to_dir(&normalized, std::path::Path::new("/")) {
-            Ok(affected) => Ok(format!(
-                "Patch applied successfully.\n{}",
-                affected.format_summary()
-            )),
+            Ok(result) => Ok(format_patch_success("Patch applied successfully.", &result)),
             Err(e) => Ok(format!("Error applying patch: {e}")),
         }
     } else {
         // Fast path: all relative paths, use CWD as base_dir (original behavior)
         match coding::apply_patch_to_dir(patch_text, &cwd) {
-            Ok(affected) => Ok(format!(
-                "Patch applied successfully.\n{}",
-                affected.format_summary()
-            )),
+            Ok(result) => Ok(format_patch_success("Patch applied successfully.", &result)),
             Err(e) => Ok(format!("Error applying patch: {e}")),
         }
     }
 }
 
+fn format_patch_success(prefix: &str, result: &coding::ApplyPatchResult) -> String {
+    let mut parts = vec![prefix.to_string()];
+    let summary = result.format_summary();
+    if !summary.is_empty() {
+        parts.push(summary);
+    }
+    if !result.diff.trim().is_empty() {
+        parts.push(result.diff.clone());
+    }
+    parts.join("\n\n")
+}
+
 /// Check whether the patch text contains any absolute or tilde-prefixed file paths.
 fn patch_has_absolute_paths(patch_text: &str) -> bool {
     for line in patch_text.lines() {
-        if let Some(path) = extract_path_from_line(line) {
+        for path in extract_paths_from_line(line) {
             if path.starts_with('/') || path.starts_with('~') {
                 return true;
             }
@@ -110,7 +116,7 @@ fn patch_has_absolute_paths(patch_text: &str) -> bool {
 fn extract_patch_paths(patch_text: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in patch_text.lines() {
-        if let Some(path) = extract_path_from_line(line) {
+        for path in extract_paths_from_line(line) {
             paths.push(path.to_string());
         }
     }
@@ -122,6 +128,7 @@ const PATCH_DSL_MARKERS: &[&str] = &[
     "*** Add File: ",
     "*** Update File: ",
     "*** Delete File: ",
+    "*** Move File: ",
     "*** Move to: ",
     "*** Move To: ",
 ];
@@ -129,6 +136,13 @@ const PATCH_DSL_MARKERS: &[&str] = &[
 /// Extract a file path from a patch DSL marker line, if present.
 fn extract_path_from_line(line: &str) -> Option<&str> {
     let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("*** Move File: ") {
+        let (src, _) = rest.split_once("->")?;
+        let path = src.trim();
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
     for prefix in PATCH_DSL_MARKERS {
         if let Some(rest) = trimmed.strip_prefix(prefix) {
             let path = rest.trim();
@@ -140,16 +154,39 @@ fn extract_path_from_line(line: &str) -> Option<&str> {
     None
 }
 
+fn extract_paths_from_line(line: &str) -> Vec<&str> {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix("*** Move File: ") {
+        if let Some((src, dst)) = rest.split_once("->") {
+            let src = src.trim();
+            let dst = dst.trim();
+            let mut paths = Vec::new();
+            if !src.is_empty() {
+                paths.push(src);
+            }
+            if !dst.is_empty() {
+                paths.push(dst);
+            }
+            return paths;
+        }
+        return Vec::new();
+    }
+
+    extract_path_from_line(line).into_iter().collect()
+}
+
 /// Normalize patch file paths so apply_patch_to_dir can use "/" as base_dir.
 /// All paths become absolute: tilde-expanded, relative paths prepended with CWD.
-/// Only rewrites *** (Add|Update|Delete) File: and *** Move to: lines.
+/// Rewrites path-bearing patch markers, including standalone move operations.
 fn normalize_patch_paths(patch_text: &str, cwd: &std::path::Path) -> String {
     let mut output = String::with_capacity(patch_text.len());
     for (i, line) in patch_text.lines().enumerate() {
         if i > 0 {
             output.push('\n');
         }
-        if let Some((prefix, path)) = split_marker_line(line) {
+        if let Some(normalized_move) = normalize_move_file_line(line, cwd) {
+            output.push_str(&normalized_move);
+        } else if let Some((prefix, path)) = split_marker_line(line) {
             let expanded = shellexpand::tilde(path).to_string();
             let absolute = if std::path::Path::new(&expanded).is_absolute() {
                 expanded
@@ -181,6 +218,24 @@ fn split_marker_line(line: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+fn normalize_move_file_line(line: &str, cwd: &std::path::Path) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("*** Move File: ")?;
+    let (src, dst) = rest.split_once("->")?;
+    let src = normalize_patch_path_fragment(src.trim(), cwd);
+    let dst = normalize_patch_path_fragment(dst.trim(), cwd);
+    Some(format!("*** Move File: {src} -> {dst}"))
+}
+
+fn normalize_patch_path_fragment(path: &str, cwd: &std::path::Path) -> String {
+    let expanded = shellexpand::tilde(path).to_string();
+    if std::path::Path::new(&expanded).is_absolute() {
+        expanded
+    } else {
+        cwd.join(&expanded).to_string_lossy().to_string()
+    }
 }
 
 pub fn handle_create_channel(args: &serde_json::Value) -> Result<String> {
@@ -1067,6 +1122,25 @@ mod tests {
         let _ = std::fs::remove_file(&created);
     }
 
+    #[test]
+    fn apply_patch_success_includes_diff_output() {
+        let config = Config::default();
+        let filename = format!("borg_patch_diff_{}.txt", std::process::id());
+        std::fs::write(&filename, "old\n").unwrap();
+        let patch =
+            format!("*** Begin Patch\n*** Update File: {filename}\n@@\n-old\n+new\n*** End Patch");
+        let args = json!({"patch": patch});
+        let result = handle_apply_patch(&args, &config).unwrap();
+        assert!(result.contains("Patch applied successfully."));
+        assert!(result.contains(&format!("M {filename}")), "got: {result}");
+        assert!(
+            result.contains(&format!("--- a/{filename}")),
+            "got: {result}"
+        );
+        assert!(result.contains("+new"), "got: {result}");
+        let _ = std::fs::remove_file(&filename);
+    }
+
     /// Mixed relative and absolute paths in one patch should both work.
     #[test]
     fn apply_patch_mixed_relative_and_absolute() {
@@ -1098,6 +1172,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_file(&rel_target);
+    }
+
+    #[test]
+    fn normalize_patch_paths_handles_standalone_move_file() {
+        let cwd = std::env::current_dir().unwrap();
+        let patch = "*** Begin Patch\n*** Move File: src.txt -> dest.txt\n*** End Patch";
+        let normalized = normalize_patch_paths(patch, &cwd);
+        assert!(normalized.contains(&format!(
+            "*** Move File: {} -> {}",
+            cwd.join("src.txt").display(),
+            cwd.join("dest.txt").display()
+        )));
+    }
+
+    #[test]
+    fn extract_patch_paths_includes_move_destination() {
+        let paths = extract_patch_paths("*** Move File: src.txt -> /tmp/dest.txt");
+        assert_eq!(
+            paths,
+            vec!["src.txt".to_string(), "/tmp/dest.txt".to_string()]
+        );
+        assert!(patch_has_absolute_paths(
+            "*** Move File: src.txt -> /tmp/dest.txt"
+        ));
     }
 
     // ── normalize_patch_paths unit tests ──

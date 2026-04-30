@@ -35,10 +35,10 @@ mod seek_sequence;
 use anyhow::Result;
 use std::path::Path;
 
-pub use apply::AffectedPaths;
+pub use apply::{AffectedPaths, ApplyPatchResult};
 
 /// Parse and apply a patch to a directory, returning which files were affected.
-pub fn apply_patch_to_dir(patch_text: &str, base_dir: &Path) -> Result<AffectedPaths> {
+pub fn apply_patch_to_dir(patch_text: &str, base_dir: &Path) -> Result<ApplyPatchResult> {
     let patch = parser::parse_patch(patch_text)?;
     apply::apply_patch(&patch, base_dir)
 }
