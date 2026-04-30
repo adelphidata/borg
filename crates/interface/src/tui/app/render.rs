@@ -965,6 +965,48 @@ mod tests {
     }
 
     // ========================================================================
+    // flush_cell_range_to_scrollback — spacer between non-tool-flow cells.
+    // ========================================================================
+
+    #[test]
+    fn flush_separates_doctor_warning_from_heartbeat_with_one_blank() {
+        // Regression guard for the screenshot bug: doctor-warning card hugging
+        // the heartbeat line in scrollback. Must produce *exactly one* blank
+        // line between the two cells — zero would reproduce the original bug,
+        // two would mean both `flush_cell_range_to_scrollback` and
+        // `render_cell_lines` are each prepending a spacer.
+        let mut app = make_app();
+        app.cells.push(HistoryCell::DoctorWarning {
+            warnings: vec!["A:b".into()],
+        });
+        app.cells.push(HistoryCell::Heartbeat {
+            text: "hello".into(),
+        });
+        let before = app.pending_scrollback.len();
+        app.flush_cell_range_to_scrollback(0, 2, 80);
+        let flushed = &app.pending_scrollback[before..];
+
+        let is_blank =
+            |l: &Line<'static>| l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty());
+        let heartbeat_idx = flushed
+            .iter()
+            .rposition(|l| l.spans.iter().any(|s| s.content.contains("[heartbeat]")))
+            .expect("heartbeat line should be flushed");
+        let mut consecutive_blanks = 0usize;
+        for l in flushed[..heartbeat_idx].iter().rev() {
+            if is_blank(l) {
+                consecutive_blanks += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(
+            consecutive_blanks, 1,
+            "expected exactly one blank between warning card and heartbeat, got: {flushed:?}"
+        );
+    }
+
+    // ========================================================================
     // desired_status_height — governs whether a second row is allocated for
     // the live details snippet; layout depends on this number directly.
     // ========================================================================

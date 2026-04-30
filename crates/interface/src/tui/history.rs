@@ -146,6 +146,96 @@ fn render_boxed_lines(
     lines
 }
 
+/// Build the amber warning card shown at startup when the daemon reports
+/// persistent doctor warnings. Returns an empty vec for no warnings (the
+/// render arm collapses to a no-op cell). `warnings` is a list of
+/// `category:name` payloads as emitted by the daemon's `WarningList`.
+///
+/// The card lists the *categories* affected — deduplicated, first-seen
+/// order, max 3 shown then `and N more` — rather than the raw IDs. This is
+/// designed to be a one-line scan: "you have issues over here, here, and
+/// here; run `/doctor` if you want the detail." Detail lives in the doctor
+/// command, not the startup card.
+pub(super) fn build_doctor_warning_lines(warnings: &[String], width: u16) -> Vec<Line<'static>> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+
+    // Extract the category prefix (text before the first `:`); fall back to
+    // the whole string for malformed entries. Dedupe preserving first-seen
+    // order so a category with N failing checks appears once.
+    let mut categories: Vec<String> = Vec::new();
+    for w in warnings {
+        let cat = match w.split_once(':') {
+            Some((c, _)) => c.trim().to_string(),
+            None => w.trim().to_string(),
+        };
+        if cat.is_empty() {
+            continue;
+        }
+        if !categories.iter().any(|c| c == &cat) {
+            categories.push(cat);
+        }
+    }
+    if categories.is_empty() {
+        return Vec::new();
+    }
+
+    const MAX_SHOWN: usize = 3;
+    let total_categories = categories.len();
+    let shown = total_categories.min(MAX_SHOWN);
+    let extra = total_categories - shown;
+
+    // Build the summary line: dim "Issues with " + bold-white categories
+    // separated by dim commas + dim period (or "and N more.").
+    let mut summary: Vec<Span<'static>> = Vec::new();
+    let lead = if total_categories == 1 {
+        "Issue with "
+    } else {
+        "Issues with "
+    };
+    summary.push(Span::styled(lead.to_string(), theme::dim()));
+    for (i, cat) in categories.iter().take(shown).enumerate() {
+        if i > 0 {
+            // Oxford-comma style: ", " between, ", and " before the last
+            // when there's no overflow tail. With overflow, the tail uses
+            // ", and N more" so each gap is a plain ", ".
+            let sep = if extra == 0 && i == shown - 1 {
+                if shown == 2 {
+                    " and "
+                } else {
+                    ", and "
+                }
+            } else {
+                ", "
+            };
+            summary.push(Span::styled(sep.to_string(), theme::dim()));
+        }
+        summary.push(Span::styled(cat.clone(), theme::header_style()));
+    }
+    if extra > 0 {
+        summary.push(Span::styled(format!(", and {extra} more"), theme::dim()));
+    }
+    summary.push(Span::styled(".".to_string(), theme::dim()));
+
+    // Footer with `/doctor` highlighted.
+    let footer = Line::from(vec![
+        Span::styled("Run ".to_string(), theme::dim()),
+        Span::styled("/doctor".to_string(), theme::header_style()),
+        Span::styled(" for more details.".to_string(), theme::dim()),
+    ]);
+
+    let inner = vec![Line::from(summary), Line::default(), footer];
+
+    let total_warnings = warnings.len();
+    let label = if total_warnings == 1 {
+        " ⚠ 1 Warning ".to_string()
+    } else {
+        format!(" ⚠ {total_warnings} Warnings ")
+    };
+    render_boxed_lines(inner, theme::warning_style(), Some(&label), width, 0)
+}
+
 /// Display *rows* of tool output shown before collapsing. Row-aware
 /// (post-wrap) — a single logical line that wraps to many rows counts
 /// against this budget, so a stray long URL can't blow past the preview.
@@ -254,6 +344,14 @@ pub enum HistoryCell {
     /// renders with the same teal styling as the startup header.
     Card {
         lines: Vec<Line<'static>>,
+    },
+    /// Amber warning card shown at startup when the daemon reports
+    /// persistent doctor warnings. Lines are computed on each render so the
+    /// box matches the current viewport width — unlike `Card`, which is
+    /// baked once. Each `String` is a `category:name` payload from the
+    /// daemon's `WarningList`.
+    DoctorWarning {
+        warnings: Vec<String>,
     },
     Thinking {
         text: String,
@@ -1021,6 +1119,7 @@ impl HistoryCell {
             }
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
             HistoryCell::Card { lines } => lines.clone(),
+            HistoryCell::DoctorWarning { warnings } => build_doctor_warning_lines(warnings, width),
             HistoryCell::Thinking { text } => {
                 // reasoning: dim + italic bullet block, no box.
                 // Header line: "• thinking" (dim, italic) — bullet matches assistant

@@ -233,44 +233,24 @@ pub struct AmbientStatus {
     pub archetype: Option<cortex::evolution::Archetype>,
 }
 
-/// Compose a one-line notice summarizing the latest maintenance run's
-/// `persistent_warnings`, or `None` if the last run had no persistent
-/// issues (or there are no runs yet).
+/// Fetch the persistent doctor warnings from the daemon, returning the raw
+/// `category:name` strings. Returns `None` when there are no warnings (or
+/// the daemon RPC fails — caller treats that as "show nothing").
 ///
-/// Rendered once at TUI startup, right after the opening card. This is
-/// deliberately quiet — a System cell that scrolls away, not a banner.
-/// The report is also in `doctor_runs` and surfaced via `borg doctor`;
-/// this is just a nudge when something has been stuck across sweeps.
-pub(super) fn load_persistent_warning_notice(client: &Arc<Mutex<DaemonClient>>) -> Option<String> {
+/// Rendered once at TUI startup as a `HistoryCell::DoctorWarning` so it
+/// scrolls away like any other cell — intentionally not a pinned banner.
+/// `borg doctor` is the source of truth for the full list.
+pub(super) fn load_persistent_warning_notice(
+    client: &Arc<Mutex<DaemonClient>>,
+) -> Option<Vec<String>> {
     let warnings = block_on_client(client, |c| {
         Box::pin(async move { c.get_persistent_warnings().await })
     })?;
-    persistent_warning_notice_from_warnings(&warnings.warnings)
-}
-
-/// Testable core of [`load_persistent_warning_notice`]. Takes the warning
-/// strings from the daemon and renders the startup notice.
-fn persistent_warning_notice_from_warnings(warnings: &[String]) -> Option<String> {
-    if warnings.is_empty() {
-        return None;
+    if warnings.warnings.is_empty() {
+        None
+    } else {
+        Some(warnings.warnings)
     }
-
-    // Cap the list to keep the startup notice quiet — 3 warnings max.
-    const MAX_SHOWN: usize = 3;
-    let total = warnings.len();
-    let shown = total.min(MAX_SHOWN);
-    let extra = total - shown;
-    let mut lines = Vec::with_capacity(shown + 2);
-    lines.push(format!(
-        "⚠ doctor: {total} persistent warning(s) — run /doctor for details"
-    ));
-    for w in warnings.iter().take(shown) {
-        lines.push(format!("  • {w}"));
-    }
-    if extra > 0 {
-        lines.push(format!("  … and {extra} more"));
-    }
-    Some(lines.join("\n"))
 }
 
 /// Load the current ambient-status snapshot via the daemon. Errors propagate
@@ -591,8 +571,9 @@ impl<'a> App<'a> {
         // One-shot persistent-warning notice. Rendered once after the
         // opening card on TUI startup, then scrolls away like any other
         // System cell — intentionally *not* a pinned banner.
-        if let Some(text) = load_persistent_warning_notice(&app.client) {
-            app.cells.push(super::history::HistoryCell::System { text });
+        if let Some(warnings) = load_persistent_warning_notice(&app.client) {
+            app.cells
+                .push(super::history::HistoryCell::DoctorWarning { warnings });
         }
         app
     }
@@ -1053,60 +1034,108 @@ mod tests {
     }
 
     // ========================================================================
-    // persistent_warning_notice_from_warnings — pure rendering helper for the
-    // one-shot TUI notice. The daemon owns the doctor_runs read; the cli only
-    // formats the WarningList payload, so these tests drive the formatter
-    // directly without touching SQLite.
+    // build_doctor_warning_lines — pure rendering helper for the startup
+    // amber warning card. Drives the formatter directly without touching the
+    // daemon or SQLite.
     // ========================================================================
 
     fn warns(s: &[&str]) -> Vec<String> {
         s.iter().map(|w| (*w).to_string()).collect()
     }
 
-    #[test]
-    fn notice_none_when_no_warnings() {
-        assert!(persistent_warning_notice_from_warnings(&[]).is_none());
+    fn flatten(lines: &[ratatui::text::Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn notice_lists_single_warning() {
-        let notice = persistent_warning_notice_from_warnings(&warns(&["Memory:Index staleness"]))
-            .expect("notice present");
-        assert!(
-            notice.contains("1 persistent warning"),
-            "expected count line, got: {notice}"
+    fn doctor_card_empty_for_no_warnings() {
+        assert!(super::super::history::build_doctor_warning_lines(&[], 80).is_empty());
+    }
+
+    #[test]
+    fn doctor_card_singular_for_one_category() {
+        let lines = super::super::history::build_doctor_warning_lines(
+            &warns(&["Memory:Index staleness"]),
+            80,
         );
-        assert!(
-            notice.contains("Memory:Index staleness"),
-            "expected warning text, got: {notice}"
+        let text = flatten(&lines);
+        assert!(text.contains("⚠ 1 Warning "), "label: {text}");
+        assert!(text.contains("Issue with Memory."), "summary: {text}");
+        assert!(text.contains("/doctor"), "footer cta: {text}");
+    }
+
+    #[test]
+    fn doctor_card_two_categories_uses_and() {
+        let lines = super::super::history::build_doctor_warning_lines(
+            &warns(&["Memory:a", "Gateway:b"]),
+            80,
         );
+        let text = flatten(&lines);
         assert!(
-            notice.contains("/doctor"),
-            "expected CTA mentioning `/doctor`, got: {notice}"
+            text.contains("Issues with Memory and Gateway."),
+            "got: {text}"
         );
     }
 
     #[test]
-    fn notice_caps_long_list_and_reports_overflow() {
-        // Five persistent warnings — first three shown inline, remaining two
-        // collapsed into a single "… and N more" line so the startup notice
-        // stays quiet even after prolonged neglect.
-        let notice = persistent_warning_notice_from_warnings(&warns(&[
-            "a:one", "a:two", "a:three", "a:four", "a:five",
-        ]))
-        .expect("notice present");
-        assert!(notice.contains("5 persistent warning"));
-        assert!(notice.contains("• a:one"));
-        assert!(notice.contains("• a:two"));
-        assert!(notice.contains("• a:three"));
-        assert!(
-            !notice.contains("• a:four"),
-            "fourth warning should be collapsed, got: {notice}"
+    fn doctor_card_three_categories_uses_oxford_and() {
+        let lines = super::super::history::build_doctor_warning_lines(
+            &warns(&["Memory:a", "Gateway:b", "Heartbeat:c"]),
+            80,
         );
+        let text = flatten(&lines);
         assert!(
-            notice.contains("… and 2 more"),
-            "expected overflow indicator, got: {notice}"
+            text.contains("Issues with Memory, Gateway, and Heartbeat."),
+            "got: {text}"
         );
+    }
+
+    #[test]
+    fn doctor_card_overflow_collapses_extra_categories() {
+        // 8 warnings spanning 5 distinct categories — first 3 listed, the
+        // remaining 2 collapse into "and 2 more". Label still shows the raw
+        // warning total (8), not the deduped category count.
+        let lines = super::super::history::build_doctor_warning_lines(
+            &warns(&[
+                "Embeddings:provider",
+                "Embeddings:cache",
+                "Gateway:dir",
+                "Heartbeat:age",
+                "Memory:idx",
+                "Memory:cap",
+                "Sandbox:profile",
+                "Sandbox:bin",
+            ]),
+            80,
+        );
+        let text = flatten(&lines);
+        assert!(text.contains("⚠ 8 Warnings "), "label: {text}");
+        assert!(
+            text.contains("Issues with Embeddings, Gateway, Heartbeat, and 2 more."),
+            "summary: {text}"
+        );
+    }
+
+    #[test]
+    fn doctor_card_dedupes_repeated_categories() {
+        // Three warnings, all under one category — should render as a single
+        // "Issue with Memory" (singular) since only one category remains.
+        let lines = super::super::history::build_doctor_warning_lines(
+            &warns(&["Memory:a", "Memory:b", "Memory:c"]),
+            80,
+        );
+        let text = flatten(&lines);
+        assert!(text.contains("⚠ 3 Warnings "), "label: {text}");
+        assert!(text.contains("Issue with Memory."), "summary: {text}");
     }
 
     fn key(code: KeyCode) -> KeyEvent {
