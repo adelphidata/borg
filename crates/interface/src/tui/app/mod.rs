@@ -882,10 +882,6 @@ impl<'a> App<'a> {
             }
         }
 
-        // Separator between turns
-        if !self.cells.is_empty() {
-            self.cells.push(HistoryCell::Separator);
-        }
         // Prepare to send to agent
         self.cells.push(HistoryCell::User {
             text: input.to_string(),
@@ -941,11 +937,6 @@ impl<'a> App<'a> {
     /// The user message was already shown in the transcript when it was queued,
     /// so we skip the User cell push and only add Separator + Assistant cell.
     pub fn handle_queued_submit(&mut self, qm: QueuedMessage) -> Result<AppAction> {
-        // Add separator between turns (User cell was already shown when queued)
-        if !self.cells.is_empty() {
-            self.cells.push(HistoryCell::Separator);
-        }
-
         // Expand `@path` mentions in the queued text. Cards render
         // between the (already-shown) user cell and the assistant cell
         // we're about to push. See `handle_submit` for the same pattern.

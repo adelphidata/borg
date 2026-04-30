@@ -50,6 +50,13 @@ use super::{App, AppState, BacktrackPhase};
 use cortex::config::CollaborationMode;
 
 impl<'a> App<'a> {
+    fn needs_inter_cell_spacer(prev: &HistoryCell, next: &HistoryCell) -> bool {
+        if next.is_stream_continuation() {
+            return false;
+        }
+        !(prev.is_tool_flow() && next.is_tool_flow())
+    }
+
     /// Render the inline viewport: only un-flushed cells (`[cells_emitted..]`)
     /// plus chrome (status, composer, popups, footer, toasts). Cells already
     /// emitted to scrollback via `insert_history_lines` are NEVER re-rendered
@@ -148,10 +155,9 @@ impl<'a> App<'a> {
             // Skip the inter-cell separator on the very first cell of this
             // render pass — there's nothing above it in the viewport, even
             // if there are flushed cells in scrollback.
-            if offset > 0 && !cell.is_stream_continuation() {
+            if offset > 0 {
                 let prev = &self.cells[start + offset - 1];
-                let hug = prev.is_tool_flow() && cell.is_tool_flow();
-                if !hug {
+                if Self::needs_inter_cell_spacer(prev, cell) {
                     lines.push(Line::default());
                 }
             }
@@ -703,10 +709,9 @@ impl<'a> App<'a> {
     fn render_cell_lines(&self, idx: usize, width: u16) -> Vec<Line<'static>> {
         let cell = &self.cells[idx];
         let mut out: Vec<Line<'static>> = Vec::new();
-        if idx > 0 && !cell.is_stream_continuation() {
+        if idx > 0 {
             let prev = &self.cells[idx - 1];
-            let hug = prev.is_tool_flow() && cell.is_tool_flow();
-            if !hug {
+            if Self::needs_inter_cell_spacer(prev, cell) {
                 out.push(Line::default());
             }
         }
@@ -1246,5 +1251,41 @@ mod tests {
         // row. With no pending transcript cells, the viewport is just the
         // collapsed chrome plus the 3-row minimum live tail.
         assert_eq!(viewport, 8);
+    }
+
+    #[test]
+    fn user_to_assistant_has_single_blank_spacer() {
+        let mut app = make_app();
+        app.cells.push(HistoryCell::User {
+            text: "hello".to_string(),
+        });
+        app.cells
+            .push(HistoryCell::assistant("hi".to_string(), false));
+
+        let assistant_lines = app.render_cell_lines(1, 40);
+        assert_eq!(assistant_lines.len(), 2);
+        assert!(
+            assistant_lines[0].spans.is_empty(),
+            "first line must be a blank terminal-bg spacer, got: {:?}",
+            assistant_lines[0]
+        );
+    }
+
+    #[test]
+    fn assistant_to_user_has_single_blank_spacer() {
+        let mut app = make_app();
+        app.cells
+            .push(HistoryCell::assistant("hi".to_string(), false));
+        app.cells.push(HistoryCell::User {
+            text: "hello".to_string(),
+        });
+
+        let user_lines = app.render_cell_lines(1, 40);
+        assert_eq!(user_lines.len(), 4);
+        assert!(
+            user_lines[0].spans.is_empty(),
+            "first line must be a blank terminal-bg spacer, got: {:?}",
+            user_lines[0]
+        );
     }
 }

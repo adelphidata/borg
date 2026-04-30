@@ -730,6 +730,7 @@ async fn run_event_loop(
                 event_tx,
                 cancel,
             } => {
+                draw_viewport(tui, app)?;
                 // Steer channel: when the user types into a streaming turn,
                 // App routes the text to `steer_tx`; this task forwards each
                 // message to the daemon via `Session.Steer`.

@@ -181,6 +181,25 @@ fn parse_shell_output(raw: &str) -> Option<ShellOutput<'_>> {
     })
 }
 
+fn strip_reply_directive_prefix(text: &str) -> &str {
+    if let Some(rest) = text.strip_prefix("[[reply_to_current]]") {
+        return rest.trim_start_matches([' ', '\n', '\r']);
+    }
+
+    if let Some(rest) = text.strip_prefix("[[reply_to:") {
+        if let Some(end) = rest.find("]]") {
+            return rest[end + 2..].trim_start_matches([' ', '\n', '\r']);
+        }
+        return "";
+    }
+
+    if text.starts_with("[[reply_to_current") || text.starts_with("[[reply_to:") {
+        return "";
+    }
+
+    text
+}
+
 #[derive(Clone)]
 pub enum ApprovalStatus {
     Pending,
@@ -661,23 +680,19 @@ impl HistoryCell {
     ) -> Vec<Line<'static>> {
         match self {
             HistoryCell::User { text } => {
-                // User bubbles are rendered row-by-row so the tinted fill owns
-                // every interior cell, including trailing padding on wrapped rows.
+                // User messages render as a flat filled block, not an outlined
+                // bubble. Every rendered row owns the full viewport width.
                 let bg = theme::user_message_style();
                 let prefix_style =
                     bg.add_modifier(ratatui::style::Modifier::BOLD | ratatui::style::Modifier::DIM);
-                let border_style = theme::dim();
                 let mention_style = bg.patch(theme::file_mention_style());
                 let w = width as usize;
-                let rule_len = w.saturating_sub(2);
-                let content_width = w.saturating_sub(4).max(1);
-                let wrap_width = content_width.saturating_sub(2).max(1);
+                let inset = 0usize;
+                let wrap_width = w.saturating_sub(2).max(1);
                 let mut lines = Vec::new();
-                lines.push(Line::from(vec![
-                    Span::styled(theme::BOX_TOP_LEFT.to_string(), border_style),
-                    Span::styled(theme::SEPARATOR.repeat(rule_len), border_style),
-                    Span::styled(theme::BOX_TOP_RIGHT.to_string(), border_style),
-                ]));
+                if w > 0 {
+                    lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
+                }
                 let mut first = true;
                 for line in text.lines() {
                     let wrapped = if line.is_empty() {
@@ -694,39 +709,35 @@ impl HistoryCell {
                         };
                         let spans = parse_at_mentions(wl.as_ref(), bg, mention_style);
                         let mut row: Vec<Span<'static>> = Vec::new();
-                        row.push(Span::styled(theme::BOX_VERTICAL.to_string(), border_style));
-                        row.push(Span::styled(" ", bg));
+                        if inset > 0 {
+                            row.push(Span::styled(" ".repeat(inset), bg));
+                        }
                         row.push(prefix);
                         row.extend(spans);
                         let used_width: usize = row
                             .iter()
-                            .skip(2)
                             .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
                             .sum();
-                        let pad = content_width.saturating_sub(used_width);
+                        let pad = w.saturating_sub(used_width);
                         if pad > 0 {
                             row.push(Span::styled(" ".repeat(pad), bg));
                         }
-                        row.push(Span::styled(" ", bg));
-                        row.push(Span::styled(theme::BOX_VERTICAL.to_string(), border_style));
-                        lines.push(Line::from(row));
+                        lines.push(Line::from(row).style(bg));
                     }
                 }
-                // Bottom rule.
-                lines.push(Line::from(vec![
-                    Span::styled(theme::BOX_BOTTOM_LEFT.to_string(), border_style),
-                    Span::styled(theme::SEPARATOR.repeat(rule_len), border_style),
-                    Span::styled(theme::BOX_BOTTOM_RIGHT.to_string(), border_style),
-                ]));
+                if w > 0 {
+                    lines.push(Line::from(Span::styled(" ".repeat(w), bg)).style(bg));
+                }
                 lines
             }
             HistoryCell::Assistant {
                 text,
-                streaming,
+                streaming: _,
                 cache,
             } => {
+                let visible_text = strip_reply_directive_prefix(text);
                 let inner_width = width.saturating_sub(LIVE_PREFIX_COLS as u16);
-                let commit_end = text
+                let commit_end = visible_text
                     .as_bytes()
                     .iter()
                     .rposition(|&b| b == b'\n')
@@ -740,13 +751,13 @@ impl HistoryCell {
                     cache.committed_lines = if commit_end == 0 {
                         Vec::new()
                     } else {
-                        markdown::render_markdown(&text[..commit_end], inner_width)
+                        markdown::render_markdown(&visible_text[..commit_end], inner_width)
                     };
                     cache.committed_byte_len = commit_end;
                     cache.cached_width = Some(inner_width);
                 }
-                let pending_lines = if commit_end < text.len() {
-                    markdown::render_markdown(&text[commit_end..], inner_width)
+                let pending_lines = if commit_end < visible_text.len() {
+                    markdown::render_markdown(&visible_text[commit_end..], inner_width)
                 } else {
                     Vec::new()
                 };
@@ -758,16 +769,13 @@ impl HistoryCell {
                     .cloned()
                     .chain(pending_lines)
                     .collect();
-                let mut lines = if text.is_empty() && *streaming {
+                let lines = if visible_text.is_empty() {
                     vec![]
                 } else if all.is_empty() {
                     vec![Line::from(prefix_span)]
                 } else {
                     prefix_lines(all, prefix_span, Span::raw("  "))
                 };
-                if *streaming {
-                    lines.push(Line::from(Span::styled("▊", theme::dim())));
-                }
                 lines
             }
             HistoryCell::ToolStart {
@@ -1233,29 +1241,10 @@ mod tests {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
-        // box: top rule + body + bottom rule = 3 lines (spacer is owned by
-        // the render loop, not the cell).
         assert_eq!(lines.len(), 3);
-        // Top rule starts with ╭ and ends with ╮.
-        let top = &lines[0];
-        assert_eq!(
-            top.spans.first().unwrap().content.as_ref(),
-            super::theme::BOX_TOP_LEFT
-        );
-        assert_eq!(
-            top.spans.last().unwrap().content.as_ref(),
-            super::theme::BOX_TOP_RIGHT
-        );
-        // Bottom rule.
-        let bot = lines.last().unwrap();
-        assert_eq!(
-            bot.spans.first().unwrap().content.as_ref(),
-            super::theme::BOX_BOTTOM_LEFT
-        );
-        assert_eq!(
-            bot.spans.last().unwrap().content.as_ref(),
-            super::theme::BOX_BOTTOM_RIGHT
-        );
+        let text: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("hello"));
+        assert!(text.contains(super::theme::CHEVRON));
     }
 
     #[test]
@@ -1272,7 +1261,7 @@ mod tests {
         });
         assert!(chevron_line_idx.is_some(), "chevron must be present");
         let idx = chevron_line_idx.unwrap();
-        assert!(idx > 0, "chevron should not be on the first (spacer) line");
+        assert_eq!(idx, 1, "chevron should be on the middle filled line");
     }
 
     #[test]
@@ -1295,11 +1284,7 @@ mod tests {
             .expect("chevron line");
         assert!(lines.len() > chev_idx + 1, "expected wrap, got {:?}", lines);
         let cont = &lines[chev_idx + 1];
-        // Continuation row inside the border: spans are [│, " ", "  ", ...].
-        // First span is the left border; the prefix-position span (index 2)
-        // is "  " continuation, never another chevron.
-        assert_eq!(cont.spans[0].content.as_ref(), super::theme::BOX_VERTICAL);
-        assert_eq!(cont.spans[2].content.as_ref(), "  ");
+        assert_eq!(cont.spans[0].content.as_ref(), "  ");
         assert!(!cont
             .spans
             .iter()
@@ -1314,6 +1299,7 @@ mod tests {
         let width = 40;
         let lines = cell.render(width, None);
         let row = &lines[1];
+        assert_eq!(row.style.bg, theme::user_message_style().bg);
         let rendered_width: usize = row
             .spans
             .iter()
@@ -1324,12 +1310,10 @@ mod tests {
             let fill_width: usize = row
                 .spans
                 .iter()
-                .skip(1)
-                .take(row.spans.len().saturating_sub(2))
                 .filter(|span| span.style.bg == Some(bubble_bg))
                 .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
                 .sum();
-            assert_eq!(fill_width, width as usize - 2);
+            assert_eq!(fill_width, width as usize);
         }
     }
 
@@ -1337,10 +1321,9 @@ mod tests {
     fn render_assistant_streaming() {
         let cell = HistoryCell::assistant("partial".to_string(), true);
         let lines = cell.render(40, None);
-        // Last line should be the cursor block
-        let last = &lines[lines.len() - 1];
-        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains('▊'));
+        let rendered = flatten_plain(&lines);
+        assert!(rendered.contains("partial"));
+        assert!(!rendered.contains('▊'));
     }
 
     #[test]
@@ -1358,24 +1341,20 @@ mod tests {
 
     #[test]
     fn user_cell_does_not_emit_leading_blank() {
-        // User cell used to push a leading `Line::default()` above its box;
-        // that duplicated the inter-cell spacer in `app/render.rs` and read
-        // as an extra "lit" empty row because the User box bg style spread
-        // across the row. The leading blank is now removed.
         let cell = HistoryCell::User {
             text: "hello".to_string(),
         };
         let lines = cell.render(40, None);
         assert!(!lines.is_empty(), "User render produced no lines");
-        let first = &lines[0];
+        let first = &lines[1];
         assert!(
             !first.spans.is_empty(),
-            "first User line is unexpectedly blank: {first:?}"
+            "content User line is unexpectedly blank: {first:?}"
         );
         let text: String = first.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            text.contains(theme::BOX_TOP_LEFT) || text.contains(theme::BOX_TOP_RIGHT),
-            "first User line should be the top box rule, got: {text:?}"
+            text.contains("hello"),
+            "content User line should contain content, got: {text:?}"
         );
     }
 
@@ -2273,9 +2252,18 @@ mod tests {
     fn streaming_empty_while_streaming_renders_cursor_only() {
         let cell = HistoryCell::assistant(String::new(), true);
         let lines = cell.render(40, None);
-        assert_eq!(lines.len(), 1, "empty streaming cell => cursor line only");
-        let rendered = flatten_plain(&lines);
-        assert_eq!(rendered, "▊");
+        assert!(
+            lines.is_empty(),
+            "empty streaming cell should stay invisible"
+        );
+    }
+
+    #[test]
+    fn reply_directive_prefix_is_hidden_from_assistant_render() {
+        let cell = HistoryCell::assistant("[[reply_to_current]]\nHello there".to_string(), true);
+        let rendered = flatten_plain(&cell.render(60, None));
+        assert!(!rendered.contains("[[reply_to_current]]"));
+        assert!(rendered.contains("Hello there"));
     }
 
     fn shell_tool_result(output: &str, collapsed: bool) -> HistoryCell {
