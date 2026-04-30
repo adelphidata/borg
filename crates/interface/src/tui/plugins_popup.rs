@@ -118,6 +118,7 @@ impl PluginsPopup {
                     "email" => Category::Email,
                     "productivity" => Category::Productivity,
                     "channels" => Category::Channels,
+                    "payments" => Category::Payments,
                     _ => Category::Utilities,
                 };
                 let enabled = !skill.disabled;
@@ -141,6 +142,7 @@ impl PluginsPopup {
                 Category::Productivity => 3,
                 Category::Utilities => 4,
                 Category::Email => 5,
+                Category::Payments => 6,
             }
         };
         items.sort_by(|a, b| {

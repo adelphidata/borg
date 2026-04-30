@@ -86,6 +86,7 @@ bundled_skills! {
     "pdf"            => "pdf"            { category: "utilities", default_enabled: true,  hidden: false },
     "reminders"      => "reminders"      { category: "productivity", default_enabled: false, hidden: false },
     "linear"         => "linear"         { category: "productivity", default_enabled: false, hidden: false },
+    "stripe-link"    => "stripe-link"    { category: "payments",  default_enabled: false, hidden: false },
 }
 
 /// Filter `SKILL_REGISTRY` to the names satisfying a predicate, all at compile time.

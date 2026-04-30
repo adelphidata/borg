@@ -356,6 +356,7 @@ pub fn categories() -> &'static [Category] {
         Category::Developer,
         Category::Productivity,
         Category::Utilities,
+        Category::Payments,
     ]
 }
 

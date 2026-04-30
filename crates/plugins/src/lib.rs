@@ -74,6 +74,8 @@ pub enum Category {
     Productivity,
     /// General utilities (search, browser, weather, etc.).
     Utilities,
+    /// Payments and wallets (Stripe Link, etc.).
+    Payments,
 }
 
 impl std::fmt::Display for Category {
@@ -85,6 +87,7 @@ impl std::fmt::Display for Category {
             Self::Developer => write!(f, "DEVELOPER"),
             Self::Productivity => write!(f, "PRODUCTIVITY"),
             Self::Utilities => write!(f, "UTILITIES"),
+            Self::Payments => write!(f, "PAYMENTS"),
         }
     }
 }
@@ -252,6 +255,7 @@ mod tests {
         assert_eq!(Category::Developer.to_string(), "DEVELOPER");
         assert_eq!(Category::Productivity.to_string(), "PRODUCTIVITY");
         assert_eq!(Category::Utilities.to_string(), "UTILITIES");
+        assert_eq!(Category::Payments.to_string(), "PAYMENTS");
     }
 
     // -- Platform --
