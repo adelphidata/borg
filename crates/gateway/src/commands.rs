@@ -739,62 +739,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_known_commands() {
-        assert!(matches!(
-            Command::parse("/status"),
-            Some((Command::Status, _))
-        ));
-        assert!(matches!(Command::parse("/new"), Some((Command::New, _))));
-        assert!(matches!(
-            Command::parse("/reset"),
-            Some((Command::Reset, _))
-        ));
-        assert!(matches!(
-            Command::parse("/usage"),
-            Some((Command::Usage, _))
-        ));
-        assert!(matches!(Command::parse("/help"), Some((Command::Help, _))));
-        assert!(matches!(
-            Command::parse("/commands"),
-            Some((Command::Commands, _))
-        ));
-        assert!(matches!(
-            Command::parse("/skills"),
-            Some((Command::Skills, _))
-        ));
-        assert!(matches!(
-            Command::parse("/whoami"),
-            Some((Command::WhoAmI, _))
-        ));
-        assert!(matches!(
-            Command::parse("/memory"),
-            Some((Command::Memory, _))
-        ));
-        assert!(matches!(
-            Command::parse("/doctor"),
-            Some((Command::Doctor, _))
-        ));
-        assert!(matches!(
-            Command::parse("/pairing"),
-            Some((Command::Pairing, _))
-        ));
-        assert!(matches!(
-            Command::parse("/skill"),
-            Some((Command::Skill, _))
-        ));
-        assert!(matches!(
-            Command::parse("/cancel"),
-            Some((Command::Cancel, _))
-        ));
-        // /stop and /abort are aliases for /cancel.
-        assert!(matches!(
-            Command::parse("/stop"),
-            Some((Command::Cancel, _))
-        ));
-        assert!(matches!(
-            Command::parse("/abort"),
-            Some((Command::Cancel, _))
-        ));
+    fn parse_maps_slash_commands_to_variants() {
+        use std::mem::discriminant;
+        let cases: &[(&str, Command, &str)] = &[
+            // Core commands.
+            ("/start", Command::Start, ""),
+            ("/help", Command::Help, ""),
+            ("/commands", Command::Commands, ""),
+            ("/status", Command::Status, ""),
+            ("/new", Command::New, ""),
+            ("/reset", Command::Reset, ""),
+            ("/usage", Command::Usage, ""),
+            ("/skill", Command::Skill, ""),
+            ("/skills", Command::Skills, ""),
+            ("/whoami", Command::WhoAmI, ""),
+            ("/memory", Command::Memory, ""),
+            ("/doctor", Command::Doctor, ""),
+            ("/pairing", Command::Pairing, ""),
+            ("/cancel", Command::Cancel, ""),
+            ("/mode", Command::Mode, ""),
+            ("/plan", Command::Plan, ""),
+            ("/compact", Command::Compact, ""),
+            ("/undo", Command::Undo, ""),
+            ("/history", Command::History, ""),
+            ("/schedule", Command::Schedule, ""),
+            ("/settings", Command::Settings, ""),
+            ("/poke", Command::Poke, ""),
+            ("/evolution", Command::Evolution, ""),
+            ("/xp", Command::Xp, ""),
+            ("/card", Command::Card, ""),
+            // Cancel aliases.
+            ("/stop", Command::Cancel, ""),
+            ("/abort", Command::Cancel, ""),
+            // Case-insensitive.
+            ("/Status", Command::Status, ""),
+            ("/HELP", Command::Help, ""),
+            ("/Evolution", Command::Evolution, ""),
+            ("/XP", Command::Xp, ""),
+            // @botname suffix stripped.
+            ("/help@MyBorgBot", Command::Help, ""),
+            ("/status@BotName", Command::Status, ""),
+            ("/xp@MyBorgBot", Command::Xp, ""),
+            ("/skills@Bot extra", Command::Skills, "extra"),
+            // Args preserved verbatim.
+            ("/mode execute", Command::Mode, "execute"),
+            (
+                "/plan analyze the codebase",
+                Command::Plan,
+                "analyze the codebase",
+            ),
+            ("/compact 10", Command::Compact, "10"),
+            ("/history 25", Command::History, "25"),
+            (
+                "/settings temperature 0.5",
+                Command::Settings,
+                "temperature 0.5",
+            ),
+            ("/skill weather", Command::Skill, "weather"),
+            ("/card --out /tmp/x", Command::Card, "--out /tmp/x"),
+            ("/status extra args", Command::Status, "extra args"),
+        ];
+        for (input, want_cmd, want_args) in cases {
+            let (cmd, args) =
+                Command::parse(input).unwrap_or_else(|| panic!("expected Some for {input}"));
+            assert_eq!(
+                discriminant(&cmd),
+                discriminant(want_cmd),
+                "wrong variant for {input}"
+            );
+            assert_eq!(args, *want_args, "wrong args for {input}");
+        }
+    }
+
+    #[test]
+    fn parse_rejects_non_commands() {
+        for input in ["/unknown", "hello", ""] {
+            assert!(
+                Command::parse(input).is_none(),
+                "expected None for {input:?}"
+            );
+        }
     }
 
     #[test]
@@ -847,31 +871,6 @@ mod tests {
         assert!(is_cancel_command("/cancel"));
         assert!(exec.cancel("test-session").await);
         assert!(flag.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn parse_evolution_commands() {
-        assert!(matches!(
-            Command::parse("/evolution"),
-            Some((Command::Evolution, _))
-        ));
-        assert!(matches!(Command::parse("/xp"), Some((Command::Xp, _))));
-        assert!(matches!(Command::parse("/card"), Some((Command::Card, _))));
-        // case-insensitive
-        assert!(matches!(
-            Command::parse("/Evolution"),
-            Some((Command::Evolution, _))
-        ));
-        assert!(matches!(Command::parse("/XP"), Some((Command::Xp, _))));
-        // @botname suffix
-        assert!(matches!(
-            Command::parse("/xp@MyBorgBot"),
-            Some((Command::Xp, _))
-        ));
-        // /card forwards its args (handler rejects non-empty on channels)
-        let (cmd, args) = Command::parse("/card --out /tmp/x").unwrap();
-        assert!(matches!(cmd, Command::Card));
-        assert_eq!(args, "--out /tmp/x");
     }
 
     fn gateway_test_db() -> Database {
@@ -942,65 +941,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_new_commands() {
-        assert!(matches!(Command::parse("/mode"), Some((Command::Mode, _))));
-        assert!(matches!(Command::parse("/plan"), Some((Command::Plan, _))));
-        assert!(matches!(
-            Command::parse("/compact"),
-            Some((Command::Compact, _))
-        ));
-        assert!(matches!(Command::parse("/undo"), Some((Command::Undo, _))));
-        assert!(matches!(
-            Command::parse("/history"),
-            Some((Command::History, _))
-        ));
-        assert!(matches!(
-            Command::parse("/schedule"),
-            Some((Command::Schedule, _))
-        ));
-        assert!(matches!(
-            Command::parse("/settings"),
-            Some((Command::Settings, _))
-        ));
-        assert!(matches!(Command::parse("/poke"), Some((Command::Poke, _))));
-    }
-
-    #[test]
-    fn parse_mode_with_args() {
-        let (cmd, args) = Command::parse("/mode execute").unwrap();
-        assert!(matches!(cmd, Command::Mode));
-        assert_eq!(args, "execute");
-    }
-
-    #[test]
-    fn parse_plan_with_args() {
-        let (cmd, args) = Command::parse("/plan analyze the codebase").unwrap();
-        assert!(matches!(cmd, Command::Plan));
-        assert_eq!(args, "analyze the codebase");
-    }
-
-    #[test]
-    fn parse_compact_with_count() {
-        let (cmd, args) = Command::parse("/compact 10").unwrap();
-        assert!(matches!(cmd, Command::Compact));
-        assert_eq!(args, "10");
-    }
-
-    #[test]
-    fn parse_history_with_count() {
-        let (cmd, args) = Command::parse("/history 25").unwrap();
-        assert!(matches!(cmd, Command::History));
-        assert_eq!(args, "25");
-    }
-
-    #[test]
-    fn parse_settings_with_key_value() {
-        let (cmd, args) = Command::parse("/settings temperature 0.5").unwrap();
-        assert!(matches!(cmd, Command::Settings));
-        assert_eq!(args, "temperature 0.5");
-    }
-
-    #[test]
     fn is_poke_command_matches() {
         assert!(is_poke_command("/poke"));
         assert!(is_poke_command("/Poke"));
@@ -1008,57 +948,6 @@ mod tests {
         assert!(!is_poke_command("/status"));
         assert!(!is_poke_command("poke"));
         assert!(!is_poke_command(""));
-    }
-
-    #[test]
-    fn parse_unknown_command_returns_none() {
-        assert!(Command::parse("/unknown").is_none());
-        assert!(Command::parse("hello").is_none());
-        assert!(Command::parse("").is_none());
-    }
-
-    #[test]
-    fn parse_command_with_trailing_text() {
-        let (cmd, args) = Command::parse("/status extra args").unwrap();
-        assert!(matches!(cmd, Command::Status));
-        assert_eq!(args, "extra args");
-    }
-
-    #[test]
-    fn parse_skill_with_args() {
-        let (cmd, args) = Command::parse("/skill weather").unwrap();
-        assert!(matches!(cmd, Command::Skill));
-        assert_eq!(args, "weather");
-    }
-
-    #[test]
-    fn parse_case_insensitive() {
-        assert!(matches!(
-            Command::parse("/Status"),
-            Some((Command::Status, _))
-        ));
-        assert!(matches!(Command::parse("/HELP"), Some((Command::Help, _))));
-        assert!(matches!(Command::parse("/New"), Some((Command::New, _))));
-        assert!(matches!(
-            Command::parse("/SKILLS"),
-            Some((Command::Skills, _))
-        ));
-    }
-
-    #[test]
-    fn parse_strips_botname_suffix() {
-        assert!(matches!(
-            Command::parse("/help@MyBorgBot"),
-            Some((Command::Help, _))
-        ));
-        assert!(matches!(
-            Command::parse("/status@BotName"),
-            Some((Command::Status, _))
-        ));
-        assert!(matches!(
-            Command::parse("/skills@Bot extra"),
-            Some((Command::Skills, _))
-        ));
     }
 
     #[test]

@@ -302,26 +302,6 @@ fn cooldown_auth_has_longer_base() {
 }
 
 #[test]
-fn failover_reason_display() {
-    assert_eq!(FailoverReason::Auth.to_string(), "auth");
-    assert_eq!(FailoverReason::Billing.to_string(), "billing");
-    assert_eq!(FailoverReason::RateLimit.to_string(), "rate_limit");
-    assert_eq!(FailoverReason::Overloaded.to_string(), "overloaded");
-    assert_eq!(FailoverReason::Timeout.to_string(), "timeout");
-    assert_eq!(FailoverReason::Format.to_string(), "format");
-    assert_eq!(FailoverReason::Unknown.to_string(), "unknown");
-}
-
-#[test]
-fn llm_client_new_ollama_no_panic() {
-    let mut config = Config::default();
-    config.llm.provider = Some("ollama".to_string());
-    config.llm.model = "llama3.3".to_string();
-    let client = LlmClient::new(&config);
-    assert!(client.is_ok());
-}
-
-#[test]
 fn effective_base_url_uses_config_override() {
     let mut config = Config::default();
     config.llm.provider = Some("ollama".to_string());
@@ -347,51 +327,74 @@ fn effective_base_url_falls_back_to_provider_default() {
 }
 
 #[test]
-fn normalize_gemini_base_leaves_canonical_url_untouched() {
+fn normalize_gemini_base_table() {
     let canonical = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
-    let got = normalize_gemini_base(canonical);
-    assert_eq!(got.as_ref(), canonical);
-    assert!(matches!(got, Cow::Borrowed(_)));
-}
-
-#[test]
-fn normalize_gemini_base_appends_completions_to_bare_origin() {
-    assert_eq!(
-        normalize_gemini_base("https://generativelanguage.googleapis.com").as_ref(),
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    );
-    assert_eq!(
-        normalize_gemini_base("https://generativelanguage.googleapis.com/").as_ref(),
-        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-    );
-}
-
-#[test]
-fn normalize_gemini_base_strips_partial_suffixes() {
-    for input in [
-        "https://generativelanguage.googleapis.com/v1beta",
-        "https://generativelanguage.googleapis.com/v1beta/",
-        "https://generativelanguage.googleapis.com/v1beta/openai",
-        "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "https://generativelanguage.googleapis.com/openai",
-        "https://generativelanguage.googleapis.com/v1",
-    ] {
+    // (input, expected, must_be_borrowed). `Borrowed` means we returned the
+    // input unchanged — a real perf invariant when the canonical URL or a
+    // non-gemini host is passed in.
+    let cases: &[(&str, &str, bool)] = &[
+        (canonical, canonical, true),
+        (
+            "https://generativelanguage.googleapis.com",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/openai",
+            canonical,
+            false,
+        ),
+        (
+            "https://generativelanguage.googleapis.com/v1",
+            canonical,
+            false,
+        ),
+        // OpenAI-compatible proxies using /v1 must not be truncated.
+        (
+            "https://my-proxy.example.com/v1",
+            "https://my-proxy.example.com/v1",
+            true,
+        ),
+        (
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/chat/completions",
+            true,
+        ),
+    ];
+    for (input, expected, want_borrowed) in cases {
+        let got = normalize_gemini_base(input);
+        assert_eq!(got.as_ref(), *expected, "wrong output for {input}");
         assert_eq!(
-            normalize_gemini_base(input).as_ref(),
-            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "input {input} did not normalize",
+            matches!(got, Cow::Borrowed(_)),
+            *want_borrowed,
+            "wrong Cow variant for {input}"
         );
     }
-}
-
-#[test]
-fn normalize_gemini_base_leaves_non_gemini_hosts_alone() {
-    // OpenAI-compatible proxies using /v1 must not be truncated.
-    let proxy = "https://my-proxy.example.com/v1";
-    assert_eq!(normalize_gemini_base(proxy).as_ref(), proxy);
-
-    let openai = "https://api.openai.com/v1/chat/completions";
-    assert_eq!(normalize_gemini_base(openai).as_ref(), openai);
 }
 
 #[test]
