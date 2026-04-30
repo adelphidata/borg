@@ -55,6 +55,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/migrate", "Import from another agent"),
     ("/restart", "Restart gateway server"),
     ("/xp", "Show XP summary and feed"),
+    ("/exit", "Exit Borg chat"),
 ];
 
 fn builtin_defs() -> Vec<SlashCommandDef> {
@@ -438,6 +439,7 @@ mod tests {
             "/schedule",
             "/migrate",
             "/restart",
+            "/exit",
         ];
         assert_eq!(
             BUILTIN_COMMANDS.len(),
