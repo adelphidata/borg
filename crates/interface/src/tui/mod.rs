@@ -14,7 +14,6 @@ mod goodbye;
 mod highlight;
 mod history;
 mod insert_history;
-mod key_hint;
 mod layout;
 mod line_utils;
 mod markdown;

@@ -57,19 +57,6 @@ impl InsertHistoryMode {
     }
 }
 
-/// Insert `lines` above the viewport using the terminal's backend writer
-/// (avoids direct stdout references).
-#[allow(dead_code)]
-pub fn insert_history_lines<B>(
-    terminal: &mut super::custom_terminal::Terminal<B>,
-    lines: Vec<Line>,
-) -> io::Result<()>
-where
-    B: Backend + Write,
-{
-    insert_history_lines_with_mode(terminal, lines, InsertHistoryMode::Standard)
-}
-
 /// Insert `lines` above the viewport, using the escape strategy selected by `mode`.
 ///
 /// In `Standard` mode this manipulates DECSTBM scroll regions to slide existing

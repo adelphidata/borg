@@ -136,11 +136,6 @@ pub fn md_ordered_marker_style() -> Style {
     Style::default().fg(Color::LightBlue)
 }
 
-/// Key-hint footer text ("ctrl + c" labels).
-pub fn key_hint_style() -> Style {
-    dim()
-}
-
 pub fn diff_add_style() -> Style {
     Style::default().fg(TOOL_ACTIVE_GREEN)
 }
