@@ -80,6 +80,13 @@ pub async fn run(cfg: Config) -> Result<()> {
     let _lock = PidLock::acquire(&pid_path)
         .with_context(|| format!("acquiring single-instance lock at {}", pid_path.display()))?;
 
+    // Self-heal: make sure ~/.borg subdirs exist so first-start doesn't
+    // race fresh-install lazy creation. Idempotent; daily maintenance
+    // runs the same step. Failures log+continue.
+    if let Err(e) = cortex::maintenance::ensure_data_subdirs(&cfg.borg_home) {
+        tracing::warn!("borgd: ensure_data_subdirs failed: {e}");
+    }
+
     let socket_path = paths::socket_path(&cfg.borg_home);
     let uds = bind_uds(&socket_path)?;
 

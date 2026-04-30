@@ -24,6 +24,18 @@ pub fn run_host_security_checks(checks: &mut Vec<DiagnosticCheck>) {
 
 const CATEGORY: &str = "Host Security";
 
+/// macOS `socketfilterfw` is not on `$PATH`. Use the absolute path Apple
+/// ships at instead — otherwise the firewall check always reports "could
+/// not check: No such file or directory" on a healthy system.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+
+/// `pfctl` lives in `/sbin`, which is on the default PATH for most shells
+/// but not always for daemons spawned via `launchd`. Prefer the absolute
+/// path to make the check work in both contexts.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_PFCTL: &str = "/sbin/pfctl";
+
 // ---------------------------------------------------------------------------
 // Firewall
 // ---------------------------------------------------------------------------
@@ -31,7 +43,7 @@ const CATEGORY: &str = "Host Security";
 pub fn check_firewall(checks: &mut Vec<DiagnosticCheck>) {
     #[cfg(target_os = "macos")]
     {
-        match run_cmd("socketfilterfw", &["--getglobalstate"]) {
+        match run_cmd(MACOS_SOCKETFILTERFW, &["--getglobalstate"]) {
             Ok(output) => checks.push(DiagnosticCheck::with_status(
                 CATEGORY,
                 "Application Firewall",
@@ -44,7 +56,7 @@ pub fn check_firewall(checks: &mut Vec<DiagnosticCheck>) {
             )),
         }
 
-        match run_cmd("pfctl", &["-s", "info"]) {
+        match run_cmd(MACOS_PFCTL, &["-s", "info"]) {
             Ok(output) => checks.push(DiagnosticCheck::with_status(
                 CATEGORY,
                 "PF packet filter",
@@ -848,6 +860,23 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].category, CATEGORY);
         assert!(matches!(checks[0].status, CheckStatus::Warn(_)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_firewall_binaries_exist_at_expected_paths() {
+        // Regression: prior code shelled out to bare `socketfilterfw`/`pfctl`,
+        // which aren't on $PATH. Doctor reported "could not check" on every
+        // healthy macOS install. If Apple ever moves these, this test is
+        // the loud failure that catches it.
+        assert!(
+            std::path::Path::new(MACOS_SOCKETFILTERFW).exists(),
+            "expected socketfilterfw at {MACOS_SOCKETFILTERFW}"
+        );
+        assert!(
+            std::path::Path::new(MACOS_PFCTL).exists(),
+            "expected pfctl at {MACOS_PFCTL}"
+        );
     }
 
     #[test]

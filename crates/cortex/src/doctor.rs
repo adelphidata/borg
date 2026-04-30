@@ -138,6 +138,11 @@ pub struct DiagnosticRunner {
 
 const STEP_COUNT: usize = 16;
 
+/// Max acceptable gap between memory entries and indexed embeddings before
+/// the doctor escalates to a warning. Below this threshold the gap is the
+/// normal write/embed race window — the next embed pass closes it.
+const EMBEDDING_LAG_WARN_THRESHOLD: usize = 5;
+
 impl DiagnosticRunner {
     /// Create a new diagnostic runner starting at step 0.
     pub fn new() -> Self {
@@ -686,11 +691,10 @@ fn check_gateway(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                     checks.push(DiagnosticCheck::fail("Gateway", "channel manifest", error));
                 }
             } else {
-                checks.push(DiagnosticCheck::warn(
-                    "Gateway",
-                    "channels directory",
-                    "not found",
-                ));
+                // Fresh install: ~/.borg/channels is created lazily when a
+                // script channel is installed. No directory means no script
+                // channels, which is the normal state — not a warning.
+                checks.push(DiagnosticCheck::pass("Gateway", "0 channel(s) found"));
             }
         }
         Err(e) => {
@@ -1085,6 +1089,29 @@ fn check_agents(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     ));
 }
 
+/// Decide pass/warn for the embedding-lag check. A small unindexed gap is
+/// the normal race window between `write_memory` and the embedder backfill;
+/// only warn when the gap is large enough to suggest the embedder is stuck.
+///
+/// Pulled out as a pure function so the threshold can be exercised in unit
+/// tests without spinning up a real `Database`.
+fn classify_embedding_lag(global_count: usize, entry_count: usize) -> DiagnosticCheck {
+    let name = format!("embeddings: {global_count}/{entry_count} memory entries indexed");
+    if entry_count == 0 || global_count >= entry_count {
+        return DiagnosticCheck::pass("Embeddings", name);
+    }
+    let gap = entry_count - global_count;
+    if gap <= EMBEDDING_LAG_WARN_THRESHOLD {
+        DiagnosticCheck::pass("Embeddings", format!("{name} (pending backfill)"))
+    } else {
+        DiagnosticCheck::warn(
+            "Embeddings",
+            name,
+            format!("{gap} entries lag behind — embedder may be stuck"),
+        )
+    }
+}
+
 fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     if !config.memory.embeddings.enabled {
         checks.push(DiagnosticCheck::warn(
@@ -1123,16 +1150,7 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
                 .map(|v| v.len())
                 .unwrap_or(0);
 
-            let name = format!("embeddings: {global_count}/{entry_count} memory entries indexed");
-            if entry_count == 0 || global_count >= entry_count {
-                checks.push(DiagnosticCheck::pass("Embeddings", name));
-            } else {
-                checks.push(DiagnosticCheck::warn(
-                    "Embeddings",
-                    name,
-                    "some memory entries not yet embedded (will be indexed on next write)",
-                ));
-            }
+            checks.push(classify_embedding_lag(global_count, entry_count));
         }
         Err(e) => {
             checks.push(DiagnosticCheck::warn(
@@ -1559,5 +1577,36 @@ mod tests {
         let mut checks = Vec::new();
         check_heartbeat(&config, &mut checks);
         assert!(checks.iter().any(|c| c.name.contains("interval: 30m")));
+    }
+
+    #[test]
+    fn classify_embedding_lag_thresholds() {
+        // (global, entries, expected_status_label, expect_pending_suffix)
+        let cases: &[(usize, usize, &str, bool)] = &[
+            (0, 0, "pass", false),   // empty DB
+            (5, 5, "pass", false),   // fully indexed
+            (10, 5, "pass", false),  // count > entries (cache > db)
+            (0, 1, "pass", true),    // single-entry race window
+            (3, 8, "pass", true),    // gap = 5, exactly at threshold
+            (2, 8, "warn", false),   // gap = 6, just over threshold
+            (0, 100, "warn", false), // dead embedder
+        ];
+        for (global, entries, want_status, want_pending) in cases {
+            let got = classify_embedding_lag(*global, *entries);
+            let status = match got.status {
+                CheckStatus::Pass => "pass",
+                CheckStatus::Warn(_) => "warn",
+                CheckStatus::Fail(_) => "fail",
+            };
+            assert_eq!(
+                status, *want_status,
+                "({global}/{entries}) expected {want_status}, got {status}"
+            );
+            assert_eq!(
+                got.name.contains("(pending backfill)"),
+                *want_pending,
+                "({global}/{entries}) pending-suffix mismatch"
+            );
+        }
     }
 }

@@ -233,6 +233,8 @@ pub async fn run_and_broadcast(
         HeartbeatResult::Failed { error } => ("failed", error, None),
     };
 
+    log_heartbeat_activity(trigger.source, status, &message);
+
     bus.publish(DaemonHeartbeatEvent {
         source: trigger.source,
         started_at_unix: started,
@@ -241,6 +243,43 @@ pub async fn run_and_broadcast(
         message,
         skip_reason,
         duration_ms,
+    });
+}
+
+/// Record a heartbeat outcome to `activity_log`. Doctor's `check_heartbeat`
+/// reads this table to detect a stalled scheduler — without these writes
+/// the check warns "no heartbeat activity recorded" even when ticks are
+/// firing normally. Best-effort: a failed log entry must not break the
+/// heartbeat path.
+fn log_heartbeat_activity(source: HeartbeatSource, status: &str, message: &str) {
+    // Fire-and-forget — opening the DB and writing the row is fast, but
+    // we run it on a blocking thread to keep this off the runtime.
+    let source_wire = source.as_wire().to_string();
+    let status = status.to_string();
+    let level = if status == "ran" { "info" } else { "debug" };
+    let summary = if message.is_empty() {
+        format!("heartbeat ({source_wire}): {status}")
+    } else {
+        // chars().take to avoid splitting a multibyte codepoint — heartbeat
+        // messages can carry channel names, file paths, or LLM output with
+        // non-ASCII characters that would otherwise panic on byte slicing.
+        let snippet: String = message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        format!("heartbeat ({source_wire}, {status}): {snippet}")
+    };
+    tokio::task::spawn_blocking(move || match cortex::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.log_activity(level, "heartbeat", &summary, None) {
+                tracing::warn!("heartbeat: log_activity failed: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("heartbeat: db open for activity log failed: {e}"),
     });
 }
 
@@ -263,6 +302,8 @@ fn publish_scheduler_result(bus: &HeartbeatBus, source: HeartbeatSource, result:
         ),
         HeartbeatResult::Failed { error } => ("failed", error, None),
     };
+
+    log_heartbeat_activity(source, status, &message);
 
     let now = chrono::Utc::now().timestamp();
     bus.publish(DaemonHeartbeatEvent {
