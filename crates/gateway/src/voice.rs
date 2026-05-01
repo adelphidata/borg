@@ -1,0 +1,175 @@
+use anyhow::Result;
+use tracing::warn;
+
+use cortex::config::Config;
+use cortex::db::Database;
+
+/// Per-chat voice reply mode for messaging channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum VoiceReplyMode {
+    /// Never send voice replies automatically.
+    Off,
+    /// Send voice replies only when the inbound message was a voice message.
+    VoiceOnly,
+    /// Send voice replies for all replies.
+    All,
+}
+
+impl VoiceReplyMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::VoiceOnly => "voice_only",
+            Self::All => "all",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "voice_only" => Some(Self::VoiceOnly),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Off => "Off (text only)",
+            Self::VoiceOnly => "On (voice reply to voice messages)",
+            Self::All => "TTS (voice reply to all messages)",
+        }
+    }
+}
+
+pub fn voice_mode_setting_key(channel_name: &str, chat_id: &str) -> String {
+    format!("gw:voice_mode:{channel_name}:{chat_id}")
+}
+
+pub fn default_voice_reply_mode(config: &Config) -> VoiceReplyMode {
+    if config.tts.auto_mode {
+        VoiceReplyMode::All
+    } else {
+        VoiceReplyMode::Off
+    }
+}
+
+pub fn resolve_voice_reply_mode(
+    db: &Database,
+    config: &Config,
+    channel_name: &str,
+    chat_id: &str,
+) -> Result<VoiceReplyMode> {
+    let key = voice_mode_setting_key(channel_name, chat_id);
+    match db.get_setting(&key)? {
+        Some(value) => {
+            if let Some(mode) = VoiceReplyMode::from_str(&value) {
+                Ok(mode)
+            } else {
+                warn!("Invalid voice mode setting for {key}: {value}");
+                Ok(default_voice_reply_mode(config))
+            }
+        }
+        None => Ok(default_voice_reply_mode(config)),
+    }
+}
+
+pub fn should_send_voice_reply(
+    mode: VoiceReplyMode,
+    response_text: &str,
+    is_voice_input: bool,
+) -> bool {
+    let trimmed = response_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() || trimmed.starts_with('(') {
+        return false;
+    }
+
+    if cortex::error_format::classify_error(trimmed) != cortex::error_format::ErrorCategory::Unknown
+    {
+        return false;
+    }
+
+    if lower.contains("the ai provider")
+        || lower.contains("rate-limited")
+        || lower.contains("authentication failed")
+        || lower.contains("timed out")
+    {
+        return false;
+    }
+
+    match mode {
+        VoiceReplyMode::Off => false,
+        VoiceReplyMode::VoiceOnly => is_voice_input,
+        VoiceReplyMode::All => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn default_mode_uses_tts_auto_mode() {
+        let mut config = Config::default();
+        config.tts.auto_mode = false;
+        assert_eq!(default_voice_reply_mode(&config), VoiceReplyMode::Off);
+
+        config.tts.auto_mode = true;
+        assert_eq!(default_voice_reply_mode(&config), VoiceReplyMode::All);
+    }
+
+    #[test]
+    fn should_send_voice_reply_obeys_mode_and_input_kind() {
+        assert!(!should_send_voice_reply(VoiceReplyMode::Off, "hello", true));
+        assert!(should_send_voice_reply(
+            VoiceReplyMode::VoiceOnly,
+            "hello",
+            true
+        ));
+        assert!(!should_send_voice_reply(
+            VoiceReplyMode::VoiceOnly,
+            "hello",
+            false
+        ));
+        assert!(should_send_voice_reply(VoiceReplyMode::All, "hello", false));
+    }
+
+    #[test]
+    fn should_not_send_voice_for_empty_or_errorish_responses() {
+        assert!(!should_send_voice_reply(VoiceReplyMode::All, "", true));
+        assert!(!should_send_voice_reply(
+            VoiceReplyMode::All,
+            "(request timed out — agent was idle too long)",
+            true
+        ));
+        assert!(!should_send_voice_reply(
+            VoiceReplyMode::All,
+            "The AI provider is temporarily rate-limited. Please try again in a moment.",
+            true
+        ));
+    }
+
+    #[test]
+    fn resolve_voice_reply_mode_reads_override_from_db() {
+        let db = Database::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        let mut config = Config::default();
+        config.tts.auto_mode = true;
+        let key = voice_mode_setting_key("telegram", "42");
+        db.set_setting(&key, VoiceReplyMode::VoiceOnly.as_str())
+            .unwrap();
+
+        let mode = resolve_voice_reply_mode(&db, &config, "telegram", "42").unwrap();
+        assert_eq!(mode, VoiceReplyMode::VoiceOnly);
+    }
+
+    #[test]
+    fn resolve_voice_reply_mode_propagates_setting_lookup_errors() {
+        let db = Database::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+        db.conn().execute("DROP TABLE settings", []).unwrap();
+
+        let err = resolve_voice_reply_mode(&db, &Config::default(), "telegram", "42").unwrap_err();
+        assert!(err.to_string().contains("no such table"));
+    }
+}

@@ -33,7 +33,6 @@ use crate::slack::api::SlackClient;
 use crate::slack::channel::SlackChannel;
 use crate::slack::dedup::EventDeduplicator;
 use crate::teams::channel::TeamsChannel;
-use crate::telegram::api::TelegramClient;
 use crate::telegram::channel::TelegramChannel;
 use crate::telegram::dedup::UpdateDeduplicator;
 use crate::twilio::channel::TwilioChannel;
@@ -342,8 +341,8 @@ impl GatewayServer {
                 let poll_tts = tts_synth.clone();
                 let poll_request_timeout = Duration::from_millis(gateway_config.request_timeout_ms);
 
-                let callback: crate::telegram::polling::PollCallback =
-                    Arc::new(move |inbound, chat_id| {
+                let callback: crate::telegram::polling::PollCallback = Arc::new(
+                    move |parsed, chat_id| {
                         let poll_tts = poll_tts.clone();
                         let config = poll_config.clone();
                         let health = poll_health.clone();
@@ -351,6 +350,10 @@ impl GatewayServer {
                         let bot_mention = poll_bot_username.as_deref().map(|u| format!("@{u}"));
                         let request_timeout = poll_request_timeout;
                         Box::pin(async move {
+                            let mut parsed = parsed;
+                            crate::telegram::enrich_parsed_message(&tg, &config, &mut parsed).await;
+                            let inbound = parsed.inbound;
+
                             let typing = crate::telegram::typing::TypingIndicator::start(
                                 tg.clone(),
                                 chat_id,
@@ -377,26 +380,61 @@ impl GatewayServer {
                             match agent_result {
                                 Ok(Ok((response_text, _))) => {
                                     typing.stop().await;
-                                    send_telegram_response(
+                                    let voice_reply_mode = match Database::open_with_timeout(
+                                        Database::GATEWAY_BUSY_TIMEOUT_MS,
+                                    ) {
+                                        Ok(db) => match crate::voice::resolve_voice_reply_mode(
+                                            &db,
+                                            &config,
+                                            "telegram",
+                                            &chat_id.to_string(),
+                                        ) {
+                                            Ok(mode) => Some(mode),
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to resolve Telegram poll voice mode: {e}"
+                                                );
+                                                None
+                                            }
+                                        },
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to open DB for Telegram poll voice mode lookup: {e}"
+                                            );
+                                            None
+                                        }
+                                    };
+                                    crate::telegram::delivery::send_response(
                                         &tg,
                                         chat_id,
                                         &response_text,
                                         thread_id,
                                         reply_to,
+                                        matches!(
+                                            parsed.input_kind,
+                                            crate::telegram::parse::TelegramInputKind::Voice
+                                        ),
+                                        voice_reply_mode,
                                         &health,
                                         poll_tts.as_deref(),
                                     )
-                                    .await;
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        warn!("Failed to send Telegram poll response: {e}")
+                                    });
                                 }
                                 Ok(Err(e)) => {
                                     typing.stop().await;
                                     warn!("Agent error in Telegram poll mode: {e:#}");
                                     let error_msg = handler::format_gateway_error(&e);
-                                    send_telegram_response(
-                                        &tg, chat_id, &error_msg, thread_id, reply_to, &health,
-                                        None,
+                                    crate::telegram::delivery::send_response(
+                                        &tg, chat_id, &error_msg, thread_id, reply_to, false, None,
+                                        &health, None,
                                     )
-                                    .await;
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        warn!("Failed to send Telegram poll error response: {e}")
+                                    });
                                 }
                                 Err(_) => {
                                     typing.stop().await;
@@ -405,15 +443,19 @@ impl GatewayServer {
                                         "request timed out",
                                         cortex::error_format::ErrorContext::Gateway,
                                     );
-                                    send_telegram_response(
-                                        &tg, chat_id, &error_msg, thread_id, reply_to, &health,
-                                        None,
+                                    crate::telegram::delivery::send_response(
+                                        &tg, chat_id, &error_msg, thread_id, reply_to, false, None,
+                                        &health, None,
                                     )
-                                    .await;
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        warn!("Failed to send Telegram poll timeout response: {e}")
+                                    });
                                 }
                             }
                         })
-                    });
+                    },
+                );
 
                 let polling_client = tg_client.clone();
                 tokio::spawn(async move {
@@ -1292,65 +1334,6 @@ async fn slack_command_handler(
         return service_unavailable_response();
     }
     ok_response()
-}
-
-/// Send a Telegram response with HTML formatting, TTS, and fallback.
-/// Used by the Telegram long-polling code path (not webhooks).
-async fn send_telegram_response(
-    client: &TelegramClient,
-    chat_id: i64,
-    response_text: &str,
-    thread_id: Option<i64>,
-    reply_to: Option<i64>,
-    health: &Arc<RwLock<ChannelHealthRegistry>>,
-    tts_synthesizer: Option<&cortex::tts::TtsSynthesizer>,
-) {
-    if response_text.trim().is_empty() {
-        tracing::debug!("Telegram response empty after trim, skipping send for chat {chat_id}");
-        return;
-    }
-
-    let html = crate::telegram::format::markdown_to_telegram_html(response_text);
-
-    if let Err(e) = client
-        .send_message(chat_id, &html, Some("HTML"), thread_id, reply_to)
-        .await
-    {
-        warn!("HTML send failed, retrying as plain text: {e}");
-        if let Err(e2) = client
-            .send_message(chat_id, response_text, None, thread_id, reply_to)
-            .await
-        {
-            warn!("Failed to send Telegram response: {e2}");
-            health
-                .write()
-                .await
-                .record_error("telegram", &e2.to_string());
-        } else {
-            health.write().await.record_outbound("telegram");
-        }
-    } else {
-        health.write().await.record_outbound("telegram");
-    }
-
-    // Auto-TTS: synthesize and send voice message after text
-    if let Some(synth) = tts_synthesizer {
-        let tts_text = cortex::tts::truncate_for_tts(response_text, 4096);
-        match synth
-            .synthesize(&tts_text, None, Some(cortex::tts::AudioFormat::Opus))
-            .await
-        {
-            Ok((audio_bytes, _, _)) => {
-                if let Err(e) = client
-                    .send_voice(chat_id, &audio_bytes, None, thread_id, None)
-                    .await
-                {
-                    warn!("Failed to send TTS voice message: {e}");
-                }
-            }
-            Err(e) => warn!("TTS synthesis failed: {e}"),
-        }
-    }
 }
 
 #[cfg(test)]

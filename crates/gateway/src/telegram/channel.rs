@@ -8,6 +8,7 @@ use axum::http::HeaderMap;
 use tokio::sync::{Mutex, RwLock};
 
 use cortex::config::Config;
+use cortex::db::Database;
 
 use crate::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
@@ -21,6 +22,8 @@ struct TelegramResponseContext {
     chat_id: i64,
     thread_id: Option<i64>,
     reply_to: Option<i64>,
+    input_was_voice: bool,
+    voice_reply_mode: Option<crate::voice::VoiceReplyMode>,
 }
 
 /// Telegram native channel implementation.
@@ -65,89 +68,9 @@ impl NativeChannel for TelegramChannel {
             Err(e) => return Err(e),
         };
 
-        let super::TelegramParsed {
-            mut inbound,
-            audio: audio_ref,
-            photo: photo_ref,
-        } = parsed;
-
-        // Photo download (must happen before enqueue — URLs expire, so we
-        // inline the bytes as a base64 attachment exactly like Slack does).
-        if let Some(ref photo) = photo_ref {
-            match async {
-                let file_info = self.client.get_file(&photo.file_id).await?;
-                let file_path = file_info
-                    .file_path
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-                let bytes = self.client.download_file(file_path).await?;
-                Ok::<_, anyhow::Error>(bytes)
-            }
-            .await
-            {
-                Ok(bytes) => {
-                    use base64::Engine;
-                    inbound.attachments.push(crate::handler::InboundAttachment {
-                        mime_type: "image/jpeg".to_string(),
-                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        filename: Some(photo.filename.clone()),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("Telegram photo download failed: {e}");
-                }
-            }
-        }
-
-        // Audio transcription (must happen before enqueue — needs file data)
-        if let Some(ref audio) = audio_ref {
-            if let Some(transcriber) =
-                cortex::media_understanding::AudioTranscriber::from_config(&self.config)
-            {
-                match async {
-                    let file_info = self.client.get_file(&audio.file_id).await?;
-                    let file_path = file_info
-                        .file_path
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
-                    let bytes = self.client.download_file(file_path).await?;
-                    let filename = file_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("audio.ogg")
-                        .to_string();
-                    let lang = self.config.audio.language.as_deref();
-                    transcriber
-                        .transcribe(&bytes, &audio.mime_type, &filename, lang)
-                        .await
-                }
-                .await
-                {
-                    Ok((transcript, _attempts)) => {
-                        inbound.text = format!("[Voice transcript]: {transcript}");
-                        if self.config.audio.echo_transcript {
-                            let echo_chat_id: i64 = inbound
-                                .channel_id
-                                .as_deref()
-                                .and_then(|id| id.parse().ok())
-                                .unwrap_or(0);
-                            if echo_chat_id != 0 {
-                                if let Err(e) = self
-                                    .client
-                                    .send_message(echo_chat_id, &transcript, None, None, None)
-                                    .await
-                                {
-                                    tracing::warn!("Failed to echo Telegram transcript: {e}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Audio transcription failed: {e}");
-                    }
-                }
-            }
-        }
+        let mut parsed = parsed;
+        super::enrich_parsed_message(&self.client, &self.config, &mut parsed).await;
+        let inbound = parsed.inbound;
 
         let chat_id: i64 = match inbound.channel_id.as_deref().and_then(|id| id.parse().ok()) {
             Some(id) => id,
@@ -167,6 +90,8 @@ impl NativeChannel for TelegramChannel {
             chat_id,
             thread_id,
             reply_to,
+            input_was_voice: matches!(parsed.input_kind, super::parse::TelegramInputKind::Voice),
+            voice_reply_mode: None,
         })?;
 
         Ok(WebhookOutcome::Message {
@@ -184,60 +109,37 @@ impl NativeChannel for TelegramChannel {
     ) -> Result<()> {
         let ctx: TelegramResponseContext = serde_json::from_value(response_context.clone())?;
 
-        let html = super::format::markdown_to_telegram_html(response_text);
+        super::delivery::send_response(
+            &self.client,
+            ctx.chat_id,
+            response_text,
+            ctx.thread_id,
+            ctx.reply_to,
+            ctx.input_was_voice,
+            ctx.voice_reply_mode,
+            health,
+            self.tts_synthesizer.as_deref(),
+        )
+        .await
+    }
 
-        if let Err(e) = self
-            .client
-            .send_message(
-                ctx.chat_id,
-                &html,
-                Some("HTML"),
-                ctx.thread_id,
-                ctx.reply_to,
-            )
-            .await
-        {
-            tracing::warn!("HTML send failed, retrying as plain text: {e}");
-            if let Err(e2) = self
-                .client
-                .send_message(
-                    ctx.chat_id,
-                    response_text,
-                    None,
-                    ctx.thread_id,
-                    ctx.reply_to,
-                )
-                .await
-            {
-                health
-                    .write()
-                    .await
-                    .record_error("telegram", &e2.to_string());
-                return Err(e2);
-            }
-        }
-        health.write().await.record_outbound("telegram");
-
-        // Auto-TTS: synthesize and send voice message after text
-        if let Some(ref synth) = self.tts_synthesizer {
-            let tts_text = cortex::tts::truncate_for_tts(response_text, 4096);
-            match synth
-                .synthesize(&tts_text, None, Some(cortex::tts::AudioFormat::Opus))
-                .await
-            {
-                Ok((audio_bytes, _, _)) => {
-                    if let Err(e) = self
-                        .client
-                        .send_voice(ctx.chat_id, &audio_bytes, None, ctx.thread_id, None)
-                        .await
-                    {
-                        tracing::warn!("Failed to send TTS voice message: {e}");
-                    }
-                }
-                Err(e) => tracing::warn!("TTS synthesis failed: {e}"),
-            }
-        }
-
+    fn prepare_response_context(
+        &self,
+        response_context: &mut serde_json::Value,
+        db: Option<&Database>,
+        config: &Config,
+    ) -> Result<()> {
+        let Some(db) = db else {
+            return Ok(());
+        };
+        let mut ctx: TelegramResponseContext = serde_json::from_value(response_context.clone())?;
+        ctx.voice_reply_mode = Some(crate::voice::resolve_voice_reply_mode(
+            db,
+            config,
+            "telegram",
+            &ctx.chat_id.to_string(),
+        )?);
+        *response_context = serde_json::to_value(ctx)?;
         Ok(())
     }
 
@@ -276,12 +178,19 @@ mod tests {
             chat_id: 12345,
             thread_id: Some(67),
             reply_to: Some(89),
+            input_was_voice: true,
+            voice_reply_mode: Some(crate::voice::VoiceReplyMode::VoiceOnly),
         };
         let json = serde_json::to_value(&ctx).unwrap();
         let back: TelegramResponseContext = serde_json::from_value(json).unwrap();
         assert_eq!(back.chat_id, 12345);
         assert_eq!(back.thread_id, Some(67));
         assert_eq!(back.reply_to, Some(89));
+        assert!(back.input_was_voice);
+        assert_eq!(
+            back.voice_reply_mode,
+            Some(crate::voice::VoiceReplyMode::VoiceOnly)
+        );
     }
 
     #[test]
@@ -290,11 +199,52 @@ mod tests {
             chat_id: 1,
             thread_id: None,
             reply_to: None,
+            input_was_voice: false,
+            voice_reply_mode: None,
         };
         let json = serde_json::to_value(&ctx).unwrap();
         let back: TelegramResponseContext = serde_json::from_value(json).unwrap();
         assert_eq!(back.chat_id, 1);
         assert!(back.thread_id.is_none());
         assert!(back.reply_to.is_none());
+        assert!(!back.input_was_voice);
+        assert!(back.voice_reply_mode.is_none());
+    }
+
+    #[test]
+    fn prepare_response_context_reads_mode_from_provided_db() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        db.set_setting(
+            &crate::voice::voice_mode_setting_key("telegram", "42"),
+            crate::voice::VoiceReplyMode::VoiceOnly.as_str(),
+        )
+        .unwrap();
+        let channel = TelegramChannel {
+            client: Arc::new(TelegramClient::new("token").unwrap()),
+            dedup: Arc::new(Mutex::new(UpdateDeduplicator::new())),
+            secret: None,
+            bot_username: None,
+            config: Config::default(),
+            tts_synthesizer: None,
+        };
+        let mut response_context = serde_json::to_value(TelegramResponseContext {
+            chat_id: 42,
+            thread_id: None,
+            reply_to: None,
+            input_was_voice: true,
+            voice_reply_mode: None,
+        })
+        .unwrap();
+
+        channel
+            .prepare_response_context(&mut response_context, Some(&db), &Config::default())
+            .unwrap();
+
+        let back: TelegramResponseContext = serde_json::from_value(response_context).unwrap();
+        assert_eq!(
+            back.voice_reply_mode,
+            Some(crate::voice::VoiceReplyMode::VoiceOnly)
+        );
     }
 }

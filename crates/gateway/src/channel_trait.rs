@@ -88,6 +88,18 @@ pub trait NativeChannel: Send + Sync {
         health: &Arc<RwLock<ChannelHealthRegistry>>,
     ) -> Result<()>;
 
+    /// Mutate channel-specific response context after the shared DB work has
+    /// completed but before delivery is queued or sent.
+    fn prepare_response_context(
+        &self,
+        response_context: &mut serde_json::Value,
+        db: Option<&Database>,
+        config: &Config,
+    ) -> Result<()> {
+        let _ = (response_context, db, config);
+        Ok(())
+    }
+
     /// Return the bot mention string for group activation filtering.
     /// E.g., `Some("@mybot")` for Telegram, `Some("<@U123>")` for Slack.
     fn bot_mention(&self) -> Option<String> {
@@ -228,6 +240,7 @@ pub async fn dispatch_webhook(
                 .enqueue(
                     session_key,
                     Box::pin(async move {
+                        let mut response_context = response_context;
                         let typing = channel.start_typing(&response_context);
                         let bot_mention = channel.bot_mention();
                         let channel_name = channel.names()[0].to_string();
@@ -276,13 +289,22 @@ pub async fn dispatch_webhook(
                         // Persist to delivery queue for at-least-once guarantee.
                         // A single DB connection is reused for enqueue + status update.
                         let delivery_id = uuid::Uuid::new_v4().to_string();
+                        let db =
+                            Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).ok();
+
+                        if let Err(e) =
+                            channel.prepare_response_context(&mut response_context, db.as_ref(), &config)
+                        {
+                            tracing::warn!(
+                                "Failed to prepare {channel_name} response context: {e}"
+                            );
+                        }
+
                         let payload = serde_json::json!({
                             "text": response_text,
                             "response_context": response_context,
                         });
                         let payload_str = payload.to_string();
-                        let db =
-                            Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS).ok();
 
                         if let Some(ref db) = db {
                             let new_delivery = cortex::db::NewDelivery {

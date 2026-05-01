@@ -443,6 +443,7 @@ async fn resolve_session_and_commands(
         &db,
         config,
         channel_name,
+        inbound.channel_id.as_deref(),
         &session_key,
         &session_id,
         &inbound.sender_id,

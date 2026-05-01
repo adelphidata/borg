@@ -2,6 +2,15 @@ use super::types::{CallbackQuery, TelegramMessage, Update};
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use crate::handler::InboundMessage;
 
+/// The Telegram input type relevant to voice reply policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramInputKind {
+    Text,
+    Audio,
+    Voice,
+    Other,
+}
+
 /// Reference to an audio file in a Telegram message (for transcription).
 #[derive(Debug, Clone)]
 pub struct TelegramAudioRef {
@@ -24,6 +33,7 @@ pub struct TelegramParsed {
     pub inbound: InboundMessage,
     pub audio: Option<TelegramAudioRef>,
     pub photo: Option<TelegramPhotoRef>,
+    pub input_kind: TelegramInputKind,
 }
 
 /// Detect non-printable control characters that indicate raw binary payload
@@ -76,7 +86,7 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
             filename: format!("photo_{}.jpg", largest.file_unique_id),
         });
 
-    let (text, audio_ref) = derive_message_text(msg)?;
+    let (text, audio_ref, input_kind) = derive_message_text(msg)?;
 
     let sender_id = msg
         .from
@@ -103,34 +113,37 @@ fn parse_message(msg: &TelegramMessage) -> Option<TelegramParsed> {
         },
         audio: audio_ref,
         photo: photo_ref,
+        input_kind,
     })
 }
 
 /// Derive display text (and any audio ref needed for transcription) from a
 /// Telegram message. Prefers text, then caption, then a per-media-type
 /// placeholder. Returns `None` if there's nothing routable.
-fn derive_message_text(msg: &TelegramMessage) -> Option<(String, Option<TelegramAudioRef>)> {
+fn derive_message_text(
+    msg: &TelegramMessage,
+) -> Option<(String, Option<TelegramAudioRef>, TelegramInputKind)> {
     if let Some(t) = msg.text.as_ref() {
         if t.is_empty() || is_binary_content(t) {
             return None;
         }
-        return Some((t.clone(), None));
+        return Some((t.clone(), None, TelegramInputKind::Text));
     }
     if let Some(caption) = msg.caption.as_deref().filter(|c| !is_binary_content(c)) {
-        return Some((caption.to_string(), None));
+        return Some((caption.to_string(), None, TelegramInputKind::Other));
     }
     if msg.photo.is_some() {
-        return Some(("[Photo]".to_string(), None));
+        return Some(("[Photo]".to_string(), None, TelegramInputKind::Other));
     }
     if let Some(doc) = msg.document.as_ref() {
         let text = match doc.file_name.as_deref() {
             Some(name) if !is_binary_content(name) => format!("[Document: {name}]"),
             _ => "[Document]".to_string(),
         };
-        return Some((text, None));
+        return Some((text, None, TelegramInputKind::Other));
     }
     if msg.video.is_some() {
-        return Some(("[Video]".to_string(), None));
+        return Some(("[Video]".to_string(), None, TelegramInputKind::Other));
     }
     if let Some(audio) = msg.audio.as_ref() {
         let audio_ref = TelegramAudioRef {
@@ -138,7 +151,11 @@ fn derive_message_text(msg: &TelegramMessage) -> Option<(String, Option<Telegram
             mime_type: "audio/mpeg".to_string(),
             duration: audio.duration,
         };
-        return Some(("[Audio]".to_string(), Some(audio_ref)));
+        return Some((
+            "[Audio]".to_string(),
+            Some(audio_ref),
+            TelegramInputKind::Audio,
+        ));
     }
     if let Some(voice) = msg.voice.as_ref() {
         let audio_ref = TelegramAudioRef {
@@ -146,14 +163,18 @@ fn derive_message_text(msg: &TelegramMessage) -> Option<(String, Option<Telegram
             mime_type: "audio/ogg".to_string(),
             duration: voice.duration,
         };
-        return Some(("[Voice message]".to_string(), Some(audio_ref)));
+        return Some((
+            "[Voice message]".to_string(),
+            Some(audio_ref),
+            TelegramInputKind::Voice,
+        ));
     }
     if let Some(sticker) = msg.sticker.as_ref() {
         let text = match &sticker.emoji {
             Some(emoji) => format!("[Sticker: {emoji}]"),
             None => "[Sticker]".to_string(),
         };
-        return Some((text, None));
+        return Some((text, None, TelegramInputKind::Other));
     }
     None
 }
@@ -195,6 +216,7 @@ fn parse_callback(cb: &CallbackQuery) -> Option<TelegramParsed> {
         },
         audio: None,
         photo: None,
+        input_kind: TelegramInputKind::Other,
     })
 }
 
@@ -231,12 +253,14 @@ mod tests {
     fn parse_text_message() {
         let update = text_update("Hello bot");
         let p = parse_update(&update).unwrap();
+        let input_kind = p.input_kind;
         let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.sender_id, "42");
         assert_eq!(msg.text, "Hello bot");
         assert_eq!(msg.channel_id.as_deref(), Some("42"));
         assert_eq!(msg.message_id.as_deref(), Some("1"));
         assert!(audio.is_none());
+        assert_eq!(input_kind, TelegramInputKind::Text);
     }
 
     #[test]
@@ -365,12 +389,14 @@ mod tests {
         .unwrap();
 
         let p = parse_update(&update).unwrap();
+        let input_kind = p.input_kind;
         let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Voice message]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "abc");
         assert_eq!(audio.mime_type, "audio/ogg");
         assert_eq!(audio.duration, 5);
+        assert_eq!(input_kind, TelegramInputKind::Voice);
     }
 
     #[test]
@@ -410,12 +436,14 @@ mod tests {
         .unwrap();
 
         let p = parse_update(&update).unwrap();
+        let input_kind = p.input_kind;
         let (msg, audio) = (p.inbound, p.audio);
         assert_eq!(msg.text, "[Audio]");
         let audio = audio.unwrap();
         assert_eq!(audio.file_id, "audio123");
         assert_eq!(audio.mime_type, "audio/mpeg");
         assert_eq!(audio.duration, 180);
+        assert_eq!(input_kind, TelegramInputKind::Audio);
     }
 
     #[test]

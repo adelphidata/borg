@@ -21,7 +21,7 @@ const STALL_TIMEOUT: Duration = constants::TELEGRAM_STALL_TIMEOUT;
 
 /// Callback invoked for each parsed inbound message during polling.
 pub type PollCallback = Arc<
-    dyn Fn(crate::handler::InboundMessage, i64) -> futures::future::BoxFuture<'static, ()>
+    dyn Fn(super::parse::TelegramParsed, i64) -> futures::future::BoxFuture<'static, ()>
         + Send
         + Sync,
 >;
@@ -103,11 +103,11 @@ pub async fn run_polling(
                     // Extract chat_id for the callback
                     let chat_id = extract_chat_id(&update);
 
-                    // Parse into an InboundMessage; ignore media refs in
-                    // long-polling mode (webhook path handles media download).
+                    // Parse into a TelegramParsed so the caller can perform
+                    // the same media-enrichment flow as the webhook path.
                     if let Some(parsed) = parse_update(&update) {
                         if let Some(cid) = chat_id {
-                            callback(parsed.inbound, cid).await;
+                            callback(parsed, cid).await;
                         }
                     }
                 }

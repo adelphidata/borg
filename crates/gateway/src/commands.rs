@@ -95,6 +95,12 @@ pub const GATEWAY_COMMANDS: &[CommandDef] = &[
         pass_through: false,
     },
     CommandDef {
+        name: "voice",
+        description: "Show or change Telegram voice reply mode",
+        accepts_args: true,
+        pass_through: false,
+    },
+    CommandDef {
         name: "cancel",
         description: "Stop the current in-progress turn",
         accepts_args: false,
@@ -188,6 +194,7 @@ enum Command {
     Memory,
     Doctor,
     Pairing,
+    Voice,
     Cancel,
     Mode,
     Plan,
@@ -226,6 +233,7 @@ impl Command {
             "/memory" => Self::Memory,
             "/doctor" => Self::Doctor,
             "/pairing" => Self::Pairing,
+            "/voice" => Self::Voice,
             "/cancel" | "/stop" | "/abort" => Self::Cancel,
             "/mode" => Self::Mode,
             "/plan" => Self::Plan,
@@ -270,6 +278,7 @@ pub fn try_handle_command(
     db: &Database,
     config: &Config,
     channel_name: &str,
+    channel_id: Option<&str>,
     session_key: &str,
     session_id: &str,
     sender_id: &str,
@@ -289,6 +298,7 @@ pub fn try_handle_command(
         Command::Memory => handle_memory(config),
         Command::Doctor => handle_doctor(config),
         Command::Pairing => handle_pairing(db, channel_name, sender_id),
+        Command::Voice => handle_voice(db, config, channel_name, channel_id, args),
         // Handled out-of-band in the caller; see `is_cancel_command`.
         Command::Cancel => return None,
         Command::Mode => handle_mode(db, config, session_id, args),
@@ -482,6 +492,52 @@ fn handle_mode(db: &Database, config: &Config, session_id: &str, args: &str) -> 
         }
         _ => "Invalid mode. Choose: default, execute, plan".to_string(),
     }
+}
+
+fn handle_voice(
+    db: &Database,
+    config: &Config,
+    channel_name: &str,
+    channel_id: Option<&str>,
+    args: &str,
+) -> String {
+    if channel_name != "telegram" {
+        return "Voice mode is currently implemented for Telegram only.".to_string();
+    }
+
+    let Some(chat_id) = channel_id.filter(|id| !id.is_empty()) else {
+        return "Voice mode is unavailable because this Telegram chat ID is missing.".to_string();
+    };
+
+    let key = crate::voice::voice_mode_setting_key(channel_name, chat_id);
+    let current = match crate::voice::resolve_voice_reply_mode(db, config, channel_name, chat_id) {
+        Ok(mode) => mode,
+        Err(e) => {
+            warn!("Failed to read voice mode: {e}");
+            return "Failed to read voice mode.".to_string();
+        }
+    };
+    let arg = args.trim().to_ascii_lowercase();
+
+    if arg.is_empty() || arg == "status" {
+        return format!("Voice mode: {}", current.status_label());
+    }
+
+    let next = match arg.as_str() {
+        "on" | "enable" => crate::voice::VoiceReplyMode::VoiceOnly,
+        "tts" => crate::voice::VoiceReplyMode::All,
+        "off" | "disable" => crate::voice::VoiceReplyMode::Off,
+        _ => {
+            return "Usage: /voice [on|off|tts|status]".to_string();
+        }
+    };
+
+    if let Err(e) = db.set_setting(&key, next.as_str()) {
+        warn!("Failed to set voice mode: {e}");
+        return "Failed to update voice mode.".to_string();
+    }
+
+    format!("Voice mode: {}", next.status_label())
 }
 
 /// Handle `/plan [message]`. Returns `Some(response)` for bare `/plan`,
@@ -756,6 +812,7 @@ mod tests {
             ("/memory", Command::Memory, ""),
             ("/doctor", Command::Doctor, ""),
             ("/pairing", Command::Pairing, ""),
+            ("/voice", Command::Voice, ""),
             ("/cancel", Command::Cancel, ""),
             ("/mode", Command::Mode, ""),
             ("/plan", Command::Plan, ""),
@@ -980,5 +1037,40 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), GATEWAY_COMMANDS.len());
+    }
+
+    #[test]
+    fn handle_voice_uses_default_mode_from_config() {
+        let db = gateway_test_db();
+        let config = Config::default();
+        let out = handle_voice(&db, &config, "telegram", Some("42"), "status");
+        assert_eq!(out, "Voice mode: Off (text only)");
+    }
+
+    #[test]
+    fn handle_voice_can_enable_all_and_voice_only_modes() {
+        let db = gateway_test_db();
+        let config = Config::default();
+
+        let on = handle_voice(&db, &config, "telegram", Some("42"), "on");
+        assert_eq!(on, "Voice mode: On (voice reply to voice messages)");
+        let status = handle_voice(&db, &config, "telegram", Some("42"), "status");
+        assert_eq!(status, "Voice mode: On (voice reply to voice messages)");
+
+        let tts = handle_voice(&db, &config, "telegram", Some("42"), "tts");
+        assert_eq!(tts, "Voice mode: TTS (voice reply to all messages)");
+        let key = crate::voice::voice_mode_setting_key("telegram", "42");
+        assert_eq!(db.get_setting(&key).unwrap().as_deref(), Some("all"));
+    }
+
+    #[test]
+    fn handle_voice_rejects_non_telegram_channels() {
+        let db = gateway_test_db();
+        let config = Config::default();
+        let out = handle_voice(&db, &config, "slack", Some("C123"), "on");
+        assert_eq!(
+            out,
+            "Voice mode is currently implemented for Telegram only."
+        );
     }
 }

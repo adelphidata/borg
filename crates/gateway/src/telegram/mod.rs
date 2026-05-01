@@ -8,6 +8,8 @@ pub mod chat_queue;
 pub mod circuit_breaker;
 /// Update deduplication by update_id.
 pub mod dedup;
+/// Shared Telegram delivery helpers.
+pub mod delivery;
 /// Markdown-to-Telegram HTML formatting.
 pub mod format;
 /// Telegram update parsing into inbound messages.
@@ -26,7 +28,95 @@ use axum::http::HeaderMap;
 use tokio::sync::Mutex;
 
 use dedup::UpdateDeduplicator;
-pub use parse::{TelegramAudioRef, TelegramParsed, TelegramPhotoRef};
+pub use parse::{TelegramAudioRef, TelegramInputKind, TelegramParsed, TelegramPhotoRef};
+
+/// Download referenced Telegram media and inline it into the inbound message.
+///
+/// Photos become base64 image attachments. Audio/voice becomes transcribed text
+/// when audio transcription is enabled.
+pub async fn enrich_parsed_message(
+    client: &api::TelegramClient,
+    config: &cortex::config::Config,
+    parsed: &mut TelegramParsed,
+) {
+    if let Some(ref photo) = parsed.photo {
+        match async {
+            let file_info = client.get_file(&photo.file_id).await?;
+            let file_path = file_info
+                .file_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+            let bytes = client.download_file(file_path).await?;
+            Ok::<_, anyhow::Error>(bytes)
+        }
+        .await
+        {
+            Ok(bytes) => {
+                use base64::Engine;
+                parsed
+                    .inbound
+                    .attachments
+                    .push(crate::handler::InboundAttachment {
+                        mime_type: "image/jpeg".to_string(),
+                        data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                        filename: Some(photo.filename.clone()),
+                    });
+            }
+            Err(e) => {
+                tracing::warn!("Telegram photo download failed: {e}");
+            }
+        }
+    }
+
+    if let Some(ref audio) = parsed.audio {
+        if let Some(transcriber) =
+            cortex::media_understanding::AudioTranscriber::from_config(config)
+        {
+            match async {
+                let file_info = client.get_file(&audio.file_id).await?;
+                let file_path = file_info
+                    .file_path
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("No file_path in getFile response"))?;
+                let bytes = client.download_file(file_path).await?;
+                let filename = file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("audio.ogg")
+                    .to_string();
+                let lang = config.audio.language.as_deref();
+                transcriber
+                    .transcribe(&bytes, &audio.mime_type, &filename, lang)
+                    .await
+            }
+            .await
+            {
+                Ok((transcript, _attempts)) => {
+                    parsed.inbound.text = format!("[Voice transcript]: {transcript}");
+                    if config.audio.echo_transcript {
+                        let echo_chat_id: i64 = parsed
+                            .inbound
+                            .channel_id
+                            .as_deref()
+                            .and_then(|id| id.parse().ok())
+                            .unwrap_or(0);
+                        if echo_chat_id != 0 {
+                            if let Err(e) = client
+                                .send_message(echo_chat_id, &transcript, None, None, None)
+                                .await
+                            {
+                                tracing::warn!("Failed to echo Telegram transcript: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Audio transcription failed: {e}");
+                }
+            }
+        }
+    }
+}
 
 /// Process an incoming Telegram webhook request.
 ///

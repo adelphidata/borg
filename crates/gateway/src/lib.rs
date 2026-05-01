@@ -76,6 +76,7 @@ pub mod telegram;
 pub mod twilio;
 pub(crate) mod typing_keepalive;
 pub mod verify_common;
+pub mod voice;
 
 pub use registry::ChannelRegistry;
 pub use server::GatewayServer;

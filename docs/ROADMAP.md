@@ -66,6 +66,16 @@ unfinished items stay here so a future contributor can see what's left.
   Reply should land as a threaded follow-up so it doesn't derail the
   main conversation.
 
+## Telegram voice follow-through
+
+- **Roll out shared voice I/O policy to the rest of the gateway.**
+  Telegram now has shared voice-policy resolution, per-chat `/voice`
+  modes, inbound audio/voice transcription, and outbound voice replies
+  wired through reusable gateway helpers. Extend the same pattern to
+  Discord, Slack, Twilio/WhatsApp, Signal, Teams, Google Chat, and
+  iMessage in a future session instead of re-implementing per-platform
+  toggles ad hoc.
+
 ## Headless KEK — passphrase lifecycle
 
 The headless-VPS path (`security.kek_backend = file`) ships in v0.1.x as
