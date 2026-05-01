@@ -54,6 +54,20 @@ pub fn default_voice_reply_mode(config: &Config) -> VoiceReplyMode {
     }
 }
 
+pub fn configured_tts_synthesizer(config: &Config) -> Option<cortex::tts::TtsSynthesizer> {
+    cortex::tts::TtsSynthesizer::from_config(config)
+}
+
+pub fn voice_reply_unavailable_reason(config: &Config) -> Option<&'static str> {
+    if !config.tts.enabled {
+        Some("Voice replies require `tts.enabled = true`.")
+    } else if configured_tts_synthesizer(config).is_none() {
+        Some("Voice replies require at least one configured TTS provider.")
+    } else {
+        None
+    }
+}
+
 pub fn resolve_voice_reply_mode(
     db: &Database,
     config: &Config,
@@ -171,5 +185,37 @@ mod tests {
 
         let err = resolve_voice_reply_mode(&db, &Config::default(), "telegram", "42").unwrap_err();
         assert!(err.to_string().contains("no such table"));
+    }
+
+    #[test]
+    fn voice_reply_unavailable_reason_reports_disabled_tts() {
+        let config = Config::default();
+        assert_eq!(
+            voice_reply_unavailable_reason(&config),
+            Some("Voice replies require `tts.enabled = true`.")
+        );
+    }
+
+    #[test]
+    fn configured_tts_synthesizer_ignores_auto_mode_flag() {
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.tts.auto_mode = false;
+        config.tts.models = vec![cortex::config::TtsModelConfig {
+            provider: "openai".to_string(),
+            model: None,
+            voice: None,
+            timeout_ms: None,
+            api_key_env: Some("BORG_TEST_TTS_KEY".to_string()),
+        }];
+        unsafe {
+            std::env::set_var("BORG_TEST_TTS_KEY", "test-key");
+        }
+
+        assert!(configured_tts_synthesizer(&config).is_some());
+
+        unsafe {
+            std::env::remove_var("BORG_TEST_TTS_KEY");
+        }
     }
 }

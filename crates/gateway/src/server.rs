@@ -145,11 +145,7 @@ impl GatewayServer {
 
         // TTS synthesizer (shared between webhook and polling paths)
         let tts_synth: Option<Arc<cortex::tts::TtsSynthesizer>> =
-            if self.config.tts.enabled && self.config.tts.auto_mode {
-                cortex::tts::TtsSynthesizer::from_config(&self.config).map(Arc::new)
-            } else {
-                None
-            };
+            crate::voice::configured_tts_synthesizer(&self.config).map(Arc::new);
 
         // Build native channel registry for unified webhook dispatch
         let native_channels = {

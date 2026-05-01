@@ -520,6 +520,9 @@ fn handle_voice(
     let arg = args.trim().to_ascii_lowercase();
 
     if arg.is_empty() || arg == "status" {
+        if let Some(reason) = crate::voice::voice_reply_unavailable_reason(config) {
+            return format!("Voice mode: {}. {reason}", current.status_label());
+        }
         return format!("Voice mode: {}", current.status_label());
     }
 
@@ -531,6 +534,12 @@ fn handle_voice(
             return "Usage: /voice [on|off|tts|status]".to_string();
         }
     };
+
+    if next != crate::voice::VoiceReplyMode::Off {
+        if let Some(reason) = crate::voice::voice_reply_unavailable_reason(config) {
+            return reason.to_string();
+        }
+    }
 
     if let Err(e) = db.set_setting(&key, next.as_str()) {
         warn!("Failed to set voice mode: {e}");
@@ -1044,13 +1053,36 @@ mod tests {
         let db = gateway_test_db();
         let config = Config::default();
         let out = handle_voice(&db, &config, "telegram", Some("42"), "status");
-        assert_eq!(out, "Voice mode: Off (text only)");
+        assert_eq!(
+            out,
+            "Voice mode: Off (text only). Voice replies require `tts.enabled = true`."
+        );
+    }
+
+    #[test]
+    fn handle_voice_rejects_enable_when_tts_is_unavailable() {
+        let db = gateway_test_db();
+        let config = Config::default();
+
+        let on = handle_voice(&db, &config, "telegram", Some("42"), "on");
+        assert_eq!(on, "Voice replies require `tts.enabled = true`.");
+        let key = crate::voice::voice_mode_setting_key("telegram", "42");
+        assert_eq!(db.get_setting(&key).unwrap().as_deref(), None);
     }
 
     #[test]
     fn handle_voice_can_enable_all_and_voice_only_modes() {
         let db = gateway_test_db();
-        let config = Config::default();
+        let mut config = Config::default();
+        config.tts.enabled = true;
+        config.tts.models = vec![cortex::config::TtsModelConfig {
+            provider: "openai".to_string(),
+            model: None,
+            voice: None,
+            timeout_ms: None,
+            api_key_env: Some("BORG_TEST_TTS_KEY".to_string()),
+        }];
+        std::env::set_var("BORG_TEST_TTS_KEY", "test-key");
 
         let on = handle_voice(&db, &config, "telegram", Some("42"), "on");
         assert_eq!(on, "Voice mode: On (voice reply to voice messages)");
@@ -1061,6 +1093,8 @@ mod tests {
         assert_eq!(tts, "Voice mode: TTS (voice reply to all messages)");
         let key = crate::voice::voice_mode_setting_key("telegram", "42");
         assert_eq!(db.get_setting(&key).unwrap().as_deref(), Some("all"));
+
+        std::env::remove_var("BORG_TEST_TTS_KEY");
     }
 
     #[test]
