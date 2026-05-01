@@ -23,7 +23,7 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
     ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyList, ApiKeyRef,
     ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
-    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, Empty as AdminEmpty,
+    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, DreamReport, Empty as AdminEmpty,
     ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
@@ -384,6 +384,17 @@ impl DaemonClient {
             .heal(AdminEmpty {})
             .await
             .context("Admin.Heal failed")?
+            .into_inner();
+        Ok(report)
+    }
+
+    /// Run memory consolidation on the daemon.
+    pub async fn dream(&mut self) -> Result<DreamReport> {
+        let report = self
+            .admin
+            .dream(AdminEmpty {})
+            .await
+            .context("Admin.Dream failed")?
             .into_inner();
         Ok(report)
     }

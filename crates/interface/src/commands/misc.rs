@@ -150,6 +150,43 @@ pub(crate) async fn run_poke() -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn run_dream() -> Result<()> {
+    let socket = crate::daemon_client::default_socket_path();
+    if !socket.exists() {
+        anyhow::bail!("Could not reach daemon. Start it with: borg service start");
+    }
+
+    let mut client = crate::daemon_client::connect(Some(&socket))
+        .await
+        .context("connect to borgd for dream")?;
+    let report = client.dream().await.context("Admin.Dream via borgd")?;
+    println!("{}", format_dream_report(&report));
+    Ok(())
+}
+
+pub(crate) fn format_dream_report(report: &protocols::admin::DreamReport) -> String {
+    let mut text = format!(
+        "Dream complete\n──────────────\nEntries extracted: {}\nDupes merged: {}\nTokens used: {}",
+        report.entries_extracted, report.dupes_merged, report.tokens_used
+    );
+    if !report.nightly_summary.is_empty() {
+        text.push_str("\nNightly: ");
+        text.push_str(&report.nightly_summary);
+    }
+    if !report.weekly_summary.is_empty() {
+        text.push_str("\nWeekly: ");
+        text.push_str(&report.weekly_summary);
+    }
+    if !report.warnings.is_empty() {
+        text.push_str("\nWarnings:");
+        for warning in &report.warnings {
+            text.push_str("\n  - ");
+            text.push_str(warning);
+        }
+    }
+    text
+}
+
 pub(crate) async fn run_cancel(session: Option<String>) -> Result<()> {
     let config = cortex::config::Config::load_from_db()?;
     let url = format!(

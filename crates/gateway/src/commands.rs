@@ -89,6 +89,12 @@ pub const GATEWAY_COMMANDS: &[CommandDef] = &[
         pass_through: false,
     },
     CommandDef {
+        name: "dream",
+        description: "Run memory consolidation now",
+        accepts_args: false,
+        pass_through: false,
+    },
+    CommandDef {
         name: "pairing",
         description: "Show pairing status",
         accepts_args: false,
@@ -193,6 +199,7 @@ enum Command {
     WhoAmI,
     Memory,
     Doctor,
+    Dream,
     Pairing,
     Voice,
     Cancel,
@@ -232,6 +239,7 @@ impl Command {
             "/whoami" => Self::WhoAmI,
             "/memory" => Self::Memory,
             "/doctor" => Self::Doctor,
+            "/dream" => Self::Dream,
             "/pairing" => Self::Pairing,
             "/voice" => Self::Voice,
             "/cancel" | "/stop" | "/abort" => Self::Cancel,
@@ -267,6 +275,12 @@ pub fn is_poke_command(text: &str) -> bool {
     matches!(Command::parse(text), Some((Command::Poke, _)))
 }
 
+/// Returns `true` if `text` parses as the `/dream` slash command. Handled
+/// separately from [`try_handle_command`] because dream requires async work.
+pub fn is_dream_command(text: &str) -> bool {
+    matches!(Command::parse(text), Some((Command::Dream, _)))
+}
+
 /// Try to handle a slash command. Returns `Some(response)` if the message was
 /// a recognised command, `None` to fall through to the agent.
 ///
@@ -297,6 +311,7 @@ pub fn try_handle_command(
         Command::WhoAmI => handle_whoami(sender_id, channel_name, db),
         Command::Memory => handle_memory(config),
         Command::Doctor => handle_doctor(config),
+        Command::Dream => return None,
         Command::Pairing => handle_pairing(db, channel_name, sender_id),
         Command::Voice => handle_voice(db, config, channel_name, channel_id, args),
         // Handled out-of-band in the caller; see `is_cancel_command`.
@@ -820,6 +835,7 @@ mod tests {
             ("/whoami", Command::WhoAmI, ""),
             ("/memory", Command::Memory, ""),
             ("/doctor", Command::Doctor, ""),
+            ("/dream", Command::Dream, ""),
             ("/pairing", Command::Pairing, ""),
             ("/voice", Command::Voice, ""),
             ("/cancel", Command::Cancel, ""),
@@ -899,6 +915,15 @@ mod tests {
         assert!(!is_cancel_command(""));
     }
 
+    #[test]
+    fn is_dream_command_matches_aliases() {
+        assert!(is_dream_command("/dream"));
+        assert!(is_dream_command("/Dream"));
+        assert!(is_dream_command("/dream@MyBorgBot"));
+        assert!(!is_dream_command("/status"));
+        assert!(!is_dream_command("dream"));
+    }
+
     #[tokio::test]
     async fn cancel_command_intercepted_via_session_executor() {
         // Simulates the handler.rs interception path: a /cancel message
@@ -961,6 +986,12 @@ mod tests {
         assert!(out.contains("[knowledge:global] global/memory.md"));
 
         std::env::remove_var("BORG_DATA_DIR");
+    }
+
+    #[test]
+    fn help_lists_dream_command() {
+        let out = handle_help();
+        assert!(out.contains("/dream"), "{out}");
     }
 
     #[test]

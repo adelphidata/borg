@@ -8,6 +8,7 @@ service Admin {
   rpc Poke(Empty) returns (Empty);
   rpc TriggerHeartbeat(TriggerHeartbeatRequest) returns (Empty);
   rpc Heal(Empty) returns (HealReport);
+  rpc Dream(Empty) returns (DreamReport);
   rpc Shutdown(Empty) returns (Empty);
 
   // Settings.
@@ -249,6 +250,17 @@ message HealReport {
   uint64 backups_pruned = 11;
   string auto_backup_path = 12;
   bool skipped = 13;
+}
+
+message DreamReport {
+  uint64 entries_extracted = 1;
+  uint64 dupes_merged = 2;
+  uint64 tokens_used = 3;
+  bool nightly_completed = 4;
+  bool weekly_completed = 5;
+  repeated string warnings = 6;
+  string nightly_summary = 7;
+  string weekly_summary = 8;
 }
 
 message SettingKey { string key = 1; }

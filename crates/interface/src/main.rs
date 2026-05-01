@@ -161,6 +161,8 @@ enum Commands {
     /// Trigger an immediate heartbeat check-in
     #[command(alias = "wake")]
     Poke,
+    /// Run memory consolidation immediately
+    Dream,
     /// Cancel the in-progress agent turn
     ///
     /// Sends a cancel signal to the running daemon/gateway. With `--session`,
@@ -487,6 +489,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Usage) => commands::status::run_usage()?,
         Some(Commands::Pairing { action }) => commands::pairing::dispatch_pairing(action)?,
         Some(Commands::Poke) => commands::misc::run_poke().await?,
+        Some(Commands::Dream) => commands::misc::run_dream().await?,
         Some(Commands::Cancel { session }) => commands::misc::run_cancel(session).await?,
         Some(Commands::Away { message }) => commands::misc::run_away(message).await?,
         Some(Commands::Available) => commands::misc::run_available().await?,
@@ -1262,6 +1265,12 @@ mod tests {
         let cli = Cli::try_parse_from(["borg", "--resume", "abcd1234"]).unwrap();
         assert_eq!(cli.resume.as_deref(), Some("abcd1234"));
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_parse_dream_subcommand() {
+        let cli = Cli::try_parse_from(["borg", "dream"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Dream)));
     }
 
     #[test]

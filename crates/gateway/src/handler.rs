@@ -437,6 +437,30 @@ async fn resolve_session_and_commands(
         });
     }
 
+    if crate::commands::is_dream_command(&inbound.text) {
+        let config = config.clone();
+        let response = match tokio::spawn(async move { cortex::consolidation::run_dream(&config).await }).await {
+            Ok(Ok(report)) => format_dream_report(&report),
+            Ok(Err(e)) => format!("Dream failed: {e}"),
+            Err(e) => format!("Dream failed: {e}"),
+        };
+        if let Err(e) = db.log_channel_message(
+            channel_name,
+            &inbound.sender_id,
+            "outbound",
+            Some(&response),
+            None,
+            Some(&session_id),
+        ) {
+            warn!("Failed to log /dream response: {e}");
+        }
+        return Ok(SessionResolution {
+            db,
+            session_id,
+            command_response: Some(response),
+        });
+    }
+
     // Check for slash commands before creating agent (use original text for commands)
     if let Some(response) = crate::commands::try_handle_command(
         &inbound.text,
@@ -470,6 +494,29 @@ async fn resolve_session_and_commands(
         session_id,
         command_response: None,
     })
+}
+
+fn format_dream_report(report: &cortex::consolidation::DreamReport) -> String {
+    let mut text = format!(
+        "Dream complete.\nEntries extracted: {}\nDupes merged: {}\nTokens used: {}",
+        report.entries_extracted, report.dupes_merged, report.tokens_used
+    );
+    if !report.nightly_summary.is_empty() {
+        text.push_str("\nNightly: ");
+        text.push_str(&report.nightly_summary);
+    }
+    if !report.weekly_summary.is_empty() {
+        text.push_str("\nWeekly: ");
+        text.push_str(&report.weekly_summary);
+    }
+    if !report.warnings.is_empty() {
+        text.push_str("\nWarnings:");
+        for warning in &report.warnings {
+            text.push_str("\n- ");
+            text.push_str(warning);
+        }
+    }
+    text
 }
 
 /// Prepare the final message text for the agent.

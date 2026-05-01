@@ -16,8 +16,9 @@ use protocols::admin::{
     admin_server::Admin, ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus,
     ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender,
     ApprovedSenderList, ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest,
-    CreateWebhookResponse, DaemonStatus, Empty, ExportSessionRequest, ExportSessionResponse,
-    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
+    CreateWebhookResponse, DaemonStatus, DreamReport, Empty, ExportSessionRequest,
+    ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
+    HeartbeatEvent as PbHeartbeatEvent,
     IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
     MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
     PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
@@ -173,6 +174,24 @@ impl Admin for AdminSvc {
             backups_pruned: report.backups_pruned as u64,
             auto_backup_path: report.auto_backup_path.unwrap_or_default(),
             skipped: report.skipped,
+        }))
+    }
+
+    async fn dream(&self, _req: Request<Empty>) -> Result<Response<DreamReport>, TStatus> {
+        let config = cortex::config::Config::load_from_db()
+            .map_err(|e| TStatus::internal(format!("dream config load failed: {e}")))?;
+        let report = cortex::consolidation::run_dream(&config)
+            .await
+            .map_err(|e| TStatus::internal(format!("dream failed: {e}")))?;
+        Ok(Response::new(DreamReport {
+            entries_extracted: report.entries_extracted,
+            dupes_merged: report.dupes_merged,
+            tokens_used: report.tokens_used,
+            nightly_completed: report.nightly_completed,
+            weekly_completed: report.weekly_completed,
+            warnings: report.warnings,
+            nightly_summary: report.nightly_summary,
+            weekly_summary: report.weekly_summary,
         }))
     }
 

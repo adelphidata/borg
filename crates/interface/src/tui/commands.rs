@@ -50,6 +50,7 @@ impl App<'_> {
             "/doctor squelch" | "/doctor unsquelch" => {
                 return Some(self.cmd_doctor_squelch_help());
             }
+            "/dream" => return Some(self.cmd_dream()),
             "/heal" => return Some(self.cmd_heal()),
             // `/update` and `/update <flags>` are handled by the prefix block below.
             "/pairing" => {
@@ -289,6 +290,7 @@ impl App<'_> {
              /history   - Show conversation history\n  \
              /logs      - Show activity log (error|warn|info|debug|all|raw)\n  \
              /doctor    - Run diagnostics\n  \
+             /dream     - Run memory consolidation now\n  \
              /doctor squelches - List active doctor squelches\n  \
              /doctor squelch <Category>:<Name>   - Suppress a finding from heartbeat / heal\n  \
              /doctor unsquelch <Category>:<Name> - Resume reminders for it\n  \
@@ -674,6 +676,24 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
+    fn cmd_dream(&mut self) -> Result<AppAction> {
+        let client = self.client.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.dream().await
+            })
+        });
+        match result {
+            Ok(report) => self.push_system_message(crate::commands::misc::format_dream_report(&report)),
+            Err(e) => {
+                tracing::warn!(error = %e, "on-demand /dream: daemon dream RPC failed");
+                self.push_system_message(format!("Dream failed: {e}"));
+            }
+        }
+        Ok(AppAction::Continue)
+    }
+
     /// Squelch a doctor finding so it stops firing in the heartbeat
     /// security nudge and the daily maintenance sweep, until the TTL set
     /// by `maintenance.security_squelch_ttl_days` (default 30) elapses.
@@ -911,6 +931,36 @@ mod tests {
             None => src,
         };
         assert!(code.contains("\"/heal\""), "commands.rs must handle /heal");
+    }
+
+    #[test]
+    fn commands_rs_registers_dream_command() {
+        let src = include_str!("commands.rs");
+        let code = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(code.contains("\"/dream\""), "commands.rs must handle /dream");
+    }
+
+    #[test]
+    fn format_dream_report_renders_counts_and_sections() {
+        let out = crate::commands::misc::format_dream_report(&protocols::admin::DreamReport {
+            entries_extracted: 3,
+            dupes_merged: 2,
+            tokens_used: 144,
+            nightly_completed: true,
+            weekly_completed: true,
+            warnings: vec!["check INDEX".into()],
+            nightly_summary: "wrote durable facts".into(),
+            weekly_summary: "merged duplicate notes".into(),
+        });
+        assert!(out.contains("Entries extracted: 3"), "{out}");
+        assert!(out.contains("Dupes merged: 2"), "{out}");
+        assert!(out.contains("Tokens used: 144"), "{out}");
+        assert!(out.contains("Nightly: wrote durable facts"), "{out}");
+        assert!(out.contains("Weekly: merged duplicate notes"), "{out}");
+        assert!(out.contains("check INDEX"), "{out}");
     }
 
     #[test]

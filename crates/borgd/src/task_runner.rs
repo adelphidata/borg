@@ -88,6 +88,8 @@ pub async fn spawn_task_execution(
                 execute_command_task(&exec_ctx).await;
             } else if task_type == "maintenance" {
                 execute_maintenance_task(&exec_ctx).await;
+            } else if cortex::consolidation::is_consolidation_task_id(&task.id) {
+                execute_consolidation_task(&exec_ctx).await;
             } else {
                 execute_prompt_task(&exec_ctx).await;
             }
@@ -421,6 +423,89 @@ async fn execute_command_task(ctx: &TaskExecContext) {
     }
 }
 
+async fn execute_consolidation_task(ctx: &TaskExecContext) {
+    let TaskExecContext {
+        task_name,
+        task_id,
+        timeout,
+        run_id,
+        started_at_ms,
+        retry_count,
+        max_retries,
+        schedule_type,
+        delivery_channel,
+        delivery_target,
+        config,
+        ..
+    } = ctx;
+    let pass = if task_id == cortex::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID {
+        cortex::consolidation::ConsolidationPass::Nightly
+    } else {
+        cortex::consolidation::ConsolidationPass::Weekly
+    };
+
+    let result = tokio::time::timeout(*timeout, cortex::consolidation::run_single_pass(config, pass)).await;
+
+    match result {
+        Ok(Ok(report)) => {
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+            let combined = format_consolidation_report(&report);
+            match cortex::db::Database::open() {
+                Ok(db) => {
+                    if let Err(e) =
+                        db.complete_task_run(*run_id, duration_ms, Some(&combined), None)
+                    {
+                        tracing::warn!("Task '{task_name}': failed to finalize run: {e}");
+                    }
+                    if let Err(e) = db.clear_task_retry(task_id) {
+                        tracing::warn!("Task '{task_name}': failed to clear retry: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Task '{task_name}': DB open failed at success path: {e}")
+                }
+            }
+            if let (Some(ch), Some(tgt)) = (delivery_channel, delivery_target) {
+                deliver_task_result(ch, tgt, task_name, &combined, config).await;
+            }
+        }
+        Ok(Err(e)) => {
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+            handle_task_failure(
+                task_id,
+                task_name,
+                *run_id,
+                duration_ms,
+                *retry_count,
+                *max_retries,
+                schedule_type,
+                delivery_channel,
+                delivery_target,
+                config,
+                &format!("consolidation failed: {e}"),
+            )
+            .await;
+        }
+        Err(_) => {
+            let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+            handle_task_failure(
+                task_id,
+                task_name,
+                *run_id,
+                duration_ms,
+                *retry_count,
+                *max_retries,
+                schedule_type,
+                delivery_channel,
+                delivery_target,
+                config,
+                "Consolidation task timed out",
+            )
+            .await;
+        }
+    }
+}
+
 async fn execute_prompt_task(ctx: &TaskExecContext) {
     let TaskExecContext {
         task_name,
@@ -611,6 +696,29 @@ async fn deliver_task_result(
     if let Err(e) = crate::channel_delivery::send(config, channel, &sender, &msg).await {
         tracing::warn!("Failed to deliver task result via {channel}: {e}");
     }
+}
+
+fn format_consolidation_report(report: &cortex::consolidation::DreamReport) -> String {
+    let mut text = format!(
+        "Dream complete: {} entries extracted, {} dupes merged, {} tokens used",
+        report.entries_extracted, report.dupes_merged, report.tokens_used
+    );
+    if !report.nightly_summary.is_empty() {
+        text.push_str("\nNightly: ");
+        text.push_str(&report.nightly_summary);
+    }
+    if !report.weekly_summary.is_empty() {
+        text.push_str("\nWeekly: ");
+        text.push_str(&report.weekly_summary);
+    }
+    if !report.warnings.is_empty() {
+        text.push_str("\nWarnings:");
+        for warning in &report.warnings {
+            text.push_str("\n  - ");
+            text.push_str(warning);
+        }
+    }
+    text
 }
 
 /// Deliver an evolution / milestone celebration to all configured heartbeat
