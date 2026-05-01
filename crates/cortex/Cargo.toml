@@ -55,6 +55,7 @@ zstd = { workspace = true }
 ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 bip39 = "2"
+iana-time-zone = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

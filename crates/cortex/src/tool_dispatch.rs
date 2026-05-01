@@ -36,7 +36,162 @@ pub(crate) fn handle_write_memory_with_effects(
         spawn_embedding_task(args, config_arc);
     }
 
+    if result.is_ok() {
+        maybe_slide_quiet_hours_tz(args);
+    }
+
     result
+}
+
+/// If a `write_memory` payload mentions a common timezone AND the user hasn't
+/// customized their quiet-hour times, slide `user.timezone` to match. The
+/// "still on default times" check is what tells us the user has not yet taken
+/// manual control of quiet hours.
+///
+/// Fire-and-forget. Errors log and continue — never abort the tool.
+fn maybe_slide_quiet_hours_tz(args: &serde_json::Value) {
+    let content = args["content"].as_str().unwrap_or_default().to_string();
+    if content.is_empty() {
+        return;
+    }
+    crate::agent::spawn_logged("tz_slide", async move {
+        if let Err(e) = run_tz_slide(&content) {
+            tracing::warn!("tz_slide failed: {e}");
+        }
+    });
+}
+
+fn run_tz_slide(content: &str) -> Result<()> {
+    let Some(detected) = extract_timezone_mention(content) else {
+        return Ok(());
+    };
+    let db = crate::db::Database::open()?;
+    let quiet_start = db.get_setting("heartbeat.quiet_hours_start")?;
+    let quiet_end = db.get_setting("heartbeat.quiet_hours_end")?;
+    let current_tz = db.get_setting("user.timezone")?;
+    let Some(target) = decide_tz_slide(
+        &detected,
+        quiet_start.as_deref(),
+        quiet_end.as_deref(),
+        current_tz.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    db.set_setting("user.timezone", &target)?;
+    tracing::info!(
+        "Quiet-hours timezone slid {} → {} (mentioned in memory; defaults intact)",
+        current_tz.as_deref().unwrap_or("(unset)"),
+        target
+    );
+    Ok(())
+}
+
+/// Pure decision: should we slide `user.timezone` to `detected`?
+///
+/// Returns `Some(target)` iff:
+/// - quiet-hour times are still at compiled defaults (user has not customized
+///   them — the only "user took control" signal we recognize), AND
+/// - `detected` differs from the currently-set timezone.
+///
+/// Splitting this out keeps the gating logic unit-testable without touching DB.
+pub(crate) fn decide_tz_slide(
+    detected: &str,
+    quiet_start: Option<&str>,
+    quiet_end: Option<&str>,
+    current_tz: Option<&str>,
+) -> Option<String> {
+    use crate::constants::{DEFAULT_HEARTBEAT_QUIET_END, DEFAULT_HEARTBEAT_QUIET_START};
+    let times_at_default = quiet_start == Some(DEFAULT_HEARTBEAT_QUIET_START)
+        && quiet_end == Some(DEFAULT_HEARTBEAT_QUIET_END);
+    if !times_at_default {
+        return None;
+    }
+    if current_tz == Some(detected) {
+        return None;
+    }
+    Some(detected.to_string())
+}
+
+/// Pure deterministic scan: extract the IANA timezone implied by `text`, if
+/// any. Returns `None` for ambiguous, generic (`UTC`/`GMT`), or absent matches.
+///
+/// Two tiers: explicit IANA strings (e.g. `Europe/Berlin`) parsed against
+/// `chrono_tz`, and a small whole-word-only abbreviation map for common ones.
+/// Abbreviations are case-sensitive (uppercase only) so that occurrences inside
+/// identifiers, code, or paths don't trigger.
+pub(crate) fn extract_timezone_mention(text: &str) -> Option<String> {
+    use std::collections::HashSet;
+
+    let mut hits: HashSet<String> = HashSet::new();
+
+    // Tier 1: IANA strings (Region/City or Region/City/Sub).
+    static IANA_RE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let re = IANA_RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Za-z_]+/[A-Z][A-Za-z_]+(?:/[A-Z][A-Za-z_]+)?\b").ok()
+    });
+    if let Some(re) = re.as_ref() {
+        for m in re.find_iter(text) {
+            if m.as_str().parse::<chrono_tz::Tz>().is_ok() {
+                hits.insert(m.as_str().to_string());
+            }
+        }
+    }
+
+    // Tier 2: case-sensitive whole-word abbreviations.
+    const ABBREVS: &[(&str, &str)] = &[
+        ("PST", "America/Los_Angeles"),
+        ("PDT", "America/Los_Angeles"),
+        ("EST", "America/New_York"),
+        ("EDT", "America/New_York"),
+        ("CST", "America/Chicago"),
+        ("CDT", "America/Chicago"),
+        ("MST", "America/Denver"),
+        ("MDT", "America/Denver"),
+        ("BST", "Europe/London"),
+        ("CET", "Europe/Paris"),
+        ("CEST", "Europe/Paris"),
+        ("JST", "Asia/Tokyo"),
+        ("IST", "Asia/Kolkata"),
+        ("AEST", "Australia/Sydney"),
+        ("AEDT", "Australia/Sydney"),
+        // UTC / GMT intentionally omitted: too generic; that's the state
+        // we're trying to leave, not the one we want to slide back to.
+    ];
+    for (abbr, tz) in ABBREVS {
+        if contains_whole_word(text, abbr) {
+            hits.insert((*tz).to_string());
+        }
+    }
+
+    if hits.len() == 1 {
+        hits.into_iter().next()
+    } else {
+        None // 0 → no match; >1 → ambiguous, refuse to guess
+    }
+}
+
+/// Whole-word, case-sensitive substring check. Matches only when surrounded by
+/// non-alphanumeric/underscore characters (or string boundaries).
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() || bytes.len() < nb.len() {
+        return false;
+    }
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + nb.len() <= bytes.len() {
+        if &bytes[i..i + nb.len()] == nb {
+            let before_ok = i == 0 || !is_word(bytes[i - 1]);
+            let after_idx = i + nb.len();
+            let after_ok = after_idx == bytes.len() || !is_word(bytes[after_idx]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Spawn a background task to generate embeddings for a memory file write.
@@ -255,6 +410,84 @@ mod tests {
         .expect("list succeeds without control");
         // Output is JSON (array of roles, possibly empty).
         assert!(out.starts_with('[') || out.contains("error"), "got: {out}");
+    }
+
+    #[test]
+    fn extract_timezone_mention_table() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("user is in PST", Some("America/Los_Angeles")),
+            ("based in Europe/Berlin", Some("Europe/Berlin")),
+            (
+                "located in America/Los_Angeles right now",
+                Some("America/Los_Angeles"),
+            ),
+            ("EST and PST mentioned", None),     // ambiguous → None
+            ("est is the worst", None),          // case-sensitive guard
+            ("running in UTC datacenter", None), // generic skipped
+            ("GMT only here", None),             // generic skipped
+            ("no tz here at all", None),
+            ("PSTDouble", None),     // not a whole word
+            ("greet_PST_var", None), // identifier-internal
+            ("Switching to JST next month", Some("Asia/Tokyo")),
+        ];
+        for (input, expected) in cases {
+            let got = extract_timezone_mention(input);
+            assert_eq!(
+                got.as_deref(),
+                *expected,
+                "input={input:?} expected={expected:?} got={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_tz_slide_writes_when_times_default_and_tz_differs() {
+        let out = decide_tz_slide(
+            "America/Los_Angeles",
+            Some("00:00"),
+            Some("06:00"),
+            Some("UTC"),
+        );
+        assert_eq!(out.as_deref(), Some("America/Los_Angeles"));
+    }
+
+    #[test]
+    fn decide_tz_slide_writes_when_times_default_and_tz_unset() {
+        let out = decide_tz_slide("America/Los_Angeles", Some("00:00"), Some("06:00"), None);
+        assert_eq!(out.as_deref(), Some("America/Los_Angeles"));
+    }
+
+    #[test]
+    fn decide_tz_slide_noop_when_user_changed_start_time() {
+        let out = decide_tz_slide(
+            "America/Los_Angeles",
+            Some("22:00"), // user customized start
+            Some("06:00"),
+            Some("UTC"),
+        );
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn decide_tz_slide_noop_when_user_changed_end_time() {
+        let out = decide_tz_slide(
+            "America/Los_Angeles",
+            Some("00:00"),
+            Some("07:30"), // user customized end
+            Some("UTC"),
+        );
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn decide_tz_slide_noop_when_already_matching() {
+        let out = decide_tz_slide(
+            "America/Los_Angeles",
+            Some("00:00"),
+            Some("06:00"),
+            Some("America/Los_Angeles"),
+        );
+        assert_eq!(out, None);
     }
 
     #[test]

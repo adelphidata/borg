@@ -561,7 +561,7 @@ pub fn load_all_skills(
                                     // directory/name pairs as bundled identity rather than
                                     // noisy conflicting user skills.
                                     if dir_name == name && bundled_skill_content(&name).is_some() {
-                                        debug!(
+                                        trace!(
                                             "Skipping bundled skill copy on disk for '{}'",
                                             name
                                         );

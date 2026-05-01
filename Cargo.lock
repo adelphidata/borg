@@ -1161,6 +1161,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hmac",
+ "iana-time-zone",
  "image",
  "keyring",
  "libc",

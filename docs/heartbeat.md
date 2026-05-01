@@ -44,6 +44,8 @@ Quiet hours prevent heartbeats during specified time ranges. The range correctly
 
 Quiet hours are interpreted in the timezone configured in `[user] timezone` (IANA string, e.g., `America/New_York`). If no timezone is set, the system local time is used.
 
+`user.timezone` is auto-detected from the host on first onboarding (or first daemon start for pre-existing installs); afterward, if a `write_memory` call mentions a common timezone (`PST`, `EST`, `Europe/Berlin`, …) and quiet-hour times are still at their defaults (`00:00`–`06:00`), the timezone slides to match — once the user changes either default time, the slide is disabled.
+
 If quiet hours are not configured, heartbeats fire at every interval.
 
 ### Channel delivery

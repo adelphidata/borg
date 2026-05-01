@@ -505,6 +505,14 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                 .set_setting("user.agent_name", &result.agent_name)
                 .await?;
         }
+        // Auto-detect the host's IANA timezone so heartbeat quiet hours
+        // anchor in local time (e.g. 00:00–06:00 ET on a Mac in EST) instead
+        // of UTC. Headless boxes whose OS doesn't expose a usable tz return
+        // None here; we leave the setting unset and `user_timezone()`
+        // continues to fall back to UTC.
+        if let Some(tz) = cortex::config::Config::detect_host_timezone() {
+            client.set_setting("user.timezone", &tz).await?;
+        }
         // Sentinel that gates re-running the onboarding wizard on subsequent
         // launches. See `is_onboarded` in `crates/cli/src/main.rs`.
         client.set_onboarding_complete().await?;

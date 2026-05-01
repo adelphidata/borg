@@ -120,6 +120,26 @@ pub async fn run(cfg: Config) -> Result<()> {
     // task; daemon health is unaffected.
     crate::budget_tick::spawn(shutdown_tx.subscribe());
 
+    // Migration for pre-existing installs: if `user.timezone` was never set
+    // (onboarding ran before host-timezone auto-detection landed), detect it
+    // now so heartbeat quiet hours anchor to local time. Idempotent and
+    // write-once — explicit user values are preserved.
+    if let Ok(db) = Database::open() {
+        match db.get_setting("user.timezone") {
+            Ok(None) => {
+                if let Some(tz) = cortex::config::Config::detect_host_timezone() {
+                    if let Err(e) = db.set_setting("user.timezone", &tz) {
+                        tracing::warn!("borgd: failed to persist auto-detected timezone: {e}");
+                    } else {
+                        tracing::info!("borgd: auto-detected user.timezone = {tz}");
+                    }
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(e) => tracing::warn!("borgd: read user.timezone failed: {e}"),
+        }
+    }
+
     let extras = match CoreConfig::load_from_db() {
         Ok(core_config) => {
             let handles =

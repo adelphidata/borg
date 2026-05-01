@@ -223,6 +223,17 @@ impl Config {
         Ok(Self::data_dir()?.join("memory"))
     }
 
+    /// Detect the host's IANA timezone via the OS.
+    ///
+    /// Returns `Some(name)` only if the OS reports a string that parses as a
+    /// valid `chrono_tz::Tz` (e.g. `"America/New_York"`). Headless containers
+    /// without a usable tzdata lookup return `None`, so callers should treat
+    /// `None` as "leave the existing setting alone, fall back to UTC."
+    pub fn detect_host_timezone() -> Option<String> {
+        let raw = iana_time_zone::get_timezone().ok()?;
+        raw.parse::<chrono_tz::Tz>().ok().map(|_| raw)
+    }
+
     /// Resolve the user's configured timezone, falling back to UTC.
     pub fn user_timezone(&self) -> chrono_tz::Tz {
         self.user
