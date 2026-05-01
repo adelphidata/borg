@@ -120,6 +120,7 @@ define_settings! {
         "heartbeat.session_start_enabled" => heartbeat.session_start_enabled, parsed(bool);
         "heartbeat.session_start_throttle_minutes" => heartbeat.session_start_throttle_minutes, parsed(u32);
         "heartbeat.last_fired_at" => heartbeat.last_fired_at, parsed(i64);
+        "heartbeat.min_interval_secs" => heartbeat.min_interval_secs, parsed(u64);
 
         // ── User ──
         "user.name" => user.name, opt_string;

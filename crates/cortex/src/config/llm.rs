@@ -375,6 +375,13 @@ pub struct HeartbeatConfig {
     /// share the throttle across scheduled, poke, and session-start sources.
     /// Not user-facing — managed internally by `execute_heartbeat_turn`.
     pub last_fired_at: i64,
+    /// Minimum allowed scheduler interval, in seconds. Floors to 1s in the
+    /// scheduler regardless of the configured value. Default 60 matches
+    /// `cortex::constants::MIN_HEARTBEAT_INTERVAL_SECS` and should be left
+    /// in place in production — sub-minute firings exist to let the
+    /// smorgasborg eval harness exercise real scheduler timing without
+    /// burning ≥60s of wall time per assertion.
+    pub min_interval_secs: u64,
 }
 
 impl Default for HeartbeatConfig {
@@ -389,6 +396,7 @@ impl Default for HeartbeatConfig {
             session_start_enabled: true,
             session_start_throttle_minutes: 30,
             last_fired_at: 0,
+            min_interval_secs: crate::constants::MIN_HEARTBEAT_INTERVAL_SECS,
         }
     }
 }
@@ -505,6 +513,10 @@ mod tests {
         assert!(cfg.cron.is_none());
         assert!(cfg.channels.is_empty());
         assert!(cfg.recipients.is_empty());
+        assert_eq!(
+            cfg.min_interval_secs,
+            crate::constants::MIN_HEARTBEAT_INTERVAL_SECS
+        );
     }
 
     #[test]
@@ -512,10 +524,12 @@ mod tests {
         let toml_str = r#"
             interval = "1h"
             channels = ["telegram", "slack"]
+            min_interval_secs = 5
         "#;
         let cfg: HeartbeatConfig = toml::from_str(toml_str).expect("parse");
         assert_eq!(cfg.interval, "1h");
         assert_eq!(cfg.channels, vec!["telegram", "slack"]);
+        assert_eq!(cfg.min_interval_secs, 5);
     }
 
     #[test]

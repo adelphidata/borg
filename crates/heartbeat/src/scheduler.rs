@@ -9,8 +9,10 @@ use tracing::{debug, info, instrument, warn};
 use cortex::config::HeartbeatConfig;
 use cortex::tasks::parse_interval;
 
-/// Minimum allowed heartbeat interval (60 seconds) to prevent API waste.
-const MIN_INTERVAL_SECS: u64 = cortex::constants::MIN_HEARTBEAT_INTERVAL_SECS;
+/// Hard floor enforced regardless of `heartbeat.min_interval_secs`. A
+/// configured value of 0 is bumped to 1 second so a misconfiguration
+/// can't busy-loop the scheduler.
+const HARD_FLOOR_SECS: u64 = 1;
 
 /// Outcome of a heartbeat agent turn.
 #[derive(Debug, Clone)]
@@ -97,7 +99,9 @@ impl HeartbeatScheduler {
         let start = match NaiveTime::parse_from_str(start_str, "%H:%M") {
             Ok(t) => t,
             Err(_) => {
-                warn!("Invalid quiet_hours_start '{start_str}', expected HH:MM — quiet hours disabled");
+                warn!(
+                    "Invalid quiet_hours_start '{start_str}', expected HH:MM — quiet hours disabled"
+                );
                 return None;
             }
         };
@@ -159,13 +163,14 @@ impl HeartbeatScheduler {
         let mut interval =
             parse_interval(&self.config.interval).unwrap_or(std::time::Duration::from_secs(1800));
 
-        if interval.as_secs() < MIN_INTERVAL_SECS {
+        let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);
+        if interval.as_secs() < min_secs {
             warn!(
                 "Heartbeat interval {}s is below minimum {}s, clamping",
                 interval.as_secs(),
-                MIN_INTERVAL_SECS
+                min_secs
             );
-            interval = std::time::Duration::from_secs(MIN_INTERVAL_SECS);
+            interval = std::time::Duration::from_secs(min_secs);
         }
 
         info!("Heartbeat scheduler started (interval: {interval:?})");
@@ -231,12 +236,13 @@ impl HeartbeatScheduler {
 
         // Validate minimum interval between cron firings
         {
+            let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);
             let mut upcoming = schedule.upcoming(chrono::Utc);
             if let (Some(t1), Some(t2)) = (upcoming.next(), upcoming.next()) {
                 let interval = (t2 - t1).to_std().unwrap_or_default();
-                if interval < std::time::Duration::from_secs(60) {
+                if interval < std::time::Duration::from_secs(min_secs) {
                     warn!(
-                        "Cron expression '{cron_expr}' fires more often than once per minute ({interval:?}). Falling back to interval."
+                        "Cron expression '{cron_expr}' fires more often than minimum {min_secs}s ({interval:?}). Falling back to interval."
                     );
                     self.run_interval(tx, cancel).await;
                     return;
@@ -570,10 +576,65 @@ mod tests {
             .expect("scheduler task panicked");
     }
 
-    #[tokio::test]
-    async fn interval_below_minimum_clamped() {
+    #[tokio::test(start_paused = true)]
+    async fn interval_below_default_min_clamped_to_60s() {
+        // With the default min_interval_secs (60), a configured 30s interval
+        // must be clamped up. Advancing 30s of virtual time produces no Fire;
+        // advancing past 60s does. Regression guard: if a future change drops
+        // the clamp this test fires immediately at 30s and fails.
         let config = HeartbeatConfig {
-            interval: "30s".to_string(), // below MIN_INTERVAL_SECS (60)
+            interval: "30s".to_string(),
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            cron: None,
+            channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
+            ..Default::default()
+        };
+        assert_eq!(config.min_interval_secs, 60, "default must be 60s");
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let scheduler = HeartbeatScheduler::new(config, chrono_tz::UTC, poke_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // 30s in: still below the clamped 60s, no Fire yet.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            matches!(fire_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "30s should not produce a Fire when clamp is 60s"
+        );
+
+        // Past 60s: Fire arrives.
+        tokio::time::advance(std::time::Duration::from_secs(32)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            other => panic!("expected Fire after 62s, got: {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn subminute_interval_fires_when_min_lowered() {
+        // Operator/eval-suite knob: dropping min_interval_secs to 1 lets a
+        // 3s interval actually fire on its 3s cadence rather than getting
+        // clamped to 60s. Without this, smorgasborg's scheduler smoke test
+        // would burn ≥60s of wall time per assertion.
+        let config = HeartbeatConfig {
+            interval: "3s".to_string(),
+            min_interval_secs: 1,
             quiet_hours_start: None,
             quiet_hours_end: None,
             cron: None,
@@ -582,7 +643,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (poke_tx, poke_rx) = mpsc::channel(8);
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
         let (fire_tx, mut fire_rx) = mpsc::channel(32);
         let cancel = CancellationToken::new();
 
@@ -590,17 +651,109 @@ mod tests {
         let cancel_clone = cancel.clone();
         tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
 
-        // Drain SchedulerStarted
+        tokio::task::yield_now().await;
         drain_started(&mut fire_rx).await;
 
-        // Should still respond to poke (interval gets clamped, not rejected)
-        poke_tx.send(()).await.unwrap();
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), fire_rx.recv())
-            .await
-            .expect("timed out")
-            .expect("channel closed");
-        assert!(matches!(event, HeartbeatEvent::Fire));
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            other => panic!("expected Fire after 4s with min=1, got: {other:?}"),
+        }
         cancel.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn min_interval_zero_is_floored_to_one_second() {
+        // Misconfiguration guard: a configured 0 must not busy-loop the
+        // scheduler. The HARD_FLOOR_SECS = 1 bump means a 1s interval still
+        // fires once per virtual second (not many times per virtual instant).
+        let config = HeartbeatConfig {
+            interval: "1s".to_string(),
+            min_interval_secs: 0,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+            cron: None,
+            channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
+            ..Default::default()
+        };
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let scheduler = HeartbeatScheduler::new(config, chrono_tz::UTC, poke_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // Advance exactly one floor-tick. Expect at least one Fire and a
+        // bounded number — busy-looping would dump dozens.
+        tokio::time::advance(std::time::Duration::from_millis(1100)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut fires = 0;
+        while let Ok(HeartbeatEvent::Fire) = fire_rx.try_recv() {
+            fires += 1;
+        }
+        assert!(fires >= 1, "expected at least one Fire after 1.1s");
+        assert!(
+            fires <= 4,
+            "1s floor must not busy-loop; got {fires} fires in 1.1s"
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn cron_subminute_falls_back_unless_min_lowered() {
+        // Two sub-cases share scaffolding to avoid near-duplicate tests.
+        // Default min (60): "* * * * * *" (every second) must fall back to
+        // interval mode. Lowered min (1): same expression runs as cron.
+        async fn run_case(min_interval_secs: u64) -> String {
+            let config = HeartbeatConfig {
+                interval: "30m".to_string(),
+                min_interval_secs,
+                quiet_hours_start: None,
+                quiet_hours_end: None,
+                cron: Some("* * * * * *".to_string()),
+                channels: Vec::new(),
+                recipients: std::collections::BTreeMap::new(),
+                ..Default::default()
+            };
+            let (_poke_tx, poke_rx) = mpsc::channel(1);
+            let (fire_tx, mut fire_rx) = mpsc::channel(32);
+            let cancel = CancellationToken::new();
+            let scheduler = HeartbeatScheduler::new(config, chrono_tz::UTC, poke_rx);
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), fire_rx.recv())
+                .await
+                .expect("timed out waiting for SchedulerStarted")
+                .expect("channel closed");
+            cancel.cancel();
+            match event {
+                HeartbeatEvent::SchedulerStarted { mode } => mode,
+                other => panic!("expected SchedulerStarted, got: {other:?}"),
+            }
+        }
+
+        let default_mode = run_case(60).await;
+        assert!(
+            default_mode.starts_with("interval"),
+            "default min=60 must fall back to interval, got: {default_mode}"
+        );
+
+        let lowered_mode = run_case(1).await;
+        assert!(
+            lowered_mode.starts_with("cron"),
+            "min=1 must keep cron mode, got: {lowered_mode}"
+        );
     }
 
     #[tokio::test]

@@ -32,7 +32,13 @@ borg settings set heartbeat.channels '["telegram"]'     # empty = local TUI/tran
 | Seconds | `"45s"` | 45 seconds |
 | Bare number | `"120"` | 120 seconds |
 
-Minimum interval is 60 seconds (enforced to prevent API waste).
+Minimum interval is 60 seconds (enforced to prevent API waste). The
+floor is configurable via `heartbeat.min_interval_secs` (default `60`,
+hard floor `1`). Leave at `60` in production — sub-minute firings exist
+to let the smorgasborg eval suite exercise real scheduler timing
+without burning ≥60s of wall time per assertion. The same floor is
+applied to cron expressions: a cron that fires faster than
+`min_interval_secs` falls back to interval mode.
 
 ### Cron scheduling
 
