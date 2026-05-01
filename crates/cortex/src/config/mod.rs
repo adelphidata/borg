@@ -7,6 +7,7 @@ pub mod security;
 #[macro_use]
 mod settings_macro;
 pub mod settings_table;
+pub mod update;
 
 #[cfg(test)]
 mod tests;
@@ -17,6 +18,7 @@ pub use llm::*;
 pub use maintenance::*;
 pub use media::*;
 pub use security::*;
+pub use update::*;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -128,6 +130,9 @@ pub struct Config {
     /// Daemon-wide data retention + backup policy.
     #[serde(default)]
     pub data: DataConfig,
+    /// Self-update prompt state (skipped-version sentinel).
+    #[serde(default)]
+    pub update: UpdateConfig,
     /// Credential store for resolving secrets from env, file, exec, or keychain.
     #[serde(default)]
     pub credentials: HashMap<String, CredentialValue>,

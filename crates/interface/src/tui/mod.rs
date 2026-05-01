@@ -35,6 +35,7 @@ mod toast;
 mod tool_display;
 mod transcript_pager;
 mod tui_lifecycle;
+mod update_prompt;
 mod wrapping;
 
 use std::io::stdout;
@@ -230,6 +231,27 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     crate::openrouter_catalog::spawn_prefetch();
 
     let config = Config::load_from_db()?;
+
+    // "Update available" prompt — runs before alt-screen / daemon connect so
+    // a user choosing "Update now" exits cleanly before we wire up the rest
+    // of the TUI. Network and RPC failures inside the prompt are swallowed
+    // (logged) so a flaky GitHub never blocks boot.
+    if let update_prompt::UpdatePromptOutcome::RunUpdate =
+        update_prompt::run_update_prompt_if_needed(&config).await?
+    {
+        println!("Updating borg...");
+        match cortex::update::perform_update(false).await {
+            Ok(result) => {
+                println!("{}", format_install_outcome(&result));
+                return Ok(None);
+            }
+            Err(e) => {
+                eprintln!("Update failed: {e:#}");
+                eprintln!("Continuing to TUI with current version.");
+            }
+        }
+    }
+
     let metrics = BorgMetrics::from_config(&config);
 
     // Connect to (or auto-spawn) the daemon. The agent loop, hooks (vitals,

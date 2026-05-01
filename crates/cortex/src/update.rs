@@ -8,6 +8,39 @@ use std::io::Read;
 
 const GITHUB_API: &str = "https://api.github.com/repos/borganization/borg";
 
+/// Public URL for human-readable release notes, surfaced in the TUI-open
+/// update prompt.
+pub const RELEASE_NOTES_URL: &str = "https://github.com/borganization/borg/releases/latest";
+
+/// How a future "Update now" action would install. Only `Tarball` is wired up
+/// today — `Homebrew` is a stub for an upcoming `brew install borg` formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallSource {
+    /// Current GitHub-release flow (`perform_update`): download tarball,
+    /// verify checksum, swap in place.
+    Tarball,
+    /// Stub for a future Homebrew formula. Not yet wired up.
+    Homebrew,
+}
+
+/// Detect how the running binary should self-update. Today everyone uses the
+/// tarball flow; the Homebrew arm is reserved for a future formula.
+pub fn detect_install_source() -> InstallSource {
+    // TODO(brew): switch to InstallSource::Homebrew when the formula ships and
+    // we can reliably detect a brew-installed binary (e.g. canonical path
+    // under HOMEBREW_PREFIX, or a build-time feature flag).
+    InstallSource::Tarball
+}
+
+/// Human-readable command rendered in the prompt's "Update now (runs `…`)"
+/// row.
+pub fn update_command_str(src: InstallSource) -> &'static str {
+    match src {
+        InstallSource::Tarball => "borg /update",
+        InstallSource::Homebrew => "brew upgrade borg",
+    }
+}
+
 /// Returns the current binary version from Cargo.toml.
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -435,6 +468,26 @@ pub async fn perform_update(dev: bool) -> Result<UpdateResult> {
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn update_command_str_distinguishes_install_sources() {
+        // Guard the brew stub: when the Homebrew formula lands and someone
+        // wires up `detect_install_source`, the prompt's command string must
+        // change with it. Testing the mapping prevents the stub from going
+        // out of sync silently.
+        assert_eq!(update_command_str(InstallSource::Tarball), "borg /update");
+        assert_eq!(
+            update_command_str(InstallSource::Homebrew),
+            "brew upgrade borg"
+        );
+    }
+
+    #[test]
+    fn detect_install_source_is_tarball_until_brew_lands() {
+        // Lock in the current default. Flip this assertion in the same PR
+        // that ships the brew formula so the change is auditable.
+        assert_eq!(detect_install_source(), InstallSource::Tarball);
+    }
 
     #[test]
     fn test_current_version() {

@@ -196,6 +196,9 @@ define_settings! {
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
 
+        // ── Self-update prompt ──
+        "update.skipped_version" => update.skipped_version, string;
+
         // ── Maintenance (self-healing) ──
         "maintenance.enabled" => maintenance.enabled, parsed(bool);
         "maintenance.logs_retention_days" => maintenance.logs_retention_days, parsed(u32);
