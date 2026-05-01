@@ -364,6 +364,10 @@ impl Tui {
         self.terminal.clear_scrollback_and_visible_screen_ansi()
     }
 
+    fn alt_screen_viewport(size: Size) -> Rect {
+        Rect::new(0, 0, size.width, size.height)
+    }
+
     /// Resize the inline viewport to `height` rows, scrolling content above it
     /// if the viewport would extend past the bottom of the screen. Returns
     /// `true` when the caller must invalidate the diff buffer (newline-fallback
@@ -447,6 +451,19 @@ impl Tui {
         height: u16,
         draw_fn: impl FnOnce(&mut custom_terminal::Frame),
     ) -> Result<()> {
+        if self.is_alt_screen_active() {
+            if let Ok(size) = self.terminal.size() {
+                let full_area = Self::alt_screen_viewport(size);
+                if self.terminal.viewport_area != full_area {
+                    self.terminal.clear()?;
+                    self.terminal.set_viewport_area(full_area);
+                }
+            }
+            return self.terminal.draw(|frame| {
+                draw_fn(frame);
+            });
+        }
+
         let newline_fallback = self.uses_newline_fallback();
         let terminal = &mut self.terminal;
 
@@ -546,5 +563,30 @@ mod tests {
         let mut buf = String::new();
         DisableAlternateScroll.write_ansi(&mut buf).unwrap();
         assert_eq!(buf, "\x1b[?1007l");
+    }
+
+    #[test]
+    fn alt_screen_viewport_covers_full_terminal() {
+        let viewport = Tui::alt_screen_viewport(Size {
+            width: 132,
+            height: 41,
+        });
+        assert_eq!(viewport, Rect::new(0, 0, 132, 41));
+    }
+
+    #[test]
+    fn inline_viewport_height_is_not_used_for_alt_screen_area() {
+        let size = Size {
+            width: 120,
+            height: 36,
+        };
+        let inline_height = 7;
+        let alt_viewport = Tui::alt_screen_viewport(size);
+
+        assert_eq!(alt_viewport.height, size.height);
+        assert_ne!(
+            alt_viewport.height, inline_height,
+            "alt-screen popups must not be clipped to the inline viewport height"
+        );
     }
 }
