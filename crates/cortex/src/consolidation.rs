@@ -27,7 +27,8 @@ const CONSOLIDATION_TOOLS: &[&str] = &["memory_search", "read_memory", "write_me
 const NIGHTLY_PROMPT: &str = "Review today's sessions and extract durable information into long-term memory. \
 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
 Never duplicate information already in existing memory entries. When in doubt, keep the information.";
-const WEEKLY_PROMPT: &str = "Review all long-term memory for: (a) duplicate information across entries, \
+const WEEKLY_PROMPT: &str =
+    "Review all long-term memory for: (a) duplicate information across entries, \
 (b) outdated information superseded by newer entries, (c) entries that should be merged, \
 (d) overly verbose entries that can be tightened. \
 Never delete information unless it is provably superseded. When in doubt, keep it.";
@@ -182,13 +183,21 @@ pub async fn run_single_pass(
     })
 }
 
-async fn run_pass(config: &crate::config::Config, pass: ConsolidationPass) -> Result<PassExecution> {
+async fn run_pass(
+    config: &crate::config::Config,
+    pass: ConsolidationPass,
+) -> Result<PassExecution> {
     let mut agent = crate::agent::Agent::new_sub_agent(
         config.clone(),
         0,
         &config.agents,
         crate::telemetry::BorgMetrics::from_config(config),
-        Some(CONSOLIDATION_TOOLS.iter().map(|tool| (*tool).to_string()).collect()),
+        Some(
+            CONSOLIDATION_TOOLS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+        ),
     )?;
     agent.inject_history_message(crate::types::Message::system(pass.system_instruction()));
 
@@ -399,10 +408,7 @@ pub fn flush_short_term_to_daily_with_optional_db(
 
 /// Same as [`flush_short_term_to_daily`] but uses a caller-provided database
 /// handle. Split out primarily so tests can run against an in-memory DB.
-pub fn flush_short_term_to_daily_with_db(
-    db: &crate::db::Database,
-    facts_text: &str,
-) -> Result<()> {
+pub fn flush_short_term_to_daily_with_db(db: &crate::db::Database, facts_text: &str) -> Result<()> {
     if facts_text.trim().is_empty() {
         return Ok(());
     }
@@ -474,7 +480,9 @@ mod tests {
         assert_eq!(execution.dupes_merged, 0);
         assert_eq!(execution.tokens_used, 77);
         assert!(
-            execution.summary.contains("2 successful write_memory calls"),
+            execution
+                .summary
+                .contains("2 successful write_memory calls"),
             "{}",
             execution.summary
         );
@@ -503,7 +511,8 @@ mod tests {
             execution
                 .warnings
                 .iter()
-                .any(|w| w.contains("reported 5 merged dupes but only 3 write_memory calls succeeded")),
+                .any(|w| w
+                    .contains("reported 5 merged dupes but only 3 write_memory calls succeeded")),
             "{:?}",
             execution.warnings
         );
@@ -598,11 +607,10 @@ mod tests {
         assert!(flush_short_term_to_daily_with_optional_db(Some(&db), "   \n").is_ok());
         assert!(flush_short_term_to_daily_with_optional_db(None, "").is_ok());
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(
-            db.get_memory_entry("global", &format!("daily/{date}"))
-                .unwrap()
-                .is_none()
-        );
+        assert!(db
+            .get_memory_entry("global", &format!("daily/{date}"))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

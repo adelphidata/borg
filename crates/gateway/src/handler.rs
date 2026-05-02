@@ -439,7 +439,11 @@ async fn resolve_session_and_commands(
 
     if crate::commands::is_dream_command(&inbound.text) {
         let config = config.clone();
-        let response = match tokio::spawn(async move { cortex::consolidation::run_dream(&config).await }).await {
+        let response = match tokio::spawn(
+            async move { cortex::consolidation::run_dream(&config).await },
+        )
+        .await
+        {
             Ok(Ok(report)) => format_dream_report(&report),
             Ok(Err(e)) => format!("Dream failed: {e}"),
             Err(e) => format!("Dream failed: {e}"),

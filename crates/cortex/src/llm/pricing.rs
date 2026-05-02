@@ -41,31 +41,175 @@ struct AnthropicModelRate {
 
 static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        ("gpt-4", ModelRate { input_per_mtok: "30.00", output_per_mtok: "60.00" }),
-        ("gpt-4.1", ModelRate { input_per_mtok: "2.00", output_per_mtok: "8.00" }),
-        ("gpt-4.1-mini", ModelRate { input_per_mtok: "0.40", output_per_mtok: "1.60" }),
-        ("gpt-4.1-nano", ModelRate { input_per_mtok: "0.10", output_per_mtok: "0.40" }),
-        ("gpt-4o", ModelRate { input_per_mtok: "2.50", output_per_mtok: "10.00" }),
-        ("gpt-4o-2024-08-06", ModelRate { input_per_mtok: "2.50", output_per_mtok: "10.00" }),
-        ("gpt-4o-mini", ModelRate { input_per_mtok: "0.15", output_per_mtok: "0.60" }),
-        ("gpt-5", ModelRate { input_per_mtok: "1.25", output_per_mtok: "10.00" }),
-        ("gpt-5-mini", ModelRate { input_per_mtok: "0.25", output_per_mtok: "2.00" }),
-        ("gpt-5-nano", ModelRate { input_per_mtok: "0.05", output_per_mtok: "0.40" }),
-        ("o3", ModelRate { input_per_mtok: "2.00", output_per_mtok: "8.00" }),
-        ("o4-mini", ModelRate { input_per_mtok: "1.10", output_per_mtok: "4.40" }),
+        (
+            "gpt-4",
+            ModelRate {
+                input_per_mtok: "30.00",
+                output_per_mtok: "60.00",
+            },
+        ),
+        (
+            "gpt-4.1",
+            ModelRate {
+                input_per_mtok: "2.00",
+                output_per_mtok: "8.00",
+            },
+        ),
+        (
+            "gpt-4.1-mini",
+            ModelRate {
+                input_per_mtok: "0.40",
+                output_per_mtok: "1.60",
+            },
+        ),
+        (
+            "gpt-4.1-nano",
+            ModelRate {
+                input_per_mtok: "0.10",
+                output_per_mtok: "0.40",
+            },
+        ),
+        (
+            "gpt-4o",
+            ModelRate {
+                input_per_mtok: "2.50",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gpt-4o-2024-08-06",
+            ModelRate {
+                input_per_mtok: "2.50",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gpt-4o-mini",
+            ModelRate {
+                input_per_mtok: "0.15",
+                output_per_mtok: "0.60",
+            },
+        ),
+        (
+            "gpt-5",
+            ModelRate {
+                input_per_mtok: "1.25",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gpt-5-mini",
+            ModelRate {
+                input_per_mtok: "0.25",
+                output_per_mtok: "2.00",
+            },
+        ),
+        (
+            "gpt-5-nano",
+            ModelRate {
+                input_per_mtok: "0.05",
+                output_per_mtok: "0.40",
+            },
+        ),
+        (
+            "o3",
+            ModelRate {
+                input_per_mtok: "2.00",
+                output_per_mtok: "8.00",
+            },
+        ),
+        (
+            "o4-mini",
+            ModelRate {
+                input_per_mtok: "1.10",
+                output_per_mtok: "4.40",
+            },
+        ),
     ])
 });
 
 static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = LazyLock::new(|| {
     HashMap::from([
-        ("claude-opus-4", AnthropicModelRate { input_per_mtok: "15.00", cache_read_per_mtok: "1.50", cache_write_5m_per_mtok: "18.75", cache_write_1h_per_mtok: "30.00", output_per_mtok: "75.00" }),
-        ("claude-opus-4-20250514", AnthropicModelRate { input_per_mtok: "15.00", cache_read_per_mtok: "1.50", cache_write_5m_per_mtok: "18.75", cache_write_1h_per_mtok: "30.00", output_per_mtok: "75.00" }),
-        ("claude-opus-4-7", AnthropicModelRate { input_per_mtok: "15.00", cache_read_per_mtok: "1.50", cache_write_5m_per_mtok: "18.75", cache_write_1h_per_mtok: "30.00", output_per_mtok: "75.00" }),
-        ("claude-sonnet-4", AnthropicModelRate { input_per_mtok: "3.00", cache_read_per_mtok: "0.30", cache_write_5m_per_mtok: "3.75", cache_write_1h_per_mtok: "6.00", output_per_mtok: "15.00" }),
-        ("claude-sonnet-4-20250514", AnthropicModelRate { input_per_mtok: "3.00", cache_read_per_mtok: "0.30", cache_write_5m_per_mtok: "3.75", cache_write_1h_per_mtok: "6.00", output_per_mtok: "15.00" }),
-        ("claude-sonnet-4-6", AnthropicModelRate { input_per_mtok: "3.00", cache_read_per_mtok: "0.30", cache_write_5m_per_mtok: "3.75", cache_write_1h_per_mtok: "6.00", output_per_mtok: "15.00" }),
-        ("claude-haiku-4-5", AnthropicModelRate { input_per_mtok: "1.00", cache_read_per_mtok: "0.10", cache_write_5m_per_mtok: "1.25", cache_write_1h_per_mtok: "2.00", output_per_mtok: "5.00" }),
-        ("claude-haiku-4-5-20251001", AnthropicModelRate { input_per_mtok: "1.00", cache_read_per_mtok: "0.10", cache_write_5m_per_mtok: "1.25", cache_write_1h_per_mtok: "2.00", output_per_mtok: "5.00" }),
+        (
+            "claude-opus-4",
+            AnthropicModelRate {
+                input_per_mtok: "15.00",
+                cache_read_per_mtok: "1.50",
+                cache_write_5m_per_mtok: "18.75",
+                cache_write_1h_per_mtok: "30.00",
+                output_per_mtok: "75.00",
+            },
+        ),
+        (
+            "claude-opus-4-20250514",
+            AnthropicModelRate {
+                input_per_mtok: "15.00",
+                cache_read_per_mtok: "1.50",
+                cache_write_5m_per_mtok: "18.75",
+                cache_write_1h_per_mtok: "30.00",
+                output_per_mtok: "75.00",
+            },
+        ),
+        (
+            "claude-opus-4-7",
+            AnthropicModelRate {
+                input_per_mtok: "15.00",
+                cache_read_per_mtok: "1.50",
+                cache_write_5m_per_mtok: "18.75",
+                cache_write_1h_per_mtok: "30.00",
+                output_per_mtok: "75.00",
+            },
+        ),
+        (
+            "claude-sonnet-4",
+            AnthropicModelRate {
+                input_per_mtok: "3.00",
+                cache_read_per_mtok: "0.30",
+                cache_write_5m_per_mtok: "3.75",
+                cache_write_1h_per_mtok: "6.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "claude-sonnet-4-20250514",
+            AnthropicModelRate {
+                input_per_mtok: "3.00",
+                cache_read_per_mtok: "0.30",
+                cache_write_5m_per_mtok: "3.75",
+                cache_write_1h_per_mtok: "6.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "claude-sonnet-4-6",
+            AnthropicModelRate {
+                input_per_mtok: "3.00",
+                cache_read_per_mtok: "0.30",
+                cache_write_5m_per_mtok: "3.75",
+                cache_write_1h_per_mtok: "6.00",
+                output_per_mtok: "15.00",
+            },
+        ),
+        (
+            "claude-haiku-4-5",
+            AnthropicModelRate {
+                input_per_mtok: "1.00",
+                cache_read_per_mtok: "0.10",
+                cache_write_5m_per_mtok: "1.25",
+                cache_write_1h_per_mtok: "2.00",
+                output_per_mtok: "5.00",
+            },
+        ),
+        (
+            "claude-haiku-4-5-20251001",
+            AnthropicModelRate {
+                input_per_mtok: "1.00",
+                cache_read_per_mtok: "0.10",
+                cache_write_5m_per_mtok: "1.25",
+                cache_write_1h_per_mtok: "2.00",
+                output_per_mtok: "5.00",
+            },
+        ),
     ])
 });
 
@@ -113,9 +257,12 @@ pub fn estimate_anthropic_cost_usd(
     cache_ttl: CacheTtl,
 ) -> Option<String> {
     let rate = anthropic_rates_for(model)?;
-    let uncached_input = Usd::from_tokens_at_rate(prompt_tokens, Usd::parse(rate.input_per_mtok).ok()?);
-    let cached_read =
-        Usd::from_tokens_at_rate(cached_input_tokens, Usd::parse(rate.cache_read_per_mtok).ok()?);
+    let uncached_input =
+        Usd::from_tokens_at_rate(prompt_tokens, Usd::parse(rate.input_per_mtok).ok()?);
+    let cached_read = Usd::from_tokens_at_rate(
+        cached_input_tokens,
+        Usd::parse(rate.cache_read_per_mtok).ok()?,
+    );
     let cache_write_rate = match cache_ttl {
         CacheTtl::OneHour => rate.cache_write_1h_per_mtok,
         CacheTtl::Auto | CacheTtl::FiveMin => rate.cache_write_5m_per_mtok,
@@ -171,29 +318,17 @@ mod tests {
 
     #[test]
     fn anthropic_cost_accounts_for_prompt_cache_reads_and_writes() {
-        let cost = estimate_anthropic_cost_usd(
-            "claude-sonnet-4",
-            1_000,
-            500,
-            800,
-            400,
-            CacheTtl::FiveMin,
-        )
-        .unwrap();
+        let cost =
+            estimate_anthropic_cost_usd("claude-sonnet-4", 1_000, 500, 800, 400, CacheTtl::FiveMin)
+                .unwrap();
         assert_eq!(cost, "0.01224");
     }
 
     #[test]
     fn anthropic_one_hour_cache_write_uses_one_hour_rate() {
-        let cost = estimate_anthropic_cost_usd(
-            "claude-sonnet-4",
-            1_000,
-            500,
-            0,
-            1_000,
-            CacheTtl::OneHour,
-        )
-        .unwrap();
+        let cost =
+            estimate_anthropic_cost_usd("claude-sonnet-4", 1_000, 500, 0, 1_000, CacheTtl::OneHour)
+                .unwrap();
         assert_eq!(cost, "0.0165");
     }
 
@@ -205,7 +340,10 @@ mod tests {
     #[test]
     fn shipped_openai_models_have_rates() {
         for model in shipped_openai_models() {
-            assert!(has_model_rate(Provider::OpenAi, model), "missing OpenAI rate for {model}");
+            assert!(
+                has_model_rate(Provider::OpenAi, model),
+                "missing OpenAI rate for {model}"
+            );
         }
     }
 

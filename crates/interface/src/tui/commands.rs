@@ -685,7 +685,9 @@ impl App<'_> {
             })
         });
         match result {
-            Ok(report) => self.push_system_message(crate::commands::misc::format_dream_report(&report)),
+            Ok(report) => {
+                self.push_system_message(crate::commands::misc::format_dream_report(&report))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "on-demand /dream: daemon dream RPC failed");
                 self.push_system_message(format!("Dream failed: {e}"));
@@ -940,7 +942,10 @@ mod tests {
             Some(idx) => &src[..idx],
             None => src,
         };
-        assert!(code.contains("\"/dream\""), "commands.rs must handle /dream");
+        assert!(
+            code.contains("\"/dream\""),
+            "commands.rs must handle /dream"
+        );
     }
 
     #[test]

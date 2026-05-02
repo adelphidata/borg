@@ -1,9 +1,7 @@
 //! Telemetry gRPC service.
 
 use crate::cost_events::CostEventBus;
-use protocols::telemetry::{
-    telemetry_server::Telemetry, CostEvent as PbCostEvent, Empty,
-};
+use protocols::telemetry::{telemetry_server::Telemetry, CostEvent as PbCostEvent, Empty};
 use std::pin::Pin;
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;

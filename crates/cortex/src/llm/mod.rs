@@ -1,6 +1,6 @@
 use std::borrow::Cow;
-use std::sync::Arc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -957,9 +957,8 @@ impl LlmClient {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
-            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled()).then_some(
-                UsageOptions { include: true },
-            ),
+            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled())
+                .then_some(UsageOptions { include: true }),
         };
 
         debug!(
@@ -1157,9 +1156,8 @@ impl LlmClient {
             prompt_cache_key: self.prompt_cache_key.clone(),
             user: self.prompt_cache_key.clone(),
             stream_options: None,
-            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled()).then_some(
-                UsageOptions { include: true },
-            ),
+            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled())
+                .then_some(UsageOptions { include: true }),
         };
 
         #[derive(Deserialize)]

@@ -17,10 +17,10 @@ use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
-use std::sync::Arc;
 use gateway::{InboundTurn, SessionExecutor};
-use tokio::sync::{broadcast, mpsc};
+use std::sync::Arc;
 use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 /// Daemon-side [`SessionExecutor`]. Cheap-to-clone via `Arc` from the gateway

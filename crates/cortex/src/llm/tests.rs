@@ -142,7 +142,8 @@ fn air_gap_skips_public_cloud_fallback_slot() {
 #[test]
 fn openrouter_cost_event_uses_usage_cost_verbatim() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    let client =
+        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -167,7 +168,8 @@ fn openrouter_cost_event_uses_usage_cost_verbatim() {
 #[test]
 fn openrouter_missing_cost_emits_unknown_cost() {
     let sink = Arc::new(CollectingSink::default());
-    let client = make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    let client =
+        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
     let usage = UsageData {
         prompt_tokens: 10,
         completion_tokens: 20,
@@ -309,7 +311,8 @@ fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
 
 #[test]
 fn sink_panic_is_caught_and_does_not_propagate() {
-    let client = make_test_openai_client().with_cost_event_sink(Arc::new(PanicSink), cost_context());
+    let client =
+        make_test_openai_client().with_cost_event_sink(Arc::new(PanicSink), cost_context());
     let usage = UsageData {
         prompt_tokens: 1_000,
         completion_tokens: 500,

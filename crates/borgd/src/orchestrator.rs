@@ -229,9 +229,17 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
     );
     let registry = SessionRegistry::new();
     let (_config_tx, config_rx) = watch::channel(config.clone());
-    let cost_event_sink: Arc<dyn CostEventSink> =
-        Arc::new(crate::cost_events::CostEventBus::new(&config, BorgMetrics::noop()));
-    let _handles = start(registry, config, shutdown.clone(), config_rx, cost_event_sink);
+    let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(crate::cost_events::CostEventBus::new(
+        &config,
+        BorgMetrics::noop(),
+    ));
+    let _handles = start(
+        registry,
+        config,
+        shutdown.clone(),
+        config_rx,
+        cost_event_sink,
+    );
     shutdown.cancelled().await;
     Ok(())
 }

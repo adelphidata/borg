@@ -471,7 +471,11 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
         cortex::consolidation::ConsolidationPass::Weekly
     };
 
-    let result = tokio::time::timeout(*timeout, cortex::consolidation::run_single_pass(config, pass)).await;
+    let result = tokio::time::timeout(
+        *timeout,
+        cortex::consolidation::run_single_pass(config, pass),
+    )
+    .await;
 
     match result {
         Ok(Ok(report)) => {

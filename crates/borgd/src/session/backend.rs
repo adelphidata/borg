@@ -10,8 +10,8 @@ use cortex::config::Config;
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use tokio::sync::watch;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Snapshot of the agent's user-facing state for `Session.GetState`.
