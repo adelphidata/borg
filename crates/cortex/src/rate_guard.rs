@@ -179,9 +179,48 @@ impl ActionLimits {
     /// monotonically *unlocks* headroom, never tightens it.
     pub fn apply_stage(&mut self, stage: EvolutionStage) {
         let (tool_calls, shell_commands, file_writes) = match stage {
-            EvolutionStage::Base => ((50, 100), (20, 50), (15, 30)),
-            EvolutionStage::Evolved => ((75, 150), (30, 75), (25, 50)),
-            EvolutionStage::Final => ((100, 200), (50, 100), (40, 80)),
+            EvolutionStage::Base => (
+                (
+                    constants::EVOLUTION_BASE_TOOL_CALLS_WARN,
+                    constants::EVOLUTION_BASE_TOOL_CALLS_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_BASE_SHELL_WARN,
+                    constants::EVOLUTION_BASE_SHELL_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_BASE_FILE_WRITES_WARN,
+                    constants::EVOLUTION_BASE_FILE_WRITES_BLOCK,
+                ),
+            ),
+            EvolutionStage::Evolved => (
+                (
+                    constants::EVOLUTION_EVOLVED_TOOL_CALLS_WARN,
+                    constants::EVOLUTION_EVOLVED_TOOL_CALLS_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_EVOLVED_SHELL_WARN,
+                    constants::EVOLUTION_EVOLVED_SHELL_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_EVOLVED_FILE_WRITES_WARN,
+                    constants::EVOLUTION_EVOLVED_FILE_WRITES_BLOCK,
+                ),
+            ),
+            EvolutionStage::Final => (
+                (
+                    constants::EVOLUTION_FINAL_TOOL_CALLS_WARN,
+                    constants::EVOLUTION_FINAL_TOOL_CALLS_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_FINAL_SHELL_WARN,
+                    constants::EVOLUTION_FINAL_SHELL_BLOCK,
+                ),
+                (
+                    constants::EVOLUTION_FINAL_FILE_WRITES_WARN,
+                    constants::EVOLUTION_FINAL_FILE_WRITES_BLOCK,
+                ),
+            ),
         };
         self.tool_calls_warn = self.tool_calls_warn.max(tool_calls.0);
         self.tool_calls_block = self.tool_calls_block.max(tool_calls.1);

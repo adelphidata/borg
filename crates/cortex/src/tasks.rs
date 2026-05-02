@@ -5,7 +5,13 @@ use cron::Schedule;
 use rusqlite::params;
 use std::str::FromStr;
 
+use crate::constants::{SECS_PER_DAY, SECS_PER_HOUR};
 use crate::db::{Database, ScheduledTaskRow};
+
+/// Grace window allowed when validating a future ISO-8601 timestamp.
+/// Absorbs minor clock skew between client and server so a "now" timestamp
+/// isn't rejected as in-the-past.
+const FUTURE_TIMESTAMP_GRACE_SECS: i64 = 60;
 
 // ── Task status constants ──
 
@@ -162,7 +168,7 @@ pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
     };
 
     let now = Utc::now().timestamp();
-    if ts < now - 60 {
+    if ts < now - FUTURE_TIMESTAMP_GRACE_SECS {
         anyhow::bail!("Timestamp is in the past: {trimmed}. Pass a future ISO-8601 timestamp.");
     }
     Ok(ts)
@@ -368,13 +374,13 @@ pub fn parse_interval(s: &str) -> Option<std::time::Duration> {
         hours
             .parse::<u64>()
             .ok()
-            .map(|h| std::time::Duration::from_secs(h * 3600))
+            .map(|h| std::time::Duration::from_secs(h * SECS_PER_HOUR as u64))
     } else if let Some(secs) = s.strip_suffix('s') {
         secs.parse::<u64>().ok().map(std::time::Duration::from_secs)
     } else if let Some(days) = s.strip_suffix('d') {
         days.parse::<u64>()
             .ok()
-            .map(|d| std::time::Duration::from_secs(d * 86400))
+            .map(|d| std::time::Duration::from_secs(d * SECS_PER_DAY as u64))
     } else {
         s.parse::<u64>().ok().map(std::time::Duration::from_secs)
     }

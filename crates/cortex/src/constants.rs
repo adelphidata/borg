@@ -200,6 +200,51 @@ pub const GW_RATE_WEB_REQUESTS_WARN: u32 = 10;
 /// Gateway session: web request count that blocks further requests.
 pub const GW_RATE_WEB_REQUESTS_BLOCK: u32 = 25;
 
+// ── Evolution stage rate limits ───────────────────────────────────
+//
+// Rate-limit floors per evolution stage. `ActionLimits::apply_stage` uses
+// `.max()` against these so explicit user config above the floor is preserved.
+// Source of truth: `docs/evolution.md#action-limits-by-stage`.
+
+/// Base stage: tool call warn floor.
+pub const EVOLUTION_BASE_TOOL_CALLS_WARN: u32 = 50;
+/// Base stage: tool call block floor.
+pub const EVOLUTION_BASE_TOOL_CALLS_BLOCK: u32 = 100;
+/// Base stage: shell command warn floor.
+pub const EVOLUTION_BASE_SHELL_WARN: u32 = 20;
+/// Base stage: shell command block floor.
+pub const EVOLUTION_BASE_SHELL_BLOCK: u32 = 50;
+/// Base stage: file write warn floor.
+pub const EVOLUTION_BASE_FILE_WRITES_WARN: u32 = 15;
+/// Base stage: file write block floor.
+pub const EVOLUTION_BASE_FILE_WRITES_BLOCK: u32 = 30;
+
+/// Evolved stage: tool call warn floor.
+pub const EVOLUTION_EVOLVED_TOOL_CALLS_WARN: u32 = 75;
+/// Evolved stage: tool call block floor.
+pub const EVOLUTION_EVOLVED_TOOL_CALLS_BLOCK: u32 = 150;
+/// Evolved stage: shell command warn floor.
+pub const EVOLUTION_EVOLVED_SHELL_WARN: u32 = 30;
+/// Evolved stage: shell command block floor.
+pub const EVOLUTION_EVOLVED_SHELL_BLOCK: u32 = 75;
+/// Evolved stage: file write warn floor.
+pub const EVOLUTION_EVOLVED_FILE_WRITES_WARN: u32 = 25;
+/// Evolved stage: file write block floor.
+pub const EVOLUTION_EVOLVED_FILE_WRITES_BLOCK: u32 = 50;
+
+/// Final stage: tool call warn floor.
+pub const EVOLUTION_FINAL_TOOL_CALLS_WARN: u32 = 100;
+/// Final stage: tool call block floor.
+pub const EVOLUTION_FINAL_TOOL_CALLS_BLOCK: u32 = 200;
+/// Final stage: shell command warn floor.
+pub const EVOLUTION_FINAL_SHELL_WARN: u32 = 50;
+/// Final stage: shell command block floor.
+pub const EVOLUTION_FINAL_SHELL_BLOCK: u32 = 100;
+/// Final stage: file write warn floor.
+pub const EVOLUTION_FINAL_FILE_WRITES_WARN: u32 = 40;
+/// Final stage: file write block floor.
+pub const EVOLUTION_FINAL_FILE_WRITES_BLOCK: u32 = 80;
+
 // ── File reading defaults ──────────────────────────────────────────
 
 /// Default max characters for file/PDF/URL reading tools.
@@ -417,6 +462,9 @@ pub const HMAC_CHECKPOINT_INTERVAL: u32 = 100;
 
 /// Seconds per hour, used for rate-limit hour bucketing.
 pub const SECS_PER_HOUR: i64 = 3600;
+
+/// Seconds per day, used for interval parsing.
+pub const SECS_PER_DAY: i64 = 86_400;
 
 /// Maximum pairing code generation attempts per sender per hour.
 pub const PAIRING_MAX_ATTEMPTS_PER_HOUR: u32 = 20;
@@ -671,5 +719,20 @@ mod tests {
     fn hmac_constants_valid() {
         assert!(HMAC_CHECKPOINT_INTERVAL > 0);
         assert_eq!(SECS_PER_HOUR, 3600);
+        assert_eq!(SECS_PER_DAY, SECS_PER_HOUR * 24);
+    }
+
+    #[test]
+    fn evolution_stages_monotonically_unlock() {
+        assert!(EVOLUTION_BASE_TOOL_CALLS_WARN <= EVOLUTION_BASE_TOOL_CALLS_BLOCK);
+        assert!(EVOLUTION_EVOLVED_TOOL_CALLS_WARN <= EVOLUTION_EVOLVED_TOOL_CALLS_BLOCK);
+        assert!(EVOLUTION_FINAL_TOOL_CALLS_WARN <= EVOLUTION_FINAL_TOOL_CALLS_BLOCK);
+
+        assert!(EVOLUTION_BASE_TOOL_CALLS_BLOCK <= EVOLUTION_EVOLVED_TOOL_CALLS_BLOCK);
+        assert!(EVOLUTION_EVOLVED_TOOL_CALLS_BLOCK <= EVOLUTION_FINAL_TOOL_CALLS_BLOCK);
+        assert!(EVOLUTION_BASE_SHELL_BLOCK <= EVOLUTION_EVOLVED_SHELL_BLOCK);
+        assert!(EVOLUTION_EVOLVED_SHELL_BLOCK <= EVOLUTION_FINAL_SHELL_BLOCK);
+        assert!(EVOLUTION_BASE_FILE_WRITES_BLOCK <= EVOLUTION_EVOLVED_FILE_WRITES_BLOCK);
+        assert!(EVOLUTION_EVOLVED_FILE_WRITES_BLOCK <= EVOLUTION_FINAL_FILE_WRITES_BLOCK);
     }
 }
