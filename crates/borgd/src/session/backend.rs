@@ -7,9 +7,11 @@
 use async_trait::async_trait;
 use cortex::agent::{Agent, AgentEvent};
 use cortex::config::Config;
+use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Snapshot of the agent's user-facing state for `Session.GetState`.
@@ -159,8 +161,16 @@ impl AgentBackend {
         config: Config,
         metrics: BorgMetrics,
         resume_id: Option<&str>,
+        config_rx: Option<watch::Receiver<Config>>,
+        cost_event_sink: Option<Arc<dyn CostEventSink>>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics)?;
+        if let Some(rx) = config_rx {
+            agent.set_config_watcher(rx);
+        }
+        if let Some(sink) = cost_event_sink {
+            agent.set_cost_event_sink(sink);
+        }
 
         // Register the same hook set the in-process REPL/TUI uses. Failed
         // registration is non-fatal — log so operators can debug "why is XP

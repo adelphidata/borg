@@ -149,6 +149,7 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
             cache_creation_tokens: u.cache_creation_tokens,
             provider: String::new(),
             model: String::new(),
+            provider_cost_usd: None,
         }),
         Kind::SubAgentUpdate(s) => CoreEvent::SubAgentUpdate {
             agent_id: s.agent_id,

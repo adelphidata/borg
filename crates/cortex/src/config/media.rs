@@ -748,6 +748,8 @@ pub struct TelemetryConfig {
     pub tracing_enabled: bool,
     /// Enable metrics export.
     pub metrics_enabled: bool,
+    /// Enable daemon cost-event streaming.
+    pub cost_events: bool,
     /// OTLP collector endpoint URL.
     pub otlp_endpoint: String,
     /// Service name reported in telemetry data.
@@ -761,6 +763,7 @@ impl Default for TelemetryConfig {
         Self {
             tracing_enabled: false,
             metrics_enabled: false,
+            cost_events: false,
             otlp_endpoint: "http://localhost:4317".to_string(),
             service_name: "borg".to_string(),
             sampling_ratio: 1.0,

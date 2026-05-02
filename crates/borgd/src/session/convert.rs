@@ -142,6 +142,7 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             cache_creation_tokens: u.cache_creation_tokens,
             provider: String::new(),
             model: String::new(),
+            provider_cost_usd: None,
         }),
         Kind::SubAgentUpdate(s) => CoreEvent::SubAgentUpdate {
             agent_id: s.agent_id,

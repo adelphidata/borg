@@ -292,6 +292,8 @@ pub struct Agent {
     steer_rx: Option<mpsc::UnboundedReceiver<String>>,
     /// Tool names used in recent turns, for conditional tool loading.
     recent_tool_names: std::collections::HashSet<String>,
+    /// Optional best-effort sink for borgd cost events.
+    cost_event_sink: Option<Arc<dyn crate::llm::CostEventSink>>,
     /// Short-term working memory for the current session.
     short_term_memory: crate::short_term_memory::ShortTermMemory,
     /// Most recent compaction summary text (no marker prefix). Used by
@@ -468,6 +470,7 @@ impl Agent {
             config_arc,
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
+            cost_event_sink: None,
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
             previous_summary: None,
             setup_just_consumed: false,
@@ -549,6 +552,11 @@ impl Agent {
         self.config_rx = Some(rx);
     }
 
+    /// Install a best-effort cost-event sink for all session-backed LLM calls.
+    pub fn set_cost_event_sink(&mut self, sink: Arc<dyn crate::llm::CostEventSink>) {
+        self.cost_event_sink = Some(sink);
+    }
+
     /// Replace config, re-derive dependent state (policy, rate limits).
     fn reload_config(&mut self, new_config: Config) {
         self.policy = new_config.policy.clone();
@@ -559,6 +567,22 @@ impl Agent {
         self.config_arc = Arc::new(new_config.clone());
         self.config = new_config;
         self.refresh_skill_runtime_state();
+    }
+
+    fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
+        let mut client = LlmClient::new(config)?;
+        if let Some(ref sink) = self.cost_event_sink {
+            if config.telemetry.cost_events {
+                client = client.with_cost_event_sink(
+                    sink.clone(),
+                    crate::llm::CostEventContext {
+                        session_id: self.session.meta.id.clone(),
+                        kind: "chat".to_string(),
+                    },
+                );
+            }
+        }
+        Ok(client)
     }
 
     /// Create a sub-agent that shares the parent's config but has its own session.
@@ -800,7 +824,7 @@ impl Agent {
     /// Compact conversation history to fit within context limits. Returns (before, after) message counts.
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
-        let llm = match LlmClient::new(&self.config) {
+        let llm = match self.make_llm_client_from_config(&self.config) {
             Ok(l) => l,
             Err(_) => return (before, before),
         };
@@ -1159,7 +1183,7 @@ Rules:
         ];
 
         let compaction_config = self.config.with_compaction_overrides();
-        let llm = match LlmClient::new(&compaction_config) {
+        let llm = match self.make_llm_client_from_config(&compaction_config) {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("Pre-compaction flush LLM init failed: {e}");
@@ -1527,7 +1551,8 @@ Rules:
             let tools_clone = tools.map(<[ToolDefinition]>::to_vec);
             let cancel_clone = cancel.clone();
             let stream_handle = {
-                let mut llm_client = LlmClient::new(&self.config)
+                let mut llm_client = self
+                    .make_llm_client_from_config(&self.config)
                     .context("Failed to initialize LLM client")?
                     .with_prompt_cache_key(self.session.meta.id.clone());
                 tokio::spawn(async move {
@@ -1973,7 +1998,7 @@ Rules:
             }
 
             let compaction_config = self.config.with_compaction_overrides();
-            let compaction_llm = LlmClient::new(&compaction_config)?;
+            let compaction_llm = self.make_llm_client_from_config(&compaction_config)?;
 
             let protect_first_n = self.config.conversation.protect_first_n;
             // Seed the iterative-summary state from any prior compaction
@@ -2074,7 +2099,7 @@ Rules:
         }
 
         let compaction_config = self.config.with_compaction_overrides();
-        let compaction_llm = LlmClient::new(&compaction_config)?;
+        let compaction_llm = self.make_llm_client_from_config(&compaction_config)?;
         let protect_first_n = self.config.conversation.protect_first_n;
 
         if self.previous_summary.is_none() {
@@ -3372,6 +3397,7 @@ mod tests {
             config_arc: Arc::new(config),
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
+            cost_event_sink: None,
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
             previous_summary: None,
             setup_just_consumed: false,

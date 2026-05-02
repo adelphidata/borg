@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -25,9 +26,7 @@ macro_rules! lc_log {
 }
 
 fn short_request_id() -> String {
-    let mut s = uuid::Uuid::new_v4().simple().to_string();
-    s.truncate(8);
-    s
+    uuid::Uuid::new_v4().to_string()
 }
 
 use crate::config::{Config, LlmConfig};
@@ -38,12 +37,15 @@ use crate::types::{Message, Role, ToolDefinition};
 const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 
 mod anthropic;
+mod cost;
+mod pricing;
 
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
     apply_message_cache_control, build_anthropic_messages, build_cache_control_marker,
     parse_anthropic_response, sanitize_openai_messages, strip_images,
 };
+pub use cost::{CostEvent, CostEventContext, CostEventSink};
 
 pub use crate::llm_error::*;
 
@@ -64,6 +66,8 @@ pub struct UsageData {
     pub cache_creation_tokens: u64,
     pub provider: String,
     pub model: String,
+    /// Provider-reported authoritative USD cost when available (OpenRouter).
+    pub provider_cost_usd: Option<String>,
 }
 
 /// Events emitted during SSE streaming from the LLM.
@@ -118,11 +122,20 @@ struct ChatRequest {
     /// DeepSeek, Groq, ...) never report token counts and `/usage` shows zeros.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    /// OpenRouter usage accounting opt-in. Only attached when cost-event
+    /// streaming is enabled at runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<UsageOptions>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct StreamOptions {
     include_usage: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageOptions {
+    include: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +156,8 @@ struct StreamUsage {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
     cached_tokens: Option<u64>,
+    #[serde(default)]
+    cost: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +274,10 @@ pub struct LlmClient {
     /// Sent as `prompt_cache_key` on OpenAI-family requests to bias the
     /// provider's auto-cache toward a consistent shard across turns.
     prompt_cache_key: Option<String>,
+    /// Optional best-effort sink for daemon cost events.
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    /// Per-call metadata supplied by borgd.
+    cost_event_context: Option<CostEventContext>,
 }
 
 /// Normalize a Gemini OpenAI-compat base URL by ensuring it resolves to the
@@ -351,6 +370,8 @@ impl LlmClient {
             active_slot_index: usize::MAX,
             debug_logging,
             prompt_cache_key: None,
+            cost_event_sink: None,
+            cost_event_context: None,
         })
     }
 
@@ -360,6 +381,21 @@ impl LlmClient {
     pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
         self.prompt_cache_key = Some(key.into());
         self
+    }
+
+    /// Attach a best-effort daemon sink for per-call cost events.
+    pub fn with_cost_event_sink(
+        mut self,
+        sink: Arc<dyn CostEventSink>,
+        context: CostEventContext,
+    ) -> Self {
+        self.cost_event_sink = Some(sink);
+        self.cost_event_context = Some(context);
+        self
+    }
+
+    fn cost_events_enabled(&self) -> bool {
+        self.cost_event_sink.is_some() && self.cost_event_context.is_some()
     }
 
     /// Practical context window of the active model in tokens. Resolves through
@@ -510,6 +546,96 @@ impl LlmClient {
         let redacted = crate::secrets::redact_secrets(content);
         if let Err(e) = std::fs::write(&path, redacted) {
             tracing::debug!("llm: failed to write debug log: {e}");
+        }
+    }
+
+    fn parse_usage_cost(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    fn maybe_capture_usage_from_action(
+        action: &crate::sse::SseAction,
+        last_usage: &mut Option<UsageData>,
+    ) {
+        match action {
+            crate::sse::SseAction::Emit(events) | crate::sse::SseAction::Done(events) => {
+                for event in events {
+                    if let StreamEvent::Usage(usage) = event {
+                        *last_usage = Some(usage.clone());
+                    }
+                }
+            }
+            crate::sse::SseAction::Continue | crate::sse::SseAction::Error(_) => {}
+        }
+    }
+
+    fn emit_cost_event_best_effort(
+        &self,
+        request_id: &str,
+        usage: Option<&UsageData>,
+        fallback_model: &str,
+    ) {
+        let (Some(sink), Some(context)) = (&self.cost_event_sink, &self.cost_event_context) else {
+            return;
+        };
+
+        let provider_str = usage
+            .map(|u| u.provider.clone())
+            .unwrap_or_else(|| self.provider.as_str().to_string());
+        let model = usage
+            .map(|u| u.model.clone())
+            .unwrap_or_else(|| fallback_model.to_string());
+        let prompt_tokens = usage.map(|u| u.prompt_tokens as u32).unwrap_or(0);
+        let completion_tokens = usage.map(|u| u.completion_tokens as u32).unwrap_or(0);
+
+        let (cost_usd, cost_usd_present, cost_source) = match self.provider {
+            Provider::OpenRouter => match usage.and_then(|u| u.provider_cost_usd.clone()) {
+                Some(cost) => (Some(cost), true, "openrouter_usage".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
+            Provider::OpenAi => match pricing::estimate_cost_usd(
+                Provider::OpenAi,
+                &model,
+                u64::from(prompt_tokens),
+                u64::from(completion_tokens),
+            ) {
+                Some(cost) => (Some(cost), true, "table_openai".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
+            Provider::Anthropic => match pricing::estimate_anthropic_cost_usd(
+                &model,
+                u64::from(prompt_tokens),
+                u64::from(completion_tokens),
+                usage.map(|u| u.cached_input_tokens).unwrap_or(0),
+                usage.map(|u| u.cache_creation_tokens).unwrap_or(0),
+                self.llm_config.cache.ttl,
+            ) {
+                Some(cost) => (Some(cost), true, "table_anthropic".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
+            _ => (None, false, "unknown".to_string()),
+        };
+
+        let event = CostEvent {
+            request_id: request_id.to_string(),
+            session_id: context.session_id.clone(),
+            provider: provider_str,
+            model,
+            cost_usd,
+            cost_usd_present,
+            cost_source,
+            prompt_tokens,
+            completion_tokens,
+            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+            kind: context.kind.clone(),
+        };
+
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.emit(event))).is_err() {
+            warn!("Cost-event sink panicked; dropping event");
         }
     }
 
@@ -831,6 +957,9 @@ impl LlmClient {
             stream_options: Some(StreamOptions {
                 include_usage: true,
             }),
+            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled()).then_some(
+                UsageOptions { include: true },
+            ),
         };
 
         debug!(
@@ -885,6 +1014,7 @@ impl LlmClient {
 
         let mut first_byte_ms: Option<u64> = None;
         let mut line_count: u64 = 0;
+        let mut last_usage: Option<UsageData> = None;
         let result = crate::sse::process_sse_stream(
             stream,
             tx,
@@ -896,7 +1026,9 @@ impl LlmClient {
                     first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
                 }
                 line_count += 1;
-                Self::parse_openai_sse_line(line, &provider_str, &model_str)
+                let action = Self::parse_openai_sse_line(line, &provider_str, &model_str);
+                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
+                action
             },
         )
         .await;
@@ -918,6 +1050,9 @@ impl LlmClient {
                 line_count = line_count,
                 "openai-compat: stream end err: {e}"
             ),
+        }
+        if result.is_ok() {
+            self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
         }
         result
     }
@@ -954,6 +1089,7 @@ impl LlmClient {
                         cache_creation_tokens: 0,
                         provider: provider.to_string(),
                         model: model.to_string(),
+                        provider_cost_usd: usage.cost.as_ref().and_then(Self::parse_usage_cost),
                     }));
                 }
 
@@ -1021,11 +1157,16 @@ impl LlmClient {
             prompt_cache_key: self.prompt_cache_key.clone(),
             user: self.prompt_cache_key.clone(),
             stream_options: None,
+            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled()).then_some(
+                UsageOptions { include: true },
+            ),
         };
 
         #[derive(Deserialize)]
         struct ChatResponse {
             choices: Vec<ChatChoice>,
+            #[serde(default)]
+            usage: Option<StreamUsage>,
         }
         #[derive(Deserialize)]
         struct ChatChoice {
@@ -1035,18 +1176,37 @@ impl LlmClient {
         let max_retries = self.llm_config.max_retries;
         let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
         let cancel = CancellationToken::new();
+        let req_id = short_request_id();
+        let request_model = self.llm_config.model.clone();
 
         for attempt in 0..=max_retries {
             let result = self.send_request(&request, &cancel).await;
             match result {
                 Ok(response) => {
                     let resp: ChatResponse = response.json().await?;
-                    return resp
+                    let message = resp
                         .choices
                         .into_iter()
                         .next()
                         .map(|c| c.message)
-                        .context("No response from LLM");
+                        .context("No response from LLM")?;
+                    let usage = resp.usage.map(|usage| UsageData {
+                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
+                        completion_tokens: usage.completion_tokens.unwrap_or(0),
+                        total_tokens: usage.total_tokens.unwrap_or(0),
+                        cached_input_tokens: usage
+                            .prompt_tokens_details
+                            .as_ref()
+                            .and_then(|d| d.cached_tokens)
+                            .or(usage.cached_tokens)
+                            .unwrap_or(0),
+                        cache_creation_tokens: 0,
+                        provider: self.provider.as_str().to_string(),
+                        model: request_model.clone(),
+                        provider_cost_usd: usage.cost.as_ref().and_then(Self::parse_usage_cost),
+                    });
+                    self.emit_cost_event_best_effort(&req_id, usage.as_ref(), &request_model);
+                    return Ok(message);
                 }
                 Err(e) => {
                     if !e.is_retryable() || attempt == max_retries {
@@ -1240,6 +1400,7 @@ impl LlmClient {
         let mut pending_cache_creation_tokens: u64 = 0;
         let mut first_byte_ms: Option<u64> = None;
         let mut line_count: u64 = 0;
+        let mut last_usage: Option<UsageData> = None;
 
         let result = crate::sse::process_sse_stream(
             stream,
@@ -1252,7 +1413,7 @@ impl LlmClient {
                     first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
                 }
                 line_count += 1;
-                Self::parse_anthropic_sse_line(
+                let action = Self::parse_anthropic_sse_line(
                     line,
                     &provider_str,
                     &model_str,
@@ -1262,7 +1423,9 @@ impl LlmClient {
                     &mut pending_input_tokens,
                     &mut pending_cached_input_tokens,
                     &mut pending_cache_creation_tokens,
-                )
+                );
+                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
+                action
             },
         )
         .await;
@@ -1284,6 +1447,9 @@ impl LlmClient {
                 line_count = line_count,
                 "anthropic: stream end err: {e}"
             ),
+        }
+        if result.is_ok() {
+            self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
         }
         result
     }
@@ -1429,6 +1595,7 @@ impl LlmClient {
                         cache_creation_tokens,
                         provider: provider.to_string(),
                         model: model.to_string(),
+                        provider_cost_usd: None,
                     }));
                 }
                 if event["delta"]["stop_reason"].as_str().is_some() {
@@ -1465,13 +1632,45 @@ impl LlmClient {
         let max_retries = self.llm_config.max_retries;
         let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
         let cancel = CancellationToken::new();
+        let req_id = short_request_id();
+        let request_model = self.llm_config.model.clone();
 
         for attempt in 0..=max_retries {
             let result = self.send_request(&body, &cancel).await;
             match result {
                 Ok(response) => {
                     let resp: serde_json::Value = response.json().await?;
-                    return parse_anthropic_response(&resp);
+                    let message = parse_anthropic_response(&resp)?;
+                    let usage = resp["usage"].as_object().map(|usage| {
+                        let usage_value = serde_json::Value::Object(usage.clone());
+                        let (cached_input_tokens, cache_creation_tokens) =
+                            normalize_cache_tokens(&usage_value);
+                        UsageData {
+                            prompt_tokens: usage
+                                .get("input_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0),
+                            completion_tokens: usage
+                                .get("output_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0),
+                            total_tokens: usage
+                                .get("input_tokens")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or(0)
+                                + usage
+                                    .get("output_tokens")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0),
+                            cached_input_tokens,
+                            cache_creation_tokens,
+                            provider: self.provider.as_str().to_string(),
+                            model: request_model.clone(),
+                            provider_cost_usd: None,
+                        }
+                    });
+                    self.emit_cost_event_best_effort(&req_id, usage.as_ref(), &request_model);
+                    return Ok(message);
                 }
                 Err(e) => {
                     if !e.is_retryable() || attempt == max_retries {

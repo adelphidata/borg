@@ -77,6 +77,33 @@ cp .env.example .env
 # edit .env with your key
 ```
 
+## Cost events
+
+`borgd` exposes an opt-in gRPC stream at `Telemetry.StreamCostEvents`.
+
+- Gate: `telemetry.cost_events` in the DB-backed settings table, default `false`
+- Transport/auth: unchanged from the rest of the daemon gRPC surface
+- Event: one `CostEvent` per completed LLM call
+- Source labels:
+  - `openrouter_usage` when OpenRouter returns `usage.cost`
+  - `table_openai` when OpenAI cost is derived from the static price table
+  - `table_anthropic` when Anthropic cost is derived from the static price table
+  - `unknown` when cost is unavailable or the model is not priced
+- `cost_usd_present = false` means “unknown”, not `$0`
+
+OpenRouter only returns `usage.cost` when the request opts in with
+`usage.include = true`. Borg only adds that field when
+`telemetry.cost_events = true`; when the setting is off, no cost-event bus is
+created and the OpenRouter request shape stays on the existing path.
+
+Emission is best-effort by design.
+
+- Cost events never block the LLM path.
+- Lagging subscribers can miss events; dropped samples increment the
+  `cost_events_dropped` metric.
+- Sink failures and panics are contained and logged; they do not fail the
+  user-visible LLM call or terminate the daemon.
+
 ## Adding a built-in skill
 
 1. Create `crates/cortex/skills/<name>/SKILL.md` with YAML frontmatter

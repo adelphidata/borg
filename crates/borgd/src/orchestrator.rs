@@ -13,9 +13,10 @@ use crate::task_runner;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
+use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Spawn a gateway server task. Returns the join handle.
@@ -68,11 +69,15 @@ pub fn start(
     registry: SessionRegistry,
     config: Config,
     shutdown: CancellationToken,
+    config_rx: watch::Receiver<Config>,
+    cost_event_sink: Arc<dyn CostEventSink>,
 ) -> OrchestratorHandles {
     let executor = Arc::new(DaemonSessionExecutor::new(
         registry,
         config.clone(),
         BorgMetrics::noop(),
+        Some(config_rx.clone()),
+        Some(cost_event_sink.clone()),
     ));
     let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) =
         heartbeat::spawn(config.clone(), executor.clone(), shutdown.clone());
@@ -154,16 +159,37 @@ pub fn start(
     let scheduler_config = config;
     let scheduler_shutdown = shutdown;
     let scheduler_semaphore = semaphore;
+    let task_cost_event_sink = cost_event_sink.clone();
+    let workflow_cost_event_sink = cost_event_sink;
     tokio::spawn(async move {
         let hooks = scheduler::DispatcherHooks {
-            spawn_task: Arc::new(|task, run_id, retry, sem, cfg| {
+            spawn_task: Arc::new(move |task, run_id, retry, sem, cfg| {
+                let cost_event_sink = task_cost_event_sink.clone();
                 Box::pin(async move {
-                    task_runner::spawn_task_execution(task, run_id, retry, sem, cfg).await
+                    task_runner::spawn_task_execution(
+                        task,
+                        run_id,
+                        retry,
+                        sem,
+                        cfg,
+                        Some(cost_event_sink),
+                    )
+                    .await
                 })
             }),
-            spawn_workflow_step: Arc::new(|wf, step, prior, all, sem, cfg| {
+            spawn_workflow_step: Arc::new(move |wf, step, prior, all, sem, cfg| {
+                let cost_event_sink = workflow_cost_event_sink.clone();
                 Box::pin(async move {
-                    task_runner::spawn_workflow_step(wf, step, prior, all, sem, cfg).await
+                    task_runner::spawn_workflow_step(
+                        wf,
+                        step,
+                        prior,
+                        all,
+                        sem,
+                        cfg,
+                        Some(cost_event_sink),
+                    )
+                    .await
                 })
             }),
             deliver_celebration: Arc::new(|cfg, c| {
@@ -202,7 +228,10 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         "Daemon orchestrator started (cli shim)",
     );
     let registry = SessionRegistry::new();
-    let _handles = start(registry, config, shutdown.clone());
+    let (_config_tx, config_rx) = watch::channel(config.clone());
+    let cost_event_sink: Arc<dyn CostEventSink> =
+        Arc::new(crate::cost_events::CostEventBus::new(&config, BorgMetrics::noop()));
+    let _handles = start(registry, config, shutdown.clone(), config_rx, cost_event_sink);
     shutdown.cancelled().await;
     Ok(())
 }

@@ -4,7 +4,9 @@ pub mod admin;
 pub mod capability;
 pub mod session;
 pub mod status;
+pub mod telemetry;
 
+use crate::cost_events::CostEventBus;
 use crate::heartbeat::HeartbeatBus;
 use crate::heartbeat::HeartbeatTrigger;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
@@ -12,6 +14,7 @@ use protocols::admin::admin_server::AdminServer;
 use protocols::capability::capability_server::CapabilityServer;
 use protocols::session::session_server::SessionServer;
 use protocols::status::status_server::StatusServer;
+use protocols::telemetry::telemetry_server::TelemetryServer;
 use std::sync::Arc;
 
 /// Bundle of all service servers exposed by borgd.
@@ -24,6 +27,8 @@ pub struct Services {
     pub session: SessionServer<session::SessionSvc>,
     /// Capability bidi-stream for client-offered capabilities.
     pub capability: CapabilityServer<capability::CapabilitySvc>,
+    /// Daemon-wide telemetry streams.
+    pub telemetry: TelemetryServer<telemetry::TelemetrySvc>,
 }
 
 /// Construct the service bundle. The session factory governs how new
@@ -32,12 +37,14 @@ pub fn build_services(
     registry: SessionRegistry,
     factory: Arc<dyn session::SessionFactory>,
     capability_router: Arc<capability::CapabilityRouter>,
+    cost_event_bus: CostEventBus,
 ) -> Services {
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin::AdminSvc::new(registry.clone())),
         session: SessionServer::new(session::SessionSvc::new(registry, factory)),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
+        telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
     }
 }
 
@@ -52,6 +59,8 @@ pub struct AdminExtras {
     pub heartbeat_trigger_tx: Option<tokio::sync::mpsc::Sender<HeartbeatTrigger>>,
     /// Broadcaster `Admin.Shutdown` fires.
     pub shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Config watcher notifier for immediate post-setting reloads.
+    pub config_notify_tx: Option<tokio::sync::mpsc::Sender<cortex::config::Config>>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -60,6 +69,7 @@ pub fn build_services_with_extras(
     registry: SessionRegistry,
     factory: Arc<dyn session::SessionFactory>,
     capability_router: Arc<capability::CapabilityRouter>,
+    cost_event_bus: CostEventBus,
     extras: AdminExtras,
 ) -> Services {
     let mut admin_svc = admin::AdminSvc::new(registry.clone());
@@ -75,10 +85,14 @@ pub fn build_services_with_extras(
     if let Some(tx) = extras.shutdown_tx {
         admin_svc = admin_svc.with_shutdown_sender(tx);
     }
+    if let Some(tx) = extras.config_notify_tx {
+        admin_svc = admin_svc.with_config_notify_sender(tx);
+    }
     Services {
         status: StatusServer::new(status::StatusSvc::new()),
         admin: AdminServer::new(admin_svc),
         session: SessionServer::new(session::SessionSvc::new(registry, factory)),
         capability: CapabilityServer::new(capability::CapabilitySvc::new(capability_router)),
+        telemetry: TelemetryServer::new(telemetry::TelemetrySvc::new(cost_event_bus)),
     }
 }

@@ -136,6 +136,8 @@ async fn send_approval_greeting_accepts_request_when_executor_wired() {
         registry.clone(),
         Config::default(),
         BorgMetrics::noop(),
+        None,
+        None,
     ));
     let admin = AdminSvc::new(registry).with_executor(executor);
 

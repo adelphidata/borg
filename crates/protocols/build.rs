@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/capability.proto",
         "proto/status.proto",
         "proto/admin.proto",
+        "proto/telemetry.proto",
         "proto/pki.proto",
     ];
     // Without these, edits to .proto files don't trigger codegen on

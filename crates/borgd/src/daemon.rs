@@ -2,6 +2,7 @@
 
 use crate::auth::kek_factory::build_kek_store;
 use crate::auth::{ensure_root_ca, ensure_server_cert, ServerCertMaterial};
+use crate::cost_events::CostEventBus;
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
 use crate::grpc::session::SessionFactory;
@@ -14,7 +15,9 @@ use crate::session::backend::AgentBackend;
 use crate::session::{SessionHost, SessionRegistry};
 use anyhow::{Context, Result};
 use cortex::config::Config as CoreConfig;
+use cortex::config_watcher::ConfigWatcher;
 use cortex::db::{audit_events, AuditWriter, Database};
+use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
 use protocols::pki::pki_server::PkiServer;
 use serde_json::json;
@@ -27,13 +30,21 @@ use tokio::sync::broadcast;
 use tokio_stream::wrappers::UnixListenerStream;
 
 /// Production session factory: builds an `AgentBackend` for each session.
-struct DaemonSessionFactory;
+struct DaemonSessionFactory {
+    config_rx: tokio::sync::watch::Receiver<CoreConfig>,
+    cost_event_sink: Arc<dyn CostEventSink>,
+}
 
 impl SessionFactory for DaemonSessionFactory {
     fn open(&self, resume_id: Option<&str>) -> Result<SessionHost> {
-        let config =
-            CoreConfig::load_from_db().context("loading config from db for new session")?;
-        let backend = AgentBackend::new(config, BorgMetrics::noop(), resume_id)?;
+        let config = self.config_rx.borrow().clone();
+        let backend = AgentBackend::new(
+            config,
+            BorgMetrics::noop(),
+            resume_id,
+            Some(self.config_rx.clone()),
+            Some(self.cost_event_sink.clone()),
+        )?;
         Ok(SessionHost::new(backend))
     }
 }
@@ -92,8 +103,30 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     tracing::info!(socket = %socket_path.display(), "borgd listening on UDS");
 
+    let initial_core_config = CoreConfig::load_from_db().unwrap_or_default();
+    let config_watcher =
+        ConfigWatcher::start(initial_core_config.clone()).context("start config watcher")?;
+    let metrics = BorgMetrics::noop();
+    let cost_event_bus = CostEventBus::new(&initial_core_config, metrics.clone());
+    let cost_event_sink: Arc<dyn CostEventSink> = Arc::new(cost_event_bus.clone());
+    {
+        let mut rx = config_watcher.subscribe();
+        let bus = cost_event_bus.clone();
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                bus.sync_from_config(&rx.borrow().clone());
+            }
+        });
+    }
+
     let registry = SessionRegistry::new();
-    let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory);
+    let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory {
+        config_rx: config_watcher.subscribe(),
+        cost_event_sink: cost_event_sink.clone(),
+    });
     let capability_router = Arc::new(CapabilityRouter::new());
 
     // Single shutdown signal fanned out to every transport so SIGTERM drains
@@ -142,13 +175,19 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let extras = match CoreConfig::load_from_db() {
         Ok(core_config) => {
-            let handles =
-                orchestrator::start(registry.clone(), core_config, orchestrator_token.clone());
+            let handles = orchestrator::start(
+                registry.clone(),
+                core_config,
+                orchestrator_token.clone(),
+                config_watcher.subscribe(),
+                cost_event_sink.clone(),
+            );
             grpc::AdminExtras {
                 heartbeat_bus: Some(handles.heartbeat_bus),
                 executor: Some(handles.executor),
                 heartbeat_trigger_tx: Some(handles.heartbeat_trigger_tx),
                 shutdown_tx: Some(shutdown_tx.clone()),
+                config_notify_tx: Some(config_watcher.notify_sender()),
             }
         }
         Err(e) => {
@@ -160,6 +199,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 executor: None,
                 heartbeat_trigger_tx: None,
                 shutdown_tx: Some(shutdown_tx.clone()),
+                config_notify_tx: Some(config_watcher.notify_sender()),
             }
         }
     };
@@ -267,7 +307,13 @@ pub async fn run(cfg: Config) -> Result<()> {
         });
     }
 
-    let services = grpc::build_services_with_extras(registry, factory, capability_router, extras);
+    let services = grpc::build_services_with_extras(
+        registry,
+        factory,
+        capability_router,
+        cost_event_bus.clone(),
+        extras,
+    );
 
     let uds_stream = UnixListenerStream::new(uds);
 
@@ -277,6 +323,7 @@ pub async fn run(cfg: Config) -> Result<()> {
             .add_service(services.admin.clone())
             .add_service(services.session.clone())
             .add_service(services.capability.clone())
+            .add_service(services.telemetry.clone())
             .add_service(PkiServer::new(PkiSvc::new(
                 pki_db.clone(),
                 audit.clone(),

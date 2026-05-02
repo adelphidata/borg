@@ -3,6 +3,7 @@
 //! shelling out to the cli's in-process helpers.
 
 use cortex::config::Config;
+use cortex::llm::{CostEventContext, CostEventSink, LlmClient};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -16,6 +17,7 @@ pub async fn spawn_task_execution(
     is_retry: bool,
     semaphore: Arc<Semaphore>,
     config: Config,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
 ) {
     // Acquire the permit *inside* the spawned task, not on the caller's
     // dispatcher loop. If we awaited here while all permits were claimed, the
@@ -81,6 +83,7 @@ pub async fn spawn_task_execution(
             delivery_channel,
             delivery_target,
             config,
+            cost_event_sink,
         };
 
         let result = std::panic::AssertUnwindSafe(async {
@@ -128,6 +131,7 @@ pub async fn spawn_workflow_step(
     all_steps: Vec<cortex::db::WorkflowStepRow>,
     semaphore: Arc<Semaphore>,
     config: Config,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
 ) {
     let step_id = step.id;
     let step_title = step.title.clone();
@@ -171,8 +175,8 @@ pub async fn spawn_workflow_step(
             cortex::types::Message::user(&step.instructions),
         ];
 
-        let llm = match cortex::llm::LlmClient::new(&config) {
-            Ok(l) => l,
+        let llm = match LlmClient::new(&config) {
+            Ok(l) => maybe_attach_cost_event_sink(l, &config, cost_event_sink.clone()),
             Err(e) => {
                 tracing::warn!("Failed to create LLM client for workflow step '{step_title}': {e}");
                 if let Err(e2) = db.fail_workflow_step(step_id, &format!("{e}")) {
@@ -250,6 +254,28 @@ struct TaskExecContext {
     delivery_channel: Option<String>,
     delivery_target: Option<String>,
     config: Config,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
+}
+
+fn maybe_attach_cost_event_sink(
+    client: LlmClient,
+    config: &Config,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
+) -> LlmClient {
+    if !config.telemetry.cost_events {
+        return client;
+    }
+
+    match cost_event_sink {
+        Some(sink) => client.with_cost_event_sink(
+            sink,
+            CostEventContext {
+                session_id: String::new(),
+                kind: "chat".to_string(),
+            },
+        ),
+        None => client,
+    }
 }
 
 async fn execute_maintenance_task(ctx: &TaskExecContext) {
@@ -314,6 +340,7 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         delivery_channel,
         delivery_target,
         config,
+        cost_event_sink: _,
     } = ctx;
     let result = tokio::time::timeout(
         *timeout,
@@ -520,6 +547,7 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         delivery_channel,
         delivery_target,
         config,
+        cost_event_sink,
     } = ctx;
     let identity = cortex::identity::load_identity().unwrap_or_default();
     let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
@@ -536,8 +564,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         cortex::types::Message::user(task_prompt),
     ];
 
-    let llm = match cortex::llm::LlmClient::new(config) {
-        Ok(l) => l,
+    let llm = match LlmClient::new(config) {
+        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone()),
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
             match cortex::db::Database::open() {

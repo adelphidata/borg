@@ -191,6 +191,15 @@ top-down by priority, not by section order.
   cache creation/hit/miss counts per turn. We use Anthropic prompt
   caching but currently can't measure whether it's actually working.
 
+## Cost emission: additional providers
+
+- **Groq.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **Together.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **Fireworks.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **Bedrock.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **Vertex.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **Local models.** Emit `cost_usd_present = false` until a local-pricing policy exists.
+
 ### Tools & sub-agents
 
 - **`delegate` subagent tool.** `[H]` Spawn a child agent with

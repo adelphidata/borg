@@ -63,12 +63,12 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
     let hooks = scheduler::DispatcherHooks {
         spawn_task: Arc::new(|task, run_id, retry, sem, cfg| {
             Box::pin(async move {
-                task_runner::spawn_task_execution(task, run_id, retry, sem, cfg).await
+                task_runner::spawn_task_execution(task, run_id, retry, sem, cfg, None).await
             })
         }),
         spawn_workflow_step: Arc::new(|wf, step, prior, all, sem, cfg| {
             Box::pin(async move {
-                task_runner::spawn_workflow_step(wf, step, prior, all, sem, cfg).await
+                task_runner::spawn_workflow_step(wf, step, prior, all, sem, cfg, None).await
             })
         }),
         deliver_celebration: Arc::new(|cfg, c| {

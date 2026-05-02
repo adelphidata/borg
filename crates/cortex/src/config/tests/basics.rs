@@ -406,6 +406,7 @@ fn telemetry_config_defaults() {
     let cfg = TelemetryConfig::default();
     assert!(!cfg.tracing_enabled);
     assert!(!cfg.metrics_enabled);
+    assert!(!cfg.cost_events);
     assert_eq!(cfg.otlp_endpoint, "http://localhost:4317");
     assert_eq!(cfg.service_name, "borg");
     assert!((cfg.sampling_ratio - 1.0).abs() < f64::EPSILON);
@@ -417,6 +418,7 @@ fn telemetry_config_parsing() {
 [telemetry]
 tracing_enabled = true
 metrics_enabled = true
+cost_events = true
 otlp_endpoint = "http://otel:4317"
 service_name = "my-borg"
 sampling_ratio = 0.5
@@ -424,6 +426,7 @@ sampling_ratio = 0.5
     let cfg: Config = toml::from_str(toml_str).expect("should parse");
     assert!(cfg.telemetry.tracing_enabled);
     assert!(cfg.telemetry.metrics_enabled);
+    assert!(cfg.telemetry.cost_events);
     assert_eq!(cfg.telemetry.otlp_endpoint, "http://otel:4317");
     assert_eq!(cfg.telemetry.service_name, "my-borg");
     assert!((cfg.telemetry.sampling_ratio - 0.5).abs() < f64::EPSILON);

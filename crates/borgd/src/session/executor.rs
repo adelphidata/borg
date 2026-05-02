@@ -15,9 +15,12 @@ use crate::session::{
 use async_trait::async_trait;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
+use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
+use std::sync::Arc;
 use gateway::{InboundTurn, SessionExecutor};
 use tokio::sync::{broadcast, mpsc};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Daemon-side [`SessionExecutor`]. Cheap-to-clone via `Arc` from the gateway
@@ -27,18 +30,35 @@ pub struct DaemonSessionExecutor {
     registry: SessionRegistry,
     config: Config,
     metrics: BorgMetrics,
+    config_rx: Option<watch::Receiver<Config>>,
+    cost_event_sink: Option<Arc<dyn CostEventSink>>,
 }
 
 impl DaemonSessionExecutor {
     /// Build an executor wrapping `registry`. `config` and `metrics` are used
     /// only when a new [`SessionHost`] needs to be constructed; resumed hosts
     /// from the registry already carry their own `Agent`.
-    pub fn new(registry: SessionRegistry, config: Config, metrics: BorgMetrics) -> Self {
+    pub fn new(
+        registry: SessionRegistry,
+        config: Config,
+        metrics: BorgMetrics,
+        config_rx: Option<watch::Receiver<Config>>,
+        cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    ) -> Self {
         Self {
             registry,
             config,
             metrics,
+            config_rx,
+            cost_event_sink,
         }
+    }
+
+    fn current_config(&self) -> Config {
+        self.config_rx
+            .as_ref()
+            .map(|rx| rx.borrow().clone())
+            .unwrap_or_else(|| self.config.clone())
     }
 
     fn ensure_host(&self, session_key: &str) -> anyhow::Result<SessionHost> {
@@ -56,11 +76,46 @@ impl DaemonSessionExecutor {
         // resume_id — `Agent::load_session` falls back to a fresh session
         // when the id is unknown, which is the right behavior for the
         // first-ever inbound from this `(sender, thread)`.
-        let backend =
-            AgentBackend::new(self.config.clone(), self.metrics.clone(), Some(session_key))?;
+        let backend = AgentBackend::new(
+            self.current_config(),
+            self.metrics.clone(),
+            Some(session_key),
+            self.config_rx.clone(),
+            self.cost_event_sink.clone(),
+        )?;
         let host = SessionHost::new(backend);
         self.registry.insert(host.clone());
         Ok(host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_config_prefers_live_watcher_value_for_new_sessions() {
+        let mut startup = Config::default();
+        startup.llm.model = "startup-model".to_string();
+
+        let mut live = startup.clone();
+        live.llm.model = "live-model".to_string();
+
+        let (tx, rx) = watch::channel(startup.clone());
+        tx.send_replace(live.clone());
+
+        // Simulate an operator update that happened after executor startup.
+        // New hosts must see the watcher's current value immediately rather
+        // than waiting for a later has_changed() edge inside Agent.
+        let executor = DaemonSessionExecutor::new(
+            SessionRegistry::new(),
+            startup,
+            BorgMetrics::noop(),
+            Some(rx),
+            None,
+        );
+
+        assert_eq!(executor.current_config().llm.model, live.llm.model);
     }
 }
 

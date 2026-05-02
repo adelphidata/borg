@@ -43,6 +43,7 @@ pub struct AdminSvc {
     shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
     heartbeat_bus: Mutex<Option<HeartbeatBus>>,
     executor: Mutex<Option<Arc<DaemonSessionExecutor>>>,
+    config_notify_tx: Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
 }
 
 impl AdminSvc {
@@ -54,6 +55,7 @@ impl AdminSvc {
             shutdown_tx: Mutex::new(None),
             heartbeat_bus: Mutex::new(None),
             executor: Mutex::new(None),
+            config_notify_tx: Mutex::new(None),
         }
     }
 
@@ -92,6 +94,15 @@ impl AdminSvc {
             .executor
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(executor);
+        self
+    }
+
+    /// Wire the config watcher notifier used after setting changes.
+    pub fn with_config_notify_sender(self, tx: mpsc::Sender<cortex::config::Config>) -> Self {
+        *self
+            .config_notify_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
         self
     }
 }
@@ -247,6 +258,7 @@ impl Admin for AdminSvc {
         resolver
             .set(&req.key, &req.value)
             .map_err(|e| TStatus::invalid_argument(format!("set `{}` failed: {e}", req.key)))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
         Ok(Response::new(Empty {}))
     }
 
@@ -257,6 +269,7 @@ impl Admin for AdminSvc {
         resolver
             .unset(&key)
             .map_err(|e| TStatus::invalid_argument(format!("unset `{key}` failed: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
         Ok(Response::new(Empty {}))
     }
 
@@ -1392,6 +1405,28 @@ impl Admin for AdminSvc {
             label: row.label,
             revoked_at: row.revoked_at.unwrap_or(0) as u64,
         }))
+    }
+}
+
+fn notify_runtime_config_reload(
+    config_notify_tx: &Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
+) {
+    let tx = {
+        let guard = config_notify_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clone()
+    };
+    let Some(tx) = tx else {
+        return;
+    };
+    match cortex::config::Config::load_from_db() {
+        Ok(config) => {
+            if tx.try_send(config).is_err() {
+                tracing::debug!("config watcher notify queue full; poll loop will pick it up");
+            }
+        }
+        Err(e) => tracing::warn!("settings changed but config reload failed: {e}"),
     }
 }
 

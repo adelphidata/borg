@@ -166,6 +166,9 @@ define_settings! {
         // ── Debug ──
         "debug.llm_logging" => debug.llm_logging, parsed(bool);
 
+        // ── Telemetry ──
+        "telemetry.cost_events" => telemetry.cost_events, parsed(bool);
+
         // ── Audio ──
         "audio.enabled" => audio.enabled, parsed(bool);
         "audio.models" => audio.models, json_count("models");

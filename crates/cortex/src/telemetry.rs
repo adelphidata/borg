@@ -139,6 +139,8 @@ pub struct BorgMetrics {
     pub gateway_requests: Counter<u64>,
     /// Histogram of gateway request processing durations in seconds.
     pub gateway_duration: Histogram<f64>,
+    /// Counter for dropped cost events due to lagged stream consumers.
+    pub cost_events_dropped: Counter<u64>,
 }
 
 impl Default for BorgMetrics {
@@ -211,6 +213,10 @@ impl BorgMetrics {
                 .with_description("Gateway request processing duration in seconds")
                 .with_unit("s")
                 .build(),
+            cost_events_dropped: meter
+                .u64_counter("borg.telemetry.cost_events_dropped")
+                .with_description("Number of dropped cost events due to lagged consumers")
+                .build(),
         }
     }
 }
@@ -249,6 +255,7 @@ mod tests {
         metrics.tool_duration.record(0.1, &[]);
         metrics.gateway_requests.add(1, &[]);
         metrics.gateway_duration.record(0.2, &[]);
+        metrics.cost_events_dropped.add(1, &[]);
 
         // Dropping a noop guard must not panic or print.
         drop(TelemetryGuard::noop());
@@ -264,5 +271,6 @@ mod tests {
         let noop = BorgMetrics::from_config(&config);
         noop.llm_requests.add(5, &[]);
         noop.gateway_duration.record(0.01, &[]);
+        noop.cost_events_dropped.add(1, &[]);
     }
 }

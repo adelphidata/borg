@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package borg.telemetry.v1;
+
+service Telemetry {
+  rpc StreamCostEvents(Empty) returns (stream CostEvent);
+}
+
+message Empty {}
+
+message CostEvent {
+  string request_id = 1;
+  string session_id = 2;
+  string provider = 3;
+  string model = 4;
+  string cost_usd = 5;
+  bool cost_usd_present = 6;
+  string cost_source = 7;
+  uint32 prompt_tokens = 8;
+  uint32 completion_tokens = 9;
+  int64 timestamp_unix_ms = 10;
+  string kind = 11;
+}

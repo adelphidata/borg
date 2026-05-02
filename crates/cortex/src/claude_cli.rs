@@ -274,6 +274,7 @@ fn parse_jsonl_event(line: &str) -> Option<StreamEvent> {
                     cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
                     provider: "claude-cli".to_string(),
                     model: String::new(),
+                    provider_cost_usd: None,
                 })
             })
         }

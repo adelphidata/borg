@@ -32,6 +32,12 @@ pub mod admin {
     tonic::include_proto!("borg.admin.v1");
 }
 
+/// Telemetry streaming RPCs.
+pub mod telemetry {
+    #![allow(missing_docs, clippy::all)]
+    tonic::include_proto!("borg.telemetry.v1");
+}
+
 /// PKI / pairing / audit RPCs.
 pub mod pki {
     #![allow(missing_docs, clippy::all)]

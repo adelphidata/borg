@@ -229,6 +229,8 @@ fn install_global_executor() {
         shared_registry().clone(),
         Config::default(),
         BorgMetrics::noop(),
+        None,
+        None,
     ));
     session_executor::set_global(exec);
 }

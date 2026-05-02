@@ -1,5 +1,38 @@
 use super::*;
 use crate::types::{FunctionCall, ToolCall, ToolDefinition};
+use std::sync::{Arc, Mutex};
+
+#[derive(Default)]
+struct CollectingSink {
+    events: Mutex<Vec<CostEvent>>,
+}
+
+impl CollectingSink {
+    fn take(&self) -> Vec<CostEvent> {
+        let mut guard = self
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+}
+
+impl CostEventSink for CollectingSink {
+    fn emit(&self, event: CostEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event);
+    }
+}
+
+struct PanicSink;
+
+impl CostEventSink for PanicSink {
+    fn emit(&self, _event: CostEvent) {
+        panic!("intentional sink panic");
+    }
+}
 
 /// Helper to create an LlmClient with Anthropic provider for testing.
 /// Uses a unique env var to avoid races with parallel tests.
@@ -11,6 +44,34 @@ fn make_test_anthropic_client() -> LlmClient {
     config.llm.api_key_env = env_var.to_string();
     config.llm.model = "claude-sonnet-4".to_string();
     LlmClient::new(&config).unwrap()
+}
+
+fn make_test_openai_client() -> LlmClient {
+    let env_var = "BORG_TEST_OPENAI_LLM";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "gpt-4.1".to_string();
+    LlmClient::new(&config).unwrap()
+}
+
+fn make_test_openrouter_client(cost_events: bool) -> LlmClient {
+    let env_var = "BORG_TEST_OPENROUTER_LLM";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("openrouter".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "openai/gpt-4o-mini".to_string();
+    config.telemetry.cost_events = cost_events;
+    LlmClient::new(&config).unwrap()
+}
+
+fn cost_context() -> CostEventContext {
+    CostEventContext {
+        session_id: "session-123".to_string(),
+        kind: "chat".to_string(),
+    }
 }
 
 #[test]
@@ -76,6 +137,195 @@ fn air_gap_skips_public_cloud_fallback_slot() {
         client.provider_slots.is_empty(),
         "PublicCloud fallback must be dropped under air-gap"
     );
+}
+
+#[test]
+fn openrouter_cost_event_uses_usage_cost_verbatim() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "openrouter".to_string(),
+        model: "openai/gpt-4o-mini".to_string(),
+        provider_cost_usd: Some("0.000123".to_string()),
+    };
+
+    client.emit_cost_event_best_effort("req-1", Some(&usage), "openai/gpt-4o-mini");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].provider, "openrouter");
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0.000123"));
+    assert!(events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "openrouter_usage");
+}
+
+#[test]
+fn openrouter_missing_cost_emits_unknown_cost() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "openrouter".to_string(),
+        model: "openai/gpt-4o-mini".to_string(),
+        provider_cost_usd: None,
+    };
+
+    client.emit_cost_event_best_effort("req-2", Some(&usage), "openai/gpt-4o-mini");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_usd, None);
+    assert!(!events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "unknown");
+}
+
+#[test]
+fn openai_cost_event_uses_static_price_table() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_openai_client().with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "openai".to_string(),
+        model: "gpt-4.1".to_string(),
+        provider_cost_usd: None,
+    };
+
+    client.emit_cost_event_best_effort("req-3", Some(&usage), "gpt-4.1");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0.006"));
+    assert!(events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "table_openai");
+}
+
+#[test]
+fn anthropic_cost_event_uses_static_price_table() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_anthropic_client().with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4".to_string(),
+        provider_cost_usd: None,
+    };
+
+    client.emit_cost_event_best_effort("req-4", Some(&usage), "claude-sonnet-4");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0.0105"));
+    assert!(events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "table_anthropic");
+}
+
+#[test]
+fn anthropic_cost_event_prices_prompt_cache_reads_and_writes() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_anthropic_client().with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 800,
+        cache_creation_tokens: 400,
+        provider: "anthropic".to_string(),
+        model: "claude-sonnet-4".to_string(),
+        provider_cost_usd: None,
+    };
+
+    client.emit_cost_event_best_effort("req-4b", Some(&usage), "claude-sonnet-4");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0.01224"));
+    assert!(events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "table_anthropic");
+}
+
+#[test]
+fn unknown_openai_model_emits_unknown_cost() {
+    let sink = Arc::new(CollectingSink::default());
+    let client = make_test_openai_client().with_cost_event_sink(sink.clone(), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "openai".to_string(),
+        model: "missing-model".to_string(),
+        provider_cost_usd: None,
+    };
+
+    client.emit_cost_event_best_effort("req-5", Some(&usage), "missing-model");
+
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_usd, None);
+    assert!(!events[0].cost_usd_present);
+    assert_eq!(events[0].cost_source, "unknown");
+}
+
+#[test]
+fn openrouter_cost_opt_in_is_disabled_when_feature_is_off() {
+    let client = make_test_openrouter_client(false);
+    let request = ChatRequest {
+        model: client.provider.normalize_model(&client.llm_config.model),
+        messages: vec![Message::user("hi")],
+        tools: None,
+        temperature: client.llm_config.temperature,
+        max_tokens: client.llm_config.max_tokens,
+        stream: true,
+        reasoning_effort: None,
+        prompt_cache_key: None,
+        user: None,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        usage: (client.provider == Provider::OpenRouter && client.cost_events_enabled())
+            .then_some(UsageOptions { include: true }),
+    };
+    let json = serde_json::to_value(&request).unwrap();
+    assert!(json.get("usage").is_none());
+}
+
+#[test]
+fn sink_panic_is_caught_and_does_not_propagate() {
+    let client = make_test_openai_client().with_cost_event_sink(Arc::new(PanicSink), cost_context());
+    let usage = UsageData {
+        prompt_tokens: 1_000,
+        completion_tokens: 500,
+        total_tokens: 1_500,
+        cached_input_tokens: 0,
+        cache_creation_tokens: 0,
+        provider: "openai".to_string(),
+        model: "gpt-4.1".to_string(),
+        provider_cost_usd: None,
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.emit_cost_event_best_effort("req-6", Some(&usage), "gpt-4.1");
+    }));
+
+    assert!(result.is_ok(), "sink panic must not escape the LLM path");
 }
 
 #[test]
@@ -480,6 +730,7 @@ fn openai_request_includes_reasoning_effort() {
         prompt_cache_key: None,
         user: None,
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["reasoning_effort"], "high");
@@ -498,6 +749,7 @@ fn openai_request_omits_reasoning_effort_when_none() {
         prompt_cache_key: None,
         user: None,
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert!(json.get("reasoning_effort").is_none());
@@ -516,6 +768,7 @@ fn openai_request_serializes_prompt_cache_key_when_set() {
         prompt_cache_key: Some("sess-abc-123".to_string()),
         user: Some("sess-abc-123".to_string()),
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["prompt_cache_key"], "sess-abc-123");
@@ -535,6 +788,7 @@ fn openai_request_omits_prompt_cache_key_when_none() {
         prompt_cache_key: None,
         user: None,
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert!(json.get("prompt_cache_key").is_none());
@@ -560,6 +814,7 @@ fn openai_stream_request_serializes_include_usage() {
         stream_options: Some(StreamOptions {
             include_usage: true,
         }),
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["stream_options"]["include_usage"], true);
@@ -580,6 +835,7 @@ fn openai_nonstream_request_omits_stream_options() {
         prompt_cache_key: None,
         user: None,
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     assert!(json.get("stream_options").is_none());
@@ -734,6 +990,7 @@ fn openai_sanitizes_null_content_on_tool_call_messages() {
         prompt_cache_key: None,
         user: None,
         stream_options: None,
+        usage: None,
     };
     let json = serde_json::to_value(&request).unwrap();
     let msgs = json["messages"].as_array().unwrap();

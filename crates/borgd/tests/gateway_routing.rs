@@ -83,6 +83,8 @@ fn executor(registry: SessionRegistry) -> borgd::session::DaemonSessionExecutor 
         registry,
         cortex::config::Config::default(),
         cortex::telemetry::BorgMetrics::noop(),
+        None,
+        None,
     )
 }
 
@@ -179,6 +181,8 @@ async fn second_start_turn_reuses_existing_host() {
         registry.clone(),
         cortex::config::Config::default(),
         cortex::telemetry::BorgMetrics::noop(),
+        None,
+        None,
     );
 
     // First turn

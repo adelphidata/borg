@@ -522,6 +522,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 provider: "test".into(),
                 model: "model".into(),
+                provider_cost_usd: None,
             }),
             &mut tokens,
             &mut writes,

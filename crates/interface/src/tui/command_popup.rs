@@ -424,6 +424,7 @@ mod tests {
             "/history",
             "/logs",
             "/doctor",
+            "/dream",
             "/heal",
             "/stats",
             "/xp",
