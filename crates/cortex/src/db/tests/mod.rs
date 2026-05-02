@@ -43,6 +43,7 @@ mod delivery;
 mod maintenance;
 mod memory;
 mod meta;
+mod migrations;
 mod multi_agent;
 mod pairing;
 mod plugins;

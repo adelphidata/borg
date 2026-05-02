@@ -897,3 +897,207 @@ fn multiple_pending_celebrations_ordered() {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].payload_json, r#"{"id":2}"#);
 }
+
+// ── Atomic claim / unclaim ──
+
+#[test]
+fn claim_pending_celebrations_hides_rows_from_get_pending() {
+    let db = test_db();
+    db.insert_pending_celebration("evolution", r#"{"id":1}"#)
+        .unwrap();
+    db.insert_pending_celebration("evolution", r#"{"id":2}"#)
+        .unwrap();
+
+    let claimed = db.claim_pending_celebrations().unwrap();
+    assert_eq!(claimed.len(), 2, "claim should return both pending rows");
+
+    // After claim, get_pending_celebrations sees nothing — claim writes the
+    // -1 sentinel into delivered_at so duplicate delivery is impossible.
+    let still_pending = db.get_pending_celebrations().unwrap();
+    assert!(
+        still_pending.is_empty(),
+        "claimed rows must not appear pending"
+    );
+
+    // A second concurrent claim should now find nothing to deliver.
+    let second_claim = db.claim_pending_celebrations().unwrap();
+    assert!(
+        second_claim.is_empty(),
+        "double-claim must not return the same rows again"
+    );
+}
+
+#[test]
+fn unclaim_celebration_returns_row_to_pending() {
+    let db = test_db();
+    db.insert_pending_celebration("evolution", r#"{"id":42}"#)
+        .unwrap();
+
+    let claimed = db.claim_pending_celebrations().unwrap();
+    assert_eq!(claimed.len(), 1);
+    let id = claimed[0].id;
+
+    db.unclaim_celebration(id).unwrap();
+    let pending_again = db.get_pending_celebrations().unwrap();
+    assert_eq!(
+        pending_again.len(),
+        1,
+        "unclaim must return the row to pending state"
+    );
+    assert_eq!(pending_again[0].id, id);
+
+    // unclaim is gated on delivered_at = -1, so calling it again on a now-pending
+    // row is a no-op and must not duplicate or corrupt the row.
+    db.unclaim_celebration(id).unwrap();
+    let pending_again = db.get_pending_celebrations().unwrap();
+    assert_eq!(pending_again.len(), 1);
+}
+
+#[test]
+fn mark_delivered_after_claim_keeps_row_out_of_pending() {
+    let db = test_db();
+    db.insert_pending_celebration("evolution", r#"{}"#).unwrap();
+    let claimed = db.claim_pending_celebrations().unwrap();
+    db.mark_celebration_delivered(claimed[0].id).unwrap();
+
+    // A subsequent unclaim must NOT resurrect a row whose delivered_at is the
+    // real timestamp, only one with the -1 sentinel — proves the claim/deliver
+    // happy-path is durable.
+    db.unclaim_celebration(claimed[0].id).unwrap();
+    assert!(db.get_pending_celebrations().unwrap().is_empty());
+}
+
+// ── Chain integrity: corruption detection ──
+
+#[test]
+fn verify_event_chains_detects_tampered_vitals_event() {
+    let db = test_db();
+    let deltas = crate::vitals::deltas_for(crate::vitals::EventCategory::Success);
+    db.record_vitals_event("success", "real_event", &deltas, None)
+        .unwrap();
+
+    // Append-only triggers block UPDATE/DELETE but not INSERT, so an attacker
+    // who reaches the SQLite file can splice in a row with a forged HMAC.
+    // verify_event_chains MUST detect the broken link and report invalid.
+    let now = chrono::Utc::now().timestamp() + 1;
+    db.conn
+        .execute(
+            "INSERT INTO vitals_events (category, source, stability_delta, focus_delta,
+                sync_delta, growth_delta, happiness_delta, metadata_json, created_at,
+                hmac, prev_hmac)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                "success",
+                "forged",
+                1,
+                1,
+                0,
+                0,
+                1,
+                Option::<String>::None,
+                now,
+                "deadbeef_not_a_valid_hmac",
+                "wrong_prev_hmac_too",
+            ],
+        )
+        .unwrap();
+
+    let health = db.verify_event_chains();
+    assert!(
+        !health.vitals_valid,
+        "chain verification must flag a forged vitals event as invalid"
+    );
+    assert_eq!(
+        health.vitals_count, 2,
+        "both rows are loaded — invalidity is reported via chain_valid, not by hiding rows"
+    );
+    // Other domains untouched.
+    assert!(health.bond_valid && health.evolution_valid);
+}
+
+// ── Task-runs counter (used by self-healing & rate-limit dashboards) ──
+
+#[test]
+fn count_task_runs_since_filters_by_status() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.create_task(&simple_task(
+        "t1",
+        "t1",
+        "p",
+        "interval",
+        "1h",
+        Some(now + 3600),
+    ))
+    .unwrap();
+
+    // Insert task_runs of mixed status. Schema: id, task_id, started_at, ...
+    for (started_at, status) in [
+        (now - 30, "success"),
+        (now - 20, "failed"),
+        (now - 10, "success"),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, result, error, status)
+                 VALUES (?1, ?2, 0, NULL, NULL, ?3)",
+                rusqlite::params!["t1", started_at, status],
+            )
+            .unwrap();
+    }
+
+    let (succ, total) = db.count_task_runs_since(now - 60, Some("success")).unwrap();
+    assert_eq!((succ, total), (2, 3), "should count successes vs total");
+
+    // Cutoff after the failed run — only later successes remain.
+    let (succ, total) = db.count_task_runs_since(now - 15, Some("success")).unwrap();
+    assert_eq!((succ, total), (1, 1));
+
+    // No status filter → matching == total.
+    let (matching, total) = db.count_task_runs_since(now - 60, None).unwrap();
+    assert_eq!(matching, total);
+    assert_eq!(total, 3);
+}
+
+// ── Evolution: explicit session_id is queryable ──
+
+#[test]
+fn record_evolution_event_with_session_persists_session_id() {
+    let db = test_db();
+    db.record_evolution_event_with_session(
+        "xp_gain",
+        2,
+        Some("ops"),
+        "agent_hook",
+        None,
+        Some("sess_abc123"),
+    )
+    .unwrap();
+
+    let row: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT session_id FROM evolution_events ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        row.as_deref(),
+        Some("sess_abc123"),
+        "explicit session_id must land in its own column, not just metadata_json"
+    );
+
+    // Calling without session_id leaves the column NULL (via record_evolution_event).
+    db.record_evolution_event("xp_gain", 1, Some("ops"), "other_src", None)
+        .unwrap();
+    let row: Option<String> = db
+        .conn
+        .query_row(
+            "SELECT session_id FROM evolution_events ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(row.is_none(), "no session_id requested → column NULL");
+}
