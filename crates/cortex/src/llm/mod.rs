@@ -156,7 +156,11 @@ struct StreamUsage {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
     cached_tokens: Option<u64>,
-    #[serde(default)]
+    /// OpenRouter's streaming usage chunk reports the dollar total under
+    /// `total_cost`; older / non-streaming shapes use `cost`. Accept both
+    /// so cost-event attribution stays `openrouter_usage` instead of
+    /// silently regressing to `unknown` when the upstream field is renamed.
+    #[serde(default, alias = "total_cost")]
     cost: Option<serde_json::Value>,
 }
 

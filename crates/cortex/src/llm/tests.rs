@@ -191,6 +191,51 @@ fn openrouter_missing_cost_emits_unknown_cost() {
 }
 
 #[test]
+fn openrouter_sse_usage_total_cost_populates_provider_cost_usd() {
+    // Regression: OpenRouter's streaming usage chunk reports the dollar
+    // total under `total_cost` (not `cost`). The SSE parser must accept
+    // it so the cost-event emitter ends up with cost_source =
+    // "openrouter_usage" rather than falling through to "unknown".
+    use crate::sse::SseAction;
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"total_cost":0.000123}}"#;
+    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected usage emit"),
+    };
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u.clone()),
+            _ => None,
+        })
+        .expect("usage event must be emitted");
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000123"));
+}
+
+#[test]
+fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
+    // Negative case: when no cost field is present at all, the parser
+    // still emits a Usage event but with provider_cost_usd = None, which
+    // the emitter then attributes as cost_source = "unknown".
+    use crate::sse::SseAction;
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30}}"#;
+    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected usage emit"),
+    };
+    let usage = events
+        .iter()
+        .find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u.clone()),
+            _ => None,
+        })
+        .expect("usage event must be emitted");
+    assert_eq!(usage.provider_cost_usd, None);
+}
+
+#[test]
 fn openai_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
     let client = make_test_openai_client().with_cost_event_sink(sink.clone(), cost_context());
