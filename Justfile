@@ -107,6 +107,19 @@ run *args="":
 daemon *args="":
     cargo run --bin borgd -- {{args}}
 
+# Kill any running borgd + borg TUI from this repo's target/ so the next
+# `just daemon`/`just run` picks up the latest build. Path-scoped so we never
+# touch unrelated binaries (e.g. borgbackup's `borg` from Homebrew).
+stop:
+    -@if [ -f ~/.borg/borgd.pid ]; then kill "$(cat ~/.borg/borgd.pid)" 2>/dev/null; fi
+    -@pkill -f "{{justfile_directory()}}/target/[^ ]*/borgd?( |$)" 2>/dev/null
+    @i=0; while [ -e ~/.borg/borgd.pid ] && kill -0 "$(cat ~/.borg/borgd.pid)" 2>/dev/null; do \
+        i=$((i+1)); \
+        if [ $i -gt 50 ]; then kill -9 "$(cat ~/.borg/borgd.pid)" 2>/dev/null; break; fi; \
+        sleep 0.2; \
+    done
+    @echo "stopped"
+
 # Clean cargo target dirs (main + worktrees)
 clean:
     cargo clean
