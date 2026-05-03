@@ -9,6 +9,7 @@ use super::*;
 mod basics;
 mod channels;
 mod compaction_workflow;
+mod consolidation_settings;
 mod credentials;
 mod gateway;
 mod guards;

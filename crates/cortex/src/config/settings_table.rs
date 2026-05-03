@@ -346,6 +346,32 @@ define_settings! {
             Ok(format!("{key} = {kind}"))
         };
 
+        // consolidation.last_nightly / last_weekly: Option<i64> unix-epoch
+        // seconds, written by `consolidation::run_dream` via `db.set_setting`
+        // on every successful pass. Empty string clears to None; non-empty
+        // must parse as i64. Without these arms the resolver logged "Unknown
+        // setting" on every reload after the first Dream run.
+        "consolidation.last_nightly" => |s, key, value| {
+            if value.trim().is_empty() {
+                s.consolidation.last_nightly = None;
+                Ok(format!("{key} = (none)"))
+            } else {
+                let ts = crate::config::parse_value::<i64>(value, key)?;
+                s.consolidation.last_nightly = Some(ts);
+                Ok(format!("{key} = {ts}"))
+            }
+        };
+        "consolidation.last_weekly" => |s, key, value| {
+            if value.trim().is_empty() {
+                s.consolidation.last_weekly = None;
+                Ok(format!("{key} = (none)"))
+            } else {
+                let ts = crate::config::parse_value::<i64>(value, key)?;
+                s.consolidation.last_weekly = Some(ts);
+                Ok(format!("{key} = {ts}"))
+            }
+        };
+
         // skills.budget_pct: Option<f32> in [0.0, 1.0]; empty string clears to None
         "skills.budget_pct" => |s, key, value| {
             if value.trim().is_empty() {
@@ -385,6 +411,14 @@ define_settings! {
         "skills.budget_pct" => |c| match c.skills.budget_pct {
             Some(pct) => format!("{pct}"),
             None => "(none)".to_string(),
+        };
+        "consolidation.last_nightly" => |c| match c.consolidation.last_nightly {
+            Some(ts) => ts.to_string(),
+            None => String::new(),
+        };
+        "consolidation.last_weekly" => |c| match c.consolidation.last_weekly {
+            Some(ts) => ts.to_string(),
+            None => String::new(),
         };
     }
 

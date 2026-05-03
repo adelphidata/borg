@@ -1,3 +1,4 @@
+pub mod consolidation;
 pub mod data;
 pub mod gateway;
 pub mod llm;
@@ -12,6 +13,7 @@ pub mod update;
 #[cfg(test)]
 mod tests;
 
+pub use consolidation::*;
 pub use data::*;
 pub use gateway::*;
 pub use llm::*;
@@ -130,6 +132,9 @@ pub struct Config {
     /// Daemon-wide data retention + backup policy.
     #[serde(default)]
     pub data: DataConfig,
+    /// Memory-consolidation runtime state (last-run timestamps).
+    #[serde(default)]
+    pub consolidation: ConsolidationConfig,
     /// Self-update prompt state (skipped-version sentinel).
     #[serde(default)]
     pub update: UpdateConfig,
