@@ -294,6 +294,117 @@ description = "A test channel"
         assert!(registry.list_channels().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_skips_symlinked_subdirectory() {
+        // Two tempdirs: real channel lives in `external`, `dir` only contains a symlink to it.
+        // Security invariant: the registry must not register items reachable via symlink,
+        // because that would let an attacker plant a channel in any readable location.
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let real_channel = external.path().join("real");
+        std::fs::create_dir_all(&real_channel).unwrap();
+        std::fs::write(
+            real_channel.join("channel.toml"),
+            "name = \"real\"\ndescription = \"x\"\n",
+        )
+        .unwrap();
+
+        std::os::unix::fs::symlink(&real_channel, dir.path().join("via-symlink")).unwrap();
+
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert!(
+            registry.list_channels().is_empty(),
+            "symlinked dirs must not register"
+        );
+        assert!(registry.get("real").is_none());
+        assert!(registry.get("via-symlink").is_none());
+    }
+
+    #[test]
+    fn scan_skips_plain_files() {
+        // A loose file at the top level (matching the manifest filename or otherwise)
+        // is not a channel and must be ignored without error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("channel.toml"), "name = \"x\"\n").unwrap();
+        std::fs::write(dir.path().join("README"), "ignore me").unwrap();
+
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert!(registry.list_channels().is_empty());
+    }
+
+    #[test]
+    fn scan_skips_dirs_without_manifest_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join("not-a-channel");
+        std::fs::create_dir_all(&stray).unwrap();
+        // No channel.toml inside.
+        std::fs::write(stray.join("notes.txt"), "scratch").unwrap();
+
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert!(registry.list_channels().is_empty());
+        assert!(registry.get("not-a-channel").is_none());
+    }
+
+    #[test]
+    fn rescan_replaces_previous_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let chan_a = dir.path().join("a");
+        std::fs::create_dir_all(&chan_a).unwrap();
+        std::fs::write(
+            chan_a.join("channel.toml"),
+            "name = \"a\"\ndescription = \"x\"\n",
+        )
+        .unwrap();
+
+        let mut registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert!(registry.get("a").is_some());
+
+        // Replace channel `a` with channel `b` on disk.
+        std::fs::remove_dir_all(&chan_a).unwrap();
+        let chan_b = dir.path().join("b");
+        std::fs::create_dir_all(&chan_b).unwrap();
+        std::fs::write(
+            chan_b.join("channel.toml"),
+            "name = \"b\"\ndescription = \"y\"\n",
+        )
+        .unwrap();
+
+        registry.scan().unwrap();
+        assert!(registry.get("a").is_none(), "prior items must be cleared");
+        assert!(registry.get("b").is_some());
+        assert_eq!(registry.list_channels().len(), 1);
+    }
+
+    #[test]
+    fn multiple_channels_all_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in &["alpha", "beta", "gamma"] {
+            let cd = dir.path().join(name);
+            std::fs::create_dir_all(&cd).unwrap();
+            std::fs::write(
+                cd.join("channel.toml"),
+                format!("name = \"{name}\"\ndescription = \"d\"\n"),
+            )
+            .unwrap();
+        }
+
+        let registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(registry.list_channels().len(), 3);
+        for name in &["alpha", "beta", "gamma"] {
+            assert!(registry.get(name).is_some(), "missing {name}");
+        }
+
+        let names: std::collections::HashSet<_> = registry
+            .all_channels()
+            .map(|c| c.manifest.name.clone())
+            .collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains("alpha"));
+        assert!(names.contains("beta"));
+        assert!(names.contains("gamma"));
+    }
+
     #[test]
     fn channel_definitions_format() {
         let dir = tempfile::tempdir().unwrap();

@@ -257,6 +257,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn processes_in_strict_fifo_order_per_session() {
+        // The count-only existing test passes even if work is reordered.
+        // This one pins ordering: every item appends its index to a shared vec
+        // and yields, so a non-sequential consumer would interleave indices.
+        let observed = Arc::new(Mutex::new(Vec::<u32>::new()));
+
+        let queue = SessionQueue::new(10);
+
+        for i in 0..5u32 {
+            let obs = observed.clone();
+            queue
+                .enqueue(
+                    "channel:user:thread".to_string(),
+                    Box::pin(async move {
+                        // Yield so a concurrent consumer would have a chance to interleave.
+                        tokio::task::yield_now().await;
+                        obs.lock().await.push(i);
+                    }),
+                )
+                .await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let final_order = observed.lock().await.clone();
+        assert_eq!(final_order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn enqueue_returns_false_when_per_sender_quota_hit() {
+        // Session keys use the format "channel:sender:sub". The per-sender cap
+        // looks for the `:sender:` substring in any registered key.
+        let queue = SessionQueue::new(10);
+
+        // Block every consumer so the senders map stays at MAX_SESSIONS_PER_SENDER.
+        let gate = Arc::new(tokio::sync::Notify::new());
+
+        for i in 0..MAX_SESSIONS_PER_SENDER {
+            let g = gate.clone();
+            let accepted = queue
+                .enqueue(
+                    format!("chan:alice:{i}"),
+                    Box::pin(async move {
+                        g.notified().await;
+                    }),
+                )
+                .await;
+            assert!(accepted, "session #{i} for alice must be accepted");
+        }
+
+        // Give the spawned consumers a tick to actually register & block on the gate.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Alice's next session must be dropped.
+        let dropped = queue
+            .enqueue(
+                format!("chan:alice:{MAX_SESSIONS_PER_SENDER}"),
+                Box::pin(async {}),
+            )
+            .await;
+        assert!(
+            !dropped,
+            "alice past quota must be rejected, got accepted=true"
+        );
+
+        // A different sender is unaffected (proves the cap is per-sender, not global).
+        let bob = queue
+            .enqueue(
+                "chan:bob:0".to_string(),
+                Box::pin(async {
+                    // no-op
+                }),
+            )
+            .await;
+        assert!(bob, "bob's first session must be accepted");
+
+        // Release the blocked consumers so they can clean up before the test ends.
+        for _ in 0..MAX_SESSIONS_PER_SENDER {
+            gate.notify_one();
+        }
+    }
+
+    #[tokio::test]
     async fn coalesces_rapid_messages() {
         let call_count = Arc::new(AtomicU32::new(0));
 

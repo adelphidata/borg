@@ -58,7 +58,9 @@ impl RetryPolicy {
 }
 
 /// Exit code 4 from outbound scripts signals a permanent/non-retryable failure.
-const PERMANENT_FAILURE_EXIT_CODE: &str = "exited 4:";
+/// Matches the format produced by `sandbox::runner::run_sandboxed_script` —
+/// "Error (exit 4): ..." — surfaced via `bail!` in `ChannelExecutor::run_script`.
+const PERMANENT_FAILURE_EXIT_CODE: &str = "Error (exit 4)";
 
 /// Send an outbound message with automatic retries using exponential backoff.
 pub async fn send_with_retry(
@@ -166,6 +168,156 @@ mod tests {
             assert!(d >= prev, "attempt {attempt}: {d:?} < {prev:?}");
             prev = d;
         }
+    }
+
+    use crate::executor::ChannelExecutor;
+    use crate::manifest::ChannelManifest;
+
+    fn fast_policy(max_retries: u32) -> RetryPolicy {
+        RetryPolicy {
+            max_retries,
+            initial_delay_ms: 1,
+            max_delay_ms: 5,
+            backoff_factor: 2.0,
+            jitter_factor: 0.0,
+        }
+    }
+
+    fn manifest_with_outbound(outbound: &str) -> ChannelManifest {
+        toml::from_str(&format!(
+            "name = \"retry-test\"\ndescription = \"d\"\nruntime = \"bash\"\n\n[scripts]\ninbound = \"in.sh\"\noutbound = \"{outbound}\"\n"
+        ))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_retry_returns_success_on_first_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls");
+        write_executable(
+            &dir.path().join("out.sh"),
+            &format!(
+                "#!/bin/bash\necho one >> {counter}\necho ok\n",
+                counter = counter.display()
+            ),
+        );
+        let manifest = manifest_with_outbound("out.sh");
+        let executor = ChannelExecutor::new(&manifest, dir.path());
+
+        let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(3)).await;
+        match outcome {
+            RetryOutcome::Success(s) => assert!(s.contains("ok"), "stdout: {s}"),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(calls.lines().count(), 1, "must not retry on success");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_retry_returns_permanent_failure_on_exit_4_without_retrying() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls");
+        write_executable(
+            &dir.path().join("out.sh"),
+            &format!(
+                "#!/bin/bash\necho one >> {counter}\necho 'auth failed' >&2\nexit 4\n",
+                counter = counter.display()
+            ),
+        );
+        let manifest = manifest_with_outbound("out.sh");
+        let executor = ChannelExecutor::new(&manifest, dir.path());
+
+        // max_retries=5 — must still only invoke once because exit 4 is permanent.
+        let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(5)).await;
+        match outcome {
+            RetryOutcome::PermanentFailure(msg) => {
+                assert!(msg.contains("exit 4"), "msg: {msg}")
+            }
+            other => panic!("expected PermanentFailure, got {other:?}"),
+        }
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "exit 4 must short-circuit — no retries"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_retry_exhausts_after_max_retries_for_transient_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls");
+        write_executable(
+            &dir.path().join("out.sh"),
+            &format!(
+                "#!/bin/bash\necho one >> {counter}\necho 'transient' >&2\nexit 1\n",
+                counter = counter.display()
+            ),
+        );
+        let manifest = manifest_with_outbound("out.sh");
+        let executor = ChannelExecutor::new(&manifest, dir.path());
+
+        let policy = fast_policy(2);
+        let outcome = send_with_retry(&executor, "{}", &[], &policy).await;
+        match outcome {
+            RetryOutcome::Exhausted(msg) => assert!(!msg.is_empty()),
+            other => panic!("expected Exhausted, got {other:?}"),
+        }
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        // Initial attempt + max_retries retries.
+        assert_eq!(
+            calls.lines().count(),
+            (policy.max_retries as usize) + 1,
+            "must invoke max_retries + 1 times"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_retry_recovers_after_transient_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("calls");
+        // Script appends a marker per call; fails (exit 1) on the first call,
+        // succeeds (exit 0 with "ok") on every subsequent call.
+        write_executable(
+            &dir.path().join("out.sh"),
+            &format!(
+                "#!/bin/bash
+echo x >> {counter}
+n=$(wc -l < {counter} | tr -d ' ')
+if [ \"$n\" -lt 2 ]; then
+  echo 'first call failed' >&2
+  exit 1
+fi
+echo ok
+",
+                counter = counter.display()
+            ),
+        );
+        let manifest = manifest_with_outbound("out.sh");
+        let executor = ChannelExecutor::new(&manifest, dir.path());
+
+        let outcome = send_with_retry(&executor, "{}", &[], &fast_policy(3)).await;
+        match outcome {
+            RetryOutcome::Success(s) => assert!(s.contains("ok"), "stdout: {s}"),
+            other => panic!("expected Success after retry, got {other:?}"),
+        }
+        let calls = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            calls.lines().count(),
+            2,
+            "must retry exactly once before succeeding"
+        );
     }
 
     #[test]

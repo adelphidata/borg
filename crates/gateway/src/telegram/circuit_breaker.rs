@@ -78,4 +78,54 @@ mod tests {
         cb.record_failure(401);
         assert!(!cb.is_open());
     }
+
+    #[test]
+    fn mixed_failure_codes_only_count_401s() {
+        let cb = CircuitBreaker::new();
+        // Interleave non-401 errors that must NOT count toward the threshold.
+        for _ in 0..(FAILURE_THRESHOLD - 1) {
+            cb.record_failure(401);
+            cb.record_failure(500);
+            cb.record_failure(429);
+            cb.record_failure(403);
+        }
+        // Threshold-1 401s only — still closed despite many other errors.
+        assert!(!cb.is_open());
+        // The Nth 401 trips it.
+        cb.record_failure(401);
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn at_threshold_minus_one_is_still_closed() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..(FAILURE_THRESHOLD - 1) {
+            cb.record_failure(401);
+        }
+        assert!(!cb.is_open(), "must remain closed at threshold-1");
+        cb.record_failure(401);
+        assert!(cb.is_open(), "must open exactly at threshold");
+    }
+
+    #[test]
+    fn record_success_after_open_resets_counter() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..FAILURE_THRESHOLD {
+            cb.record_failure(401);
+        }
+        assert!(cb.is_open());
+
+        // record_success must clear both the open flag and the counter so the
+        // breaker behaves like a brand-new instance afterwards.
+        cb.record_success();
+        assert!(!cb.is_open());
+
+        // Threshold-1 401s should still leave it closed (proving the counter reset).
+        for _ in 0..(FAILURE_THRESHOLD - 1) {
+            cb.record_failure(401);
+        }
+        assert!(!cb.is_open());
+        cb.record_failure(401);
+        assert!(cb.is_open(), "should re-open only after a fresh threshold");
+    }
 }
