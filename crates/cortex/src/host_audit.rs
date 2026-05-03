@@ -41,18 +41,18 @@ const CATEGORY: &str = "Host Security";
 /// macOS `socketfilterfw` is not on `$PATH`. Use the absolute path Apple
 /// ships at instead — otherwise the firewall check always reports "could
 /// not check: No such file or directory" on a healthy system.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const MACOS_SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
 
 /// `pfctl` lives in `/sbin`, which is on the default PATH for most shells
 /// but not always for daemons spawned via `launchd`. Prefer the absolute
 /// path to make the check work in both contexts.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const MACOS_PFCTL: &str = "/sbin/pfctl";
 
 /// Concrete next-step block appended to the ALF-disabled warning so the
 /// heartbeat surfaces an actionable fix, not just the symptom.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const ALF_DISABLED_HINT: &str = "Next step: enable in System Settings → Network → Firewall, or run: sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on";
 
 // ---------------------------------------------------------------------------
@@ -544,7 +544,7 @@ fn run_cmd_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<St
 // Pure parsing functions (testable)
 // ===========================================================================
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn parse_macos_firewall(output: &str) -> CheckStatus {
     if output.contains("enabled") {
         CheckStatus::Pass
@@ -563,7 +563,7 @@ fn parse_macos_firewall(output: &str) -> CheckStatus {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn parse_pf_status(output: &str) -> CheckStatus {
     if output.contains("Status: Enabled") {
         CheckStatus::Pass
@@ -640,7 +640,7 @@ fn parse_ssh_config(content: &str) -> Vec<String> {
     issues
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn parse_fde_status(output: &str) -> CheckStatus {
     if output.contains("FileVault is On") {
         CheckStatus::Pass
@@ -654,7 +654,7 @@ fn parse_fde_status(output: &str) -> CheckStatus {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn parse_softwareupdate(output: &str) -> CheckStatus {
     if output.contains("No new software available") {
         CheckStatus::Pass
