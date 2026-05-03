@@ -79,10 +79,16 @@ pub fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result
         }
         "cancel" => {
             let task_id = require_str_param(args, "task_id")?;
+            if let Some(msg) = reject_system_task(task_id, "cancel") {
+                return Ok(msg);
+            }
             update_task_status(task_id, tasks::TASK_STATUS_CANCELLED, "cancelled")
         }
         "delete" => {
             let task_id = require_str_param(args, "task_id")?;
+            if let Some(msg) = reject_system_task(task_id, "delete") {
+                return Ok(msg);
+            }
             with_db(|db| match db.delete_task(task_id) {
                 Ok(true) => Ok(format!("Task {task_id} deleted.")),
                 Ok(false) => Ok(format!("Task {task_id} not found.")),
@@ -94,6 +100,29 @@ pub fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result
         other => Ok(format!(
             "Unknown action: {other}. Use: create, list, get, update, pause, resume, cancel, delete, runs, run_now."
         )),
+    }
+}
+
+/// Refuse destructive actions on system-seeded task rows (heartbeat,
+/// maintenance, consolidation, daily summary, security audit). These are
+/// re-seeded idempotently on migration; deleting them would leave the
+/// system without a heartbeat / maintenance loop until the next migration
+/// run. Returns `Some(error_string)` if the action should be refused.
+fn reject_system_task(task_id: &str, action: &str) -> Option<String> {
+    let is_system = task_id == crate::heartbeat_task::HEARTBEAT_TASK_ID
+        || task_id == crate::maintenance::MAINTENANCE_TASK_ID
+        || task_id == crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID
+        || task_id == crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID
+        || task_id == crate::daily_summary::DAILY_SUMMARY_TASK_ID;
+    if is_system {
+        Some(format!(
+            "Error: refusing to {action} system-seeded task {task_id}. \
+             System tasks (heartbeat, maintenance, consolidation, daily summary) \
+             are managed by configuration; pause via the relevant `*.enabled` \
+             setting instead."
+        ))
+    } else {
+        None
     }
 }
 
@@ -146,6 +175,13 @@ fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
         Err(e) => return Ok(format!("Error: Invalid schedule: {e}")),
     };
     let id = uuid::Uuid::new_v4().to_string();
+    if let Some(ch) = optional_str_param(args, "delivery_channel") {
+        if ch == crate::heartbeat_task::BROADCAST_DELIVERY {
+            return Ok(format!(
+                "Error: delivery_channel='{ch}' is reserved for system tasks; user tasks must target a single channel."
+            ));
+        }
+    }
     let (delivery_channel, delivery_target) = resolve_origin_delivery(
         optional_str_param(args, "delivery_channel").map(str::to_string),
         optional_str_param(args, "delivery_target").map(str::to_string),
@@ -513,6 +549,55 @@ mod tests {
         assert!(
             result.contains("Invalid schedule") || result.contains("Error"),
             "expected schedule error in: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_create_rejects_broadcast_delivery_channel() {
+        // The "broadcast" delivery_channel sentinel is reserved for the
+        // seeded heartbeat row (system-only multi-channel fanout). Users
+        // creating tasks via the schedule tool must target a single channel.
+        let args = json!({
+            "action": "create",
+            "name": "spam",
+            "prompt": "say hi",
+            "schedule_type": "interval",
+            "schedule_expr": "30m",
+            "delivery_channel": "broadcast",
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("reserved for system tasks"),
+            "expected broadcast-reserved error, got: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_delete_refuses_heartbeat_row() {
+        // Heartbeat row is system-seeded; deleting it would leave the daemon
+        // without a heartbeat until next migration. The tool must refuse.
+        let args = json!({
+            "action": "delete",
+            "task_id": crate::heartbeat_task::HEARTBEAT_TASK_ID,
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("refusing to delete") && result.contains("system-seeded"),
+            "expected system-seed refusal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_delete_refuses_maintenance_row() {
+        // Same protection covers all system task IDs, not just heartbeat.
+        let args = json!({
+            "action": "delete",
+            "task_id": crate::maintenance::MAINTENANCE_TASK_ID,
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("refusing to delete"),
+            "expected refusal, got: {result}"
         );
     }
 
