@@ -283,6 +283,44 @@ impl Database {
         Ok(rows)
     }
 
+    /// Scheduled tasks that currently carry a non-null `last_error`. These
+    /// are the tasks the heartbeat / system-prompt should surface as
+    /// "something failed last time it ran" — distinct from `find_stalled_tasks`
+    /// which targets schedule drift, not execution failure.
+    pub fn tasks_with_last_error(&self) -> Result<Vec<ScheduledTaskRow>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM scheduled_tasks \
+             WHERE last_error IS NOT NULL AND last_error != '' \
+             ORDER BY name ASC"
+        ))?;
+        let rows = stmt
+            .query_map([], Self::map_task_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Count `task_runs` rows with `status = 'failed'` newer than `since_ts`.
+    /// Used to ground heartbeat / system-prompt claims about recent failures
+    /// in real DB state instead of LLM freelancing.
+    pub fn count_failed_runs_since(&self, since_ts: i64) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE status = ?1 AND started_at >= ?2",
+            params![crate::tasks::RUN_STATUS_FAILED, since_ts],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Count `task_runs` rows with `status = 'completed'` (success) newer than `since_ts`.
+    pub fn count_successful_runs_since(&self, since_ts: i64) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM task_runs WHERE status = ?1 AND started_at >= ?2",
+            params![crate::tasks::RUN_STATUS_SUCCESS, since_ts],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Insert a `task_runs` row with `status = 'missed'` so the stall is
     /// visible in run history. `started_at` is the detection time, not the
     /// would-have-fired time (the latter is available on `scheduled_tasks.next_run`

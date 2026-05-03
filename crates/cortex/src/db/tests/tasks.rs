@@ -898,3 +898,199 @@ fn v34_seeds_memory_consolidation_tasks() {
         "unexpected weekly task name: {weekly_name}"
     );
 }
+
+// ── tasks_with_last_error / count_failed_runs_since ──
+//
+// These accessors back the heartbeat `task_health` augmenter and the
+// `<scheduled_tasks>` system-prompt snapshot. The heartbeat once
+// hallucinated "5 failed task runs sitting in the queue" with zero DB
+// grounding — the tests below pin the DB layer to real state so a regression
+// (e.g. accidentally counting non-failed runs, or missing tasks with
+// last_error set) shows up here, not in user-visible LLM output.
+
+#[test]
+fn tasks_with_last_error_empty_when_no_failures() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "healthy",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    let failing = db.tasks_with_last_error().expect("query");
+    assert!(
+        failing.is_empty(),
+        "no last_error set anywhere — expected empty, got {} rows",
+        failing.len()
+    );
+}
+
+#[test]
+fn tasks_with_last_error_returns_only_failing_tasks() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "healthy",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    db.create_task(&simple_task(
+        "t2",
+        "broken-a",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    db.create_task(&simple_task(
+        "t3",
+        "broken-b",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+
+    db.set_task_retry("t2", 1, "openrouter 429", 9999)
+        .expect("set t2 error");
+    db.set_task_retry("t3", 1, "timeout", 9999)
+        .expect("set t3 error");
+
+    let failing = db.tasks_with_last_error().expect("query");
+    let names: Vec<String> = failing.iter().map(|t| t.name.clone()).collect();
+    assert_eq!(failing.len(), 2, "expected 2 failing tasks, got {names:?}");
+    assert!(names.contains(&"broken-a".to_string()));
+    assert!(names.contains(&"broken-b".to_string()));
+    assert!(!names.contains(&"healthy".to_string()));
+}
+
+#[test]
+fn tasks_with_last_error_excludes_after_clear() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "broken",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    db.set_task_retry("t1", 1, "boom", 9999).expect("set");
+    assert_eq!(db.tasks_with_last_error().expect("query").len(), 1);
+
+    db.clear_task_retry("t1").expect("clear");
+    assert!(
+        db.tasks_with_last_error().expect("query").is_empty(),
+        "clearing retry must drop the row from tasks_with_last_error"
+    );
+}
+
+#[test]
+fn count_failed_runs_since_zero_when_empty() {
+    let db = test_db();
+    assert_eq!(db.count_failed_runs_since(0).expect("count"), 0);
+}
+
+#[test]
+fn count_failed_runs_since_counts_only_failed_status() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+
+    // 2 successful runs at t=1000, t=2000
+    db.record_task_run("t1", 1000, 100, Some("ok"), None)
+        .expect("record");
+    db.record_task_run("t1", 2000, 100, Some("ok"), None)
+        .expect("record");
+    // 3 failed runs at t=3000, t=4000, t=5000
+    db.record_task_run("t1", 3000, 100, None, Some("e1"))
+        .expect("record");
+    db.record_task_run("t1", 4000, 100, None, Some("e2"))
+        .expect("record");
+    db.record_task_run("t1", 5000, 100, None, Some("e3"))
+        .expect("record");
+
+    assert_eq!(
+        db.count_failed_runs_since(0).expect("count"),
+        3,
+        "since=0 should count all 3 failed runs and exclude successes"
+    );
+    assert_eq!(
+        db.count_successful_runs_since(0).expect("count"),
+        2,
+        "should not double-count failures as successes"
+    );
+}
+
+#[test]
+fn count_failed_runs_since_respects_time_window() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    db.record_task_run("t1", 1000, 100, None, Some("old"))
+        .expect("record");
+    db.record_task_run("t1", 5000, 100, None, Some("recent"))
+        .expect("record");
+
+    assert_eq!(db.count_failed_runs_since(0).expect("count"), 2);
+    assert_eq!(
+        db.count_failed_runs_since(2000).expect("count"),
+        1,
+        "since=2000 should exclude the t=1000 failure"
+    );
+    assert_eq!(
+        db.count_failed_runs_since(9999).expect("count"),
+        0,
+        "future cutoff should exclude everything"
+    );
+}
+
+#[test]
+fn count_failed_runs_excludes_missed_and_running() {
+    // Regression: missed and running runs are NOT failures. The heartbeat
+    // distinguishes "schedule drift" (missed) from "execution failure"
+    // (failed); conflating them would falsely inflate the failure count.
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task",
+        "prompt",
+        "interval",
+        "30m",
+        Some(100),
+    ))
+    .expect("create");
+    db.record_missed_run("t1", 1000, "stalled").expect("missed");
+    db.start_task_run("t1", 2000).expect("start running");
+    db.record_task_run("t1", 3000, 100, None, Some("real failure"))
+        .expect("record");
+
+    assert_eq!(
+        db.count_failed_runs_since(0).expect("count"),
+        1,
+        "only the genuinely-failed run should count"
+    );
+}

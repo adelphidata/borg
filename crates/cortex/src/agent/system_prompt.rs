@@ -230,6 +230,94 @@ impl Agent {
         )
     }
 
+    /// Build a `<scheduled_tasks>` snapshot for the dynamic suffix.
+    ///
+    /// Returns the empty string when there's nothing actionable — no failing
+    /// tasks and no recent failed runs. When the heartbeat's `task_health`
+    /// augmenter would fire, this section gives the *main user session* the
+    /// same ground truth so a follow-up like "tell me what the tasks are"
+    /// can be answered from real DB state instead of grepping source code.
+    ///
+    /// Regression context: heartbeat once said "5 failed task runs sitting
+    /// in the queue" and the agent had no idea what it meant on follow-up
+    /// because (a) the heartbeat ran in a separate session and (b) the
+    /// system prompt had zero visibility into the task queue.
+    pub(super) fn build_scheduled_tasks_section(&self) -> String {
+        let guard = self.db_guard();
+        let Some(db) = guard.as_ref() else {
+            return String::new();
+        };
+        render_scheduled_tasks_snapshot(db, chrono::Utc::now().timestamp())
+    }
+}
+
+/// Number of `task_runs` rows to inspect when summarizing 24h activity for
+/// the `<scheduled_tasks>` snapshot. 24h matches the heartbeat augmenter's
+/// window so the two surfaces stay in sync.
+pub(super) const SCHEDULED_TASKS_WINDOW_SECS: i64 = 24 * 60 * 60;
+/// Cap on per-task lines emitted into the snapshot to keep prompt size sane
+/// when many tasks are failing simultaneously.
+pub(super) const SCHEDULED_TASKS_MAX_LISTED: usize = 5;
+
+/// Pure formatter — extracted so the section can be unit-tested without
+/// constructing a full `Agent` (which requires sessions, metrics, etc.).
+pub(super) fn render_scheduled_tasks_snapshot(db: &crate::db::Database, now: i64) -> String {
+    let failing = match db.tasks_with_last_error() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("scheduled_tasks_section: tasks_with_last_error failed: {e}");
+            return String::new();
+        }
+    };
+    let recent_failed = db
+        .count_failed_runs_since(now - SCHEDULED_TASKS_WINDOW_SECS)
+        .unwrap_or(0);
+    let recent_success = db
+        .count_successful_runs_since(now - SCHEDULED_TASKS_WINDOW_SECS)
+        .unwrap_or(0);
+
+    if failing.is_empty() && recent_failed == 0 {
+        return String::new();
+    }
+
+    let mut s = String::from("\n<scheduled_tasks trust=\"db\">\n");
+    if !failing.is_empty() {
+        s.push_str(&format!(
+            "{} task(s) currently carry a last_error:\n",
+            failing.len()
+        ));
+        for task in failing.iter().take(SCHEDULED_TASKS_MAX_LISTED) {
+            let err = task
+                .last_error
+                .as_deref()
+                .unwrap_or("(unknown)")
+                .replace('\n', " ");
+            let err = if err.len() > 120 { &err[..120] } else { &err };
+            s.push_str(&format!(
+                "  - {} (id={}, last_error: \"{}\")\n",
+                task.name, task.id, err
+            ));
+        }
+        if failing.len() > SCHEDULED_TASKS_MAX_LISTED {
+            s.push_str(&format!(
+                "  … and {} more (truncated)\n",
+                failing.len() - SCHEDULED_TASKS_MAX_LISTED
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "task_runs in last 24h: {recent_success} succeeded, {recent_failed} failed\n"
+    ));
+    s.push_str(
+        "When the user references \"the tasks\" or asks about failures, answer from this \
+         list — do not invent counts or names. Use the `schedule` tool with action=\"runs\" \
+         and an `id` from above for run history.\n",
+    );
+    s.push_str("</scheduled_tasks>\n");
+    s
+}
+
+impl Agent {
     /// Build the `<collaboration_mode>` section from the current config.
     pub(super) fn build_collaboration_section(&self) -> String {
         let mode_template = match self.config.conversation.collaboration_mode {
@@ -313,5 +401,251 @@ impl Agent {
             trimmed.to_string()
         };
         format!("\n<active_memory trust=\"retrieved\">\n{truncated}\n</active_memory>\n")
+    }
+}
+
+#[cfg(test)]
+mod scheduled_tasks_snapshot_tests {
+    //! Tests for the `<scheduled_tasks>` system-prompt snapshot.
+    //!
+    //! Regression context: the heartbeat once produced "5 failed task runs
+    //! sitting in the queue" with zero DB grounding, and on follow-up the
+    //! agent had no idea what tasks the user meant — it grep'd source for
+    //! TODOs. The snapshot fixes that by feeding real DB state into every
+    //! main-session turn. These tests pin both directions:
+    //!   - **negative**: clean DB → no `<scheduled_tasks>` tag (no prompt bloat)
+    //!   - **positive**: failing tasks/runs → tag present with names, ids,
+    //!     errors, and counts that match DB rows verbatim.
+    use super::{
+        render_scheduled_tasks_snapshot, SCHEDULED_TASKS_MAX_LISTED, SCHEDULED_TASKS_WINDOW_SECS,
+    };
+    use crate::db::{Database, NewTask};
+    use rusqlite::Connection;
+
+    fn in_mem_db() -> Database {
+        Database::from_connection(Connection::open_in_memory().expect("open")).expect("init db")
+    }
+
+    fn make_task(db: &Database, id: &str, name: &str) {
+        db.create_task(&NewTask {
+            id,
+            name,
+            prompt: "noop",
+            schedule_type: "interval",
+            schedule_expr: "30m",
+            timezone: "UTC",
+            next_run: Some(0),
+            max_retries: Some(3),
+            timeout_ms: None,
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+        })
+        .expect("create task");
+    }
+
+    #[test]
+    fn snapshot_empty_when_no_failures() {
+        // Negative case: clean DB (only the seeded default tasks, none with
+        // last_error) must NOT emit a <scheduled_tasks> block. We don't want
+        // to bloat the system prompt for users with healthy schedules.
+        let db = in_mem_db();
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        assert!(
+            snap.is_empty(),
+            "expected empty snapshot on clean DB, got: {snap}"
+        );
+    }
+
+    #[test]
+    fn snapshot_emits_block_with_names_ids_and_errors() {
+        let db = in_mem_db();
+        make_task(&db, "task-a-id", "daily_summary");
+        make_task(&db, "task-b-id", "weekly_report");
+        db.set_task_retry("task-a-id", 1, "openrouter 429", 9999)
+            .expect("set");
+        db.set_task_retry("task-b-id", 1, "timeout reading model", 9999)
+            .expect("set");
+
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        assert!(snap.contains("<scheduled_tasks trust=\"db\">"), "{snap}");
+        // Names verbatim — so the LLM can resolve "the tasks" from the heartbeat.
+        assert!(snap.contains("daily_summary"), "missing name: {snap}");
+        assert!(snap.contains("weekly_report"), "missing name: {snap}");
+        // IDs verbatim — so the LLM can call `schedule action=runs id=...`.
+        assert!(snap.contains("task-a-id"), "missing id: {snap}");
+        assert!(snap.contains("task-b-id"), "missing id: {snap}");
+        // Errors verbatim — so the LLM can answer "what went wrong?".
+        assert!(snap.contains("openrouter 429"), "missing err: {snap}");
+        assert!(
+            snap.contains("timeout reading model"),
+            "missing err: {snap}"
+        );
+        // Real count.
+        assert!(
+            snap.contains("2 task(s) currently carry a last_error"),
+            "expected count line: {snap}"
+        );
+        // Anti-hallucination directive must be present.
+        assert!(
+            snap.contains("do not invent counts or names"),
+            "missing guard directive: {snap}"
+        );
+    }
+
+    #[test]
+    fn snapshot_window_filters_run_counts() {
+        let db = in_mem_db();
+        make_task(&db, "t1", "task1");
+        let now = 1_000_000_i64;
+
+        // Within 24h
+        db.record_task_run("t1", now - 60, 100, None, Some("e1"))
+            .expect("record");
+        db.record_task_run("t1", now - 120, 100, Some("ok"), None)
+            .expect("record");
+        // Outside 24h — must be excluded
+        db.record_task_run(
+            "t1",
+            now - SCHEDULED_TASKS_WINDOW_SECS - 1,
+            100,
+            None,
+            Some("ancient"),
+        )
+        .expect("record");
+
+        let snap = render_scheduled_tasks_snapshot(&db, now);
+        assert!(
+            snap.contains("task_runs in last 24h: 1 succeeded, 1 failed"),
+            "expected 24h-windowed counts: {snap}"
+        );
+        assert!(
+            !snap.contains("ancient"),
+            "leaked outside-window error: {snap}"
+        );
+    }
+
+    #[test]
+    fn snapshot_truncates_long_failure_list() {
+        let db = in_mem_db();
+        let total = SCHEDULED_TASKS_MAX_LISTED + 3;
+        for i in 0..total {
+            let id = format!("id-{i}");
+            let name = format!("task_{i}");
+            make_task(&db, &id, &name);
+            db.set_task_retry(&id, 1, "boom", 9999).expect("set");
+        }
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        // Header reflects the full count, not the truncated one.
+        assert!(
+            snap.contains(&format!("{total} task(s) currently carry a last_error")),
+            "header must report real total: {snap}"
+        );
+        // Truncation marker present with the right remainder.
+        assert!(
+            snap.contains(&format!(
+                "… and {} more (truncated)",
+                total - SCHEDULED_TASKS_MAX_LISTED
+            )),
+            "expected truncation marker: {snap}"
+        );
+    }
+
+    #[test]
+    fn snapshot_emits_when_only_recent_runs_failed() {
+        // Positive edge case: no scheduled_tasks.last_error set, but task_runs
+        // shows recent failures (e.g. a task that already cleared its
+        // last_error after success but had failures earlier in the window).
+        // The block should still surface the failed-runs count.
+        let db = in_mem_db();
+        make_task(&db, "t1", "fluky");
+        let now = 1_000_000_i64;
+        db.record_task_run("t1", now - 60, 100, None, Some("transient"))
+            .expect("record");
+
+        let snap = render_scheduled_tasks_snapshot(&db, now);
+        assert!(
+            !snap.is_empty(),
+            "should emit when there are recent failed runs even with no last_error set"
+        );
+        assert!(
+            snap.contains("0 succeeded, 1 failed"),
+            "expected failed-run count: {snap}"
+        );
+        // No "task(s) currently carry a last_error" line because none do.
+        assert!(
+            !snap.contains("carry a last_error"),
+            "should not claim last_error tasks when there are none: {snap}"
+        );
+    }
+
+    #[test]
+    fn snapshot_size_stays_bounded_under_worst_case() {
+        // Bloat guard: the snapshot ships in EVERY main-session system prompt
+        // when failures exist, so unbounded growth there is a per-turn token
+        // tax. Worst case = MAX_LISTED tasks each carrying a 120-char error.
+        // We pin the upper bound at 2KB (~500 tokens) — generous, but small
+        // enough that a future change adding a new field per row will trip
+        // this test before shipping.
+        let db = in_mem_db();
+        for i in 0..(SCHEDULED_TASKS_MAX_LISTED * 4) {
+            let id = format!("id-{i}");
+            let name = format!("task_with_a_reasonably_long_name_{i}");
+            make_task(&db, &id, &name);
+            db.set_task_retry(&id, 1, &"x".repeat(500), 9999)
+                .expect("set");
+        }
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        assert!(
+            snap.len() < 2048,
+            "snapshot must stay under 2KB even with many long-error tasks; got {} bytes:\n{snap}",
+            snap.len()
+        );
+    }
+
+    #[test]
+    fn snapshot_redacts_newlines_in_error_messages() {
+        // Defensive: a multi-line error message would otherwise break the
+        // single-line bullet format and confuse an LLM scanning the section.
+        let db = in_mem_db();
+        make_task(&db, "t1", "noisy");
+        db.set_task_retry("t1", 1, "line one\nline two\nline three", 9999)
+            .expect("set");
+        let snap = render_scheduled_tasks_snapshot(&db, 1_000_000);
+        let bullet = snap
+            .lines()
+            .find(|l| l.starts_with("  - noisy"))
+            .expect("bullet line missing");
+        assert!(
+            !bullet.contains('\n') && bullet.contains("line one line two line three"),
+            "newlines must be flattened to spaces in the bullet: {bullet}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scheduled_tasks_section_placement_tests {
+    //! Source-level guard: the snapshot must live in the dynamic suffix.
+    //! The `<scheduled_tasks>` block changes whenever the task queue changes,
+    //! so emitting it before the cache-stable prefix would invalidate prefix
+    //! caching on every turn for every user — a perf regression that's hard
+    //! to spot at runtime. This test pins it next to the other suffix calls.
+    const AGENT_RS_SRC: &str = include_str!("mod.rs");
+
+    #[test]
+    fn snapshot_call_lives_in_dynamic_suffix() {
+        let suffix_marker = AGENT_RS_SRC
+            .find("DYNAMIC SUFFIX")
+            .expect("DYNAMIC SUFFIX marker must exist in build_system_prompt");
+        let call_idx = AGENT_RS_SRC
+            .find("build_scheduled_tasks_section")
+            .expect("build_scheduled_tasks_section call must exist");
+        assert!(
+            call_idx > suffix_marker,
+            "build_scheduled_tasks_section must be invoked AFTER the DYNAMIC \
+             SUFFIX marker so it does not invalidate the prompt-cache prefix \
+             (call_idx={call_idx}, suffix_marker={suffix_marker})",
+        );
     }
 }

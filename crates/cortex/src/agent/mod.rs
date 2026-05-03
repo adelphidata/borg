@@ -1009,6 +1009,7 @@ impl Agent {
         system.push_str(&self.build_collaboration_section());
         system.push_str(&self.build_workflow_guidance_section());
         system.push_str(&self.build_environment_section().await);
+        system.push_str(&self.build_scheduled_tasks_section());
 
         // Inject first-conversation instructions from SETUP.md (created during onboarding)
         if let Ok(data_dir) = crate::config::Config::data_dir() {
