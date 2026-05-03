@@ -2,11 +2,11 @@ use chrono::NaiveTime;
 use chrono_tz::Tz;
 use cron::Schedule;
 use std::str::FromStr;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
-use cortex::config::HeartbeatConfig;
+use cortex::config::{Config, HeartbeatConfig};
 use cortex::tasks::parse_interval;
 
 /// Hard floor enforced regardless of `heartbeat.min_interval_secs`. A
@@ -77,8 +77,11 @@ pub struct HeartbeatScheduler {
     config: HeartbeatConfig,
     timezone: Tz,
     poke_rx: Option<mpsc::Receiver<()>>,
-    /// Parsed quiet hours (start, end) cached at construction time.
+    /// Parsed quiet hours (start, end), refreshed on every config reload.
     quiet_hours: Option<(NaiveTime, NaiveTime)>,
+    /// Optional live-reload subscription. When set, the run loop wakes on
+    /// `changed()` and applies the new `heartbeat.*` settings without restart.
+    config_rx: Option<watch::Receiver<Config>>,
 }
 
 impl HeartbeatScheduler {
@@ -90,7 +93,26 @@ impl HeartbeatScheduler {
             timezone,
             poke_rx: Some(poke_rx),
             quiet_hours,
+            config_rx: None,
         }
+    }
+
+    /// Subscribe the scheduler to live config updates. After this, changes to
+    /// `heartbeat.*` settings (interval, min_interval_secs, quiet hours) take
+    /// effect on the next reload tick without restarting the daemon.
+    ///
+    /// Live cron-expression changes and interval↔cron mode switches are NOT
+    /// supported — the active mode is whatever `run` chose at startup.
+    pub fn set_config_rx(&mut self, rx: watch::Receiver<Config>) {
+        self.config_rx = Some(rx);
+    }
+
+    /// Replace the active heartbeat config and re-parse quiet hours. Bad
+    /// quiet-hours input falls back to disabled (matching the constructor —
+    /// `parse_quiet_hours` logs the warning).
+    fn apply_config(&mut self, new_config: HeartbeatConfig) {
+        self.config = new_config;
+        self.quiet_hours = Self::parse_quiet_hours(&self.config);
     }
 
     fn parse_quiet_hours(config: &HeartbeatConfig) -> Option<(NaiveTime, NaiveTime)> {
@@ -116,6 +138,11 @@ impl HeartbeatScheduler {
     }
 
     /// Start the scheduler loop, emitting `Fire` events until cancellation.
+    ///
+    /// The interval/cron mode is decided once here at startup. Live-reload
+    /// (via `set_config_rx`) refreshes `heartbeat.*` values within the active
+    /// mode, but flipping `heartbeat.cron` between null and non-null still
+    /// requires a daemon restart.
     #[instrument(skip_all)]
     pub async fn run(mut self, tx: mpsc::Sender<HeartbeatEvent>, cancel: CancellationToken) {
         if let Some(ref cron_expr) = self.config.cron {
@@ -158,20 +185,42 @@ impl HeartbeatScheduler {
         }
     }
 
-    #[instrument(skip_all)]
-    async fn run_interval(&mut self, tx: mpsc::Sender<HeartbeatEvent>, cancel: CancellationToken) {
-        let mut interval =
-            parse_interval(&self.config.interval).unwrap_or(std::time::Duration::from_secs(1800));
-
+    /// Compute the clamped interval from the current config, logging when the
+    /// raw value is bumped to the floor.
+    fn clamped_interval(&self) -> std::time::Duration {
+        let raw = parse_interval(&self.config.interval)
+            .unwrap_or(std::time::Duration::from_secs(1800));
         let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);
-        if interval.as_secs() < min_secs {
+        if raw.as_secs() < min_secs {
             warn!(
                 "Heartbeat interval {}s is below minimum {}s, clamping",
-                interval.as_secs(),
+                raw.as_secs(),
                 min_secs
             );
-            interval = std::time::Duration::from_secs(min_secs);
+            std::time::Duration::from_secs(min_secs)
+        } else {
+            raw
         }
+    }
+
+    /// Await `changed()` on the given receiver, or pend forever if absent.
+    /// Returning `false` means the watch sender was dropped — caller should
+    /// drop the receiver to avoid a busy-loop on a closed channel.
+    ///
+    /// Free function rather than a `&mut self` method so callers can hold the
+    /// receiver in a local and still borrow other `self` fields concurrently
+    /// inside a `tokio::select!`.
+    async fn recv_config_change(rx: &mut Option<watch::Receiver<Config>>) -> bool {
+        match rx {
+            Some(rx) => rx.changed().await.is_ok(),
+            None => std::future::pending().await,
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn run_interval(&mut self, tx: mpsc::Sender<HeartbeatEvent>, cancel: CancellationToken) {
+        let mut config_rx = self.config_rx.take();
+        let interval = self.clamped_interval();
 
         info!("Heartbeat scheduler started (interval: {interval:?})");
         if let Some((start, end)) = self.quiet_hours {
@@ -196,6 +245,31 @@ impl HeartbeatScheduler {
                 _ = cancel.cancelled() => {
                     info!("Heartbeat scheduler shutting down");
                     return;
+                }
+                ok = Self::recv_config_change(&mut config_rx) => {
+                    if !ok {
+                        debug!("Heartbeat: config watch closed, disabling reload");
+                        config_rx = None;
+                        continue;
+                    }
+                    let new_hb = config_rx
+                        .as_ref()
+                        .map(|rx| rx.borrow().heartbeat.clone());
+                    if let Some(new_hb) = new_hb {
+                        self.apply_config(new_hb);
+                        let new_interval = self.clamped_interval();
+                        info!(
+                            "Heartbeat: config reload applied (interval: {new_interval:?})"
+                        );
+                        // Always rebuild the ticker on reload — cheap, and
+                        // resets the next tick from now (the desired UX when
+                        // the user just shortened the interval).
+                        ticker = tokio::time::interval(new_interval);
+                        ticker.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Skip,
+                        );
+                        ticker.tick().await; // Skip the immediate first tick again.
+                    }
                 }
                 _ = self.recv_poke() => {
                     // Poke signal — fire immediately, skip quiet hours (intentional poke)
@@ -263,12 +337,18 @@ impl HeartbeatScheduler {
             warn!("Failed to send SchedulerStarted event: {e}");
         }
 
+        // Move the watch receiver out of `self` so the select can borrow it
+        // independently of `self.poke_rx`. Restored before any fallback to
+        // `run_interval` so live-reload survives a cron-schedule exhaustion.
+        let mut config_rx = self.config_rx.take();
+
         loop {
             let now = chrono::Local::now();
             let next = match schedule.upcoming(chrono::Local).next() {
                 Some(t) => t,
                 None => {
                     tracing::error!("Cron schedule exhausted, falling back to interval mode");
+                    self.config_rx = config_rx;
                     self.run_interval(tx, cancel).await;
                     return;
                 }
@@ -283,6 +363,25 @@ impl HeartbeatScheduler {
                 _ = cancel.cancelled() => {
                     info!("Heartbeat scheduler shutting down");
                     return;
+                }
+                ok = Self::recv_config_change(&mut config_rx) => {
+                    if !ok {
+                        debug!("Heartbeat: config watch closed, disabling reload");
+                        config_rx = None;
+                        continue;
+                    }
+                    // TODO: live cron-expression reload + interval↔cron mode
+                    // switch. Today we only refresh quiet hours and config
+                    // values used at fire-time; changing `heartbeat.cron`
+                    // requires a daemon restart.
+                    let new_hb = config_rx
+                        .as_ref()
+                        .map(|rx| rx.borrow().heartbeat.clone());
+                    if let Some(new_hb) = new_hb {
+                        self.apply_config(new_hb);
+                        info!("Heartbeat: config reload applied (cron mode)");
+                    }
+                    continue;
                 }
                 _ = self.recv_poke() => {
                     debug!("Heartbeat: poke signal received, firing immediately");
@@ -336,6 +435,7 @@ mod tests {
             timezone: tz,
             poke_rx: Some(rx),
             quiet_hours,
+            config_rx: None,
         }
     }
 
@@ -1049,5 +1149,226 @@ mod tests {
         );
 
         cancel.cancel();
+    }
+
+    /// Build a Config wrapping the given heartbeat section. Other Config
+    /// fields default — only `heartbeat` matters for these reload tests.
+    fn config_with_heartbeat(hb: HeartbeatConfig) -> Config {
+        let mut cfg = Config::default();
+        cfg.heartbeat = hb;
+        cfg
+    }
+
+    fn hb_config(interval: &str, qh_start: Option<&str>, qh_end: Option<&str>) -> HeartbeatConfig {
+        HeartbeatConfig {
+            interval: interval.to_string(),
+            min_interval_secs: 1,
+            quiet_hours_start: qh_start.map(str::to_string),
+            quiet_hours_end: qh_end.map(str::to_string),
+            cron: None,
+            channels: Vec::new(),
+            recipients: std::collections::BTreeMap::new(),
+            ..Default::default()
+        }
+    }
+
+    /// Quiet hours go live: scheduler starts firing, then a config update
+    /// turns quiet hours on for the current virtual time and the next tick
+    /// is reported as Skipped(QuietHours) instead of Fire — without any
+    /// scheduler reconstruction.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_hours_live_reload_suppresses_next_tick() {
+        let hb = hb_config("60s", None, None);
+        let initial = config_with_heartbeat(hb.clone());
+        let (cfg_tx, cfg_rx) = watch::channel(initial);
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let mut scheduler = HeartbeatScheduler::new(hb, chrono_tz::UTC, poke_rx);
+        scheduler.set_config_rx(cfg_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // First tick fires normally.
+        tokio::time::advance(std::time::Duration::from_secs(62)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            other => panic!("expected initial Fire, got: {other:?}"),
+        }
+
+        // Push a config update that covers the full clock — next tick must skip.
+        let updated = config_with_heartbeat(hb_config("60s", Some("00:00"), Some("23:59")));
+        cfg_tx.send(updated).expect("send updated config");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(std::time::Duration::from_secs(62)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                reason: SkipReason::QuietHours,
+            })) => {}
+            other => panic!(
+                "expected Skipped(QuietHours) after live quiet-hours update, got: {other:?}"
+            ),
+        }
+        cancel.cancel();
+    }
+
+    /// Interval shortens live: a 60s scheduler picks up a 5s interval after
+    /// reload and fires within 6s of virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn interval_live_reload_shortens_cadence() {
+        let hb = hb_config("60s", None, None);
+        let (cfg_tx, cfg_rx) = watch::channel(config_with_heartbeat(hb.clone()));
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let mut scheduler = HeartbeatScheduler::new(hb, chrono_tz::UTC, poke_rx);
+        scheduler.set_config_rx(cfg_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // Live-update to a 5s interval.
+        let updated = config_with_heartbeat(hb_config("5s", None, None));
+        cfg_tx.send(updated).expect("send updated config");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // 6s of virtual time — under the original 60s, over the new 5s.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            other => panic!("expected Fire after 6s with live 5s interval, got: {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    /// Bad quiet-hours input on reload disables quiet hours — matches the
+    /// constructor's parse_quiet_hours behavior. Locks in "fall back to
+    /// disabled" rather than "retain previous valid value."
+    #[tokio::test(start_paused = true)]
+    async fn quiet_hours_bad_input_on_reload_disables() {
+        // Start with valid quiet hours covering everything → ticks would skip.
+        let hb = hb_config("60s", Some("00:00"), Some("23:59"));
+        let (cfg_tx, cfg_rx) = watch::channel(config_with_heartbeat(hb.clone()));
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let mut scheduler = HeartbeatScheduler::new(hb, chrono_tz::UTC, poke_rx);
+        scheduler.set_config_rx(cfg_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        tokio::task::yield_now().await;
+        drain_started(&mut fire_rx).await;
+
+        // Push a config with garbage quiet-hours start. Per parse_quiet_hours,
+        // both bounds are required and bad input disables the window entirely.
+        let updated = config_with_heartbeat(hb_config("60s", Some("garbage"), Some("23:59")));
+        cfg_tx.send(updated).expect("send updated config");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        // Next tick must Fire — quiet hours are disabled, NOT preserved from
+        // the previous valid config.
+        tokio::time::advance(std::time::Duration::from_secs(62)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        match fire_rx.try_recv() {
+            Ok(HeartbeatEvent::Fire) => {}
+            Ok(HeartbeatEvent::Result(HeartbeatResult::Skipped { reason })) => panic!(
+                "expected Fire after bad-input reload (quiet hours should be disabled), got Skipped({reason:?})"
+            ),
+            other => panic!("expected Fire after bad-input reload, got: {other:?}"),
+        }
+        cancel.cancel();
+    }
+
+    /// Cron mode also picks up live quiet-hours changes.
+    #[tokio::test]
+    async fn cron_quiet_hours_live_reload() {
+        // Use a 1s cron in a real (non-paused) tokio runtime — we need
+        // chrono::Local::now to advance for the cron schedule.
+        let mut hb = hb_config("30m", None, None);
+        hb.cron = Some("* * * * * *".to_string());
+        let (cfg_tx, cfg_rx) = watch::channel(config_with_heartbeat(hb.clone()));
+
+        let (_poke_tx, poke_rx) = mpsc::channel(1);
+        let (fire_tx, mut fire_rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+
+        let mut scheduler = HeartbeatScheduler::new(hb.clone(), chrono_tz::UTC, poke_rx);
+        scheduler.set_config_rx(cfg_rx);
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move { scheduler.run(fire_tx, cancel_clone).await });
+
+        // First event is SchedulerStarted (cron mode).
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), fire_rx.recv())
+            .await
+            .expect("timed out waiting for SchedulerStarted")
+            .expect("channel closed");
+        match event {
+            HeartbeatEvent::SchedulerStarted { mode } => assert!(mode.starts_with("cron")),
+            other => panic!("expected SchedulerStarted(cron), got: {other:?}"),
+        }
+
+        // Send live update enabling all-day quiet hours.
+        let mut updated = hb;
+        updated.quiet_hours_start = Some("00:00".to_string());
+        updated.quiet_hours_end = Some("23:59".to_string());
+        cfg_tx
+            .send(config_with_heartbeat(updated))
+            .expect("send updated config");
+
+        // Drain up to ~3s of events; we expect a Skipped(QuietHours) and no Fire.
+        let mut saw_skip = false;
+        let mut saw_fire = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), fire_rx.recv()).await
+            {
+                Ok(Some(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                    reason: SkipReason::QuietHours,
+                }))) => saw_skip = true,
+                Ok(Some(HeartbeatEvent::Fire)) => saw_fire = true,
+                Ok(_) | Err(_) => {}
+            }
+            if saw_skip {
+                break;
+            }
+        }
+        cancel.cancel();
+        assert!(
+            saw_skip,
+            "cron scheduler did not pick up live quiet-hours update (saw_fire={saw_fire})"
+        );
     }
 }

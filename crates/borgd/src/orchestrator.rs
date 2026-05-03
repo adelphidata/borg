@@ -76,11 +76,15 @@ pub fn start(
         registry,
         config.clone(),
         BorgMetrics::noop(),
-        Some(config_rx),
+        Some(config_rx.clone()),
         Some(cost_event_sink.clone()),
     ));
-    let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) =
-        heartbeat::spawn(config.clone(), executor.clone(), shutdown.clone());
+    let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
+        config.clone(),
+        executor.clone(),
+        shutdown.clone(),
+        config_rx,
+    );
 
     // Gateway with respawn supervisor.
     let gw_poke_tx = poke_tx.clone();

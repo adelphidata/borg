@@ -21,7 +21,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Why a heartbeat turn is running.
@@ -129,6 +129,7 @@ pub fn spawn(
     config: Config,
     executor: Arc<DaemonSessionExecutor>,
     shutdown: CancellationToken,
+    config_rx: watch::Receiver<Config>,
 ) -> (
     HeartbeatBus,
     mpsc::Sender<HeartbeatTrigger>,
@@ -139,7 +140,8 @@ pub fn spawn(
     let (poke_tx, poke_rx) = mpsc::channel::<()>(8);
 
     let tz = config.user_timezone();
-    let scheduler = HeartbeatScheduler::new(config.heartbeat.clone(), tz, poke_rx);
+    let mut scheduler = HeartbeatScheduler::new(config.heartbeat, tz, poke_rx);
+    scheduler.set_config_rx(config_rx.clone());
     let scheduler_cancel = shutdown.clone();
     tokio::spawn(async move {
         scheduler.run(hb_tx, scheduler_cancel).await;
@@ -148,10 +150,14 @@ pub fn spawn(
     let bus = HeartbeatBus::default();
     let bus_for_runner = bus.clone();
     let runner_cancel = shutdown;
-    let runner_config = config;
     let runner_executor = executor;
+    // Hold the watch receiver and re-borrow the latest `Config` per iteration
+    // so quiet-hours suppression on `Admin.Trigger`, dedup-window sizing, and
+    // channel delivery all see edits made via `Admin.SetSetting` immediately.
+    let mut runner_config_rx = config_rx;
     tokio::spawn(async move {
         loop {
+            let runner_config = runner_config_rx.borrow_and_update().clone();
             tokio::select! {
                 biased;
                 _ = runner_cancel.cancelled() => return,
@@ -197,6 +203,9 @@ pub fn spawn(
                         trigger,
                         &bus_for_runner,
                     ).await;
+                }
+                _ = runner_config_rx.changed() => {
+                    // Loop back so the next iteration re-borrows the fresh config.
                 }
             }
         }
