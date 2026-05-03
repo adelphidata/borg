@@ -586,6 +586,10 @@ impl PopupHandler for PluginsPopup {
     fn handle_paste_event(&mut self, text: &str) -> bool {
         self.handle_paste(text)
     }
+
+    fn wants_text_input(&self) -> bool {
+        matches!(self.phase, PluginPhase::CredentialInput { .. })
+    }
 }
 
 #[cfg(test)]
@@ -833,5 +837,35 @@ mod tests {
         assert_eq!(title_case("skill-creator"), "Skill Creator");
         assert_eq!(title_case("1password"), "1password");
         assert_eq!(title_case("google-calendar"), "Google Calendar");
+    }
+
+    /// Tokens/credentials commonly contain `/`. The global slash-interceptor
+    /// must defer to this predicate so a `/` mid-credential is NOT eaten by
+    /// the dispatcher (which would also throw away `collected` credentials
+    /// from prior services in the same install batch).
+    #[test]
+    fn wants_text_input_only_during_credential_input() {
+        use super::super::app::PopupHandler;
+        let mut popup = make_test_popup();
+        assert!(
+            !popup.wants_text_input(),
+            "Browsing the plugin list does not consume `/`"
+        );
+        // Drive into CredentialInput via the same key path users take.
+        let idx = popup
+            .items
+            .iter()
+            .position(|i| i.id == "messaging/telegram")
+            .expect("telegram plugin");
+        popup.items[idx].original_enabled = false;
+        popup.items[idx].toggled = false;
+        popup.cursor = idx;
+        press(&mut popup, KeyCode::Char(' '));
+        press(&mut popup, KeyCode::Enter);
+        assert!(matches!(popup.phase, PluginPhase::CredentialInput { .. }));
+        assert!(
+            popup.wants_text_input(),
+            "CredentialInput must claim text input — `/` belongs in tokens"
+        );
     }
 }

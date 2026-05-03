@@ -462,6 +462,10 @@ impl PopupHandler for ModelPopup {
     fn handle_paste_event(&mut self, text: &str) -> bool {
         self.handle_paste(text)
     }
+
+    fn wants_text_input(&self) -> bool {
+        matches!(self.step, Step::EnterApiKey { .. })
+    }
 }
 
 #[cfg(test)]
@@ -657,5 +661,22 @@ mod tests {
         assert!(provider_needs_key("anthropic"));
         assert!(!provider_needs_key("ollama"));
         assert!(!provider_needs_key("claude-cli"));
+    }
+
+    /// API keys frequently contain `/` (base64 tokens). The global
+    /// slash-interceptor must defer to this predicate so a stray `/` mid-key
+    /// doesn't dismiss the popup and leak a `/` into the composer.
+    #[test]
+    fn wants_text_input_only_in_enter_api_key_step() {
+        use super::super::app::PopupHandler;
+        let mut popup = make_popup();
+        assert!(!popup.wants_text_input(), "PickProvider does not need text");
+        popup.step = Step::EnterApiKey {
+            buffer: String::new(),
+        };
+        assert!(
+            popup.wants_text_input(),
+            "EnterApiKey must claim text input so `/` is preserved in tokens"
+        );
     }
 }

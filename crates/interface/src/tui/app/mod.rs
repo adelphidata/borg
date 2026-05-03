@@ -80,6 +80,13 @@ pub(super) trait PopupHandler {
     fn handle_paste_event(&mut self, _text: &str) -> bool {
         false
     }
+    /// True when the popup is currently in a free-text-input mode (API key,
+    /// cron expression, project name, etc.). Used by the global `/` fall-through
+    /// in `dispatch_key_to_popup` so we don't hijack `/` from legitimate input
+    /// like cron `*/5 * * * *` or paths/URLs in setting values.
+    fn wants_text_input(&self) -> bool {
+        false
+    }
 }
 
 pub enum AppState {
@@ -659,6 +666,36 @@ impl<'a> App<'a> {
         false
     }
 
+    /// Dismiss every routed popup. Used when a global key (e.g. `/`) needs to
+    /// reach the composer regardless of current popup state.
+    pub fn close_all_popups(&mut self) {
+        macro_rules! close {
+            ($self:ident, $popup:ident) => {
+                if $self.$popup.is_visible() {
+                    $self.$popup.dismiss();
+                }
+            };
+        }
+        for_each_routed_popup!(self, close);
+    }
+
+    /// True when any visible popup is currently in a free-text-input mode
+    /// (settings value editing, model API key entry, plugin credentials,
+    /// project name/description, schedule cron). The global `/` fall-through
+    /// must NOT fire while one of these is active — `/` is a valid character
+    /// in cron expressions, paths, URLs, and many credential formats.
+    pub fn any_popup_wants_text_input(&self) -> bool {
+        macro_rules! check {
+            ($self:ident, $popup:ident) => {
+                if $self.$popup.is_visible() && $self.$popup.wants_text_input() {
+                    return true;
+                }
+            };
+        }
+        for_each_routed_popup!(self, check);
+        false
+    }
+
     /// Whether the TUI currently wants an alt-screen surface.
     ///
     /// True when any of the large popups in the spec's "alt-screen wrap audit"
@@ -713,6 +750,23 @@ impl<'a> App<'a> {
         &mut self,
         key: crossterm::event::KeyEvent,
     ) -> Result<Option<AppAction>> {
+        // Slash is the global command-palette entry. When a non-text-input
+        // popup is open (e.g. Settings browsing list, Status overview),
+        // typing `/stats` would otherwise be silently dropped because popups
+        // have modal capture. Dismiss the popup and let `/` fall through to
+        // the composer.
+        //
+        // Skipped when a popup is in a text-input mode (cron `*/5`, API keys,
+        // paths, project names) — those need `/` as a literal character.
+        if matches!(key.code, crossterm::event::KeyCode::Char('/'))
+            && key.modifiers.is_empty()
+            && self.any_popup_visible()
+            && !self.any_popup_wants_text_input()
+        {
+            self.close_all_popups();
+            return Ok(None);
+        }
+
         // The macro expands to a chain of `if popup.is_visible() { return ... }`
         // blocks — one per popup. Writing it this way avoids the split-borrow
         // problem that blocks iterating an `&mut dyn PopupHandler` array when
@@ -2403,6 +2457,74 @@ mod tests {
         let data_dir = std::env::temp_dir().join("borg-test-any-popup");
         app.plugins_popup.show(&app.config, &data_dir);
         assert!(app.any_popup_visible());
+    }
+
+    /// Mirror of the per-popup `wants_text_input` tests at the App level:
+    /// no popup open, no popup wants text input.
+    #[test]
+    fn any_popup_wants_text_input_false_when_idle() {
+        let app = make_app();
+        assert!(!app.any_popup_wants_text_input());
+    }
+
+    /// Critical gating test: when a popup is in a text-input mode (cron `*/5`,
+    /// API key, path setting, etc.) the global `/` interceptor MUST NOT fire.
+    /// Otherwise `/` mid-input dismisses the popup and silently dumps a single
+    /// `/` into the composer — the original bug this fix could have introduced.
+    #[test]
+    fn slash_does_not_dismiss_popup_in_text_input_mode() {
+        let mut app = make_app();
+        let client = app.client.clone();
+        app.settings_popup.show(&app.config, &client);
+        app.settings_popup
+            .force_editing_for_test("cron */5".to_string());
+        assert!(app.any_popup_wants_text_input());
+
+        app.handle_key(key(KeyCode::Char('/'))).unwrap();
+
+        assert!(
+            app.settings_popup.is_visible(),
+            "popup must stay open while editing — `/` is a valid value char"
+        );
+        assert!(
+            app.composer.text().is_empty(),
+            "composer must NOT receive `/` — it belongs in the value buffer"
+        );
+    }
+
+    /// Regression: typing `/` while another popup is open must dismiss that
+    /// popup and reach the composer, so slash commands like `/stats` still
+    /// work without first hitting Esc. Previously the popup's modal capture
+    /// silently ate every keystroke.
+    #[test]
+    fn slash_dismisses_open_popup_and_falls_through_to_composer() {
+        let mut app = make_app();
+        let client = app.client.clone();
+        app.settings_popup.show(&app.config, &client);
+        assert!(app.settings_popup.is_visible());
+
+        app.handle_key(key(KeyCode::Char('/'))).unwrap();
+
+        assert!(
+            !app.settings_popup.is_visible(),
+            "settings popup should be dismissed by global slash"
+        );
+        assert_eq!(
+            app.composer.text(),
+            "/",
+            "slash should reach composer, not be swallowed by the popup"
+        );
+
+        // Confirm the slash command itself still routes to the Status popup
+        // (independent of typing mechanics — `try_handle_command` is the same
+        // dispatch path the composer reaches after Enter).
+        app.try_handle_command("/stats")
+            .expect("/stats handled")
+            .unwrap();
+        assert!(
+            app.status_popup.is_visible(),
+            "/stats should open the status popup"
+        );
     }
 
     #[test]

@@ -83,7 +83,7 @@ impl MigratePopup {
         self.error = None;
     }
 
-    fn dismiss(&mut self) {
+    pub fn dismiss(&mut self) {
         self.visible = false;
     }
 

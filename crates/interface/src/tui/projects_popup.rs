@@ -541,6 +541,10 @@ impl PopupHandler for ProjectsPopup {
     fn handle_paste_event(&mut self, text: &str) -> bool {
         self.handle_paste(text)
     }
+
+    fn wants_text_input(&self) -> bool {
+        matches!(self.phase, Phase::Creating { .. } | Phase::Editing { .. })
+    }
 }
 
 #[cfg(test)]
@@ -870,5 +874,29 @@ mod tests {
             }
             _ => panic!("expected Update action"),
         }
+    }
+
+    /// Project names and descriptions can contain `/` (`team/repo`, paths).
+    /// The global slash-interceptor must defer to this predicate so input
+    /// isn't truncated mid-name.
+    #[test]
+    fn wants_text_input_only_during_creating_or_editing() {
+        use super::super::app::PopupHandler;
+        let mut popup = make_popup_with_project("active");
+        assert!(
+            !popup.wants_text_input(),
+            "Browsing the project list does not consume `/`"
+        );
+        popup.phase = Phase::Creating {
+            step: CreateStep::Name,
+            name: String::new(),
+            buffer: String::new(),
+        };
+        assert!(popup.wants_text_input(), "Creating must claim text input");
+        popup.phase = Phase::Editing {
+            field: EditField::Name,
+            buffer: String::new(),
+        };
+        assert!(popup.wants_text_input(), "Editing must claim text input");
     }
 }

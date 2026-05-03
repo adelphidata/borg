@@ -395,6 +395,10 @@ impl PopupHandler for SchedulePopup {
     fn handle_paste_event(&mut self, text: &str) -> bool {
         self.handle_paste(text)
     }
+
+    fn wants_text_input(&self) -> bool {
+        matches!(self.phase, SchedulePhase::EditingSchedule { .. })
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +534,25 @@ mod tests {
     fn handle_paste_not_consumed_when_hidden() {
         let popup = &mut SchedulePopup::new();
         assert!(!popup.handle_paste("anything"));
+    }
+
+    /// Cron expressions use `/` constantly (`*/5 * * * *`). The global
+    /// slash-interceptor in App must defer to this predicate so EditingSchedule
+    /// keeps every typed `/`.
+    #[test]
+    fn wants_text_input_only_in_editing_schedule_phase() {
+        use super::super::app::PopupHandler;
+        let mut popup = make_popup_with_task("active");
+        assert!(
+            !popup.wants_text_input(),
+            "Browsing schedule list does not consume `/`"
+        );
+        popup.phase = SchedulePhase::EditingSchedule {
+            buffer: String::new(),
+        };
+        assert!(
+            popup.wants_text_input(),
+            "EditingSchedule must claim text input — cron uses `/`"
+        );
     }
 }

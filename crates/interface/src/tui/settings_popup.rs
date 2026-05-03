@@ -169,6 +169,14 @@ impl SettingsPopup {
         self.status_message = None;
     }
 
+    /// Force the popup into `Editing` mode. Test-only backdoor for verifying
+    /// that downstream logic (e.g. the global `/` interceptor in the App)
+    /// correctly defers to `wants_text_input()`.
+    #[cfg(test)]
+    pub(super) fn force_editing_for_test(&mut self, buffer: String) {
+        self.mode = EditMode::Editing { buffer };
+    }
+
     fn current_value(&self, config: &Config, key: &str) -> String {
         // Secret entries must never echo the raw value to the UI.
         if self.entry_for_key(key).map(|e| e.kind) == Some(SettingKind::Secret) {
@@ -932,6 +940,10 @@ impl PopupHandler for SettingsPopup {
 
     fn handle_paste_event(&mut self, text: &str) -> bool {
         self.handle_paste(text)
+    }
+
+    fn wants_text_input(&self) -> bool {
+        matches!(self.mode, EditMode::Editing { .. })
     }
 }
 
@@ -1709,5 +1721,27 @@ mod tests {
             }
             other => panic!("expected Editing, got {other:?}"),
         }
+    }
+
+    /// Guards the global slash-interceptor's gating predicate. `/` is a valid
+    /// character inside many setting values (paths, URLs, `OPENROUTER_API_KEY`-
+    /// style env names with no slashes are fine, but values like
+    /// `~/.config/foo` or regex blocked_paths are not). The interceptor must
+    /// not fire while the popup is collecting that input.
+    #[test]
+    fn wants_text_input_only_in_editing_mode() {
+        use super::super::app::PopupHandler;
+        let mut popup = SettingsPopup::new();
+        let cfg = Config::default();
+        open(&mut popup, &cfg);
+        assert!(
+            !popup.wants_text_input(),
+            "Browsing list of settings does not consume free text"
+        );
+        popup.force_editing_for_test("/etc/borg".to_string());
+        assert!(
+            popup.wants_text_input(),
+            "Editing a value buffer must claim text input so `/` is preserved"
+        );
     }
 }
