@@ -104,8 +104,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<BondAction>,
     },
-    /// Run diagnostics to check configuration, connectivity, and dependencies
-    Doctor,
+    /// Run diagnostics, or manage squelches with subcommands
+    Doctor {
+        #[command(subcommand)]
+        action: Option<commands::doctor::DoctorAction>,
+    },
     /// Manage the daemon as a system service
     Service {
         #[command(subcommand)]
@@ -157,6 +160,23 @@ enum Commands {
     Pairing {
         #[command(subcommand)]
         action: Option<PairingAction>,
+    },
+    /// List, show, enable, or disable agent skills
+    Skills {
+        #[command(subcommand)]
+        action: Option<commands::skills::SkillsAction>,
+    },
+    /// Read, write, search, and delete long-term memory entries
+    Memory {
+        #[command(subcommand)]
+        action: commands::memory::MemoryAction,
+    },
+    /// Run a one-shot self-heal sweep (logs, embeddings, stalled tasks)
+    Heal,
+    /// List or show stored sessions
+    Sessions {
+        #[command(subcommand)]
+        action: Option<commands::sessions::SessionsAction>,
     },
     /// Trigger an immediate heartbeat check-in
     #[command(alias = "wake")]
@@ -463,7 +483,13 @@ async fn async_main() -> Result<()> {
         }) => repl::one_shot(&message, json, mode.as_deref()).await?,
         Some(Commands::Status { action }) => commands::status::dispatch_status(action)?,
         Some(Commands::Bond { action }) => commands::status::dispatch_bond(action)?,
-        Some(Commands::Doctor) => commands::misc::run_doctor()?,
+        Some(Commands::Doctor { action }) => commands::doctor::dispatch_doctor(action)?,
+        Some(Commands::Skills { action }) => commands::skills::dispatch_skills(action)?,
+        Some(Commands::Memory { action }) => commands::memory::dispatch_memory(action)?,
+        Some(Commands::Heal) => commands::heal::run_heal().await?,
+        Some(Commands::Sessions { action }) => {
+            commands::sessions::dispatch_sessions(action).await?
+        }
         Some(Commands::Service { action }) => commands::misc::dispatch_service(action).await?,
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
@@ -1469,5 +1495,213 @@ mod tests {
     #[test]
     fn test_parse_export_requires_session_id() {
         assert!(Cli::try_parse_from(["borg", "export"]).is_err());
+    }
+
+    // ── Skills CLI parse tests ──
+
+    #[test]
+    fn test_parse_skills_list_default() {
+        let cli = Cli::try_parse_from(["borg", "skills"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skills { action: None })
+        ));
+    }
+
+    #[test]
+    fn test_parse_skills_enable_disable() {
+        let cli = Cli::try_parse_from(["borg", "skills", "enable", "git"]).unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                action: Some(commands::skills::SkillsAction::Enable { name }),
+            }) => assert_eq!(name, "git"),
+            _ => panic!("Expected Skills Enable"),
+        }
+        let cli = Cli::try_parse_from(["borg", "skills", "disable", "docker"]).unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                action: Some(commands::skills::SkillsAction::Disable { name }),
+            }) => assert_eq!(name, "docker"),
+            _ => panic!("Expected Skills Disable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_skills_show() {
+        let cli = Cli::try_parse_from(["borg", "skills", "show", "borg-cli"]).unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                action: Some(commands::skills::SkillsAction::Show { name }),
+            }) => assert_eq!(name, "borg-cli"),
+            _ => panic!("Expected Skills Show"),
+        }
+    }
+
+    // ── Memory CLI parse tests ──
+
+    #[test]
+    fn test_parse_memory_list_default_scope() {
+        let cli = Cli::try_parse_from(["borg", "memory", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::Memory {
+                action: commands::memory::MemoryAction::List { scope },
+            }) => assert_eq!(scope, "global"),
+            _ => panic!("Expected Memory List"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_write_requires_content_or_file() {
+        // Both omitted: clap accepts (mutually-exclusive args are optional);
+        // the runtime check rejects. This test pins the parse-level shape.
+        let cli = Cli::try_parse_from([
+            "borg",
+            "memory",
+            "write",
+            "global",
+            "notes",
+            "--content",
+            "hi",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Memory {
+                action:
+                    commands::memory::MemoryAction::Write {
+                        scope,
+                        name,
+                        content,
+                        file,
+                        append,
+                    },
+            }) => {
+                assert_eq!(scope, "global");
+                assert_eq!(name, "notes");
+                assert_eq!(content.as_deref(), Some("hi"));
+                assert!(file.is_none());
+                assert!(!append);
+            }
+            _ => panic!("Expected Memory Write"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_search() {
+        let cli =
+            Cli::try_parse_from(["borg", "memory", "search", "rust patterns", "--top-k", "5"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Memory {
+                action:
+                    commands::memory::MemoryAction::Search {
+                        query,
+                        scope,
+                        top_k,
+                    },
+            }) => {
+                assert_eq!(query, "rust patterns");
+                assert_eq!(scope, "global");
+                assert_eq!(top_k, 5);
+            }
+            _ => panic!("Expected Memory Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_memory_content_and_file_conflict() {
+        let err = Cli::try_parse_from([
+            "borg",
+            "memory",
+            "write",
+            "global",
+            "n",
+            "--content",
+            "x",
+            "--file",
+            "/tmp/x",
+        ]);
+        assert!(err.is_err(), "--content + --file must conflict");
+    }
+
+    // ── Heal / Sessions parse tests ──
+
+    #[test]
+    fn test_parse_heal() {
+        let cli = Cli::try_parse_from(["borg", "heal"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Heal)));
+    }
+
+    #[test]
+    fn test_parse_sessions_list_with_limit() {
+        let cli = Cli::try_parse_from(["borg", "sessions", "list", "--limit", "10"]).unwrap();
+        match cli.command {
+            Some(Commands::Sessions {
+                action: Some(commands::sessions::SessionsAction::List { limit }),
+            }) => assert_eq!(limit, 10),
+            _ => panic!("Expected Sessions List"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sessions_show() {
+        let cli = Cli::try_parse_from(["borg", "sessions", "show", "abc123"]).unwrap();
+        match cli.command {
+            Some(Commands::Sessions {
+                action: Some(commands::sessions::SessionsAction::Show { id }),
+            }) => assert_eq!(id, "abc123"),
+            _ => panic!("Expected Sessions Show"),
+        }
+    }
+
+    // ── Doctor squelch parse tests ──
+
+    #[test]
+    fn test_parse_doctor_squelch_with_ttl() {
+        let cli = Cli::try_parse_from([
+            "borg",
+            "doctor",
+            "squelch",
+            "Host Security",
+            "ALF",
+            "--ttl-days",
+            "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                action:
+                    Some(commands::doctor::DoctorAction::Squelch {
+                        category,
+                        name,
+                        ttl_days,
+                        reason,
+                    }),
+            }) => {
+                assert_eq!(category, "Host Security");
+                assert_eq!(name, "ALF");
+                assert_eq!(ttl_days, 7);
+                assert!(reason.is_none());
+            }
+            _ => panic!("Expected Doctor Squelch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_doctor_unsquelch_and_squelches() {
+        let cli =
+            Cli::try_parse_from(["borg", "doctor", "unsquelch", "Host Security", "PF"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                action: Some(commands::doctor::DoctorAction::Unsquelch { .. })
+            })
+        ));
+        let cli = Cli::try_parse_from(["borg", "doctor", "squelches"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Doctor {
+                action: Some(commands::doctor::DoctorAction::Squelches)
+            })
+        ));
     }
 }

@@ -67,6 +67,7 @@ macro_rules! bundled_skills {
 
 bundled_skills! {
     "skill-creator"  => "skill-creator"  { category: "core",      default_enabled: true,  hidden: false },
+    "borg-cli"       => "borg-cli"       { category: "core",      default_enabled: true,  hidden: false },
     "slack"          => "slack"          { category: "channels",  default_enabled: false, hidden: true  },
     "discord"        => "discord"        { category: "channels",  default_enabled: false, hidden: true  },
     "github"         => "github"         { category: "developer", default_enabled: true,  hidden: false },
@@ -1200,6 +1201,42 @@ Short body.
         for &(name, _) in BUNDLED_SKILLS {
             let skill_file = tmp.path().join("skills").join(name).join("SKILL.md");
             assert!(skill_file.exists(), "Missing: {}", skill_file.display());
+        }
+    }
+
+    #[test]
+    fn borg_cli_skill_is_registered_default_enabled_and_documents_self_config() {
+        // The borg-cli skill is the entry point for self-configuration —
+        // disabling it by default would silently strip Borg's ability to
+        // discover its own CLI from the system prompt.
+        assert!(is_builtin_skill_name("borg-cli"));
+        assert!(DEFAULT_ENABLED_SKILLS.contains(&"borg-cli"));
+
+        let content = bundled_skill_content("borg-cli").expect("borg-cli content embedded");
+        let (manifest, body) = parse_skill_md(content).expect("borg-cli SKILL.md parses");
+        assert_eq!(manifest.name, "borg-cli");
+        assert!(
+            !manifest.description.is_empty(),
+            "borg-cli must have a description so the loader can advertise it"
+        );
+
+        // The skill exists to teach Borg how to drive itself; if these key
+        // surfaces ever disappear from the body, callers asking "change a
+        // setting" / "enable a skill" / "remember this" will get nothing
+        // useful from this skill in their context.
+        for required in [
+            "borg settings set",
+            "borg skills",
+            "borg memory",
+            "borg tasks",
+            "borg heal",
+            "borg sessions",
+            "borg status",
+        ] {
+            assert!(
+                body.contains(required),
+                "borg-cli skill missing required CLI reference: {required}"
+            );
         }
     }
 
