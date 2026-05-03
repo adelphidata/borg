@@ -67,7 +67,7 @@ pub async fn spawn_task_execution(
     let delivery_channel = task.delivery_channel.clone();
     let delivery_target = task.delivery_target.clone();
     let schedule_type = task.schedule_type.clone();
-    let task_type = task.task_type;
+    let task_type = task.task_type.clone();
     let pre_run_command = task.pre_run_command.clone();
     let pre_run_cwd = task.pre_run_cwd.clone();
     let pre_run_timeout_ms = task.pre_run_timeout_ms;
@@ -122,6 +122,8 @@ pub async fn spawn_task_execution(
                 execute_command_task(&exec_ctx).await;
             } else if task_type == "maintenance" {
                 execute_maintenance_task(&exec_ctx).await;
+            } else if task_type == "heartbeat" {
+                execute_heartbeat_task(&exec_ctx, &task).await;
             } else if cortex::consolidation::is_consolidation_task_id(&task.id) {
                 execute_consolidation_task(&exec_ctx).await;
             } else {
@@ -704,6 +706,186 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
             .await;
         }
     }
+}
+
+/// Execute a `task_type="heartbeat"` row.
+///
+/// Unified dispatch path that replaces the legacy `crates/heartbeat/`
+/// parallel scheduler. The dispatcher claims the row the same way as any
+/// other scheduled task; by the time we get here the
+/// `bypass_quiet_hours_once` flag on `task` has already been consumed and
+/// reset in DB by `claim_due_tasks`. We use the captured value off `task`
+/// to decide whether quiet-hour / min-interval gates are skipped.
+///
+/// Suppression layers (in order):
+///   1. Quiet hours / min-interval — recorded as `task_runs(status='success', result=<reason>)`
+///   2. `[SILENT]` sentinel — primary suppression, set by the model
+///   3. Zero-info ack ("ok", "nothing new", …) — heartbeat-specific filter
+///   4. `last_response_hash` dedup — belt-and-suspenders if the model repeats
+///
+/// `bypass_quiet_hours_once == true` overrides #1 only. Model `[SILENT]`
+/// and dedup hash always apply.
+async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::ScheduledTaskRow) {
+    let TaskExecContext {
+        task_name,
+        task_id,
+        timeout,
+        run_id,
+        started_at_ms,
+        config,
+        cost_event_sink,
+        pre_run_command,
+        pre_run_cwd,
+        pre_run_timeout_ms,
+        ..
+    } = ctx;
+
+    let bypass = task.bypass_quiet_hours_once;
+    let now = chrono::Utc::now().timestamp();
+
+    if !bypass && crate::heartbeat::is_quiet_hours(config) {
+        record_heartbeat_skip(*run_id, *started_at_ms, "quiet_hours", task_name);
+        return;
+    }
+
+    if !bypass {
+        if let Some(min_interval) = task.min_interval_secs {
+            let last_success = match cortex::db::Database::open() {
+                Ok(db) => match db.task_run_history(task_id, 10) {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .find(|r| r.status == cortex::tasks::RUN_STATUS_SUCCESS)
+                        .map(|r| r.started_at),
+                    Err(e) => {
+                        tracing::warn!("Heartbeat: history lookup failed: {e}");
+                        None
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("Heartbeat: DB open for min-interval failed: {e}");
+                    None
+                }
+            };
+            if let Some(last) = last_success {
+                if now.saturating_sub(last) < min_interval {
+                    record_heartbeat_skip(*run_id, *started_at_ms, "min_interval", task_name);
+                    return;
+                }
+            }
+        }
+    }
+
+    let identity = cortex::identity::load_identity().unwrap_or_default();
+    let memory = cortex::memory::load_memory_context_db(4000).unwrap_or_default();
+    let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+    let system = format!(
+        "{identity}\n\n# Current Time\n{time}\n\n{memory}\n\n\
+         # Heartbeat\nYou are running a proactive heartbeat check-in. \
+         If nothing actionable changed, respond with exactly `{SILENT_SENTINEL}` \
+         on its own line to suppress delivery."
+    );
+
+    let mut user_msg = crate::heartbeat::build_scheduled_heartbeat_prompt(config);
+    if let Some(cmd) = pre_run_command.as_deref() {
+        let outcome = run_pre_run_command(cmd, pre_run_cwd.as_deref(), *pre_run_timeout_ms).await;
+        user_msg = format!("{}{user_msg}", render_pre_run_block(&outcome));
+    }
+
+    let messages = vec![
+        cortex::types::Message::system(system),
+        cortex::types::Message::user(&user_msg),
+    ];
+    let llm = match LlmClient::new(config) {
+        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone()),
+        Err(e) => {
+            record_heartbeat_failure(*run_id, *started_at_ms, &format!("{e}"), task_name);
+            return;
+        }
+    };
+    let result = tokio::time::timeout(*timeout, llm.chat(&messages, None)).await;
+    let response = match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            record_heartbeat_failure(*run_id, *started_at_ms, &format!("{e}"), task_name);
+            return;
+        }
+        Err(_) => {
+            record_heartbeat_failure(*run_id, *started_at_ms, "Heartbeat timed out", task_name);
+            return;
+        }
+    };
+
+    let duration_ms = chrono::Utc::now().timestamp_millis() - *started_at_ms;
+    let result_text = response.text_content().unwrap_or("").trim().to_string();
+
+    if is_silent_response(&result_text) {
+        record_heartbeat_silent(*run_id, duration_ms, "silent", task_name);
+        return;
+    }
+    if result_text.is_empty() || crate::heartbeat::is_zero_info_heartbeat(&result_text) {
+        record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name);
+        return;
+    }
+    let new_hash = response_hash(&result_text);
+    if task.last_response_hash.as_deref() == Some(new_hash.as_str()) {
+        record_heartbeat_silent(*run_id, duration_ms, "dedup_suppressed", task_name);
+        return;
+    }
+
+    if let Ok(db) = cortex::db::Database::open() {
+        if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&result_text), None) {
+            tracing::warn!("Heartbeat: failed to finalize run: {e}");
+        }
+        if let Err(e) = db.update_task_response_hash(task_id, Some(&new_hash)) {
+            tracing::warn!("Heartbeat: failed to persist last_response_hash: {e}");
+        }
+    }
+
+    let delivery_channel = ctx.delivery_channel.as_deref().unwrap_or("");
+    if delivery_channel == cortex::heartbeat_task::BROADCAST_DELIVERY {
+        crate::heartbeat::deliver_to_channels(config, &result_text).await;
+    } else if !delivery_channel.is_empty() {
+        if let Some(tgt) = ctx.delivery_target.as_deref() {
+            deliver_task_result(delivery_channel, tgt, task_name, &result_text, config).await;
+        }
+    }
+}
+
+fn response_hash(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
+    let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
+    if let Ok(db) = cortex::db::Database::open() {
+        if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(reason), None) {
+            tracing::warn!("Heartbeat '{task_name}': skip-record failed ({reason}): {e}");
+        }
+    }
+    tracing::info!(task = %task_name, reason, "heartbeat: skipped tick");
+}
+
+fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
+    if let Ok(db) = cortex::db::Database::open() {
+        if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(marker), None) {
+            tracing::warn!("Heartbeat '{task_name}': silent-record failed: {e}");
+        }
+    }
+    tracing::info!(task = %task_name, marker, "heartbeat: suppressed delivery");
+}
+
+fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, task_name: &str) {
+    let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
+    if let Ok(db) = cortex::db::Database::open() {
+        if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
+            tracing::warn!("Heartbeat '{task_name}': failure-record failed: {e}");
+        }
+    }
+    tracing::warn!(task = %task_name, error, "heartbeat: failed");
 }
 
 #[allow(clippy::too_many_arguments)]

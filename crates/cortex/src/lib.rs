@@ -63,8 +63,6 @@ pub mod constants;
 pub mod conversation;
 /// Daily summary generation from memory flush.
 pub mod daily_summary;
-/// Heartbeat task constants and helpers (seeded heartbeat row).
-pub mod heartbeat_task;
 /// SQLite database with versioned migrations.
 pub mod db;
 /// Diagnostic checks for `borg doctor`.
@@ -81,6 +79,8 @@ pub mod export;
 pub mod gateway_context;
 /// Git utilities: ghost commits, context enrichment, turn diff tracking.
 pub mod git;
+/// Heartbeat task constants and helpers (seeded heartbeat row).
+pub mod heartbeat_task;
 /// HMAC-SHA256 chain for tamper-proof event logs.
 pub mod hmac_chain;
 /// Lifecycle hook system for intercepting agent loop events.

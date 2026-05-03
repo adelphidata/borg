@@ -13,9 +13,7 @@ use anyhow::Result;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use gateway::{InboundTurn, SessionExecutor};
-use heartbeat::scheduler::{
-    HeartbeatEvent as SchedulerEvent, HeartbeatResult, HeartbeatScheduler, SkipReason,
-};
+use heartbeat::scheduler::{HeartbeatEvent as SchedulerEvent, HeartbeatResult, SkipReason};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,17 +133,19 @@ pub fn spawn(
     mpsc::Sender<HeartbeatTrigger>,
     mpsc::Sender<()>,
 ) {
-    let (hb_tx, mut hb_rx) = mpsc::channel::<SchedulerEvent>(32);
+    // V52 consolidation: scheduled heartbeat firings now flow through the
+    // unified scheduled-task dispatcher (`task_type="heartbeat"` row in
+    // `scheduled_tasks`). The legacy in-process `HeartbeatScheduler` timer
+    // is no longer spawned — leaving it running would double-fire on every
+    // tick. The trigger-channel loop below is preserved so TUI-initiated
+    // SessionStart greetings (which still need executor context) work.
+    let _ = config; // signature preserved for callers
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
-    let (poke_tx, poke_rx) = mpsc::channel::<()>(8);
-
-    let tz = config.user_timezone();
-    let mut scheduler = HeartbeatScheduler::new(config.heartbeat, tz, poke_rx);
-    scheduler.set_config_rx(config_rx.clone());
-    let scheduler_cancel = shutdown.clone();
-    tokio::spawn(async move {
-        scheduler.run(hb_tx, scheduler_cancel).await;
-    });
+    let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
+    // hb_rx exists only so the runner-loop's `select!` arm compiles; nothing
+    // ever sends on it post-V52, so the arm wakes up exactly once on close.
+    let (_hb_tx, mut hb_rx) = mpsc::channel::<SchedulerEvent>(1);
+    drop(_hb_tx);
 
     let bus = HeartbeatBus::default();
     let bus_for_runner = bus.clone();
@@ -424,7 +424,7 @@ pub async fn execute_heartbeat_turn(
 }
 
 /// Daemon variant of `is_zero_info_heartbeat` (kept in sync with cli's copy).
-fn is_zero_info_heartbeat(response: &str) -> bool {
+pub(crate) fn is_zero_info_heartbeat(response: &str) -> bool {
     const TRIVIAL_PATTERNS: &[&str] = &[
         "ok",
         "okay",
@@ -467,7 +467,7 @@ fn skip_reason_wire(reason: &SkipReason) -> &'static str {
     }
 }
 
-fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
+pub(crate) fn build_scheduled_heartbeat_prompt(config: &Config) -> String {
     let mut user_msg = "*heartbeat tick*".to_string();
     if let Some(cl) = cortex::memory::load_heartbeat_checklist() {
         user_msg.push_str("\n\n# Heartbeat Checklist\n");
@@ -560,7 +560,7 @@ fn open_heartbeat_db_for_nudges() -> Option<cortex::db::Database> {
     }
 }
 
-fn is_quiet_hours(config: &Config) -> bool {
+pub(crate) fn is_quiet_hours(config: &Config) -> bool {
     use chrono::{NaiveTime, Utc};
 
     let Some(start_str) = config.heartbeat.quiet_hours_start.as_deref() else {
@@ -587,7 +587,7 @@ fn is_quiet_hours(config: &Config) -> bool {
 }
 
 /// Send `text` to every channel listed in `config.heartbeat.channels`.
-async fn deliver_to_channels(config: &Config, text: &str) {
+pub(crate) async fn deliver_to_channels(config: &Config, text: &str) {
     for channel_name in &config.heartbeat.channels {
         if let Err(e) = deliver_to_channel(config, channel_name, text).await {
             tracing::warn!("Heartbeat delivery to {channel_name} failed: {e}");
@@ -635,6 +635,40 @@ fn resolve_recipients(config: &Config, channel_name: &str) -> Result<Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V52 invariant: `heartbeat::spawn` MUST NOT spawn the legacy
+    /// `HeartbeatScheduler::run` timer. Scheduled heartbeat firings now flow
+    /// through the unified scheduled-task dispatcher
+    /// (`task_type="heartbeat"`); leaving the legacy timer running would
+    /// double-fire on every tick. Source-grep guard so a future refactor
+    /// can't silently re-introduce the parallel loop. Pairs with the TUI
+    /// mouse-capture invariant guards.
+    #[test]
+    fn heartbeat_spawn_does_not_run_legacy_scheduler() {
+        // Build the forbidden patterns at runtime so this guard test's own
+        // source text doesn't trip the grep against itself.
+        let scheduler_run = ["scheduler", "run("].join(".");
+        let scheduler_new = ["HeartbeatScheduler", "new("].join("::");
+        let src = include_str!("heartbeat.rs");
+        // Strip this test's own body before searching so its mention of the
+        // patterns inside string literals doesn't false-positive.
+        let test_marker = "fn heartbeat_spawn_does_not_run_legacy_scheduler";
+        let scan = match src.find(test_marker) {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        assert!(
+            !scan.contains(&scheduler_run),
+            "heartbeat::spawn must not invoke the legacy timer — V52 routes \
+             scheduled firings through the task dispatcher; the parallel loop \
+             would double-fire on every tick"
+        );
+        assert!(
+            !scan.contains(&scheduler_new),
+            "heartbeat::spawn must not construct the legacy scheduler — the \
+             seeded heartbeat row owns the schedule under V52"
+        );
+    }
 
     #[test]
     fn zero_info_recognizes_trivial_acks() {

@@ -108,6 +108,10 @@ impl AdminSvc {
 #[tonic::async_trait]
 impl Admin for AdminSvc {
     async fn poke(&self, _req: Request<Empty>) -> Result<Response<Empty>, TStatus> {
+        // /poke routes through the in-process trigger channel so the heartbeat
+        // turn runs on the existing `DaemonSessionExecutor` (with hooks, vitals,
+        // evolution wiring). The unified dispatcher (`task_type="heartbeat"`)
+        // owns *scheduled* firings only — the legacy timer was removed in V52.
         let tx = {
             let g = self
                 .heartbeat_trigger_tx
@@ -151,6 +155,9 @@ impl Admin for AdminSvc {
         };
         let tx =
             tx.ok_or_else(|| TStatus::failed_precondition("no heartbeat scheduler is wired"))?;
+        // TriggerHeartbeat (both Scheduled and SessionStart) routes through
+        // the in-process channel for executor-backed turns. The new
+        // task_type="heartbeat" dispatcher fires scheduled cadence only.
         tx.send(HeartbeatTrigger {
             source,
             bypass_quiet_hours: req.bypass_quiet_hours,

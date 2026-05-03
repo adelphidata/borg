@@ -121,6 +121,9 @@ define_settings! {
         "heartbeat.session_start_throttle_minutes" => heartbeat.session_start_throttle_minutes, parsed(u32);
         "heartbeat.last_fired_at" => heartbeat.last_fired_at, parsed(i64);
         "heartbeat.min_interval_secs" => heartbeat.min_interval_secs, parsed(u64);
+        "heartbeat.pre_run_command" => heartbeat.pre_run_command, string;
+        "heartbeat.pre_run_cwd" => heartbeat.pre_run_cwd, string;
+        "heartbeat.pre_run_timeout_ms" => heartbeat.pre_run_timeout_ms, parsed(u64);
 
         // ── User ──
         "user.name" => user.name, opt_string;

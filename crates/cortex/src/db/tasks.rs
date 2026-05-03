@@ -582,5 +582,4 @@ impl Database {
         )?;
         Ok(())
     }
-
 }

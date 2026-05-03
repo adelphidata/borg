@@ -382,6 +382,17 @@ pub struct HeartbeatConfig {
     /// smorgasborg eval harness exercise real scheduler timing without
     /// burning ≥60s of wall time per assertion.
     pub min_interval_secs: u64,
+    /// Optional shell preamble run before each heartbeat firing. When
+    /// non-empty, stdout is injected into the LLM prompt as a
+    /// `<preprocessed_context>` block (Hermes-style fail-soft: a non-zero
+    /// exit / timeout / spawn failure still lets the LLM run, but the block
+    /// reflects the failure). Empty string disables — no block is added.
+    /// Mirrors the `pre_run_command` field on user-level scheduled tasks.
+    pub pre_run_command: String,
+    /// Working directory for `pre_run_command`. Empty defaults to `$HOME`.
+    pub pre_run_cwd: String,
+    /// Timeout in milliseconds for `pre_run_command`. Default 60_000.
+    pub pre_run_timeout_ms: u64,
 }
 
 impl Default for HeartbeatConfig {
@@ -397,6 +408,9 @@ impl Default for HeartbeatConfig {
             session_start_throttle_minutes: 30,
             last_fired_at: 0,
             min_interval_secs: crate::constants::MIN_HEARTBEAT_INTERVAL_SECS,
+            pre_run_command: String::new(),
+            pre_run_cwd: String::new(),
+            pre_run_timeout_ms: 60_000,
         }
     }
 }

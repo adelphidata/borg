@@ -1234,3 +1234,109 @@ fn create_task_persists_and_reads_back_pre_run_fields() {
     assert_eq!(task.pre_run_cwd.as_deref(), Some("/tmp"));
     assert_eq!(task.pre_run_timeout_ms, 15_000);
 }
+
+// ── V52 heartbeat consolidation regression guards ──
+
+/// V52 seeds exactly one heartbeat row keyed by the fixed UUID. Re-opening
+/// the DB must not duplicate it (idempotent INSERT OR IGNORE). Fails if the
+/// seed re-runs and creates a second row, or never runs at all.
+#[test]
+fn v52_seeds_exactly_one_heartbeat_row() {
+    let db = test_db();
+    let rows = db.list_tasks().expect("list");
+    let hb: Vec<_> = rows.iter().filter(|t| t.task_type == "heartbeat").collect();
+    assert_eq!(hb.len(), 1, "expected exactly one heartbeat-typed row");
+    assert_eq!(
+        hb[0].id,
+        crate::heartbeat_task::HEARTBEAT_TASK_ID,
+        "heartbeat row must use the fixed system UUID"
+    );
+    assert_eq!(
+        hb[0].delivery_channel.as_deref(),
+        Some(crate::heartbeat_task::BROADCAST_DELIVERY),
+        "heartbeat row must have broadcast delivery for multi-channel fanout"
+    );
+    assert!(
+        hb[0].min_interval_secs.is_some(),
+        "heartbeat row must have min_interval_secs populated"
+    );
+}
+
+/// `bypass_quiet_hours_once` is a one-shot flag — `claim_due_tasks` must
+/// clear it atomically inside the same `BEGIN IMMEDIATE` transaction that
+/// claims the row. Without this, a concurrent second poke after the read
+/// but before the clear would see `bypass=1` and be a no-op (silently
+/// losing the user's override). The fix ships in `claim_due_tasks_inner`.
+#[test]
+fn claim_due_tasks_clears_bypass_quiet_hours_once() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.create_task(&NewTask {
+        id: "bypass-task",
+        name: "bypass test",
+        prompt: "p",
+        schedule_type: "interval",
+        schedule_expr: "1h",
+        timezone: "UTC",
+        next_run: Some(now - 1),
+        max_retries: Some(0),
+        timeout_ms: Some(1000),
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
+        min_interval_secs: None,
+    })
+    .expect("create");
+
+    db.set_task_bypass_quiet_hours_once("bypass-task", true)
+        .expect("set bypass");
+    let pre = db.get_task_by_id("bypass-task").unwrap().unwrap();
+    assert!(pre.bypass_quiet_hours_once, "bypass should be set");
+
+    let claimed = db.claim_due_tasks(now).expect("claim");
+    assert!(
+        claimed.iter().any(|c| c.task.id == "bypass-task"),
+        "task should have been claimed"
+    );
+    let claimed_task = claimed.iter().find(|c| c.task.id == "bypass-task").unwrap();
+    assert!(
+        claimed_task.task.bypass_quiet_hours_once,
+        "claimed snapshot must still carry bypass=true (cleared in DB, not in returned row)"
+    );
+
+    let post = db.get_task_by_id("bypass-task").unwrap().unwrap();
+    assert!(
+        !post.bypass_quiet_hours_once,
+        "bypass must be cleared in DB after claim — atomic with the claim tx"
+    );
+}
+
+/// `update_task_response_hash` round-trips an arbitrary string and `None`
+/// clears it. Used by the heartbeat dispatch path's belt-and-suspenders
+/// dedup behind the primary `[SILENT]` suppression.
+#[test]
+fn update_task_response_hash_round_trips() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "hash-task",
+        "h",
+        "p",
+        "interval",
+        "1h",
+        Some(100),
+    ))
+    .expect("create");
+    db.update_task_response_hash("hash-task", Some("deadbeef"))
+        .expect("write hash");
+    let task = db.get_task_by_id("hash-task").unwrap().unwrap();
+    assert_eq!(task.last_response_hash.as_deref(), Some("deadbeef"));
+
+    db.update_task_response_hash("hash-task", None)
+        .expect("clear hash");
+    let task = db.get_task_by_id("hash-task").unwrap().unwrap();
+    assert!(task.last_response_hash.is_none());
+}

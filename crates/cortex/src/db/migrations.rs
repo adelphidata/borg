@@ -1806,9 +1806,8 @@ impl Database {
             )?;
         }
         if !Self::has_column(&self.conn, "scheduled_tasks", "last_response_hash") {
-            self.conn.execute_batch(
-                "ALTER TABLE scheduled_tasks ADD COLUMN last_response_hash TEXT;",
-            )?;
+            self.conn
+                .execute_batch("ALTER TABLE scheduled_tasks ADD COLUMN last_response_hash TEXT;")?;
         }
         self.seed_heartbeat_task()?;
         Ok(())
