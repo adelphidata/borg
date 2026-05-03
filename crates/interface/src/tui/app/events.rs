@@ -128,12 +128,9 @@ impl<'a> App<'a> {
             AgentEvent::Error(e) => self.handle_event_error(e),
             AgentEvent::SteerReceived { text } => self.handle_event_steer_received(text),
             AgentEvent::PlanUpdated { steps } => self.handle_event_plan_updated(steps),
-            AgentEvent::UserInputRequest {
-                prompt,
-                choices,
-                allow_custom,
-                respond,
-            } => self.handle_event_user_input_request(prompt, choices, allow_custom, respond),
+            AgentEvent::UserInputRequest { questions, respond } => {
+                self.handle_event_user_input_request(questions, respond)
+            }
             AgentEvent::SubAgentUpdate { .. } => {
                 // Sub-agent updates are informational; no TUI action needed yet.
             }
@@ -453,33 +450,43 @@ impl<'a> App<'a> {
 
     fn handle_event_user_input_request(
         &mut self,
-        prompt: String,
-        choices: Vec<cortex::tool_handlers::user_input::UserInputChoice>,
-        allow_custom: bool,
-        respond: oneshot::Sender<String>,
+        questions: Vec<cortex::tool_handlers::user_input::Question>,
+        respond: oneshot::Sender<
+            std::collections::HashMap<String, cortex::tool_handlers::user_input::Answer>,
+        >,
     ) {
-        // Show prompt (and choices, if any) in history so they remain visible after answering.
-        let mut text = format!("[agent asks: {prompt}]");
-        if !choices.is_empty() {
-            for (i, c) in choices.iter().enumerate() {
-                let desc = c
-                    .description
-                    .as_deref()
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default();
-                text.push_str(&format!("\n  {}. {}{}", i + 1, c.label, desc));
+        // Mirror the questions (and their options) into history so the prompt
+        // stays visible after the carousel closes.
+        let mut text = String::new();
+        let total = questions.len();
+        for (qi, q) in questions.iter().enumerate() {
+            if qi > 0 {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "[agent asks ({}/{}) {}]: {}",
+                qi + 1,
+                total,
+                q.header,
+                q.question
+            ));
+            for (i, opt) in q.options.iter().enumerate() {
+                text.push_str(&format!(
+                    "\n  {}. {} — {}",
+                    i + 1,
+                    opt.label,
+                    opt.description
+                ));
             }
         }
         self.cells.push(HistoryCell::System { text });
-        // If choices provided but allow_custom is false, start in selection mode (custom_mode=false).
-        // If no choices, the free-text path is the only option (custom_mode=true acts as free-text).
-        let custom_mode = choices.is_empty();
+        let per_question_state = (0..questions.len())
+            .map(|_| super::QuestionState::default())
+            .collect();
         self.state = AppState::AwaitingInput {
-            prompt,
-            choices,
-            cursor: 0,
-            custom_mode,
-            allow_custom,
+            questions,
+            current_idx: 0,
+            per_question_state,
             respond: Some(respond),
         };
     }

@@ -87,6 +87,30 @@ pub(super) trait PopupHandler {
     }
 }
 
+/// Per-question UI state for the `AwaitingInput` carousel.
+///
+/// Tracks which option the user has highlighted (`cursor`), which options they
+/// have committed (`multi_selected` for multi-select questions; ignored when
+/// the question is single-select and the answer is `[options[cursor]]` on
+/// submit), whether the auto-appended "Other" row is selected, and the
+/// Tab-toggled notes box state.
+#[derive(Debug, Clone, Default)]
+pub struct QuestionState {
+    /// Highlighted row in the option list. `0..=options.len()` — index
+    /// `options.len()` selects the auto-appended "Other" row.
+    pub cursor: usize,
+    /// Set of row indices the user committed (multi-select only).
+    pub multi_selected: std::collections::HashSet<usize>,
+    /// True when the user committed the "Other" free-form row. The note text
+    /// itself lives in `notes`.
+    pub other_selected: bool,
+    /// Whether the Notes editor is open (Tab toggles).
+    pub notes_open: bool,
+    /// Free-form note text. Submitted to the agent prefixed with `user_note: `
+    /// when non-empty, regardless of whether "Other" was picked.
+    pub notes: String,
+}
+
 pub enum AppState {
     Idle,
     // Live header/details shown beside the elapsed clock live on `App` as
@@ -99,20 +123,22 @@ pub enum AppState {
     AwaitingApproval {
         respond: Option<oneshot::Sender<bool>>,
     },
-    /// Agent has asked a question mid-turn via `request_user_input`; waiting for user to
-    /// either type a response or pick from `choices`.
+    /// Agent has asked one or more questions mid-turn via `request_user_input`;
+    /// waiting for the user to walk through the carousel and submit answers.
     ///
-    /// When `choices` is non-empty and `custom_mode` is `false`, the UI renders a selectable
-    /// list; Up/Down (or j/k) move `cursor`, 1..=9 jump to an index, Enter sends
-    /// `choices[cursor].label`. Tab (when `allow_custom`) toggles into free-text mode.
-    /// When `choices` is empty, behavior is free-text only.
+    /// `questions` is the immutable batch (1-3 entries). `current_idx` is the
+    /// active question; `per_question_state` parallels `questions` and holds
+    /// per-question UI state (cursor + selections + notes). `respond` carries
+    /// the oneshot back to the agent — `None` once consumed.
     AwaitingInput {
-        prompt: String,
-        choices: Vec<cortex::tool_handlers::user_input::UserInputChoice>,
-        cursor: usize,
-        custom_mode: bool,
-        allow_custom: bool,
-        respond: Option<oneshot::Sender<String>>,
+        questions: Vec<cortex::tool_handlers::user_input::Question>,
+        current_idx: usize,
+        per_question_state: Vec<QuestionState>,
+        respond: Option<
+            oneshot::Sender<
+                std::collections::HashMap<String, cortex::tool_handlers::user_input::Answer>,
+            >,
+        >,
     },
     PlanReview,
     /// Full-screen transcript pager open (Ctrl+T). All keys route to the pager.
@@ -2657,167 +2683,241 @@ mod tests {
     }
 
     // ========================================================================
-    // request_user_input with `choices` — selection mode key handling.
-    // Guards the contract that Up/Down move cursor, number keys quick-pick,
-    // Enter submits the selected label, Tab toggles free-text (when allowed),
-    // and Esc routes correctly depending on mode.
+    // request_user_input — multi-question carousel key handling.
+    // Guards the new batched contract: ↑/↓ move cursor, ←/→ navigate between
+    // questions preserving per-question state, Tab toggles Notes editor, Space
+    // toggles multi-select rows, Enter on the last question submits the whole
+    // batch as a HashMap<id, Answer>, Esc cancels with an interrupted marker
+    // per question.
     // ========================================================================
 
-    use cortex::tool_handlers::user_input::UserInputChoice;
+    use cortex::tool_handlers::user_input::{Answer, Question, QuestionOption, INTERRUPTED_MARKER};
+    use std::collections::HashMap;
 
-    fn seed_awaiting_with_choices(
+    fn make_question(id: &str, header: &str, labels: &[&str], multi_select: bool) -> Question {
+        Question {
+            id: id.to_string(),
+            header: header.to_string(),
+            question: format!("Pick from {header}"),
+            multi_select,
+            options: labels
+                .iter()
+                .map(|l| QuestionOption {
+                    label: (*l).to_string(),
+                    description: format!("desc for {l}"),
+                })
+                .collect(),
+        }
+    }
+
+    fn seed_awaiting_with_questions(
         app: &mut App<'_>,
-        labels: &[&str],
-        allow_custom: bool,
-    ) -> oneshot::Receiver<String> {
-        let (tx, rx) = oneshot::channel::<String>();
-        let choices: Vec<UserInputChoice> = labels
-            .iter()
-            .map(|l| UserInputChoice {
-                label: (*l).to_string(),
-                description: None,
-            })
+        questions: Vec<Question>,
+    ) -> oneshot::Receiver<HashMap<String, Answer>> {
+        let (tx, rx) = oneshot::channel::<HashMap<String, Answer>>();
+        let per_question_state = (0..questions.len())
+            .map(|_| QuestionState::default())
             .collect();
         app.state = AppState::AwaitingInput {
-            prompt: "pick one".to_string(),
-            choices,
-            cursor: 0,
-            custom_mode: false,
-            allow_custom,
+            questions,
+            current_idx: 0,
+            per_question_state,
             respond: Some(tx),
         };
         rx
     }
 
     #[test]
-    fn choices_down_then_enter_submits_second_label() {
+    fn enter_on_last_question_submits_full_answer_map() {
         let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
-
-        app.handle_key(key(KeyCode::Down)).unwrap();
-        app.handle_key(key(KeyCode::Enter)).unwrap();
-
-        let answer = rx.try_recv().expect("response sent");
-        assert_eq!(answer, "bravo");
-        assert!(matches!(app.state, AppState::Streaming { .. }));
-    }
-
-    #[test]
-    fn choices_up_from_zero_wraps_to_last() {
-        let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo", "charlie"], true);
-
-        app.handle_key(key(KeyCode::Up)).unwrap();
-        app.handle_key(key(KeyCode::Enter)).unwrap();
-
-        assert_eq!(rx.try_recv().unwrap(), "charlie");
-    }
-
-    #[test]
-    fn choices_number_key_quick_selects() {
-        let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo", "charlie"], true);
-
-        // '2' should submit the second option immediately, no Enter required.
-        app.handle_key(key(KeyCode::Char('2'))).unwrap();
-
-        assert_eq!(rx.try_recv().unwrap(), "bravo");
-        assert!(matches!(app.state, AppState::Streaming { .. }));
-    }
-
-    #[test]
-    fn choices_number_key_out_of_range_is_noop() {
-        let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
-
-        app.handle_key(key(KeyCode::Char('5'))).unwrap();
-
-        assert!(rx.try_recv().is_err(), "no response should be sent");
-        assert!(
-            matches!(app.state, AppState::AwaitingInput { .. }),
-            "should remain in AwaitingInput"
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![
+                make_question("color", "Color", &["red", "blue"], false),
+                make_question("size", "Size", &["small", "large"], false),
+            ],
         );
+
+        // Q1: pick "blue" (move cursor down to index 1) then advance.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // advances to Q2
+                                                      // Q2: leave on default (cursor 0 = "small") then submit.
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let map = rx.try_recv().expect("response sent");
+        assert_eq!(map.get("color").unwrap().answers, vec!["blue".to_string()]);
+        assert_eq!(map.get("size").unwrap().answers, vec!["small".to_string()]);
+        assert!(matches!(app.state, AppState::Streaming { .. }));
     }
 
     #[test]
-    fn choices_tab_toggles_custom_mode_when_allowed() {
+    fn arrow_keys_navigate_between_questions_preserving_per_question_state() {
         let mut app = make_app();
-        let _rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        let _rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![
+                make_question("a", "A", &["x", "y", "z"], false),
+                make_question("b", "B", &["p", "q"], false),
+            ],
+        );
 
-        app.handle_key(key(KeyCode::Tab)).unwrap();
+        // Move Q1 cursor to "z" (index 2).
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        // Right arrow: advance to Q2 — Q1 cursor must be retained.
+        app.handle_key(key(KeyCode::Right)).unwrap();
+        // Move Q2 cursor to index 1.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        // Left arrow: back to Q1 — Q1 cursor should still be 2 (not reset).
+        app.handle_key(key(KeyCode::Left)).unwrap();
 
         match &app.state {
-            AppState::AwaitingInput { custom_mode, .. } => assert!(*custom_mode),
-            _ => panic!("expected AwaitingInput"),
-        }
-    }
-
-    #[test]
-    fn choices_tab_ignored_when_custom_disallowed() {
-        let mut app = make_app();
-        let _rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], false);
-
-        app.handle_key(key(KeyCode::Tab)).unwrap();
-
-        match &app.state {
-            AppState::AwaitingInput { custom_mode, .. } => {
-                assert!(!custom_mode, "Tab must be a no-op when allow_custom=false");
+            AppState::AwaitingInput {
+                current_idx,
+                per_question_state,
+                ..
+            } => {
+                assert_eq!(*current_idx, 0);
+                assert_eq!(per_question_state[0].cursor, 2);
+                assert_eq!(per_question_state[1].cursor, 1);
             }
             _ => panic!("expected AwaitingInput"),
         }
     }
 
     #[test]
-    fn custom_mode_esc_returns_to_selection_not_decline() {
+    fn tab_toggles_notes_field_on_current_question() {
         let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        let _rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question("only", "Only", &["a", "b"], false)],
+        );
+
+        // Tab opens notes; subsequent character keys land in notes, not options.
         app.handle_key(key(KeyCode::Tab)).unwrap();
-        // Now in custom_mode.
-
-        app.handle_key(key(KeyCode::Esc)).unwrap();
-
-        // Must not decline — just flip back to selection mode.
-        assert!(rx.try_recv().is_err());
+        app.handle_key(key(KeyCode::Char('h'))).unwrap();
+        app.handle_key(key(KeyCode::Char('i'))).unwrap();
         match &app.state {
-            AppState::AwaitingInput { custom_mode, .. } => assert!(!*custom_mode),
+            AppState::AwaitingInput {
+                per_question_state, ..
+            } => {
+                assert!(per_question_state[0].notes_open);
+                assert_eq!(per_question_state[0].notes, "hi");
+            }
+            _ => panic!("expected AwaitingInput"),
+        }
+        // Tab again closes notes.
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        match &app.state {
+            AppState::AwaitingInput {
+                per_question_state, ..
+            } => assert!(!per_question_state[0].notes_open),
             _ => panic!("expected AwaitingInput"),
         }
     }
 
     #[test]
-    fn choices_esc_declines_and_returns_to_streaming() {
+    fn multi_select_question_accumulates_selections_with_space() {
         let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question(
+                "channels",
+                "Channels",
+                &["telegram", "slack", "discord"],
+                true,
+            )],
+        );
+
+        // Cursor on "telegram" (idx 0): toggle on.
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        // Move to "discord" (idx 2): toggle on.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        // Submit.
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let map = rx.try_recv().expect("response sent");
+        // Multi-select preserves option order, not toggle order.
+        assert_eq!(
+            map.get("channels").unwrap().answers,
+            vec!["telegram".to_string(), "discord".to_string()]
+        );
+    }
+
+    #[test]
+    fn esc_cancels_and_returns_interrupted_marker_per_question() {
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![
+                make_question("a", "A", &["x", "y"], false),
+                make_question("b", "B", &["p", "q"], false),
+            ],
+        );
 
         app.handle_key(key(KeyCode::Esc)).unwrap();
 
-        assert_eq!(rx.try_recv().unwrap(), "[user declined to answer]");
+        let map = rx.try_recv().expect("response sent");
+        assert_eq!(
+            map.get("a").unwrap().answers,
+            vec![INTERRUPTED_MARKER.to_string()]
+        );
+        assert_eq!(
+            map.get("b").unwrap().answers,
+            vec![INTERRUPTED_MARKER.to_string()]
+        );
         assert!(matches!(app.state, AppState::Streaming { .. }));
     }
 
     #[test]
-    fn choices_enter_at_cursor_zero_submits_first_label() {
+    fn notes_appended_with_user_note_prefix_on_submit() {
+        // Regression guard: free-form notes must round-trip into the answer
+        // payload prefixed with `user_note: ` so the LLM can distinguish them
+        // from option labels.
         let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question("color", "Color", &["red", "blue"], false)],
+        );
 
-        app.handle_key(key(KeyCode::Enter)).unwrap();
-
-        assert_eq!(rx.try_recv().unwrap(), "alpha");
-    }
-
-    #[test]
-    fn custom_mode_typed_answer_is_sent_on_enter() {
-        let mut app = make_app();
-        let mut rx = seed_awaiting_with_choices(&mut app, &["alpha", "bravo"], true);
+        // Open notes, type "I love crimson", close, submit.
         app.handle_key(key(KeyCode::Tab)).unwrap();
-
-        // Seed the composer directly to avoid tripping the paste-burst detector,
-        // which buffers rapid single-char KeyEvents in tests.
-        app.composer.set_text("custom");
+        for c in "crimson".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Tab)).unwrap();
         app.handle_key(key(KeyCode::Enter)).unwrap();
 
-        assert_eq!(rx.try_recv().unwrap(), "custom");
-        assert!(matches!(app.state, AppState::Streaming { .. }));
+        let map = rx.try_recv().expect("response sent");
+        let entry = map.get("color").unwrap();
+        assert_eq!(entry.answers[0], "red");
+        assert_eq!(entry.answers[1], "user_note: crimson");
+    }
+
+    #[test]
+    fn other_row_is_appended_below_options() {
+        // The "Other" row is auto-added at index `options.len()` so total rows
+        // is options.len() + 1. Cursor wrap-around must include it.
+        let mut app = make_app();
+        let _rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question("color", "Color", &["red", "blue"], false)],
+        );
+        // 2 options + 1 Other = 3 rows. Two Downs lands us on "Other".
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        match &app.state {
+            AppState::AwaitingInput {
+                per_question_state,
+                questions,
+                ..
+            } => {
+                assert_eq!(per_question_state[0].cursor, questions[0].options.len());
+            }
+            _ => panic!("expected AwaitingInput"),
+        }
     }
 
     // ========================================================================

@@ -751,24 +751,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_instructs_choices_for_channels_and_timezone() {
+    fn setup_instructs_batched_questions_for_channels_and_timezone() {
         // Regression guard: the first-boot template must tell the agent to use
-        // `request_user_input` with `choices` for the two enumerable onboarding
-        // topics (messaging channels, timezone). This is the contract that
-        // drives the selectable-answer UX on first launch — if it gets rewritten
-        // as free-text guidance, onboarding silently regresses.
-        let setup = generate_setup("Borg", "Dave").to_lowercase();
+        // `request_user_input` with a batched `questions` array covering at
+        // least the two enumerable onboarding topics — messaging channels and
+        // timezone — so they're answered in one carousel rather than N round-trips.
+        let setup = generate_setup("Borg", "Dave");
+        let setup_lc = setup.to_lowercase();
         assert!(
-            setup.contains("request_user_input"),
+            setup_lc.contains("request_user_input"),
             "SETUP.md must reference the request_user_input tool"
         );
         assert!(
-            setup.contains("choices"),
-            "SETUP.md must instruct using `choices`"
+            setup_lc.contains("\"questions\""),
+            "SETUP.md must instruct using the batched `questions` array shape"
+        );
+        // Both topic ids must appear so the model picks deterministic keys for
+        // downstream config writes.
+        assert!(
+            setup_lc.contains("\"id\": \"channels\""),
+            "SETUP.md must include a `channels` question id"
         );
         assert!(
-            setup.contains("channels") && setup.contains("timezone"),
-            "SETUP.md must cover both channels and timezone as choice-driven topics"
+            setup_lc.contains("\"id\": \"timezone\""),
+            "SETUP.md must include a `timezone` question id"
+        );
+        // The legacy `choices` parameter is gone — guard against the template
+        // being copy-pasted back from history.
+        assert!(
+            !setup.contains("`choices`"),
+            "SETUP.md must not reference the removed `choices` parameter"
         );
     }
 

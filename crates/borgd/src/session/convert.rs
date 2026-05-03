@@ -69,24 +69,37 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
                 })
                 .collect(),
         }),
-        CoreEvent::UserInputRequest {
-            prompt,
-            choices,
-            allow_custom,
-            respond,
-        } => {
+        CoreEvent::UserInputRequest { questions, respond } => {
             let prompt_id = prompts.register(PendingPrompt::UserInput(respond));
+            // Mirror the first question into the legacy `prompt` slot so
+            // older clients (if any) still see something readable; new clients
+            // read the structured `questions` field exclusively.
+            let legacy_prompt = questions
+                .first()
+                .map(|q| q.question.clone())
+                .unwrap_or_default();
             Kind::UserInputRequest(pb::UserInputRequest {
-                prompt,
-                choices: choices
+                prompt: legacy_prompt,
+                choices: Vec::new(),
+                allow_custom: true,
+                prompt_id,
+                questions: questions
                     .into_iter()
-                    .map(|c| pb::UserInputChoice {
-                        label: c.label,
-                        description: c.description.unwrap_or_default(),
+                    .map(|q| pb::UserInputQuestion {
+                        id: q.id,
+                        header: q.header,
+                        question: q.question,
+                        multi_select: q.multi_select,
+                        options: q
+                            .options
+                            .into_iter()
+                            .map(|o| pb::UserInputQuestionOption {
+                                label: o.label,
+                                description: o.description,
+                            })
+                            .collect(),
                     })
                     .collect(),
-                allow_custom,
-                prompt_id,
             })
         }
         CoreEvent::Preparing => Kind::Preparing(pb::Preparing {}),
@@ -203,7 +216,8 @@ pub fn is_terminal(event: &pb::AgentEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortex::tool_handlers::user_input::UserInputChoice;
+    use cortex::tool_handlers::user_input::{Answer, Question, QuestionOption};
+    use std::collections::HashMap;
     use tokio::sync::oneshot;
 
     #[test]
@@ -227,27 +241,44 @@ mod tests {
     }
 
     #[test]
-    fn user_input_request_carries_choices_and_prompt_id() {
+    fn user_input_request_serializes_question_batch_and_round_trips_answers() {
+        // Real failure mode: a regression that drops the structured
+        // questions[] field would leave the new TUI carousel with nothing
+        // to render and the LLM would silently see empty answers back.
         let prompts = Arc::new(PromptRegistry::default());
-        let (tx, _rx) = oneshot::channel::<String>();
+        let (tx, _rx) = oneshot::channel::<HashMap<String, Answer>>();
         let event = CoreEvent::UserInputRequest {
-            prompt: "pick one".into(),
-            choices: vec![UserInputChoice {
-                label: "red".into(),
-                description: Some("warm".into()),
+            questions: vec![Question {
+                id: "color".into(),
+                header: "Color".into(),
+                question: "Pick a color".into(),
+                multi_select: false,
+                options: vec![
+                    QuestionOption {
+                        label: "Red".into(),
+                        description: "warm".into(),
+                    },
+                    QuestionOption {
+                        label: "Blue".into(),
+                        description: "cool".into(),
+                    },
+                ],
             }],
-            allow_custom: true,
             respond: tx,
         };
         let proto = to_proto(event, &prompts);
         let pb::agent_event::Kind::UserInputRequest(ui) = proto.kind.expect("kind") else {
             panic!("expected UserInputRequest");
         };
-        assert_eq!(ui.choices.len(), 1);
-        assert_eq!(ui.choices[0].label, "red");
-        assert_eq!(ui.choices[0].description, "warm");
-        assert!(ui.allow_custom);
+        assert_eq!(ui.questions.len(), 1);
+        assert_eq!(ui.questions[0].id, "color");
+        assert_eq!(ui.questions[0].options.len(), 2);
+        assert_eq!(ui.questions[0].options[0].label, "Red");
         assert!(!ui.prompt_id.is_empty());
+        // And the daemon can resolve the matching answer payload through the registry.
+        prompts
+            .respond(&ui.prompt_id, r#"{"color":{"answers":["Red"]}}"#)
+            .expect("respond ok");
     }
 
     #[test]

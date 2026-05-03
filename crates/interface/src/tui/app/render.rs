@@ -236,18 +236,16 @@ impl<'a> App<'a> {
                 theme::error_style(),
             )]),
             AppState::AwaitingInput {
-                choices,
-                custom_mode,
+                questions,
+                current_idx,
                 ..
             } => {
-                let msg = if !choices.is_empty() && !custom_mode {
-                    format!(" {} Agent needs your input — pick an option", theme::BULLET)
-                } else {
-                    format!(
-                        " {} Agent needs your input — type and press enter",
-                        theme::BULLET
-                    )
-                };
+                let msg = format!(
+                    " {} Agent needs your input — question {}/{}",
+                    theme::BULLET,
+                    current_idx + 1,
+                    questions.len()
+                );
                 Line::from(vec![Span::styled(msg, theme::tool_style())])
             }
             AppState::PlanReview => Line::from(vec![Span::styled(
@@ -412,75 +410,72 @@ impl<'a> App<'a> {
                 },
             ],
             AppState::AwaitingInput {
-                prompt,
-                choices,
-                custom_mode,
-                allow_custom,
+                questions,
+                current_idx,
+                per_question_state,
                 ..
             } => {
+                let q = &questions[*current_idx];
+                let st = &per_question_state[*current_idx];
                 let prompt_hint = FooterHint {
-                    text: format!("[{prompt}]"),
+                    text: format!("[{}/{}: {}]", current_idx + 1, questions.len(), q.header),
                     priority: 50,
                 };
-                if !choices.is_empty() && !*custom_mode {
+                if st.notes_open {
+                    vec![
+                        FooterHint {
+                            text: "type a note".into(),
+                            priority: 80,
+                        },
+                        FooterHint {
+                            text: "tab close notes".into(),
+                            priority: 90,
+                        },
+                        FooterHint {
+                            text: "esc cancel".into(),
+                            priority: 100,
+                        },
+                        prompt_hint,
+                    ]
+                } else {
+                    let last = *current_idx + 1 == questions.len();
+                    let enter_label = if last { "enter submit" } else { "enter next" };
                     let mut h = vec![
                         FooterHint {
                             text: "↑/↓ select".into(),
                             priority: 80,
                         },
                         FooterHint {
-                            text: format!("1–{} quick pick", choices.len().min(9)),
-                            priority: 70,
-                        },
-                        FooterHint {
-                            text: "enter to confirm".into(),
-                            priority: 90,
+                            text: format!("1–{} jump", q.options.len().min(9) + 1),
+                            priority: 60,
                         },
                     ];
-                    if *allow_custom {
+                    if q.multi_select {
                         h.push(FooterHint {
-                            text: "tab to type answer".into(),
-                            priority: 60,
+                            text: "space toggle".into(),
+                            priority: 75,
                         });
                     }
                     h.push(FooterHint {
-                        text: "esc to skip".into(),
+                        text: enter_label.into(),
+                        priority: 90,
+                    });
+                    if questions.len() > 1 {
+                        h.push(FooterHint {
+                            text: "←/→ questions".into(),
+                            priority: 70,
+                        });
+                    }
+                    h.push(FooterHint {
+                        text: "tab notes".into(),
+                        priority: 65,
+                    });
+                    h.push(FooterHint {
+                        text: "esc cancel".into(),
                         priority: 100,
                     });
                     h.push(prompt_hint);
                     h
-                } else if !choices.is_empty() && *custom_mode {
-                    vec![
-                        FooterHint {
-                            text: "type your answer".into(),
-                            priority: 70,
-                        },
-                        FooterHint {
-                            text: "enter to send".into(),
-                            priority: 90,
-                        },
-                        FooterHint {
-                            text: "esc back to options".into(),
-                            priority: 100,
-                        },
-                        prompt_hint,
-                    ]
-                } else {
-                    vec![
-                        FooterHint {
-                            text: "type your answer".into(),
-                            priority: 70,
-                        },
-                        FooterHint {
-                            text: "enter to send".into(),
-                            priority: 90,
-                        },
-                        FooterHint {
-                            text: "esc to skip".into(),
-                            priority: 100,
-                        },
-                        prompt_hint,
-                    ]
                 }
             }
             AppState::PlanReview => vec![
@@ -568,43 +563,129 @@ impl<'a> App<'a> {
         1 + shown + overflow + 1
     }
 
-    /// Overlay a selectable choice list on top of the composer area when the
-    /// agent has asked `request_user_input` with `choices` and the user hasn't
-    /// switched to free-text (custom) mode. A `Clear` widget hides the composer
-    /// underneath so the options are the focal point.
+    /// Overlay the multi-question carousel on top of the composer area when the
+    /// agent has asked `request_user_input`. A `Clear` widget hides the composer
+    /// underneath so the questions are the focal point.
+    ///
+    /// Layout (top to bottom):
+    /// - Header chip line: `[Question N/M • <header>]`
+    /// - Question text
+    /// - Options as `( ) label — description` (or `[ ]` when multi-select),
+    ///   with the auto-appended "Other" row at the bottom
+    /// - Optional Notes box (visible when `notes_open` or non-empty)
     fn render_choices_overlay(&self, frame: &mut Frame, area: Rect) {
         let AppState::AwaitingInput {
-            choices,
-            cursor,
-            custom_mode,
+            questions,
+            current_idx,
+            per_question_state,
             ..
         } = &self.state
         else {
             return;
         };
-        if choices.is_empty() || *custom_mode {
-            return;
-        }
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(choices.len());
-        for (i, c) in choices.iter().enumerate() {
-            let selected = i == *cursor;
-            let marker = if selected { "▌ " } else { "  " };
-            let number = format!("{}. ", i + 1);
-            let base_style = if selected {
+        let q = &questions[*current_idx];
+        let st = &per_question_state[*current_idx];
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        // Header chip + counter.
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" Question {}/{} ", current_idx + 1, questions.len()),
+                theme::tool_style().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            ),
+            Span::styled(format!("  {}", q.header), theme::dim()),
+        ]));
+        // Question text.
+        lines.push(Line::from(Span::styled(
+            q.question.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+
+        // Options + auto-appended "Other".
+        let total_rows = q.options.len() + 1;
+        for (i, opt) in q.options.iter().enumerate() {
+            let highlighted = i == st.cursor && !st.notes_open;
+            let chosen = if q.multi_select {
+                st.multi_selected.contains(&i)
+            } else {
+                i == st.cursor
+            };
+            let glyph = if q.multi_select {
+                if chosen {
+                    "[x]"
+                } else {
+                    "[ ]"
+                }
+            } else if chosen {
+                "(•)"
+            } else {
+                "( )"
+            };
+            let marker = if highlighted { "▌ " } else { "  " };
+            let row_style = if highlighted {
                 theme::tool_style().add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
-            let mut spans = vec![
-                Span::styled(marker.to_string(), base_style),
-                Span::styled(number, theme::dim()),
-                Span::styled(c.label.clone(), base_style),
-            ];
-            if let Some(desc) = c.description.as_deref() {
-                spans.push(Span::styled(format!("  — {desc}"), theme::dim()));
-            }
-            lines.push(Line::from(spans));
+            lines.push(Line::from(vec![
+                Span::styled(marker.to_string(), row_style),
+                Span::styled(format!("{}. ", i + 1), theme::dim()),
+                Span::styled(format!("{glyph} "), row_style),
+                Span::styled(opt.label.clone(), row_style),
+                Span::styled(format!("  — {}", opt.description), theme::dim()),
+            ]));
         }
+        // "Other" row.
+        let other_idx = q.options.len();
+        let other_highlighted = st.cursor == other_idx && !st.notes_open;
+        let other_chosen = st.other_selected;
+        let other_glyph = if q.multi_select {
+            if other_chosen {
+                "[x]"
+            } else {
+                "[ ]"
+            }
+        } else if other_highlighted {
+            "(•)"
+        } else {
+            "( )"
+        };
+        let other_marker = if other_highlighted { "▌ " } else { "  " };
+        let other_style = if other_highlighted {
+            theme::tool_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(other_marker.to_string(), other_style),
+            Span::styled(format!("{total_rows}. "), theme::dim()),
+            Span::styled(format!("{other_glyph} "), other_style),
+            Span::styled("Other".to_string(), other_style),
+            Span::styled(
+                "  — type your own answer in Notes".to_string(),
+                theme::dim(),
+            ),
+        ]));
+
+        // Notes box: shown when the user has opened it or already typed text.
+        if st.notes_open || !st.notes.is_empty() {
+            let prefix = if st.notes_open {
+                "▌ Notes: "
+            } else {
+                "  Notes: "
+            };
+            let style = if st.notes_open {
+                theme::tool_style()
+            } else {
+                theme::dim()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), style),
+                Span::raw(st.notes.clone()),
+            ]));
+        }
+
         let needed = lines.len() as u16;
         let h = needed.min(area.height);
         let overlay = Rect {

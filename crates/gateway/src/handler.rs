@@ -715,9 +715,37 @@ async fn collect_agent_response(
                             );
                         }
                     }
-                    AgentEvent::UserInputRequest { respond, prompt, .. } => {
-                        warn!("Auto-declining user input request in gateway mode: {prompt}");
-                        if respond.send("[Not available in gateway mode]".to_string()).is_err() {
+                    AgentEvent::UserInputRequest { respond, questions } => {
+                        let topics: Vec<&str> = questions
+                            .iter()
+                            .map(|q| q.header.as_str())
+                            .collect();
+                        warn!(
+                            "Auto-declining user input request in gateway mode (questions: {:?})",
+                            topics
+                        );
+                        // Populate each question with an explicit unavailable
+                        // marker so the LLM can distinguish "channel can't ask"
+                        // from "user picked nothing" when reasoning about the
+                        // returned answer map.
+                        let decline: std::collections::HashMap<
+                            String,
+                            cortex::tool_handlers::user_input::Answer,
+                        > = questions
+                            .iter()
+                            .map(|q| {
+                                (
+                                    q.id.clone(),
+                                    cortex::tool_handlers::user_input::Answer {
+                                        answers: vec![
+                                            "[unavailable: gateway mode cannot prompt user]"
+                                                .to_string(),
+                                        ],
+                                    },
+                                )
+                            })
+                            .collect();
+                        if respond.send(decline).is_err() {
                             warn!(
                                 "Failed to send user-input decline on channel '{channel_name}': receiver dropped"
                             );
@@ -1972,16 +2000,16 @@ mod tests {
 
     #[test]
     fn event_is_activity_excludes_user_input_and_shell() {
+        use cortex::tool_handlers::user_input::Answer;
         let (txb, _rxb) = tokio::sync::oneshot::channel::<bool>();
-        let (txs, _rxs) = tokio::sync::oneshot::channel::<String>();
+        let (txs, _rxs) =
+            tokio::sync::oneshot::channel::<std::collections::HashMap<String, Answer>>();
         assert!(!event_is_activity(&AgentEvent::ShellConfirmation {
             command: "ls".into(),
             respond: txb,
         }));
         assert!(!event_is_activity(&AgentEvent::UserInputRequest {
-            prompt: "ok?".into(),
-            choices: Vec::new(),
-            allow_custom: true,
+            questions: Vec::new(),
             respond: txs,
         }));
         assert!(event_is_activity(&AgentEvent::TextDelta("x".into())));

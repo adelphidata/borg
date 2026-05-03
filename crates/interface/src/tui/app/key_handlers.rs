@@ -151,13 +151,15 @@ impl<'a> App<'a> {
     }
 
     fn handle_key_awaiting_input(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        use cortex::tool_handlers::user_input::{Answer, INTERRUPTED_MARKER};
         use crossterm::event::{KeyCode, KeyModifiers};
+        use std::collections::HashMap;
+
         let AppState::AwaitingInput {
             respond,
-            choices,
-            cursor,
-            custom_mode,
-            allow_custom,
+            questions,
+            current_idx,
+            per_question_state,
             ..
         } = &mut self.state
         else {
@@ -167,7 +169,9 @@ impl<'a> App<'a> {
         // Ctrl+C always cancels, regardless of mode.
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             if let Some(tx) = respond.take() {
-                let _ = tx.send("[user declined to answer]".to_string());
+                if tx.send(HashMap::new()).is_err() {
+                    tracing::warn!("user-input: agent dropped receiver before Ctrl+C cancel");
+                }
             }
             if let Some(token) = self.cancel_token.take() {
                 token.cancel();
@@ -182,89 +186,152 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         }
 
-        if !*custom_mode && !choices.is_empty() {
-            // Selection mode.
-            let n = choices.len();
+        let q = &questions[*current_idx];
+        let total_rows = q.options.len() + 1; // +1 for "Other"
+        let st = &mut per_question_state[*current_idx];
+
+        // Notes editor swallows most keys when open.
+        if st.notes_open {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    *cursor = if *cursor == 0 { n - 1 } else { *cursor - 1 };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    *cursor = (*cursor + 1) % n;
-                }
-                KeyCode::Char(c @ '1'..='9') => {
-                    let idx = (c as u8 - b'1') as usize;
-                    if idx < n {
-                        *cursor = idx;
-                        // Submit immediately on digit press for quick selection.
-                        let label = choices[idx].label.clone();
-                        if let Some(tx) = respond.take() {
-                            let _ = tx.send(label);
-                        }
-                        self.composer.set_text("");
-                        self.resume_streaming();
-                    }
-                }
-                KeyCode::Enter => {
-                    let label = choices[*cursor].label.clone();
-                    if let Some(tx) = respond.take() {
-                        let _ = tx.send(label);
-                    }
-                    self.composer.set_text("");
-                    self.resume_streaming();
-                }
                 KeyCode::Tab => {
-                    if *allow_custom {
-                        *custom_mode = true;
-                    }
+                    st.notes_open = false;
                 }
                 KeyCode::Esc => {
-                    if let Some(tx) = respond.take() {
-                        let _ = tx.send("[user declined to answer]".to_string());
-                    }
-                    self.composer.set_text("");
-                    self.resume_streaming();
+                    // Close notes without losing the buffered text.
+                    st.notes_open = false;
+                }
+                KeyCode::Backspace => {
+                    st.notes.pop();
+                }
+                KeyCode::Char(c) => {
+                    st.notes.push(c);
                 }
                 _ => {}
             }
             return Ok(AppAction::Continue);
         }
 
-        // Free-text / custom mode.
         match key.code {
-            KeyCode::Enter => {
-                let text = self.composer.text().trim().to_string();
-                if text.is_empty() {
-                    // Don't send empty responses — user must type something or press Esc
-                    return Ok(AppAction::Continue);
-                }
-                if let Some(tx) = respond.take() {
-                    let _ = tx.send(text);
-                }
-                self.composer.set_text("");
-                self.resume_streaming();
-            }
-            KeyCode::Esc => {
-                // If in custom_mode with choices available, Esc returns to selection mode
-                // rather than declining, so the user can back out of a typed-answer detour.
-                if *custom_mode && !choices.is_empty() {
-                    *custom_mode = false;
-                    self.composer.set_text("");
+            KeyCode::Up | KeyCode::Char('k') => {
+                st.cursor = if st.cursor == 0 {
+                    total_rows - 1
                 } else {
+                    st.cursor - 1
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                st.cursor = (st.cursor + 1) % total_rows;
+            }
+            KeyCode::Left => {
+                if *current_idx > 0 {
+                    *current_idx -= 1;
+                }
+            }
+            KeyCode::Right => {
+                if *current_idx + 1 < questions.len() {
+                    *current_idx += 1;
+                }
+            }
+            KeyCode::Char(' ') if q.multi_select => {
+                if st.cursor == q.options.len() {
+                    st.other_selected = !st.other_selected;
+                } else if !st.multi_selected.insert(st.cursor) {
+                    st.multi_selected.remove(&st.cursor);
+                }
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = (c as u8 - b'1') as usize;
+                if idx < total_rows {
+                    st.cursor = idx;
+                }
+            }
+            KeyCode::Tab => {
+                st.notes_open = true;
+            }
+            KeyCode::Enter => {
+                if *current_idx + 1 < questions.len() {
+                    *current_idx += 1;
+                } else {
+                    // Submit the entire batch.
+                    let map = collect_answers(questions, per_question_state);
                     if let Some(tx) = respond.take() {
-                        let _ = tx.send("[user declined to answer]".to_string());
+                        if tx.send(map).is_err() {
+                            tracing::warn!("user-input: agent dropped receiver before submit");
+                        }
                     }
                     self.composer.set_text("");
                     self.resume_streaming();
                 }
             }
-            _ => {
-                self.composer.handle_key(key);
+            KeyCode::Esc => {
+                // Cancel the batch — every question reports the interrupted marker
+                // so the LLM can reason about partial cancellation.
+                let mut map: HashMap<String, Answer> = HashMap::new();
+                for question in questions.iter() {
+                    map.insert(
+                        question.id.clone(),
+                        Answer {
+                            answers: vec![INTERRUPTED_MARKER.to_string()],
+                        },
+                    );
+                }
+                if let Some(tx) = respond.take() {
+                    if tx.send(map).is_err() {
+                        tracing::warn!("user-input: agent dropped receiver before Esc cancel");
+                    }
+                }
+                self.composer.set_text("");
+                self.resume_streaming();
             }
+            _ => {}
         }
         Ok(AppAction::Continue)
     }
+}
 
+/// Collect committed answers from per-question state into the `HashMap` the
+/// agent expects. For single-select questions, the highlighted row is the
+/// answer; for multi-select, every committed row is included in cursor order.
+/// "Other" is reported as the literal string `Other` (for compat) and the
+/// `notes` buffer (when non-empty) is appended to that question's answer list
+/// with the `user_note: ` prefix.
+fn collect_answers(
+    questions: &[cortex::tool_handlers::user_input::Question],
+    state: &[super::QuestionState],
+) -> std::collections::HashMap<String, cortex::tool_handlers::user_input::Answer> {
+    use cortex::tool_handlers::user_input::{Answer, OTHER_LABEL, USER_NOTE_PREFIX};
+    let mut out = std::collections::HashMap::with_capacity(questions.len());
+    for (q, st) in questions.iter().zip(state.iter()) {
+        let mut answers: Vec<String> = Vec::new();
+        if q.multi_select {
+            // Preserve option order for deterministic round-trip.
+            for (i, opt) in q.options.iter().enumerate() {
+                if st.multi_selected.contains(&i) {
+                    answers.push(opt.label.clone());
+                }
+            }
+            if st.other_selected {
+                answers.push(OTHER_LABEL.to_string());
+            }
+        } else if st.cursor == q.options.len() {
+            // Single-select with cursor on "Other" row.
+            answers.push(OTHER_LABEL.to_string());
+        } else if let Some(opt) = q.options.get(st.cursor) {
+            answers.push(opt.label.clone());
+        }
+        let trimmed = st.notes.trim();
+        if !trimmed.is_empty() {
+            answers.push(format!("{USER_NOTE_PREFIX}{trimmed}"));
+        }
+        out.insert(q.id.clone(), Answer { answers });
+    }
+    out
+}
+
+// Re-open the impl block so the rest of the file's methods stay attached.
+// `handle_key_awaiting_input` above closed its impl block so `collect_answers`
+// could live at module scope without nesting a free fn inside an impl.
+impl<'a> super::App<'a> {
     fn handle_key_plan_review(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
         use crossterm::event::KeyCode;
         match key.code {

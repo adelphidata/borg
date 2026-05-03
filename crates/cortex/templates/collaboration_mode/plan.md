@@ -21,6 +21,8 @@ Ask until you can clearly state: goal, success criteria, scope, constraints, and
 
 Only ask questions that exploration couldn't answer. Don't ask about things you could have found by reading the code.
 
+Use `request_user_input` to clarify ambiguous requirements before finalizing the plan — batch related questions in one call (1–3 multiple-choice questions per call) so the user can answer the whole set in a single carousel instead of waiting between turns.
+
 ## Phase 3 — Design implementation
 Once intent is stable, detail the approach: interfaces, data flow, edge cases, testing, and any migrations.
 

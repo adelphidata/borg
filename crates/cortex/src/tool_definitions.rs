@@ -110,32 +110,47 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
         ));
     }
 
-    // Request user input — always available (disabled at gateway level)
+    // Request user input — always available (disabled at gateway level).
+    // Batched 1–3 question carousel; UI auto-appends an "Other" row per
+    // question and exposes a Tab-toggled notes box.
     defs.push(ToolDefinition::new(
         tool_names::REQUEST_USER_INPUT,
-        "Ask the user a question and wait for their response. Use when you need clarification or a decision before proceeding. Do not use for routine confirmations — only when genuinely blocked. Provide 'choices' when the expected answer is one of a small enumerated set (2–9 options) so the user can pick instead of typing; omit 'choices' for open questions.",
+        "Ask the user 1–3 short multiple-choice questions in one batch and wait for answers. The UI auto-appends an 'Other' option per question and shows a Tab-toggled notes field. Use this in Plan mode to clarify requirements, in onboarding to gather setup choices, or any time you're genuinely blocked on a decision. Don't use for routine confirmations.",
         serde_json::json!({
             "type": "object",
             "properties": {
-                "prompt": { "type": "string", "description": "The question to ask the user" },
-                "choices": {
+                "questions": {
                     "type": "array",
-                    "description": "Optional candidate answers. When provided, the user picks one and its label is returned. Provide 2–9 options.",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "description": "Questions to show the user. Prefer 1; never exceed 3.",
                     "items": {
                         "type": "object",
+                        "required": ["id", "header", "question", "options"],
                         "properties": {
-                            "label": { "type": "string", "description": "Shown to the user and returned as the answer" },
-                            "description": { "type": "string", "description": "Optional short hint shown next to the label" }
-                        },
-                        "required": ["label"]
+                            "id": { "type": "string", "description": "Stable snake_case id for mapping the answer back." },
+                            "header": { "type": "string", "description": "Short header chip label shown in the UI (12 chars or fewer, e.g. 'Timezone')." },
+                            "question": { "type": "string", "description": "Single-sentence prompt shown to the user." },
+                            "multi_select": { "type": "boolean", "description": "Allow multiple selections (default false)." },
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "description": "Provide 2–4 mutually exclusive choices. Put the recommended option first and suffix its label with '(Recommended)'. Do not include an 'Other' option — the client adds a free-form one automatically.",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["label", "description"],
+                                    "properties": {
+                                        "label": { "type": "string", "description": "1–5 word user-facing label, returned verbatim as the answer." },
+                                        "description": { "type": "string", "description": "One short sentence explaining the tradeoff." }
+                                    }
+                                }
+                            }
+                        }
                     }
-                },
-                "allow_custom": {
-                    "type": "boolean",
-                    "description": "When 'choices' is provided, allow the user to type a free-text answer instead (default: true)."
                 }
             },
-            "required": ["prompt"]
+            "required": ["questions"]
         }),
     ));
 

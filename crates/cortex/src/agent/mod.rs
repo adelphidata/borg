@@ -195,17 +195,18 @@ pub enum AgentEvent {
     SteerReceived { text: String },
     /// The agent's plan has been updated (structured step tracking).
     PlanUpdated { steps: Vec<crate::types::PlanStep> },
-    /// The agent is requesting user input mid-turn. Send the user's response via the channel.
+    /// The agent is requesting user input mid-turn — a batch of 1-3 short
+    /// multiple-choice questions rendered as a single carousel widget. The UI
+    /// auto-appends an "Other" free-form row per question and exposes a
+    /// Tab-toggled notes box. Reply with one [`Answer`] per question id;
+    /// missing ids are treated as empty answers.
     ///
-    /// When `choices` is non-empty, the UI should render a selectable list; the selected
-    /// label is what gets sent back through `respond`. `allow_custom` allows falling back
-    /// to free-text entry (the TUI uses Tab to toggle). When `choices` is empty, behavior
-    /// is free-text only.
+    /// [`Answer`]: crate::tool_handlers::user_input::Answer
     UserInputRequest {
-        prompt: String,
-        choices: Vec<crate::tool_handlers::user_input::UserInputChoice>,
-        allow_custom: bool,
-        respond: oneshot::Sender<String>,
+        questions: Vec<crate::tool_handlers::user_input::Question>,
+        respond: oneshot::Sender<
+            std::collections::HashMap<String, crate::tool_handlers::user_input::Answer>,
+        >,
     },
     /// Emitted between tool result and next LLM stream to indicate preparation work.
     Preparing,
@@ -3362,8 +3363,6 @@ mod tests {
         assert!(is_mutating_tool("browser"));
         assert!(is_mutating_tool("schedule"));
         assert!(is_mutating_tool("generate_image"));
-        // request_user_input blocks execution; must be gated in plan mode.
-        assert!(is_mutating_tool("request_user_input"));
     }
 
     #[test]
@@ -3376,6 +3375,9 @@ mod tests {
         assert!(!is_mutating_tool("memory_search"));
         assert!(!is_mutating_tool("web_fetch"));
         assert!(!is_mutating_tool("web_search"));
+        // request_user_input is now allowlisted: clarification questions don't
+        // mutate state and are essential to Plan-mode requirement gathering.
+        assert!(!is_mutating_tool("request_user_input"));
     }
 
     #[test]

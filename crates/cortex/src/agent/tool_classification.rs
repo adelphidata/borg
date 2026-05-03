@@ -24,6 +24,7 @@ pub(crate) fn is_mutating_tool(name: &str) -> bool {
             | "memory_search"
             | "web_fetch"
             | "web_search"
+            | "request_user_input"
     )
 }
 
@@ -44,7 +45,6 @@ pub fn mutating_tool_names() -> &'static [&'static str] {
         "manage_roles",
         "manage_tasks",
         "projects",
-        "request_user_input",
         "run_shell",
         "schedule",
         "send_to_agent",

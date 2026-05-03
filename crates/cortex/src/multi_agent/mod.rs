@@ -1350,6 +1350,7 @@ mod tests {
             "memory_search",
             "web_fetch",
             "web_search",
+            "request_user_input",
         ]
         .into_iter()
         .collect();

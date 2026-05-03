@@ -8,8 +8,10 @@
 //! `Session.RespondToPrompt`. The render layer never knows it's talking to a
 //! daemon — it consumes the same enum it always has.
 
+use std::collections::HashMap;
+
 use cortex::agent::AgentEvent as CoreEvent;
-use cortex::tool_handlers::user_input::UserInputChoice;
+use cortex::tool_handlers::user_input::{Answer, Question, QuestionOption};
 use cortex::types::{PlanStep, PlanStepStatus};
 use protocols::session::agent_event::Kind;
 use protocols::session::AgentEvent as PbEvent;
@@ -168,28 +170,33 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
                 .collect(),
         },
         Kind::UserInputRequest(u) => {
-            let (respond_tx, respond_rx) = oneshot::channel::<String>();
+            let (respond_tx, respond_rx) = oneshot::channel::<HashMap<String, Answer>>();
             spawn_input_responder(
                 client.clone(),
                 session_id.to_string(),
                 u.prompt_id,
                 respond_rx,
             );
+            let questions: Vec<Question> = u
+                .questions
+                .into_iter()
+                .map(|q| Question {
+                    id: q.id,
+                    header: q.header,
+                    question: q.question,
+                    multi_select: q.multi_select,
+                    options: q
+                        .options
+                        .into_iter()
+                        .map(|o| QuestionOption {
+                            label: o.label,
+                            description: o.description,
+                        })
+                        .collect(),
+                })
+                .collect();
             CoreEvent::UserInputRequest {
-                prompt: u.prompt,
-                choices: u
-                    .choices
-                    .into_iter()
-                    .map(|c| UserInputChoice {
-                        label: c.label,
-                        description: if c.description.is_empty() {
-                            None
-                        } else {
-                            Some(c.description)
-                        },
-                    })
-                    .collect(),
-                allow_custom: u.allow_custom,
+                questions,
                 respond: respond_tx,
             }
         }
@@ -257,11 +264,15 @@ fn spawn_input_responder(
     mut client: DaemonClient,
     session_id: String,
     prompt_id: String,
-    rx: oneshot::Receiver<String>,
+    rx: oneshot::Receiver<HashMap<String, Answer>>,
 ) {
     tokio::spawn(async move {
         match rx.await {
-            Ok(value) => {
+            Ok(map) => {
+                let value = serde_json::to_string(&map).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to encode user-input answers; sending empty map");
+                    "{}".to_string()
+                });
                 if let Err(e) = client
                     .respond_to_prompt(&session_id, &prompt_id, &value)
                     .await
@@ -275,9 +286,14 @@ fn spawn_input_responder(
                 }
             }
             Err(_) => {
-                // No answer — empty string keeps the agent from hanging while
-                // signalling "no input."
-                if let Err(e) = client.respond_to_prompt(&session_id, &prompt_id, "").await {
+                // No answer — empty map keeps the agent from hanging while
+                // signalling "no input." (Each question key absent => empty
+                // answers list; matches `serialize_answers` fill-missing
+                // behavior.)
+                if let Err(e) = client
+                    .respond_to_prompt(&session_id, &prompt_id, "{}")
+                    .await
+                {
                     tracing::warn!(error = %e, "fallback user-input cancel failed");
                 }
             }

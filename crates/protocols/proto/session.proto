@@ -139,11 +139,27 @@ message SteerReceived { string text = 1; }
 message PlanStep { string id = 1; string text = 2; string status = 3; }
 message PlanUpdated { repeated PlanStep steps = 1; }
 message UserInputChoice { string label = 1; string description = 2; }
+// A single question option in a batched UserInputRequest. The UI auto-appends
+// an "Other" free-form row, so the model never includes it explicitly.
+message UserInputQuestionOption { string label = 1; string description = 2; }
+// One question in a UserInputRequest batch.
+message UserInputQuestion {
+  string id = 1;            // snake_case stable id
+  string header = 2;        // ≤12 char chip label
+  string question = 3;      // one-sentence prompt
+  bool multi_select = 4;    // allow multiple selections
+  repeated UserInputQuestionOption options = 5;
+}
 message UserInputRequest {
+  // Legacy single-prompt fields (deprecated, kept for forward-compat readers).
   string prompt = 1;
   repeated UserInputChoice choices = 2;
   bool allow_custom = 3;
   string prompt_id = 4;
+  // New batched-question payload. When `questions` is non-empty, the response
+  // (RespondToPrompt.value) is the JSON `{ "<qid>": { "answers": [...] } }`
+  // map and the legacy fields above are ignored.
+  repeated UserInputQuestion questions = 5;
 }
 message Preparing {}
 message TurnComplete {}
