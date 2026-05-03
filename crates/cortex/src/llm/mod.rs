@@ -186,6 +186,12 @@ struct PromptTokensDetails {
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
     delta: Option<Delta>,
+    /// Present on the terminal chunk(s). Read but unused: termination is
+    /// driven solely by the `[DONE]` sentinel because OpenRouter splits
+    /// termination across two `finish_reason` chunks (the second carries
+    /// `usage`), and exiting early on the first would drop cost attribution.
+    #[allow(dead_code)]
+    #[serde(default)]
     finish_reason: Option<String>,
 }
 
@@ -627,7 +633,22 @@ impl LlmClient {
         let (cost_usd, cost_usd_present, cost_source) = match self.provider {
             Provider::OpenRouter => match usage.and_then(|u| u.provider_cost_usd.clone()) {
                 Some(cost) => (Some(cost), true, "openrouter_usage".to_string()),
-                None => (None, false, "unknown".to_string()),
+                None => {
+                    // Diagnostic: surface why OpenRouter attribution dropped to
+                    // `unknown`. Distinguishes "no usage chunk arrived" from
+                    // "usage chunk had no cost field" so the eval failure mode
+                    // is observable without enabling full LLM debug logging.
+                    warn!(
+                        target: "cortex::llm::cost",
+                        req_id = %request_id,
+                        usage_present = usage.is_some(),
+                        prompt_tokens = prompt_tokens,
+                        completion_tokens = completion_tokens,
+                        "OpenRouter cost attribution fell through to 'unknown' — \
+                         provider_cost_usd is None"
+                    );
+                    (None, false, "unknown".to_string())
+                }
             },
             Provider::OpenAi => match pricing::estimate_cost_usd(
                 Provider::OpenAi,
@@ -1112,6 +1133,24 @@ impl LlmClient {
                         .and_then(|d| d.cached_tokens)
                         .or(usage.cached_tokens)
                         .unwrap_or(0);
+                    let provider_cost_usd = Self::extract_provider_cost_usd(&usage);
+                    if provider == "openrouter" && provider_cost_usd.is_none() {
+                        // Diagnostic: capture the raw `usage` JSON when an
+                        // OpenRouter chunk lacks a recognizable cost field, so
+                        // the actual response shape is observable in
+                        // production logs without enabling full debug logging.
+                        let raw_usage = serde_json::from_str::<serde_json::Value>(data)
+                            .ok()
+                            .and_then(|v| v.get("usage").cloned())
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "<unparseable>".to_string());
+                        warn!(
+                            target: "cortex::llm::cost",
+                            usage = %raw_usage,
+                            "OpenRouter usage chunk has no recognizable cost field — \
+                             cost-event attribution will be 'unknown'"
+                        );
+                    }
                     events.push(StreamEvent::Usage(UsageData {
                         prompt_tokens: usage.prompt_tokens.unwrap_or(0),
                         completion_tokens: usage.completion_tokens.unwrap_or(0),
@@ -1120,7 +1159,7 @@ impl LlmClient {
                         cache_creation_tokens: 0,
                         provider: provider.to_string(),
                         model: model.to_string(),
-                        provider_cost_usd: Self::extract_provider_cost_usd(&usage),
+                        provider_cost_usd,
                     }));
                 }
 
@@ -1145,10 +1184,12 @@ impl LlmClient {
                                 }
                             }
                         }
-                        if choice.finish_reason.is_some() {
-                            events.push(StreamEvent::Done);
-                            return SseAction::Done(events);
-                        }
+                        // OpenRouter (and others) split termination across
+                        // two chunks: the first carries `finish_reason`, the
+                        // second carries `finish_reason` + `usage`. Returning
+                        // `Done` here would race past the usage chunk and
+                        // permanently strand cost attribution at "unknown".
+                        // Rely solely on the `[DONE]` sentinel to terminate.
                     }
                 }
 

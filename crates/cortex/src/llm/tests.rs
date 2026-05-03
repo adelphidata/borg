@@ -332,6 +332,45 @@ fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
 }
 
 #[test]
+fn openrouter_finish_reason_chunk_does_not_terminate_stream_before_usage() {
+    // Real-world bug: OpenRouter splits termination across two SSE chunks.
+    // First chunk has `finish_reason: "stop"` only. Second chunk has both
+    // `finish_reason: "stop"` AND `usage:{cost:...}`. If the parser returns
+    // `SseAction::Done` on the first finish_reason, `process_sse_stream`
+    // exits and the second chunk's usage is never captured — leaving
+    // `cost_source = "unknown"`. Both chunks must be `Emit`/`Continue`;
+    // termination is driven solely by the `[DONE]` sentinel.
+    use crate::sse::SseAction;
+
+    let line_first_terminal = r#"data: {"choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop"}]}"#;
+    let action = LlmClient::parse_openai_sse_line(
+        line_first_terminal,
+        "openrouter",
+        "anthropic/claude-sonnet-4.5",
+    );
+    assert!(
+        !matches!(action, SseAction::Done(_)),
+        "first finish_reason chunk must NOT terminate the stream — would race past the usage chunk"
+    );
+
+    let line_second_terminal = r#"data: {"choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"stop"}],"usage":{"prompt_tokens":16,"completion_tokens":5,"total_tokens":21,"cost":0.000123}}"#;
+    let usage = parse_openrouter_usage_from_sse(line_second_terminal);
+    assert_eq!(
+        usage.provider_cost_usd.as_deref(),
+        Some("0.000123"),
+        "second terminal chunk's usage must populate provider_cost_usd"
+    );
+
+    let done_line = "data: [DONE]";
+    let done_action =
+        LlmClient::parse_openai_sse_line(done_line, "openrouter", "anthropic/claude-sonnet-4.5");
+    assert!(
+        matches!(done_action, SseAction::Done(_)),
+        "[DONE] sentinel must be the sole termination trigger"
+    );
+}
+
+#[test]
 fn openrouter_non_streaming_usage_cost_resolves_via_extractor() {
     // Non-streaming `chat_openai` deserializes the same `StreamUsage`
     // struct out of the JSON response body. Lock in that the canonical
