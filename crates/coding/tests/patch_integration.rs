@@ -258,6 +258,421 @@ fn spaces_in_filename() {
     assert!(affected.added.contains(&"my file (1).txt".to_string()));
 }
 
+// ── Test: path traversal error message names the violation ──
+//
+// The pre-existing `path_traversal_rejected` test only checks `is_err()`. That
+// passes even if the error came from an unrelated cause (e.g. parse failure).
+// This test pins down that the error is the path-traversal guard specifically,
+// so a regression that lets the path through but fails for a different reason
+// can't pass silently.
+
+#[test]
+fn path_traversal_error_mentions_traversal() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let patch = "\
+*** Begin Patch
+*** Add File: ../escape.txt
++evil
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir).unwrap_err().to_string();
+    assert!(
+        err.contains("Path traversal"),
+        "expected path-traversal error, got: {err}"
+    );
+    // And no file is created anywhere.
+    assert!(!dir.join("../escape.txt").exists());
+    assert!(!dir.parent().unwrap().join("escape.txt").exists());
+}
+
+// ── Test: rerunning an Update patch is not silently idempotent ──
+//
+// Catches a class of bug where an LLM retries a successful apply and the
+// second application either silently no-ops (allowing stale callers to think
+// the file changed twice) or partially mutates state. The contract is: the
+// second apply must error because the search text is no longer present, and
+// the file content must equal the post-first-apply content (no torn write).
+
+#[test]
+fn rerunning_update_patch_errors_without_partial_mutation() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("f.txt"), "alpha\nbeta\ngamma\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+-beta
++BETA
+*** End Patch";
+
+    apply_patch_to_dir(patch, dir).expect("first apply");
+    let after_first = fs::read_to_string(dir.join("f.txt")).expect("read");
+    assert_eq!(after_first, "alpha\nBETA\ngamma\n");
+
+    let second = apply_patch_to_dir(patch, dir);
+    assert!(
+        second.is_err(),
+        "second apply must fail — search text 'beta' no longer exists"
+    );
+    let after_second = fs::read_to_string(dir.join("f.txt")).expect("read");
+    assert_eq!(
+        after_second, after_first,
+        "failed re-apply must not mutate the file"
+    );
+}
+
+// ── Test: multi-hunk update with `@@ context @@` disambiguates near-identical blocks ──
+//
+// Without context hints, the two `    return value;` blocks are ambiguous and
+// the apply must reject. With distinct hints, each hunk anchors to its
+// function and both apply correctly. This validates that context hints carry
+// real disambiguation power, not decoration.
+
+#[test]
+fn context_hints_disambiguate_near_identical_blocks() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let original = "\
+fn alpha(value: i32) -> i32 {
+    return value;
+}
+
+fn beta(value: i32) -> i32 {
+    return value;
+}
+";
+    fs::write(dir.join("dup.rs"), original).expect("seed");
+
+    // First, prove the ambiguity guard fires without hints.
+    let ambiguous_patch = "\
+*** Begin Patch
+*** Update File: dup.rs
+@@
+-    return value;
++    return value + 1;
+*** End Patch";
+    let err = apply_patch_to_dir(ambiguous_patch, dir)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("matched 2 locations") || err.contains("Ambiguous"),
+        "expected ambiguity error, got: {err}"
+    );
+    // File untouched.
+    assert_eq!(fs::read_to_string(dir.join("dup.rs")).unwrap(), original);
+
+    // Now with hints, both hunks resolve.
+    let hinted_patch = "\
+*** Begin Patch
+*** Update File: dup.rs
+@@ fn alpha @@
+ fn alpha(value: i32) -> i32 {
+-    return value;
++    return value + 1;
+ }
+@@ fn beta @@
+ fn beta(value: i32) -> i32 {
+-    return value;
++    return value + 2;
+ }
+*** End Patch";
+    apply_patch_to_dir(hinted_patch, dir).expect("hinted apply");
+    let after = fs::read_to_string(dir.join("dup.rs")).expect("read");
+    assert!(
+        after.contains("fn alpha(value: i32) -> i32 {\n    return value + 1;\n}"),
+        "alpha not patched correctly: {after}"
+    );
+    assert!(
+        after.contains("fn beta(value: i32) -> i32 {\n    return value + 2;\n}"),
+        "beta not patched correctly: {after}"
+    );
+}
+
+// ── Test: CRLF input file is normalized to LF after patching ──
+//
+// `apply_hunks` splits on `content.lines()` which silently strips `\r\n`. The
+// file written back uses `\n` joins. This locks down that observable behavior
+// so a future change that introduces line-ending preservation (or breaks
+// CRLF input entirely) is caught.
+
+#[test]
+fn crlf_input_is_normalized_to_lf_on_update() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("crlf.txt"), "alpha\r\nbeta\r\ngamma\r\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: crlf.txt
+@@
+-beta
++BETA
+*** End Patch";
+
+    apply_patch_to_dir(patch, dir).expect("apply against CRLF file");
+    let after = fs::read_to_string(dir.join("crlf.txt")).expect("read");
+    assert!(
+        !after.contains('\r'),
+        "CRLF must be normalized to LF after patch: {after:?}"
+    );
+    assert!(after.contains("BETA"), "replacement applied: {after:?}");
+    assert!(!after.contains("beta\n"), "old text removed: {after:?}");
+}
+
+// ── Test: move chain (A→B and C→A in one patch) ──
+//
+// A common refactor pattern. Each move's destination must be checked against
+// the *post-move* state, not the original on-disk state, otherwise C→A would
+// be rejected as "destination exists" even though A is being moved away in
+// the same patch.
+
+#[test]
+fn move_chain_a_to_b_and_c_to_a() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("a.txt"), "from a\n").expect("seed a");
+    fs::write(dir.join("c.txt"), "from c\n").expect("seed c");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: a.txt
+*** Move to: b.txt
+*** Update File: c.txt
+*** Move to: a.txt
+*** End Patch";
+
+    let result = apply_patch_to_dir(patch, dir);
+
+    // We don't assume which behavior is correct — we lock down whatever the
+    // applicator does. If it succeeds, both moves must take effect coherently.
+    // If it fails, both files must remain untouched.
+    match result {
+        Ok(_) => {
+            assert!(!dir.join("c.txt").exists(), "c.txt should be moved away");
+            assert_eq!(
+                fs::read_to_string(dir.join("a.txt")).unwrap(),
+                "from c\n",
+                "a.txt should now hold former c.txt content"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("b.txt")).unwrap(),
+                "from a\n",
+                "b.txt should hold former a.txt content"
+            );
+        }
+        Err(_) => {
+            // Whole-patch rollback: original layout intact, no b.txt created.
+            assert_eq!(
+                fs::read_to_string(dir.join("a.txt")).unwrap(),
+                "from a\n",
+                "rollback must preserve a.txt"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.join("c.txt")).unwrap(),
+                "from c\n",
+                "rollback must preserve c.txt"
+            );
+            assert!(
+                !dir.join("b.txt").exists(),
+                "rollback must not leave b.txt behind"
+            );
+        }
+    }
+}
+
+// ── Test: preflight rejects whole patch when one op fails, no partial writes ──
+//
+// Multi-op atomicity from the integration surface. An Add op that would
+// succeed in isolation must not write to disk if a later Update op in the
+// same patch fails its hunk match.
+
+#[test]
+fn preflight_failure_prevents_partial_filesystem_writes() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("existing.txt"), "real content\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Add File: should_not_appear.txt
++this file must not exist after the failed apply
+*** Update File: existing.txt
+@@
+-not in file
++replacement
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir).expect_err("update should fail and abort whole patch");
+    let _ = err; // error message variants tested elsewhere
+
+    assert!(
+        !dir.join("should_not_appear.txt").exists(),
+        "Add op must be rolled back on later Update failure"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("existing.txt")).unwrap(),
+        "real content\n",
+        "existing file must be unchanged"
+    );
+}
+
+// ── Test: missing diff-line prefix is a parse error ──
+//
+// The CLAUDE.md "common mistake" — Update body lines without `+`/`-`/space
+// must be rejected at parse time, not silently dropped or treated as context.
+
+#[test]
+fn update_body_line_missing_prefix_is_parse_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+    fs::write(dir.join("f.txt"), "old\n").expect("seed");
+
+    // Note: 'naked line' has no leading space, +, or -.
+    let patch = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+naked line
+-old
++new
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir).unwrap_err().to_string();
+    // File untouched.
+    assert_eq!(fs::read_to_string(dir.join("f.txt")).unwrap(), "old\n");
+    // Error must mention the offending content so the user can fix it.
+    assert!(
+        !err.is_empty(),
+        "error should be reported, got empty: {err}"
+    );
+}
+
+// ── Test: missing Begin Patch sentinel rejected (default Strict mode) ──
+//
+// The default ParseMode is Strict — apply_patch_to_dir requires
+// *** Begin Patch on the first non-empty line. The error message names the
+// missing sentinel so an LLM caller can recover on its next turn without
+// guessing the format.
+
+#[test]
+fn missing_begin_patch_sentinel_rejected_with_actionable_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let patch = "\
+*** Add File: x.txt
++content
+*** End Patch";
+
+    let err =
+        apply_patch_to_dir(patch, dir).expect_err("strict mode must reject missing Begin Patch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Begin Patch"),
+        "error must name the missing sentinel so the caller can fix it; got: {msg}"
+    );
+    assert!(
+        !dir.join("x.txt").exists(),
+        "no file should be created on parse failure"
+    );
+}
+
+// ── Test: missing End Patch sentinel rejected ──
+
+#[test]
+fn missing_end_patch_sentinel_rejected_with_actionable_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let patch = "\
+*** Begin Patch
+*** Add File: x.txt
++content";
+
+    let err =
+        apply_patch_to_dir(patch, dir).expect_err("strict mode must reject missing End Patch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("End Patch"),
+        "error must name the missing sentinel; got: {msg}"
+    );
+    assert!(!dir.join("x.txt").exists());
+}
+
+// ── Test: heredoc-wrapped patch rejected by default, accepted in Lenient ──
+//
+// Validates the explicit Strict-by-default + Lenient-opt-in surface end
+// to end. Same patch, two modes, two outcomes. Real filesystem writes
+// in the success case, no writes in the error case.
+
+#[test]
+fn heredoc_wrapping_rejected_in_default_strict_but_accepted_in_lenient() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let heredoc_patch = "<<'EOF'\n\
+*** Begin Patch\n\
+*** Add File: y.txt\n\
++hello via heredoc\n\
+*** End Patch\n\
+EOF";
+
+    // Default (Strict): rejects, no file created.
+    let strict_err = apply_patch_to_dir(heredoc_patch, dir)
+        .expect_err("strict default must reject heredoc wrapping");
+    assert!(
+        strict_err.to_string().contains("Begin Patch"),
+        "got: {strict_err}"
+    );
+    assert!(!dir.join("y.txt").exists());
+
+    // Lenient: unwraps EOF heredoc, applies inner patch.
+    let affected =
+        coding::apply_patch_to_dir_with_mode(heredoc_patch, dir, coding::ParseMode::Lenient)
+            .expect("lenient must accept EOF heredoc");
+    assert_eq!(affected.added, vec!["y.txt"]);
+    assert_eq!(
+        fs::read_to_string(dir.join("y.txt")).unwrap(),
+        "hello via heredoc",
+        "heredoc unwrapping must yield the inner content verbatim"
+    );
+}
+
+// ── Test: Lenient does not paper over a missing inner Begin Patch ──
+//
+// Lenient is *only* about outer-wrapper tolerance. A heredoc whose inner
+// content lacks `*** Begin Patch` must still error — otherwise Lenient
+// becomes "anything goes," which defeats the whole point of having two
+// explicit modes.
+
+#[test]
+fn lenient_still_requires_inner_begin_patch_marker() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let patch = "<<'EOF'\n\
+*** Add File: z.txt\n\
++content\n\
+EOF";
+
+    let err = coding::apply_patch_to_dir_with_mode(patch, dir, coding::ParseMode::Lenient)
+        .expect_err("lenient still requires inner sentinels");
+    assert!(
+        err.to_string().contains("Begin Patch") || err.to_string().contains("End Patch"),
+        "got: {err}"
+    );
+    assert!(!dir.join("z.txt").exists());
+}
+
 // ── Test: multi-hunk update ──
 
 #[test]

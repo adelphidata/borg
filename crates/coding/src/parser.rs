@@ -184,33 +184,29 @@ fn collect_diff_lines<'a>(lines: &[&'a str], i: &mut usize) -> (Vec<&'a str>, Ve
     (search_lines, replace_lines, is_end_of_file)
 }
 
-/// Strip heredoc wrapping (`<<'EOF'...EOF`) that LLMs sometimes produce.
-/// Supports any delimiter word (EOF, PATCH, END, etc.) with optional single or double quotes.
-/// Returns the original lines unchanged if no valid heredoc wrapper is detected.
-fn strip_heredoc_wrapper(lines: Vec<&str>) -> Vec<&str> {
-    if lines.len() < 4 {
-        return lines;
-    }
-    let first = lines.first().map(|l| l.trim()).unwrap_or("");
-    let last = lines.last().map(|l| l.trim()).unwrap_or("");
-    if let Some(rest) = first.strip_prefix("<<") {
-        // Strip matching quotes ('' or ""), reject mismatched quotes
-        let delim = if let Some(inner) = rest.strip_prefix('\'').and_then(|s| s.strip_suffix('\''))
-        {
-            inner
-        } else if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-            inner
-        } else {
-            rest
-        };
-        if !delim.is_empty() && last == delim {
-            return lines[1..lines.len() - 1].to_vec();
-        }
-    }
-    lines
+/// Parser tolerance level for `*** Begin Patch` / `*** End Patch` boundary
+/// markers and shell-heredoc wrapping.
+///
+/// `Strict` is the default and mirrors the documented format: the patch text
+/// must begin with `*** Begin Patch` and end with `*** End Patch`. Anything
+/// else — bare body, leading garbage, heredoc wrapping — is rejected with a
+/// clear error so the caller (or LLM) can correct it.
+///
+/// `Lenient` first attempts `Strict`; on failure, if the input looks like a
+/// shell heredoc (`<<EOF ... EOF`, `<<'EOF' ... EOF`, or `<<"EOF" ... EOF`),
+/// the wrapper is stripped and the inner content is re-parsed under `Strict`.
+/// The inner content is still required to carry the `*** Begin Patch` /
+/// `*** End Patch` sentinels — `Lenient` only forgives the outer wrapping,
+/// not missing markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseMode {
+    /// Sentinels required, no heredoc unwrapping.
+    Strict,
+    /// Sentinels required, with `<<EOF`-family heredoc unwrapping as a fallback.
+    Lenient,
 }
 
-/// Parse a patch string into a structured `Patch`.
+/// Parse a patch string into a structured `Patch` using `ParseMode::Strict`.
 ///
 /// The format follows the apply-patch DSL:
 ///
@@ -229,25 +225,87 @@ fn strip_heredoc_wrapper(lines: Vec<&str>) -> Vec<&str> {
 /// ```
 ///
 /// Key rules:
-/// - `*** Begin Patch` and `*** End Patch` are required boundaries.
+/// - `*** Begin Patch` and `*** End Patch` are required boundaries (Strict).
 /// - Add File content lines MUST start with `+` (stripped when stored).
 ///   Lines without `+` terminate the add block — this prevents ambiguity
 ///   when file content itself contains `***` markers.
 /// - Update File hunk lines use unified diff prefixes: ` ` (context),
 ///   `-` (remove), `+` (add). Lines without these prefixes terminate the hunk.
 /// - Delete File has no body.
+///
+/// For shell-heredoc-wrapped input (which some LLMs emit when targeting a
+/// `local_shell`-style tool), use `parse_patch_with_mode` with `ParseMode::Lenient`.
 pub fn parse_patch(input: &str) -> Result<Patch, ParseError> {
+    parse_patch_with_mode(input, ParseMode::Strict)
+}
+
+/// Parse a patch string with an explicit `ParseMode`. See `ParseMode` for the
+/// distinction.
+pub fn parse_patch_with_mode(input: &str, mode: ParseMode) -> Result<Patch, ParseError> {
     if looks_like_unified_diff(input) {
         return parse_unified_diff(input);
     }
-    parse_patch_dsl(input)
+    let body = match mode {
+        ParseMode::Strict => check_patch_boundaries_strict(input)?,
+        ParseMode::Lenient => check_patch_boundaries_lenient(input)?,
+    };
+    parse_patch_dsl(&body)
+}
+
+/// Validate that the input has the required outer `*** Begin Patch` /
+/// `*** End Patch` sentinels (after trimming surrounding whitespace) and
+/// return the input unchanged for downstream parsing.
+///
+/// The error messages name the offending sentinel so callers can fix the
+/// patch without guessing.
+fn check_patch_boundaries_strict(input: &str) -> Result<String, ParseError> {
+    let trimmed: Vec<&str> = input.trim().lines().collect();
+    let first = trimmed.first().map(|l| l.trim());
+    let last = trimmed.last().map(|l| l.trim());
+    match (first, last) {
+        (Some(f), Some(l)) if f == BEGIN_PATCH_MARKER && l == END_PATCH_MARKER => {
+            Ok(input.to_string())
+        }
+        (None, _) => Err(ParseError::InvalidFormat(
+            "Patch is empty; expected '*** Begin Patch' on the first line".to_string(),
+        )),
+        (Some(f), _) if f != BEGIN_PATCH_MARKER => Err(ParseError::InvalidFormat(
+            "The first line of the patch must be '*** Begin Patch'".to_string(),
+        )),
+        _ => Err(ParseError::InvalidFormat(
+            "The last line of the patch must be '*** End Patch'".to_string(),
+        )),
+    }
+}
+
+/// Validate boundaries with a single fallback for heredoc-wrapped input.
+///
+/// Tries strict first. If that fails *and* the input is wrapped in a
+/// shell-style EOF heredoc (`<<EOF`, `<<'EOF'`, or `<<"EOF"` … `EOF`), the
+/// outer markers are stripped and the inner content is validated strictly.
+/// The inner content must still carry `*** Begin Patch` / `*** End Patch` —
+/// Lenient mode does not forgive missing sentinels, only outer wrapping.
+fn check_patch_boundaries_lenient(input: &str) -> Result<String, ParseError> {
+    let original_err = match check_patch_boundaries_strict(input) {
+        Ok(s) => return Ok(s),
+        Err(e) => e,
+    };
+
+    let trimmed_lines: Vec<&str> = input.trim().lines().collect();
+    if trimmed_lines.len() >= 4 {
+        let first = trimmed_lines[0].trim();
+        let last = trimmed_lines[trimmed_lines.len() - 1].trim();
+        let is_eof_open = matches!(first, "<<EOF" | "<<'EOF'" | "<<\"EOF\"");
+        if is_eof_open && last == "EOF" {
+            let inner = trimmed_lines[1..trimmed_lines.len() - 1].join("\n");
+            return check_patch_boundaries_strict(&inner);
+        }
+    }
+    Err(original_err)
 }
 
 fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
     let lines: Vec<&str> = input.lines().collect();
-
-    // Heredoc tolerance: strip <<'EOF'...EOF wrapping that LLMs sometimes emit.
-    let lines = strip_heredoc_wrapper(lines);
 
     let mut operations = Vec::new();
     let mut i = 0;
@@ -774,12 +832,18 @@ mod tests {
         // A '+' line outside any block must fail loudly. Prior behavior
         // silently dropped it, masking truncated AddFile/UpdateFile blocks
         // and reporting "applied successfully" on corrupted patches.
+        // The orphan appears between two complete operations — both
+        // boundary sentinels are present so the strict outer check passes,
+        // and the dsl parser then catches the bare '+' at top level.
         let input = "\
 *** Begin Patch
 *** Add File: a.txt
 +hello
 *** End Patch
-+stray line";
++stray line
+*** Add File: b.txt
++world
+*** End Patch";
         let err = parse_patch(input).expect_err("orphaned + must error");
         match err {
             ParseError::InvalidFormat(msg) => {
@@ -861,20 +925,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_add_file_without_begin_end_markers() {
-        // The parser is lenient and doesn't require Begin/End markers
+    fn parse_add_file_without_begin_end_markers_rejected_in_strict() {
+        // Strict mode (the default) requires the *** Begin Patch / *** End Patch
+        // sentinels. Missing markers must produce a clear, actionable error
+        // naming the offending sentinel — so an LLM caller can recover on
+        // its next turn without guessing.
         let input = "\
 *** Add File: test.txt
 +content here";
-        let patch = parse_patch(input).unwrap();
-        assert_eq!(patch.operations.len(), 1);
-        match &patch.operations[0] {
-            PatchOperation::AddFile { path, content } => {
-                assert_eq!(path, "test.txt");
-                assert_eq!(content, "content here");
-            }
-            other => panic!("Expected AddFile, got {:?}", other),
+        let err = parse_patch(input).expect_err("strict mode must reject missing markers");
+        match err {
+            ParseError::InvalidFormat(msg) => assert!(
+                msg.contains("Begin Patch"),
+                "error must name the missing sentinel, got: {msg}"
+            ),
+            other => panic!("Expected InvalidFormat, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_add_file_without_begin_end_markers_rejected_in_lenient_too() {
+        // Lenient mode only forgives shell-heredoc *outer* wrapping — it
+        // still requires *** Begin Patch / *** End Patch on the inner content.
+        // A bare body with no sentinels is rejected in both modes.
+        let input = "\
+*** Add File: test.txt
++content here";
+        let err = parse_patch_with_mode(input, ParseMode::Lenient)
+            .expect_err("lenient mode also requires sentinels");
+        assert!(matches!(err, ParseError::InvalidFormat(_)));
     }
 
     // ── Delete File ──
@@ -1082,7 +1161,13 @@ mod tests {
         let result = parse_patch("");
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("No operations found"), "got: {err}");
+        // Strict boundary check fires on empty input with a message naming
+        // the missing sentinel — clearer for an LLM caller to recover from
+        // than a vague "no operations" message.
+        assert!(
+            err.contains("Begin Patch") || err.contains("empty"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1321,14 +1406,34 @@ mod tests {
     // ── Heredoc tolerance ──
 
     #[test]
-    fn parse_heredoc_wrapped_patch() {
+    fn parse_heredoc_rejected_in_strict_mode() {
+        // Strict mode (the default) does NOT unwrap shell heredocs — it
+        // requires *** Begin Patch as the literal first line. This catches
+        // misformatted patches loudly so the LLM can retry without the
+        // shell wrapper, which is what the agent's tool-call surface
+        // expects today.
         let input = "<<'EOF'\n\
 *** Begin Patch\n\
 *** Add File: test.txt\n\
 +hello\n\
 *** End Patch\n\
 EOF";
-        let patch = parse_patch(input).unwrap();
+        let err = parse_patch(input).expect_err("strict must reject heredoc");
+        assert!(
+            matches!(err, ParseError::InvalidFormat(ref m) if m.contains("Begin Patch")),
+            "expected first-line Begin Patch error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_heredoc_single_quoted_accepted_in_lenient() {
+        let input = "<<'EOF'\n\
+*** Begin Patch\n\
+*** Add File: test.txt\n\
++hello\n\
+*** End Patch\n\
+EOF";
+        let patch = parse_patch_with_mode(input, ParseMode::Lenient).unwrap();
         assert_eq!(patch.operations.len(), 1);
         match &patch.operations[0] {
             PatchOperation::AddFile { path, content } => {
@@ -1340,42 +1445,56 @@ EOF";
     }
 
     #[test]
-    fn parse_heredoc_unquoted() {
+    fn parse_heredoc_unquoted_accepted_in_lenient() {
         let input = "<<EOF\n\
 *** Begin Patch\n\
 *** Add File: test.txt\n\
 +hello\n\
 *** End Patch\n\
 EOF";
-        let patch = parse_patch(input).unwrap();
+        let patch = parse_patch_with_mode(input, ParseMode::Lenient).unwrap();
         assert_eq!(patch.operations.len(), 1);
     }
 
     #[test]
-    fn parse_heredoc_double_quoted() {
+    fn parse_heredoc_double_quoted_accepted_in_lenient() {
         let input = "<<\"EOF\"\n\
 *** Begin Patch\n\
 *** Add File: test.txt\n\
 +hello\n\
 *** End Patch\n\
 EOF";
-        let patch = parse_patch(input).unwrap();
+        let patch = parse_patch_with_mode(input, ParseMode::Lenient).unwrap();
         assert_eq!(patch.operations.len(), 1);
     }
 
     #[test]
-    fn parse_heredoc_mismatched_not_stripped() {
-        // Mismatched quotes should NOT trigger heredoc stripping.
-        // The inner patch content may still parse due to Borg's lenient parser,
-        // but the heredoc lines themselves are not consumed as valid operations.
-        // Use content that would fail without proper stripping: no Begin/End inside.
-        let input = "<<\"EOF'\n\
+    fn parse_heredoc_lenient_still_requires_inner_begin_patch() {
+        // Lenient only forgives the outer wrapping. The content INSIDE the
+        // heredoc must still carry *** Begin Patch / *** End Patch sentinels.
+        let input = "<<'EOF'\n\
+*** Add File: test.txt\n\
 +hello\n\
 EOF";
-        let result = parse_patch(input);
-        // Without heredoc stripping, "<<\"EOF'" and "EOF" are not valid operations,
-        // and "+hello" alone is not recognized outside an AddFile block.
-        assert!(result.is_err());
+        let err = parse_patch_with_mode(input, ParseMode::Lenient)
+            .expect_err("lenient still requires inner sentinels");
+        assert!(matches!(err, ParseError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn parse_heredoc_mismatched_quotes_rejected_in_lenient() {
+        // Mismatched quotes (`<<"EOF'`) must NOT be treated as a valid
+        // heredoc. Lenient should refuse to unwrap and bubble up the
+        // strict error.
+        let input = "<<\"EOF'\n\
+*** Begin Patch\n\
+*** Add File: test.txt\n\
++hello\n\
+*** End Patch\n\
+EOF";
+        let err = parse_patch_with_mode(input, ParseMode::Lenient)
+            .expect_err("mismatched quotes must not be unwrapped");
+        assert!(matches!(err, ParseError::InvalidFormat(_)));
     }
 
     // ── First chunk without @@ header ──
@@ -1465,10 +1584,13 @@ not_a_diff_line
     }
 
     #[test]
-    fn parse_heredoc_with_eof_in_content() {
-        // Content that itself contains "EOF" should not confuse heredoc stripping
+    fn parse_heredoc_with_eof_in_content_accepted_in_lenient() {
+        // Content that itself contains "EOF" must not confuse heredoc
+        // stripping — the outer EOF markers strip cleanly because the
+        // boundary check looks at the literal first/last lines, not the
+        // body.
         let input = "<<'EOF'\n*** Begin Patch\n*** Add File: t.txt\n+EOF\n*** End Patch\nEOF";
-        let patch = parse_patch(input).unwrap();
+        let patch = parse_patch_with_mode(input, ParseMode::Lenient).unwrap();
         match &patch.operations[0] {
             PatchOperation::AddFile { content, .. } => assert_eq!(content, "EOF"),
             other => panic!("Expected AddFile, got {:?}", other),
@@ -1476,11 +1598,15 @@ not_a_diff_line
     }
 
     #[test]
-    fn parse_heredoc_custom_delimiter() {
-        // LLMs sometimes use PATCH or END instead of EOF
+    fn parse_heredoc_custom_delimiter_rejected_in_lenient() {
+        // Lenient mode mirrors the documented heredoc shapes only:
+        // <<EOF, <<'EOF', <<"EOF". Custom delimiters like <<'PATCH' are NOT
+        // unwrapped — callers must use the standard EOF spelling. This
+        // narrows the API surface and keeps Lenient predictable.
         let input = "<<'PATCH'\n*** Begin Patch\n*** Add File: t.txt\n+hi\n*** End Patch\nPATCH";
-        let patch = parse_patch(input).unwrap();
-        assert_eq!(patch.operations.len(), 1);
+        let err = parse_patch_with_mode(input, ParseMode::Lenient)
+            .expect_err("non-EOF delimiter must not be unwrapped");
+        assert!(matches!(err, ParseError::InvalidFormat(_)));
     }
 
     #[test]
@@ -1506,12 +1632,15 @@ not_a_diff_line
 
     #[test]
     fn parse_add_file_strips_plus_end_patch_marker() {
-        // LLM erroneously prefixes *** End Patch with +
+        // LLM erroneously prefixes *** End Patch with +. The real End Patch
+        // sentinel still terminates the patch; the +-prefixed copy must be
+        // stripped from the AddFile content.
         let input = "\
 *** Begin Patch
 *** Add File: src/new.rs
 +fn main() {}
-+*** End Patch";
++*** End Patch
+*** End Patch";
         let patch = parse_patch(input).unwrap();
         assert_eq!(patch.operations.len(), 1);
         match &patch.operations[0] {
@@ -1560,7 +1689,8 @@ not_a_diff_line
 @@
 -old_line
 +new_line
-+*** End Patch";
++*** End Patch
+*** End Patch";
         let patch = parse_patch(input).unwrap();
         match &patch.operations[0] {
             PatchOperation::UpdateFile { hunks, .. } => {
@@ -1603,13 +1733,15 @@ not_a_diff_line
 
     #[test]
     fn parse_add_file_strips_plus_begin_patch_marker() {
-        // LLM wraps content with both +*** Begin Patch and +*** End Patch
+        // LLM wraps content with both +*** Begin Patch and +*** End Patch.
+        // The outer real *** End Patch terminates the patch.
         let input = "\
 *** Begin Patch
 *** Add File: script.py
 +*** Begin Patch
 +print('hello')
-+*** End Patch";
++*** End Patch
+*** End Patch";
         let patch = parse_patch(input).unwrap();
         assert_eq!(patch.operations.len(), 1);
         match &patch.operations[0] {
@@ -1629,12 +1761,14 @@ not_a_diff_line
 
     #[test]
     fn parse_add_file_strips_all_dsl_markers_at_end() {
-        // +*** Add File: as last line should be stripped too
+        // +*** Add File: as last + line should be stripped too. The real
+        // *** End Patch terminates the patch.
         let input = "\
 *** Begin Patch
 *** Add File: test.py
 +code here
-+*** Add File: bogus.py";
++*** Add File: bogus.py
+*** End Patch";
         let patch = parse_patch(input).unwrap();
         assert_eq!(patch.operations.len(), 1);
         match &patch.operations[0] {
@@ -1647,11 +1781,13 @@ not_a_diff_line
 
     #[test]
     fn parse_add_file_no_content_only_plus_end_patch() {
-        // Edge case: only line is +*** End Patch — should produce empty content
+        // Edge case: only + line is +*** End Patch — produces empty content.
+        // The real *** End Patch terminates the patch.
         let input = "\
 *** Begin Patch
 *** Add File: empty.py
-+*** End Patch";
++*** End Patch
+*** End Patch";
         let patch = parse_patch(input).unwrap();
         assert_eq!(patch.operations.len(), 1);
         match &patch.operations[0] {

@@ -1373,7 +1373,8 @@ mod tests {
 *** Add File: snake.py
 +import sys
 +print('hello')
-+*** End Patch";
++*** End Patch
+*** End Patch";
 
         let affected = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
         assert_eq!(affected.added, vec!["snake.py"]);
@@ -1399,7 +1400,8 @@ mod tests {
 @@
 -old_line
 +new_line
-+*** End Patch";
++*** End Patch
+*** End Patch";
 
         let affected = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
         assert_eq!(affected.modified, vec!["app.py"]);
@@ -1514,7 +1516,12 @@ mod tests {
 *** End Patch\n\
 EOF";
 
-        let affected = crate::apply_patch_to_dir(patch_text, dir.path()).unwrap();
+        // Heredoc-wrapped input requires Lenient mode: the public API defaults
+        // to Strict (sentinels at the outermost layer), so callers that need
+        // shell-heredoc tolerance must opt in.
+        let affected =
+            crate::apply_patch_to_dir_with_mode(patch_text, dir.path(), crate::ParseMode::Lenient)
+                .unwrap();
         assert_eq!(affected.modified, vec!["main.py"]);
         let content = std::fs::read_to_string(dir.path().join("main.py")).unwrap();
         assert!(content.contains("x = 10"));

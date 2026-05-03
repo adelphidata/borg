@@ -36,10 +36,25 @@ use anyhow::Result;
 use std::path::Path;
 
 pub use apply::{AffectedPaths, ApplyPatchResult};
+pub use parser::ParseMode;
 
 /// Parse and apply a patch to a directory, returning which files were affected.
+///
+/// Defaults to `ParseMode::Strict`: the patch text must begin with
+/// `*** Begin Patch` and end with `*** End Patch`. For callers that need to
+/// accept shell-heredoc-wrapped input (some LLM tool-call shapes), use
+/// `apply_patch_to_dir_with_mode` with `ParseMode::Lenient`.
 pub fn apply_patch_to_dir(patch_text: &str, base_dir: &Path) -> Result<ApplyPatchResult> {
-    let patch = parser::parse_patch(patch_text)?;
+    apply_patch_to_dir_with_mode(patch_text, base_dir, ParseMode::Strict)
+}
+
+/// Parse and apply a patch with an explicit `ParseMode`.
+pub fn apply_patch_to_dir_with_mode(
+    patch_text: &str,
+    base_dir: &Path,
+    mode: ParseMode,
+) -> Result<ApplyPatchResult> {
+    let patch = parser::parse_patch_with_mode(patch_text, mode)?;
     apply::apply_patch(&patch, base_dir)
 }
 
