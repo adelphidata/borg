@@ -794,59 +794,14 @@ impl Database {
         Ok(())
     }
 
-    /// V31: Workflow engine — durable multi-step task orchestration + projects
+    /// V31: Workflow engine + projects (DEMOLISHED in V51).
+    ///
+    /// Originally created `projects`, `workflows`, and `workflow_steps`
+    /// tables. The feature was removed pre-release because workflow steps
+    /// ran as text-only LLM calls with no tools — actively misleading the
+    /// model into hallucinating progress. V51 drops the tables; this
+    /// migration is now a no-op kept for version-numbering continuity.
     pub(super) fn migrate_v31(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS projects (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_projects_status ON projects(status);
-
-            CREATE TABLE IF NOT EXISTS workflows (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                goal TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                current_step INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                completed_at INTEGER,
-                error TEXT,
-                session_id TEXT REFERENCES sessions(id),
-                project_id TEXT REFERENCES projects(id) ON DELETE CASCADE,
-                delivery_channel TEXT,
-                delivery_target TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status);
-            CREATE INDEX IF NOT EXISTS idx_workflows_session ON workflows(session_id);
-            CREATE INDEX IF NOT EXISTS idx_workflows_project ON workflows(project_id);
-
-            CREATE TABLE IF NOT EXISTS workflow_steps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-                step_index INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                instructions TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                output TEXT,
-                error TEXT,
-                started_at INTEGER,
-                completed_at INTEGER,
-                max_retries INTEGER NOT NULL DEFAULT 3,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                timeout_ms INTEGER NOT NULL DEFAULT 300000,
-                UNIQUE(workflow_id, step_index)
-            );
-            CREATE INDEX IF NOT EXISTS idx_workflow_steps_workflow
-                ON workflow_steps(workflow_id, step_index);
-            ",
-        )?;
         Ok(())
     }
 
@@ -1791,6 +1746,38 @@ impl Database {
                 ON doctor_squelches(expires_at);
             ",
         )?;
+        Ok(())
+    }
+
+    /// V51: Demolish workflows + projects; add `pre_run_*` columns to
+    /// `scheduled_tasks` for Hermes-style script preprocessing.
+    ///
+    /// The workflow feature was removed pre-release: step execution ran
+    /// `llm.chat(.., None)` with no tools, so each step could only emit
+    /// text — actively misleading the model into hallucinating progress.
+    /// Projects existed only to group workflows; removed alongside.
+    ///
+    /// `pre_run_command` runs a shell preamble before the LLM step; its
+    /// stdout is injected into the prompt as `<preprocessed_context>` so
+    /// weaker models reason instead of fetch.
+    pub(super) fn migrate_v51(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS workflow_steps;
+             DROP TABLE IF EXISTS workflows;
+             DROP TABLE IF EXISTS projects;",
+        )?;
+        for col in ["pre_run_command", "pre_run_cwd"] {
+            if !Self::has_column(&self.conn, "scheduled_tasks", col) {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE scheduled_tasks ADD COLUMN {col} TEXT;"
+                ))?;
+            }
+        }
+        if !Self::has_column(&self.conn, "scheduled_tasks", "pre_run_timeout_ms") {
+            self.conn.execute_batch(
+                "ALTER TABLE scheduled_tasks ADD COLUMN pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000;",
+            )?;
+        }
         Ok(())
     }
 

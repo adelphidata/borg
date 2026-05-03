@@ -24,7 +24,6 @@ mod paste_burst;
 mod plan_overlay;
 mod plugins_popup;
 mod popup_utils;
-mod projects_popup;
 mod schedule_popup;
 mod sessions_popup;
 mod settings_popup;
@@ -1348,64 +1347,6 @@ async fn run_event_loop(
                             let short = &task_id[..8.min(task_id.len())];
                             match client.delete_scheduled_task(&task_id).await {
                                 Ok(()) => results.push(format!("Task {short} deleted")),
-                                Err(e) => results.push(format!("Error: {e}")),
-                            }
-                        }
-                    }
-                }
-                if !results.is_empty() {
-                    app.push_system_message(results.join("\n"));
-                }
-            }
-            AppAction::RunProjectActions { actions } => {
-                let mut results: Vec<String> = Vec::new();
-                for action in actions {
-                    match action {
-                        projects_popup::ProjectAction::Create {
-                            id: _,
-                            name,
-                            description,
-                        } => match client.create_project(&name, &description).await {
-                            Ok(_) => results.push(format!("Project '{name}' created")),
-                            Err(e) => results.push(format!("Error: {e}")),
-                        },
-                        projects_popup::ProjectAction::Update {
-                            project_id,
-                            name,
-                            description,
-                        } => {
-                            let short = &project_id[..8.min(project_id.len())];
-                            match client
-                                .update_project(
-                                    &project_id,
-                                    name.as_deref().unwrap_or(""),
-                                    description.as_deref().unwrap_or(""),
-                                    "",
-                                )
-                                .await
-                            {
-                                Ok(_) => results.push(format!("Project {short} updated")),
-                                Err(e) => results.push(format!("Error: {e}")),
-                            }
-                        }
-                        projects_popup::ProjectAction::Archive { project_id } => {
-                            let short = &project_id[..8.min(project_id.len())];
-                            match client.archive_project(&project_id).await {
-                                Ok(()) => results.push(format!("Project {short} archived")),
-                                Err(e) => results.push(format!("Error: {e}")),
-                            }
-                        }
-                        projects_popup::ProjectAction::Unarchive { project_id } => {
-                            let short = &project_id[..8.min(project_id.len())];
-                            match client.unarchive_project(&project_id).await {
-                                Ok(()) => results.push(format!("Project {short} unarchived")),
-                                Err(e) => results.push(format!("Error: {e}")),
-                            }
-                        }
-                        projects_popup::ProjectAction::Delete { project_id } => {
-                            let short = &project_id[..8.min(project_id.len())];
-                            match client.delete_project(&project_id).await {
-                                Ok(()) => results.push(format!("Project {short} deleted")),
                                 Err(e) => results.push(format!("Error: {e}")),
                             }
                         }

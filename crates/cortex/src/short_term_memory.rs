@@ -8,19 +8,6 @@
 use crate::sanitize::escape_xml_attr;
 use crate::tokenizer::estimate_tokens;
 
-/// Context about the currently active project.
-#[derive(Debug, Clone)]
-pub struct ProjectContext {
-    /// Project ID from the projects table.
-    pub id: String,
-    /// Human-readable project name.
-    pub name: String,
-    /// Brief project description.
-    pub description: String,
-    /// Project status (e.g. "active", "archived").
-    pub status: String,
-}
-
 /// Category of a short-term memory fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactCategory {
@@ -63,12 +50,11 @@ pub struct MemoryFact {
 
 /// Short-term working memory for the current session.
 ///
-/// Accumulates facts and project context in-memory. Rendered into the
-/// system prompt on each turn and flushed to a daily log on session end.
+/// Accumulates facts in-memory. Rendered into the system prompt on each
+/// turn and flushed to a daily log on session end.
 #[derive(Debug)]
 pub struct ShortTermMemory {
     session_id: String,
-    active_project: Option<ProjectContext>,
     facts: Vec<MemoryFact>,
     facts_tokens: usize,
     max_tokens: usize,
@@ -79,16 +65,10 @@ impl ShortTermMemory {
     pub fn new(session_id: String, max_tokens: usize) -> Self {
         Self {
             session_id,
-            active_project: None,
             facts: Vec::new(),
             facts_tokens: 0,
             max_tokens,
         }
-    }
-
-    /// Set the active project context.
-    pub fn set_active_project(&mut self, project: ProjectContext) {
-        self.active_project = Some(project);
     }
 
     /// Add a fact to working memory. Drops the oldest fact if over budget.
@@ -114,9 +94,9 @@ impl ShortTermMemory {
         }
     }
 
-    /// Returns true if there are no facts and no active project.
+    /// Returns true if there are no facts.
     pub fn is_empty(&self) -> bool {
-        self.facts.is_empty() && self.active_project.is_none()
+        self.facts.is_empty()
     }
 
     /// Estimated token count of the rendered output.
@@ -124,12 +104,7 @@ impl ShortTermMemory {
         if self.is_empty() {
             return 0;
         }
-        let project_tokens = self
-            .active_project
-            .as_ref()
-            .map(|p| estimate_tokens(&p.name) + estimate_tokens(&p.description) + 20)
-            .unwrap_or(0);
-        self.facts_tokens + project_tokens + 30 // overhead for XML tags
+        self.facts_tokens + 30 // overhead for XML tags
     }
 
     /// Render as XML for inclusion in the system prompt.
@@ -143,15 +118,6 @@ impl ShortTermMemory {
             "\n<working_memory session=\"{}\">\n",
             escape_xml_attr(&self.session_id)
         );
-
-        if let Some(ref project) = self.active_project {
-            out.push_str(&format!(
-                "  <active_project name=\"{}\" status=\"{}\">\n    {}\n  </active_project>\n",
-                escape_xml_attr(&project.name),
-                escape_xml_attr(&project.status),
-                escape_xml_attr(&project.description),
-            ));
-        }
 
         if !self.facts.is_empty() {
             out.push_str("  <session_facts>\n");
@@ -226,24 +192,6 @@ mod tests {
     }
 
     #[test]
-    fn render_with_project() {
-        let mut stm = ShortTermMemory::new("sess-1".into(), 2000);
-        stm.set_active_project(ProjectContext {
-            id: "proj-1".into(),
-            name: "borg".into(),
-            description: "AI assistant".into(),
-            status: "active".into(),
-        });
-
-        let rendered = stm.render();
-        assert!(rendered.contains("<working_memory"));
-        assert!(rendered.contains("<active_project"));
-        assert!(rendered.contains("borg"));
-        assert!(rendered.contains("AI assistant"));
-        assert!(rendered.contains("</working_memory>"));
-    }
-
-    #[test]
     fn render_with_facts() {
         let mut stm = ShortTermMemory::new("sess-1".into(), 2000);
         stm.add_fact(FactCategory::Decision, "chose Rust".into(), 0);
@@ -253,20 +201,6 @@ mod tests {
         assert!(rendered.contains("<session_facts>"));
         assert!(rendered.contains("[Decision] chose Rust"));
         assert!(rendered.contains("[Correction] use snake_case"));
-    }
-
-    #[test]
-    fn set_active_project() {
-        let mut stm = ShortTermMemory::new("sess-1".into(), 2000);
-        assert!(stm.is_empty());
-
-        stm.set_active_project(ProjectContext {
-            id: "p1".into(),
-            name: "test".into(),
-            description: "desc".into(),
-            status: "active".into(),
-        });
-        assert!(!stm.is_empty());
     }
 
     #[test]

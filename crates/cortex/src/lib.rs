@@ -198,5 +198,3 @@ pub mod validation;
 pub mod vitals;
 /// Web fetching and search capabilities.
 pub mod web;
-/// Workflow engine — durable multi-step task orchestration for weaker models.
-pub mod workflow;

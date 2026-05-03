@@ -36,7 +36,6 @@ use tracing_subscriber::EnvFilter;
 // `Subcommand` enum below just refers to them.
 use crate::commands::misc::{MigrateSubcommand, ServiceAction};
 use crate::commands::pairing::PairingAction;
-use crate::commands::projects::ProjectsAction;
 use crate::commands::providers::ProvidersAction;
 use crate::commands::settings::SettingsAction;
 use crate::commands::status::{BondAction, StatusAction};
@@ -209,11 +208,6 @@ enum Commands {
     },
     /// Update borg to the latest released version
     Update(commands::update_args::UpdateArgs),
-    /// Manage projects (group related workflows and workstreams)
-    Projects {
-        #[command(subcommand)]
-        action: Option<ProjectsAction>,
-    },
     /// Manage cron jobs (shell commands on a schedule)
     Cron {
         #[command(subcommand)]
@@ -510,7 +504,6 @@ async fn async_main() -> Result<()> {
         )?,
         Some(Commands::Tasks { action }) => commands::tasks::dispatch_tasks(action)?,
         Some(Commands::Cron { action }) => commands::tasks::dispatch_cron(action)?,
-        Some(Commands::Projects { action }) => commands::projects::dispatch_projects(action)?,
         Some(Commands::Providers { action }) => commands::providers::dispatch(action)?,
         Some(Commands::Usage) => commands::status::run_usage()?,
         Some(Commands::Pairing { action }) => commands::pairing::dispatch_pairing(action)?,
@@ -1317,121 +1310,6 @@ mod tests {
     fn test_parse_resume_requires_value() {
         // --resume with no value should fail to parse
         assert!(Cli::try_parse_from(["borg", "--resume"]).is_err());
-    }
-
-    // ── Projects CLI parse tests ──
-
-    #[test]
-    fn test_parse_projects_list() {
-        let cli = Cli::try_parse_from(["borg", "projects"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Projects { action: None })
-        ));
-
-        let cli = Cli::try_parse_from(["borg", "projects", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::List { .. })
-            })
-        ));
-    }
-
-    #[test]
-    fn test_parse_projects_create() {
-        let cli =
-            Cli::try_parse_from(["borg", "projects", "create", "--name", "My Project"]).unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::Create { name, description }),
-            }) => {
-                assert_eq!(name, "My Project");
-                assert!(description.is_none());
-            }
-            _ => panic!("Expected Projects Create"),
-        }
-    }
-
-    #[test]
-    fn test_parse_projects_create_with_description() {
-        let cli = Cli::try_parse_from([
-            "borg",
-            "projects",
-            "create",
-            "--name",
-            "My Project",
-            "--description",
-            "A test project",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::Create { name, description }),
-            }) => {
-                assert_eq!(name, "My Project");
-                assert_eq!(description.as_deref(), Some("A test project"));
-            }
-            _ => panic!("Expected Projects Create"),
-        }
-    }
-
-    #[test]
-    fn test_parse_projects_get() {
-        let cli = Cli::try_parse_from(["borg", "projects", "get", "abc123"]).unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::Get { id }),
-            }) => assert_eq!(id, "abc123"),
-            _ => panic!("Expected Projects Get"),
-        }
-    }
-
-    #[test]
-    fn test_parse_projects_update() {
-        let cli = Cli::try_parse_from([
-            "borg", "projects", "update", "abc123", "--name", "New Name", "--status", "archived",
-        ])
-        .unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action:
-                    Some(ProjectsAction::Update {
-                        id,
-                        name,
-                        description,
-                        status,
-                    }),
-            }) => {
-                assert_eq!(id, "abc123");
-                assert_eq!(name.as_deref(), Some("New Name"));
-                assert!(description.is_none());
-                assert_eq!(status.as_deref(), Some("archived"));
-            }
-            _ => panic!("Expected Projects Update"),
-        }
-    }
-
-    #[test]
-    fn test_parse_projects_delete() {
-        let cli = Cli::try_parse_from(["borg", "projects", "delete", "abc123"]).unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::Delete { id }),
-            }) => assert_eq!(id, "abc123"),
-            _ => panic!("Expected Projects Delete"),
-        }
-    }
-
-    #[test]
-    fn test_parse_projects_archive() {
-        let cli = Cli::try_parse_from(["borg", "projects", "archive", "abc123"]).unwrap();
-        match cli.command {
-            Some(Commands::Projects {
-                action: Some(ProjectsAction::Archive { id }),
-            }) => assert_eq!(id, "abc123"),
-            _ => panic!("Expected Projects Archive"),
-        }
     }
 
     // ── Export CLI parse tests ──

@@ -135,7 +135,6 @@ fn record_and_latest_doctor_run_roundtrip() {
         fail_count: 0,
         log_files_deleted: 1,
         log_bytes_truncated: 0,
-        workflows_pruned: 0,
         activity_rows_deleted: 5,
         embeddings_pruned: 0,
         stalled_tasks_healed: 0,
@@ -157,71 +156,6 @@ fn record_and_latest_doctor_run_roundtrip() {
     assert_eq!(latest.pass_count, 10);
     assert_eq!(latest.warn_count, 2);
     assert_eq!(latest.persistent_warnings, vec!["Gateway:reachable"]);
-}
-
-#[test]
-fn prune_completed_workflows_only_deletes_terminal_older_than_cutoff() {
-    use crate::db::models::NewWorkflowStep;
-    let db = test_db();
-    let now = chrono::Utc::now().timestamp();
-    let old = now - 30 * 86_400; // 30 days ago
-    let recent = now - 1 * 86_400; // 1 day ago
-    let cutoff = now - 7 * 86_400; // default workflow_retention_days
-
-    let step = || NewWorkflowStep {
-        title: "s".into(),
-        instructions: "i".into(),
-        max_retries: 0,
-        timeout_ms: 1000,
-    };
-
-    // Three workflows: old-completed, recent-completed, old-running.
-    db.create_workflow("old-done", "t", "g", &[step()], None, None, None, None)
-        .unwrap();
-    db.create_workflow("recent-done", "t", "g", &[step()], None, None, None, None)
-        .unwrap();
-    db.create_workflow("old-running", "t", "g", &[step()], None, None, None, None)
-        .unwrap();
-
-    // Force status + completed_at directly so the test controls the timeline
-    // (create_workflow always stamps `now`). This mirrors what the workflow
-    // executor does on completion, without running a real agent loop.
-    db.conn()
-        .execute(
-            "UPDATE workflows SET status = 'completed', completed_at = ?1 WHERE id = 'old-done'",
-            [old],
-        )
-        .unwrap();
-    db.conn()
-        .execute(
-            "UPDATE workflows SET status = 'completed', completed_at = ?1 WHERE id = 'recent-done'",
-            [recent],
-        )
-        .unwrap();
-    // old-running: keep status=running, completed_at=NULL — must NEVER be pruned.
-
-    let deleted = db.prune_completed_workflows(cutoff).unwrap();
-    assert_eq!(deleted, 1, "only old-done should be pruned");
-
-    assert!(
-        db.get_workflow("old-done").unwrap().is_none(),
-        "old terminal workflow should be gone"
-    );
-    assert!(
-        db.get_workflow("recent-done").unwrap().is_some(),
-        "recent terminal workflow must be retained"
-    );
-    assert!(
-        db.get_workflow("old-running").unwrap().is_some(),
-        "active workflow must never be pruned even if old"
-    );
-
-    // Steps for the pruned workflow must also be gone (no orphan rows).
-    let orphan_steps = db.get_workflow_steps("old-done").unwrap();
-    assert!(
-        orphan_steps.is_empty(),
-        "steps of pruned workflow must be deleted too"
-    );
 }
 
 // ── Wedged-run recovery (in-daemon sweep) ──
@@ -259,6 +193,9 @@ fn task_with_timeout<'a>(
         delivery_target: None,
         allowed_tools: None,
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     }
 }
 

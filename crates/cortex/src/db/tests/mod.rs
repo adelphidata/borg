@@ -35,6 +35,9 @@ pub(super) fn simple_task<'a>(
         delivery_target: None,
         allowed_tools: None,
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     }
 }
 

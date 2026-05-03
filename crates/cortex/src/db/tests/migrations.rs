@@ -118,6 +118,40 @@ fn append_only_triggers_present_on_chain_tables() {
     }
 }
 
+// V51 demolished workflows + projects and added the pre_run preamble columns
+// to scheduled_tasks. Catches a partial migration: tables that should be gone
+// reappear, or any of the three columns are missing.
+#[test]
+fn v51_drops_workflow_and_project_tables_and_adds_pre_run_columns() {
+    let db = test_db();
+    for dropped in ["workflows", "workflow_steps", "projects"] {
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
+                rusqlite::params![dropped],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{dropped} must not exist after V51");
+    }
+
+    let cols: Vec<String> = db
+        .conn
+        .prepare("PRAGMA table_info(scheduled_tasks)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for required in ["pre_run_command", "pre_run_cwd", "pre_run_timeout_ms"] {
+        assert!(
+            cols.iter().any(|c| c == required),
+            "scheduled_tasks must expose {required}; columns: {cols:?}"
+        );
+    }
+}
+
 // Re-running schema_version() when the meta row is corrupted (non-numeric)
 // MUST degrade to 0 rather than panic — otherwise a single bad meta write
 // would brick startup. Documented in db/mod.rs:451-460.

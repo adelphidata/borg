@@ -262,6 +262,9 @@ pub(crate) fn run_tasks_create(
         max_retries: max_retries.unwrap_or(-1),
         timeout_ms: timeout_ms.unwrap_or(0),
         allowed_tools: String::new(),
+        pre_run_command: String::new(),
+        pre_run_cwd: String::new(),
+        pre_run_timeout_ms: 0,
     };
 
     let task = block_on(async {
@@ -532,6 +535,9 @@ pub(crate) fn run_cron_add(
         max_retries: 0,
         timeout_ms: timeout_ms.unwrap_or(0),
         allowed_tools: String::new(),
+        pre_run_command: String::new(),
+        pre_run_cwd: String::new(),
+        pre_run_timeout_ms: 0,
     };
 
     let task = block_on(async {

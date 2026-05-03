@@ -55,7 +55,6 @@ pub struct MaintenanceReport {
     pub fail_count: usize,
     pub log_files_deleted: usize,
     pub log_bytes_truncated: u64,
-    pub workflows_pruned: usize,
     pub activity_rows_deleted: usize,
     pub embeddings_pruned: usize,
     pub stalled_tasks_healed: usize,
@@ -129,7 +128,7 @@ impl MaintenanceReport {
             return "maintenance: skipped (maintenance.enabled = false)".to_string();
         }
         format!(
-            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} cache embedding(s), {} workflow(s), healed {} stalled task(s), recovered {} wedged run(s), repaired {} embedding file(s)/{} chunk(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
+            "maintenance: {} pass / {} warn / {} fail — pruned {} log(s) ({} bytes truncated), {} activity row(s), {} cache embedding(s), healed {} stalled task(s), recovered {} wedged run(s), repaired {} embedding file(s)/{} chunk(s); retention: {} message(s) purged, {} audit event(s) tombstoned",
             self.pass_count,
             self.warn_count,
             self.fail_count,
@@ -137,7 +136,6 @@ impl MaintenanceReport {
             self.log_bytes_truncated,
             self.activity_rows_deleted,
             self.embeddings_pruned,
-            self.workflows_pruned,
             self.stalled_tasks_healed,
             self.wedged_runs_recovered,
             self.embeddings_repaired_files,
@@ -246,17 +244,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         Err(e) => tracing::warn!("maintenance: doctor-squelch prune failed: {e}"),
     }
 
-    // 4b. Prune old completed/failed/cancelled workflows. Without this,
-    //     experimental "test" workflows accumulate indefinitely (hundreds
-    //     seen in the wild) and, if any sit in `running` across a daemon
-    //     restart, burst-process all at once and spam the activity log.
-    let workflow_cutoff = now - (config.maintenance.workflow_retention_days as i64) * SECS_PER_DAY;
-    match db.prune_completed_workflows(workflow_cutoff) {
-        Ok(n) => report.workflows_pruned = n,
-        Err(e) => tracing::warn!("maintenance: workflow prune failed: {e}"),
-    }
-
-    // 4c. Apply data retention. Deletes `messages` rows past the cutoff
+    // 4b. Apply data retention. Deletes `messages` rows past the cutoff
     //     and tombstones `audit_log_chain` rows in place,
     //     preserving hash-chain linkage. Skipped when `retention_days`
     //     is unset or `purge_policy` is `Never` / `OnDemandOnly` — see
@@ -931,7 +919,6 @@ mod tests {
             fail_count: 0,
             log_files_deleted: 3,
             log_bytes_truncated: 4_321,
-            workflows_pruned: 2,
             activity_rows_deleted: 120,
             embeddings_pruned: 8,
             stalled_tasks_healed: 1,
@@ -943,7 +930,6 @@ mod tests {
         assert!(line.contains("2 warn"));
         assert!(line.contains("pruned 3 log"));
         assert!(line.contains("4321 bytes truncated"));
-        assert!(line.contains("2 workflow"));
         assert!(line.contains("healed 1 stalled"));
         assert!(line.contains("recovered 3 wedged"));
     }
@@ -1242,6 +1228,9 @@ mod tests {
             delivery_target: None,
             allowed_tools: None,
             task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .unwrap();
         db.conn()

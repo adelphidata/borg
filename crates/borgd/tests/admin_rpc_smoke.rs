@@ -24,12 +24,12 @@ use borgd::daemon::bind_uds;
 use borgd::grpc::admin::AdminSvc;
 use borgd::grpc::status::StatusSvc;
 use borgd::session::SessionRegistry;
-use cortex::db::{Database, NewTask, NewWorkflowStep, UpdateTask};
+use cortex::db::{Database, NewTask, UpdateTask};
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::admin_server::AdminServer;
 use protocols::admin::{
     api_key_value::Body as ApiKeyBody, ApiKeyRef, ApiKeyValue, Empty as AdminEmpty, KeychainRef,
-    ProjectRef, ScheduledTaskUpdate,
+    ScheduledTaskUpdate,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::status_server::StatusServer;
@@ -111,127 +111,13 @@ async fn channel(socket: &Path) -> Channel {
 }
 
 #[tokio::test]
-async fn projects_admin_rpcs_round_trip_workflows_and_archive() {
+async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
     let _g = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let h = start_harness().await;
     let chan = channel(&h.socket).await;
     let mut admin = AdminClient::new(chan);
-
-    // Seed: one project + two workflows under it. We use the live Database
-    // handle directly so the handler's `list_workflows_by_project` path is
-    // what's exercised, not a mock.
-    {
-        let db = Database::open().expect("db");
-        db.create_project("p1", "P1", "first").expect("create p1");
-        db.create_project("p2", "P2", "second").expect("create p2");
-        let mk_step = || NewWorkflowStep {
-            title: "s".into(),
-            instructions: "i".into(),
-            max_retries: 0,
-            timeout_ms: 60_000,
-        };
-        db.create_workflow(
-            "w1",
-            "Title One",
-            "g",
-            &[mk_step()],
-            None,
-            Some("p1"),
-            None,
-            None,
-        )
-        .expect("create w1");
-        db.create_workflow(
-            "w2",
-            "Title Two",
-            "g",
-            &[mk_step()],
-            None,
-            Some("p1"),
-            None,
-            None,
-        )
-        .expect("create w2");
-        db.create_workflow(
-            "w3",
-            "Other",
-            "g",
-            &[mk_step()],
-            None,
-            Some("p2"),
-            None,
-            None,
-        )
-        .expect("create w3");
-    }
-
-    // ListWorkflowsByProject: must filter to p1 and round-trip title+status.
-    // Real failure mode: the handler not passing project_id through, or the
-    // proto WorkflowSummary dropping `title` because field 2 was renumbered.
-    let list = admin
-        .list_workflows_by_project(ProjectRef { id: "p1".into() })
-        .await
-        .expect("list")
-        .into_inner();
-    assert_eq!(
-        list.workflows.len(),
-        2,
-        "expected exactly 2 workflows for p1"
-    );
-    let titles: Vec<_> = list.workflows.iter().map(|w| w.title.clone()).collect();
-    assert!(
-        titles.contains(&"Title One".to_string()) && titles.contains(&"Title Two".to_string()),
-        "expected Title One + Title Two, got {titles:?}"
-    );
-    for w in &list.workflows {
-        assert!(!w.status.is_empty(), "status field must round-trip");
-        assert!(!w.id.is_empty(), "id field must round-trip");
-    }
-
-    // Empty project_id → InvalidArgument (defensive guard so callers can't
-    // accidentally fetch every workflow on an empty popup state).
-    let err = admin
-        .list_workflows_by_project(ProjectRef { id: "".into() })
-        .await
-        .expect_err("empty rejected");
-    assert_eq!(err.code(), tonic::Code::InvalidArgument);
-
-    // ArchiveProject + UnarchiveProject — convenience over UpdateProject.
-    // Real failure mode: handler updates the wrong column or returns Ok on
-    // a missing id.
-    admin
-        .archive_project(ProjectRef { id: "p1".into() })
-        .await
-        .expect("archive p1");
-    {
-        let db = Database::open().expect("db");
-        let after = db.list_projects(None).expect("list");
-        let p1 = after.iter().find(|p| p.id == "p1").expect("p1 row");
-        assert_eq!(p1.status, "archived", "archive must set status=archived");
-    }
-    admin
-        .unarchive_project(ProjectRef { id: "p1".into() })
-        .await
-        .expect("unarchive p1");
-    {
-        let db = Database::open().expect("db");
-        let p1 = db
-            .list_projects(None)
-            .expect("list")
-            .into_iter()
-            .find(|p| p.id == "p1")
-            .expect("p1");
-        assert_eq!(p1.status, "active", "unarchive must set status=active");
-    }
-    let err = admin
-        .archive_project(ProjectRef {
-            id: "does-not-exist".into(),
-        })
-        .await
-        .expect_err("missing id rejected");
-    assert_eq!(err.code(), tonic::Code::NotFound);
 
     // GetPersistentWarnings: empty when no doctor_runs row exists, and
     // round-trips a seeded report's persistent_warnings vector verbatim.
@@ -285,6 +171,9 @@ async fn projects_admin_rpcs_round_trip_workflows_and_archive() {
             delivery_target: None,
             allowed_tools: None,
             task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .expect("create wedged task");
         let started_at = chrono::Utc::now().timestamp() - 3600;
@@ -327,6 +216,9 @@ async fn projects_admin_rpcs_round_trip_workflows_and_archive() {
             delivery_target: None,
             allowed_tools: None,
             task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .expect("create t1");
     }

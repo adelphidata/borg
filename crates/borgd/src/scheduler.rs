@@ -34,20 +34,6 @@ pub type TaskSpawn = Arc<
         + Sync,
 >;
 
-/// Workflow step spawn callback. Same shape — provided by the cli shim.
-pub type WorkflowStepSpawn = Arc<
-    dyn Fn(
-            cortex::db::WorkflowRow,
-            cortex::db::WorkflowStepRow,
-            Vec<cortex::db::WorkflowStepRow>,
-            Vec<cortex::db::WorkflowStepRow>,
-            Arc<tokio::sync::Semaphore>,
-            Config,
-        ) -> futures::future::BoxFuture<'static, ()>
-        + Send
-        + Sync,
->;
-
 /// Celebration deliver callback.
 pub type CelebrationDeliver = Arc<
     dyn Fn(Config, cortex::db::PendingCelebration) -> futures::future::BoxFuture<'static, bool>
@@ -63,8 +49,6 @@ pub struct DispatcherHooks {
     /// Spawn a single scheduled-task execution. The dispatcher only knows
     /// about claiming + retry scheduling; the body is the cli's territory.
     pub spawn_task: TaskSpawn,
-    /// Spawn a single workflow step.
-    pub spawn_workflow_step: WorkflowStepSpawn,
     /// Deliver an evolution/milestone celebration.
     pub deliver_celebration: CelebrationDeliver,
 }
@@ -93,12 +77,6 @@ pub async fn run(
             tracing::warn!("Recovered {count} stale task run(s) from previous daemon crash");
         }
     }
-    if let Ok(count) = db.recover_stale_workflow_steps() {
-        if count > 0 {
-            tracing::warn!("Recovered {count} stale workflow step(s) from previous daemon crash");
-        }
-    }
-
     skip_stale_tasks(&db);
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
@@ -220,28 +198,6 @@ pub async fn run(
             Err(e) => tracing::warn!("Failed to check retry tasks: {e}"),
         }
 
-        // Workflow steps (one step per workflow per tick).
-        match db.get_runnable_workflows() {
-            Ok(workflows) => {
-                for wf in workflows {
-                    if let Ok(Some(step)) = db.claim_next_workflow_step(&wf.id) {
-                        let prior = db.get_completed_workflow_steps(&wf.id).unwrap_or_default();
-                        let all_steps = db.get_workflow_steps(&wf.id).unwrap_or_default();
-                        let fut = (hooks.spawn_workflow_step)(
-                            wf,
-                            step,
-                            prior,
-                            all_steps,
-                            semaphore.clone(),
-                            config.clone(),
-                        );
-                        fut.await;
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("Failed to check runnable workflows: {e}"),
-        }
-
         // Celebrations.
         match db.claim_pending_celebrations() {
             Ok(celebrations) => {
@@ -323,6 +279,9 @@ mod tests {
             delivery_target: None,
             allowed_tools: None,
             task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .expect("create_task");
     }

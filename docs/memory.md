@@ -16,7 +16,6 @@ Session-scoped working memory accumulates facts during the conversation:
 
 - Fact categories: `Decision`, `Preference`, `TaskOutcome`, `CodeFact`, `Correction`
 - Budget-aware: oldest facts are evicted when the token budget is exceeded
-- Active project: tracks project context from the projects tool
 - Rendered as `<working_memory>` only when non-empty
 
 Working memory is never edited directly. On session end it flushes to a daily long-term entry, which later consolidation jobs can turn into curated durable memory.

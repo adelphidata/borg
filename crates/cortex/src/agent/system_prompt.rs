@@ -12,7 +12,7 @@
 
 use crate::constants;
 
-use super::{Agent, COLLAB_MODE_DEFAULT, COLLAB_MODE_EXECUTE, COLLAB_MODE_PLAN, WORKFLOW_GUIDANCE};
+use super::{Agent, COLLAB_MODE_DEFAULT, COLLAB_MODE_EXECUTE, COLLAB_MODE_PLAN};
 
 impl Agent {
     /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
@@ -89,11 +89,7 @@ impl Agent {
             ("browser", "Control headless Chrome browser"),
             (
                 "schedule",
-                "Manage scheduled jobs: prompt tasks, cron commands, workflows",
-            ),
-            (
-                "projects",
-                "Manage projects (create/list/get/update/archive/delete)",
+                "Manage scheduled jobs: prompt tasks and cron commands",
             ),
             (
                 "request_user_input",
@@ -328,15 +324,6 @@ impl Agent {
         format!("\n<collaboration_mode>\n{mode_template}\n</collaboration_mode>\n")
     }
 
-    /// Build the `<workflow_guidance>` section when workflows are active.
-    pub(super) fn build_workflow_guidance_section(&self) -> String {
-        if crate::workflow::workflows_active(&self.config) {
-            format!("\n<workflow_guidance>\n{WORKFLOW_GUIDANCE}\n</workflow_guidance>\n")
-        } else {
-            String::new()
-        }
-    }
-
     /// Build the `<active_memory trust="retrieved">` section: per-turn hybrid
     /// search of memory + past session transcripts, keyed off the last user
     /// message. Returns an empty string when disabled, when no last user
@@ -441,6 +428,9 @@ mod scheduled_tasks_snapshot_tests {
             delivery_target: None,
             allowed_tools: None,
             task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .expect("create task");
     }

@@ -282,6 +282,9 @@ fn create_task_with_delivery_config() {
         delivery_target: Some("12345"),
         allowed_tools: None,
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     })
     .expect("create");
     let task = db.get_task_by_id("t1").expect("get").expect("some");
@@ -308,6 +311,9 @@ fn create_task_with_allowed_tools() {
         delivery_target: None,
         allowed_tools: Some("run_shell,read_file"),
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     })
     .expect("create");
     let task = db.get_task_by_id("t-tools").expect("get").expect("some");
@@ -347,6 +353,9 @@ fn allowed_tools_survives_list_tasks() {
         delivery_target: None,
         allowed_tools: Some("read_memory,write_memory"),
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     })
     .expect("create");
     let tasks = db.list_tasks().expect("list");
@@ -1093,4 +1102,37 @@ fn count_failed_runs_excludes_missed_and_running() {
         1,
         "only the genuinely-failed run should count"
     );
+}
+
+// pre_run_command / pre_run_cwd / pre_run_timeout_ms must round-trip through
+// SQLite. A column-mapping regression (wrong index in TASK_COLUMNS or
+// map_task_row) silently drops the values; the read-back is the only way to
+// catch it.
+#[test]
+fn create_task_persists_and_reads_back_pre_run_fields() {
+    let db = test_db();
+    db.create_task(&NewTask {
+        id: "pre-run-1",
+        name: "preamble task",
+        prompt: "summarize the preprocessed context",
+        schedule_type: "interval",
+        schedule_expr: "30m",
+        timezone: "local",
+        next_run: Some(0),
+        max_retries: None,
+        timeout_ms: None,
+        delivery_channel: None,
+        delivery_target: None,
+        allowed_tools: None,
+        task_type: "prompt",
+        pre_run_command: Some("echo hello"),
+        pre_run_cwd: Some("/tmp"),
+        pre_run_timeout_ms: Some(15_000),
+    })
+    .expect("create");
+
+    let task = db.get_task_by_id("pre-run-1").expect("get").expect("found");
+    assert_eq!(task.pre_run_command.as_deref(), Some("echo hello"));
+    assert_eq!(task.pre_run_cwd.as_deref(), Some("/tmp"));
+    assert_eq!(task.pre_run_timeout_ms, 15_000);
 }

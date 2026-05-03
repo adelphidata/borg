@@ -53,6 +53,9 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
             delivery_target: None,
             allowed_tools: None,
             task_type: "command",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
         })
         .expect("create due-cmd");
     }
@@ -64,11 +67,6 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
         spawn_task: Arc::new(|task, run_id, retry, sem, cfg| {
             Box::pin(async move {
                 task_runner::spawn_task_execution(task, run_id, retry, sem, cfg, None).await
-            })
-        }),
-        spawn_workflow_step: Arc::new(|wf, step, prior, all, sem, cfg| {
-            Box::pin(async move {
-                task_runner::spawn_workflow_step(wf, step, prior, all, sem, cfg, None).await
             })
         }),
         deliver_celebration: Arc::new(|cfg, c| {

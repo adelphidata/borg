@@ -76,11 +76,6 @@ impl App<'_> {
                 return Some(Ok(AppAction::Continue));
             }
             "/plugins" => return Some(self.cmd_plugins()),
-            "/projects" => {
-                let client = self.client.clone();
-                self.projects_popup.show(&client);
-                return Some(Ok(AppAction::EnterAltScreen));
-            }
             "/schedule-tasks" | "/schedule" => {
                 let client = self.client.clone();
                 self.schedule_popup.show(&client);
@@ -831,12 +826,11 @@ pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> Strin
         text.push_str("maintenance.enabled is false");
     } else {
         text.push_str(&format!(
-            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, pruned {} workflows, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events, pruned {} backups",
+            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events, pruned {} backups",
             report.pruned_logs,
             report.log_bytes_truncated,
             report.pruned_activity,
             report.evicted_embeddings,
-            report.workflows_pruned,
             report.healed_tasks,
             report.wedged_runs_recovered,
             report.messages_purged,
@@ -1029,7 +1023,6 @@ mod tests {
             healed_tasks: 11,
             warnings: vec!["Skills:tamper audit".into()],
             log_bytes_truncated: 1234,
-            workflows_pruned: 13,
             messages_purged: 17,
             audit_events_tombstoned: 19,
             wedged_runs_recovered: 23,
@@ -1038,7 +1031,6 @@ mod tests {
             skipped: false,
         });
         assert!(out.contains("1234 bytes truncated"), "{out:?}");
-        assert!(out.contains("13 workflows"), "{out:?}");
         assert!(out.contains("recovered 23 wedged runs"), "{out:?}");
         assert!(
             out.contains("Backup created: /tmp/backup.tar.zst"),

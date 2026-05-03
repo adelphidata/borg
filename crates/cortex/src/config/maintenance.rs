@@ -16,9 +16,6 @@ pub struct MaintenanceConfig {
     pub activity_retention_days: u32,
     /// Keep at most this many rows in the `doctor_runs` history table.
     pub doctor_runs_keep: u32,
-    /// Delete workflows (and their steps) in a terminal status
-    /// (`completed` / `failed` / `cancelled`) older than this many days.
-    pub workflow_retention_days: u32,
     /// Whether the maintenance sweep should repair missing/stale memory
     /// embeddings and chunk indexes.
     pub embedding_repair_enabled: bool,
@@ -42,7 +39,6 @@ impl Default for MaintenanceConfig {
             logs_retention_days: 30,
             activity_retention_days: 30,
             doctor_runs_keep: 30,
-            workflow_retention_days: 7,
             embedding_repair_enabled: true,
             embedding_repair_max_files: 16,
             embedding_repair_max_chunks: 256,
@@ -63,7 +59,6 @@ mod tests {
         assert_eq!(cfg.logs_retention_days, 30);
         assert_eq!(cfg.activity_retention_days, 30);
         assert_eq!(cfg.doctor_runs_keep, 30);
-        assert_eq!(cfg.workflow_retention_days, 7);
         assert!(cfg.embedding_repair_enabled);
         assert_eq!(cfg.embedding_repair_max_files, 16);
         assert_eq!(cfg.embedding_repair_max_chunks, 256);
@@ -78,7 +73,6 @@ mod tests {
             logs_retention_days = 7
             activity_retention_days = 14
             doctor_runs_keep = 90
-            workflow_retention_days = 3
             embedding_repair_enabled = false
             embedding_repair_max_files = 4
             embedding_repair_max_chunks = 64
@@ -89,7 +83,6 @@ mod tests {
         assert_eq!(cfg.logs_retention_days, 7);
         assert_eq!(cfg.activity_retention_days, 14);
         assert_eq!(cfg.doctor_runs_keep, 90);
-        assert_eq!(cfg.workflow_retention_days, 3);
         assert!(!cfg.embedding_repair_enabled);
         assert_eq!(cfg.embedding_repair_max_files, 4);
         assert_eq!(cfg.embedding_repair_max_chunks, 64);

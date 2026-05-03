@@ -97,6 +97,9 @@ fn task_lifecycle_with_runs() {
         delivery_target: None,
         allowed_tools: None,
         task_type: "prompt",
+        pre_run_command: None,
+        pre_run_cwd: None,
+        pre_run_timeout_ms: None,
     };
 
     db.create_task(&task).expect("create task");

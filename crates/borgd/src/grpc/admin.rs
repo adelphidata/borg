@@ -21,12 +21,11 @@ use protocols::admin::{
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     KeychainRef, LogActivityRequest, MessageView, MonthlyTokenTotal, MonthlyTotalCost,
     OnboardingState, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, Project, ProjectCreate, ProjectList, ProjectRef,
-    ProjectUpdate, RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
-    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
-    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
-    TriggerHeartbeatRequest, WarningList, WebhookRef, WorkflowList, WorkflowSummary,
+    PluginInstallRequest, PluginInstallResponse, RemoveProviderRequest, RevokedClientToken,
+    ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
+    ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
+    SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
+    TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -177,7 +176,6 @@ impl Admin for AdminSvc {
             healed_tasks: report.stalled_tasks_healed as u64,
             warnings: report.persistent_warnings,
             log_bytes_truncated: report.log_bytes_truncated,
-            workflows_pruned: report.workflows_pruned as u64,
             messages_purged: report.messages_purged as u64,
             audit_events_tombstoned: report.audit_events_tombstoned as u64,
             wedged_runs_recovered: report.wedged_runs_recovered as u64,
@@ -334,80 +332,6 @@ impl Admin for AdminSvc {
         Ok(Response::new(detail))
     }
 
-    // ── Projects ──────────────────────────────────────────────────────────
-
-    async fn list_projects(&self, _req: Request<Empty>) -> Result<Response<ProjectList>, TStatus> {
-        let rows = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.list_projects(None)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("projects task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_projects failed: {e}")))?;
-        Ok(Response::new(ProjectList {
-            projects: rows.into_iter().map(project_row_to_proto).collect(),
-        }))
-    }
-
-    async fn create_project(
-        &self,
-        req: Request<ProjectCreate>,
-    ) -> Result<Response<Project>, TStatus> {
-        let req = req.into_inner();
-        let id = uuid::Uuid::new_v4().to_string();
-        let id_for_lookup = id.clone();
-        let inserted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.create_project(&id, &req.name, &req.description)?;
-            Ok(db.list_projects(None)?.into_iter().find(|p| p.id == id))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("create_project task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("create_project failed: {e}")))?
-        .ok_or_else(|| {
-            TStatus::internal(format!(
-                "create_project: row `{id_for_lookup}` not found after insert"
-            ))
-        })?;
-        Ok(Response::new(project_row_to_proto(inserted)))
-    }
-
-    async fn update_project(
-        &self,
-        req: Request<ProjectUpdate>,
-    ) -> Result<Response<Project>, TStatus> {
-        let req = req.into_inner();
-        let id_for_lookup = req.id.clone();
-        let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            let name = (!req.name.is_empty()).then_some(req.name.as_str());
-            let desc = (!req.description.is_empty()).then_some(req.description.as_str());
-            let status = (!req.status.is_empty()).then_some(req.status.as_str());
-            db.update_project(&req.id, name, desc, status)?;
-            Ok(db.list_projects(None)?.into_iter().find(|p| p.id == req.id))
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("update_project task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("update_project failed: {e}")))?
-        .ok_or_else(|| TStatus::not_found(format!("project `{id_for_lookup}` not found")))?;
-        Ok(Response::new(project_row_to_proto(updated)))
-    }
-
-    async fn delete_project(&self, req: Request<ProjectRef>) -> Result<Response<Empty>, TStatus> {
-        let id = req.into_inner().id;
-        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.delete_project(&id)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("delete_project task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("delete_project failed: {e}")))?;
-        if !removed {
-            return Err(TStatus::not_found("project not found"));
-        }
-        Ok(Response::new(Empty {}))
-    }
-
     // ── Scheduled tasks ───────────────────────────────────────────────────
 
     async fn list_scheduled_tasks(
@@ -475,6 +399,9 @@ impl Admin for AdminSvc {
                 delivery_target,
                 allowed_tools,
                 task_type,
+                pre_run_command: None,
+                pre_run_cwd: None,
+                pre_run_timeout_ms: None,
             };
             db.create_task(&new_task)?;
             Ok(db.list_tasks()?.into_iter().find(|t| t.id == id))
@@ -774,44 +701,6 @@ impl Admin for AdminSvc {
             active_tasks: active,
             paused_tasks: paused,
             pending_pairings: pending,
-        }))
-    }
-
-    async fn archive_project(&self, req: Request<ProjectRef>) -> Result<Response<Empty>, TStatus> {
-        set_project_status(req.into_inner().id, "archived").await
-    }
-
-    async fn unarchive_project(
-        &self,
-        req: Request<ProjectRef>,
-    ) -> Result<Response<Empty>, TStatus> {
-        set_project_status(req.into_inner().id, "active").await
-    }
-
-    async fn list_workflows_by_project(
-        &self,
-        req: Request<ProjectRef>,
-    ) -> Result<Response<WorkflowList>, TStatus> {
-        let id = req.into_inner().id;
-        if id.is_empty() {
-            return Err(TStatus::invalid_argument("project id required"));
-        }
-        let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let db = Database::open()?;
-            db.list_workflows_by_project(&id)
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("list_workflows_by_project panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("list_workflows_by_project failed: {e}")))?;
-        Ok(Response::new(WorkflowList {
-            workflows: rows
-                .into_iter()
-                .map(|w| WorkflowSummary {
-                    id: w.id,
-                    title: w.title,
-                    status: w.status,
-                })
-                .collect(),
         }))
     }
 
@@ -1438,23 +1327,6 @@ enum ApiKeyRouting {
     Keychain { service: String, account: String },
 }
 
-async fn set_project_status(id: String, status: &'static str) -> Result<Response<Empty>, TStatus> {
-    let id_for_err = id.clone();
-    let updated = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let db = Database::open()?;
-        db.update_project(&id, None, None, Some(status))
-    })
-    .await
-    .map_err(|e| TStatus::internal(format!("update_project panicked: {e}")))?
-    .map_err(|e| TStatus::internal(format!("update_project failed: {e}")))?;
-    if !updated {
-        return Err(TStatus::not_found(format!(
-            "project `{id_for_err}` not found"
-        )));
-    }
-    Ok(Response::new(Empty {}))
-}
-
 fn load_ambient_status() -> anyhow::Result<AmbientStatus> {
     let db = Database::open()?;
     let evo = db.get_evolution_state()?;
@@ -1486,17 +1358,6 @@ async fn update_task_status(id: String, status: &'static str) -> Result<Response
         return Err(TStatus::not_found("scheduled task not found"));
     }
     Ok(Response::new(Empty {}))
-}
-
-fn project_row_to_proto(r: cortex::db::ProjectRow) -> Project {
-    Project {
-        id: r.id,
-        name: r.name,
-        description: r.description,
-        status: r.status,
-        created_at: r.created_at as u64,
-        updated_at: r.updated_at as u64,
-    }
 }
 
 fn scheduled_task_row_to_proto(r: cortex::db::ScheduledTaskRow) -> ScheduledTask {

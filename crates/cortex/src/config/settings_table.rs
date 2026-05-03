@@ -208,7 +208,6 @@ define_settings! {
         "maintenance.logs_retention_days" => maintenance.logs_retention_days, parsed(u32);
         "maintenance.activity_retention_days" => maintenance.activity_retention_days, parsed(u32);
         "maintenance.doctor_runs_keep" => maintenance.doctor_runs_keep, parsed(u32);
-        "maintenance.workflow_retention_days" => maintenance.workflow_retention_days, parsed(u32);
         "maintenance.embedding_repair_enabled" => maintenance.embedding_repair_enabled, parsed(bool);
         "maintenance.embedding_repair_max_files" => maintenance.embedding_repair_max_files, parsed(u32);
         "maintenance.embedding_repair_max_chunks" => maintenance.embedding_repair_max_chunks, parsed(u32);
@@ -309,19 +308,6 @@ define_settings! {
             Ok(format!("{key} = {value}"))
         };
 
-        // workflow.enabled: tri-state (auto/on/off)
-        "workflow.enabled" => |s, key, value| {
-            match value {
-                "auto" | "on" | "off" => {
-                    s.workflow.enabled = value.to_string();
-                    Ok(format!("{key} = {value}"))
-                }
-                _ => anyhow::bail!(
-                    "Invalid value for workflow.enabled: {value}. Use 'auto', 'on', or 'off'."
-                ),
-            }
-        };
-
         // gateway.error_policy: FromStr enum
         "gateway.error_policy" => |s, key, value| {
             s.gateway.error_policy = value.parse()?;
@@ -404,7 +390,6 @@ define_settings! {
         "memory.extra_paths" => |c| c.memory.extra_paths.join(", ");
         "conversation.collaboration_mode" => |c| format!("{}", c.conversation.collaboration_mode);
         "tts.default_format" => |c| c.tts.default_format.clone();
-        "workflow.enabled" => |c| c.workflow.enabled.clone();
         "gateway.error_policy" => |c| format!("{}", c.gateway.error_policy);
         "security.verifier" => |c| format!("{}", c.security.verifier);
         "security.kek_backend" => |c| format!("{}", c.security.kek_backend);
@@ -469,7 +454,6 @@ define_settings! {
         "maintenance.logs_retention_days" => "Log retention (days)", Uint, "Maintenance";
         "maintenance.activity_retention_days" => "Activity retention (days)", Uint, "Maintenance";
         "maintenance.doctor_runs_keep" => "Doctor runs kept", Uint, "Maintenance";
-        "maintenance.workflow_retention_days" => "Workflow retention (days)", Uint, "Maintenance";
         "maintenance.embedding_repair_enabled" => "Repair embeddings", Bool, "Maintenance";
         "maintenance.embedding_repair_max_files" => "Embed repair files", Uint, "Maintenance";
         "maintenance.embedding_repair_max_chunks" => "Embed repair chunks", Uint, "Maintenance";
@@ -482,7 +466,6 @@ define_settings! {
         "conversation.protect_first_n" => "Protected head msgs", Uint, "Advanced";
         "skills.budget_pct" => "Skills budget (% ctx)", Float, "Advanced";
         "budget.warning_threshold" => "Budget warning", Float, "Advanced";
-        "workflow.enabled" => "Workflows", Select, "Advanced";
     }
 }
 
@@ -499,7 +482,6 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         "llm.cache.strategy",
         &["tools_system_and_2", "system_and_3"],
     ),
-    ("workflow.enabled", &["auto", "on", "off"]),
     ("security.verifier", &["tofu", "tailscale"]),
 ];
 

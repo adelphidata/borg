@@ -77,6 +77,13 @@ pub struct ScheduledTaskRow {
     pub allowed_tools: Option<String>,
     /// Task type: "prompt" (LLM task) or "command" (shell cron job).
     pub task_type: String,
+    /// Optional shell command to run before the LLM (for type=prompt).
+    /// Stdout is injected into the prompt as `<preprocessed_context>`.
+    pub pre_run_command: Option<String>,
+    /// Optional working directory for `pre_run_command`. Defaults to $HOME.
+    pub pre_run_cwd: Option<String>,
+    /// Timeout in milliseconds for `pre_run_command` (default 60000).
+    pub pre_run_timeout_ms: i64,
 }
 
 /// Task run log row from SQLite.
@@ -405,6 +412,13 @@ pub struct NewTask<'a> {
     pub allowed_tools: Option<&'a str>,
     /// Task type: "prompt" (LLM task) or "command" (shell cron job). Defaults to "prompt".
     pub task_type: &'a str,
+    /// Optional shell preamble for type=prompt tasks. Stdout injected as
+    /// `<preprocessed_context>`.
+    pub pre_run_command: Option<&'a str>,
+    /// Optional working directory for `pre_run_command`. Defaults to $HOME.
+    pub pre_run_cwd: Option<&'a str>,
+    /// Timeout (ms) for `pre_run_command`. Defaults to 60_000.
+    pub pre_run_timeout_ms: Option<i64>,
 }
 
 /// Parameters for enqueuing a delivery.
@@ -502,143 +516,6 @@ pub struct NewScript<'a> {
     pub created_at: i64,
     /// Unix timestamp when the script was last updated.
     pub updated_at: i64,
-}
-
-/// Lifecycle status of a project.
-///
-/// Stored as a lowercase string in the `projects.status` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ProjectStatus {
-    /// Project is open; new workflows may target it.
-    Active,
-    /// Project is closed; hidden from the default `list` and not acceptable as a
-    /// target for new workflows.
-    Archived,
-}
-
-impl ProjectStatus {
-    /// All variants, in the order they should appear in JSON schemas.
-    pub const ALL: &'static [Self] = &[Self::Active, Self::Archived];
-
-    /// SQLite/JSON string form of this status.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Archived => "archived",
-        }
-    }
-}
-
-impl std::fmt::Display for ProjectStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ProjectStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(Self::Active),
-            "archived" => Ok(Self::Archived),
-            other => Err(format!(
-                "Invalid status: {other}. Use 'active' or 'archived'."
-            )),
-        }
-    }
-}
-
-/// Project row from SQLite — groups related workflows.
-#[derive(Debug, Clone)]
-pub struct ProjectRow {
-    /// Unique project identifier.
-    pub id: String,
-    /// Human-readable project name.
-    pub name: String,
-    /// Project description.
-    pub description: String,
-    /// Current status (active, archived).
-    pub status: String,
-    /// Unix timestamp when the project was created.
-    pub created_at: i64,
-    /// Unix timestamp when the project was last updated.
-    pub updated_at: i64,
-}
-
-/// Workflow row from SQLite.
-#[derive(Debug, Clone)]
-pub struct WorkflowRow {
-    /// Unique workflow identifier.
-    pub id: String,
-    /// Human-readable workflow title.
-    pub title: String,
-    /// Full description of the workflow's objective.
-    pub goal: String,
-    /// Current workflow status (pending, running, completed, failed, cancelled).
-    pub status: String,
-    /// Index of the step currently being executed (0-based).
-    pub current_step: i64,
-    /// Unix timestamp when the workflow was created.
-    pub created_at: i64,
-    /// Unix timestamp when the workflow was last updated.
-    pub updated_at: i64,
-    /// Unix timestamp when the workflow completed, if finished.
-    pub completed_at: Option<i64>,
-    /// Error message if the workflow failed.
-    pub error: Option<String>,
-    /// Session that created this workflow (FK to sessions).
-    pub session_id: Option<String>,
-    /// Project this workflow belongs to (FK to projects).
-    pub project_id: Option<String>,
-    /// Channel to deliver final results to.
-    pub delivery_channel: Option<String>,
-    /// Target identifier within the delivery channel.
-    pub delivery_target: Option<String>,
-}
-
-/// Workflow step row from SQLite.
-#[derive(Debug, Clone)]
-pub struct WorkflowStepRow {
-    /// Unique step identifier.
-    pub id: i64,
-    /// ID of the parent workflow.
-    pub workflow_id: String,
-    /// Zero-based ordering index within the workflow.
-    pub step_index: i64,
-    /// Human-readable step title.
-    pub title: String,
-    /// Prompt/instructions for the agent executing this step.
-    pub instructions: String,
-    /// Current step status (pending, running, completed, failed, skipped).
-    pub status: String,
-    /// Accumulated output/result from this step.
-    pub output: Option<String>,
-    /// Error message if the step failed.
-    pub error: Option<String>,
-    /// Unix timestamp when the step started executing.
-    pub started_at: Option<i64>,
-    /// Unix timestamp when the step completed.
-    pub completed_at: Option<i64>,
-    /// Maximum retry attempts for this step.
-    pub max_retries: i32,
-    /// Number of retries already attempted.
-    pub retry_count: i32,
-    /// Per-step execution timeout in milliseconds.
-    pub timeout_ms: i64,
-}
-
-/// Parameters for creating a new workflow step.
-pub struct NewWorkflowStep {
-    /// Human-readable step title.
-    pub title: String,
-    /// Prompt/instructions for the agent executing this step.
-    pub instructions: String,
-    /// Maximum retry attempts for this step (default 3).
-    pub max_retries: i32,
-    /// Per-step execution timeout in milliseconds (default 300000).
-    pub timeout_ms: i64,
 }
 
 /// Health report for all event-sourced HMAC chains.

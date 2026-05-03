@@ -791,14 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn custom_setter_workflow_enabled_validates() {
-        let mut config = Config::default();
-        config.apply_setting("workflow.enabled", "on").unwrap();
-        assert_eq!(config.workflow.enabled, "on");
-        assert!(config.apply_setting("workflow.enabled", "maybe").is_err());
-    }
-
-    #[test]
     fn custom_setter_tts_format_validates() {
         let mut config = Config::default();
         config.apply_setting("tts.default_format", "opus").unwrap();

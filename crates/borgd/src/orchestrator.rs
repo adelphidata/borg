@@ -163,8 +163,7 @@ pub fn start(
     let scheduler_config = config;
     let scheduler_shutdown = shutdown;
     let scheduler_semaphore = semaphore;
-    let task_cost_event_sink = cost_event_sink.clone();
-    let workflow_cost_event_sink = cost_event_sink;
+    let task_cost_event_sink = cost_event_sink;
     tokio::spawn(async move {
         let hooks = scheduler::DispatcherHooks {
             spawn_task: Arc::new(move |task, run_id, retry, sem, cfg| {
@@ -174,21 +173,6 @@ pub fn start(
                         task,
                         run_id,
                         retry,
-                        sem,
-                        cfg,
-                        Some(cost_event_sink),
-                    )
-                    .await
-                })
-            }),
-            spawn_workflow_step: Arc::new(move |wf, step, prior, all, sem, cfg| {
-                let cost_event_sink = workflow_cost_event_sink.clone();
-                Box::pin(async move {
-                    task_runner::spawn_workflow_step(
-                        wf,
-                        step,
-                        prior,
-                        all,
                         sem,
                         cfg,
                         Some(cost_event_sink),

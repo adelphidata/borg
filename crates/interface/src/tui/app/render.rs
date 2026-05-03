@@ -88,7 +88,6 @@ impl<'a> App<'a> {
         self.model_popup.render(frame);
         self.plugins_popup.render(frame);
         self.pairing_popup.render(frame);
-        self.projects_popup.render(frame);
         self.sessions_popup.render(frame);
         self.schedule_popup.render(frame);
         self.migrate_popup.render(frame);

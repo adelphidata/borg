@@ -127,7 +127,6 @@ borg service status     # check service status
 | `borg cancel` | Cancel the in-progress agent turn |
 | `borg tasks list/create/run/runs/status/pause/resume/delete` | Manage scheduled tasks |
 | `borg cron …` | Manage cron jobs (shell commands on a schedule) |
-| `borg projects …` | Manage projects (group related workflows) |
 | `borg pairing list/approve/revoke/approved` | Manage sender access |
 | `borg settings get/set/unset` | Manage settings |
 | `borg logs` | Show conversation history |

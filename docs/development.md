@@ -43,7 +43,7 @@ Cargo workspace under `crates/` (no-prefix names):
 | Crate | Purpose |
 |-------|---------|
 | `interface` | The `borg` binary: clap commands, REPL, ratatui TUI, onboarding wizard |
-| `cortex` | Agent loop, LLM client, memory, identity, config, tools, skills, workflows, hooks, evolution, bond — the bulk of the app |
+| `cortex` | Agent loop, LLM client, memory, identity, config, tools, skills, hooks, evolution, bond — the bulk of the app |
 | `borgd` | Long-running gRPC daemon: scheduler, task runner, channel delivery, heartbeat, orchestrator, mTLS pairing |
 | `heartbeat` | Heartbeat scheduling primitives (interval/cron, quiet hours, poke signal) |
 | `gateway` | Webhook gateway + native channel integrations (Telegram, Slack, Discord, Teams, Google Chat, Signal, Twilio, iMessage) |

@@ -9,7 +9,7 @@ Cargo workspace, no-prefix crate names:
 | Crate | Purpose |
 |-------|---------|
 | `interface` | Binary `borg`: REPL, TUI, clap, onboarding |
-| `cortex` | Agent loop, LLM, memory, identity, config, tools, skills, workflows |
+| `cortex` | Agent loop, LLM, memory, identity, config, tools, skills |
 | `heartbeat` | Proactive scheduler |
 | `sandbox` | macOS Seatbelt + Linux Bubblewrap |
 | `coding` | Patch DSL parser + applicator |
@@ -113,7 +113,9 @@ Every tool's JSON schema is sent to the LLM every turn (~5KB+). Prefer adding ac
 
 ### Tools
 
-`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `projects`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`.
+`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`.
+
+`schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs (Hermes-style — silent preamble failures lose user trust). Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
 
 ### Config
 
@@ -147,17 +149,13 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 `core/agent.rs` — streams LLM, parses tool calls, executes, loops until text-only. `<internal>` tags stripped in real-time. Messages persisted to SQLite immediately. System prompt assembled per turn from IDENTITY + time + git + mode + memory + project docs + skills.
 
-### Workflows
-
-Multi-step orchestration. LLM decomposes into ordered steps; each runs as isolated agent turn. Persists in SQLite. Claude and OpenAI models skip workflows. `crates/cortex/src/workflow/`, `crates/cortex/src/db/workflow.rs`.
-
 ### Heartbeat
 
 Proactive check-ins (default 30m or cron, quiet 00:00–06:00). `~/.borg/HEARTBEAT.md` checklist. Honors gateway bindings. Suppresses empty/duplicate/ack-only. Trigger: `borg poke` / `/poke`. `heartbeat.min_interval_secs` (default 60, hard floor 1) is the operator/eval-suite knob for sub-minute firings — leave at 60 in production.
 
 ### Database
 
-SQLite at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events, projects, workflows.
+SQLite at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.
 
 ### Sandboxing
 

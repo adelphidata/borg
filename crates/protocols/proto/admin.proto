@@ -20,12 +20,6 @@ service Admin {
   rpc ListSessions(Empty) returns (SessionList);
   rpc GetSession(SessionRef) returns (SessionDetail);
 
-  // Projects.
-  rpc ListProjects(Empty) returns (ProjectList);
-  rpc CreateProject(ProjectCreate) returns (Project);
-  rpc UpdateProject(ProjectUpdate) returns (Project);
-  rpc DeleteProject(ProjectRef) returns (Empty);
-
   // Scheduled tasks.
   rpc ListScheduledTasks(Empty) returns (ScheduledTaskList);
   rpc CreateScheduledTask(ScheduledTaskCreate) returns (ScheduledTask);
@@ -39,13 +33,6 @@ service Admin {
 
   // Session export — renders one session via borg_core::export to bytes.
   rpc ExportSession(ExportSessionRequest) returns (ExportSessionResponse);
-
-  // Project convenience: archive/unarchive (vs the lower-level UpdateProject).
-  rpc ArchiveProject(ProjectRef) returns (Empty);
-  rpc UnarchiveProject(ProjectRef) returns (Empty);
-
-  // Workflows scoped by project — used by the projects popup workflow_count.
-  rpc ListWorkflowsByProject(ProjectRef) returns (WorkflowList);
 
   // Ambient header status (the `class: …` line in the TUI header).
   rpc GetAmbientStatus(Empty) returns (AmbientStatus);
@@ -243,7 +230,9 @@ message HealReport {
   uint64 healed_tasks = 4;
   repeated string warnings = 5;
   uint64 log_bytes_truncated = 6;
-  uint64 workflows_pruned = 7;
+  // Field 7 (workflows_pruned) removed when the workflow feature was demolished.
+  reserved 7;
+  reserved "workflows_pruned";
   uint64 messages_purged = 8;
   uint64 audit_events_tombstoned = 9;
   uint64 wedged_runs_recovered = 10;
@@ -289,25 +278,6 @@ message MessageView {
   uint64 unix_ts = 3;
 }
 
-// Projects.
-message Project {
-  string id = 1;
-  string name = 2;
-  string description = 3;
-  string status = 4;
-  uint64 created_at = 5;
-  uint64 updated_at = 6;
-}
-message ProjectList { repeated Project projects = 1; }
-message ProjectRef { string id = 1; }
-message ProjectCreate { string name = 1; string description = 2; }
-message ProjectUpdate {
-  string id = 1;
-  string name = 2;
-  string description = 3;
-  string status = 4;
-}
-
 // Scheduled tasks.
 message ScheduledTask {
   string id = 1;
@@ -341,6 +311,13 @@ message ScheduledTaskCreate {
   // 0 = unset.
   int64 timeout_ms = 11;
   string allowed_tools = 12;
+  // Optional shell preamble (only valid for type=prompt). Stdout is
+  // injected into the prompt as `<preprocessed_context>`. Empty = unset.
+  string pre_run_command = 13;
+  // Optional working directory for `pre_run_command`. Empty = $HOME.
+  string pre_run_cwd = 14;
+  // Timeout (ms) for `pre_run_command`. 0 = unset (defaults to 60_000).
+  int64 pre_run_timeout_ms = 15;
 }
 
 message ScheduledTaskRun {
@@ -390,13 +367,6 @@ message ScheduledTaskUpdate {
   string schedule_expr = 5;
   string timezone = 6;
 }
-
-message WorkflowSummary {
-  string id = 1;
-  string title = 2;
-  string status = 3;
-}
-message WorkflowList { repeated WorkflowSummary workflows = 1; }
 
 message AmbientStatus {
   // Empty when the agent is still the unnamed placeholder. The TUI

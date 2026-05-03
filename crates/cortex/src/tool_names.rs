@@ -27,8 +27,7 @@ pub const BROWSER: &str = "browser";
 pub const GENERATE_IMAGE: &str = "generate_image";
 pub const TEXT_TO_SPEECH: &str = "text_to_speech";
 
-// ── Project management ──
-pub const PROJECTS: &str = "projects";
+// ── User interaction ──
 pub const REQUEST_USER_INPUT: &str = "request_user_input";
 
 // ── Filesystem aliases ──

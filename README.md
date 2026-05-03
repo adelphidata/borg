@@ -25,8 +25,7 @@ Or download manually from [Releases](https://github.com/borganization/borg/relea
 | Command     | What it does                                     |
 | ----------- | ------------------------------------------------ |
 | `/plugins`  | Add, remove, and manage plugins and channels     |
-| `/schedule` | Manage scheduled prompts, scripts, and workflows |
-| `/projects` | Browse and switch between projects               |
+| `/schedule` | Manage scheduled prompts and cron jobs           |
 | `/settings` | Configure any setting from a popup               |
 | `/model`    | Switch LLM provider and model                    |
 | `/memory`   | Inspect long-term memory context                 |

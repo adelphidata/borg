@@ -52,7 +52,6 @@ const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
     (crate::tool_names::RUN_SHELL, ToolGroup::Runtime, false),
     // Discovery
     (crate::tool_names::LIST, ToolGroup::Discovery, false),
-    (crate::tool_names::PROJECTS, ToolGroup::Discovery, false),
     (
         crate::tool_names::REQUEST_USER_INPUT,
         ToolGroup::Discovery,
@@ -752,7 +751,6 @@ mod tests {
             tool_names::BROWSER,
             tool_names::GENERATE_IMAGE,
             tool_names::TEXT_TO_SPEECH,
-            tool_names::PROJECTS,
             tool_names::REQUEST_USER_INPUT,
             tool_names::APPLY_SKILL_PATCH,
             tool_names::CREATE_CHANNEL,

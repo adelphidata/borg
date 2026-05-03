@@ -30,7 +30,6 @@ use super::model_popup::ModelPopup;
 use super::pairing_popup::{PairingAction, PairingPopup};
 use super::plan_overlay::PlanOverlay;
 use super::plugins_popup::{PluginAction, PluginsPopup};
-use super::projects_popup::{ProjectAction, ProjectsPopup};
 use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
@@ -49,7 +48,6 @@ macro_rules! for_each_routed_popup {
         $body!($self, model_popup);
         $body!($self, plugins_popup);
         $body!($self, pairing_popup);
-        $body!($self, projects_popup);
         $body!($self, sessions_popup);
         $body!($self, schedule_popup);
         $body!($self, migrate_popup);
@@ -369,9 +367,6 @@ pub enum AppAction {
     RunScheduleActions {
         actions: Vec<ScheduleAction>,
     },
-    RunProjectActions {
-        actions: Vec<ProjectAction>,
-    },
     RunPairingActions {
         actions: Vec<PairingAction>,
     },
@@ -470,7 +465,6 @@ pub struct App<'a> {
     /// user is not currently in a transient Plan-then-execute flow.
     pub previous_collab_mode: Option<CollaborationMode>,
     pub pairing_popup: PairingPopup,
-    pub projects_popup: ProjectsPopup,
     pub sessions_popup: SessionsPopup,
     pub schedule_popup: SchedulePopup,
     pub migrate_popup: MigratePopup,
@@ -559,7 +553,6 @@ impl<'a> App<'a> {
             transcript_pager: TranscriptPager::new(),
             previous_collab_mode: None,
             pairing_popup: PairingPopup::new(),
-            projects_popup: ProjectsPopup::new(),
             sessions_popup: SessionsPopup::new(),
             schedule_popup: SchedulePopup::new(),
             migrate_popup: MigratePopup::new(),
@@ -716,7 +709,6 @@ impl<'a> App<'a> {
         }
         self.settings_popup.is_visible()
             || self.pairing_popup.is_visible()
-            || self.projects_popup.is_visible()
             || self.sessions_popup.is_visible()
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()

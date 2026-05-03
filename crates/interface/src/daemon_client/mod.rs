@@ -27,12 +27,11 @@ use protocols::admin::{
     ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
-    PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse, Project,
-    ProjectCreate, ProjectList, ProjectRef, ProjectUpdate, RemoveProviderRequest,
-    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
-    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SettingKey, SettingMutation, SettingsSnapshot, TriggerHeartbeatRequest,
-    WarningList, WebhookRef, WorkflowList,
+    PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
+    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
+    ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SettingKey, SettingMutation,
+    SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -580,61 +579,6 @@ impl DaemonClient {
             .into_inner())
     }
 
-    // ── Projects ──────────────────────────────────────────────────────────
-
-    /// List all projects.
-    pub async fn list_projects(&mut self) -> Result<ProjectList> {
-        Ok(self
-            .admin
-            .list_projects(AdminEmpty {})
-            .await
-            .context("Admin.ListProjects failed")?
-            .into_inner())
-    }
-
-    /// Create a project.
-    pub async fn create_project(&mut self, name: &str, description: &str) -> Result<Project> {
-        Ok(self
-            .admin
-            .create_project(ProjectCreate {
-                name: name.to_string(),
-                description: description.to_string(),
-            })
-            .await
-            .context("Admin.CreateProject failed")?
-            .into_inner())
-    }
-
-    /// Update a project (empty fields are skipped).
-    pub async fn update_project(
-        &mut self,
-        id: &str,
-        name: &str,
-        description: &str,
-        status: &str,
-    ) -> Result<Project> {
-        Ok(self
-            .admin
-            .update_project(ProjectUpdate {
-                id: id.to_string(),
-                name: name.to_string(),
-                description: description.to_string(),
-                status: status.to_string(),
-            })
-            .await
-            .context("Admin.UpdateProject failed")?
-            .into_inner())
-    }
-
-    /// Delete a project by id.
-    pub async fn delete_project(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .delete_project(ProjectRef { id: id.to_string() })
-            .await
-            .context("Admin.DeleteProject failed")?;
-        Ok(())
-    }
-
     // ── Scheduled tasks ───────────────────────────────────────────────────
 
     /// List all scheduled tasks.
@@ -807,36 +751,6 @@ impl DaemonClient {
             .update_scheduled_task(spec)
             .await
             .context("Admin.UpdateScheduledTask failed")?
-            .into_inner())
-    }
-
-    /// Mark a project archived (convenience over UpdateProject).
-    pub async fn archive_project(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .archive_project(ProjectRef { id: id.to_string() })
-            .await
-            .context("Admin.ArchiveProject failed")?;
-        Ok(())
-    }
-
-    /// Mark a project active (convenience over UpdateProject).
-    pub async fn unarchive_project(&mut self, id: &str) -> Result<()> {
-        self.admin
-            .unarchive_project(ProjectRef { id: id.to_string() })
-            .await
-            .context("Admin.UnarchiveProject failed")?;
-        Ok(())
-    }
-
-    /// List workflows for a project (used by the projects popup workflow_count).
-    pub async fn list_workflows_by_project(&mut self, project_id: &str) -> Result<WorkflowList> {
-        Ok(self
-            .admin
-            .list_workflows_by_project(ProjectRef {
-                id: project_id.to_string(),
-            })
-            .await
-            .context("Admin.ListWorkflowsByProject failed")?
             .into_inner())
     }
 

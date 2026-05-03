@@ -24,7 +24,6 @@ fn print_heal_report(r: &protocols::admin::HealReport) {
     println!("Activity rows pruned:  {}", r.pruned_activity);
     println!("Embeddings evicted:    {}", r.evicted_embeddings);
     println!("Stalled tasks healed:  {}", r.healed_tasks);
-    println!("Workflows pruned:      {}", r.workflows_pruned);
     println!("Messages purged:       {}", r.messages_purged);
     println!("Wedged runs recovered: {}", r.wedged_runs_recovered);
     println!("Backups pruned:        {}", r.backups_pruned);
