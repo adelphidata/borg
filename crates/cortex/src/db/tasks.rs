@@ -221,6 +221,16 @@ impl Database {
         for task in tasks {
             crate::tasks::advance_next_run_raw(&self.conn, &task)?;
 
+            // Atomically consume any one-shot bypass flag so a concurrent
+            // second poke (or any code reading the row mid-tick) can't lose
+            // its override. The flag is already captured on `task`.
+            if task.bypass_quiet_hours_once {
+                self.conn.execute(
+                    "UPDATE scheduled_tasks SET bypass_quiet_hours_once = 0 WHERE id = ?1",
+                    params![task.id],
+                )?;
+            }
+
             // Insert a 'running' task_run row
             self.conn.execute(
                 "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
@@ -548,4 +558,29 @@ impl Database {
         let runs = self.task_run_history(task_id, 1)?;
         Ok(runs.into_iter().next())
     }
+
+    /// Set the one-shot `bypass_quiet_hours_once` flag on a task. Used by
+    /// `Admin.Poke` / `TriggerHeartbeat(bypass=true)` to make the heartbeat
+    /// row's next dispatch ignore quiet hours and the per-task min-interval
+    /// floor. The flag is cleared atomically inside `claim_due_tasks` so a
+    /// concurrent second poke cannot silently lose its override.
+    pub fn set_task_bypass_quiet_hours_once(&self, id: &str, bypass: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_tasks SET bypass_quiet_hours_once = ?1 WHERE id = ?2",
+            params![bypass as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the hash of the most recently delivered response for a task.
+    /// Used by the heartbeat dispatch path as belt-and-suspenders dedup
+    /// behind the primary `[SILENT]` suppression. Pass `None` to clear.
+    pub fn update_task_response_hash(&self, id: &str, hash: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE scheduled_tasks SET last_response_hash = ?1 WHERE id = ?2",
+            params![hash, id],
+        )?;
+        Ok(())
+    }
+
 }
