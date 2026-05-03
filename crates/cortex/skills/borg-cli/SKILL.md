@@ -1,6 +1,6 @@
 ---
 name: borg-cli
-description: "Drive the borg CLI to self-configure: settings, skills, memory, tasks, channels, status. Use whenever the user asks to change Borg's own behavior."
+description: "Drive the borg CLI to self-configure and diagnose: settings, skills, memory, tasks, channels, status, recent failures."
 category: core
 triggers:
   - "configure borg"
@@ -10,6 +10,8 @@ triggers:
   - "remember this"
   - "schedule a task"
   - "borg status"
+  - "what failed"
+  - "what was the last session"
 ---
 
 # Borg CLI
@@ -59,6 +61,19 @@ borg tasks                       # list scheduled agent tasks
 borg tasks create -n <name> -p <prompt> -s "<cron|interval>" [-t cron|interval]
 borg tasks delete|pause|resume|run|status|runs <id>
 borg cron list|add|remove        # shell-command cron jobs
+```
+
+## Diagnose recent activity
+
+Use these when asked "what failed", "what's flagged", "what's the last session". Prefer CLI; sqlite for cross-task lookups.
+
+```bash
+borg tasks                       # status flags failing tasks
+borg tasks runs <id>             # last N runs for one task
+# Cross-task failures (last 24h):
+sqlite3 ~/.borg/borg.db "SELECT st.name, tr.error, datetime(tr.started_at,'unixepoch','localtime') FROM task_runs tr JOIN scheduled_tasks st ON st.id=tr.task_id WHERE tr.status='failed' AND tr.started_at>=strftime('%s','now','-24 hours') ORDER BY tr.started_at DESC LIMIT 10;"
+borg doctor                      # current findings
+borg sessions list --limit 5
 ```
 
 ## Channels & Pairing

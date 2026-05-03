@@ -1232,6 +1232,12 @@ Short body.
             "borg heal",
             "borg sessions",
             "borg status",
+            // Diagnostics recipes — the agent reaches for these when asked
+            // "what failed?" instead of fishing with memory_search or
+            // hand-rolling a SQL JOIN. Removing them regresses the
+            // heartbeat-followup grounding behavior.
+            "borg tasks runs",
+            "task_runs tr JOIN scheduled_tasks st",
         ] {
             assert!(
                 body.contains(required),

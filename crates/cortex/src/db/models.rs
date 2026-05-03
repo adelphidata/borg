@@ -84,6 +84,22 @@ pub struct ScheduledTaskRow {
     pub pre_run_cwd: Option<String>,
     /// Timeout in milliseconds for `pre_run_command` (default 60000).
     pub pre_run_timeout_ms: i64,
+    /// One-shot bypass flag: when 1, the next dispatch ignores quiet hours
+    /// and the per-task `min_interval_secs` floor. Cleared atomically when
+    /// the dispatcher claims the row, so a concurrent second poke can't
+    /// silently lose its override. Used today only by `task_type="heartbeat"`
+    /// (set via `Admin.Poke` / `TriggerHeartbeat`).
+    pub bypass_quiet_hours_once: bool,
+    /// Per-task minimum-interval floor in seconds. NULL for tasks where the
+    /// schedule expression is the only gate (regular `prompt`/`command`).
+    /// Heartbeat populates this from `heartbeat.min_interval_secs` so two
+    /// firings can't land within the configured window.
+    pub min_interval_secs: Option<i64>,
+    /// Hash of the most recent delivered response. The heartbeat dispatch
+    /// path checks this before broadcasting to suppress accidental repeats
+    /// (model said the same thing twice). `[SILENT]` runs do NOT update
+    /// this — only successful deliveries do.
+    pub last_response_hash: Option<String>,
 }
 
 /// Task run log row from SQLite.
@@ -419,6 +435,10 @@ pub struct NewTask<'a> {
     pub pre_run_cwd: Option<&'a str>,
     /// Timeout (ms) for `pre_run_command`. Defaults to 60_000.
     pub pre_run_timeout_ms: Option<i64>,
+    /// Per-task minimum-interval floor in seconds. Used by the heartbeat row
+    /// to enforce `heartbeat.min_interval_secs` at dispatch time. None for
+    /// regular tasks.
+    pub min_interval_secs: Option<i64>,
 }
 
 /// Parameters for enqueuing a delivery.

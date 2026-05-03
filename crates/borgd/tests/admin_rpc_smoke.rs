@@ -174,6 +174,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
+            min_interval_secs: None,
         })
         .expect("create wedged task");
         let started_at = chrono::Utc::now().timestamp() - 3600;
@@ -219,6 +220,7 @@ async fn admin_rpcs_round_trip_warnings_heal_and_scheduled_tasks() {
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
+            min_interval_secs: None,
         })
         .expect("create t1");
     }

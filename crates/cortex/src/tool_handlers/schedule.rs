@@ -178,6 +178,7 @@ fn manage_tasks_create(args: &serde_json::Value) -> Result<String> {
             pre_run_command,
             pre_run_cwd,
             pre_run_timeout_ms,
+            min_interval_secs: None,
         }) {
             Ok(()) => Ok(format!(
                 "Scheduled task created: {task_name} (id: {})",
@@ -445,6 +446,7 @@ fn manage_cron_create(args: &serde_json::Value) -> Result<String> {
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
+            min_interval_secs: None,
         }) {
             Ok(()) => Ok(format!(
                 "Cron job created: {name} (id: {})\n  Schedule: {schedule}\n  Command: {command}",

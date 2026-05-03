@@ -56,6 +56,7 @@ async fn dispatcher_claims_due_command_task_and_records_task_run() {
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
+            min_interval_secs: None,
         })
         .expect("create due-cmd");
     }

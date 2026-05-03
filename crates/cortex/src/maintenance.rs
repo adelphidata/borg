@@ -1231,6 +1231,7 @@ mod tests {
             pre_run_command: None,
             pre_run_cwd: None,
             pre_run_timeout_ms: None,
+            min_interval_secs: None,
         })
         .unwrap();
         db.conn()

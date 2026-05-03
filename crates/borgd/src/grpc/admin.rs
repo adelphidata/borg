@@ -402,6 +402,7 @@ impl Admin for AdminSvc {
                 pre_run_command: None,
                 pre_run_cwd: None,
                 pre_run_timeout_ms: None,
+                min_interval_secs: None,
             };
             db.create_task(&new_task)?;
             Ok(db.list_tasks()?.into_iter().find(|t| t.id == id))

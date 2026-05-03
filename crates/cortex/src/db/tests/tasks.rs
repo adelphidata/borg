@@ -24,9 +24,10 @@ fn create_and_list_tasks() {
     .expect("create task 2");
 
     let tasks = db.list_tasks().expect("list");
-    // +5 for seeded tasks: Monthly Security Audit, Daily Summary, Nightly
-    // Consolidation, Weekly Maintenance, Daily Self-Healing Maintenance.
-    assert_eq!(tasks.len(), 7);
+    // +6 for seeded tasks: Monthly Security Audit, Daily Summary, Nightly
+    // Consolidation, Weekly Maintenance, Daily Self-Healing Maintenance,
+    // and the V52 Heartbeat row.
+    assert_eq!(tasks.len(), 8);
 }
 
 #[test]
@@ -285,6 +286,7 @@ fn create_task_with_delivery_config() {
         pre_run_command: None,
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
+        min_interval_secs: None,
     })
     .expect("create");
     let task = db.get_task_by_id("t1").expect("get").expect("some");
@@ -314,6 +316,7 @@ fn create_task_with_allowed_tools() {
         pre_run_command: None,
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
+        min_interval_secs: None,
     })
     .expect("create");
     let task = db.get_task_by_id("t-tools").expect("get").expect("some");
@@ -356,6 +359,7 @@ fn allowed_tools_survives_list_tasks() {
         pre_run_command: None,
         pre_run_cwd: None,
         pre_run_timeout_ms: None,
+        min_interval_secs: None,
     })
     .expect("create");
     let tasks = db.list_tasks().expect("list");
@@ -687,6 +691,99 @@ fn recover_stale_runs_ignores_completed() {
 
     let count = db.recover_stale_runs("Daemon crashed").expect("recover");
     assert_eq!(count, 0);
+}
+
+// ── recover_stale_runs: last_error propagation ──
+//
+// Regression context: daemon-crash victims were marked failed in `task_runs`
+// but invisible to anything reading `scheduled_tasks.last_error` (the
+// `borg tasks` listing, `tasks_with_last_error`). Heartbeat surfaced
+// "N tasks failed" without names because the parent rows said NULL.
+
+#[test]
+fn recover_stale_runs_propagates_error_to_parent_last_error() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task1",
+        "prompt",
+        "interval",
+        "30m",
+        Some(50),
+    ))
+    .expect("create");
+    db.create_task(&simple_task(
+        "t2",
+        "task2",
+        "prompt",
+        "interval",
+        "30m",
+        Some(50),
+    ))
+    .expect("create");
+
+    db.start_task_run("t1", 1000).expect("start t1");
+    db.start_task_run("t2", 1100).expect("start t2");
+
+    let count = db.recover_stale_runs("Daemon crashed").expect("recover");
+    assert_eq!(count, 2);
+
+    let t1 = db.get_task_by_id("t1").expect("get").expect("some");
+    let t2 = db.get_task_by_id("t2").expect("get").expect("some");
+    assert_eq!(t1.last_error.as_deref(), Some("Daemon crashed"));
+    assert_eq!(t2.last_error.as_deref(), Some("Daemon crashed"));
+}
+
+#[test]
+fn recover_stale_runs_does_not_overwrite_existing_last_error() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task1",
+        "prompt",
+        "interval",
+        "30m",
+        Some(50),
+    ))
+    .expect("create");
+    // A more specific transient error already on the parent row.
+    db.set_task_retry("t1", 1, "openrouter 429", 9999)
+        .expect("set retry");
+
+    db.start_task_run("t1", 1000).expect("start");
+    db.recover_stale_runs("Daemon crashed").expect("recover");
+
+    let t1 = db.get_task_by_id("t1").expect("get").expect("some");
+    assert_eq!(
+        t1.last_error.as_deref(),
+        Some("openrouter 429"),
+        "specific transient error must not be clobbered by crash recovery"
+    );
+}
+
+#[test]
+fn recover_stale_runs_does_not_touch_tasks_without_running_runs() {
+    let db = test_db();
+    db.create_task(&simple_task(
+        "t1",
+        "task1",
+        "prompt",
+        "interval",
+        "30m",
+        Some(50),
+    ))
+    .expect("create");
+    // No running run for t1 — only a completed one.
+    db.record_task_run("t1", 1000, 500, Some("ok"), None)
+        .expect("record");
+
+    db.recover_stale_runs("Daemon crashed").expect("recover");
+
+    let t1 = db.get_task_by_id("t1").expect("get").expect("some");
+    assert!(
+        t1.last_error.is_none(),
+        "task with no running run must keep last_error NULL"
+    );
 }
 
 #[test]
@@ -1128,6 +1225,7 @@ fn create_task_persists_and_reads_back_pre_run_fields() {
         pre_run_command: Some("echo hello"),
         pre_run_cwd: Some("/tmp"),
         pre_run_timeout_ms: Some(15_000),
+        min_interval_secs: None,
     })
     .expect("create");
 

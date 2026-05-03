@@ -1781,6 +1781,70 @@ impl Database {
         Ok(())
     }
 
+    /// V52: Fold heartbeat into `scheduled_tasks` as `task_type="heartbeat"`.
+    ///
+    /// Adds three columns:
+    ///   - `bypass_quiet_hours_once` — one-shot flag set by `/poke` to ignore
+    ///     quiet hours + min-interval on the next dispatch. Cleared atomically
+    ///     when the dispatcher claims the row.
+    ///   - `min_interval_secs` — per-task floor between firings (heartbeat-
+    ///     specific today; NULL for everything else).
+    ///   - `last_response_hash` — persistent dedup of the last delivered
+    ///     heartbeat response across daemon restarts (was in-process before).
+    ///
+    /// Then seeds the heartbeat row idempotently. Existing dev DBs that ran
+    /// V51 without a heartbeat row get one on first V52 boot.
+    pub(super) fn migrate_v52(&self) -> Result<()> {
+        if !Self::has_column(&self.conn, "scheduled_tasks", "bypass_quiet_hours_once") {
+            self.conn.execute_batch(
+                "ALTER TABLE scheduled_tasks ADD COLUMN bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !Self::has_column(&self.conn, "scheduled_tasks", "min_interval_secs") {
+            self.conn.execute_batch(
+                "ALTER TABLE scheduled_tasks ADD COLUMN min_interval_secs INTEGER;",
+            )?;
+        }
+        if !Self::has_column(&self.conn, "scheduled_tasks", "last_response_hash") {
+            self.conn.execute_batch(
+                "ALTER TABLE scheduled_tasks ADD COLUMN last_response_hash TEXT;",
+            )?;
+        }
+        self.seed_heartbeat_task()?;
+        Ok(())
+    }
+
+    /// Seed the heartbeat row. Idempotent via `INSERT OR IGNORE`. Default
+    /// schedule matches `HeartbeatConfig::default()`: 30-minute interval,
+    /// 60s min-interval floor, broadcast delivery to gateway-bound channels.
+    /// `borgd` startup re-syncs the row from current settings via
+    /// `Database::sync_heartbeat_row_from_config`, so any user override is
+    /// applied before the first firing.
+    fn seed_heartbeat_task(&self) -> Result<()> {
+        let task_id = crate::heartbeat_task::HEARTBEAT_TASK_ID;
+        let now = chrono::Utc::now().timestamp();
+        // Default 30m interval — matches DEFAULT_HEARTBEAT_INTERVAL.
+        let next_run = crate::tasks::calculate_next_run("interval", "30m", "local")?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO scheduled_tasks
+             (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, 300000, ?9, NULL, NULL, 'heartbeat', NULL, NULL, 60000, ?10)",
+            rusqlite::params![
+                task_id,
+                "Heartbeat",
+                "", // HEARTBEAT.md is loaded at run time by execute_heartbeat_task
+                "interval",
+                "30m",
+                "local",
+                next_run,
+                now,
+                crate::heartbeat_task::BROADCAST_DELIVERY,
+                crate::constants::MIN_HEARTBEAT_INTERVAL_SECS as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Seed the daily self-healing maintenance task. Idempotent via
     /// `INSERT OR IGNORE` so re-running on an existing install leaves the
     /// row untouched.
