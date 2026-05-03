@@ -1656,6 +1656,19 @@ Short body.
             .filter(|skill| !skill.disabled)
             .collect::<Vec<_>>();
 
+        // The test premise is that a high-relevance *available* skill survives a
+        // tight budget. `load_skills_context` sorts unavailable skills to the
+        // bottom, so if `pdftotext` isn't installed (e.g. minimal CI image),
+        // pdf is unavailable and the premise doesn't hold — skip rather than
+        // assert against an environment-dependent ordering.
+        if !skills
+            .iter()
+            .any(|s| s.manifest.name == "pdf" && s.available)
+        {
+            eprintln!("skipping: pdf skill unavailable in this environment");
+            return;
+        }
+
         let mut sorted_skills = skills;
         sorted_skills.sort_by(|a, b| {
             let score_a = skill_relevance_score(a, "extract text from this pdf");
