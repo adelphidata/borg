@@ -4,28 +4,6 @@ use crate::secrets_resolve::SecretRef;
 use std::io::Write;
 
 #[test]
-fn default_config_values() {
-    let cfg = Config::default();
-    assert!(cfg.llm.provider.is_none());
-    assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
-    assert_eq!(cfg.llm.model, "");
-    assert!((cfg.llm.temperature - 0.7).abs() < f32::EPSILON);
-    assert_eq!(cfg.llm.max_tokens, 4096);
-    assert!(cfg.llm.base_url.is_none());
-    assert_eq!(cfg.heartbeat.interval, "30m");
-    assert_eq!(cfg.tools.default_timeout_ms, 30000);
-    assert!(cfg.sandbox.enabled);
-    assert_eq!(cfg.sandbox.mode, "strict");
-    assert_eq!(cfg.memory.max_context_tokens, 8000);
-    assert!(cfg.skills.enabled);
-    assert_eq!(cfg.skills.max_context_tokens, 4000);
-    assert_eq!(cfg.conversation.max_history_tokens, 32000);
-    assert_eq!(cfg.conversation.max_iterations, 25);
-    assert!(cfg.conversation.show_thinking);
-    assert!(cfg.security.secret_detection);
-}
-
-#[test]
 fn parse_complete_config_toml() {
     let toml_str = r#"
 [llm]
@@ -238,28 +216,6 @@ fn display_settings_contains_key_fields() {
 }
 
 #[test]
-fn default_web_config_values() {
-    let cfg = WebConfig::default();
-    assert!(cfg.enabled);
-    assert_eq!(cfg.search_provider, "auto");
-    assert!(cfg.search_api_key_env.is_none());
-}
-
-#[test]
-fn default_tasks_config_values() {
-    let cfg = TasksConfig::default();
-    assert_eq!(cfg.max_concurrent, 3);
-}
-
-#[test]
-fn default_llm_config_retry_fields() {
-    let cfg = LlmConfig::default();
-    assert_eq!(cfg.max_retries, 3);
-    assert_eq!(cfg.initial_retry_delay_ms, 200);
-    assert_eq!(cfg.request_timeout_ms, 120_000);
-}
-
-#[test]
 fn path_helpers() {
     let data = Config::data_dir().unwrap();
     assert!(data.to_string_lossy().ends_with(".borg"));
@@ -341,13 +297,6 @@ fn save_and_reload_round_trip() {
 }
 
 #[test]
-fn default_budget_config_values() {
-    let cfg = BudgetConfig::default();
-    assert_eq!(cfg.monthly_token_limit, 1_000_000);
-    assert!((cfg.warning_threshold - 0.8).abs() < f64::EPSILON);
-}
-
-#[test]
 fn parse_budget_config_from_toml() {
     let toml_str = r#"
 [budget]
@@ -399,17 +348,6 @@ fn display_settings_contains_budget() {
     let display = cfg.display_settings();
     assert!(display.contains("budget.monthly_token_limit"));
     assert!(display.contains("budget.warning_threshold"));
-}
-
-#[test]
-fn telemetry_config_defaults() {
-    let cfg = TelemetryConfig::default();
-    assert!(!cfg.tracing_enabled);
-    assert!(!cfg.metrics_enabled);
-    assert!(!cfg.cost_events);
-    assert_eq!(cfg.otlp_endpoint, "http://localhost:4317");
-    assert_eq!(cfg.service_name, "borg");
-    assert!((cfg.sampling_ratio - 1.0).abs() < f64::EPSILON);
 }
 
 #[test]

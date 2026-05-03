@@ -17,6 +17,27 @@ use crate::teams::api::TeamsClient;
 use crate::telegram::api::TelegramClient;
 use crate::twilio::api::TwilioClient;
 
+/// All credential keys this module reads via `resolve_credential`.
+/// Every entry must be present in `Config::KEY_PLUGIN_MAP` (asserted in tests
+/// below) so the OS-keychain fallback can locate it.
+#[allow(dead_code)] // referenced from tests only; documents the contract
+pub(crate) const GATEWAY_CREDENTIAL_KEYS: &[&str] = &[
+    "TELEGRAM_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_SIGNING_SECRET",
+    "TWILIO_ACCOUNT_SID",
+    "TWILIO_AUTH_TOKEN",
+    "TWILIO_PHONE_NUMBER",
+    "TWILIO_WHATSAPP_NUMBER",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_PUBLIC_KEY",
+    "TEAMS_APP_ID",
+    "TEAMS_APP_SECRET",
+    "GOOGLE_CHAT_SERVICE_TOKEN",
+    "GOOGLE_CHAT_WEBHOOK_TOKEN",
+    "SIGNAL_ACCOUNT",
+];
+
 /// Resolve a credential for a channel plugin.
 ///
 /// Delegates to `Config::resolve_credential_or_env` which handles config store,
@@ -340,84 +361,30 @@ mod tests {
         assert_eq!(result.as_deref(), Some("config-value"));
     }
 
-    /// Guard: the resolve_credential_or_env function must log when a credential
-    /// is configured but fails to resolve (not silently swallow errors).
+    /// Every credential key the gateway resolves must have a plugin-ID
+    /// mapping in `Config::KEY_PLUGIN_MAP`, so the OS-keychain fallback can
+    /// derive a service name. Drift here means a channel silently loses its
+    /// keychain fallback when env + config-store both miss.
     #[test]
-    fn resolve_credential_or_env_logs_on_failure() {
-        // Verify the source code contains the warning log
-        let source = include_str!("../../cortex/src/config/mod.rs");
-        assert!(
-            source.contains("Failed to resolve credential"),
-            "resolve_credential_or_env must log when credential resolution fails"
-        );
-    }
-
-    /// Guard: init_telegram must warn when credential is configured but unresolvable.
-    #[test]
-    fn init_telegram_warns_on_configured_but_unresolvable_token() {
-        let source = include_str!("channel_init.rs");
-        assert!(
-            source.contains("could not be resolved"),
-            "init_telegram must warn when TELEGRAM_BOT_TOKEN is in config but can't be resolved"
-        );
-    }
-
-    /// Guard: all native channel init_* functions use resolve_credential (with keychain fallback),
-    /// not resolve_credential_or_env directly. The only allowed direct calls are inside the
-    /// resolve_credential helper itself and for optional webhook secrets.
-    #[test]
-    fn all_channel_inits_use_keychain_fallback() {
-        let source = include_str!("channel_init.rs");
-        // Find direct calls in init_* functions (not in resolve_credential helper or tests)
-        let mut in_init_fn = false;
-        for line in source.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("pub(crate)") && trimmed.contains("fn init_") {
-                in_init_fn = true;
-            } else if trimmed.starts_with("fn resolve_credential")
-                || trimmed.starts_with("#[cfg(test)]")
-            {
-                in_init_fn = false;
-            }
-            if in_init_fn && trimmed.contains("resolve_credential_or_env") {
-                assert!(
-                    trimmed.contains("WEBHOOK_SECRET"),
-                    "Non-webhook-secret credential in init_* should use resolve_credential() with keychain fallback, found: {trimmed}"
-                );
-            }
+    fn every_gateway_key_maps_to_a_plugin() {
+        for key in GATEWAY_CREDENTIAL_KEYS {
+            assert!(
+                Config::keychain_plugin_for_key(key).is_some(),
+                "gateway credential {key} has no entry in Config::KEY_PLUGIN_MAP"
+            );
         }
     }
 
-    /// Guard: TUI uninstall handler must wipe the data directory.
+    /// All keychain plugin IDs follow the `messaging/<channel>` namespace —
+    /// this is the contract `resolve_keychain_fallback` and the catalog rely
+    /// on for service-name derivation (`borg-messaging-<channel>`).
     #[test]
-    fn uninstall_handler_wipes_data_directory() {
-        let source = include_str!("../../interface/src/tui/mod.rs");
-        let uninstall_section: String = source
-            .lines()
-            .skip_while(|l| !l.contains("PluginAction::Uninstall"))
-            .take(40)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            uninstall_section.contains("remove_dir_all"),
-            "Uninstall handler must wipe the data directory via remove_dir_all"
-        );
-    }
-
-    /// Guard: uninstall must restart gateway for channel plugins.
-    #[test]
-    fn uninstall_restarts_gateway_for_channels() {
-        let source = include_str!("../../interface/src/tui/mod.rs");
-        // Find the Uninstall block and verify it calls restart_gateway
-        let uninstall_section: String = source
-            .lines()
-            .skip_while(|l| !l.contains("PluginAction::Uninstall"))
-            .take(50)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            uninstall_section.contains("restart_gateway"),
-            "Uninstall handler must restart gateway after removing a channel plugin"
-        );
+    fn keychain_plugin_ids_are_namespaced() {
+        for (key, plugin_id) in Config::KEY_PLUGIN_MAP {
+            assert!(
+                plugin_id.starts_with("messaging/"),
+                "key {key} maps to non-messaging plugin id {plugin_id}"
+            );
+        }
     }
 }

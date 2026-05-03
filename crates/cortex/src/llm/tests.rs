@@ -570,19 +570,27 @@ fn cooldown_reset_on_success() {
 
 #[test]
 fn cooldown_backoff_escalates() {
+    // Consecutive failures (without intervening success) must back off
+    // longer each time — the whole point of the error_count counter.
     let mut cd = ProviderCooldown::default();
     cd.record_failure(FailoverReason::RateLimit);
     let first = cd.cooldown_until.unwrap();
 
-    cd.cooldown_until = None; // simulate expiry
-    cd.error_count = 0; // reset will happen in record_failure
     cd.record_failure(FailoverReason::RateLimit);
     let second = cd.cooldown_until.unwrap();
 
-    // Both cooldowns should be in the future, second may be different
-    // since error_count resets on expiry
-    assert!(first > std::time::Instant::now() - Duration::from_secs(120));
-    assert!(second > std::time::Instant::now() - Duration::from_secs(120));
+    cd.record_failure(FailoverReason::RateLimit);
+    let third = cd.cooldown_until.unwrap();
+
+    assert!(
+        second > first,
+        "second cooldown {second:?} did not escalate past first {first:?}"
+    );
+    assert!(
+        third > second,
+        "third cooldown {third:?} did not escalate past second {second:?}"
+    );
+    assert_eq!(cd.error_count, 3);
 }
 
 #[test]

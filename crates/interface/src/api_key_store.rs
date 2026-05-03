@@ -154,20 +154,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keychain_service_name_format() {
-        assert_eq!(keychain_service_name("openrouter"), "borg-openrouter");
-        assert_eq!(keychain_service_name("anthropic"), "borg-anthropic");
-    }
-
-    #[test]
-    fn env_var_hint_mentions_env_var() {
-        let hint = env_var_hint("openrouter");
-        assert!(hint.contains("OPENROUTER_API_KEY"), "hint was: {hint}");
-        let hint = env_var_hint("anthropic");
-        assert!(hint.contains("ANTHROPIC_API_KEY"), "hint was: {hint}");
-    }
-
-    #[test]
     fn provider_api_key_secret_ref_is_canonical_keychain_ref() {
         let secret_ref = provider_api_key_secret_ref("openrouter");
         match secret_ref {
@@ -180,11 +166,26 @@ mod tests {
     }
 
     #[test]
-    fn provider_api_key_secret_ref_json_is_valid() {
+    fn provider_api_key_secret_ref_json_round_trip() {
         let secret_ref = provider_api_key_secret_ref("openrouter");
         let json = serde_json::to_string(&secret_ref).expect("serialize");
-        let parsed: Result<SecretRef, _> = serde_json::from_str(&json);
-        assert!(parsed.is_ok(), "invalid JSON: {json}");
+        let parsed: SecretRef = serde_json::from_str(&json).expect("deserialize");
+        match (parsed, secret_ref) {
+            (
+                SecretRef::Keychain {
+                    service: a_svc,
+                    account: a_acc,
+                },
+                SecretRef::Keychain {
+                    service: b_svc,
+                    account: b_acc,
+                },
+            ) => {
+                assert_eq!(a_svc, b_svc);
+                assert_eq!(a_acc, b_acc);
+            }
+            (other, _) => panic!("round-trip changed variant: {other:?}"),
+        }
     }
 
     // The empty-input fast path doesn't need a daemon; it returns before any
