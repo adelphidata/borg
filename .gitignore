@@ -29,7 +29,7 @@ Thumbs.db
 /docs/spec/
 
 # Live regression log (local only — surfaced from external eval suite)
-/docs/ISSUES.md
+issues/
 
 # Claude Code local hooks
 /.claude/hooks/

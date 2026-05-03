@@ -112,12 +112,18 @@ fn multiple_categories_recorded() {
     }
 
     let events = db.vitals_events_since(0).expect("get events");
-    assert_eq!(events.len(), 5);
+    assert_eq!(
+        events.len(),
+        categories.len(),
+        "every distinct-category insert should persist (none share an hourly cap with each other in a fresh DB)"
+    );
 
-    let cats: Vec<&str> = events.iter().map(|e| e.category.as_str()).collect();
-    for cat in &categories {
-        assert!(cats.contains(cat), "Should have {cat} event");
-    }
+    // Bidirectional set equality, not just one-direction containment — catches
+    // both missing inputs and unexpected extras.
+    let recorded: std::collections::HashSet<&str> =
+        events.iter().map(|e| e.category.as_str()).collect();
+    let expected: std::collections::HashSet<&str> = categories.iter().copied().collect();
+    assert_eq!(recorded, expected, "recorded set differs from inserted set");
 }
 
 // ── Test: baseline values are mid-range ──
