@@ -30,6 +30,8 @@ cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 
 **Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage` / `just coverage-summary`. Target 80%+.
 
+**Live-LLM lane (opt-in).** `web_fetch` / `web_search` / `browser` are exercised against real network targets in `crates/cortex/tests/live_network_integration.rs`, gated by both the `live-llm` cargo feature and `BORG_ALLOW_LIVE_TESTS=1`. Default `cargo test` stays hermetic; full ship checks should run `BORG_ALLOW_LIVE_TESTS=1 cargo test -p cortex --features live-llm --test live_network_integration`.
+
 Requires one of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, Ollama, or Claude Code CLI.
 
 Smaller crates (apply-patch, sandbox, heartbeat, plugins) enforce `#![warn(missing_docs)]`. iMessage is macOS-only via `#[cfg(target_os = "macos")]`.

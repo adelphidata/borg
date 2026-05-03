@@ -188,8 +188,8 @@ impl HeartbeatScheduler {
     /// Compute the clamped interval from the current config, logging when the
     /// raw value is bumped to the floor.
     fn clamped_interval(&self) -> std::time::Duration {
-        let raw = parse_interval(&self.config.interval)
-            .unwrap_or(std::time::Duration::from_secs(1800));
+        let raw =
+            parse_interval(&self.config.interval).unwrap_or(std::time::Duration::from_secs(1800));
         let min_secs = self.config.min_interval_secs.max(HARD_FLOOR_SECS);
         if raw.as_secs() < min_secs {
             warn!(
@@ -1220,9 +1220,9 @@ mod tests {
             Ok(HeartbeatEvent::Result(HeartbeatResult::Skipped {
                 reason: SkipReason::QuietHours,
             })) => {}
-            other => panic!(
-                "expected Skipped(QuietHours) after live quiet-hours update, got: {other:?}"
-            ),
+            other => {
+                panic!("expected Skipped(QuietHours) after live quiet-hours update, got: {other:?}")
+            }
         }
         cancel.cancel();
     }

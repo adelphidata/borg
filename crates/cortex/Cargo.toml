@@ -60,6 +60,13 @@ iana-time-zone = "0.1"
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[features]
+# Opt-in lane that exercises tool handlers against real network targets
+# (`web_fetch`, `web_search`, `browser`). Tests under this feature additionally
+# require `BORG_ALLOW_LIVE_TESTS=1` at runtime so a feature-only build still
+# stays green offline.
+live-llm = []
+
 [lints]
 workspace = true
 
