@@ -34,7 +34,7 @@ use super::usd::Usd;
 /// Reads `providers.default_id` and the active model from a config-loaded
 /// snapshot. Falls back to `("openai", "gpt-4o-mini")` if no override is
 /// stored — matches the v1 hobbyist default.
-fn active_provider_and_model(db: &Database) -> (String, String) {
+pub(crate) fn active_provider_and_model(db: &Database) -> (String, String) {
     let provider = db
         .get_setting("providers.default_id")
         .ok()
@@ -170,5 +170,173 @@ impl Hook for BudgetHook {
 impl fmt::Debug for BudgetHook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BudgetHook").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::{HookData, HookPoint};
+    use rusqlite::params;
+
+    fn override_default_budget(
+        db: &Database,
+        hard: &str,
+        soft: Option<&str>,
+        spent: &str,
+        period_start: i64,
+    ) {
+        db.conn()
+            .execute(
+                "UPDATE budgets
+                 SET hard_cap_usd = ?1, soft_cap_usd = ?2, current_spent_usd = ?3,
+                     current_period_start = ?4, last_soft_toast_period = NULL
+                 WHERE scope = 'default'",
+                params![hard, soft, spent, period_start],
+            )
+            .unwrap();
+    }
+
+    fn ctx(point: HookPoint, data: HookData) -> HookContext {
+        HookContext {
+            point,
+            session_id: "test-session".to_string(),
+            turn_count: 0,
+            data,
+        }
+    }
+
+    #[test]
+    fn active_provider_and_model_falls_back_when_unset() {
+        let db = Database::test_db();
+        let (provider, model) = active_provider_and_model(&db);
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn active_provider_and_model_lowercases_provider_id_only() {
+        // Provider IDs are normalized to lowercase for rate-card lookups
+        // (rate-card rows are seeded lowercase). Model names must NOT be
+        // lowercased — `claude-sonnet-4-6` and many OpenRouter slugs are
+        // case-sensitive on the wire.
+        let db = Database::test_db();
+        db.set_setting("providers.default_id", "OpenRouter")
+            .unwrap();
+        db.set_setting("model", "GPT-4o").unwrap();
+        let (provider, model) = active_provider_and_model(&db);
+        assert_eq!(provider, "openrouter");
+        assert_eq!(model, "GPT-4o");
+    }
+
+    #[test]
+    fn active_provider_and_model_treats_empty_string_as_unset() {
+        // Settings rows containing the empty string must fall back to the
+        // hobbyist default — guards the `.filter(|s| !s.is_empty())` clause.
+        let db = Database::test_db();
+        db.set_setting("providers.default_id", "").unwrap();
+        db.set_setting("model", "").unwrap();
+        let (provider, model) = active_provider_and_model(&db);
+        assert_eq!(provider, "openai");
+        assert_eq!(model, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn hook_continue_on_non_llm_data() {
+        // Variants other than LlmCall / AgentStart are explicitly out-of-scope
+        // for the budget hook; it must short-circuit to Continue without
+        // touching the DB or the engine.
+        let db = Database::test_db();
+        let hook = BudgetHook::from_database(db);
+        let action = hook.execute(&ctx(
+            HookPoint::AfterToolCall,
+            HookData::ToolCall {
+                name: "run_shell".to_string(),
+                args: "{}".to_string(),
+            },
+        ));
+        assert!(matches!(action, HookAction::Continue), "got {action:?}");
+    }
+
+    #[test]
+    fn hook_continue_when_no_rate_card() {
+        // Default openai/gpt-4o-mini path with no rate-card row → estimate is
+        // Usd::ZERO → Allow. Mirrors the local-Ollama pass-through case.
+        let db = Database::test_db();
+        let hook = BudgetHook::from_database(db);
+        let action = hook.execute(&ctx(
+            HookPoint::BeforeLlmCall,
+            HookData::LlmCall {
+                message_count: 4,
+                prompt_tokens: Some(100),
+            },
+        ));
+        assert!(matches!(action, HookAction::Continue), "got {action:?}");
+    }
+
+    #[test]
+    fn hook_skips_at_hard_cap() {
+        // current_spent > hard_cap means even a $0 estimate (no rate card)
+        // projects past hard cap → HardRefuse → hook returns Skip. This is
+        // the hook's reason for existing.
+        let db = Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        override_default_budget(&db, "0.01", None, "0.02", now);
+        let hook = BudgetHook::from_database(db);
+        let action = hook.execute(&ctx(
+            HookPoint::BeforeLlmCall,
+            HookData::LlmCall {
+                message_count: 1,
+                prompt_tokens: Some(50),
+            },
+        ));
+        assert!(matches!(action, HookAction::Skip), "got {action:?}");
+    }
+
+    #[test]
+    fn hook_inject_context_at_soft_cap() {
+        // Soft cap $0.50, threshold = 80% = $0.40, spent = $0.40, estimate $0
+        // → projected $0.40 ≥ $0.40 → SoftWarn → hook returns InjectContext
+        // carrying the budget_soft_warning marker the agent prompt can
+        // recognize.
+        let db = Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        override_default_budget(&db, "10.00", Some("0.50"), "0.40", now);
+        let hook = BudgetHook::from_database(db);
+        let action = hook.execute(&ctx(
+            HookPoint::BeforeLlmCall,
+            HookData::LlmCall {
+                message_count: 1,
+                prompt_tokens: Some(0),
+            },
+        ));
+        let payload = match action {
+            HookAction::InjectContext(s) => s,
+            other => panic!("expected InjectContext, got {other:?}"),
+        };
+        assert!(
+            payload.contains("<budget_soft_warning>"),
+            "missing tag: {payload}"
+        );
+        assert!(payload.contains("0.40"), "missing spent: {payload}");
+        assert!(payload.contains("0.50"), "missing soft cap: {payload}");
+    }
+
+    #[test]
+    fn hook_agent_start_uses_estimate_tokens_path() {
+        // AgentStart routes through the byte→token estimator in
+        // crate::tokenizer::estimate_tokens. With no rate cards seeded the
+        // estimate is still Usd::ZERO so the engine returns Allow → Continue.
+        // The point of this test is to exercise the AgentStart match arm
+        // without panicking on an unexpectedly large user_message.
+        let db = Database::test_db();
+        let hook = BudgetHook::from_database(db);
+        let action = hook.execute(&ctx(
+            HookPoint::BeforeAgentStart,
+            HookData::AgentStart {
+                user_message: "x".repeat(2000),
+            },
+        ));
+        assert!(matches!(action, HookAction::Continue), "got {action:?}");
     }
 }

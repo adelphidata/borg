@@ -905,6 +905,85 @@ mod tests {
     }
 
     #[test]
+    fn wrap_monospace_strips_trailing_newlines_only() {
+        // Trailing newlines collapsed; the output must end with exactly one
+        // newline before the closing fence.
+        assert_eq!(wrap_monospace("hi\n\n".to_string()), "```\nhi\n```");
+        // Leading/embedded whitespace preserved verbatim — destroying it
+        // would mangle code-like output (indentation matters).
+        assert_eq!(wrap_monospace("  x".to_string()), "```\n  x\n```");
+        assert_eq!(wrap_monospace("a\nb\nc".to_string()), "```\na\nb\nc\n```");
+        // A single trailing newline still trims to the same shape.
+        assert_eq!(wrap_monospace("a\n".to_string()), "```\na\n```");
+        // Empty string round-trips to an empty fenced block, not a missing one.
+        assert_eq!(wrap_monospace(String::new()), "```\n\n```");
+    }
+
+    #[test]
+    fn handle_help_lists_every_gateway_command() {
+        let out = handle_help();
+        assert!(out.starts_with("Available commands:"));
+        for cmd in GATEWAY_COMMANDS {
+            // Every registered command must surface in /help — guards against
+            // adding a CommandDef but forgetting to wire it through.
+            let needle = format!("/{}", cmd.name);
+            assert!(
+                out.contains(&needle),
+                "/help output missing {needle}: {out}"
+            );
+            assert!(
+                out.contains(cmd.description),
+                "/help output missing description for {}: {out}",
+                cmd.name
+            );
+            // accepts_args must render `<args>`; non-arg commands must not
+            // attach `<args>` to their line.
+            let line = out
+                .lines()
+                .find(|l| l.contains(&format!("/{}", cmd.name)) && l.contains(cmd.description))
+                .unwrap_or_else(|| panic!("no line for {}", cmd.name));
+            if cmd.accepts_args {
+                assert!(
+                    line.contains("<args>"),
+                    "{} accepts args but /help line lacks <args>: {line}",
+                    cmd.name
+                );
+            } else {
+                assert!(
+                    !line.contains("<args>"),
+                    "{} does not accept args but /help line has <args>: {line}",
+                    cmd.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn handle_commands_marks_pass_through_distinctly() {
+        let out = handle_commands();
+        assert!(out.starts_with("Slash commands:"));
+        for cmd in GATEWAY_COMMANDS {
+            let line = out
+                .lines()
+                .find(|l| l.contains(&format!("/{}", cmd.name)) && l.contains(cmd.description))
+                .unwrap_or_else(|| panic!("/commands missing entry for {}", cmd.name));
+            if cmd.pass_through {
+                assert!(
+                    line.ends_with("(sent to agent)"),
+                    "{} is pass_through but line lacks (sent to agent) suffix: {line}",
+                    cmd.name
+                );
+            } else {
+                assert!(
+                    !line.contains("(sent to agent)"),
+                    "{} is not pass_through but line marks it as such: {line}",
+                    cmd.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn is_cancel_command_matches_aliases() {
         assert!(is_cancel_command("/cancel"));
         assert!(is_cancel_command("/stop"));

@@ -1261,6 +1261,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_dream_report_minimal() {
+        let report = cortex::consolidation::DreamReport::default();
+        let out = format_dream_report(&report);
+        assert!(out.starts_with("Dream complete."));
+        assert!(out.contains("Entries extracted: 0"));
+        assert!(out.contains("Dupes merged: 0"));
+        assert!(out.contains("Tokens used: 0"));
+        // Empty optional sections must not render their headers.
+        assert!(!out.contains("Nightly:"), "got: {out}");
+        assert!(!out.contains("Weekly:"), "got: {out}");
+        assert!(!out.contains("Warnings:"), "got: {out}");
+    }
+
+    #[test]
+    fn format_dream_report_with_summaries_and_warnings() {
+        let report = cortex::consolidation::DreamReport {
+            entries_extracted: 7,
+            dupes_merged: 2,
+            tokens_used: 1234,
+            nightly_completed: true,
+            weekly_completed: true,
+            warnings: vec!["disk near full".to_string(), "stale entry".to_string()],
+            nightly_summary: "extracted 7 entries".to_string(),
+            weekly_summary: "merged 2 dupes".to_string(),
+        };
+        let out = format_dream_report(&report);
+
+        assert!(out.contains("Entries extracted: 7"));
+        assert!(out.contains("Dupes merged: 2"));
+        assert!(out.contains("Tokens used: 1234"));
+        assert!(out.contains("Nightly: extracted 7 entries"));
+        assert!(out.contains("Weekly: merged 2 dupes"));
+        // Each warning must render as a discrete bullet, exactly once.
+        let bullet_count = out.matches("\n- ").count();
+        assert_eq!(bullet_count, 2, "expected 2 warning bullets, got: {out}");
+        assert!(out.contains("\n- disk near full"));
+        assert!(out.contains("\n- stale entry"));
+    }
+
+    #[test]
+    fn format_dream_report_warnings_without_summaries() {
+        // Real production case: consolidation aborts before summaries land.
+        let report = cortex::consolidation::DreamReport {
+            entries_extracted: 0,
+            dupes_merged: 0,
+            tokens_used: 0,
+            nightly_completed: false,
+            weekly_completed: false,
+            warnings: vec!["llm timeout".to_string()],
+            nightly_summary: String::new(),
+            weekly_summary: String::new(),
+        };
+        let out = format_dream_report(&report);
+        assert!(out.contains("Warnings:"));
+        assert!(out.contains("\n- llm timeout"));
+        assert!(!out.contains("Nightly:"));
+        assert!(!out.contains("Weekly:"));
+        assert_eq!(out.matches("\n- ").count(), 1);
+    }
+
+    #[test]
     fn inbound_message_deserialize_minimal() {
         let json = r#"{"sender_id": "user123", "text": "hello"}"#;
         let msg: InboundMessage = serde_json::from_str(json).unwrap();
