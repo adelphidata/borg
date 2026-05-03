@@ -76,7 +76,7 @@ pub fn start(
         registry,
         config.clone(),
         BorgMetrics::noop(),
-        Some(config_rx.clone()),
+        Some(config_rx),
         Some(cost_event_sink.clone()),
     ));
     let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) =

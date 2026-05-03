@@ -9,6 +9,7 @@ use crate::voice::{should_send_voice_reply, VoiceReplyMode};
 
 use super::api::TelegramClient;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_response(
     client: &TelegramClient,
     chat_id: i64,

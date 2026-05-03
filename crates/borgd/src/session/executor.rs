@@ -89,36 +89,6 @@ impl DaemonSessionExecutor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn current_config_prefers_live_watcher_value_for_new_sessions() {
-        let mut startup = Config::default();
-        startup.llm.model = "startup-model".to_string();
-
-        let mut live = startup.clone();
-        live.llm.model = "live-model".to_string();
-
-        let (tx, rx) = watch::channel(startup.clone());
-        tx.send_replace(live.clone());
-
-        // Simulate an operator update that happened after executor startup.
-        // New hosts must see the watcher's current value immediately rather
-        // than waiting for a later has_changed() edge inside Agent.
-        let executor = DaemonSessionExecutor::new(
-            SessionRegistry::new(),
-            startup,
-            BorgMetrics::noop(),
-            Some(rx),
-            None,
-        );
-
-        assert_eq!(executor.current_config().llm.model, live.llm.model);
-    }
-}
-
 #[async_trait]
 impl SessionExecutor for DaemonSessionExecutor {
     async fn start_turn(
@@ -211,5 +181,35 @@ impl SessionExecutor for DaemonSessionExecutor {
             }
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_config_prefers_live_watcher_value_for_new_sessions() {
+        let mut startup = Config::default();
+        startup.llm.model = "startup-model".to_string();
+
+        let mut live = startup.clone();
+        live.llm.model = "live-model".to_string();
+
+        let (tx, rx) = watch::channel(startup.clone());
+        tx.send_replace(live.clone());
+
+        // Simulate an operator update that happened after executor startup.
+        // New hosts must see the watcher's current value immediately rather
+        // than waiting for a later has_changed() edge inside Agent.
+        let executor = DaemonSessionExecutor::new(
+            SessionRegistry::new(),
+            startup,
+            BorgMetrics::noop(),
+            Some(rx),
+            None,
+        );
+
+        assert_eq!(executor.current_config().llm.model, live.llm.model);
     }
 }

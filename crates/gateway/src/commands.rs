@@ -287,6 +287,7 @@ pub fn is_dream_command(text: &str) -> bool {
 /// Note: `/cancel` is **not** handled here — it is intercepted in
 /// `handler::invoke_agent_with_auto_reply` via [`is_cancel_command`] so the
 /// async cancellation path can run without holding a DB reference.
+#[allow(clippy::too_many_arguments)]
 pub fn try_handle_command(
     text: &str,
     db: &Database,

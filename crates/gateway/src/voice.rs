@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use anyhow::Result;
 use tracing::warn;
 
@@ -24,20 +26,24 @@ impl VoiceReplyMode {
         }
     }
 
-    pub fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "off" => Some(Self::Off),
-            "voice_only" => Some(Self::VoiceOnly),
-            "all" => Some(Self::All),
-            _ => None,
-        }
-    }
-
     pub fn status_label(self) -> &'static str {
         match self {
             Self::Off => "Off (text only)",
             Self::VoiceOnly => "On (voice reply to voice messages)",
             Self::All => "TTS (voice reply to all messages)",
+        }
+    }
+}
+
+impl FromStr for VoiceReplyMode {
+    type Err = ();
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "voice_only" => Ok(Self::VoiceOnly),
+            "all" => Ok(Self::All),
+            _ => Err(()),
         }
     }
 }
@@ -77,7 +83,7 @@ pub fn resolve_voice_reply_mode(
     let key = voice_mode_setting_key(channel_name, chat_id);
     match db.get_setting(&key)? {
         Some(value) => {
-            if let Some(mode) = VoiceReplyMode::from_str(&value) {
+            if let Ok(mode) = VoiceReplyMode::from_str(&value) {
                 Ok(mode)
             } else {
                 warn!("Invalid voice mode setting for {key}: {value}");
