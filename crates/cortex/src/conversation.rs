@@ -1650,6 +1650,60 @@ mod tests {
     }
 
     #[test]
+    fn compaction_pipeline_shrinks_over_budget_history() {
+        // End-to-end behavioral guard for the autocompaction trigger pipeline
+        // that `compact_history_if_needed` runs (sans the LLM-summary stage):
+        //   1. enforce_tool_result_share_limit — caps any single tool result
+        //   2. compact_tool_results — replaces older results with markers
+        //
+        // Regression for "ctx 100% but autocompaction never ran": this test
+        // proves the non-LLM half of the pipeline actually shrinks an
+        // over-budget history. If a future refactor breaks
+        // `compact_tool_results`, this fails before the user notices the TUI
+        // hanging at full context.
+        let huge = "x".repeat(40_000); // ~10k tokens each
+        let mut history = vec![
+            make_user("q1"),
+            make_tool_call_msg("", "c1", "run_shell"),
+            make_tool_result("c1", &huge),
+            make_assistant("a1"),
+            make_user("q2"),
+            make_tool_call_msg("", "c2", "run_shell"),
+            make_tool_result("c2", &huge),
+            make_assistant("a2"),
+            make_user("q3"),
+            make_tool_call_msg("", "c3", "run_shell"),
+            make_tool_result("c3", &huge),
+            make_assistant("a3"),
+        ];
+        let max = 2_000;
+        let before = history_tokens(&history);
+        assert!(
+            before > max,
+            "test setup: history must start over budget (was {before}, max {max})",
+        );
+
+        enforce_tool_result_share_limit(&mut history, max, 0.5);
+        compact_tool_results(&mut history, max);
+
+        let after = history_tokens(&history);
+        assert!(
+            after < before / 2,
+            "compaction pipeline must materially shrink history ({before} -> {after})",
+        );
+        // Tool results must have been mutated — either truncated or replaced
+        // by a compaction marker. If neither, the pipeline didn't run.
+        let any_mutated = history
+            .iter()
+            .filter_map(|m| m.text_content())
+            .any(|t| t.contains("truncated") || t.contains("compacted"));
+        assert!(
+            any_mutated,
+            "expected at least one tool result to be truncated or compacted",
+        );
+    }
+
+    #[test]
     fn share_limit_skips_non_tool_messages() {
         let big = "x".repeat(100_000);
         let mut history = vec![make_user(&big), make_assistant(&big)];

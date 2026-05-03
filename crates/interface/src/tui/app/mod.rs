@@ -446,9 +446,15 @@ pub struct App<'a> {
     pub heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>>,
     pub poke_tx: Option<mpsc::Sender<()>>,
     pub cancel_token: Option<CancellationToken>,
-    /// Accumulated token usage for the current session
+    /// Accumulated token usage for the current session (surfaced via /usage).
     pub session_prompt_tokens: u64,
     pub session_completion_tokens: u64,
+    /// Prompt-token count from the most recent LLM Usage event — i.e. the
+    /// current effective context window size. Overwritten (not summed) per
+    /// turn, and reset to the post-compaction history token count when a
+    /// `HistoryCompacted` event arrives. This is the source for the footer
+    /// `ctx %` indicator.
+    pub last_prompt_tokens: u64,
     /// Messages queued by Enter during streaming, auto-submitted FIFO on turn complete
     pub queued_messages: VecDeque<QueuedMessage>,
     /// Whether the last agent turn ended with an error (pauses queue drain)
@@ -544,6 +550,7 @@ impl<'a> App<'a> {
             cancel_token: None,
             session_prompt_tokens: 0,
             session_completion_tokens: 0,
+            last_prompt_tokens: 0,
             queued_messages: VecDeque::new(),
             last_turn_errored: false,
             queue_pause_notified: false,
@@ -1496,36 +1503,72 @@ mod tests {
     }
 
     // --- Context-usage % (surfaced in footer) ---
+    //
+    // Regression guards for the "ctx 100% but autocompaction never ran" bug.
+    // The footer percent must reflect the *current* context window
+    // (last_prompt_tokens) — not cumulative session token counts. If anyone
+    // reintroduces `+=` accumulation in handle_event_usage these tests fail.
+
+    fn usage(prompt_tokens: u64) -> cortex::llm::UsageData {
+        cortex::llm::UsageData {
+            prompt_tokens,
+            ..Default::default()
+        }
+    }
 
     #[test]
-    fn compute_context_pct_zero_by_default() {
+    fn ctx_pct_zero_by_default() {
         let app = make_app();
         assert_eq!(app.compute_context_pct(), 0);
     }
 
     #[test]
-    fn compute_context_pct_scales_with_usage() {
+    fn ctx_pct_reflects_current_context_not_cumulative_session_tokens() {
+        // Bug being guarded: `compute_context_pct` summed
+        // session_prompt_tokens + session_completion_tokens, both `+=` per
+        // turn, so ten turns at 25% each saturated the gauge to 100% even
+        // though the live context was still ~25%.
         let mut app = make_app();
         let max = app.config.conversation.max_history_tokens.max(1) as u64;
-        app.session_prompt_tokens = max / 2;
-        app.session_completion_tokens = 0;
-        assert_eq!(app.compute_context_pct(), 50);
-
-        app.session_prompt_tokens = max;
-        app.session_completion_tokens = max; // overflow: should clamp to 100
-        assert_eq!(app.compute_context_pct(), 100);
+        let quarter = max / 4;
+        for _ in 0..10 {
+            app.process_agent_event(AgentEvent::Usage(usage(quarter)));
+        }
+        // Cumulative would be 250%-clamped-to-100. Correct is ~25%.
+        let pct = app.compute_context_pct();
+        assert!(
+            (24..=26).contains(&pct),
+            "expected ~25%, got {pct}% (cumulative regression)"
+        );
     }
 
     #[test]
-    fn compute_context_pct_crosses_warning_thresholds() {
+    fn ctx_pct_drops_after_history_compacted_event() {
         let mut app = make_app();
         let max = app.config.conversation.max_history_tokens.max(1) as u64;
-        // 80% → warning zone
-        app.session_prompt_tokens = (max * 80) / 100;
-        assert!(app.compute_context_pct() >= 80);
-        // 95% → error zone
-        app.session_prompt_tokens = (max * 95) / 100;
-        assert!(app.compute_context_pct() >= 95);
+        // Drive the gauge up to 90%.
+        app.process_agent_event(AgentEvent::Usage(usage((max * 90) / 100)));
+        assert!(app.compute_context_pct() >= 89);
+        // Compaction event should snap the gauge to the post-compaction size.
+        app.process_agent_event(AgentEvent::HistoryCompacted {
+            dropped: 5,
+            before_tokens: ((max * 90) / 100) as usize,
+            after_tokens: (max / 4) as usize,
+            iterative: false,
+        });
+        let pct = app.compute_context_pct();
+        assert!(
+            (24..=26).contains(&pct),
+            "expected ctx % to drop to ~25% after compaction, got {pct}%"
+        );
+    }
+
+    #[test]
+    fn ctx_pct_clamps_to_100_on_overflow() {
+        let mut app = make_app();
+        let max = app.config.conversation.max_history_tokens.max(1) as u64;
+        app.last_prompt_tokens = max * 5;
+        assert_eq!(app.compute_context_pct(), 100);
     }
 
     fn qm(text: &str) -> QueuedMessage {

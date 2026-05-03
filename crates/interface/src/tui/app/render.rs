@@ -125,12 +125,17 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn compute_context_pct(&self) -> u8 {
+        // Reflect the *current* context window — the prompt size of the most
+        // recent LLM request — not cumulative session usage. Summing
+        // prompt+completion across turns saturates at 100% almost
+        // immediately and never recovers after autocompaction, which
+        // misleadingly looks like compaction never ran. See
+        // crates/interface/src/tui/app/mod.rs `last_prompt_tokens`.
         let max = self.config.conversation.max_history_tokens;
         if max == 0 {
             return 0;
         }
-        let used = self.session_prompt_tokens + self.session_completion_tokens;
-        ((used as f64 / max as f64) * 100.0).min(100.0) as u8
+        ((self.last_prompt_tokens as f64 / max as f64) * 100.0).min(100.0) as u8
     }
 
     /// Render only un-flushed cells (`[cells_emitted..]`) into the upper

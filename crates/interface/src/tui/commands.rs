@@ -427,6 +427,7 @@ impl App<'_> {
         self.queued_messages.clear();
         self.session_prompt_tokens = 0;
         self.session_completion_tokens = 0;
+        self.last_prompt_tokens = 0;
         Ok(AppAction::NewSession)
     }
 

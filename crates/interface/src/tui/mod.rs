@@ -831,6 +831,7 @@ async fn run_event_loop(
                         app.cells.clear();
                         app.session_prompt_tokens = 0;
                         app.session_completion_tokens = 0;
+                        app.last_prompt_tokens = 0;
                         if let Err(e) = client.load_agent_session(session_id, &id).await {
                             app.push_system_message(format!("Forked, but switching failed: {e}"));
                         }
@@ -998,6 +999,7 @@ async fn run_event_loop(
                 app.cells.clear();
                 app.session_prompt_tokens = 0;
                 app.session_completion_tokens = 0;
+                app.last_prompt_tokens = 0;
                 // Support partial ID matching (prefix) via shared resolver.
                 let load_id = match cortex::session::resolve_session_id(&id) {
                     Ok(meta) => meta.id,
@@ -1284,6 +1286,7 @@ async fn run_event_loop(
                     app.cells.clear();
                     app.session_prompt_tokens = 0;
                     app.session_completion_tokens = 0;
+                    app.last_prompt_tokens = 0;
 
                     if plan_text.is_empty() {
                         "Proceed with the plan as outlined.".to_string()

@@ -148,6 +148,11 @@ impl<'a> App<'a> {
             } => {
                 let saved = before_tokens.saturating_sub(after_tokens);
                 let mode = if iterative { "updated" } else { "new" };
+                // Snap the ctx-% gauge to the new history size immediately,
+                // rather than waiting for the next Usage event. Without this
+                // the footer keeps showing pre-compaction utilization until
+                // the next turn lands.
+                self.last_prompt_tokens = after_tokens as u64;
                 self.push_system_message(format!(
                     "Compacted {dropped} messages ({mode} summary, saved ~{saved} tokens)"
                 ));
@@ -336,6 +341,9 @@ impl<'a> App<'a> {
     fn handle_event_usage(&mut self, usage: cortex::llm::UsageData) {
         self.session_prompt_tokens += usage.prompt_tokens;
         self.session_completion_tokens += usage.completion_tokens;
+        // Overwrite (not sum) — `prompt_tokens` is the current context size,
+        // not a delta. Drives the footer `ctx %` indicator.
+        self.last_prompt_tokens = usage.prompt_tokens;
     }
 
     fn handle_event_turn_complete(&mut self) {

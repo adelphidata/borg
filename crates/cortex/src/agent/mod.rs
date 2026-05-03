@@ -3257,6 +3257,54 @@ mod tests {
         );
     }
 
+    // ── Autocompaction trigger wiring ──
+    //
+    // Regression guard for "ctx 100% but autocompaction never ran." The fix
+    // for the user-visible bug was in the TUI percent calc, but the agent
+    // wiring is what makes compaction actually fire — if the call site at
+    // run_agent_loop is dropped, history grows unbounded until an LLM error
+    // and the user has no way to know why. Source-grep guard, since
+    // exercising the full Agent constructor in a unit test is too expensive.
+
+    #[test]
+    fn run_agent_loop_calls_compact_history_if_needed_before_each_request() {
+        // The dispatch must happen INSIDE the per-iteration loop and BEFORE
+        // prepare_llm_request — otherwise an over-budget history hits the
+        // LLM unmodified.
+        let compact_idx = AGENT_RS_SRC
+            .find("self.compact_history_if_needed(&event_tx).await?;")
+            .expect(
+                "run_agent_loop must call self.compact_history_if_needed(&event_tx).await?; \
+                 dropping this call lets history grow past max_history_tokens until the LLM \
+                 returns a context-length error, which the user perceives as a hang",
+            );
+        let prepare_idx = AGENT_RS_SRC
+            .find("self.prepare_llm_request(iteration)")
+            .expect("prepare_llm_request call must exist in run_agent_loop");
+        assert!(
+            compact_idx < prepare_idx,
+            "compact_history_if_needed must run BEFORE prepare_llm_request \
+             (compact_idx={compact_idx}, prepare_idx={prepare_idx})",
+        );
+    }
+
+    #[test]
+    fn compact_history_if_needed_emits_history_compacted_event() {
+        // Fail-loud guard: if someone removes the AgentEvent::HistoryCompacted
+        // dispatch inside compact_history_if_needed, the TUI will never get
+        // the "Compacted N messages" notice and (post-fix) the ctx % gauge
+        // will never snap down — replicating the bug we just fixed.
+        let fn_idx = AGENT_RS_SRC
+            .find("async fn compact_history_if_needed")
+            .expect("compact_history_if_needed must exist");
+        let body = &AGENT_RS_SRC[fn_idx..(fn_idx + 8000).min(AGENT_RS_SRC.len())];
+        assert!(
+            body.contains("AgentEvent::HistoryCompacted"),
+            "compact_history_if_needed must emit AgentEvent::HistoryCompacted so the TUI \
+             can update the ctx %% indicator and surface a system message"
+        );
+    }
+
     #[test]
     fn require_str_param_present() {
         let args = serde_json::json!({"name": "hello"});
