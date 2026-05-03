@@ -44,7 +44,7 @@ pub mod btw;
 mod system_prompt;
 mod tool_classification;
 
-pub use btw::run_btw;
+pub use btw::{parse_btw_command, run_btw};
 pub use tool_classification::mutating_tool_names;
 use tool_classification::{classify_action, is_mutating_tool};
 

@@ -27,6 +27,8 @@
 
 pub mod auto_reply;
 pub mod backoff;
+/// Ephemeral `/btw` side-question dispatcher shared across native channels.
+pub mod btw_dispatch;
 pub mod challenge_throttle;
 mod channel_init;
 pub mod channel_trait;

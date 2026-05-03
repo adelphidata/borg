@@ -98,6 +98,11 @@ impl NativeChannel for TwilioChannel {
     ) -> Result<()> {
         let ctx: TwilioResponseContext = serde_json::from_value(response_context.clone())?;
 
+        // SMS / WhatsApp have no threading; mark `/btw` answers visually so
+        // the user can recognise side replies among the main conversation.
+        let response_text = crate::btw_dispatch::maybe_prefix_btw(response_text, response_context);
+        let response_text = response_text.as_str();
+
         let from = match ctx.from_number {
             Some(ref n) => n.as_str(),
             None => {

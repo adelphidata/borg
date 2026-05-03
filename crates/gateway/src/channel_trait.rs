@@ -236,6 +236,53 @@ pub async fn dispatch_webhook(
             let config = ctx.config.clone();
             let health = ctx.health.clone();
 
+            // /btw side questions short-circuit the main agent path entirely:
+            // they run a tool-less ephemeral turn against the existing
+            // transcript and deliver the answer as a threaded reply, with no
+            // DB writes, no delivery queue row, no typing indicator. This
+            // preserves the "doesn't derail the main thread" invariant the
+            // TUI popup path already enforces.
+            if let Some(question) = cortex::agent::parse_btw_command(&inbound.text) {
+                let question = question.to_string();
+                let channel_for_btw = channel.clone();
+                let health_for_btw = health.clone();
+                let config_for_btw = config.clone();
+                // Use a `:btw` suffix so a side question doesn't queue behind
+                // an in-flight main agent turn for the same user — that would
+                // defeat "non-blocking side question." Multiple /btw from the
+                // same sender still serialize, which is fine.
+                let btw_session_key = format!("{session_key}:btw");
+                let enqueued = session_queue
+                    .enqueue(
+                        btw_session_key,
+                        Box::pin(async move {
+                            let runner = |q: String, snap: Vec<cortex::types::Message>| {
+                                crate::btw_dispatch::run_btw_default(config_for_btw, q, snap)
+                            };
+                            if let Err(e) = crate::btw_dispatch::dispatch_btw_message(
+                                &channel_for_btw,
+                                &inbound,
+                                &question,
+                                response_context,
+                                &health_for_btw,
+                                runner,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "{} /btw dispatch failed: {e:#}",
+                                    channel_for_btw.names()[0]
+                                );
+                            }
+                        }),
+                    )
+                    .await;
+                if !enqueued {
+                    return service_unavailable_response();
+                }
+                return ok_response();
+            }
+
             let enqueued = session_queue
                 .enqueue(
                     session_key,

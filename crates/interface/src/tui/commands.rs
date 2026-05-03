@@ -170,17 +170,17 @@ impl App<'_> {
             return Some(self.cmd_plan_with_message(rest.trim()));
         }
 
-        if trimmed == "/btw" {
-            self.push_system_message(
-                "Usage: /btw <question>\n  \
-                 Ask a side question using the current session's context. \
-                 Answer appears in a dismissable popup (Esc). Not persisted."
-                    .to_string(),
-            );
-            return Some(Ok(AppAction::Continue));
-        }
-        if let Some(rest) = trimmed.strip_prefix("/btw ") {
-            return Some(self.cmd_btw(rest.trim()));
+        if let Some(question) = cortex::agent::parse_btw_command(trimmed) {
+            if question.is_empty() {
+                self.push_system_message(
+                    "Usage: /btw <question>\n  \
+                     Ask a side question using the current session's context. \
+                     Answer appears in a dismissable popup (Esc). Not persisted."
+                        .to_string(),
+                );
+                return Some(Ok(AppAction::Continue));
+            }
+            return Some(self.cmd_btw(question));
         }
 
         if trimmed == "/memory cleanup" {

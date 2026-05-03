@@ -2,12 +2,8 @@
 //!
 //! Runs a tool-less LLM turn against a read-only snapshot of the current
 //! session's transcript. Nothing is persisted (no DB writes, no session file,
-//! no hooks). The caller (TUI) shows the answer in a dismissable popup and
-//! throws the result away on dismiss.
-//!
-//! TODO(btw-gateway): mirror this into `crates/gateway/src/handler.rs` so
-//! messaging channels (Telegram, Slack, Discord, iMessage) can answer `/btw`
-//! without derailing the main thread. See `docs/ROADMAP.md`.
+//! no hooks). Callers (TUI popup, gateway threaded reply) display the answer
+//! out-of-band so it does not derail the main conversation.
 
 use std::time::Duration;
 
@@ -164,9 +160,64 @@ pub async fn run_btw(
     Ok(buf)
 }
 
+/// Parse a `/btw` slash-command from a raw message body.
+///
+/// Matches `/btw`, `/btw:`, `/btw <question>`, `/btw: <question>` (case-insensitive,
+/// allowing leading whitespace). Returns the trimmed question text on match — an
+/// empty string when the user typed `/btw` with no follow-up so callers can show
+/// a usage hint rather than silently routing to the main agent.
+///
+/// Pattern mirrors openclaw's `^\s*/btw(?::|\s|$)` so users moving between the
+/// two agents see the same trigger.
+pub fn parse_btw_command(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    let rest = trimmed.strip_prefix('/')?;
+    // case-insensitive prefix match for `btw`
+    if rest.len() < 3 || !rest.as_bytes()[..3].eq_ignore_ascii_case(b"btw") {
+        return None;
+    }
+    let after = &rest[3..];
+    let question = match after.chars().next() {
+        None => "",                                         // bare `/btw`
+        Some(':') => after[1..].trim_start(),               // `/btw:` or `/btw: foo`
+        Some(c) if c.is_whitespace() => after.trim_start(), // `/btw foo`
+        Some(_) => return None,                             // `/btweet` — not a match
+    };
+    Some(question.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_btw_positive_cases() {
+        assert_eq!(
+            parse_btw_command("/btw what is rust?"),
+            Some("what is rust?")
+        );
+        assert_eq!(parse_btw_command("/BTW hi"), Some("hi"));
+        assert_eq!(parse_btw_command("/btw: hi"), Some("hi"));
+        assert_eq!(parse_btw_command("  /btw   foo  "), Some("foo"));
+        assert_eq!(parse_btw_command("/btw\thello"), Some("hello"));
+    }
+
+    #[test]
+    fn parse_btw_empty_question() {
+        assert_eq!(parse_btw_command("/btw"), Some(""));
+        assert_eq!(parse_btw_command("/btw "), Some(""));
+        assert_eq!(parse_btw_command("/btw:"), Some(""));
+    }
+
+    #[test]
+    fn parse_btw_negative_cases() {
+        assert_eq!(parse_btw_command("/btweet me"), None);
+        assert_eq!(parse_btw_command("by the way, foo"), None);
+        assert_eq!(parse_btw_command("hello /btw inline"), None);
+        assert_eq!(parse_btw_command(""), None);
+        assert_eq!(parse_btw_command("/"), None);
+        assert_eq!(parse_btw_command("/bt"), None);
+    }
 
     #[tokio::test]
     async fn empty_question_rejected_without_llm_call() {

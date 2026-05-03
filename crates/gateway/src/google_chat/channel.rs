@@ -67,9 +67,14 @@ impl NativeChannel for GoogleChatChannel {
     ) -> Result<()> {
         let ctx: GoogleChatResponseContext = serde_json::from_value(response_context.clone())?;
 
+        // /btw replies inherit the inbound `thread_name` so they nest in the
+        // same Google Chat thread; the prefix marks them visually as side
+        // answers.
+        let response_text = crate::btw_dispatch::maybe_prefix_btw(response_text, response_context);
+
         if let Err(e) = self
             .client
-            .send_message(&ctx.space_name, response_text, ctx.thread_name.as_deref())
+            .send_message(&ctx.space_name, &response_text, ctx.thread_name.as_deref())
             .await
         {
             health

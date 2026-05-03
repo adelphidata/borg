@@ -109,10 +109,16 @@ impl NativeChannel for TelegramChannel {
     ) -> Result<()> {
         let ctx: TelegramResponseContext = serde_json::from_value(response_context.clone())?;
 
+        // /btw answers ride Telegram's native quote-reply (`reply_to_message_id`
+        // is already set on every inbound), so threading is automatic. The
+        // visual prefix lets the user distinguish a side answer from the main
+        // thread.
+        let response_text = crate::btw_dispatch::maybe_prefix_btw(response_text, response_context);
+
         super::delivery::send_response(
             &self.client,
             ctx.chat_id,
-            response_text,
+            &response_text,
             ctx.thread_id,
             ctx.reply_to,
             ctx.input_was_voice,

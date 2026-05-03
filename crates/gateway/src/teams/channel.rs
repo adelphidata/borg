@@ -105,13 +105,17 @@ impl NativeChannel for TeamsChannel {
     ) -> Result<()> {
         let ctx: TeamsResponseContext = serde_json::from_value(response_context.clone())?;
 
+        // Teams replies via `reply_to_activity` already nest under the inbound
+        // message; the prefix lets users visually distinguish /btw answers.
+        let response_text = crate::btw_dispatch::maybe_prefix_btw(response_text, response_context);
+
         if let Err(e) = self
             .client
             .reply_to_activity(
                 &ctx.service_url,
                 &ctx.conversation_id,
                 &ctx.activity_id,
-                response_text,
+                &response_text,
             )
             .await
         {

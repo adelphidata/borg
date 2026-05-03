@@ -183,7 +183,11 @@ impl NativeChannel for DiscordChannel {
     ) -> Result<()> {
         let ctx: DiscordResponseContext = serde_json::from_value(response_context.clone())?;
 
-        let formatted = super::format::markdown_to_discord(response_text);
+        // Discord has no per-message reply threading we can rely on for /btw,
+        // so we mark the answer with a visual prefix instead. Stripped/no-op
+        // when not a /btw reply.
+        let response_text = crate::btw_dispatch::maybe_prefix_btw(response_text, response_context);
+        let formatted = super::format::markdown_to_discord(&response_text);
 
         if let Some(ref app_id) = ctx.application_id {
             if let Err(e) = self

@@ -148,9 +148,24 @@ impl NativeChannel for SlackChannel {
 
         let formatted = super::format::markdown_to_mrkdwn(response_text);
 
+        // /btw replies must land in a thread off the inbound message even when
+        // the user wrote `/btw …` at the top level of a channel — otherwise the
+        // side question pollutes the channel's main timeline.
+        let thread_ts = if crate::btw_dispatch::is_threaded(response_context) {
+            let resolved = ctx.thread_ts.as_deref().or(ctx.message_ts.as_deref());
+            if resolved.is_none() {
+                tracing::warn!(
+                    "/btw on Slack with no thread_ts AND no message_ts — answer will post top-level"
+                );
+            }
+            resolved
+        } else {
+            ctx.thread_ts.as_deref()
+        };
+
         if let Err(e) = self
             .client
-            .post_message(&ctx.channel_id, &formatted, ctx.thread_ts.as_deref())
+            .post_message(&ctx.channel_id, &formatted, thread_ts)
             .await
         {
             health.write().await.record_error("slack", &e.to_string());
@@ -221,5 +236,48 @@ mod tests {
         assert_eq!(back.channel_id, "C123");
         assert_eq!(back.thread_ts.as_deref(), Some("1234567890.123456"));
         assert_eq!(back.message_ts.as_deref(), Some("1234567890.654321"));
+    }
+
+    /// `/btw` arriving at the top level of a channel must fall back to the
+    /// inbound `message_ts` so the answer lands in a thread under the user's
+    /// question instead of polluting the main channel timeline. Mirrors the
+    /// fallback applied inside `send_response`.
+    #[test]
+    fn btw_thread_anchor_falls_back_to_message_ts() {
+        let mut ctx = serde_json::to_value(SlackResponseContext {
+            channel_id: "C123".to_string(),
+            thread_ts: None,
+            message_ts: Some("1700000000.111111".to_string()),
+        })
+        .unwrap();
+        crate::btw_dispatch::mark_threaded(&mut ctx);
+
+        let parsed: SlackResponseContext = serde_json::from_value(ctx.clone()).unwrap();
+        let resolved = if crate::btw_dispatch::is_threaded(&ctx) {
+            parsed.thread_ts.as_deref().or(parsed.message_ts.as_deref())
+        } else {
+            parsed.thread_ts.as_deref()
+        };
+        assert_eq!(resolved, Some("1700000000.111111"));
+    }
+
+    /// Without the threading flag, top-level posts stay top-level. Guards
+    /// against an over-aggressive fallback that would re-thread every reply.
+    #[test]
+    fn no_thread_anchor_preserves_top_level_posting() {
+        let ctx = serde_json::to_value(SlackResponseContext {
+            channel_id: "C123".to_string(),
+            thread_ts: None,
+            message_ts: Some("1700000000.111111".to_string()),
+        })
+        .unwrap();
+
+        let parsed: SlackResponseContext = serde_json::from_value(ctx.clone()).unwrap();
+        let resolved = if crate::btw_dispatch::is_threaded(&ctx) {
+            parsed.thread_ts.as_deref().or(parsed.message_ts.as_deref())
+        } else {
+            parsed.thread_ts.as_deref()
+        };
+        assert_eq!(resolved, None);
     }
 }

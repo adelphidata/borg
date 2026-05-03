@@ -211,6 +211,25 @@ impl Database {
 
     // ── Channel sessions ──
 
+    /// Look up an existing channel session WITHOUT creating one. Returns
+    /// `Ok(None)` when no row exists yet — used by read-only paths like
+    /// `/btw` that need the current transcript snapshot but must not
+    /// materialise a new session as a side effect.
+    pub fn lookup_channel_session(
+        &self,
+        channel_name: &str,
+        sender_id: &str,
+    ) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id FROM channel_sessions WHERE channel_name = ?1 AND sender_id = ?2",
+        )?;
+        let existing: Option<String> = stmt
+            .query_map(params![channel_name, sender_id], |row| row.get(0))?
+            .next()
+            .and_then(std::result::Result::ok);
+        Ok(existing)
+    }
+
     pub fn resolve_channel_session(&self, channel_name: &str, sender_id: &str) -> Result<String> {
         let now = chrono::Utc::now().timestamp();
         let mut stmt = self.conn.prepare(

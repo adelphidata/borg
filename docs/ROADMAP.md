@@ -58,14 +58,6 @@ unfinished items stay here so a future contributor can see what's left.
   Revisit if user demand materializes — a `cargo audit` wrapper around
   `Cargo.lock` in the release binary is one safer path.
 
-## /btw — non-blocking side questions
-
-- **Gateway / channel surface.** Mirror `run_btw` into
-  `crates/gateway/src/handler.rs` so Telegram, Slack, Discord, iMessage,
-  etc. can handle a `/btw ` prefix before routing to the main agent.
-  Reply should land as a threaded follow-up so it doesn't derail the
-  main conversation.
-
 ## Telegram voice follow-through
 
 - **Roll out shared voice I/O policy to the rest of the gateway.**
