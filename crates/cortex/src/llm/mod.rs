@@ -162,6 +162,19 @@ struct StreamUsage {
     /// silently regressing to `unknown` when the upstream field is renamed.
     #[serde(default, alias = "total_cost")]
     cost: Option<serde_json::Value>,
+    /// OpenRouter also reports a per-source breakdown under `cost_details`.
+    /// Used as a fallback when the top-level `cost` field is null or
+    /// absent — without it we mis-attribute as `unknown`.
+    #[serde(default)]
+    cost_details: Option<CostDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CostDetails {
+    #[serde(default)]
+    total_cost: Option<serde_json::Value>,
+    #[serde(default)]
+    upstream_inference_cost: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -559,6 +572,21 @@ impl LlmClient {
             serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
             _ => None,
         }
+    }
+
+    /// Resolve provider-reported cost; prefer top-level `cost`/`total_cost`, fall back to `cost_details`.
+    fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
+        if let Some(c) = usage.cost.as_ref().and_then(Self::parse_usage_cost) {
+            return Some(c);
+        }
+        let details = usage.cost_details.as_ref()?;
+        if let Some(c) = details.total_cost.as_ref().and_then(Self::parse_usage_cost) {
+            return Some(c);
+        }
+        details
+            .upstream_inference_cost
+            .as_ref()
+            .and_then(Self::parse_usage_cost)
     }
 
     fn maybe_capture_usage_from_action(
@@ -1092,7 +1120,7 @@ impl LlmClient {
                         cache_creation_tokens: 0,
                         provider: provider.to_string(),
                         model: model.to_string(),
-                        provider_cost_usd: usage.cost.as_ref().and_then(Self::parse_usage_cost),
+                        provider_cost_usd: Self::extract_provider_cost_usd(&usage),
                     }));
                 }
 
@@ -1205,7 +1233,7 @@ impl LlmClient {
                         cache_creation_tokens: 0,
                         provider: self.provider.as_str().to_string(),
                         model: request_model.clone(),
-                        provider_cost_usd: usage.cost.as_ref().and_then(Self::parse_usage_cost),
+                        provider_cost_usd: Self::extract_provider_cost_usd(&usage),
                     });
                     self.emit_cost_event_best_effort(&req_id, usage.as_ref(), &request_model);
                     return Ok(message);

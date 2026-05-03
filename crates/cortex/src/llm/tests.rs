@@ -235,6 +235,115 @@ fn openrouter_sse_usage_without_cost_field_leaves_provider_cost_none() {
     assert_eq!(usage.provider_cost_usd, None);
 }
 
+/// Helper: extract the parsed `UsageData` from an SSE line.
+fn parse_openrouter_usage_from_sse(line: &str) -> UsageData {
+    use crate::sse::SseAction;
+    let action = LlmClient::parse_openai_sse_line(line, "openrouter", "openai/gpt-4o-mini");
+    let events = match action {
+        SseAction::Emit(ev) | SseAction::Done(ev) => ev,
+        _ => panic!("expected usage emit, got non-emit action"),
+    };
+    events
+        .into_iter()
+        .find_map(|e| match e {
+            StreamEvent::Usage(u) => Some(u),
+            _ => None,
+        })
+        .expect("usage event must be emitted")
+}
+
+#[test]
+fn openrouter_sse_usage_cost_field_populates_provider_cost_usd() {
+    // Canonical OpenRouter SSE shape: `usage.cost` as a number. Previously
+    // covered only via the `total_cost` alias path; this locks in the
+    // documented field name.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":0.000123}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000123"));
+}
+
+#[test]
+fn openrouter_sse_usage_cost_details_fallback_populates_provider_cost_usd() {
+    // When top-level `cost` is absent, OpenRouter's `cost_details`
+    // breakdown is authoritative. Without this fallback the eval harness
+    // would mis-report `cost_source = "unknown"`.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost_details":{"upstream_inference_cost":0.000456}}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000456"));
+}
+
+#[test]
+fn openrouter_sse_usage_cost_details_total_cost_fallback() {
+    // `cost_details.total_cost` takes precedence over
+    // `upstream_inference_cost` when both are present.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost_details":{"total_cost":0.000789,"upstream_inference_cost":0.000456}}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000789"));
+}
+
+#[test]
+fn openrouter_sse_usage_cost_as_string_populates_provider_cost_usd() {
+    // Some OpenRouter shapes serialize cost as a string. The parser must
+    // accept both number and non-empty string, otherwise we silently lose
+    // attribution on string-typed responses.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":"0.000123"}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0.000123"));
+}
+
+#[test]
+fn openrouter_sse_usage_cost_null_emits_unknown_cost_source() {
+    // Negative: explicit `cost: null` with no `cost_details` must
+    // resolve to `provider_cost_usd = None` AND propagate to
+    // `cost_source = "unknown"`. Pins the parser→emitter contract that
+    // the eval suite asserts on.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":null}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd, None);
+
+    let sink = Arc::new(CollectingSink::default());
+    let client =
+        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    client.emit_cost_event_best_effort("req-null", Some(&usage), "openai/gpt-4o-mini");
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_source, "unknown");
+    assert!(!events[0].cost_usd_present);
+}
+
+#[test]
+fn openrouter_sse_usage_cost_zero_emits_openrouter_usage_not_unknown() {
+    // Regression guard: a reported cost of exactly 0 (e.g. free-tier
+    // model) is still authoritative provider attribution. Must NOT
+    // collapse to `cost_source = "unknown"`.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":0}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.provider_cost_usd.as_deref(), Some("0"));
+
+    let sink = Arc::new(CollectingSink::default());
+    let client =
+        make_test_openrouter_client(true).with_cost_event_sink(sink.clone(), cost_context());
+    client.emit_cost_event_best_effort("req-zero", Some(&usage), "openai/gpt-4o-mini");
+    let events = sink.take();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].cost_source, "openrouter_usage");
+    assert_eq!(events[0].cost_usd.as_deref(), Some("0"));
+    assert!(events[0].cost_usd_present);
+}
+
+#[test]
+fn openrouter_non_streaming_usage_cost_resolves_via_extractor() {
+    // Non-streaming `chat_openai` deserializes the same `StreamUsage`
+    // struct out of the JSON response body. Lock in that the canonical
+    // `cost` field on a non-streaming response resolves to
+    // `provider_cost_usd` exactly as the streaming path does — this is
+    // the path `test_cost_event_emitted_for_chat_call` exercises.
+    let body = r#"{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"cost":0.000123}"#;
+    let usage: StreamUsage = serde_json::from_str(body).expect("usage must deserialize");
+    let resolved = LlmClient::extract_provider_cost_usd(&usage);
+    assert_eq!(resolved.as_deref(), Some("0.000123"));
+}
+
 #[test]
 fn openai_cost_event_uses_static_price_table() {
     let sink = Arc::new(CollectingSink::default());
