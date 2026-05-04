@@ -26,12 +26,8 @@ fn print_heal_report(r: &protocols::admin::HealReport) {
     println!("Stalled tasks healed:  {}", r.healed_tasks);
     println!("Messages purged:       {}", r.messages_purged);
     println!("Wedged runs recovered: {}", r.wedged_runs_recovered);
-    println!("Backups pruned:        {}", r.backups_pruned);
     if r.log_bytes_truncated > 0 {
         println!("Log bytes truncated:   {}", r.log_bytes_truncated);
-    }
-    if !r.auto_backup_path.is_empty() {
-        println!("Auto-backup written:   {}", r.auto_backup_path);
     }
     if !r.warnings.is_empty() {
         println!("Warnings:");

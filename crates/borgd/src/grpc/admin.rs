@@ -186,8 +186,8 @@ impl Admin for AdminSvc {
             messages_purged: report.messages_purged as u64,
             audit_events_tombstoned: report.audit_events_tombstoned as u64,
             wedged_runs_recovered: report.wedged_runs_recovered as u64,
-            backups_pruned: report.backups_pruned as u64,
-            auto_backup_path: report.auto_backup_path.unwrap_or_default(),
+            backups_pruned: 0,
+            auto_backup_path: String::new(),
             skipped: report.skipped,
         }))
     }

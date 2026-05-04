@@ -693,8 +693,7 @@ mod tests {
         assert!(dir.join("README.txt").exists());
     }
 
-    /// `keep = 0` deletes every auto-backup. Used by the
-    /// `backup_keep_count = 0` setting to disable auto-backup.
+    /// `keep = 0` deletes every backup tarball under `dir`.
     #[test]
     fn prune_backups_keep_zero_removes_all() {
         let tmp = tempfile::tempdir().unwrap();

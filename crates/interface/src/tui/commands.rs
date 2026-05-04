@@ -827,7 +827,7 @@ pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> Strin
         text.push_str("maintenance.enabled is false");
     } else {
         text.push_str(&format!(
-            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events, pruned {} backups",
+            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events",
             report.pruned_logs,
             report.log_bytes_truncated,
             report.pruned_activity,
@@ -836,12 +836,7 @@ pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> Strin
             report.wedged_runs_recovered,
             report.messages_purged,
             report.audit_events_tombstoned,
-            report.backups_pruned,
         ));
-        if !report.auto_backup_path.is_empty() {
-            text.push_str("\nBackup created: ");
-            text.push_str(&report.auto_backup_path);
-        }
     }
     if !report.warnings.is_empty() {
         text.push_str("\n\nWarnings:");
@@ -1027,16 +1022,12 @@ mod tests {
             messages_purged: 17,
             audit_events_tombstoned: 19,
             wedged_runs_recovered: 23,
-            backups_pruned: 29,
-            auto_backup_path: "/tmp/backup.tar.zst".into(),
+            backups_pruned: 0,
+            auto_backup_path: String::new(),
             skipped: false,
         });
         assert!(out.contains("1234 bytes truncated"), "{out:?}");
         assert!(out.contains("recovered 23 wedged runs"), "{out:?}");
-        assert!(
-            out.contains("Backup created: /tmp/backup.tar.zst"),
-            "{out:?}"
-        );
         assert!(out.contains("Skills:tamper audit"), "{out:?}");
     }
 

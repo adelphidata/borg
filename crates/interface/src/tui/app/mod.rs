@@ -1970,7 +1970,10 @@ mod tests {
         // Esc handling did not pull events off the queue. If a future change
         // routes Esc through the agent-event path, the receiver would still
         // be alive and the sender would not see the close.
-        assert!(tx.is_closed(), "event_rx must be dropped, closing the channel");
+        assert!(
+            tx.is_closed(),
+            "event_rx must be dropped, closing the channel"
+        );
     }
 
     // --- Channel close robustness ---

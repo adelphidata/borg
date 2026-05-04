@@ -9,9 +9,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use cortex::backup::{
-    create_backup, live_schema_version, prune_backups, restore_backup, verify_backup,
-};
+use cortex::backup::{create_backup, live_schema_version, restore_backup, verify_backup};
 use cortex::config::Config;
 
 pub fn run_create() -> Result<()> {
@@ -20,20 +18,6 @@ pub fn run_create() -> Result<()> {
     let schema_version = live_schema_version()?;
     let path = create_backup(&home, &out_dir, schema_version).context("create backup")?;
     println!("backup: {}", path.display());
-
-    // Best-effort retention prune — only prune when the user has
-    // explicitly opted into auto-backups (`backup_keep_count > 0`). If
-    // they're managing backups manually, don't second-guess them.
-    if let Ok(cfg) = Config::load_from_db() {
-        if cfg.data.backup_keep_count > 0 {
-            let kept = cfg.data.backup_keep_count as usize;
-            match prune_backups(&out_dir, kept) {
-                Ok(0) => {}
-                Ok(n) => println!("pruned {n} older backup(s)"),
-                Err(e) => eprintln!("prune warning: {e}"),
-            }
-        }
-    }
     Ok(())
 }
 
