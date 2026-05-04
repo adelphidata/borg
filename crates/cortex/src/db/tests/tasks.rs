@@ -238,7 +238,7 @@ fn last_task_run_none_when_no_runs() {
     assert!(db.last_task_run("t1").expect("last").is_none());
 }
 
-// ── V14 scheduled task retry/delivery tests ──
+// ── Scheduled task retry/delivery tests ──
 
 #[test]
 fn migrate_v14_adds_task_columns() {
@@ -520,7 +520,7 @@ fn seed_default_tasks_creates_daily_summary() {
     assert!(task.prompt.contains("daily standup"));
 }
 
-// ── V18: Atomic claim, status tracking, daemon lock tests ──
+// ── Atomic claim, status tracking, daemon lock tests ──
 
 #[test]
 fn claim_due_tasks_returns_claimed_with_run_id() {
@@ -957,7 +957,7 @@ fn refresh_daemon_lock_after_release_returns_error() {
 // ── Tamper-proof validation tests ──
 
 #[test]
-fn v34_seeds_memory_consolidation_tasks() {
+fn schema_seeds_memory_consolidation_tasks() {
     // T7 — running migrations on a fresh DB must seed the nightly and weekly
     // memory consolidation tasks with their fixed UUIDs and correct cron
     // expressions. Without this regression guard, a migration reorder could
@@ -974,7 +974,7 @@ fn v34_seeds_memory_consolidation_tasks() {
             params![nightly_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
-        .expect("nightly consolidation task must be seeded by V34");
+        .expect("nightly consolidation task must be seeded by schema");
     assert_eq!(schedule_type, "cron");
     assert_eq!(schedule_expr, "0 0 3 * * *");
     assert!(
@@ -996,7 +996,7 @@ fn v34_seeds_memory_consolidation_tasks() {
             params![weekly_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-        .expect("weekly consolidation task must be seeded by V34");
+        .expect("weekly consolidation task must be seeded by schema");
     assert_eq!(weekly_type, "cron");
     assert_eq!(weekly_expr, "0 0 4 * * 7");
     assert!(

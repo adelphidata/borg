@@ -376,7 +376,7 @@ fn get_unindexed_sessions_respects_limit() {
     assert_eq!(unindexed.len(), 2);
 }
 
-// ── V35: messages_fts ──
+// ── messages_fts ──
 
 /// Query `messages_fts` for matching rowids. Helper shared across FTS tests.
 fn fts_match_rowids(db: &Database, query: &str) -> Vec<i64> {

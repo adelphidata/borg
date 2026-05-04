@@ -149,7 +149,7 @@ fn search_scope(
 ///
 /// `sources` selects the backing stores:
 /// - `["memory"]` (default): curated long-term memory entries via `memory_chunks_fts`.
-/// - `["messages"]`: raw past-session transcripts via `messages_fts` (V35).
+/// - `["messages"]`: raw past-session transcripts via `messages_fts`.
 /// - Both: query each store and interleave by score.
 #[instrument(skip_all, fields(tool.name = "memory_search"))]
 pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> Result<String> {
@@ -281,7 +281,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
 }
 
 /// Parse the optional `sources` array. Defaults to `["memory"]` when absent
-/// or empty, preserving pre-V35 behavior. Unknown entries are ignored.
+/// or empty. Unknown entries are ignored.
 fn parse_sources(args: &serde_json::Value) -> Vec<String> {
     let values = args
         .get("sources")

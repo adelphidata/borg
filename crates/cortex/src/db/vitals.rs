@@ -705,7 +705,7 @@ impl Database {
                 )
                 .unwrap_or_else(|_| "0".to_string());
 
-            // V40+: sign new events with Ed25519. Legacy rows (pubkey_id NULL)
+            // Sign new events with Ed25519. Legacy rows (pubkey_id NULL)
             // continue to verify against HMAC; the chain bridges naturally
             // because prev_hmac is just bytes the next signer hashes over.
             let (signing_key, pubkey_id) = self.evolution_signing_key()?;

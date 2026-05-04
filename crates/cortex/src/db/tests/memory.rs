@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn v10_migration_creates_embeddings_table() {
+fn schema_creates_embeddings_table() {
     let db = test_db();
     let version = db.get_meta("schema_version").unwrap().unwrap();
     assert_eq!(version, Database::CURRENT_VERSION.to_string());

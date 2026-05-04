@@ -59,7 +59,7 @@ fn cache_token_summary_since_empty_returns_zeros() {
 }
 
 #[test]
-fn migration_v30_adds_cache_columns() {
+fn schema_includes_cache_columns() {
     // A fresh test_db() has already run all migrations. Verify the new
     // columns exist on token_usage and default to 0 for plain inserts.
     let db = test_db();
@@ -159,7 +159,7 @@ fn monthly_total_cost_sums_correctly() {
 #[test]
 fn old_rows_without_provider_handled() {
     let db = test_db();
-    // Simulate pre-V11 row with no provider/model/cost
+    // Simulate legacy row with no provider/model/cost
     db.conn
         .execute(
             "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens)

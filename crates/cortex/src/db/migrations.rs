@@ -4,7 +4,7 @@ use rusqlite::params;
 use super::Database;
 
 impl Database {
-    /// V1: Full schema. Borg has no released DBs, so all prior incremental
+    /// Full schema. Borg has no released DBs, so all prior incremental
     /// migrations were squashed into this single emit-the-final-shape step.
     pub(super) fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(SCHEMA_SQL)?;

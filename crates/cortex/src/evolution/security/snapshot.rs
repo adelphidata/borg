@@ -11,7 +11,7 @@
 //!   doesn't expose this knob yet, so the list is always empty until
 //!   the channel-binding flag ships.
 //! - `audit_chain_enabled` ← always `true` in v1 (audit chain is
-//!   unconditional after migration V46; cannot be disabled via config).
+//!   unconditional; cannot be disabled via config).
 //! - `catastrophic_denylist_intact` ← always `true` in v1 (the sandbox
 //!   denylist is compiled into `borg-sandbox`; user can't tamper without
 //!   rebuilding the binary).

@@ -35,7 +35,7 @@ impl RateCard {
     /// row's `effective_at` is in the future relative to `call_ts`.
     ///
     /// If `model` has no exact row, falls back to `*` (wildcard) which the
-    /// V43 seed uses for zero-cost local providers — this prevents silent
+    /// schema seed uses for zero-cost local providers — this prevents silent
     /// `None` returns that would skip post-flight accounting.
     pub fn lookup(
         conn: &Connection,

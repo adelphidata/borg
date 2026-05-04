@@ -1,6 +1,6 @@
 //! DB helpers for the self-healing maintenance subsystem.
 //!
-//! Backed by the V37 `doctor_runs` table. Kept separate from `tasks.rs`
+//! Backed by the `doctor_runs` table. Kept separate from `tasks.rs`
 //! so the maintenance module's persistence surface is easy to audit.
 
 use super::Database;

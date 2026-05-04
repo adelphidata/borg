@@ -2426,7 +2426,7 @@ fn parse_level_from_id_handles_stage_suffix() {
     assert_eq!(parse_level_from_id("level_abc_base"), None);
 }
 
-// ── V2: new event types (level_up, milestone_unlocked, mood_changed, share_card_created) ──
+// ── New event types (level_up, milestone_unlocked, mood_changed, share_card_created) ──
 
 #[test]
 fn replay_accepts_new_v2_event_types() {
@@ -2872,7 +2872,7 @@ fn hook_does_not_emit_mood_changed_when_stable() {
     );
 }
 
-// ── V40: Ed25519 signing path ──
+// ── Ed25519 signing path ──
 
 /// Records via the public `record_evolution_event` path (which now signs
 /// with Ed25519) and verifies that the row reads back with `pubkey_id`
@@ -2896,7 +2896,7 @@ fn record_via_public_api_signs_with_ed25519_and_verifies() {
     let row = &events[0];
     assert!(
         row.pubkey_id.is_some(),
-        "V40 writes must reference a device_keys row"
+        "Ed25519 writes must reference a device_keys row"
     );
     assert_eq!(row.session_id.as_deref(), Some("sess-sign-1"));
 
@@ -2976,7 +2976,7 @@ fn ed25519_row_with_missing_device_key_invalidates_chain() {
 }
 
 /// Legacy HMAC rows (pubkey_id NULL) and new Ed25519 rows (pubkey_id set)
-/// must both verify in the same chain — V40 grandfathers existing data.
+/// must both verify in the same chain — Ed25519 grandfathers existing data.
 #[test]
 fn legacy_hmac_row_followed_by_ed25519_row_chains_correctly() {
     let db = Database::test_db();

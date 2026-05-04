@@ -106,7 +106,7 @@ impl BudgetEngine {
         estimate: Usd,
     ) -> Result<PreFlightDecision> {
         let default = Self::load_row(conn, "default")?
-            .ok_or_else(|| anyhow!("default budget row missing — V44 migration not applied"))?;
+            .ok_or_else(|| anyhow!("default budget row missing — schema not applied"))?;
         let principal = match principal_scope {
             Some(s) if s != "default" => Self::load_row(conn, s)?,
             _ => None,

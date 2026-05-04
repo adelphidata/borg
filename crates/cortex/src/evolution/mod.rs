@@ -316,7 +316,7 @@ pub struct EvolutionEvent {
     /// Chain signature of the previous event.
     pub prev_hmac: String,
     /// Originating session for this event, if known. Populated for events
-    /// recorded by signing-aware code paths (V40+); legacy rows are NULL.
+    /// recorded by signing-aware code paths; legacy rows are NULL.
     pub session_id: Option<String>,
     /// FK into `device_keys` identifying which Ed25519 public key signed this
     /// row. `None` selects the legacy HMAC verification path on replay.

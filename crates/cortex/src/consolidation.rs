@@ -1,7 +1,7 @@
 //! Memory consolidation pipeline.
 //!
 //! Nightly and weekly scheduled tasks consolidate session data and long-term
-//! memory entries. The tasks themselves are LLM-driven (seeded in V34 migration)
+//! memory entries. The tasks themselves are LLM-driven (seeded in the schema)
 //! with tool access to `write_memory`, `read_memory`, and `memory_search`.
 //!
 //! This module provides constants, the shared consolidation runner, and helper
@@ -11,10 +11,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-/// Fixed UUID for the nightly memory consolidation task (seeded in V34 migration).
+/// Fixed UUID for the nightly memory consolidation task (seeded in the schema).
 pub const NIGHTLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0001";
 
-/// Fixed UUID for the weekly memory maintenance task (seeded in V34 migration).
+/// Fixed UUID for the weekly memory maintenance task (seeded in the schema).
 pub const WEEKLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0002";
 
 /// Settings key for tracking the last successful nightly consolidation run.

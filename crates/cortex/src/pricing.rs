@@ -85,7 +85,7 @@ static PRICING: LazyLock<HashMap<&'static str, ModelPricing>> = LazyLock::new(||
     m
 });
 
-/// One bundled rate-card row for the V43 seed.
+/// One bundled rate-card row for the schema seed.
 ///
 /// Decimal strings (not floats) so the seeded values round-trip through
 /// `provider_rate_cards.{prompt,completion}_per_mtok_usd` without any drift,
@@ -101,7 +101,7 @@ pub struct BundledRateCardEntry {
     pub completion_per_mtok_usd: &'static str,
 }
 
-/// Bundled rate card seeded by the V43 migration. One row per
+/// Bundled rate card seeded by the schema. One row per
 /// `(provider_id, model)` pair we have pricing for. Anthropic, OpenAI,
 /// Gemini, and DeepSeek native; OpenRouter intentionally excluded (its
 /// per-route surcharge is not encoded here) — users add an OpenRouter

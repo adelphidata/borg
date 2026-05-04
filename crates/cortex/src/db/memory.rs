@@ -31,7 +31,6 @@ impl Database {
     ///
     /// Writes `last_accessed_at` explicitly so TTL pruning stays correct even
     /// if the schema's column default is changed or a future helper drops it.
-    /// The column exists from V34 onward.
     pub fn cache_embedding(
         &self,
         provider: &str,

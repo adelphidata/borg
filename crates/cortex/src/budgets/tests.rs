@@ -365,7 +365,7 @@ fn rate_card_refresh_appends_never_mutates() {
     // After a "refresh" at a new effective_at, the original row must
     // still be retrievable — historical replays of audit-chain events
     // that pinned the old `effective_at` resolve identically. Use a
-    // synthetic (provider, model) pair so the V43 bundled-snapshot rows
+    // synthetic (provider, model) pair so the bundled-snapshot rows
     // don't collide with the test fixture.
     let db = Database::test_db();
     let t0: i64 = 1_700_000_000;
@@ -413,10 +413,10 @@ fn rate_card_refresh_appends_never_mutates() {
 
 #[test]
 fn migrations_seed_default_budget_and_rate_cards() {
-    // V44 must seed exactly one `default` budget row, V43 must seed at
-    // least one rate-card row from the bundled snapshot. If either is
-    // missing, post-flight reconciliation silently records zero spend
-    // (the regression this guards against).
+    // Schema must seed exactly one `default` budget row and at least one
+    // rate-card row from the bundled snapshot. If either is missing,
+    // post-flight reconciliation silently records zero spend (the
+    // regression this guards against).
     let db = Database::test_db();
     let budget_count: i64 = db
         .conn()
@@ -428,14 +428,14 @@ fn migrations_seed_default_budget_and_rate_cards() {
         .unwrap();
     assert_eq!(
         budget_count, 1,
-        "V44 must seed exactly one default budget row"
+        "schema must seed exactly one default budget row"
     );
 
     let rate_count: i64 = db
         .conn()
         .query_row("SELECT COUNT(*) FROM provider_rate_cards", [], |r| r.get(0))
         .unwrap();
-    assert!(rate_count > 0, "V43 must seed bundled rate-card rows");
+    assert!(rate_count > 0, "schema must seed bundled rate-card rows");
 
     // A representative seed row exists with the price we set in
     // bundled_rate_card_entries (anthropic/claude-sonnet-4 at $3 / $15).

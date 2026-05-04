@@ -67,7 +67,7 @@ pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) ->
 
 fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
     let conn = db.conn();
-    // Prefer the indexed `session_id` column (V40+); legacy rows fall back to
+    // Prefer the indexed `session_id` column; legacy rows fall back to
     // `json_extract` so dedup still holds across the schema bump.
     let existing: i64 = conn.query_row(
         "SELECT EXISTS(
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn session_id_populates_indexed_column() {
-        // V40 migration introduced an indexed `session_id` column. The dedup
+        // The schema includes an indexed `session_id` column. The dedup
         // query must work via that column, not just the json_extract fallback.
         let db = Database::test_db();
         record_plan_emission(&db, "sess-via-column", "deploy kubernetes").unwrap();

@@ -21,8 +21,8 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::doctor::{run_diagnostics, CheckStatus, DiagnosticCheck, RemediationKind};
 
-/// Single source of truth for the seeded maintenance task's UUID. The V37
-/// migration inserts this id and the dispatcher matches against it.
+/// Single source of truth for the seeded maintenance task's UUID. The schema
+/// inserts this id and the dispatcher matches against it.
 pub const MAINTENANCE_TASK_ID: &str = "00000000-0000-4000-8000-ada1ca1e0001";
 
 /// Seconds per day. Retention settings are expressed in days.

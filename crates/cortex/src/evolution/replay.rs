@@ -52,7 +52,7 @@ pub fn replay_events_with_key_at(
 }
 
 /// Replay events with both an HMAC key (for legacy rows) and a `pubkey_id →
-/// VerifyingKey` map (for V40+ rows signed with Ed25519). Each row dispatches
+/// VerifyingKey` map (for rows signed with Ed25519). Each row dispatches
 /// by `pubkey_id`: present → Ed25519 verify; absent → HMAC verify.
 pub fn replay_events_with_keys_at(
     key: &[u8],

@@ -218,8 +218,8 @@ fn is_configured(def: &PluginDef, config: &Config) -> bool {
 /// fallback), and persist the merged credentials map via the daemon.
 ///
 /// All settings live in the SQLite settings table — this used to write
-/// `~/.borg/config.toml` directly, but migration V32 imports that file into
-/// the DB once and renames it to `.bak`, so post-migration writes were
+/// `~/.borg/config.toml` directly, but the schema imports that file into
+/// the DB once and renames it to `.bak`, so post-import writes were
 /// silently dropped. We now mirror the onboarding flow: store the secret
 /// locally, build a `CredentialValue::Ref`, and round-trip the full
 /// `credentials` map through `Admin.SetSetting`.
