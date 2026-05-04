@@ -122,7 +122,7 @@ pub async fn run_btw(
                 stream_error = Some(msg);
             }
             StreamEvent::Done => break,
-            StreamEvent::ThinkingDelta(_) | StreamEvent::Usage(_) => {}
+            StreamEvent::ThinkingDelta(_) | StreamEvent::Usage(_) | StreamEvent::Truncated => {}
         }
     }
 

@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(cfg.api_key_env, "OPENROUTER_API_KEY");
         assert_eq!(cfg.model, "");
         assert!((cfg.temperature - 0.7).abs() < f32::EPSILON);
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 16_384);
         assert_eq!(cfg.max_retries, 3);
         assert_eq!(cfg.initial_retry_delay_ms, 200);
         assert_eq!(cfg.request_timeout_ms, 120_000);
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(cfg.model, "gpt-4");
         assert_eq!(cfg.api_key_env, "OPENAI_API_KEY");
         // defaults apply for unset fields
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 16_384);
     }
 
     #[test]

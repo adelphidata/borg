@@ -252,7 +252,7 @@ model = "custom-model"
     let cfg: Config = toml::from_str(toml_str).expect("should parse");
     assert_eq!(cfg.llm.model, "custom-model");
     assert!((cfg.llm.temperature - 0.7).abs() < f32::EPSILON);
-    assert_eq!(cfg.llm.max_tokens, 4096);
+    assert_eq!(cfg.llm.max_tokens, 16_384);
     assert_eq!(cfg.llm.max_retries, 3);
     assert_eq!(cfg.llm.initial_retry_delay_ms, 200);
     assert_eq!(cfg.llm.request_timeout_ms, 120_000);

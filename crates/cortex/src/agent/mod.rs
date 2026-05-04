@@ -1572,6 +1572,7 @@ Rules:
             let mut tool_calls: Vec<PartialToolCall> = Vec::new();
             let mut received_terminal = false;
             let mut stream_error: Option<String> = None;
+            let mut truncated_due_to_length = false;
 
             loop {
                 tokio::select! {
@@ -1597,6 +1598,7 @@ Rules:
                                 &mut tag_filter,
                                 &mut tool_calls,
                                 &mut stream_error,
+                                &mut truncated_due_to_length,
                                 &event_tx,
                             )
                             .await
@@ -1666,6 +1668,7 @@ Rules:
                     tag_filter,
                     tool_calls,
                     stream_error.take(),
+                    truncated_due_to_length,
                     needs_response,
                     nudged_for_response,
                     &event_tx,
@@ -1694,6 +1697,7 @@ Rules:
         mut tag_filter: InternalTagFilter,
         tool_calls: Vec<PartialToolCall>,
         mut stream_error: Option<String>,
+        truncated_due_to_length: bool,
         needs_response: bool,
         nudged_for_response: bool,
         event_tx: &mpsc::Sender<AgentEvent>,
@@ -1728,10 +1732,22 @@ Rules:
         }
 
         if tool_calls.is_empty() {
+            // Even with no tool calls, the assistant text itself may have
+            // been cut mid-sentence. Treat max-tokens cut-off as a stream
+            // error so the existing `[stream interrupted: …]` machinery
+            // persists a marker — the next turn / replay can tell a
+            // truncated answer from a complete one.
+            let effective_err = stream_error.take().or_else(|| {
+                truncated_due_to_length.then(|| {
+                    "response truncated at max_tokens (raise llm.max_tokens \
+                     or ask the assistant to continue)"
+                        .to_string()
+                })
+            });
             return match self
                 .handle_text_only_response(
                     &text_content,
-                    stream_error.take(),
+                    effective_err,
                     needs_response,
                     nudged_for_response,
                     event_tx,
@@ -1743,7 +1759,7 @@ Rules:
             };
         }
 
-        let (tc, invalid) = partition_tool_calls(&tool_calls);
+        let (tc, invalid) = partition_tool_calls(&tool_calls, truncated_due_to_length);
 
         if tc.is_empty() && invalid.is_empty() {
             self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
@@ -1856,6 +1872,7 @@ Rules:
         tag_filter: &mut InternalTagFilter,
         tool_calls: &mut Vec<PartialToolCall>,
         stream_error: &mut Option<String>,
+        truncated_due_to_length: &mut bool,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> StreamEventOutcome {
         match event {
@@ -1889,6 +1906,16 @@ Rules:
             StreamEvent::Usage(usage) => {
                 self.record_usage(&usage);
                 let _ = event_tx.send(AgentEvent::Usage(usage)).await;
+            }
+            StreamEvent::Truncated => {
+                // Provider signaled max-tokens cut-off. The stream still
+                // continues to Done so cost-attribution chunks can land;
+                // we just remember the flag for finish_iteration so the
+                // model can be given a clear "your output was truncated"
+                // hint instead of the cryptic JSON parse failure that
+                // shows up when a tool call's argument string was
+                // unclosed by the cut-off.
+                *truncated_due_to_length = true;
             }
             StreamEvent::Done => return StreamEventOutcome::Terminal,
             StreamEvent::Error(e) => {
@@ -3035,7 +3062,10 @@ struct InvalidToolCall {
 ///
 /// Calls without a usable id are fully discarded (no way to address a
 /// `tool_result`); they show up only in `tracing::warn!` for ops visibility.
-fn partition_tool_calls(tool_calls: &[PartialToolCall]) -> (Vec<ToolCall>, Vec<InvalidToolCall>) {
+fn partition_tool_calls(
+    tool_calls: &[PartialToolCall],
+    truncated_due_to_length: bool,
+) -> (Vec<ToolCall>, Vec<InvalidToolCall>) {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
     for ptc in tool_calls
@@ -3083,7 +3113,21 @@ fn partition_tool_calls(tool_calls: &[PartialToolCall]) -> (Vec<ToolCall>, Vec<I
             continue;
         }
         if let Err(e) = serde_json::from_str::<serde_json::Value>(&ptc.arguments) {
-            let reason = format!("invalid JSON arguments: {e}");
+            // When the provider signaled max_tokens cut-off this turn, the
+            // unparseable JSON is almost certainly the truncation symptom
+            // (closing quote / brace never arrived). Replace the cryptic
+            // serde error with a clear directive so the model splits the
+            // work instead of looping on the same oversized call.
+            let reason = if truncated_due_to_length {
+                format!(
+                    "response truncated at max_tokens; your tool call was cut off mid-output. \
+                     Split the work into multiple smaller tool calls (e.g. several apply_patch \
+                     calls, or write the file in chunks) and try again. \
+                     (underlying parse error: {e})"
+                )
+            } else {
+                format!("invalid JSON arguments: {e}")
+            };
             warn!("Invalid tool call '{}': {}", ptc.name, reason);
             invalid.push(InvalidToolCall {
                 id: ptc.id.clone(),
@@ -3855,7 +3899,7 @@ mod tests {
             "apply_patch",
             "{\"input\": \"*** Begin", // truncated JSON
         )];
-        let (valid, invalid) = partition_tool_calls(&calls);
+        let (valid, invalid) = partition_tool_calls(&calls, false);
         assert!(valid.is_empty(), "truncated JSON must not be marked valid");
         assert_eq!(invalid.len(), 1, "exactly one invalid call expected");
         assert_eq!(invalid[0].id, "call_1");
@@ -3869,6 +3913,35 @@ mod tests {
     }
 
     #[test]
+    fn partition_tool_calls_substitutes_truncation_hint_when_max_tokens_signaled() {
+        // Same truncated JSON as above, but the LLM stream signaled
+        // max_tokens via finish_reason="length". The error reason given
+        // back to the model must explicitly say so and tell it to split
+        // the work — otherwise the model loops on the same oversized call
+        // and keeps hitting the cap.
+        let calls = vec![ptc("call_1", "apply_patch", "{\"input\": \"*** Begin")];
+        let (valid, invalid) = partition_tool_calls(&calls, true);
+        assert!(valid.is_empty());
+        assert_eq!(invalid.len(), 1);
+        let reason = &invalid[0].reason;
+        assert!(
+            reason.contains("truncated at max_tokens"),
+            "reason must name the truncation cause, got: {reason}"
+        );
+        assert!(
+            reason.contains("Split the work"),
+            "reason must direct the model to split the work, got: {reason}"
+        );
+        // Cryptic serde error message is *not* what the model sees first —
+        // the truncation hint leads. The underlying parse error stays as
+        // a parenthetical for ops debugging.
+        assert!(
+            !reason.starts_with("invalid JSON"),
+            "truncation reason must shadow the bare JSON parse error, got: {reason}"
+        );
+    }
+
+    #[test]
     fn partition_tool_calls_drops_unaddressable_calls() {
         // Without an id we cannot send a tool_result back, so these must be
         // dropped entirely (no synthetic error feedback possible).
@@ -3876,7 +3949,7 @@ mod tests {
             ptc("", "apply_patch", "{}"), // missing id
             ptc("call_1", "", "{}"),      // missing name
         ];
-        let (valid, invalid) = partition_tool_calls(&calls);
+        let (valid, invalid) = partition_tool_calls(&calls, false);
         assert!(valid.is_empty());
         assert!(
             invalid.is_empty(),
@@ -3910,7 +3983,7 @@ mod tests {
             ),
         ];
         for (label, call, reason_substr) in cases {
-            let (valid, invalid) = partition_tool_calls(std::slice::from_ref(&call));
+            let (valid, invalid) = partition_tool_calls(std::slice::from_ref(&call), false);
             assert!(valid.is_empty(), "{label}: should not be valid");
             assert_eq!(invalid.len(), 1, "{label}: expected one invalid entry");
             assert_eq!(invalid[0].id, call.id, "{label}: id preserved");
@@ -3926,7 +3999,7 @@ mod tests {
     #[test]
     fn partition_tool_calls_passes_well_formed() {
         let calls = vec![ptc("call_1", "read_file", "{\"path\": \"a.txt\"}")];
-        let (valid, invalid) = partition_tool_calls(&calls);
+        let (valid, invalid) = partition_tool_calls(&calls, false);
         assert_eq!(valid.len(), 1);
         assert!(invalid.is_empty());
         assert_eq!(valid[0].id, "call_1");

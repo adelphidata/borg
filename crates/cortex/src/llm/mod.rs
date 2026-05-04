@@ -86,6 +86,15 @@ pub enum StreamEvent {
     },
     /// Token usage report.
     Usage(UsageData),
+    /// Provider signaled the response was cut off because the model hit
+    /// `max_tokens` / `max_output_tokens`. Emitted alongside the normal
+    /// stream events; the agent loop converts this into actionable feedback
+    /// for the model rather than the cryptic JSON parse failure that
+    /// otherwise surfaces when a tool call's argument string is unclosed.
+    /// OpenAI-compat: `finish_reason == "length"`. Anthropic:
+    /// `delta.stop_reason == "max_tokens"`. Non-terminal — the SSE driver
+    /// still relies on `[DONE]` / `message_stop` to end the stream.
+    Truncated,
     /// Stream completed.
     Done,
     /// Stream error.
@@ -186,11 +195,13 @@ struct PromptTokensDetails {
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
     delta: Option<Delta>,
-    /// Present on the terminal chunk(s). Read but unused: termination is
-    /// driven solely by the `[DONE]` sentinel because OpenRouter splits
-    /// termination across two `finish_reason` chunks (the second carries
-    /// `usage`), and exiting early on the first would drop cost attribution.
-    #[allow(dead_code)]
+    /// Present on the terminal chunk(s). NOT used to terminate: OpenRouter
+    /// splits termination across two `finish_reason` chunks (the second
+    /// carries `usage`), so exiting early on the first would drop cost
+    /// attribution. Termination still rides the `[DONE]` sentinel. We DO
+    /// inspect this field to detect `"length"` (max-tokens cut-off) and
+    /// emit `StreamEvent::Truncated` so the agent loop can give the model
+    /// actionable feedback rather than a cryptic JSON-parse error.
     #[serde(default)]
     finish_reason: Option<String>,
 }
@@ -1190,6 +1201,13 @@ impl LlmClient {
                         // `Done` here would race past the usage chunk and
                         // permanently strand cost attribution at "unknown".
                         // Rely solely on the `[DONE]` sentinel to terminate.
+                        // We DO inspect `finish_reason == "length"` so the
+                        // agent loop can convert the inevitable truncated
+                        // tool-call JSON into a clear "split your work" hint
+                        // for the model.
+                        if choice.finish_reason.as_deref() == Some("length") {
+                            events.push(StreamEvent::Truncated);
+                        }
                     }
                 }
 
@@ -1669,7 +1687,10 @@ impl LlmClient {
                         provider_cost_usd: None,
                     }));
                 }
-                if event["delta"]["stop_reason"].as_str().is_some() {
+                if let Some(stop_reason) = event["delta"]["stop_reason"].as_str() {
+                    if stop_reason == "max_tokens" {
+                        events.push(StreamEvent::Truncated);
+                    }
                     events.push(StreamEvent::Done);
                     return SseAction::Done(events);
                 }

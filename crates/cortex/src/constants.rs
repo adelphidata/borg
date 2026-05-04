@@ -343,8 +343,14 @@ pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 50;
 /// Default sampling temperature for LLM requests.
 pub const DEFAULT_LLM_TEMPERATURE: f32 = 0.7;
 
-/// Default maximum tokens in an LLM response.
-pub const DEFAULT_LLM_MAX_TOKENS: u32 = 4096;
+/// Default maximum tokens in an LLM response. Set high enough that single
+/// large file writes (apply_patch with a several-hundred-line body) don't
+/// hit the ceiling mid-tool-argument and produce truncated JSON. The 4096
+/// historical default routinely truncated `apply_patch` calls because the
+/// patch travels as a JSON-string-escaped argument, where every newline /
+/// quote / backslash inflates the token count. Modern providers' model-level
+/// caps are 8K–32K+; this default sits comfortably under all of them.
+pub const DEFAULT_LLM_MAX_TOKENS: u32 = 16_384;
 
 /// Default number of retry attempts on transient LLM errors.
 pub const DEFAULT_LLM_MAX_RETRIES: u32 = 3;
