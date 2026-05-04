@@ -36,6 +36,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/doctor", "Run diagnostics"),
     ("/dream", "Run memory consolidation now"),
     ("/heal", "Run self-healing maintenance sweep"),
+    ("/poke", "Trigger an immediate heartbeat (bypasses quiet hours)"),
     ("/stats", "Show agent vitals"),
     ("/evolution", "Show evolution overview"),
     ("/card", "Print an ASCII share card"),
