@@ -13,7 +13,7 @@ use anyhow::Result;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use gateway::{InboundTurn, SessionExecutor};
-use heartbeat::scheduler::{HeartbeatEvent as SchedulerEvent, HeartbeatResult, SkipReason};
+use heartbeat::scheduler::{HeartbeatResult, SkipReason};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -160,10 +160,6 @@ pub fn spawn(
     let _ = config; // signature preserved for callers
     let (trigger_tx, mut trigger_rx) = mpsc::channel::<HeartbeatTrigger>(8);
     let (poke_tx, _poke_rx) = mpsc::channel::<()>(8);
-    // hb_rx exists only so the runner-loop's `select!` arm compiles; nothing
-    // ever sends on it post-V52, so the arm wakes up exactly once on close.
-    let (_hb_tx, mut hb_rx) = mpsc::channel::<SchedulerEvent>(1);
-    drop(_hb_tx);
 
     let bus = HeartbeatBus::default();
     // Install the bus in the process-global slot so the unified scheduled-task
@@ -183,30 +179,6 @@ pub fn spawn(
             tokio::select! {
                 biased;
                 _ = runner_cancel.cancelled() => return,
-                evt = hb_rx.recv() => {
-                    let Some(evt) = evt else { return };
-                    match evt {
-                        SchedulerEvent::Fire => {
-                            // Serialize fires: dedup state (LAST_HASH/LAST_HASH_TIME)
-                            // is read-modify-write on two independent atomics, so
-                            // overlapping fires would race. Heartbeats are rare —
-                            // running sequentially is fine.
-                            run_and_broadcast(
-                                &runner_executor,
-                                &runner_config,
-                                HeartbeatTrigger {
-                                    source: HeartbeatSource::Scheduled,
-                                    bypass_quiet_hours: false,
-                                },
-                                &bus_for_runner,
-                            ).await;
-                        }
-                        SchedulerEvent::Result(result) => {
-                            publish_scheduler_result(&bus_for_runner, HeartbeatSource::Scheduled, result);
-                        }
-                        SchedulerEvent::SchedulerStarted { .. } => {}
-                    }
-                }
                 trigger = trigger_rx.recv() => {
                     let Some(trigger) = trigger else { return };
                     if should_skip_explicit_trigger(trigger, &runner_config) {
