@@ -12,7 +12,7 @@
 
 use crate::constants;
 
-use super::{Agent, COLLAB_MODE_DEFAULT, COLLAB_MODE_EXECUTE, COLLAB_MODE_PLAN};
+use super::{Agent, COLLAB_MODE_EXECUTE, COLLAB_MODE_PLAN};
 
 impl Agent {
     /// Build the `<environment>` section with time, CWD, git context, OS, and runtime info.
@@ -317,7 +317,6 @@ impl Agent {
     /// Build the `<collaboration_mode>` section from the current config.
     pub(super) fn build_collaboration_section(&self) -> String {
         let mode_template = match self.config.conversation.collaboration_mode {
-            crate::config::CollaborationMode::Default => COLLAB_MODE_DEFAULT,
             crate::config::CollaborationMode::Execute => COLLAB_MODE_EXECUTE,
             crate::config::CollaborationMode::Plan => COLLAB_MODE_PLAN,
         };

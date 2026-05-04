@@ -2260,7 +2260,7 @@ mod tests {
         let mut app = make_app();
         assert_eq!(
             app.config.conversation.collaboration_mode,
-            CollaborationMode::Default
+            CollaborationMode::Execute
         );
         let _ = app.handle_submit("/plan").unwrap();
         assert_eq!(
@@ -2270,7 +2270,7 @@ mod tests {
         );
         assert_eq!(
             app.previous_collab_mode,
-            Some(CollaborationMode::Default),
+            Some(CollaborationMode::Execute),
             "/plan should stash the previous mode for restore"
         );
     }
@@ -2309,7 +2309,7 @@ mod tests {
     fn mode_switch_away_from_plan_clears_previous() {
         let mut app = make_app();
         let _ = app.handle_submit("/plan").unwrap();
-        assert_eq!(app.previous_collab_mode, Some(CollaborationMode::Default));
+        assert_eq!(app.previous_collab_mode, Some(CollaborationMode::Execute));
         let _ = app.handle_submit("/mode execute").unwrap();
         assert_eq!(
             app.config.conversation.collaboration_mode,
@@ -2324,22 +2324,14 @@ mod tests {
     #[test]
     fn shift_tab_cycles_modes_and_manages_previous_collab_mode() {
         // Shift+Tab (BackTab) is the only keyboard path through
-        // `cycle_collaboration_mode`. Existing tests cover `/plan` and
-        // `/mode <name>` but not the cycle path. Invariant from
-        // key_handlers.rs:120-124: stash previous mode when *entering* Plan;
-        // clear when leaving Plan.
+        // `cycle_collaboration_mode`. Cycle is Execute ↔ Plan only — there is
+        // no Default mode. Invariant: stash the prior mode when *entering*
+        // Plan so the post-turn review overlay can restore it; clear when
+        // leaving Plan.
         let mut app = make_app();
         let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
 
-        // Default → Execute. Not entering Plan, so no stash.
-        app.handle_key(back_tab).unwrap();
-        assert_eq!(
-            app.config.conversation.collaboration_mode,
-            CollaborationMode::Execute
-        );
-        assert_eq!(app.previous_collab_mode, None);
-
-        // Execute → Plan. Entering Plan from non-Plan stashes Execute.
+        // Execute → Plan. Entering Plan stashes Execute.
         app.handle_key(back_tab).unwrap();
         assert_eq!(
             app.config.conversation.collaboration_mode,
@@ -2351,11 +2343,11 @@ mod tests {
             "entering Plan must stash the prior mode for restore"
         );
 
-        // Plan → Default. Leaving Plan must clear the stash.
+        // Plan → Execute. Leaving Plan must clear the stash.
         app.handle_key(back_tab).unwrap();
         assert_eq!(
             app.config.conversation.collaboration_mode,
-            CollaborationMode::Default
+            CollaborationMode::Execute
         );
         assert_eq!(
             app.previous_collab_mode, None,

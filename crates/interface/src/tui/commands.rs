@@ -465,7 +465,7 @@ impl App<'_> {
         let next = if current == CollaborationMode::Plan {
             self.previous_collab_mode
                 .take()
-                .unwrap_or(CollaborationMode::Default)
+                .unwrap_or(CollaborationMode::Execute)
         } else {
             CollaborationMode::Plan
         };

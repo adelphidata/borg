@@ -49,19 +49,18 @@ impl<'a> App<'a> {
         true
     }
 
-    /// Cycle collaboration mode: Default → Execute → Plan → Default.
+    /// Cycle collaboration mode: Execute ↔ Plan.
     /// Tracks entering/leaving Plan so the post-turn review overlay can
     /// restore the user's prior mode on "Proceed".
     fn cycle_collaboration_mode(&mut self) {
         let current = self.config.conversation.collaboration_mode;
         let next = match current {
-            CollaborationMode::Default => CollaborationMode::Execute,
             CollaborationMode::Execute => CollaborationMode::Plan,
-            CollaborationMode::Plan => CollaborationMode::Default,
+            CollaborationMode::Plan => CollaborationMode::Execute,
         };
-        if next == CollaborationMode::Plan && current != CollaborationMode::Plan {
+        if next == CollaborationMode::Plan {
             self.previous_collab_mode = Some(current);
-        } else if next != CollaborationMode::Plan {
+        } else {
             self.previous_collab_mode = None;
         }
         self.config.conversation.collaboration_mode = next;

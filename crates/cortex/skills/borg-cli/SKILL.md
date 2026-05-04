@@ -126,4 +126,4 @@ borg away ["<msg>"] | borg available
 - Setting names are stable; run `borg settings` (no args) to discover keys.
 - `borg settings set` validates the value; an invalid key/value returns non-zero.
 - Most commands talk to the running daemon; if it's not up, `borg service status` and `borg service restart` recover it.
-- In Plan mode, `run_shell` is blocked, so `borg ...` self-config will not execute. Switch to default or execute mode first (`borg settings set conversation.collaboration_mode execute`).
+- In Plan mode, `run_shell` is blocked, so `borg ...` self-config will not execute. Switch to execute mode first (`borg settings set conversation.collaboration_mode execute`).

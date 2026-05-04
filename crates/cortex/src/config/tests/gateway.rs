@@ -58,20 +58,30 @@ fn gateway_bindings_empty_by_default() {
 // -- CollaborationMode --
 
 #[test]
-fn collaboration_mode_default_is_default() {
+fn collaboration_mode_default_is_execute() {
+    // Borg is autonomous: the default mode is Execute. There is no "Default"
+    // variant — see CollaborationMode docs in config/media.rs.
     let cfg = Config::default();
     assert_eq!(
         cfg.conversation.collaboration_mode,
-        CollaborationMode::Default
+        CollaborationMode::Execute
     );
 }
 
 #[test]
 fn collaboration_mode_from_str_roundtrip() {
-    for mode_str in &["default", "execute", "plan"] {
+    for mode_str in &["execute", "plan"] {
         let mode: CollaborationMode = mode_str.parse().unwrap();
         assert_eq!(&format!("{mode}"), mode_str);
     }
+}
+
+#[test]
+fn collaboration_mode_from_str_legacy_default_alias() {
+    // Existing DB rows may carry "default" from the pre-removal era; they must
+    // resolve to Execute rather than erroring out and breaking the daemon boot.
+    let mode: CollaborationMode = "default".parse().unwrap();
+    assert_eq!(mode, CollaborationMode::Execute);
 }
 
 #[test]
@@ -91,11 +101,12 @@ fn apply_setting_collaboration_mode() {
     cfg.apply_setting("conversation.collaboration_mode", "plan")
         .unwrap();
     assert_eq!(cfg.conversation.collaboration_mode, CollaborationMode::Plan);
+    // Legacy alias still applies for stored "default" rows.
     cfg.apply_setting("conversation.collaboration_mode", "default")
         .unwrap();
     assert_eq!(
         cfg.conversation.collaboration_mode,
-        CollaborationMode::Default
+        CollaborationMode::Execute
     );
 }
 
@@ -109,9 +120,32 @@ fn apply_setting_collaboration_mode_invalid() {
 
 #[test]
 fn collaboration_mode_blocks_mutations_only_for_plan() {
-    assert!(!CollaborationMode::Default.blocks_mutations());
     assert!(!CollaborationMode::Execute.blocks_mutations());
     assert!(CollaborationMode::Plan.blocks_mutations());
+}
+
+/// Guard against reintroducing a `Default` collaboration mode variant.
+///
+/// Borg is autonomous by design — the previous `Default` mode acted like a
+/// chat assistant that asked questions instead of executing, which conflicts
+/// with the project's positioning. It was deliberately removed; "default"
+/// survives only as a `FromStr` alias for legacy DB rows. Any attempt to
+/// re-add a `Default` variant must be challenged.
+///
+/// This is a source-grep guard (allowed by CLAUDE.md as an "invariant types
+/// can't express" exception, like the prompt-cache and TUI mouse guards).
+#[test]
+fn collaboration_mode_default_variant_must_not_return() {
+    let src = include_str!("../media.rs");
+    // Either form of the variant path would only ever appear if the variant
+    // were re-added — `#[default]` (the attr) and `Default for ...` (the trait
+    // impl) use different casing/punctuation and won't trip this check.
+    assert!(
+        !src.contains("Self::Default") && !src.contains("CollaborationMode::Default"),
+        "CollaborationMode::Default has been removed; do not reintroduce it. \
+         Borg is autonomous — Execute is the default mode. See the type doc \
+         in config/media.rs.",
+    );
 }
 
 #[test]

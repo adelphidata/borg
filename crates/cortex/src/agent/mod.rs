@@ -89,7 +89,6 @@ static SETUP_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
 });
 
 // Collaboration mode templates
-const COLLAB_MODE_DEFAULT: &str = include_str!("../../templates/collaboration_mode/default.md");
 const COLLAB_MODE_EXECUTE: &str = include_str!("../../templates/collaboration_mode/execute.md");
 const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/plan.md");
 

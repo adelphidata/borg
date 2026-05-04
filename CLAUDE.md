@@ -143,7 +143,7 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 ### Collaboration Modes
 
-**Default** (asks), **Execute** (autonomous), **Plan** (read-only, blocks mutating tools). `/plan` toggles with auto-restore. Templates in `crates/cortex/templates/collaboration_mode/`.
+**Execute** (autonomous, the default) and **Plan** (read-only, blocks mutating tools). `/plan` toggles with auto-restore. Templates in `crates/cortex/templates/collaboration_mode/`. The legacy "Default" mode was removed — Borg is autonomous; `"default"` survives only as a `FromStr` alias for legacy DB rows. See the guard test `collaboration_mode_default_variant_must_not_return`.
 
 ### Agent Loop
 

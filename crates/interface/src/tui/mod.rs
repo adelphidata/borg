@@ -1264,7 +1264,7 @@ async fn run_event_loop(
                 let restored = app
                     .previous_collab_mode
                     .take()
-                    .unwrap_or(CollaborationMode::Default);
+                    .unwrap_or(CollaborationMode::Execute);
                 if app.config.conversation.collaboration_mode != restored {
                     app.config.conversation.collaboration_mode = restored;
                     app.push_system_message(format!("[mode: {restored}]"));

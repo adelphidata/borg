@@ -8,13 +8,17 @@ use crate::constants;
 use crate::secrets_resolve::SecretRef;
 
 /// Collaboration mode that controls how the agent interacts during a session.
+///
+/// Borg is autonomous by default — there is no "Default" mode. The only modes
+/// are `Execute` (the standard, autonomous mode) and `Plan` (read-only).
+/// A third "Default" mode previously existed and was removed deliberately;
+/// `FromStr` accepts `"default"` as a silent alias for `Execute` so legacy
+/// settings rows keep working, but it must not be re-added as a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CollaborationMode {
-    /// Standard collaborative interaction — asks questions when needed.
-    #[default]
-    Default,
     /// Autonomous execution — makes assumptions, executes independently, reports progress.
+    #[default]
     Execute,
     /// Read-only planning — explores codebase, asks questions, produces a plan, blocks mutations.
     Plan,
@@ -32,11 +36,12 @@ impl FromStr for CollaborationMode {
 
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "default" => Ok(Self::Default),
-            "execute" => Ok(Self::Execute),
+            // "default" is a legacy alias mapped to Execute; do not reintroduce
+            // a Default variant (see the type-level doc comment).
+            "default" | "execute" => Ok(Self::Execute),
             "plan" => Ok(Self::Plan),
             other => {
-                anyhow::bail!("Unknown collaboration mode '{other}'. Valid: default, execute, plan")
+                anyhow::bail!("Unknown collaboration mode '{other}'. Valid: execute, plan")
             }
         }
     }
@@ -45,7 +50,6 @@ impl FromStr for CollaborationMode {
 impl fmt::Display for CollaborationMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Default => write!(f, "default"),
             Self::Execute => write!(f, "execute"),
             Self::Plan => write!(f, "plan"),
         }
@@ -594,7 +598,7 @@ impl Default for ConversationConfig {
             tool_output_max_tokens: constants::TOOL_OUTPUT_MAX_TOKENS,
             compaction_marker_tokens: constants::COMPACTION_MARKER_TOKENS,
             max_transcript_chars: constants::MAX_TRANSCRIPT_CHARS,
-            collaboration_mode: CollaborationMode::Default,
+            collaboration_mode: CollaborationMode::Execute,
             age_based_degradation: true,
             protect_first_n: 3,
             concurrent_tools: ConcurrentToolsConfig::default(),
