@@ -355,6 +355,14 @@ impl Tui {
         if let Some(saved) = self.alt_saved_viewport.take() {
             self.terminal.set_viewport_area(saved);
         }
+        // Invariant: leaving the alt-screen surface invalidates ratatui's
+        // inline diff buffer. Without this, the next inline draw compares
+        // against alt-screen geometry, treats the composer cells as
+        // unchanged, and emits no output — typed characters stay invisible
+        // until something else (Enter resizing the viewport, history line
+        // flush) forces a full repaint. Mirrors the `terminal.clear()` call
+        // in `enter_alt_screen`.
+        self.terminal.invalidate_viewport();
         self.alt_screen_active.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -572,6 +580,35 @@ mod tests {
             height: 41,
         });
         assert_eq!(viewport, Rect::new(0, 0, 132, 41));
+    }
+
+    /// Regression guard: leaving the alt-screen surface MUST invalidate the
+    /// inline diff buffer. Without this, after closing a popup like
+    /// `/settings`, ratatui compares the new inline frame against the stale
+    /// alt-screen buffer, sees no diff for the composer cells, and emits no
+    /// output — typed characters stay invisible until something else (Enter
+    /// resizing the viewport, history-line flush) forces a full repaint.
+    ///
+    /// Source-grep style guard: `Tui` is hardcoded to a `CrosstermBackend<Stdout>`
+    /// terminal, so a behavioral test would require an event-loop-level
+    /// harness. We assert directly on the function body.
+    #[test]
+    fn leave_alt_screen_invalidates_viewport() {
+        let src = include_str!("tui_lifecycle.rs");
+        let start = src
+            .find("pub fn leave_alt_screen")
+            .expect("leave_alt_screen function present");
+        let body_end = src[start..]
+            .find("\n    }\n")
+            .expect("leave_alt_screen has a body terminator");
+        let body = &src[start..start + body_end];
+        assert!(
+            body.contains("invalidate_viewport"),
+            "leave_alt_screen must call self.terminal.invalidate_viewport() to \
+             reset ratatui's inline diff buffer; otherwise typed characters in \
+             the composer are invisible until Enter forces a full repaint. \
+             Body was:\n{body}"
+        );
     }
 
     #[test]

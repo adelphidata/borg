@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn heartbeat_config_defaults() {
         let cfg = HeartbeatConfig::default();
-        assert_eq!(cfg.interval, "30m");
+        assert_eq!(cfg.interval, "60m");
         assert_eq!(cfg.quiet_hours_start.as_deref(), Some("00:00"));
         assert_eq!(cfg.quiet_hours_end.as_deref(), Some("06:00"));
         assert!(cfg.cron.is_none());

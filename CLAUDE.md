@@ -151,7 +151,7 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 ### Heartbeat
 
-Proactive check-ins (default 30m or cron, quiet 00:00–06:00). `~/.borg/HEARTBEAT.md` checklist. Honors gateway bindings. Suppresses empty/duplicate/ack-only. Trigger: `borg poke` / `/poke`. `heartbeat.min_interval_secs` (default 60, hard floor 1) is the operator/eval-suite knob for sub-minute firings — leave at 60 in production.
+Proactive check-ins (default 60m or cron, quiet 00:00–06:00). `~/.borg/HEARTBEAT.md` checklist. Honors gateway bindings. Suppresses empty/duplicate/ack-only. Trigger: `borg poke` / `/poke`. `heartbeat.min_interval_secs` (default 60, hard floor 1) is the operator/eval-suite knob for sub-minute firings — leave at 60 in production.
 
 ### Database
 

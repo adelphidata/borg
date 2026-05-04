@@ -90,6 +90,15 @@ impl<'a> App<'a> {
     // =========================================================================
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Result<AppAction> {
+        // REPORT_EVENT_TYPES (kitty keyboard protocol, enabled in
+        // tui_lifecycle::set_modes) delivers both Press and Release for every
+        // key. Forwarding Release would double-fire Enter/Esc handling — e.g.
+        // the Enter that submits `/uninstall` would immediately re-trigger as
+        // "cancel" inside ConfirmingUninstall. Only Press (and Repeat) reach
+        // the per-state handlers below.
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return Ok(AppAction::Continue);
+        }
         match &self.state {
             AppState::ConfirmingUninstall => self.handle_key_confirming_uninstall(key),
             AppState::AwaitingApproval { .. } => self.handle_key_awaiting_approval(key),

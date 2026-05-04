@@ -72,6 +72,11 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "Exit Borg chat"),
 ];
 
+/// Maximum number of slash commands visible in the popup at one time.
+/// Keeps the popup short so users see what's available without it covering
+/// the composer; the selected item still scrolls into view.
+pub const MAX_VISIBLE_ITEMS: u16 = 4;
+
 fn builtin_defs() -> Vec<SlashCommandDef> {
     BUILTIN_COMMANDS
         .iter()
@@ -162,6 +167,21 @@ impl CommandPopup {
                 template: Some(c.template),
             });
         }
+        // /help and /settings pinned to the top (most-reached-for entries),
+        // then the rest A→Z. Within filter tiers (exact/prefix/fuzzy) this
+        // ordering carries through, so the popup stays predictable.
+        fn rank(name: &str) -> u8 {
+            match name {
+                "/help" => 0,
+                "/settings" => 1,
+                _ => 2,
+            }
+        }
+        commands.sort_by(|a, b| {
+            rank(&a.name)
+                .cmp(&rank(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         Self {
             visible: false,
             filter: String::new(),
@@ -265,13 +285,17 @@ impl CommandPopup {
             return;
         }
 
+        // Cap visible rows so users always see a small, predictable slate of
+        // commands rather than a wall that pushes the composer offscreen.
+        // Selected item still scrolls into view via `scroll_offset` below.
         let item_count = items.len() as u16;
+        let visible_rows = item_count.min(MAX_VISIBLE_ITEMS);
         let popup_width = composer_area.width.min(50);
         // Need at least 3 rows: top border + 1 item + bottom border.
         let Some(popup_area) = popup_utils::popup_rect_above(
             frame.area(),
             composer_area,
-            item_count + 2,
+            visible_rows + 2,
             3,
             popup_width,
         ) else {
@@ -566,8 +590,15 @@ mod tests {
         let popup = CommandPopup::with_custom(vec![custom("/standup", "Daily", "body")]);
         let names: Vec<&str> = popup.commands.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"/standup"));
-        // Built-ins must still be present and come first.
-        assert_eq!(names[0], BUILTIN_COMMANDS[0].0);
+        // /standup sorts alphabetically into the merged list — confirm it's
+        // placed correctly rather than appended at the end.
+        let standup_pos = names.iter().position(|n| *n == "/standup").unwrap();
+        if let Some(prev) = names.get(standup_pos.wrapping_sub(1)) {
+            assert!(*prev < "/standup", "list not sorted: {prev} before /standup");
+        }
+        if let Some(next) = names.get(standup_pos + 1) {
+            assert!(*next > "/standup", "list not sorted: /standup before {next}");
+        }
     }
 
     #[test]
@@ -608,18 +639,45 @@ mod tests {
     }
 
     #[test]
-    fn builtins_rank_above_custom_in_prefix_tier() {
-        // Both `/setting-x` (custom) and `/settings` (builtin) prefix-match `/set`.
-        // Built-ins are stored first, so within the prefix tier they should win.
-        let popup = CommandPopup::with_custom(vec![custom("/setting-x", "user", "body")]);
-        let mut popup = popup;
+    fn unfiltered_pins_help_then_settings_then_alphabetical() {
+        let mut popup = CommandPopup::new();
+        popup.update_filter("/");
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
+
+        assert_eq!(names[0], "/help");
+        assert_eq!(names[1], "/settings");
+
+        // Tail (everything after the two pinned entries) must be A→Z.
+        let tail: Vec<&str> = names[2..].to_vec();
+        let mut sorted_tail = tail.clone();
+        sorted_tail.sort();
+        assert_eq!(tail, sorted_tail, "tail not alphabetical: {tail:?}");
+    }
+
+    #[test]
+    fn pinned_settings_outranks_alphabetically_earlier_custom() {
+        // /setting-x and /settings both prefix-match /set. /settings is pinned
+        // to the top of the global ordering, so even though /setting-x sorts
+        // earlier alphabetically, /settings should still come first.
+        let mut popup = CommandPopup::with_custom(vec![custom("/setting-x", "user", "body")]);
         popup.update_filter("/set");
         let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
-        let builtin_pos = names.iter().position(|n| *n == "/settings").unwrap();
-        let custom_pos = names.iter().position(|n| *n == "/setting-x").unwrap();
+        let settings_pos = names.iter().position(|n| *n == "/settings").unwrap();
+        let setting_x_pos = names.iter().position(|n| *n == "/setting-x").unwrap();
         assert!(
-            builtin_pos < custom_pos,
-            "built-in /settings must rank above custom /setting-x; got {names:?}"
+            settings_pos < setting_x_pos,
+            "pinned /settings must precede /setting-x; got {names:?}"
         );
     }
+
+    #[test]
+    fn filter_he_returns_help_first() {
+        // Both /help and /heal prefix-match /he. Pinning makes /help win even
+        // though /heal sorts earlier alphabetically.
+        let mut popup = CommandPopup::new();
+        popup.update_filter("/he");
+        let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names[0], "/help", "got {names:?}");
+    }
+
 }

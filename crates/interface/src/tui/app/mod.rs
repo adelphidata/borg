@@ -2451,6 +2451,30 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_release_event_is_ignored() {
+        // REPORT_EVENT_TYPES delivers both Press and Release. The Enter that
+        // submits `/uninstall` must not re-fire as "cancel" via its Release
+        // event inside ConfirmingUninstall. Regression guard for the
+        // auto-cancel bug.
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+        let mut app = make_app();
+        app.state = AppState::ConfirmingUninstall;
+        let release = KeyEvent::new_with_kind_and_state(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+            KeyEventState::NONE,
+        );
+        let action = app.handle_key(release).unwrap();
+        assert!(matches!(action, AppAction::Continue));
+        assert!(matches!(app.state, AppState::ConfirmingUninstall));
+        assert!(!app
+            .cells
+            .iter()
+            .any(|c| matches!(c, HistoryCell::System { text } if text.contains("cancelled"))));
+    }
+
+    #[test]
     fn uninstall_not_in_autocomplete() {
         let popup = crate::tui::command_popup::CommandPopup::new();
         let all = popup.filtered();

@@ -792,10 +792,21 @@ impl<'a> App<'a> {
         let queue = self.compute_queue_preview_height();
         let footer: u16 = 1;
         let pending = self.cells.len().saturating_sub(self.cells_emitted) as u16;
+        // Reserve viewport rows for the slash-command popup so it can render
+        // its full slate above the composer. Without this, `popup_rect_above`
+        // sees only ~1 row of slack and clips the popup to a single entry.
+        let popup_rows = if self.command_popup.is_visible() {
+            let items = self.command_popup.filtered().len() as u16;
+            let visible = items.min(super::super::command_popup::MAX_VISIBLE_ITEMS);
+            visible.saturating_add(2) // +2 for top/bottom borders
+        } else {
+            0
+        };
         let chrome = composer
             .saturating_add(status.min(1))
             .saturating_add(if terminal_size.width < 72 { 0 } else { queue })
-            .saturating_add(if terminal_size.width < 56 { 0 } else { footer });
+            .saturating_add(if terminal_size.width < 56 { 0 } else { footer })
+            .saturating_add(popup_rows);
         let available_tail = terminal_size.height.saturating_sub(chrome).max(1);
         let max_tail = (terminal_size.height / 2).max(1).min(available_tail);
         let min_tail = if available_tail >= 3 { 3 } else { 1 };
@@ -1452,6 +1463,29 @@ mod tests {
         // row. With no pending transcript cells, the viewport is just the
         // collapsed chrome plus the 3-row minimum live tail.
         assert_eq!(viewport, 8);
+    }
+
+    #[test]
+    fn compute_viewport_height_reserves_rows_for_command_popup() {
+        // When the slash popup is visible, the viewport must grow enough to
+        // give `popup_rect_above` slack to render the full slate. Without
+        // this, the popup clips to a single visible entry above the composer.
+        let mut app = make_app();
+        let baseline = app.compute_viewport_height(Size::new(120, 30));
+
+        app.command_popup.update_filter("/");
+        assert!(app.command_popup.is_visible());
+        let with_popup = app.compute_viewport_height(Size::new(120, 30));
+
+        let popup_visible_items =
+            (app.command_popup.filtered().len() as u16).min(crate::tui::command_popup::MAX_VISIBLE_ITEMS);
+        let expected_extra = popup_visible_items + 2; // borders
+        assert_eq!(
+            with_popup - baseline,
+            expected_extra,
+            "popup-open viewport should reserve {expected_extra} extra rows; \
+             baseline={baseline}, with_popup={with_popup}"
+        );
     }
 
     #[test]

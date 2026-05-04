@@ -388,6 +388,31 @@ fn split_mention_label(label: &str) -> (&str, &str) {
     (label, "")
 }
 
+/// Style paired-backtick runs in `text` with the inline-code colour; surrounding prose stays at `base`. Unmatched trailing backticks pass through unstyled.
+fn style_inline_backticks(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let (before, after_open) = rest.split_at(open);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), base));
+        }
+        let after = &after_open[1..];
+        if let Some(close) = after.find('`') {
+            let code = &after[..close];
+            spans.push(Span::styled(format!("`{code}`"), theme::code_style()));
+            rest = &after[close + 1..];
+        } else {
+            spans.push(Span::styled(format!("`{after}"), base));
+            return spans;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
 /// Style a system message line with visual hierarchy:
 /// - Icons (✓, ●) → cyan, (⚠) → amber, (✗) → red
 /// - Explicit headers/titles → bold white
@@ -1113,10 +1138,9 @@ impl HistoryCell {
                 ]
             }
             HistoryCell::Heartbeat { text } => {
-                vec![Line::from(vec![
-                    Span::styled("[heartbeat] ", theme::code_style()),
-                    Span::raw(text.clone()),
-                ])]
+                let mut spans = vec![Span::styled("[heartbeat] ", theme::code_style())];
+                spans.extend(style_inline_backticks(text, Style::default()));
+                vec![Line::from(spans)]
             }
             HistoryCell::System { text } => text.lines().map(style_system_line).collect(),
             HistoryCell::Card { lines } => lines.clone(),
@@ -1899,6 +1923,29 @@ mod tests {
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("[heartbeat]"));
         assert!(text.contains("check-in"));
+    }
+
+    #[test]
+    fn heartbeat_inline_backticks_styled_teal() {
+        let cell = HistoryCell::Heartbeat {
+            text: "run `/plugins` to add an integration".to_string(),
+        };
+        let lines = cell.render(80, None);
+        let code_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "`/plugins`")
+            .expect("inline-code span present with backticks intact");
+        assert_eq!(code_span.style, theme::code_style());
+    }
+
+    #[test]
+    fn style_inline_backticks_unmatched_trailing_tick() {
+        let spans = style_inline_backticks("foo `bar baz", Style::default());
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(combined, "foo `bar baz");
+        // unmatched run keeps the leading backtick but isn't styled as code.
+        assert!(spans.iter().all(|s| s.style != theme::code_style()));
     }
 
     #[test]
