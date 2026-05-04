@@ -994,12 +994,16 @@ impl<'a> App<'a> {
     }
 
     /// Submit a queued message (called from the event loop when a turn completes).
-    /// The user message was already shown in the transcript when it was queued,
-    /// so we skip the User cell push and only add Separator + Assistant cell.
+    /// Pushes the User cell to scrollback now that the queued message is
+    /// actually being sent — at queue time the message lives only in the
+    /// queue preview widget.
     pub fn handle_queued_submit(&mut self, qm: QueuedMessage) -> Result<AppAction> {
+        self.cells.push(HistoryCell::User {
+            text: qm.text.clone(),
+        });
         // Expand `@path` mentions in the queued text. Cards render
-        // between the (already-shown) user cell and the assistant cell
-        // we're about to push. See `handle_submit` for the same pattern.
+        // between the user cell and the assistant cell we're about to push.
+        // See `handle_submit` for the same pattern.
         let expansion = cortex::mentions::expand_mentions(&qm.text, &self.config);
         for card in &expansion.cards {
             self.cells.push(HistoryCell::MentionCard {
@@ -1694,6 +1698,54 @@ mod tests {
     }
 
     #[test]
+    fn drain_pushes_user_cell_to_history() {
+        // Queued messages are not echoed to scrollback at queue time —
+        // the user cell is pushed when the queued message actually drains.
+        let mut app = make_app();
+        let before = app.cells.len();
+        app.handle_queued_submit(qm("hello queued")).unwrap();
+        let user_cell = app
+            .cells
+            .iter()
+            .find_map(|c| match c {
+                HistoryCell::User { text } if text == "hello queued" => Some(text.clone()),
+                _ => None,
+            })
+            .expect("drain must push the queued message as a User cell");
+        assert_eq!(user_cell, "hello queued");
+        // User cell + Assistant streaming cell, at minimum.
+        assert!(app.cells.len() > before);
+    }
+
+    #[test]
+    fn queueing_during_streaming_does_not_push_history_cell() {
+        // While streaming, pressing Enter on text should add to the queue
+        // only — no echo cells in scrollback. Bug regression: dual-render
+        // path produced only a thin highlight sliver in the transcript.
+        use crossterm::event::{KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        // No steer_tx → fallback queue path.
+        app.steer_tx = None;
+        app.composer.set_text("queued while busy");
+        let cells_before = app.cells.len();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            app.cells.len(),
+            cells_before,
+            "queueing must not push any cells to scrollback"
+        );
+        assert_eq!(app.queued_messages.len(), 1);
+        assert_eq!(app.queued_messages[0].text, "queued while busy");
+        assert!(app.composer.text().is_empty());
+    }
+
+    #[test]
     fn test_tab_queues_multiple() {
         let mut app = make_app();
         app.queued_messages.push_back(qm("first"));
@@ -1747,23 +1799,36 @@ mod tests {
     #[test]
     fn test_queue_preview_height() {
         let mut app = make_app();
+        let w = 80u16;
 
         // Empty queue
-        assert_eq!(app.compute_queue_preview_height(), 0);
+        assert_eq!(app.compute_queue_preview_height(w), 0);
 
-        // 1 message: header(1) + shown(1) + hint(1) = 3
+        // 1 short message: header(1) + body(1) + hint(1) = 3
         app.queued_messages.push_back(qm("a"));
-        assert_eq!(app.compute_queue_preview_height(), 3);
+        assert_eq!(app.compute_queue_preview_height(w), 3);
 
-        // 3 messages: header(1) + shown(3) + hint(1) = 5
+        // 3 short messages: header(1) + body(3) + hint(1) = 5
         app.queued_messages.push_back(qm("b"));
         app.queued_messages.push_back(qm("c"));
-        assert_eq!(app.compute_queue_preview_height(), 5);
+        assert_eq!(app.compute_queue_preview_height(w), 5);
 
-        // 5 messages: header(1) + shown(3) + overflow(1) + hint(1) = 6
+        // 5 messages: only first 3 shown (no overflow line), height unchanged
         app.queued_messages.push_back(qm("d"));
         app.queued_messages.push_back(qm("e"));
-        assert_eq!(app.compute_queue_preview_height(), 6);
+        assert_eq!(app.compute_queue_preview_height(w), 5);
+    }
+
+    #[test]
+    fn test_queue_preview_height_wraps_long_message() {
+        let mut app = make_app();
+        // inner width = 20 - 4 = 16; message of 50 chars wraps to ~4 lines,
+        // capped at 3 + 1 overflow line.
+        let long = "a".repeat(50);
+        app.queued_messages.push_back(qm(&long));
+        let h = app.compute_queue_preview_height(20);
+        // header(1) + 3 wrapped + 1 overflow + hint(1) = 6
+        assert_eq!(h, 6);
     }
 
     // --- Interrupt preserves queued messages ---

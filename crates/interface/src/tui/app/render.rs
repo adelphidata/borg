@@ -65,7 +65,7 @@ impl<'a> App<'a> {
         let area = frame.area();
         let status_height = self.desired_status_height();
         let composer_height = self.composer.height();
-        let queue_preview_height = self.compute_queue_preview_height();
+        let queue_preview_height = self.compute_queue_preview_height(area.width);
         let app_layout =
             layout::compute_layout(area, composer_height, status_height, queue_preview_height);
 
@@ -567,15 +567,8 @@ impl<'a> App<'a> {
         frame.render_widget(Paragraph::new(line), area);
     }
 
-    pub(super) fn compute_queue_preview_height(&self) -> u16 {
-        let count = self.queued_messages.len();
-        if count == 0 {
-            return 0;
-        }
-        let shown = count.min(3) as u16;
-        let overflow = if count > 3 { 1u16 } else { 0 };
-        // header + shown messages + overflow + hint
-        1 + shown + overflow + 1
+    pub(super) fn compute_queue_preview_height(&self, area_width: u16) -> u16 {
+        compute_queue_preview_height_for(&self.queued_messages, area_width)
     }
 
     /// Overlay the multi-question carousel on top of the composer area when the
@@ -714,70 +707,7 @@ impl<'a> App<'a> {
     }
 
     fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {
-        let dim_italic = Style::default()
-            .fg(theme::DIM_WHITE)
-            .add_modifier(Modifier::ITALIC);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-
-        lines.push(Line::from(Span::styled(
-            " Queued messages:".to_string(),
-            theme::dim(),
-        )));
-
-        let count = self.queued_messages.len();
-        let shown = count.min(3);
-        for (i, qm) in self.queued_messages.iter().take(shown).enumerate() {
-            let is_last_shown = i + 1 == shown && count <= 3;
-            let truncated = if qm.text.len() > 50 {
-                let end = qm
-                    .text
-                    .char_indices()
-                    .map(|(idx, _)| idx)
-                    .take_while(|&idx| idx <= 47)
-                    .last()
-                    .unwrap_or(0);
-                format!("{}...", &qm.text[..end])
-            } else {
-                qm.text.clone()
-            };
-            let img_badge = if !qm.images.is_empty() {
-                format!(
-                    " [{} image{}]",
-                    qm.images.len(),
-                    if qm.images.len() == 1 { "" } else { "s" }
-                )
-            } else {
-                String::new()
-            };
-            let prefix = if is_last_shown {
-                theme::TREE_END
-            } else {
-                theme::TREE_MID
-            };
-            let style = if i + 1 == count {
-                // Last item overall: underline to hint Alt+Up editability
-                dim_italic.add_modifier(Modifier::UNDERLINED)
-            } else {
-                dim_italic
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  {prefix} {}. {truncated}{img_badge}", i + 1),
-                style,
-            )));
-        }
-
-        if count > 3 {
-            lines.push(Line::from(Span::styled(
-                format!("  ... and {} more", count - 3),
-                theme::dim(),
-            )));
-        }
-
-        lines.push(Line::from(Span::styled(
-            "  Alt+Up to edit last".to_string(),
-            theme::dim(),
-        )));
-
+        let lines = build_queue_preview_lines(&self.queued_messages, area.width);
         frame.render_widget(Paragraph::new(lines), area);
     }
 
@@ -789,7 +719,7 @@ impl<'a> App<'a> {
     pub fn compute_viewport_height(&self, terminal_size: Size) -> u16 {
         let composer = self.composer.height();
         let status = self.desired_status_height();
-        let queue = self.compute_queue_preview_height();
+        let queue = self.compute_queue_preview_height(terminal_size.width);
         let footer: u16 = 1;
         let pending = self.cells.len().saturating_sub(self.cells_emitted) as u16;
         // Reserve viewport rows for the slash-command popup so it can render
@@ -992,6 +922,111 @@ pub(super) fn build_borg_card_lines(
         ]));
     }
     lines
+}
+
+/// Wrap a queued message into up to `max_lines` body lines for the
+/// preview, given the inner width available after the prefix indent.
+/// Returns the wrapped lines and `true` if the message overflowed (the
+/// caller appends a `…` line in that case).
+fn wrap_queued_message(text: &str, inner_width: usize, max_lines: usize) -> (Vec<String>, bool) {
+    if text.is_empty() {
+        return (vec![String::new()], false);
+    }
+    let width = inner_width.max(1);
+    let wrapped: Vec<String> = textwrap::wrap(text, width)
+        .into_iter()
+        .map(std::borrow::Cow::into_owned)
+        .collect();
+    if wrapped.len() > max_lines {
+        (wrapped.into_iter().take(max_lines).collect(), true)
+    } else {
+        (wrapped, false)
+    }
+}
+
+fn image_badge(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else if count == 1 {
+        " [1 image]".to_string()
+    } else {
+        format!(" [{count} images]")
+    }
+}
+
+const QUEUE_FIRST_PREFIX: &str = "  ↳ ";
+const QUEUE_CONT_PREFIX: &str = "    ";
+const QUEUE_PREFIX_WIDTH: u16 = 4;
+const QUEUE_MAX_LINES_PER_MSG: usize = 3;
+const QUEUE_MAX_VISIBLE: usize = 3;
+
+pub(super) fn build_queue_preview_lines(
+    queued: &std::collections::VecDeque<super::QueuedMessage>,
+    area_width: u16,
+) -> Vec<Line<'static>> {
+    let dim_italic = Style::default()
+        .fg(theme::DIM_WHITE)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if queued.is_empty() {
+        return lines;
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("• ", theme::dim()),
+        Span::styled("Queued follow-up inputs", theme::dim()),
+    ]));
+
+    let inner = area_width.saturating_sub(QUEUE_PREFIX_WIDTH).max(1) as usize;
+    for qm in queued.iter().take(QUEUE_MAX_VISIBLE) {
+        let badge = image_badge(qm.images.len());
+        let body = format!("{}{}", qm.text, badge);
+        let (wrapped, overflowed) = wrap_queued_message(&body, inner, QUEUE_MAX_LINES_PER_MSG);
+        for (i, segment) in wrapped.iter().enumerate() {
+            let prefix = if i == 0 {
+                QUEUE_FIRST_PREFIX
+            } else {
+                QUEUE_CONT_PREFIX
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), theme::dim()),
+                Span::styled(segment.clone(), dim_italic),
+            ]));
+        }
+        if overflowed {
+            lines.push(Line::from(Span::styled(
+                format!("{QUEUE_CONT_PREFIX}…"),
+                dim_italic,
+            )));
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("{QUEUE_CONT_PREFIX}⌥ + ↑ edit last queued message"),
+        theme::dim(),
+    )));
+
+    lines
+}
+
+pub(super) fn compute_queue_preview_height_for(
+    queued: &std::collections::VecDeque<super::QueuedMessage>,
+    area_width: u16,
+) -> u16 {
+    if queued.is_empty() {
+        return 0;
+    }
+    let inner = area_width.saturating_sub(QUEUE_PREFIX_WIDTH).max(1) as usize;
+    let mut h: u16 = 1; // header
+    for qm in queued.iter().take(QUEUE_MAX_VISIBLE) {
+        let body = format!("{}{}", qm.text, image_badge(qm.images.len()));
+        let (wrapped, overflowed) = wrap_queued_message(&body, inner, QUEUE_MAX_LINES_PER_MSG);
+        h = h.saturating_add(wrapped.len() as u16);
+        if overflowed {
+            h = h.saturating_add(1);
+        }
+    }
+    h.saturating_add(1) // hint
 }
 
 #[cfg(test)]
@@ -1477,8 +1512,8 @@ mod tests {
         assert!(app.command_popup.is_visible());
         let with_popup = app.compute_viewport_height(Size::new(120, 30));
 
-        let popup_visible_items =
-            (app.command_popup.filtered().len() as u16).min(crate::tui::command_popup::MAX_VISIBLE_ITEMS);
+        let popup_visible_items = (app.command_popup.filtered().len() as u16)
+            .min(crate::tui::command_popup::MAX_VISIBLE_ITEMS);
         let expected_extra = popup_visible_items + 2; // borders
         assert_eq!(
             with_popup - baseline,
@@ -1522,5 +1557,129 @@ mod tests {
             "first line must be a blank terminal-bg spacer, got: {:?}",
             user_lines[0]
         );
+    }
+
+    // ========================================================================
+    // Queue preview rendering.
+    // ========================================================================
+
+    fn line_text(l: &Line<'static>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn make_queue(
+        items: &[(&str, usize)],
+    ) -> std::collections::VecDeque<super::super::QueuedMessage> {
+        items
+            .iter()
+            .map(|(text, n_imgs)| super::super::QueuedMessage {
+                text: (*text).to_string(),
+                images: (0..*n_imgs)
+                    .map(|_| crate::tui::composer::ImageAttachment {
+                        data: vec![],
+                        mime_type: "image/png".to_string(),
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_preview_one_short_message() {
+        let q = make_queue(&[("hi", 0)]);
+        let lines = build_queue_preview_lines(&q, 60);
+        assert_eq!(lines.len(), 3, "header + 1 body + hint");
+        assert_eq!(line_text(&lines[0]), "• Queued follow-up inputs");
+        assert_eq!(line_text(&lines[1]), "  ↳ hi");
+        assert_eq!(line_text(&lines[2]), "    ⌥ + ↑ edit last queued message");
+
+        // Body must be dim+italic.
+        let body_style = lines[1].spans[1].style;
+        assert!(body_style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(body_style.fg, Some(theme::DIM_WHITE));
+    }
+
+    #[test]
+    fn queue_preview_three_messages_all_visible() {
+        let q = make_queue(&[("a", 0), ("b", 0), ("c", 0)]);
+        let lines = build_queue_preview_lines(&q, 60);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts[0], "• Queued follow-up inputs");
+        assert_eq!(texts[1], "  ↳ a");
+        assert_eq!(texts[2], "  ↳ b");
+        assert_eq!(texts[3], "  ↳ c");
+        assert_eq!(texts[4], "    ⌥ + ↑ edit last queued message");
+    }
+
+    #[test]
+    fn queue_preview_shows_only_first_three() {
+        let q = make_queue(&[("aa", 0), ("bb", 0), ("cc", 0), ("dd", 0), ("ee", 0)]);
+        let lines = build_queue_preview_lines(&q, 60);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|t| t == "  ↳ aa"));
+        assert!(texts.iter().any(|t| t == "  ↳ bb"));
+        assert!(texts.iter().any(|t| t == "  ↳ cc"));
+        assert!(!texts.iter().any(|t| t.contains("dd") || t.contains("ee")));
+        // 5 lines: header + 3 bodies + hint.
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn queue_preview_truncates_long_message_with_ellipsis() {
+        // inner width 16: a single 80-char message wraps to many lines and
+        // must be capped at 3 wrapped lines + a "    …" overflow line.
+        let long = "a ".repeat(40);
+        let q = make_queue(&[(long.trim(), 0)]);
+        let lines = build_queue_preview_lines(&q, 20);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(texts.first().unwrap(), "• Queued follow-up inputs");
+        assert!(
+            texts.iter().any(|t| t == "    …"),
+            "must include overflow ellipsis line: {texts:?}"
+        );
+        // First wrapped body line uses ↳ prefix; subsequent use the 4-space prefix.
+        let first_body = texts.iter().find(|t| t.starts_with("  ↳ ")).unwrap();
+        assert!(first_body.starts_with("  ↳ a"));
+    }
+
+    #[test]
+    fn queue_preview_image_badge() {
+        let q = make_queue(&[("see this", 1), ("two of them", 2)]);
+        let lines = build_queue_preview_lines(&q, 60);
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(texts.iter().any(|t| t.contains("[1 image]")));
+        assert!(texts.iter().any(|t| t.contains("[2 images]")));
+    }
+
+    #[test]
+    fn queue_preview_height_matches_rendered_lines() {
+        // Height calc must agree with the actual line count produced.
+        let long = "hello ".repeat(20);
+        let cases: Vec<Vec<(&str, usize)>> = vec![
+            vec![("a", 0)],
+            vec![("a", 0), ("b", 0), ("c", 0)],
+            vec![(long.trim_end(), 0)],
+        ];
+        for case in &cases {
+            let q = make_queue(case);
+            let lines = build_queue_preview_lines(&q, 30);
+            let h = compute_queue_preview_height_for(&q, 30);
+            assert_eq!(
+                lines.len() as u16,
+                h,
+                "height mismatch for case {case:?}: lines={} h={}",
+                lines.len(),
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn queue_preview_empty_returns_no_lines() {
+        let q: std::collections::VecDeque<super::super::QueuedMessage> =
+            std::collections::VecDeque::new();
+        let lines = build_queue_preview_lines(&q, 60);
+        assert!(lines.is_empty());
+        assert_eq!(compute_queue_preview_height_for(&q, 60), 0);
     }
 }

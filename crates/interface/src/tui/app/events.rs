@@ -69,8 +69,7 @@ impl<'a> App<'a> {
                 }
             }
             DoctorEvent::Done { pass, warn, fail } => {
-                let summary =
-                    format!("Summary: {pass} passed, {warn} warning(s), {fail} failed");
+                let summary = format!("Summary: {pass} passed, {warn} warning(s), {fail} failed");
                 self.push_system_message(summary);
                 self.doctor_rx = None;
             }

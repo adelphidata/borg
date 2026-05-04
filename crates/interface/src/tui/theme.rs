@@ -11,7 +11,6 @@ pub const BORDER: Color = Color::Rgb(3, 113, 113);
 // glyphs: lighter bullet (•) and single chevron (›) for message prefixes.
 pub const BULLET: &str = "•";
 pub const CHEVRON: &str = "›";
-pub const TREE_MID: &str = "├";
 pub const TREE_END: &str = "└";
 
 pub const TOOL_ACTIVE_GREEN: Color = Color::Rgb(0, 200, 0);

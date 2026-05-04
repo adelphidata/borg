@@ -541,12 +541,11 @@ impl<'a> super::App<'a> {
                     });
                     self.pending_steers.push_back(text);
                 } else {
-                    // Fallback: queue normally if no steer channel
+                    // Fallback: queue normally if no steer channel.
+                    // The message is shown only in the queue preview widget
+                    // until the agent finishes; on drain it gets pushed
+                    // to scrollback as a normal user cell.
                     let images = self.composer.take_image_attachments();
-                    self.cells.push(HistoryCell::User { text: text.clone() });
-                    self.cells.push(HistoryCell::System {
-                        text: format!("[queued — {} in queue]", self.queued_messages.len() + 1),
-                    });
                     self.queued_messages
                         .push_back(QueuedMessage { text, images });
                 }

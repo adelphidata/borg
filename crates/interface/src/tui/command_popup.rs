@@ -594,10 +594,16 @@ mod tests {
         // placed correctly rather than appended at the end.
         let standup_pos = names.iter().position(|n| *n == "/standup").unwrap();
         if let Some(prev) = names.get(standup_pos.wrapping_sub(1)) {
-            assert!(*prev < "/standup", "list not sorted: {prev} before /standup");
+            assert!(
+                *prev < "/standup",
+                "list not sorted: {prev} before /standup"
+            );
         }
         if let Some(next) = names.get(standup_pos + 1) {
-            assert!(*next > "/standup", "list not sorted: /standup before {next}");
+            assert!(
+                *next > "/standup",
+                "list not sorted: /standup before {next}"
+            );
         }
     }
 
@@ -679,5 +685,4 @@ mod tests {
         let names: Vec<&str> = popup.filtered().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names[0], "/help", "got {names:?}");
     }
-
 }
