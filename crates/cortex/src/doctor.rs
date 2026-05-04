@@ -1755,7 +1755,7 @@ mod tests {
         let config = Config::default();
         let mut checks = Vec::new();
         check_heartbeat(&config, &mut checks);
-        assert!(checks.iter().any(|c| c.name.contains("interval: 30m")));
+        assert!(checks.iter().any(|c| c.name.contains("interval: 60m")));
     }
 
     #[test]

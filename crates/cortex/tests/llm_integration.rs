@@ -106,6 +106,10 @@ async fn collect_events(mut rx: mpsc::Receiver<StreamEvent>) -> Vec<String> {
                 events.push(format!("error:{e}"));
                 break;
             }
+            StreamEvent::Truncated => {
+                events.push("truncated".into());
+                break;
+            }
         }
     }
     events
