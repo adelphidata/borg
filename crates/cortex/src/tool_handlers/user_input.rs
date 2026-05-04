@@ -244,12 +244,22 @@ pub fn serialize_answers(questions: &[Question], answers: &HashMap<String, Answe
         if i > 0 {
             s.push(',');
         }
-        let key = serde_json::to_string(&q.id).unwrap_or_else(|_| "\"\"".to_string());
+        // String/Answer serialization is infallible — neither contains a Map
+        // with non-string keys, a non-finite float, or any other shape
+        // serde_json refuses. A failure here would mean a serde upstream bug,
+        // not a runtime condition we can recover from, so panic loudly rather
+        // than ship malformed JSON to the model.
+        let key = match serde_json::to_string(&q.id) {
+            Ok(k) => k,
+            Err(e) => unreachable!("String serialization cannot fail: {e}"),
+        };
         s.push_str(&key);
         s.push(':');
         let entry = answers.get(&q.id).cloned().unwrap_or_default();
-        let value =
-            serde_json::to_string(&entry).unwrap_or_else(|_| "{\"answers\":[]}".to_string());
+        let value = match serde_json::to_string(&entry) {
+            Ok(v) => v,
+            Err(e) => unreachable!("Answer serialization cannot fail: {e}"),
+        };
         s.push_str(&value);
     }
     s.push_str("}}");

@@ -71,17 +71,7 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
         }),
         CoreEvent::UserInputRequest { questions, respond } => {
             let prompt_id = prompts.register(PendingPrompt::UserInput(respond));
-            // Mirror the first question into the legacy `prompt` slot so
-            // older clients (if any) still see something readable; new clients
-            // read the structured `questions` field exclusively.
-            let legacy_prompt = questions
-                .first()
-                .map(|q| q.question.clone())
-                .unwrap_or_default();
             Kind::UserInputRequest(pb::UserInputRequest {
-                prompt: legacy_prompt,
-                choices: Vec::new(),
-                allow_custom: true,
                 prompt_id,
                 questions: questions
                     .into_iter()
@@ -196,7 +186,7 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             return None;
         }
         Kind::UserInputRequest(ui) => {
-            tracing::warn!(prompt_id = %ui.prompt_id, prompt = %ui.prompt,
+            tracing::warn!(prompt_id = %ui.prompt_id, question_count = ui.questions.len(),
                 "from_proto: dropping UserInputRequest");
             return None;
         }

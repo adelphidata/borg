@@ -138,7 +138,6 @@ message SubAgentUpdate { string agent_id = 1; string nickname = 2; string status
 message SteerReceived { string text = 1; }
 message PlanStep { string id = 1; string text = 2; string status = 3; }
 message PlanUpdated { repeated PlanStep steps = 1; }
-message UserInputChoice { string label = 1; string description = 2; }
 // A single question option in a batched UserInputRequest. The UI auto-appends
 // an "Other" free-form row, so the model never includes it explicitly.
 message UserInputQuestionOption { string label = 1; string description = 2; }
@@ -151,14 +150,14 @@ message UserInputQuestion {
   repeated UserInputQuestionOption options = 5;
 }
 message UserInputRequest {
-  // Legacy single-prompt fields (deprecated, kept for forward-compat readers).
-  string prompt = 1;
-  repeated UserInputChoice choices = 2;
-  bool allow_custom = 3;
+  // Numbers 1-3 were a legacy single-question shape (prompt/choices/allow_custom)
+  // that no client ever shipped consuming. Reserved so the slots can't be
+  // accidentally reused with incompatible semantics.
+  reserved 1, 2, 3;
+  reserved "prompt", "choices", "allow_custom";
   string prompt_id = 4;
-  // New batched-question payload. When `questions` is non-empty, the response
-  // (RespondToPrompt.value) is the JSON `{ "<qid>": { "answers": [...] } }`
-  // map and the legacy fields above are ignored.
+  // The response (RespondToPrompt.value) is the JSON
+  // `{ "<qid>": { "answers": [...] } }` map, in question order.
   repeated UserInputQuestion questions = 5;
 }
 message Preparing {}

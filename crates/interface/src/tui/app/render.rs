@@ -432,7 +432,7 @@ impl<'a> App<'a> {
                             priority: 90,
                         },
                         FooterHint {
-                            text: "esc cancel".into(),
+                            text: "esc cancel batch".into(),
                             priority: 100,
                         },
                         prompt_hint,

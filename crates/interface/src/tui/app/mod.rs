@@ -2897,6 +2897,163 @@ mod tests {
     }
 
     #[test]
+    fn esc_does_not_close_notes_it_cancels_the_batch() {
+        // Regression guard: previously Esc only closed the notes editor when
+        // it was open, leaving users with no way to cancel from inside notes.
+        // Now Esc always cancels the batch, regardless of notes state.
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question("a", "A", &["x", "y"], false)],
+        );
+
+        // Open notes, type something, then Esc.
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        app.handle_key(key(KeyCode::Char('z'))).unwrap();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+
+        let map = rx.try_recv().expect("response sent");
+        assert_eq!(
+            map.get("a").unwrap().answers,
+            vec![INTERRUPTED_MARKER.to_string()]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_cancel_fills_interrupted_markers_per_question() {
+        // Regression guard: Ctrl+C used to send an empty HashMap, which
+        // serialize_answers would fill with empty answer lists — a different
+        // shape from Esc cancellation. Now both produce identical [interrupted]
+        // markers so the LLM sees one cancel shape.
+        use crossterm::event::KeyModifiers;
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![
+                make_question("a", "A", &["x", "y"], false),
+                make_question("b", "B", &["p", "q"], false),
+            ],
+        );
+
+        let evt = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(evt).unwrap();
+
+        let map = rx.try_recv().expect("response sent");
+        assert_eq!(
+            map.get("a").unwrap().answers,
+            vec![INTERRUPTED_MARKER.to_string()]
+        );
+        assert_eq!(
+            map.get("b").unwrap().answers,
+            vec![INTERRUPTED_MARKER.to_string()]
+        );
+    }
+
+    #[test]
+    fn moving_cursor_to_other_auto_opens_notes_in_single_select() {
+        // The bare "Other" label tells the LLM nothing without context. So when
+        // the cursor lands on the Other row, the notes editor pops open
+        // automatically, prompting the user to type their actual answer.
+        let mut app = make_app();
+        let _rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question("color", "Color", &["red", "blue"], false)],
+        );
+        // 2 options + 1 Other → two Downs lands on the Other row.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        match &app.state {
+            AppState::AwaitingInput {
+                per_question_state, ..
+            } => {
+                assert!(
+                    per_question_state[0].notes_open,
+                    "expected notes to auto-open on Other"
+                );
+            }
+            _ => panic!("expected AwaitingInput"),
+        }
+    }
+
+    #[test]
+    fn toggling_other_in_multi_select_auto_opens_notes() {
+        let mut app = make_app();
+        let _rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question(
+                "channels",
+                "Channels",
+                &["telegram", "slack"],
+                true,
+            )],
+        );
+        // Move cursor to the Other row (idx 2), then toggle with Space.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        match &app.state {
+            AppState::AwaitingInput {
+                per_question_state, ..
+            } => {
+                assert!(
+                    per_question_state[0].other_selected,
+                    "Other should be toggled on"
+                );
+                assert!(
+                    per_question_state[0].notes_open,
+                    "toggling Other on should auto-open notes"
+                );
+            }
+            _ => panic!("expected AwaitingInput"),
+        }
+    }
+
+    #[test]
+    fn multi_select_with_other_and_notes_round_trips_in_option_order() {
+        // Combined-path coverage: multi-select picks two options + Other +
+        // free-form note. The serialized answer must contain options in their
+        // declared order, then "Other", then the user_note line.
+        let mut app = make_app();
+        let mut rx = seed_awaiting_with_questions(
+            &mut app,
+            vec![make_question(
+                "channels",
+                "Channels",
+                &["telegram", "slack", "discord"],
+                true,
+            )],
+        );
+
+        // Toggle telegram (idx 0).
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        // Move to slack (idx 1) and toggle.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        // Move past discord (idx 2) to Other (idx 3) and toggle.
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        // Other auto-opened notes; type the note and Tab back out.
+        for c in "via webhook".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+
+        let map = rx.try_recv().expect("response sent");
+        let answers = &map.get("channels").unwrap().answers;
+        assert_eq!(
+            answers,
+            &vec![
+                "telegram".to_string(),
+                "slack".to_string(),
+                "Other".to_string(),
+                "user_note: via webhook".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn other_row_is_appended_below_options() {
         // The "Other" row is auto-added at index `options.len()` so total rows
         // is options.len() + 1. Cursor wrap-around must include it.

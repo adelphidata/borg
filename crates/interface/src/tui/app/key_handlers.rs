@@ -166,38 +166,70 @@ impl<'a> App<'a> {
             return Ok(AppAction::Continue);
         };
 
-        // Ctrl+C always cancels, regardless of mode.
-        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Esc and Ctrl+C both cancel the entire batch with `[interrupted]`
+        // markers per question so the LLM sees one shape for cancellation
+        // regardless of which key the user mashed. (Tab is the only key that
+        // toggles the notes editor closed — Esc does not steal it.)
+        let is_cancel = key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+        if is_cancel {
+            let mut map: HashMap<String, Answer> = HashMap::new();
+            for question in questions.iter() {
+                map.insert(
+                    question.id.clone(),
+                    Answer {
+                        answers: vec![INTERRUPTED_MARKER.to_string()],
+                    },
+                );
+            }
             if let Some(tx) = respond.take() {
-                if tx.send(HashMap::new()).is_err() {
-                    tracing::warn!("user-input: agent dropped receiver before Ctrl+C cancel");
+                if tx.send(map).is_err() {
+                    tracing::warn!("user-input: agent dropped receiver before cancel");
                 }
             }
-            if let Some(token) = self.cancel_token.take() {
-                token.cancel();
+            if key.code == KeyCode::Char('c') {
+                // Ctrl+C also tears down the in-flight turn (mirrors streaming
+                // cancel). Esc only dismisses the widget — the agent gets the
+                // markers and decides what to do next.
+                if let Some(token) = self.cancel_token.take() {
+                    token.cancel();
+                }
+                self.event_rx = None;
+                self.steer_tx = None;
+                self.composer.set_text("");
+                self.cells.push(HistoryCell::System {
+                    text: "[interrupted]".to_string(),
+                });
+                self.state = AppState::Idle;
+            } else {
+                self.composer.set_text("");
+                self.resume_streaming();
             }
-            self.event_rx = None;
-            self.steer_tx = None;
-            self.composer.set_text("");
-            self.cells.push(HistoryCell::System {
-                text: "[interrupted]".to_string(),
-            });
-            self.state = AppState::Idle;
             return Ok(AppAction::Continue);
         }
 
+        // Defensive bounds: parsing guarantees questions.len() <= MAX_QUESTIONS
+        // and per_question_state mirrors that, but a future binding (Home/End,
+        // mouse jump) could leave current_idx stale. Snap into range rather
+        // than panic on `&questions[idx]`.
+        let total_q = questions.len();
+        if total_q == 0 {
+            return Ok(AppAction::Continue);
+        }
+        if *current_idx >= total_q {
+            *current_idx = total_q - 1;
+        }
         let q = &questions[*current_idx];
-        let total_rows = q.options.len() + 1; // +1 for "Other"
+        let other_row = q.options.len();
+        let total_rows = other_row + 1; // +1 for "Other"
         let st = &mut per_question_state[*current_idx];
 
-        // Notes editor swallows most keys when open.
+        // Notes editor swallows most keys when open. Esc does NOT close notes —
+        // it cancels the batch (handled above) so the user has a single,
+        // consistent escape hatch out of the widget.
         if st.notes_open {
             match key.code {
                 KeyCode::Tab => {
-                    st.notes_open = false;
-                }
-                KeyCode::Esc => {
-                    // Close notes without losing the buffered text.
                     st.notes_open = false;
                 }
                 KeyCode::Backspace => {
@@ -218,9 +250,18 @@ impl<'a> App<'a> {
                 } else {
                     st.cursor - 1
                 };
+                // Auto-open notes when cursor lands on the Other row in
+                // single-select mode — the model needs the free-form context
+                // or "Other" alone is meaningless.
+                if !q.multi_select && st.cursor == other_row {
+                    st.notes_open = true;
+                }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 st.cursor = (st.cursor + 1) % total_rows;
+                if !q.multi_select && st.cursor == other_row {
+                    st.notes_open = true;
+                }
             }
             KeyCode::Left => {
                 if *current_idx > 0 {
@@ -233,8 +274,12 @@ impl<'a> App<'a> {
                 }
             }
             KeyCode::Char(' ') if q.multi_select => {
-                if st.cursor == q.options.len() {
+                if st.cursor == other_row {
                     st.other_selected = !st.other_selected;
+                    // Toggling Other ON auto-opens notes for free-form context.
+                    if st.other_selected {
+                        st.notes_open = true;
+                    }
                 } else if !st.multi_selected.insert(st.cursor) {
                     st.multi_selected.remove(&st.cursor);
                 }
@@ -243,6 +288,9 @@ impl<'a> App<'a> {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < total_rows {
                     st.cursor = idx;
+                    if !q.multi_select && st.cursor == other_row {
+                        st.notes_open = true;
+                    }
                 }
             }
             KeyCode::Tab => {
@@ -262,26 +310,6 @@ impl<'a> App<'a> {
                     self.composer.set_text("");
                     self.resume_streaming();
                 }
-            }
-            KeyCode::Esc => {
-                // Cancel the batch — every question reports the interrupted marker
-                // so the LLM can reason about partial cancellation.
-                let mut map: HashMap<String, Answer> = HashMap::new();
-                for question in questions.iter() {
-                    map.insert(
-                        question.id.clone(),
-                        Answer {
-                            answers: vec![INTERRUPTED_MARKER.to_string()],
-                        },
-                    );
-                }
-                if let Some(tx) = respond.take() {
-                    if tx.send(map).is_err() {
-                        tracing::warn!("user-input: agent dropped receiver before Esc cancel");
-                    }
-                }
-                self.composer.set_text("");
-                self.resume_streaming();
             }
             _ => {}
         }
