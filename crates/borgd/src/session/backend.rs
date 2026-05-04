@@ -287,8 +287,12 @@ impl SessionBackend for AgentBackend {
         };
 
         if let Err(e) = result {
-            tracing::warn!(session_id = %self.session_id, error = %e, "agent turn failed");
-            if let Err(send_err) = event_tx.send(AgentEvent::Error(e.to_string())).await {
+            // anyhow's `Display` only renders the topmost message; `{:#}` walks
+            // the `.context()` chain so the user (and the daemon log) sees the
+            // root cause instead of just the outer wrap.
+            let chained = format!("{e:#}");
+            tracing::warn!(session_id = %self.session_id, error = %chained, "agent turn failed");
+            if let Err(send_err) = event_tx.send(AgentEvent::Error(chained)).await {
                 tracing::warn!(error = %send_err, "failed to surface agent error to client");
             }
         }
@@ -420,5 +424,41 @@ mod tests {
         }
         let g = sync_lock_bridge(&mutex);
         assert_eq!(*g, 42);
+    }
+
+    /// Regression: errors surfaced via `AgentEvent::Error` must include the
+    /// full `anyhow` context chain, not just the topmost wrap. A previous
+    /// version used `e.to_string()` which produced messages like
+    /// "Failed to build system prompt" with no underlying cause — leaving
+    /// the user (and the daemon log) with nothing actionable. The production
+    /// path now uses `format!("{e:#}")`; this test pins that contract.
+    #[test]
+    fn agent_error_string_includes_full_context_chain() {
+        use anyhow::{anyhow, Context};
+
+        let err: anyhow::Error = Err::<(), _>(anyhow!("inner kaboom"))
+            .context("middle frame")
+            .context("Failed to build system prompt")
+            .unwrap_err();
+
+        let surfaced = format!("{err:#}");
+
+        assert!(
+            surfaced.contains("Failed to build system prompt"),
+            "outer wrap missing: {surfaced}"
+        );
+        assert!(
+            surfaced.contains("middle frame"),
+            "intermediate context missing: {surfaced}"
+        );
+        assert!(
+            surfaced.contains("inner kaboom"),
+            "root cause missing: {surfaced}"
+        );
+
+        // Sanity: the naive `to_string()` path is what we explicitly moved
+        // away from; document the failure mode it produced.
+        let naive = err.to_string();
+        assert!(!naive.contains("inner kaboom"));
     }
 }

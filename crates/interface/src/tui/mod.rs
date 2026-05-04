@@ -816,7 +816,7 @@ async fn run_event_loop(
                             forward_event_stream(send_client, sid, stream, event_tx).await;
                         }
                         Err(e) => {
-                            let _ = event_tx.send(AgentEvent::Error(e.to_string())).await;
+                            let _ = event_tx.send(AgentEvent::Error(format!("{e:#}"))).await;
                         }
                     }
                 });
