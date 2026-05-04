@@ -1743,9 +1743,9 @@ Rules:
             };
         }
 
-        let tc = validate_tool_calls(&tool_calls);
+        let (tc, invalid) = partition_tool_calls(&tool_calls);
 
-        if tc.is_empty() {
+        if tc.is_empty() && invalid.is_empty() {
             self.persist_discarded_tool_calls(&text_content, stream_error.take(), event_tx)
                 .await;
             return IterationOutcome::EndTurn;
@@ -1756,7 +1756,7 @@ Rules:
             self.recent_tool_names.insert(t.function.name.clone());
         }
 
-        self.execute_tool_calls(&tc, &text_content, event_tx, cancel)
+        self.execute_tool_calls(&tc, &invalid, &text_content, event_tx, cancel)
             .await;
 
         // Drain any steer messages from the user at the tool boundary
@@ -2399,14 +2399,32 @@ Rules:
 
     /// Persist the assistant message with tool calls, partition and execute them,
     /// running shell/browser sequentially and other tools in parallel.
+    ///
+    /// `invalid` holds tool calls the LLM emitted that failed validation
+    /// (malformed JSON, oversized) but still have id+name. We surface them as
+    /// synthetic `Error:`-prefixed tool_results both to the TUI (so the user
+    /// sees the failure) and to the LLM history (so the next turn can retry).
+    /// All shells — valid and invalid — go into the assistant message so the
+    /// API contract "every tool_call has a matching tool_result" is preserved.
     async fn execute_tool_calls(
         &mut self,
         tc: &[ToolCall],
+        invalid: &[InvalidToolCall],
         text_content: &str,
         event_tx: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) {
-        let tc_for_msg = tc.to_vec();
+        let mut tc_for_msg = tc.to_vec();
+        for inv in invalid {
+            tc_for_msg.push(ToolCall {
+                id: inv.id.clone(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: inv.name.clone(),
+                    arguments: inv.raw_arguments.clone(),
+                },
+            });
+        }
         let assistant_msg = Message {
             role: crate::types::Role::Assistant,
             content: if text_content.is_empty() {
@@ -2419,6 +2437,27 @@ Rules:
             timestamp: Some(chrono::Local::now().to_rfc3339()),
         };
         self.log_and_persist(assistant_msg);
+
+        for inv in invalid {
+            let body = format_invalid_tool_result(inv);
+            // Hooks intentionally NOT fired here: the tool never dispatched,
+            // so emitting AfterToolCall without a matching BeforeToolCall
+            // would skew hook accounting and surprise authors counting
+            // Before↔After pairs.
+            let _ = event_tx
+                .send(AgentEvent::ToolExecuting {
+                    name: inv.name.clone(),
+                    args: inv.raw_arguments.clone(),
+                })
+                .await;
+            let _ = event_tx
+                .send(AgentEvent::ToolResult {
+                    name: inv.name.clone(),
+                    result: body.clone(),
+                })
+                .await;
+            self.log_and_persist(Message::tool_result(&inv.id, &body));
+        }
 
         // Plan concurrent tool groups. The planner guarantees every group
         // either (a) contains a single Unknown-effect tool or (b) contains
@@ -2977,50 +3016,123 @@ async fn dispatch_parallel_safe_tool(
     }
 }
 
-/// Validate and convert partial tool calls from the LLM stream into well-formed `ToolCall`s.
-/// Drops incomplete, oversized, or malformed entries.
-fn validate_tool_calls(tool_calls: &[PartialToolCall]) -> Vec<ToolCall> {
-    tool_calls
+/// A tool call the LLM emitted that failed validation but still has enough
+/// metadata (id + name) to address a synthetic `tool_result` back to the
+/// model. We surface these as "Error: ..." results in the TUI and feed them
+/// into history so the LLM can retry on the next turn.
+#[derive(Debug, Clone)]
+struct InvalidToolCall {
+    id: String,
+    name: String,
+    reason: String,
+    raw_arguments: String,
+}
+
+/// Partition partial tool calls from the LLM stream into:
+/// - `valid`: well-formed `ToolCall`s ready to execute.
+/// - `invalid`: addressable failures (id + name present) that must be surfaced
+///   as synthetic error tool_results so the LLM gets feedback and retries.
+///
+/// Calls without a usable id are fully discarded (no way to address a
+/// `tool_result`); they show up only in `tracing::warn!` for ops visibility.
+fn partition_tool_calls(tool_calls: &[PartialToolCall]) -> (Vec<ToolCall>, Vec<InvalidToolCall>) {
+    let mut valid = Vec::new();
+    let mut invalid = Vec::new();
+    for ptc in tool_calls
         .iter()
         .take(constants::MAX_TOOL_CALLS_PER_RESPONSE)
-        .filter(|ptc| {
-            if ptc.name.is_empty() || ptc.id.is_empty() {
-                warn!("Dropping incomplete tool call (missing name or id)");
-                return false;
-            }
-            if ptc.name.len() > constants::MAX_TOOL_NAME_LEN {
-                warn!(
-                    "Dropping tool call with oversized name ({} bytes)",
-                    ptc.name.len()
-                );
-                return false;
-            }
-            if ptc.arguments.len() > constants::MAX_TOOL_ARGS_LEN {
-                warn!(
-                    "Dropping tool call '{}' with oversized arguments ({} bytes)",
-                    ptc.name,
-                    ptc.arguments.len()
-                );
-                return false;
-            }
-            if serde_json::from_str::<serde_json::Value>(&ptc.arguments).is_err() {
-                warn!(
-                    "Dropping tool call '{}' with incomplete JSON arguments",
-                    ptc.name
-                );
-                return false;
-            }
-            true
-        })
-        .map(|ptc| ToolCall {
+    {
+        if ptc.id.is_empty() {
+            warn!(
+                "Dropping unaddressable tool call (missing id, name='{}')",
+                ptc.name
+            );
+            continue;
+        }
+        if ptc.name.is_empty() {
+            warn!(
+                "Dropping unaddressable tool call (id={}, missing name)",
+                ptc.id
+            );
+            continue;
+        }
+        if ptc.name.len() > constants::MAX_TOOL_NAME_LEN {
+            let reason = format!("tool name exceeds {} bytes", constants::MAX_TOOL_NAME_LEN);
+            warn!("Invalid tool call '{}': {}", ptc.name, reason);
+            invalid.push(InvalidToolCall {
+                id: ptc.id.clone(),
+                name: ptc.name.clone(),
+                reason,
+                raw_arguments: ptc.arguments.clone(),
+            });
+            continue;
+        }
+        if ptc.arguments.len() > constants::MAX_TOOL_ARGS_LEN {
+            let reason = format!(
+                "arguments exceed {} bytes ({} received)",
+                constants::MAX_TOOL_ARGS_LEN,
+                ptc.arguments.len()
+            );
+            warn!("Invalid tool call '{}': {}", ptc.name, reason);
+            invalid.push(InvalidToolCall {
+                id: ptc.id.clone(),
+                name: ptc.name.clone(),
+                reason,
+                raw_arguments: ptc.arguments.clone(),
+            });
+            continue;
+        }
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(&ptc.arguments) {
+            let reason = format!("invalid JSON arguments: {e}");
+            warn!("Invalid tool call '{}': {}", ptc.name, reason);
+            invalid.push(InvalidToolCall {
+                id: ptc.id.clone(),
+                name: ptc.name.clone(),
+                reason,
+                raw_arguments: ptc.arguments.clone(),
+            });
+            continue;
+        }
+        valid.push(ToolCall {
             id: ptc.id.clone(),
             call_type: "function".to_string(),
             function: FunctionCall {
                 name: ptc.name.clone(),
                 arguments: ptc.arguments.clone(),
             },
-        })
-        .collect()
+        });
+    }
+    (valid, invalid)
+}
+
+/// Maximum chars of raw arguments echoed back to the LLM in a synthetic
+/// error tool_result. Long enough for the model to spot where its JSON broke
+/// without ballooning the next prompt.
+const INVALID_TOOL_ARGS_PREVIEW_LEN: usize = 2000;
+
+/// Format a synthetic tool_result body for an invalid tool call. Prefix is
+/// `Error:` so existing `is_error` detection (TUI red box, hook is_error
+/// flag) lights up automatically.
+fn format_invalid_tool_result(invalid: &InvalidToolCall) -> String {
+    let preview = if invalid.raw_arguments.len() > INVALID_TOOL_ARGS_PREVIEW_LEN {
+        // Walk back to the nearest char boundary so multi-byte UTF-8 inside
+        // the LLM's malformed JSON can't panic the agent loop.
+        let mut end = INVALID_TOOL_ARGS_PREVIEW_LEN;
+        while end > 0 && !invalid.raw_arguments.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!(
+            "{}…[truncated; total {} bytes]",
+            &invalid.raw_arguments[..end],
+            invalid.raw_arguments.len()
+        )
+    } else {
+        invalid.raw_arguments.clone()
+    };
+    format!(
+        "Error: invalid tool arguments — {reason}\n\nraw arguments:\n{preview}",
+        reason = invalid.reason,
+    )
 }
 
 #[derive(Default)]
@@ -3720,5 +3832,201 @@ mod tests {
         assert!(security < silent, "security before silent reply");
         assert!(silent < heartbeat, "silent reply before heartbeat");
         assert!(heartbeat < env, "heartbeat before environment");
+    }
+
+    // ── partition_tool_calls: surface invalid tool calls instead of dropping ──
+    //
+    // Regression: prior `validate_tool_calls` silently filtered malformed
+    // calls (e.g. truncated JSON `apply_patch` arguments) so the LLM never
+    // saw a tool_result and couldn't retry — and the TUI showed nothing.
+
+    fn ptc(id: &str, name: &str, args: &str) -> PartialToolCall {
+        PartialToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: args.to_string(),
+        }
+    }
+
+    #[test]
+    fn partition_tool_calls_classifies_invalid_json_as_addressable() {
+        let calls = vec![ptc(
+            "call_1",
+            "apply_patch",
+            "{\"input\": \"*** Begin", // truncated JSON
+        )];
+        let (valid, invalid) = partition_tool_calls(&calls);
+        assert!(valid.is_empty(), "truncated JSON must not be marked valid");
+        assert_eq!(invalid.len(), 1, "exactly one invalid call expected");
+        assert_eq!(invalid[0].id, "call_1");
+        assert_eq!(invalid[0].name, "apply_patch");
+        assert!(
+            invalid[0].reason.contains("invalid JSON"),
+            "reason should describe the JSON parse failure, got: {}",
+            invalid[0].reason,
+        );
+        assert_eq!(invalid[0].raw_arguments, "{\"input\": \"*** Begin");
+    }
+
+    #[test]
+    fn partition_tool_calls_drops_unaddressable_calls() {
+        // Without an id we cannot send a tool_result back, so these must be
+        // dropped entirely (no synthetic error feedback possible).
+        let calls = vec![
+            ptc("", "apply_patch", "{}"), // missing id
+            ptc("call_1", "", "{}"),      // missing name
+        ];
+        let (valid, invalid) = partition_tool_calls(&calls);
+        assert!(valid.is_empty());
+        assert!(
+            invalid.is_empty(),
+            "unaddressable calls must not be promoted to invalid bucket — \
+             we have no id to address a synthetic tool_result to",
+        );
+    }
+
+    #[test]
+    fn partition_tool_calls_classifies_each_failure_axis() {
+        // Table-driven over the addressable failure modes. Each row must land
+        // in the `invalid` bucket with id+name preserved and a reason that
+        // names the specific failure.
+        let oversized_name = "x".repeat(constants::MAX_TOOL_NAME_LEN + 1);
+        let oversized_args = format!("\"{}\"", "y".repeat(constants::MAX_TOOL_ARGS_LEN));
+        let cases: Vec<(&str, PartialToolCall, &str)> = vec![
+            (
+                "oversized_name",
+                ptc("id_a", &oversized_name, "{}"),
+                "tool name exceeds",
+            ),
+            (
+                "oversized_args",
+                ptc("id_b", "run_shell", &oversized_args),
+                "arguments exceed",
+            ),
+            (
+                "invalid_json",
+                ptc("id_c", "apply_patch", "{not json"),
+                "invalid JSON",
+            ),
+        ];
+        for (label, call, reason_substr) in cases {
+            let (valid, invalid) = partition_tool_calls(std::slice::from_ref(&call));
+            assert!(valid.is_empty(), "{label}: should not be valid");
+            assert_eq!(invalid.len(), 1, "{label}: expected one invalid entry");
+            assert_eq!(invalid[0].id, call.id, "{label}: id preserved");
+            assert_eq!(invalid[0].name, call.name, "{label}: name preserved");
+            assert!(
+                invalid[0].reason.contains(reason_substr),
+                "{label}: reason `{}` should mention `{reason_substr}`",
+                invalid[0].reason,
+            );
+        }
+    }
+
+    #[test]
+    fn partition_tool_calls_passes_well_formed() {
+        let calls = vec![ptc("call_1", "read_file", "{\"path\": \"a.txt\"}")];
+        let (valid, invalid) = partition_tool_calls(&calls);
+        assert_eq!(valid.len(), 1);
+        assert!(invalid.is_empty());
+        assert_eq!(valid[0].id, "call_1");
+        assert_eq!(valid[0].function.name, "read_file");
+        assert_eq!(valid[0].function.arguments, "{\"path\": \"a.txt\"}");
+    }
+
+    #[test]
+    fn format_invalid_tool_result_is_error_prefixed_and_includes_args() {
+        // The TUI's `is_error` detection in
+        // crates/interface/src/tui/app/events.rs:299 uses
+        // `result.starts_with("Error:")` — break that prefix and the
+        // failure renders as a normal (green ✓) tool result.
+        let inv = InvalidToolCall {
+            id: "call_1".into(),
+            name: "apply_patch".into(),
+            reason: "invalid JSON arguments: EOF while parsing a string".into(),
+            raw_arguments: "{\"input\": \"*** Begin".into(),
+        };
+        let body = format_invalid_tool_result(&inv);
+        assert!(
+            body.starts_with("Error:"),
+            "must keep `Error:` prefix so TUI red-box rendering and \
+             `is_error` hook flag both fire — got: {body}",
+        );
+        assert!(
+            body.contains("invalid JSON arguments"),
+            "reason must surface in the body so the LLM can fix its next attempt",
+        );
+        assert!(
+            body.contains("{\"input\": \"*** Begin"),
+            "raw arguments must be echoed so the LLM sees what it sent",
+        );
+    }
+
+    #[test]
+    fn format_invalid_tool_result_handles_multibyte_boundary() {
+        // Regression: naive `&s[..N]` panics if N falls inside a multi-byte
+        // UTF-8 char. LLM-emitted JSON regularly contains multi-byte chars
+        // (curly quotes, em-dashes, non-Latin text) so this would panic the
+        // agent loop in production.
+        let mut args = String::with_capacity(INVALID_TOOL_ARGS_PREVIEW_LEN * 3);
+        // Pad with ASCII up to one byte before the cap, then a 3-byte char
+        // straddles the boundary.
+        for _ in 0..(INVALID_TOOL_ARGS_PREVIEW_LEN - 1) {
+            args.push('a');
+        }
+        args.push('€'); // 3 bytes
+        for _ in 0..INVALID_TOOL_ARGS_PREVIEW_LEN {
+            args.push('b');
+        }
+        let inv = InvalidToolCall {
+            id: "id".into(),
+            name: "n".into(),
+            reason: "r".into(),
+            raw_arguments: args,
+        };
+        let body = format_invalid_tool_result(&inv); // must not panic
+        assert!(body.contains("truncated"));
+    }
+
+    #[test]
+    fn format_invalid_tool_result_truncates_long_args() {
+        let inv = InvalidToolCall {
+            id: "call_1".into(),
+            name: "apply_patch".into(),
+            reason: "invalid JSON".into(),
+            raw_arguments: "z".repeat(INVALID_TOOL_ARGS_PREVIEW_LEN * 2),
+        };
+        let body = format_invalid_tool_result(&inv);
+        assert!(body.contains("truncated"));
+        // Body length is bounded — preview cap + small fixed overhead.
+        // Keep the bound generous to avoid brittle exact-byte checks.
+        assert!(
+            body.len() < INVALID_TOOL_ARGS_PREVIEW_LEN + 500,
+            "preview must cap the echoed args (got {} bytes)",
+            body.len(),
+        );
+    }
+
+    #[test]
+    fn run_iteration_routes_invalid_calls_through_execute_tool_calls() {
+        // Source-grep guard for the contract between run_iteration and
+        // execute_tool_calls: invalid (addressable) calls must NOT skip the
+        // execute path, otherwise the assistant message persists with a
+        // tool_call shell that has no matching tool_result and the LLM API
+        // rejects the next turn.
+        let iter_idx = AGENT_RS_SRC
+            .find("let (tc, invalid) = partition_tool_calls(")
+            .expect("partition_tool_calls call site must exist in run_iteration");
+        let after = &AGENT_RS_SRC[iter_idx..];
+        let early_return = after
+            .find("if tc.is_empty() && invalid.is_empty()")
+            .expect("early-return guard must check BOTH valid and invalid as empty");
+        let exec_call = after
+            .find("self.execute_tool_calls(&tc, &invalid,")
+            .expect("execute_tool_calls must be invoked with both valid and invalid slices");
+        assert!(
+            early_return < exec_call,
+            "the empty-check must precede the execute call",
+        );
     }
 }
