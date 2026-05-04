@@ -14,6 +14,24 @@ use tokio::sync::watch;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// Acquire the agent mutex from a sync trait method that may be invoked
+/// from an async gRPC handler (i.e. from inside the tokio runtime).
+///
+/// `tokio::sync::Mutex::blocking_lock` panics with "Cannot block the current
+/// thread from within a runtime" when called on a worker thread, and the
+/// panic kills that worker mid-turn — which is how `/poke`-triggered
+/// heartbeats end up surfacing as `*poked Borggundy*` and nothing else: the
+/// `Session.GetState` snapshot RPC racing the in-flight turn panicked the
+/// thread that was streaming events back through the bus.
+///
+/// `block_in_place` lets the multi-thread runtime move other tasks off this
+/// worker so we can block on the lock without starving the scheduler. The
+/// trait surface stays synchronous (and stub backends stay simple); only
+/// `AgentBackend`'s production path needs the async-lock bridge.
+fn lock_agent(agent: &Mutex<Agent>) -> tokio::sync::MutexGuard<'_, Agent> {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(agent.lock()))
+}
+
 /// Snapshot of the agent's user-facing state for `Session.GetState`.
 #[derive(Debug, Clone)]
 pub struct SessionStateSnapshot {
@@ -292,41 +310,41 @@ impl SessionBackend for AgentBackend {
     }
 
     fn clear_history(&self) -> anyhow::Result<()> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         agent.clear_history();
         Ok(())
     }
 
     fn undo(&self) -> anyhow::Result<usize> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         Ok(agent.undo())
     }
 
     fn rewind_to_nth_user_message(&self, n: usize) -> anyhow::Result<usize> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         Ok(agent.rewind_to_nth_user_message(n))
     }
 
     fn auto_save(&self) -> anyhow::Result<()> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         agent.auto_save();
         Ok(())
     }
 
     fn new_agent_session(&self) -> anyhow::Result<String> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         agent.new_session();
         Ok(agent.session().meta.id.clone())
     }
 
     fn load_agent_session(&self, id: &str) -> anyhow::Result<u64> {
-        let mut agent = self.agent.blocking_lock();
+        let mut agent = lock_agent(&self.agent);
         agent.load_session(id)?;
         Ok(agent.session().messages.len() as u64)
     }
 
     fn snapshot_state(&self) -> anyhow::Result<SessionStateSnapshot> {
-        let agent = self.agent.blocking_lock();
+        let agent = lock_agent(&self.agent);
         let session = agent.session();
         let cfg = agent.config();
         let (msgs, users) = agent.conversation_stats();
@@ -375,5 +393,32 @@ impl SessionBackend for AgentBackend {
         })
         .await
         .map_err(|e| anyhow::anyhow!("fork task panicked: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: calling `lock_agent` from within a multi-thread tokio
+    /// runtime (which is what every production gRPC handler does) must not
+    /// panic with "Cannot block the current thread from within a runtime".
+    /// The naive `Mutex::blocking_lock()` panics here, killing the worker
+    /// thread mid-turn. Symptom in production: `/poke` shows the local
+    /// "*poked Borggundy*" line but no heartbeat response — the panic
+    /// aborts the worker that was streaming bus events back to the TUI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lock_agent_does_not_panic_inside_runtime() {
+        // Models the production failure mode: a sync function using
+        // `block_in_place + block_on` is called from inside a tokio async
+        // task. Naive `Mutex::blocking_lock()` panics with "Cannot block
+        // the current thread from within a runtime"; the bridge below must
+        // not.
+        let mutex = std::sync::Arc::new(Mutex::new(42i64));
+        fn sync_lock_bridge(m: &Mutex<i64>) -> tokio::sync::MutexGuard<'_, i64> {
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(m.lock()))
+        }
+        let g = sync_lock_bridge(&mutex);
+        assert_eq!(*g, 42);
     }
 }
