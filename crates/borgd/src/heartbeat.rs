@@ -18,6 +18,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -115,6 +116,23 @@ impl HeartbeatBus {
     }
 }
 
+/// Process-wide handle to the live `HeartbeatBus`. Set once by
+/// `heartbeat::spawn` so the unified scheduler dispatcher
+/// (`task_runner::execute_heartbeat_task`) can publish events into the same
+/// bus that `Admin.SubscribeHeartbeatEvents` reads from — without plumbing
+/// the bus through `TaskExecContext`. Without this, scheduled heartbeat
+/// firings would be invisible to TUI status views post-V52.
+static GLOBAL_BUS: OnceLock<HeartbeatBus> = OnceLock::new();
+
+/// Publish a heartbeat event into the process-global bus, if one has been
+/// installed. No-op when called before `heartbeat::spawn` (e.g. unit tests
+/// that drive the dispatcher in isolation).
+pub(crate) fn publish_global(evt: DaemonHeartbeatEvent) {
+    if let Some(bus) = GLOBAL_BUS.get() {
+        bus.publish(evt);
+    }
+}
+
 /// Spawn the heartbeat scheduler + an agent-turn runner. Returns the bus
 /// that `Admin.SubscribeHeartbeatEvents` reads from, the rich trigger channel
 /// Admin RPCs use, and the legacy `poke_tx` channel the HTTP gateway still
@@ -148,6 +166,10 @@ pub fn spawn(
     drop(_hb_tx);
 
     let bus = HeartbeatBus::default();
+    // Install the bus in the process-global slot so the unified scheduled-task
+    // dispatcher can publish into it. Idempotent — repeated calls (e.g. across
+    // test setups) keep the first bus and silently ignore later inits.
+    let _ = GLOBAL_BUS.set(bus.clone());
     let bus_for_runner = bus.clone();
     let runner_cancel = shutdown;
     let runner_executor = executor;
@@ -260,7 +282,7 @@ pub async fn run_and_broadcast(
 /// the check warns "no heartbeat activity recorded" even when ticks are
 /// firing normally. Best-effort: a failed log entry must not break the
 /// heartbeat path.
-fn log_heartbeat_activity(source: HeartbeatSource, status: &str, message: &str) {
+pub(crate) fn log_heartbeat_activity(source: HeartbeatSource, status: &str, message: &str) {
     // Fire-and-forget — opening the DB and writing the row is fast, but
     // we run it on a blocking thread to keep this off the runtime.
     let source_wire = source.as_wire().to_string();

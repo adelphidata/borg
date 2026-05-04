@@ -740,21 +740,38 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         ..
     } = ctx;
 
+    let started_unix = *started_at_ms / 1000;
     let bypass = task.bypass_quiet_hours_once;
     let now = chrono::Utc::now().timestamp();
 
     if !bypass && crate::heartbeat::is_quiet_hours(config) {
         record_heartbeat_skip(*run_id, *started_at_ms, "quiet_hours", task_name);
+        publish_skip_event(started_unix, "quiet_hours");
         return;
     }
 
+    // Min-interval gate. Look at recent runs and find the most recent
+    // *delivered* one — skip rows (quiet_hours / min_interval / silent /
+    // zero_info / dedup_suppressed) record `status='success'` with the
+    // reason in `result`, so a naive "first success" lookup would let a
+    // long quiet-hours window suppress the very next legitimate fire.
     if !bypass {
         if let Some(min_interval) = task.min_interval_secs {
-            let last_success = match cortex::db::Database::open() {
-                Ok(db) => match db.task_run_history(task_id, 10) {
+            let last_delivered = match cortex::db::Database::open() {
+                Ok(db) => match db.task_run_history(task_id, 20) {
                     Ok(rows) => rows
                         .into_iter()
-                        .find(|r| r.status == cortex::tasks::RUN_STATUS_SUCCESS)
+                        .find(|r| {
+                            r.status == cortex::tasks::RUN_STATUS_SUCCESS
+                                && !matches!(
+                                    r.result.as_deref(),
+                                    Some("quiet_hours")
+                                        | Some("min_interval")
+                                        | Some("silent")
+                                        | Some("zero_info")
+                                        | Some("dedup_suppressed")
+                                )
+                        })
                         .map(|r| r.started_at),
                     Err(e) => {
                         tracing::warn!("Heartbeat: history lookup failed: {e}");
@@ -766,9 +783,10 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
                     None
                 }
             };
-            if let Some(last) = last_success {
+            if let Some(last) = last_delivered {
                 if now.saturating_sub(last) < min_interval {
                     record_heartbeat_skip(*run_id, *started_at_ms, "min_interval", task_name);
+                    publish_skip_event(started_unix, "min_interval");
                     return;
                 }
             }
@@ -798,7 +816,9 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     let llm = match LlmClient::new(config) {
         Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone()),
         Err(e) => {
-            record_heartbeat_failure(*run_id, *started_at_ms, &format!("{e}"), task_name);
+            let err_str = format!("{e}");
+            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name);
+            publish_failed_event(started_unix, &err_str);
             return;
         }
     };
@@ -806,11 +826,14 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
     let response = match result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            record_heartbeat_failure(*run_id, *started_at_ms, &format!("{e}"), task_name);
+            let err_str = format!("{e}");
+            record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name);
+            publish_failed_event(started_unix, &err_str);
             return;
         }
         Err(_) => {
             record_heartbeat_failure(*run_id, *started_at_ms, "Heartbeat timed out", task_name);
+            publish_failed_event(started_unix, "Heartbeat timed out");
             return;
         }
     };
@@ -820,24 +843,32 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
 
     if is_silent_response(&result_text) {
         record_heartbeat_silent(*run_id, duration_ms, "silent", task_name);
+        publish_skip_event(started_unix, "silent");
         return;
     }
     if result_text.is_empty() || crate::heartbeat::is_zero_info_heartbeat(&result_text) {
         record_heartbeat_silent(*run_id, duration_ms, "zero_info", task_name);
+        publish_skip_event(started_unix, "zero_info");
         return;
     }
     let new_hash = response_hash(&result_text);
     if task.last_response_hash.as_deref() == Some(new_hash.as_str()) {
         record_heartbeat_silent(*run_id, duration_ms, "dedup_suppressed", task_name);
+        publish_skip_event(started_unix, "dedup_suppressed");
         return;
     }
 
-    if let Ok(db) = cortex::db::Database::open() {
-        if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&result_text), None) {
-            tracing::warn!("Heartbeat: failed to finalize run: {e}");
+    match cortex::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(*run_id, duration_ms, Some(&result_text), None) {
+                tracing::warn!("Heartbeat: failed to finalize run: {e}");
+            }
+            if let Err(e) = db.update_task_response_hash(task_id, Some(&new_hash)) {
+                tracing::warn!("Heartbeat: failed to persist last_response_hash: {e}");
+            }
         }
-        if let Err(e) = db.update_task_response_hash(task_id, Some(&new_hash)) {
-            tracing::warn!("Heartbeat: failed to persist last_response_hash: {e}");
+        Err(e) => {
+            tracing::warn!("Heartbeat: DB open for finalize failed: {e}");
         }
     }
 
@@ -849,6 +880,63 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
             deliver_task_result(delivery_channel, tgt, task_name, &result_text, config).await;
         }
     }
+
+    // Doctor's `check_heartbeat` reads `activity_log` to detect a stalled
+    // scheduler — a missing entry would surface as "no heartbeat activity
+    // recorded" even on a healthy fire. Mirror what the legacy
+    // `run_and_broadcast` did so the unified path stays observable.
+    crate::heartbeat::log_heartbeat_activity(
+        crate::heartbeat::HeartbeatSource::Scheduled,
+        "ran",
+        &result_text,
+    );
+    publish_ran_event(started_unix, &result_text, duration_ms as f64);
+}
+
+fn publish_ran_event(started_unix: i64, message: &str, duration_ms: f64) {
+    crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
+        source: crate::heartbeat::HeartbeatSource::Scheduled,
+        started_at_unix: started_unix,
+        finished_at_unix: chrono::Utc::now().timestamp(),
+        status: "ran",
+        message: message.to_string(),
+        skip_reason: None,
+        duration_ms,
+    });
+}
+
+fn publish_skip_event(started_unix: i64, reason: &'static str) {
+    crate::heartbeat::log_heartbeat_activity(
+        crate::heartbeat::HeartbeatSource::Scheduled,
+        "skipped",
+        reason,
+    );
+    crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
+        source: crate::heartbeat::HeartbeatSource::Scheduled,
+        started_at_unix: started_unix,
+        finished_at_unix: chrono::Utc::now().timestamp(),
+        status: "skipped",
+        message: reason.to_string(),
+        skip_reason: Some(reason),
+        duration_ms: 0.0,
+    });
+}
+
+fn publish_failed_event(started_unix: i64, error: &str) {
+    crate::heartbeat::log_heartbeat_activity(
+        crate::heartbeat::HeartbeatSource::Scheduled,
+        "failed",
+        error,
+    );
+    crate::heartbeat::publish_global(crate::heartbeat::DaemonHeartbeatEvent {
+        source: crate::heartbeat::HeartbeatSource::Scheduled,
+        started_at_unix: started_unix,
+        finished_at_unix: chrono::Utc::now().timestamp(),
+        status: "failed",
+        message: error.to_string(),
+        skip_reason: None,
+        duration_ms: 0.0,
+    });
 }
 
 fn response_hash(text: &str) -> String {
@@ -861,29 +949,40 @@ fn response_hash(text: &str) -> String {
 
 fn record_heartbeat_skip(run_id: i64, started_at_ms: i64, reason: &str, task_name: &str) {
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-    if let Ok(db) = cortex::db::Database::open() {
-        if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(reason), None) {
-            tracing::warn!("Heartbeat '{task_name}': skip-record failed ({reason}): {e}");
+    match cortex::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(reason), None) {
+                tracing::warn!("Heartbeat '{task_name}': skip-record failed ({reason}): {e}");
+            }
         }
+        Err(e) => tracing::warn!(
+            "Heartbeat '{task_name}': DB open for skip-record failed ({reason}): {e}"
+        ),
     }
     tracing::info!(task = %task_name, reason, "heartbeat: skipped tick");
 }
 
 fn record_heartbeat_silent(run_id: i64, duration_ms: i64, marker: &str, task_name: &str) {
-    if let Ok(db) = cortex::db::Database::open() {
-        if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(marker), None) {
-            tracing::warn!("Heartbeat '{task_name}': silent-record failed: {e}");
+    match cortex::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(run_id, duration_ms, Some(marker), None) {
+                tracing::warn!("Heartbeat '{task_name}': silent-record failed: {e}");
+            }
         }
+        Err(e) => tracing::warn!("Heartbeat '{task_name}': DB open for silent-record failed: {e}"),
     }
     tracing::info!(task = %task_name, marker, "heartbeat: suppressed delivery");
 }
 
 fn record_heartbeat_failure(run_id: i64, started_at_ms: i64, error: &str, task_name: &str) {
     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;
-    if let Ok(db) = cortex::db::Database::open() {
-        if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
-            tracing::warn!("Heartbeat '{task_name}': failure-record failed: {e}");
+    match cortex::db::Database::open() {
+        Ok(db) => {
+            if let Err(e) = db.complete_task_run(run_id, duration_ms, None, Some(error)) {
+                tracing::warn!("Heartbeat '{task_name}': failure-record failed: {e}");
+            }
         }
+        Err(e) => tracing::warn!("Heartbeat '{task_name}': DB open for failure-record failed: {e}"),
     }
     tracing::warn!(task = %task_name, error, "heartbeat: failed");
 }

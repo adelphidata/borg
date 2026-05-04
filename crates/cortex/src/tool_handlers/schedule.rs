@@ -71,6 +71,9 @@ pub fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result
         "update" => manage_tasks_update(args),
         "pause" => {
             let task_id = require_str_param(args, "task_id")?;
+            if let Some(msg) = reject_system_task(task_id, "pause") {
+                return Ok(msg);
+            }
             update_task_status(task_id, tasks::TASK_STATUS_PAUSED, "paused")
         }
         "resume" => {
@@ -260,6 +263,16 @@ fn manage_tasks_get(args: &serde_json::Value) -> Result<String> {
 
 fn manage_tasks_update(args: &serde_json::Value) -> Result<String> {
     let task_id = require_str_param(args, "task_id")?;
+    if let Some(msg) = reject_system_task(task_id, "update") {
+        return Ok(msg);
+    }
+    if let Some(ch) = optional_str_param(args, "delivery_channel") {
+        if ch == crate::heartbeat_task::BROADCAST_DELIVERY {
+            return Ok(format!(
+                "Error: delivery_channel='{ch}' is reserved for system tasks; user tasks must target a single channel."
+            ));
+        }
+    }
     let update = crate::db::UpdateTask {
         name: optional_str_param(args, "name"),
         prompt: optional_str_param(args, "prompt"),
@@ -320,13 +333,18 @@ fn manage_tasks_runs(args: &serde_json::Value) -> Result<String> {
 
 fn manage_tasks_run_now(args: &serde_json::Value) -> Result<String> {
     let task_id = require_str_param(args, "task_id")?;
+    if let Some(msg) = reject_system_task(task_id, "run_now") {
+        return Ok(msg);
+    }
     with_db(|db| match db.get_task_by_id(task_id) {
         Ok(Some(_)) => {
             let now = chrono::Utc::now().timestamp();
             if let Err(e) = db.update_task_next_run(task_id, Some(now)) {
                 return Ok(format!("Error: {e}"));
             }
-            let _ = db.clear_task_retry(task_id);
+            if let Err(e) = db.clear_task_retry(task_id) {
+                tracing::warn!("schedule.run_now: clear_task_retry({task_id}) failed: {e}");
+            }
             Ok(format!("Task {task_id} queued for immediate execution."))
         }
         Ok(None) => Ok(format!("Task {task_id} not found.")),
@@ -584,6 +602,55 @@ mod tests {
         assert!(
             result.contains("refusing to delete") && result.contains("system-seeded"),
             "expected system-seed refusal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_pause_refuses_heartbeat_row() {
+        // The destructive-verb guard must cover pause too — pausing the
+        // heartbeat row would silently kill the proactive loop until the
+        // next migration re-seeded it (which is never, since INSERT OR
+        // IGNORE skips when the row exists).
+        let args = json!({
+            "action": "pause",
+            "task_id": crate::heartbeat_task::HEARTBEAT_TASK_ID,
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("refusing to pause") && result.contains("system-seeded"),
+            "expected pause refusal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_update_refuses_heartbeat_row() {
+        // schedule_expr update would let an attacker push the heartbeat to
+        // year-out, achieving the same outcome as delete. Cover via guard.
+        let args = json!({
+            "action": "update",
+            "task_id": crate::heartbeat_task::HEARTBEAT_TASK_ID,
+            "schedule_expr": "99y",
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("refusing to update"),
+            "expected update refusal, got: {result}"
+        );
+    }
+
+    #[test]
+    fn handle_manage_tasks_run_now_refuses_heartbeat_row() {
+        // run_now should not double-fire the heartbeat through the user
+        // tool — the dedicated `/poke` path goes through the executor
+        // (vitals, hooks, evolution); the dispatcher path lacks those.
+        let args = json!({
+            "action": "run_now",
+            "task_id": crate::heartbeat_task::HEARTBEAT_TASK_ID,
+        });
+        let result = handle_manage_tasks(&args, &Config::default()).unwrap();
+        assert!(
+            result.contains("refusing to run_now"),
+            "expected run_now refusal, got: {result}"
         );
     }
 
