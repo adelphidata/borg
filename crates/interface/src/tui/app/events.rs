@@ -69,15 +69,8 @@ impl<'a> App<'a> {
                 }
             }
             DoctorEvent::Done { pass, warn, fail } => {
-                let mut summary =
+                let summary =
                     format!("Summary: {pass} passed, {warn} warning(s), {fail} failed");
-                if warn > 0 || fail > 0 {
-                    summary.push_str(
-                        "\n\nUse /doctor squelch <Category>:<Name> to suppress a finding from \
-                         heartbeat reminders for the next 30 days. /doctor squelches lists active \
-                         squelches; /doctor unsquelch <key> drops one.",
-                    );
-                }
                 self.push_system_message(summary);
                 self.doctor_rx = None;
             }
