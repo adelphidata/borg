@@ -107,6 +107,15 @@ impl<'a> App<'a> {
 
     /// Push the shared Borg card (the same one rendered at the top of the
     /// transcript) into the cell history. Used by `/card`.
+    ///
+    /// The card lines are also written directly to `pending_scrollback` and
+    /// `cells_emitted` is advanced past the new cell so the viewport never
+    /// renders the card as its live tail. Without this, the inline viewport
+    /// — bounded to a few rows by `compute_viewport_height` — clips
+    /// everything past the first 2-3 lines of the card (`flush_stable_cells`
+    /// deliberately skips the tail to keep streaming cells mutable). The
+    /// startup banner avoided this by writing to scrollback directly; `/card`
+    /// must mirror that or it appears truncated to "BORG vX.Y.Z" + name only.
     pub(crate) fn push_borg_card(&mut self) {
         let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
         let ambient = if self.config.evolution.ambient_header_enabled {
@@ -120,7 +129,13 @@ impl<'a> App<'a> {
             ambient,
             self.pending_update_version.as_deref(),
         );
+        self.pending_scrollback.extend(lines.clone());
         self.cells.push(HistoryCell::Card { lines });
+        // Mark the just-pushed Card as already emitted: the viewport's
+        // tail-render path would otherwise show only the first `viewport_height`
+        // rows of the card. Advancing `cells_emitted` past it tells
+        // `render_pending_cells` that this cell has already gone to scrollback.
+        self.cells_emitted = self.cells.len();
     }
 
     pub(super) fn compute_context_pct(&self) -> u8 {
@@ -1337,6 +1352,65 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|l| l == "update: v0.6.0 installed; restart required"));
+    }
+
+    /// Regression: `/card` must put the *full* card into terminal scrollback
+    /// (BORG header, blank, name, model, plus class/mood when ambient is set
+    /// and update line when pending). Before the fix, the card was only
+    /// pushed to `cells` and became the live-tail HistoryCell — the inline
+    /// viewport clipped it to the first 2-3 rows, hiding model/class/mood.
+    /// The startup banner takes the same `pending_scrollback` path; this
+    /// test asserts `/card` matches that contract end-to-end.
+    #[test]
+    fn push_borg_card_emits_full_card_to_scrollback() {
+        let mut app = make_app();
+        app.config.user.agent_name = Some("Borgbusters".into());
+        app.config.llm.model = "openai/gpt-5.4-nano".into();
+        app.config.evolution.ambient_header_enabled = true;
+        app.ambient_status = Some(mk_ambient(None, 0, Mood::Drifting, None));
+
+        let before = app.pending_scrollback.len();
+        app.push_borg_card();
+        let flushed: Vec<String> = app.pending_scrollback[before..]
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert!(
+            flushed.iter().any(|l| l.starts_with("BORG ")),
+            "missing BORG header line; flushed = {flushed:?}"
+        );
+        assert!(
+            flushed.iter().any(|l| l == "name:  Borgbusters"),
+            "missing name line; flushed = {flushed:?}"
+        );
+        assert!(
+            flushed.iter().any(|l| l == "model: openai/gpt-5.4-nano"),
+            "missing model line — this was the original /card truncation bug; \
+             flushed = {flushed:?}"
+        );
+        assert!(
+            flushed.iter().any(|l| l.starts_with("class:")),
+            "missing class line; flushed = {flushed:?}"
+        );
+        assert!(
+            flushed.iter().any(|l| l.starts_with("mood:")),
+            "missing mood line; flushed = {flushed:?}"
+        );
+
+        // The viewport must NOT re-render the card as its live tail —
+        // `cells_emitted` should be at the very end of `cells`, otherwise
+        // the small viewport area would clip the long card again.
+        assert_eq!(
+            app.cells_emitted,
+            app.cells.len(),
+            "Card cell was not marked emitted; viewport will clip the live tail"
+        );
     }
 
     #[test]
