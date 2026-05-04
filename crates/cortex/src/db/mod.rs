@@ -50,10 +50,6 @@ pub struct Database {
     /// Per-installation HMAC salt for event chain keys.
     /// Derived keys prevent cross-installation HMAC forgery.
     hmac_salt: Vec<u8>,
-    /// Filesystem renames deferred until after the migration transaction commits.
-    /// Keeps schema changes and filesystem moves atomic: if the migration rolls
-    /// back, the files stay in place and the next run can retry cleanly.
-    pending_post_migration_renames: std::cell::RefCell<Vec<(PathBuf, PathBuf)>>,
     /// Cached Ed25519 signing key + matching `device_keys.id`. Populated on
     /// first call to `record_evolution_event`; survives the process lifetime.
     /// `None` until first use; loading from the OS keychain is gated until
@@ -145,7 +141,6 @@ impl Database {
         Ok(Self {
             conn,
             hmac_salt: Vec::new(),
-            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
             evolution_signing_key: std::cell::RefCell::new(None),
             evolution_keystore_override: std::cell::RefCell::new(None),
         })
@@ -178,7 +173,6 @@ impl Database {
         let db = Self {
             conn,
             hmac_salt: Vec::new(),
-            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
             evolution_signing_key: std::cell::RefCell::new(None),
             evolution_keystore_override: std::cell::RefCell::new(None),
         };
@@ -191,7 +185,6 @@ impl Database {
         Ok(Self {
             conn: db.conn,
             hmac_salt: salt,
-            pending_post_migration_renames: std::cell::RefCell::new(Vec::new()),
             evolution_signing_key: std::cell::RefCell::new(None),
             evolution_keystore_override: std::cell::RefCell::new(None),
         })
@@ -256,14 +249,6 @@ impl Database {
         Ok((key, pubkey_id))
     }
 
-    /// Queue a filesystem rename to execute after the migration transaction commits.
-    /// Used by migrations that need to mutate external state atomically with schema changes.
-    pub(crate) fn queue_post_migration_rename(&self, src: PathBuf, dst: PathBuf) {
-        self.pending_post_migration_renames
-            .borrow_mut()
-            .push((src, dst));
-    }
-
     /// Get or create a per-installation random salt for HMAC key derivation.
     /// Stored in the meta table so it persists across restarts but is unique per install.
     fn get_or_create_hmac_salt(&self) -> Result<Vec<u8>> {
@@ -315,21 +300,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 52;
-
-    /// Check if a column exists on a table via `PRAGMA table_info`.
-    /// Safer than catching ALTER TABLE errors by string matching.
-    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
-        let mut stmt = match conn.prepare(&format!("PRAGMA table_info(\"{table}\")")) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let names: Vec<String> = match stmt.query_map([], |row| row.get::<_, String>(1)) {
-            Ok(rows) => rows.flatten().collect(),
-            Err(_) => return false,
-        };
-        names.iter().any(|name| name == column)
-    }
+    const CURRENT_VERSION: u32 = 1;
 
     fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside transaction
@@ -353,60 +324,7 @@ impl Database {
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin migration transaction")?;
 
-        const MIGRATIONS: &[fn(&Database) -> Result<()>] = &[
-            Database::migrate_v1,
-            Database::migrate_v2,
-            Database::migrate_v3,
-            Database::migrate_v4,
-            Database::migrate_v5,
-            Database::migrate_v6,
-            Database::migrate_v7,
-            Database::migrate_v8,
-            Database::migrate_v9,
-            Database::migrate_v10,
-            Database::migrate_v11,
-            Database::migrate_v12,
-            Database::migrate_v13,
-            Database::migrate_v14,
-            Database::migrate_v15,
-            Database::migrate_v16,
-            Database::migrate_v17,
-            Database::migrate_v18,
-            Database::migrate_v19,
-            Database::migrate_v20,
-            Database::migrate_v21,
-            Database::migrate_v22,
-            Database::migrate_v23,
-            Database::migrate_v24,
-            Database::migrate_v25,
-            Database::migrate_v26,
-            Database::migrate_v27,
-            Database::migrate_v28,
-            Database::migrate_v29,
-            Database::migrate_v30,
-            Database::migrate_v31,
-            Database::migrate_v32,
-            Database::migrate_v33,
-            Database::migrate_v34,
-            Database::migrate_v35,
-            Database::migrate_v36,
-            Database::migrate_v37,
-            Database::migrate_v38,
-            Database::migrate_v39,
-            Database::migrate_v40,
-            Database::migrate_v41,
-            Database::migrate_v42,
-            Database::migrate_v43,
-            Database::migrate_v44,
-            Database::migrate_v45,
-            Database::migrate_v46,
-            Database::migrate_v47,
-            Database::migrate_v48,
-            Database::migrate_v49,
-            Database::migrate_v50,
-            Database::migrate_v51,
-            Database::migrate_v52,
-        ];
+        const MIGRATIONS: &[fn(&Database) -> Result<()>] = &[Database::migrate_v1];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
         // will fail the build.
         const _: () = assert!(
@@ -423,25 +341,6 @@ impl Database {
 
         self.set_meta("schema_version", &Self::CURRENT_VERSION.to_string())?;
         tx.commit().context("Failed to commit migrations")?;
-
-        // Transaction committed: now perform any filesystem renames queued by
-        // migrations. Doing this after commit guarantees that if the DB
-        // rolls back, the source files remain untouched for a retry.
-        let renames = std::mem::take(&mut *self.pending_post_migration_renames.borrow_mut());
-        for (src, dst) in renames {
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => tracing::debug!(
-                    "post-migration rename: {} -> {}",
-                    src.display(),
-                    dst.display()
-                ),
-                Err(e) => tracing::warn!(
-                    "post-migration rename of {} -> {} failed: {e}",
-                    src.display(),
-                    dst.display()
-                ),
-            }
-        }
 
         // Run incremental vacuum after migrations to reclaim freed pages.
         self.conn.execute_batch("PRAGMA incremental_vacuum;")?;

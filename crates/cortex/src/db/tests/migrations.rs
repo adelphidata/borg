@@ -118,22 +118,21 @@ fn append_only_triggers_present_on_chain_tables() {
     }
 }
 
-// V51 demolished workflows + projects and added the pre_run preamble columns
-// to scheduled_tasks. Catches a partial migration: tables that should be gone
-// reappear, or any of the three columns are missing.
+// scheduled_tasks must expose the pre_run preamble columns (Hermes-style script
+// preprocessing) and the legacy workflow/project tables must not exist.
 #[test]
-fn v51_drops_workflow_and_project_tables_and_adds_pre_run_columns() {
+fn scheduled_tasks_has_pre_run_columns_and_no_workflow_tables() {
     let db = test_db();
-    for dropped in ["workflows", "workflow_steps", "projects"] {
+    for absent in ["workflows", "workflow_steps", "projects"] {
         let count: i64 = db
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?1",
-                rusqlite::params![dropped],
+                rusqlite::params![absent],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 0, "{dropped} must not exist after V51");
+        assert_eq!(count, 0, "{absent} must not exist");
     }
 
     let cols: Vec<String> = db

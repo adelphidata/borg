@@ -504,45 +504,6 @@ fn v35_fts_bm25_ranks_higher_term_frequency_first() {
 }
 
 #[test]
-fn v35_migration_backfills_existing_messages() {
-    // Simulate the upgrade path: messages already exist, then V35 is applied.
-    // The backfill SELECT is the fragile piece — forgetting it silently
-    // excludes every pre-migration row from search.
-    let db = test_db();
-    let id = db
-        .insert_message(
-            "s1",
-            "user",
-            Some("pre-existing legacy content about rustaceans"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("insert");
-
-    // Wipe FTS state as if the table didn't exist before V35. Drop triggers
-    // too so they don't auto-repopulate; re-apply the full V35 migration.
-    db.conn
-        .execute_batch(
-            "DROP TRIGGER IF EXISTS messages_ai;
-             DROP TRIGGER IF EXISTS messages_ad;
-             DROP TRIGGER IF EXISTS messages_au;
-             DROP TABLE IF EXISTS messages_fts;",
-        )
-        .expect("reset fts state");
-
-    db.migrate_v35().expect("re-run V35");
-
-    let hits = fts_match_rowids(&db, "rustaceans");
-    assert_eq!(
-        hits,
-        vec![id],
-        "V35 must backfill pre-existing messages into FTS"
-    );
-}
-
-#[test]
 fn messages_fts_search_returns_ranked_hits_with_metadata() {
     let db = test_db();
     db.insert_message(
