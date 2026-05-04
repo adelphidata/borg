@@ -637,7 +637,32 @@ async fn run_event_loop(
         let action = tokio::select! {
             biased;
 
-            // Agent events (check first for responsiveness)
+            // Terminal events FIRST under `biased`. A hot LLM stream keeps
+            // `event_rx` perpetually ready; if the agent-event arm sits above
+            // this one, biased select picks it every iteration and Esc never
+            // reaches `handle_key` — the user-visible "esc to interrupt does
+            // nothing" bug. Keys are low-volume; an agent-event burst can
+            // tolerate one extra select-cycle. INVARIANT: this arm must stay
+            // above `app.event_rx`. A source-grep guard test in this file
+            // enforces the ordering.
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(Event::Key(key))) => app.handle_key(key)?,
+                    Some(Ok(Event::Paste(text))) => app.handle_paste(text),
+                    // Intentionally NO `Event::Mouse` arm. We never enable
+                    // any mouse tracking mode (see `tui_lifecycle::set_modes`),
+                    // so no mouse events arrive. Inline-viewport mode delegates
+                    // scrollback to the terminal; alt-screen surfaces enable
+                    // xterm ?1007h so wheel events arrive as Up/Down keys.
+                    // DO NOT re-introduce a mouse handler — it would require
+                    // ?1000h/?1002h/?1003h, all of which break text selection.
+                    Some(Ok(Event::Resize(_, _))) => AppAction::Continue,
+                    Some(Err(_)) | None => AppAction::Quit,
+                    _ => AppAction::Continue,
+                }
+            }
+
+            // Agent events
             event = async {
                 if let Some(rx) = &mut app.event_rx {
                     rx.recv().await
@@ -711,24 +736,6 @@ async fn run_event_loop(
                     app.process_btw_result(result);
                 }
                 AppAction::Continue
-            }
-
-            // Terminal events
-            maybe_event = event_stream.next() => {
-                match maybe_event {
-                    Some(Ok(Event::Key(key))) => app.handle_key(key)?,
-                    Some(Ok(Event::Paste(text))) => app.handle_paste(text),
-                    // Intentionally NO `Event::Mouse` arm. We never enable
-                    // any mouse tracking mode (see `tui_lifecycle::set_modes`),
-                    // so no mouse events arrive. Inline-viewport mode delegates
-                    // scrollback to the terminal; alt-screen surfaces enable
-                    // xterm ?1007h so wheel events arrive as Up/Down keys.
-                    // DO NOT re-introduce a mouse handler — it would require
-                    // ?1000h/?1002h/?1003h, all of which break text selection.
-                    Some(Ok(Event::Resize(_, _))) => AppAction::Continue,
-                    Some(Err(_)) | None => AppAction::Quit,
-                    _ => AppAction::Continue,
-                }
             }
 
             // Tick for status bar elapsed time + throbber animation + paste burst flush
@@ -2017,6 +2024,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn run_event_loop_polls_terminal_input_before_agent_events() {
+        // INVARIANT: in the `biased` select! inside `run_event_loop`, the
+        // terminal-event arm (`event_stream.next()`) MUST appear before the
+        // agent-event arm (`app.event_rx`). A hot LLM stream keeps event_rx
+        // perpetually ready; reversing the order means biased select picks
+        // agent events every iteration and Esc never reaches `handle_key` —
+        // the user-visible "esc to interrupt does nothing" bug that this
+        // guard was added to prevent.
+        let src = include_str!("mod.rs");
+        let code = strip_tests_and_comments(src);
+        let term_idx = code
+            .find("event_stream.next()")
+            .expect("event_stream.next() arm not found in run_event_loop");
+        let agent_idx = code
+            .find("app.event_rx")
+            .expect("app.event_rx arm not found in run_event_loop");
+        assert!(
+            term_idx < agent_idx,
+            "terminal-event arm must be polled before agent-event arm in the \
+             biased select! inside run_event_loop. Reversing this order will \
+             starve key input during streaming and break Esc-to-interrupt."
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use ansi_to_tui::IntoText;
 use cortex::types::{PlanStep, PlanStepStatus};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::cell::RefCell;
 use throbber_widgets_tui::ThrobberState;
@@ -10,6 +10,34 @@ use super::line_utils;
 use super::line_utils::{prefix_lines, LIVE_PREFIX_COLS};
 use super::markdown;
 use super::theme;
+
+/// Head/tail line count for collapsed long assistant messages. A finalized
+/// assistant cell with more than `2 * ASSISTANT_PREVIEW_LINES` rendered lines
+/// is shown as `head + ellipsis + tail`; the user reaches the full body via
+/// the Ctrl+T transcript pager.
+const ASSISTANT_PREVIEW_LINES: usize = 20;
+const ASSISTANT_COLLAPSE_THRESHOLD: usize = ASSISTANT_PREVIEW_LINES * 2;
+
+/// Collapse a finalized assistant cell's rendered lines into
+/// `head + ellipsis + tail` when the body exceeds the threshold. Streaming
+/// cells skip this so the user sees live tokens in full.
+fn collapse_long_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.len() <= ASSISTANT_COLLAPSE_THRESHOLD {
+        return lines;
+    }
+    let total = lines.len();
+    let omitted = total - 2 * ASSISTANT_PREVIEW_LINES;
+    let style = theme::dim().add_modifier(Modifier::ITALIC);
+    let ellipsis = Line::from(Span::styled(
+        format!("  … +{omitted} lines (Ctrl+T to view transcript)"),
+        style,
+    ));
+    let mut out = Vec::with_capacity(ASSISTANT_COLLAPSE_THRESHOLD + 1);
+    out.extend(lines.iter().take(ASSISTANT_PREVIEW_LINES).cloned());
+    out.push(ellipsis);
+    out.extend(lines.iter().skip(total - ASSISTANT_PREVIEW_LINES).cloned());
+    out
+}
 
 /// Per-cell cache for the newline-gated streaming markdown collector. The
 /// committed region (bytes up to the last newline at render time) is rendered
@@ -856,7 +884,7 @@ impl HistoryCell {
             }
             HistoryCell::Assistant {
                 text,
-                streaming: _,
+                streaming,
                 cache,
             } => {
                 let visible_text = strip_reply_directive_prefix(text);
@@ -900,7 +928,11 @@ impl HistoryCell {
                 } else {
                     prefix_lines(all, prefix_span, Span::raw("  "))
                 };
-                lines
+                if *streaming {
+                    lines
+                } else {
+                    collapse_long_lines(lines)
+                }
             }
             HistoryCell::ToolStart {
                 name,
@@ -2506,5 +2538,150 @@ mod tests {
         assert_eq!(parsed.exit_code, "137");
         assert_eq!(parsed.stdout, "out");
         assert_eq!(parsed.stderr, "err\n");
+    }
+
+    /// Builds a multi-line plain-text body. Each line is non-empty and unique
+    /// so the renderer doesn't merge them and we can recognize head vs tail.
+    fn many_line_text(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("line-{i:04}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn assistant_short_message_not_collapsed() {
+        // 30 source lines, well under the 40-line collapse threshold.
+        let cell = HistoryCell::assistant(many_line_text(30), false);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            !text.contains("Ctrl+T to view transcript"),
+            "short message must not show ellipsis hint, got: {text}"
+        );
+        // All 30 source lines must survive verbatim.
+        for i in 0..30 {
+            let needle = format!("line-{i:04}");
+            assert!(
+                text.contains(&needle),
+                "missing {needle} in short-message render"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_long_message_collapsed_to_head_tail() {
+        let cell = HistoryCell::assistant(many_line_text(100), false);
+        let lines = cell.render(80, None);
+
+        // 20 head + 1 ellipsis + 20 tail.
+        assert_eq!(
+            lines.len(),
+            ASSISTANT_PREVIEW_LINES * 2 + 1,
+            "expected head+ellipsis+tail layout"
+        );
+
+        let text = flatten_plain(&lines);
+        assert!(
+            text.contains("line-0000"),
+            "first source line must appear in head, got: {text}"
+        );
+        assert!(
+            text.contains("line-0099"),
+            "last source line must appear in tail, got: {text}"
+        );
+        // Lines pruned from the middle are gone.
+        assert!(
+            !text.contains("line-0050"),
+            "middle source line must be omitted, got: {text}"
+        );
+
+        // Exactly one ellipsis hint line.
+        let hint_lines = lines
+            .iter()
+            .filter(|l| {
+                let s: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.contains("… +") && s.contains("Ctrl+T")
+            })
+            .count();
+        assert_eq!(hint_lines, 1, "expected exactly one ellipsis hint line");
+    }
+
+    #[test]
+    fn assistant_collapse_reports_correct_omitted_count() {
+        // 100 source lines => 100 - 40 = 60 omitted.
+        let cell = HistoryCell::assistant(many_line_text(100), false);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            text.contains("… +60 lines"),
+            "expected '+60 lines' in hint, got: {text}"
+        );
+
+        // 41 source lines => 41 - 40 = 1 omitted (boundary above threshold).
+        let cell = HistoryCell::assistant(many_line_text(41), false);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            text.contains("… +1 lines"),
+            "expected '+1 lines' at boundary, got: {text}"
+        );
+
+        // 40 source lines => exactly at threshold, no collapse.
+        let cell = HistoryCell::assistant(many_line_text(40), false);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            !text.contains("Ctrl+T to view transcript"),
+            "40-line message must not collapse, got: {text}"
+        );
+    }
+
+    #[test]
+    fn assistant_streaming_message_not_collapsed() {
+        // Streaming cells must render in full so the user sees live tokens.
+        let cell = HistoryCell::assistant(many_line_text(100), true);
+        let lines = cell.render(80, None);
+        let text = flatten_plain(&lines);
+        assert!(
+            !text.contains("Ctrl+T to view transcript"),
+            "streaming render must not collapse, got hint in: {text}"
+        );
+        assert!(
+            lines.len() >= 100,
+            "streaming render dropped lines: got {} for 100 source lines",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn collapse_long_lines_preserves_styling() {
+        // Build a styled input where head and tail carry a distinctive
+        // modifier. Guards against accidentally rebuilding lines as plain
+        // strings during truncation.
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let mut input: Vec<Line<'static>> = Vec::new();
+        for i in 0..ASSISTANT_COLLAPSE_THRESHOLD + 5 {
+            input.push(Line::from(Span::styled(format!("row-{i}"), bold)));
+        }
+        let out = collapse_long_lines(input);
+        assert_eq!(out.len(), ASSISTANT_COLLAPSE_THRESHOLD + 1);
+
+        let head_first = &out[0];
+        assert!(
+            head_first
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "head line lost BOLD: {head_first:?}"
+        );
+        let tail_last = &out[out.len() - 1];
+        assert!(
+            tail_last
+                .spans
+                .iter()
+                .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
+            "tail line lost BOLD: {tail_last:?}"
+        );
     }
 }

@@ -1929,6 +1929,50 @@ mod tests {
         assert_eq!(app.composer.text(), "draft\nqueued");
     }
 
+    #[test]
+    fn esc_during_streaming_cancels_even_with_event_rx_backlog() {
+        // Regression: a hot LLM stream keeps `event_rx` perpetually ready.
+        // The fix lives in `run_event_loop`'s biased select! (terminal-input
+        // arm now polled before the agent-event arm) — this test pins the
+        // App-level contract the fix relies on: handle_key(Esc) cancels the
+        // turn synchronously without depending on `event_rx` being drained.
+        // If a future change makes Esc handling consume from event_rx or
+        // otherwise gate on it, this test will fail.
+        let mut app = make_app();
+        app.state = AppState::Streaming {
+            start: Instant::now(),
+        };
+        let token = CancellationToken::new();
+        app.cancel_token = Some(token.clone());
+
+        // Backlog of agent events sitting in the channel — simulating a
+        // mid-stream burst of TextDelta tokens that biased select would
+        // otherwise prefer.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(256);
+        for i in 0..100 {
+            tx.try_send(AgentEvent::TextDelta(format!("tok{i}")))
+                .expect("backlog send");
+        }
+        app.event_rx = Some(rx);
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+
+        assert!(token.is_cancelled(), "Esc must cancel the turn token");
+        assert!(app.cancel_token.is_none(), "cancel_token must be taken");
+        assert!(
+            matches!(app.state, AppState::Idle),
+            "Esc must drop streaming state to Idle"
+        );
+        assert!(app.event_rx.is_none(), "Esc must drop event_rx");
+        assert_eq!(last_system_text(&app).unwrap(), "[interrupted]");
+
+        // Dropping event_rx without draining must close the channel — i.e.
+        // Esc handling did not pull events off the queue. If a future change
+        // routes Esc through the agent-event path, the receiver would still
+        // be alive and the sender would not see the close.
+        assert!(tx.is_closed(), "event_rx must be dropped, closing the channel");
+    }
+
     // --- Channel close robustness ---
 
     #[test]
