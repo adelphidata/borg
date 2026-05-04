@@ -305,7 +305,8 @@ impl App<'_> {
              /export [fmt] - Export current session (fmt: json|csv|txt, default json)\n\
              \n  \
              /plugins   - Manage plugins, channels, and tools\n  \
-             /projects  - List projects\n  \
+             /skills    - Manage skills (alias of /plugins)\n  \
+             /model     - Switch LLM provider/model\n  \
              /schedule  - Manage scheduled tasks\n  \
              /migrate   - Import from another agent\n  \
              /restart   - Restart gateway server\n\
