@@ -68,14 +68,16 @@ pub struct Patch {
 
 // ── Marker constants ──
 
-const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
-const END_PATCH_MARKER: &str = "*** End Patch";
-const ADD_FILE_MARKER: &str = "*** Add File: ";
-const DELETE_FILE_MARKER: &str = "*** Delete File: ";
-const UPDATE_FILE_MARKER: &str = "*** Update File: ";
+pub(crate) const BEGIN_PATCH_MARKER: &str = "*** Begin Patch";
+pub(crate) const END_PATCH_MARKER: &str = "*** End Patch";
+pub(crate) const ADD_FILE_MARKER: &str = "*** Add File: ";
+pub(crate) const DELETE_FILE_MARKER: &str = "*** Delete File: ";
+pub(crate) const UPDATE_FILE_MARKER: &str = "*** Update File: ";
 const MOVE_FILE_MARKER: &str = "*** Move File: ";
-const MOVE_TO_MARKER: &str = "*** Move to: ";
-const EOF_MARKER: &str = "*** End of File";
+pub(crate) const MOVE_TO_MARKER: &str = "*** Move to: ";
+pub(crate) const EOF_MARKER: &str = "*** End of File";
+pub(crate) const CHANGE_CONTEXT_MARKER: &str = "@@ ";
+pub(crate) const EMPTY_CHANGE_CONTEXT_MARKER: &str = "@@";
 
 /// Check if a line starts with a diff prefix (` `, `+`, or `-`).
 fn is_diff_prefix(line: &str) -> bool {

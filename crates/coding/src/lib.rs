@@ -31,21 +31,25 @@
 pub mod apply;
 pub mod parser;
 mod seek_sequence;
+pub mod streaming_parser;
 
 use anyhow::Result;
 use std::path::Path;
 
 pub use apply::{AffectedPaths, ApplyPatchResult};
 pub use parser::ParseMode;
+pub use streaming_parser::{StreamEvent, StreamingPatchParser};
 
 /// Parse and apply a patch to a directory, returning which files were affected.
 ///
-/// Defaults to `ParseMode::Strict`: the patch text must begin with
-/// `*** Begin Patch` and end with `*** End Patch`. For callers that need to
-/// accept shell-heredoc-wrapped input (some LLM tool-call shapes), use
-/// `apply_patch_to_dir_with_mode` with `ParseMode::Lenient`.
+/// Defaults to `ParseMode::Lenient`: the `*** Begin Patch` / `*** End Patch`
+/// sentinels are still required, but a surrounding shell-style EOF heredoc
+/// (`<<EOF`, `<<'EOF'`, `<<"EOF"`) is tolerated and stripped before parsing.
+/// Some LLM tool-call shapes emit patches wrapped this way; rejecting them
+/// just costs the agent an extra retry. Use `apply_patch_to_dir_with_mode`
+/// with `ParseMode::Strict` if you need to reject heredoc wrappers.
 pub fn apply_patch_to_dir(patch_text: &str, base_dir: &Path) -> Result<ApplyPatchResult> {
-    apply_patch_to_dir_with_mode(patch_text, base_dir, ParseMode::Strict)
+    apply_patch_to_dir_with_mode(patch_text, base_dir, ParseMode::Lenient)
 }
 
 /// Parse and apply a patch with an explicit `ParseMode`.
@@ -129,6 +133,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let patch = "this is not a valid patch";
         assert!(apply_patch_to_dir(patch, dir.path()).is_err());
+    }
+
+    #[test]
+    fn apply_patch_to_dir_default_is_lenient_unwraps_eof_heredoc() {
+        // Codex parity: LLMs that target a `local_shell`-shaped tool sometimes
+        // wrap the patch in a `<<EOF`-family heredoc. The default entry point
+        // must tolerate this (was previously rejected under Strict default).
+        let dir = tempfile::tempdir().unwrap();
+        let inner = "*** Begin Patch\n*** Add File: hi.txt\n+hi\n*** End Patch";
+        for opener in ["<<EOF", "<<'EOF'", "<<\"EOF\""] {
+            let wrapped = format!("{opener}\n{inner}\nEOF\n");
+            let affected = apply_patch_to_dir(&wrapped, dir.path())
+                .unwrap_or_else(|e| panic!("opener {opener} should be accepted: {e}"));
+            assert!(
+                affected.added.contains(&"hi.txt".to_string())
+                    || affected.modified.contains(&"hi.txt".to_string())
+            );
+            // Reset for next iteration.
+            let _ = std::fs::remove_file(dir.path().join("hi.txt"));
+        }
+    }
+
+    #[test]
+    fn apply_patch_to_dir_strict_mode_still_rejects_heredoc() {
+        // The mode-explicit entry point still honors Strict for callers that
+        // want to reject the heredoc shape (e.g. trusted internal callers).
+        let dir = tempfile::tempdir().unwrap();
+        let wrapped = "<<EOF\n*** Begin Patch\n*** Add File: hi.txt\n+hi\n*** End Patch\nEOF\n";
+        let err = apply_patch_to_dir_with_mode(wrapped, dir.path(), ParseMode::Strict)
+            .expect_err("strict mode must reject heredoc-wrapped input");
+        assert!(
+            err.to_string().contains("*** Begin Patch"),
+            "error should mention the missing sentinel: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_patch_to_dir_empty_patch_is_rejected() {
+        // Codex parity: an empty patch (sentinels only, zero hunks) is a no-op
+        // that wastes a turn and signals an LLM error. Reject at parse time
+        // so the agent gets a clear message and retries.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = "*** Begin Patch\n*** End Patch\n";
+        let err = apply_patch_to_dir(empty, dir.path()).expect_err("empty patch must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No operations") || msg.contains("empty"),
+            "error should explain emptiness, got: {msg}"
+        );
     }
 
     #[test]

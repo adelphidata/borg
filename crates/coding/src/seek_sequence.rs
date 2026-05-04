@@ -183,6 +183,43 @@ fn middle_block_match(line: &str, pat: &str) -> bool {
     indentation_flexible_match(line, pat)
 }
 
+/// Best-effort hint for failed hunks: find the file line that most closely
+/// matches the first non-empty line of `pattern`, and return a 3-line snippet
+/// of the file centered on it. Returned snippet is `(1-based-line-number, text)`
+/// pairs so callers can render `at line N`-style messages without recomputing.
+///
+/// Returns `None` if `pattern` has no non-empty lines or no file line shares
+/// any prefix with the pattern's anchor under unicode-normalized comparison.
+/// Pure heuristic; not used during matching itself.
+pub(crate) fn find_nearest_context(
+    lines: &[String],
+    pattern: &[String],
+) -> Option<Vec<(usize, String)>> {
+    let anchor = pattern.iter().find(|l| !l.trim().is_empty())?;
+    let anchor_norm = normalise(anchor);
+    if anchor_norm.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, usize)> = None; // (score, idx)
+    for (idx, line) in lines.iter().enumerate() {
+        let line_norm = normalise(line);
+        let score = anchor_norm
+            .chars()
+            .zip(line_norm.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if score > 0 && best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, idx));
+        }
+    }
+
+    let (_, center) = best?;
+    let start = center.saturating_sub(1);
+    let end = (center + 2).min(lines.len());
+    Some((start..end).map(|i| (i + 1, lines[i].clone())).collect())
+}
+
 fn normalise(s: &str) -> String {
     s.trim()
         .chars()

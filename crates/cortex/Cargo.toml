@@ -56,6 +56,7 @@ ed25519-dalek = { workspace = true }
 blake3 = { workspace = true }
 bip39 = "2"
 iana-time-zone = "0.1"
+nucleo-matcher = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

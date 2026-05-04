@@ -7,7 +7,7 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::parser::{Hunk, Patch, PatchOperation};
-use crate::seek_sequence::{seek_sequence, MatchOutcome};
+use crate::seek_sequence::{find_nearest_context, seek_sequence, MatchOutcome};
 
 /// Maximum size (in bytes) for any single file created or modified by a patch.
 /// Prevents disk exhaustion from LLM-generated oversized patches.
@@ -605,8 +605,25 @@ fn locate_hunk_match<'a>(
             "Search text matched {count} locations via {strategy}; provide more surrounding context:\n---\n{}\n---",
             hunk.search
         ),
-        MatchOutcome::NotFound => bail!("Could not find search text:\n---\n{}\n---", hunk.search),
+        MatchOutcome::NotFound => {
+            let hint = format_nearest_context_hint(content_lines, effective_search);
+            bail!(
+                "Could not find search text (tried strategies: exact, trim_trailing_whitespace, trim_surrounding_whitespace, unicode_normalized, indentation_flexible, block_anchor):\n---\n{}\n---{hint}",
+                hunk.search
+            )
+        }
     }
+}
+
+fn format_nearest_context_hint(content_lines: &[String], search_lines: &[String]) -> String {
+    let Some(snippet) = find_nearest_context(content_lines, search_lines) else {
+        return String::new();
+    };
+    let mut out = String::from("\nNearest content in file:\n");
+    for (line_no, text) in snippet {
+        out.push_str(&format!("  {line_no}: {text}\n"));
+    }
+    out
 }
 
 fn find_context_anchor(lines: &[String], hint: &str, cursor: usize) -> Result<usize> {
@@ -1595,6 +1612,53 @@ EOF";
         let content = std::fs::read_to_string(dir.path().join("dup.txt")).unwrap();
         assert!(content.contains("same\nomega"));
         assert!(!content.contains("OMEGA"));
+    }
+
+    #[test]
+    fn not_found_error_includes_nearest_context_snippet() {
+        // Regression guard for codex-parity hunk diagnostics: when a hunk
+        // fails because the file content has drifted, the error must include
+        // (a) the strategies that were attempted and (b) a 3-line snippet of
+        // the file lines closest to the search anchor — so the LLM can fix
+        // the patch without re-reading the whole file.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("file.txt"),
+            "line one\nfn renamed_target() {\n    body();\n}\nline five\n",
+        )
+        .unwrap();
+
+        let patch_text = "\
+*** Begin Patch
+*** Update File: file.txt
+@@
+-fn original_target() {
+-    body();
++fn original_target() {
++    new_body();
+ }
+*** End Patch";
+
+        let err = crate::apply_patch_to_dir(patch_text, dir.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("Could not find search text"),
+            "missing primary message: {err}"
+        );
+        assert!(
+            err.contains("tried strategies: exact"),
+            "missing strategy list: {err}"
+        );
+        assert!(
+            err.contains("Nearest content in file:"),
+            "missing nearest-context block: {err}"
+        );
+        assert!(
+            err.contains("renamed_target"),
+            "snippet should surface the actual file content the LLM should align to: {err}"
+        );
     }
 
     #[test]
