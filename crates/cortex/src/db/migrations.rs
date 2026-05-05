@@ -191,7 +191,7 @@ impl Database {
 
 const SCHEMA_SQL: &str = r#"
 -- Core sessions / messages -------------------------------------------------
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
@@ -201,9 +201,9 @@ CREATE TABLE sessions (
     parent_session_id TEXT,
     forked_from_message_id INTEGER
 );
-CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -214,31 +214,31 @@ CREATE TABLE messages (
     created_at INTEGER NOT NULL,
     content_parts_json TEXT
 );
-CREATE INDEX idx_messages_session ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 
-CREATE VIRTUAL TABLE messages_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     session_id UNINDEXED,
     role UNINDEXED,
     content,
     content='messages',
     content_rowid='id'
 );
-CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts(rowid, session_id, role, content)
     VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
 END;
-CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
     VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
 END;
-CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content)
     VALUES ('delete', old.id, old.session_id, old.role, COALESCE(old.content, ''));
     INSERT INTO messages_fts(rowid, session_id, role, content)
     VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
 END;
 
-CREATE TABLE token_usage (
+CREATE TABLE IF NOT EXISTS token_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,
     prompt_tokens INTEGER NOT NULL,
@@ -250,11 +250,11 @@ CREATE TABLE token_usage (
     cached_input_tokens INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_token_usage_ts ON token_usage(timestamp);
-CREATE INDEX idx_token_usage_model ON token_usage(model);
+CREATE INDEX IF NOT EXISTS idx_token_usage_ts ON token_usage(timestamp);
+CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model);
 
 -- Scheduler / tasks --------------------------------------------------------
-CREATE TABLE scheduled_tasks (
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     prompt TEXT NOT NULL,
@@ -280,10 +280,10 @@ CREATE TABLE scheduled_tasks (
     min_interval_secs INTEGER,
     last_response_hash TEXT
 );
-CREATE INDEX idx_tasks_due ON scheduled_tasks(status, next_run);
-CREATE INDEX idx_tasks_retry ON scheduled_tasks(status, retry_after);
+CREATE INDEX IF NOT EXISTS idx_tasks_due ON scheduled_tasks(status, next_run);
+CREATE INDEX IF NOT EXISTS idx_tasks_retry ON scheduled_tasks(status, retry_after);
 
-CREATE TABLE task_runs (
+CREATE TABLE IF NOT EXISTS task_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id TEXT NOT NULL REFERENCES scheduled_tasks(id),
     started_at INTEGER NOT NULL,
@@ -292,10 +292,10 @@ CREATE TABLE task_runs (
     error TEXT,
     status TEXT NOT NULL DEFAULT 'success'
 );
-CREATE INDEX idx_task_runs_task ON task_runs(task_id, started_at DESC);
-CREATE INDEX idx_task_runs_status ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 
-CREATE TABLE daemon_lock (
+CREATE TABLE IF NOT EXISTS daemon_lock (
     id           INTEGER PRIMARY KEY CHECK (id = 1),
     pid          INTEGER NOT NULL,
     started_at   INTEGER NOT NULL,
@@ -303,7 +303,7 @@ CREATE TABLE daemon_lock (
 );
 
 -- Channels / pairing -------------------------------------------------------
-CREATE TABLE channel_sessions (
+CREATE TABLE IF NOT EXISTS channel_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
@@ -313,7 +313,7 @@ CREATE TABLE channel_sessions (
     UNIQUE(channel_name, sender_id)
 );
 
-CREATE TABLE channel_messages (
+CREATE TABLE IF NOT EXISTS channel_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
@@ -323,10 +323,10 @@ CREATE TABLE channel_messages (
     session_id TEXT,
     created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_channel_messages_session
+CREATE INDEX IF NOT EXISTS idx_channel_messages_session
     ON channel_messages(channel_name, sender_id, created_at);
 
-CREATE TABLE pairing_requests (
+CREATE TABLE IF NOT EXISTS pairing_requests (
     id TEXT PRIMARY KEY,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
@@ -338,10 +338,10 @@ CREATE TABLE pairing_requests (
     approved_at INTEGER,
     UNIQUE(channel_name, code)
 );
-CREATE INDEX idx_pairing_channel_sender
+CREATE INDEX IF NOT EXISTS idx_pairing_channel_sender
     ON pairing_requests(channel_name, sender_id, status);
 
-CREATE TABLE approved_senders (
+CREATE TABLE IF NOT EXISTS approved_senders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
@@ -352,7 +352,7 @@ CREATE TABLE approved_senders (
 );
 
 -- Plugins / customizations -------------------------------------------------
-CREATE TABLE customizations (
+CREATE TABLE IF NOT EXISTS customizations (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     kind TEXT NOT NULL,
@@ -364,7 +364,7 @@ CREATE TABLE customizations (
     config_json TEXT
 );
 
-CREATE TABLE installed_tools (
+CREATE TABLE IF NOT EXISTS installed_tools (
     name TEXT PRIMARY KEY,
     description TEXT NOT NULL,
     runtime TEXT NOT NULL,
@@ -374,7 +374,7 @@ CREATE TABLE installed_tools (
     FOREIGN KEY(customization_id) REFERENCES customizations(id) ON DELETE SET NULL
 );
 
-CREATE TABLE installed_channels (
+CREATE TABLE IF NOT EXISTS installed_channels (
     name TEXT PRIMARY KEY,
     description TEXT NOT NULL,
     runtime TEXT NOT NULL,
@@ -385,7 +385,7 @@ CREATE TABLE installed_channels (
     FOREIGN KEY(customization_id) REFERENCES customizations(id) ON DELETE SET NULL
 );
 
-CREATE TABLE customization_credentials (
+CREATE TABLE IF NOT EXISTS customization_credentials (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     customization_id TEXT NOT NULL,
     credential_key TEXT NOT NULL,
@@ -396,7 +396,7 @@ CREATE TABLE customization_credentials (
     UNIQUE(customization_id, credential_key)
 );
 
-CREATE TABLE file_hashes (
+CREATE TABLE IF NOT EXISTS file_hashes (
     customization_id TEXT NOT NULL,
     file_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
@@ -406,7 +406,7 @@ CREATE TABLE file_hashes (
 );
 
 -- Delivery queue -----------------------------------------------------------
-CREATE TABLE delivery_queue (
+CREATE TABLE IF NOT EXISTS delivery_queue (
     id TEXT PRIMARY KEY,
     channel_name TEXT NOT NULL,
     sender_id TEXT NOT NULL,
@@ -421,11 +421,11 @@ CREATE TABLE delivery_queue (
     updated_at INTEGER NOT NULL,
     error TEXT
 );
-CREATE INDEX idx_delivery_queue_status
+CREATE INDEX IF NOT EXISTS idx_delivery_queue_status
     ON delivery_queue(status, next_retry_at);
 
 -- Multi-agent --------------------------------------------------------------
-CREATE TABLE agent_roles (
+CREATE TABLE IF NOT EXISTS agent_roles (
     name TEXT PRIMARY KEY,
     description TEXT NOT NULL,
     model TEXT,
@@ -439,7 +439,7 @@ CREATE TABLE agent_roles (
     updated_at INTEGER NOT NULL
 );
 
-CREATE TABLE sub_agent_runs (
+CREATE TABLE IF NOT EXISTS sub_agent_runs (
     id TEXT PRIMARY KEY,
     nickname TEXT NOT NULL,
     role TEXT NOT NULL,
@@ -452,16 +452,16 @@ CREATE TABLE sub_agent_runs (
     created_at INTEGER NOT NULL,
     completed_at INTEGER
 );
-CREATE INDEX idx_sub_agent_runs_parent ON sub_agent_runs(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sub_agent_runs_parent ON sub_agent_runs(parent_session_id);
 
 -- Memory -------------------------------------------------------------------
-CREATE TABLE settings (
+CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
-CREATE TABLE memory_entries (
+CREATE TABLE IF NOT EXISTS memory_entries (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     scope TEXT NOT NULL DEFAULT 'global',
     name TEXT NOT NULL,
@@ -472,10 +472,10 @@ CREATE TABLE memory_entries (
     estimated_tokens INTEGER,
     UNIQUE(scope, name)
 );
-CREATE INDEX idx_memory_entries_scope ON memory_entries(scope);
-CREATE INDEX idx_memory_entries_updated ON memory_entries(updated_at);
+CREATE INDEX IF NOT EXISTS idx_memory_entries_scope ON memory_entries(scope);
+CREATE INDEX IF NOT EXISTS idx_memory_entries_updated ON memory_entries(updated_at);
 
-CREATE TABLE memory_embeddings (
+CREATE TABLE IF NOT EXISTS memory_embeddings (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT NOT NULL DEFAULT 'global',
     filename    TEXT NOT NULL,
@@ -486,9 +486,9 @@ CREATE TABLE memory_embeddings (
     created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(scope, filename)
 );
-CREATE INDEX idx_memory_embeddings_scope ON memory_embeddings(scope);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_scope ON memory_embeddings(scope);
 
-CREATE TABLE memory_chunks (
+CREATE TABLE IF NOT EXISTS memory_chunks (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     scope        TEXT NOT NULL DEFAULT 'global',
     filename     TEXT NOT NULL,
@@ -503,9 +503,9 @@ CREATE TABLE memory_chunks (
     created_at   INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(scope, filename, chunk_index)
 );
-CREATE INDEX idx_memory_chunks_scope_file ON memory_chunks(scope, filename);
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_scope_file ON memory_chunks(scope, filename);
 
-CREATE VIRTUAL TABLE memory_chunks_fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
     scope UNINDEXED,
     filename UNINDEXED,
     chunk_index UNINDEXED,
@@ -513,22 +513,22 @@ CREATE VIRTUAL TABLE memory_chunks_fts USING fts5(
     content='memory_chunks',
     content_rowid='id'
 );
-CREATE TRIGGER memory_chunks_ai AFTER INSERT ON memory_chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ai AFTER INSERT ON memory_chunks BEGIN
     INSERT INTO memory_chunks_fts(rowid, scope, filename, chunk_index, content)
     VALUES (new.id, new.scope, new.filename, new.chunk_index, new.content);
 END;
-CREATE TRIGGER memory_chunks_ad AFTER DELETE ON memory_chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ad AFTER DELETE ON memory_chunks BEGIN
     INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, scope, filename, chunk_index, content)
     VALUES ('delete', old.id, old.scope, old.filename, old.chunk_index, old.content);
 END;
-CREATE TRIGGER memory_chunks_au AFTER UPDATE ON memory_chunks BEGIN
+CREATE TRIGGER IF NOT EXISTS memory_chunks_au AFTER UPDATE ON memory_chunks BEGIN
     INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, scope, filename, chunk_index, content)
     VALUES ('delete', old.id, old.scope, old.filename, old.chunk_index, old.content);
     INSERT INTO memory_chunks_fts(rowid, scope, filename, chunk_index, content)
     VALUES (new.id, new.scope, new.filename, new.chunk_index, new.content);
 END;
 
-CREATE TABLE embedding_cache (
+CREATE TABLE IF NOT EXISTS embedding_cache (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     provider     TEXT NOT NULL,
     model        TEXT NOT NULL,
@@ -539,17 +539,17 @@ CREATE TABLE embedding_cache (
     last_accessed_at INTEGER NOT NULL DEFAULT (unixepoch()),
     UNIQUE(provider, model, content_hash)
 );
-CREATE INDEX idx_embedding_cache_lookup
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_lookup
     ON embedding_cache(provider, model, content_hash);
 
-CREATE TABLE session_index_status (
+CREATE TABLE IF NOT EXISTS session_index_status (
     session_id    TEXT PRIMARY KEY,
     indexed_at    INTEGER NOT NULL,
     message_count INTEGER NOT NULL DEFAULT 0
 );
 
 -- Scripts ------------------------------------------------------------------
-CREATE TABLE scripts (
+CREATE TABLE IF NOT EXISTS scripts (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
     description     TEXT NOT NULL DEFAULT '',
@@ -566,11 +566,11 @@ CREATE TABLE scripts (
     last_run_at     INTEGER,
     run_count       INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_scripts_name ON scripts(name);
-CREATE INDEX idx_scripts_ephemeral ON scripts(ephemeral, created_at);
+CREATE INDEX IF NOT EXISTS idx_scripts_name ON scripts(name);
+CREATE INDEX IF NOT EXISTS idx_scripts_ephemeral ON scripts(ephemeral, created_at);
 
 -- Vitals / bond / evolution chains ----------------------------------------
-CREATE TABLE vitals_events (
+CREATE TABLE IF NOT EXISTS vitals_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     category TEXT NOT NULL,
     source TEXT NOT NULL,
@@ -584,15 +584,15 @@ CREATE TABLE vitals_events (
     hmac TEXT NOT NULL,
     prev_hmac TEXT NOT NULL DEFAULT '0'
 );
-CREATE INDEX idx_vitals_events_created ON vitals_events(created_at);
-CREATE TRIGGER vitals_events_no_update
+CREATE INDEX IF NOT EXISTS idx_vitals_events_created ON vitals_events(created_at);
+CREATE TRIGGER IF NOT EXISTS vitals_events_no_update
     BEFORE UPDATE ON vitals_events
     BEGIN SELECT RAISE(ABORT, 'vitals_events is append-only'); END;
-CREATE TRIGGER vitals_events_no_delete
+CREATE TRIGGER IF NOT EXISTS vitals_events_no_delete
     BEFORE DELETE ON vitals_events
     BEGIN SELECT RAISE(ABORT, 'vitals_events is append-only'); END;
 
-CREATE TABLE bond_events (
+CREATE TABLE IF NOT EXISTS bond_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
     score_delta INTEGER NOT NULL,
@@ -601,22 +601,22 @@ CREATE TABLE bond_events (
     prev_hmac TEXT NOT NULL DEFAULT '0',
     created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_bond_events_created ON bond_events(created_at);
-CREATE INDEX idx_bond_events_type ON bond_events(event_type);
-CREATE TRIGGER bond_events_no_update
+CREATE INDEX IF NOT EXISTS idx_bond_events_created ON bond_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_bond_events_type ON bond_events(event_type);
+CREATE TRIGGER IF NOT EXISTS bond_events_no_update
     BEFORE UPDATE ON bond_events
     BEGIN SELECT RAISE(ABORT, 'bond_events is append-only'); END;
-CREATE TRIGGER bond_events_no_delete
+CREATE TRIGGER IF NOT EXISTS bond_events_no_delete
     BEFORE DELETE ON bond_events
     BEGIN SELECT RAISE(ABORT, 'bond_events is append-only'); END;
 
-CREATE TABLE device_keys (
+CREATE TABLE IF NOT EXISTS device_keys (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     public_key  BLOB NOT NULL,
     created_at  INTEGER NOT NULL
 );
 
-CREATE TABLE evolution_events (
+CREATE TABLE IF NOT EXISTS evolution_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type TEXT NOT NULL,
     xp_delta INTEGER NOT NULL DEFAULT 0,
@@ -629,18 +629,18 @@ CREATE TABLE evolution_events (
     session_id TEXT,
     pubkey_id INTEGER REFERENCES device_keys(id)
 );
-CREATE INDEX idx_evolution_events_created ON evolution_events(created_at);
-CREATE INDEX idx_evolution_events_archetype ON evolution_events(archetype);
-CREATE INDEX idx_evolution_events_session ON evolution_events(session_id);
-CREATE INDEX idx_evolution_events_pubkey ON evolution_events(pubkey_id);
-CREATE TRIGGER evolution_events_no_update
+CREATE INDEX IF NOT EXISTS idx_evolution_events_created ON evolution_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_evolution_events_archetype ON evolution_events(archetype);
+CREATE INDEX IF NOT EXISTS idx_evolution_events_session ON evolution_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_evolution_events_pubkey ON evolution_events(pubkey_id);
+CREATE TRIGGER IF NOT EXISTS evolution_events_no_update
     BEFORE UPDATE ON evolution_events
     BEGIN SELECT RAISE(ABORT, 'evolution_events is append-only'); END;
-CREATE TRIGGER evolution_events_no_delete
+CREATE TRIGGER IF NOT EXISTS evolution_events_no_delete
     BEFORE DELETE ON evolution_events
     BEGIN SELECT RAISE(ABORT, 'evolution_events is append-only'); END;
 
-CREATE TABLE hmac_checkpoints (
+CREATE TABLE IF NOT EXISTS hmac_checkpoints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     domain TEXT NOT NULL,
     event_id INTEGER NOT NULL,
@@ -648,21 +648,21 @@ CREATE TABLE hmac_checkpoints (
     state_hash TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_hmac_checkpoints_domain
+CREATE INDEX IF NOT EXISTS idx_hmac_checkpoints_domain
     ON hmac_checkpoints(domain, event_id);
 
 -- Outboxes / activity / lifecycle -----------------------------------------
-CREATE TABLE pending_celebrations (
+CREATE TABLE IF NOT EXISTS pending_celebrations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     celebration_type TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     created_at INTEGER NOT NULL,
     delivered_at INTEGER
 );
-CREATE INDEX idx_pending_celebrations_undelivered
+CREATE INDEX IF NOT EXISTS idx_pending_celebrations_undelivered
     ON pending_celebrations (delivered_at) WHERE delivered_at IS NULL;
 
-CREATE TABLE activity_log (
+CREATE TABLE IF NOT EXISTS activity_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     level TEXT NOT NULL,
     category TEXT NOT NULL,
@@ -670,11 +670,11 @@ CREATE TABLE activity_log (
     detail TEXT,
     created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_activity_log_created ON activity_log(created_at);
-CREATE INDEX idx_activity_log_category ON activity_log(category, created_at);
-CREATE INDEX idx_activity_log_level ON activity_log(level, created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_log_category ON activity_log(category, created_at);
+CREATE INDEX IF NOT EXISTS idx_activity_log_level ON activity_log(level, created_at);
 
-CREATE TABLE client_tokens (
+CREATE TABLE IF NOT EXISTS client_tokens (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     token_hash    BLOB    NOT NULL UNIQUE,
     label         TEXT    NOT NULL UNIQUE,
@@ -683,9 +683,9 @@ CREATE TABLE client_tokens (
     last_used_at  INTEGER,
     revoked_at    INTEGER
 );
-CREATE INDEX idx_client_tokens_hash ON client_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_client_tokens_hash ON client_tokens(token_hash);
 
-CREATE TABLE webhook_definitions (
+CREATE TABLE IF NOT EXISTS webhook_definitions (
     name         TEXT PRIMARY KEY,
     secret_hash  BLOB NOT NULL,
     sender_path  TEXT NOT NULL,
@@ -695,7 +695,7 @@ CREATE TABLE webhook_definitions (
     revoked_at   INTEGER
 );
 
-CREATE TABLE providers (
+CREATE TABLE IF NOT EXISTS providers (
     id              TEXT PRIMARY KEY,
     category        TEXT NOT NULL,
     display_name    TEXT NOT NULL,
@@ -706,7 +706,7 @@ CREATE TABLE providers (
     updated_at      INTEGER NOT NULL
 );
 
-CREATE TABLE provider_rate_cards (
+CREATE TABLE IF NOT EXISTS provider_rate_cards (
     provider_id            TEXT NOT NULL,
     model                  TEXT NOT NULL,
     effective_at           INTEGER NOT NULL,
@@ -716,10 +716,10 @@ CREATE TABLE provider_rate_cards (
     source                 TEXT NOT NULL DEFAULT 'bundled',
     PRIMARY KEY (provider_id, model, effective_at)
 );
-CREATE INDEX idx_rate_cards_lookup
+CREATE INDEX IF NOT EXISTS idx_rate_cards_lookup
     ON provider_rate_cards(provider_id, model, effective_at DESC);
 
-CREATE TABLE budgets (
+CREATE TABLE IF NOT EXISTS budgets (
     id                     TEXT PRIMARY KEY,
     scope                  TEXT NOT NULL,
     reset_period           TEXT NOT NULL,
@@ -731,9 +731,9 @@ CREATE TABLE budgets (
     created_at             INTEGER NOT NULL,
     updated_at             INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX idx_budgets_scope ON budgets(scope);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_budgets_scope ON budgets(scope);
 
-CREATE TABLE provider_call_events (
+CREATE TABLE IF NOT EXISTS provider_call_events (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
     event_type             TEXT NOT NULL,
     provider_id            TEXT,
@@ -748,11 +748,11 @@ CREATE TABLE provider_call_events (
     session_id             TEXT,
     created_at             INTEGER NOT NULL
 );
-CREATE INDEX idx_pce_created ON provider_call_events(created_at);
-CREATE INDEX idx_pce_type ON provider_call_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_pce_created ON provider_call_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_pce_type ON provider_call_events(event_type);
 
 -- PKI / audit chain --------------------------------------------------------
-CREATE TABLE internal_ca_certs (
+CREATE TABLE IF NOT EXISTS internal_ca_certs (
     serial      INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,
     pem         TEXT NOT NULL,
@@ -764,10 +764,10 @@ CREATE TABLE internal_ca_certs (
     issued_at   INTEGER NOT NULL,
     revoked_at  INTEGER
 );
-CREATE INDEX idx_internal_ca_certs_kind
+CREATE INDEX IF NOT EXISTS idx_internal_ca_certs_kind
     ON internal_ca_certs(kind, status);
 
-CREATE TABLE paired_devices (
+CREATE TABLE IF NOT EXISTS paired_devices (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     fingerprint   TEXT NOT NULL UNIQUE,
     device_label  TEXT NOT NULL,
@@ -779,13 +779,13 @@ CREATE TABLE paired_devices (
     cert_serial   INTEGER NOT NULL REFERENCES internal_ca_certs(serial)
 );
 
-CREATE TABLE revoked_fingerprints (
+CREATE TABLE IF NOT EXISTS revoked_fingerprints (
     fingerprint TEXT PRIMARY KEY,
     revoked_at  INTEGER NOT NULL,
     reason      TEXT
 );
 
-CREATE TABLE pairing_codes (
+CREATE TABLE IF NOT EXISTS pairing_codes (
     code_hash   TEXT PRIMARY KEY,
     expires_at  INTEGER NOT NULL,
     intent      TEXT NOT NULL,
@@ -793,10 +793,10 @@ CREATE TABLE pairing_codes (
     consumed_at INTEGER,
     attempts    INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_pairing_codes_unconsumed
+CREATE INDEX IF NOT EXISTS idx_pairing_codes_unconsumed
     ON pairing_codes(consumed_at, expires_at);
 
-CREATE TABLE audit_log_chain (
+CREATE TABLE IF NOT EXISTS audit_log_chain (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
     prev_hash    BLOB NOT NULL,
     hash         BLOB NOT NULL,
@@ -806,10 +806,10 @@ CREATE TABLE audit_log_chain (
     principal_id TEXT NOT NULL,
     event_purged INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX idx_audit_log_event_type
+CREATE INDEX IF NOT EXISTS idx_audit_log_event_type
     ON audit_log_chain(event_type, ts);
 
-CREATE TABLE posture_snapshots (
+CREATE TABLE IF NOT EXISTS posture_snapshots (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     evolution_event_id  INTEGER NOT NULL UNIQUE,
     taken_at            INTEGER NOT NULL,
@@ -817,11 +817,11 @@ CREATE TABLE posture_snapshots (
     source              TEXT NOT NULL,
     schema_version      INTEGER NOT NULL DEFAULT 1
 );
-CREATE INDEX idx_posture_snapshots_taken_at
+CREATE INDEX IF NOT EXISTS idx_posture_snapshots_taken_at
     ON posture_snapshots(taken_at DESC);
 
 -- Web search cache ---------------------------------------------------------
-CREATE TABLE web_search_cache (
+CREATE TABLE IF NOT EXISTS web_search_cache (
     provider    TEXT NOT NULL,
     query_hash  TEXT NOT NULL,
     query       TEXT NOT NULL,
@@ -829,18 +829,18 @@ CREATE TABLE web_search_cache (
     fetched_at  INTEGER NOT NULL,
     PRIMARY KEY (provider, query_hash)
 );
-CREATE INDEX idx_web_search_cache_fetched_at
+CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched_at
     ON web_search_cache(fetched_at);
 
 -- Skill audit / doctor / maintenance --------------------------------------
-CREATE TABLE skill_audit (
+CREATE TABLE IF NOT EXISTS skill_audit (
     name           TEXT PRIMARY KEY,
     sha256         TEXT NOT NULL,
     first_seen_at  INTEGER NOT NULL,
     last_seen_at   INTEGER NOT NULL
 );
 
-CREATE TABLE doctor_runs (
+CREATE TABLE IF NOT EXISTS doctor_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ran_at      INTEGER NOT NULL,
     pass_count  INTEGER NOT NULL DEFAULT 0,
@@ -848,9 +848,9 @@ CREATE TABLE doctor_runs (
     fail_count  INTEGER NOT NULL DEFAULT 0,
     report_json TEXT NOT NULL
 );
-CREATE INDEX idx_doctor_runs_ran_at ON doctor_runs(ran_at DESC);
+CREATE INDEX IF NOT EXISTS idx_doctor_runs_ran_at ON doctor_runs(ran_at DESC);
 
-CREATE TABLE doctor_squelches (
+CREATE TABLE IF NOT EXISTS doctor_squelches (
     category    TEXT NOT NULL,
     name        TEXT NOT NULL,
     squelched_at INTEGER NOT NULL,
@@ -858,10 +858,10 @@ CREATE TABLE doctor_squelches (
     reason      TEXT,
     PRIMARY KEY (category, name)
 );
-CREATE INDEX idx_doctor_squelches_expires_at
+CREATE INDEX IF NOT EXISTS idx_doctor_squelches_expires_at
     ON doctor_squelches(expires_at);
 
-CREATE TABLE maintenance_issue_state (
+CREATE TABLE IF NOT EXISTS maintenance_issue_state (
     issue_key            TEXT PRIMARY KEY,
     first_seen_at        INTEGER NOT NULL,
     last_seen_at         INTEGER NOT NULL,
@@ -872,8 +872,8 @@ CREATE TABLE maintenance_issue_state (
     last_auto_fix_result TEXT,
     resolved_at          INTEGER
 );
-CREATE INDEX idx_maintenance_issue_state_open
+CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_open
     ON maintenance_issue_state(last_status, consecutive_count, issue_key);
-CREATE INDEX idx_maintenance_issue_state_resolved
+CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_resolved
     ON maintenance_issue_state(resolved_at);
 "#;

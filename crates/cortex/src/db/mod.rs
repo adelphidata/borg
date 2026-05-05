@@ -158,14 +158,18 @@ impl Database {
 
     /// Connection initialization: pragmas + migrations.
     pub(crate) fn init_connection(conn: Connection, busy_timeout_ms: u64) -> Result<Self> {
-        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
-        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        // busy_timeout must be set first: subsequent pragma writes
+        // (`journal_mode=WAL`, `auto_vacuum`) take a writer lock and would
+        // otherwise return SQLITE_BUSY immediately when another connection is
+        // mid-init on the same file.
         let _: i64 = conn.query_row(
             &format!("PRAGMA busy_timeout={busy_timeout_ms}"),
             [],
             |row| row.get(0),
         )?;
+        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         // Incremental auto-vacuum prevents unbounded DB growth from message history,
         // embeddings cache, and task runs. Requires running PRAGMA incremental_vacuum
         // periodically (done in run_migrations after schema changes).
@@ -323,6 +327,16 @@ impl Database {
         // while still giving us automatic ROLLBACK on drop if not committed.
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
             .context("Failed to begin migration transaction")?;
+
+        // Re-check inside the writer lock: another process/connection may have
+        // committed migrations while we were waiting on BEGIN IMMEDIATE. Without
+        // this double-check, two concurrent fresh-DB openers both see version=0
+        // outside the lock, both eventually acquire the writer in turn, and the
+        // second runs `CREATE TABLE …` against tables the first just created.
+        let current = self.schema_version()?;
+        if current >= Self::CURRENT_VERSION {
+            return Ok(());
+        }
 
         const MIGRATIONS: &[fn(&Database) -> Result<()>] = &[Database::migrate_v1];
         // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
