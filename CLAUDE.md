@@ -101,6 +101,18 @@ Every tool's JSON schema is sent to the LLM every turn (~5KB+). Prefer adding ac
 *** End Patch
 ```
 
+When the same context lines could match multiple places, anchor the hunk with `@@ method_name` (or `@@ class Foo`) before `@@`. Stack multiple anchors to navigate nested scopes:
+
+```
+*** Update File: src/parser.rs
+@@ impl Parser
+@@ fn parse
+@@
+     ...
+-    old_line
++    new_line
+```
+
 ### Security — Blocked Paths
 
 `[security] blocked_paths` defaults: `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.env`, `credentials`, `private_key`. Filtered from `fs_read`/`fs_write` and checked in `list_dir`.

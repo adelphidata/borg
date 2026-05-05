@@ -250,6 +250,18 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let max_results = optional_u64_param(args, "max_results", 50).clamp(1, 500) as usize;
+    // Optional pagination over the rendered/ranked entry list. `offset` is
+    // 0-based; `limit` caps at 500 to mirror `max_results`. When neither is
+    // given, the unpaged shape is preserved so existing callers/snapshots
+    // don't shift.
+    let offset = args
+        .get("offset")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| v as usize);
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|v| (v as usize).min(500));
 
     let base = if path_str.starts_with('/') || path_str.starts_with('~') {
         std::path::PathBuf::from(shellexpand::tilde(path_str).as_ref())
@@ -273,14 +285,15 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
     }
 
     if let Some(query) = fuzzy_match {
-        return Ok(fuzzy_list_dir(
+        let raw = fuzzy_list_dir(
             &canonical,
             query,
             include_hidden,
             max_results,
             &config.security.blocked_paths,
             &config.security.allowed_paths,
-        ));
+        );
+        return Ok(paginate_listing(&raw, offset, limit));
     }
 
     let mut output = String::new();
@@ -294,9 +307,29 @@ pub fn handle_list_dir(args: &serde_json::Value, config: &Config) -> Result<Stri
         &mut output,
     )?;
     if output.is_empty() {
-        output = "(empty directory)".to_string();
+        return Ok("(empty directory)".to_string());
     }
-    Ok(output)
+    Ok(paginate_listing(&output, offset, limit))
+}
+
+/// Paginate a newline-delimited listing. Returns the original string when no
+/// offset/limit is supplied; otherwise slices line-wise and appends a footer
+/// describing the visible window so the caller can request the next page.
+fn paginate_listing(raw: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if offset.is_none() && limit.is_none() {
+        return raw.to_string();
+    }
+    let lines: Vec<&str> = raw.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(0).min(total);
+    let end = limit.map(|l| (start + l).min(total)).unwrap_or(total);
+    if start >= end {
+        return format!("(empty page; offset {start} of {total} lines)\n");
+    }
+    let mut out = lines[start..end].join("\n");
+    out.push('\n');
+    out.push_str(&format!("(showing {}-{} of {total} lines)", start + 1, end));
+    out
 }
 
 /// Walk `root` (skipping a curated noisy-dir set) and return a ranked list of
@@ -1081,6 +1114,129 @@ mod tests {
         assert!(
             result.contains("no files match"),
             "should explain empty result: {result}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn handle_list_dir_pagination_slices_lines_with_footer() {
+        let tmp = std::env::temp_dir().join(format!(
+            "borg_paginate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for i in 0..30 {
+            std::fs::write(tmp.join(format!("f{i:02}.txt")), "x").unwrap();
+        }
+
+        let config = Config::default();
+        let result = handle_list_dir(
+            &json!({
+                "path": tmp.to_string_lossy().as_ref(),
+                "offset": 5,
+                "limit": 10,
+            }),
+            &config,
+        )
+        .unwrap();
+
+        let body_lines: Vec<&str> = result
+            .lines()
+            .filter(|l| !l.starts_with("(showing"))
+            .collect();
+        assert_eq!(
+            body_lines.len(),
+            10,
+            "page should hold exactly 10 lines: {result}"
+        );
+        assert!(
+            result.contains("(showing 6-15 of 30 lines)"),
+            "footer mismatch: {result}"
+        );
+        // Sanity check that we skipped the first 5 (sorted f00.txt..f04.txt).
+        assert!(
+            !result.contains(" f00.txt "),
+            "offset should skip f00: {result}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn handle_list_dir_pagination_offset_past_end_returns_empty_marker() {
+        let tmp = std::env::temp_dir().join(format!(
+            "borg_paginate_end_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("only.txt"), "x").unwrap();
+
+        let config = Config::default();
+        let result = handle_list_dir(
+            &json!({
+                "path": tmp.to_string_lossy().as_ref(),
+                "offset": 50,
+                "limit": 10,
+            }),
+            &config,
+        )
+        .unwrap();
+        assert!(
+            result.contains("empty page"),
+            "should announce empty page: {result}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn handle_list_dir_pagination_combines_with_fuzzy_match() {
+        let tmp = std::env::temp_dir().join(format!(
+            "borg_paginate_fuzzy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        for i in 0..20 {
+            std::fs::write(tmp.join(format!("alpha_{i:02}.rs")), "x").unwrap();
+        }
+
+        let config = Config::default();
+        let result = handle_list_dir(
+            &json!({
+                "path": tmp.to_string_lossy().as_ref(),
+                "fuzzy_match": "alpha",
+                "max_results": 20,
+                "offset": 0,
+                "limit": 5,
+            }),
+            &config,
+        )
+        .unwrap();
+        let body_lines: Vec<&str> = result
+            .lines()
+            .filter(|l| !l.starts_with("(showing"))
+            .collect();
+        assert_eq!(
+            body_lines.len(),
+            5,
+            "fuzzy page should be 5 lines: {result}"
+        );
+        assert!(
+            result.contains("(showing 1-5 of 20 lines)"),
+            "footer: {result}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

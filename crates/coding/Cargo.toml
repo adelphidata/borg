@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+similar = "2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

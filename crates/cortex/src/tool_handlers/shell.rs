@@ -91,8 +91,29 @@ pub async fn handle_run_shell(
     skill_env_allowlist: Option<&std::collections::HashSet<String>>,
 ) -> Result<String> {
     let command = args["command"].as_str().context("Missing 'command'")?;
-    let timeout_ms = config.tools.default_timeout_ms;
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(config.tools.default_timeout_ms);
     let timeout_dur = Duration::from_millis(timeout_ms);
+    let workdir = args
+        .get("workdir")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+    let want_tty = args
+        .get("tty")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    // If the model wrapped an `apply_patch` call inside a shell heredoc
+    // (`bash -lc "apply_patch <<'EOF' ... EOF"`), reroute through the
+    // verified patch path. The shell binary `apply_patch` doesn't exist on
+    // `$PATH`, so running it raw fails; we also lose blocked-path
+    // enforcement, vitals classification, and ghost-commit undo.
+    if let Some(patch_text) = coding::maybe_extract_apply_patch_from_shell(command) {
+        let patch_args = serde_json::json!({ "patch": patch_text });
+        return crate::tool_handlers::filesystem::handle_apply_patch(&patch_args, config);
+    }
 
     match policy.check(command) {
         crate::policy::PolicyDecision::Deny => {
@@ -131,11 +152,29 @@ pub async fn handle_run_shell(
     let (shell, shell_flag) = ("sh", "-c");
     #[cfg(windows)]
     let (shell, shell_flag) = ("cmd.exe", "/C");
+
+    if want_tty {
+        return run_in_pty(
+            shell,
+            shell_flag,
+            command,
+            workdir.as_deref(),
+            &filtered_creds,
+            timeout_dur,
+            timeout_ms,
+            event_tx,
+        )
+        .await;
+    }
+
     let mut cmd = tokio::process::Command::new(shell);
     cmd.arg(shell_flag)
         .arg(command)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    if let Some(dir) = workdir.as_deref() {
+        cmd.current_dir(dir);
+    }
     for (key, val) in &filtered_creds {
         cmd.env(key, val);
     }
@@ -161,6 +200,103 @@ pub async fn handle_run_shell(
                 Err(e)
             }
         }
+    }
+}
+
+/// Run `command` under a pseudo-terminal so it sees stdout as a TTY. Used for
+/// REPLs and tools whose output (or willingness to start) depends on `isatty`.
+/// Output is read off the master end into a single combined buffer; stdout
+/// and stderr are merged because that's what a TTY does on the wire — there
+/// is no separate stderr file descriptor inside a PTY.
+#[allow(clippy::too_many_arguments)]
+async fn run_in_pty(
+    shell: &str,
+    shell_flag: &str,
+    command: &str,
+    workdir: Option<&std::path::Path>,
+    env: &std::collections::HashMap<String, String>,
+    timeout: Duration,
+    timeout_ms: u64,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) -> Result<String> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("Failed to open pseudo-terminal")?;
+
+    let mut builder = CommandBuilder::new(shell);
+    builder.arg(shell_flag);
+    builder.arg(command);
+    if let Some(dir) = workdir {
+        builder.cwd(dir);
+    }
+    for (key, val) in env {
+        builder.env(key, val);
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .context("Failed to spawn PTY child")?;
+    // Closing the slave on the parent side is necessary so EOF propagates to
+    // the reader once the child exits — otherwise the read loop blocks
+    // forever waiting on a dangling fd.
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("Failed to clone PTY reader")?;
+    let event_tx_clone = event_tx.clone();
+    let reader_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut combined = String::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
+                        name: "run_shell".to_string(),
+                        delta: chunk.clone(),
+                        is_stderr: false,
+                    });
+                    combined.push_str(&chunk);
+                }
+                Err(_) => break,
+            }
+        }
+        combined
+    });
+
+    let wait_task = tokio::task::spawn_blocking(move || child.wait());
+
+    let combined_result = tokio::time::timeout(timeout, async {
+        let combined = reader_task.await.context("PTY reader task panicked")?;
+        let status = wait_task
+            .await
+            .context("PTY wait task panicked")?
+            .context("Failed to wait for PTY child")?;
+        Ok::<_, anyhow::Error>((combined, status.exit_code()))
+    })
+    .await;
+
+    match combined_result {
+        Ok(Ok((combined, exit_code))) => Ok(format!(
+            "Exit code: {exit_code}\n--- output (tty) ---\n{combined}"
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(format!(
+            "Error: command timed out after {timeout_ms}ms (tty)\nCommand: {command}"
+        )),
     }
 }
 
@@ -261,5 +397,130 @@ mod tests {
                 "run_shell must not emit shell confirmations"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_tty_true_makes_stdout_a_tty() {
+        // Confirms the PTY branch actually allocates a pseudo-terminal: a
+        // command that asks `stdin/stdout` whether they are a TTY answers
+        // "True" only when running under a PTY.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({
+            "command": "test -t 1 && echo IS_TTY || echo NOT_TTY",
+            "tty": true,
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+            .await
+            .expect("tty shell should run");
+        assert!(
+            result.contains("IS_TTY"),
+            "expected TTY output, got: {result}"
+        );
+        assert!(
+            result.contains("--- output (tty) ---"),
+            "tty branch should emit tty marker: {result}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_tty_false_keeps_pipe_shape_and_separates_streams() {
+        // Regression fence: omitting `tty` (or passing false) preserves the
+        // original piped behavior — separate stdout/stderr sections in the
+        // returned blob.
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({
+            "command": "test -t 1 && echo IS_TTY || echo NOT_TTY",
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+            .await
+            .expect("non-tty shell should run");
+        assert!(
+            result.contains("NOT_TTY"),
+            "expected non-tty output, got: {result}"
+        );
+        assert!(
+            result.contains("--- stdout ---"),
+            "non-tty must keep separate stdout: {result}"
+        );
+        assert!(
+            result.contains("--- stderr ---"),
+            "non-tty must keep separate stderr: {result}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_tty_honors_workdir_and_timeout() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("marker"), "x").expect("write marker");
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let args = serde_json::json!({
+            "command": "ls",
+            "tty": true,
+            "workdir": tmp.path().to_string_lossy().as_ref(),
+        });
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+            .await
+            .expect("workdir tty run");
+        assert!(
+            result.contains("marker"),
+            "ls in workdir should see marker: {result}"
+        );
+
+        let timeout_args = serde_json::json!({
+            "command": "sleep 5",
+            "tty": true,
+            "timeout_ms": 200,
+        });
+        let timed = handle_run_shell(&timeout_args, &config, &policy, &event_tx, None)
+            .await
+            .expect("timeout path returns Ok with explanation");
+        assert!(
+            timed.contains("timed out") && timed.contains("(tty)"),
+            "tty timeout should surface explicitly: {timed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_shell_reroutes_apply_patch_heredoc_to_verified_path() {
+        // Regression: when the model emits `bash -lc "apply_patch <<'EOF' ... EOF"`
+        // we must dispatch through `handle_apply_patch` rather than running the
+        // (non-existent) `apply_patch` binary in a subshell. The signal that the
+        // reroute worked is a real file landing in cwd and a non-shell-shaped
+        // success string.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+
+        let cmd = "bash -lc \"apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: routed.txt\n+ok\n*** End Patch\nEOF\"";
+        let args = serde_json::json!({ "command": cmd });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+            .await
+            .expect("rerouted apply_patch should succeed");
+
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+
+        assert!(
+            !result.contains("Exit code:"),
+            "rerouted call must not return shell-shaped output: {result}"
+        );
+        assert!(
+            tmp.path().join("routed.txt").exists(),
+            "patched file should be created in cwd"
+        );
     }
 }

@@ -608,14 +608,14 @@ fn missing_end_patch_sentinel_rejected_with_actionable_error() {
     assert!(!dir.join("x.txt").exists());
 }
 
-// ── Test: heredoc-wrapped patch rejected by default, accepted in Lenient ──
+// ── Test: heredoc-wrapped patch accepted by default (lenient), rejected in Strict ──
 //
-// Validates the explicit Strict-by-default + Lenient-opt-in surface end
-// to end. Same patch, two modes, two outcomes. Real filesystem writes
-// in the success case, no writes in the error case.
+// Borg defaults to Lenient parsing so the LLM's frequent `<<'EOF' ... EOF`
+// wrapper is unwrapped and applied verbatim. Strict mode is opt-in for
+// callers that need the unwrapped grammar enforced.
 
 #[test]
-fn heredoc_wrapping_rejected_in_default_strict_but_accepted_in_lenient() {
+fn heredoc_wrapping_accepted_in_default_lenient_rejected_in_strict() {
     let tmp = tempfile::tempdir().expect("create temp dir");
     let dir = tmp.path();
 
@@ -626,25 +626,26 @@ fn heredoc_wrapping_rejected_in_default_strict_but_accepted_in_lenient() {
 *** End Patch\n\
 EOF";
 
-    // Default (Strict): rejects, no file created.
-    let strict_err = apply_patch_to_dir(heredoc_patch, dir)
-        .expect_err("strict default must reject heredoc wrapping");
-    assert!(
-        strict_err.to_string().contains("Begin Patch"),
-        "got: {strict_err}"
-    );
-    assert!(!dir.join("y.txt").exists());
-
-    // Lenient: unwraps EOF heredoc, applies inner patch.
-    let affected =
-        coding::apply_patch_to_dir_with_mode(heredoc_patch, dir, coding::ParseMode::Lenient)
-            .expect("lenient must accept EOF heredoc");
-    assert_eq!(affected.added, vec!["y.txt"]);
+    // Default (Lenient): unwraps EOF heredoc, applies inner patch.
+    let result = apply_patch_to_dir(heredoc_patch, dir).expect("lenient default must accept");
+    assert_eq!(result.affected.added, vec!["y.txt"]);
     assert_eq!(
         fs::read_to_string(dir.join("y.txt")).unwrap(),
         "hello via heredoc",
         "heredoc unwrapping must yield the inner content verbatim"
     );
+
+    // Strict: rejects the wrapper.
+    let dir2_tmp = tempfile::tempdir().expect("create temp dir");
+    let dir2 = dir2_tmp.path();
+    let strict_err =
+        coding::apply_patch_to_dir_with_mode(heredoc_patch, dir2, coding::ParseMode::Strict)
+            .expect_err("strict mode must reject heredoc wrapping");
+    assert!(
+        strict_err.to_string().contains("Begin Patch"),
+        "got: {strict_err}"
+    );
+    assert!(!dir2.join("y.txt").exists());
 }
 
 // ── Test: Lenient does not paper over a missing inner Begin Patch ──

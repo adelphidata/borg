@@ -29,9 +29,12 @@
 )]
 
 pub mod apply;
+pub mod invocation;
 pub mod parser;
 mod seek_sequence;
 pub mod streaming_parser;
+
+pub use invocation::maybe_extract_apply_patch_from_shell;
 
 use anyhow::Result;
 use std::path::Path;

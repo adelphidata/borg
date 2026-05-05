@@ -672,6 +672,15 @@ fn find_optional_context_anchor(
     }
 }
 
+/// Render a unified diff between two file contents using the `similar` crate.
+///
+/// Why `similar` instead of a hand-rolled prefix/suffix trim: the prior
+/// implementation collapsed every change in a file into a single mega-hunk by
+/// stripping common prefix/suffix lines, which masked structurally distinct
+/// edits (e.g. two non-adjacent edits would be reported as one giant hunk
+/// covering everything between them). `similar::TextDiff::unified_diff` groups
+/// edits into separate `@@` hunks with the conventional 3-line context window,
+/// matching what humans (and review tools) expect.
 fn render_unified_diff(
     old: Option<&str>,
     new: Option<&str>,
@@ -684,62 +693,13 @@ fn render_unified_diff(
         return String::new();
     }
 
-    let old_lines: Vec<&str> = if old_text.is_empty() {
-        Vec::new()
-    } else {
-        old_text.lines().collect()
-    };
-    let new_lines: Vec<&str> = if new_text.is_empty() {
-        Vec::new()
-    } else {
-        new_text.lines().collect()
-    };
-
-    let mut prefix = 0usize;
-    while prefix < old_lines.len()
-        && prefix < new_lines.len()
-        && old_lines[prefix] == new_lines[prefix]
-    {
-        prefix += 1;
-    }
-
-    let mut suffix = 0usize;
-    while suffix < old_lines.len().saturating_sub(prefix)
-        && suffix < new_lines.len().saturating_sub(prefix)
-        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let old_changed_end = old_lines.len().saturating_sub(suffix);
-    let new_changed_end = new_lines.len().saturating_sub(suffix);
-    let old_start = prefix + 1;
-    let new_start = prefix + 1;
-
-    let mut diff = String::new();
-    diff.push_str(&format!("--- {from_file}\n"));
-    diff.push_str(&format!("+++ {to_file}\n"));
-    diff.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        old_start,
-        old_changed_end.saturating_sub(prefix),
-        new_start,
-        new_changed_end.saturating_sub(prefix)
-    ));
-
-    for line in &old_lines[..prefix] {
-        diff.push_str(&format!(" {line}\n"));
-    }
-    for line in &old_lines[prefix..old_changed_end] {
-        diff.push_str(&format!("-{line}\n"));
-    }
-    for line in &new_lines[prefix..new_changed_end] {
-        diff.push_str(&format!("+{line}\n"));
-    }
-    for line in &old_lines[old_changed_end..] {
-        diff.push_str(&format!(" {line}\n"));
-    }
-    diff.trim_end().to_string()
+    let diff = similar::TextDiff::from_lines(old_text, new_text);
+    let body = diff
+        .unified_diff()
+        .context_radius(3)
+        .header(from_file, to_file)
+        .to_string();
+    body.trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -1858,9 +1818,50 @@ EOF";
         }]);
 
         let result = apply_patch(&patch, dir.path()).unwrap();
+        // similar's unified-diff emits 1-based, conventional `@@ -<old_start>,<old_len> +<new_start>,<new_len> @@`
+        // headers; with 3 lines of context the change to line 3 becomes `@@ -1,4 +1,4 @@`.
+        // The invariant we care about is that headers are 1-based and counts cover the visible window.
         assert!(
-            result.diff.contains("@@ -3,1 +3,1 @@"),
+            result.diff.contains("@@ -1,4 +1,4 @@"),
             "got diff: {}",
+            result.diff
+        );
+        assert!(result.diff.contains("-three"), "got: {}", result.diff);
+        assert!(result.diff.contains("+THREE"), "got: {}", result.diff);
+    }
+
+    #[test]
+    fn apply_result_diff_groups_non_contiguous_edits_into_separate_hunks() {
+        // Regression: the previous hand-rolled diff collapsed every change in
+        // a file into one mega-hunk by stripping common prefix/suffix; two
+        // edits 30 lines apart would render as one hunk spanning everything
+        // between them. `similar::TextDiff::unified_diff` produces two
+        // separate `@@` blocks with the standard 3-line context window.
+        let dir = TempDir::new().unwrap();
+        let mut original = String::new();
+        for i in 0..40 {
+            original.push_str(&format!("line{i}\n"));
+        }
+        std::fs::write(dir.path().join("multi.txt"), &original).unwrap();
+
+        let patch = make_patch(vec![PatchOperation::UpdateFile {
+            path: "multi.txt".to_string(),
+            move_to: None,
+            hunks: vec![
+                simple_hunk("line2", "LINE2"),
+                simple_hunk("line35", "LINE35"),
+            ],
+        }]);
+
+        let result = apply_patch(&patch, dir.path()).unwrap();
+        let hunk_headers = result
+            .diff
+            .lines()
+            .filter(|l| l.starts_with("@@") && l.ends_with("@@"))
+            .count();
+        assert_eq!(
+            hunk_headers, 2,
+            "expected two grouped hunks, got diff: {}",
             result.diff
         );
     }
