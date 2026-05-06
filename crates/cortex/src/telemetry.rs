@@ -135,6 +135,9 @@ pub struct BorgMetrics {
     pub tool_executions: Counter<u64>,
     /// Histogram of tool execution durations in seconds.
     pub tool_duration: Histogram<f64>,
+    /// Counter for tool calls blocked because they were the Nth+ identical
+    /// consecutive call within a turn (see `MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS`).
+    pub tool_repeats_blocked: Counter<u64>,
     /// Counter for gateway webhook requests.
     pub gateway_requests: Counter<u64>,
     /// Histogram of gateway request processing durations in seconds.
@@ -203,6 +206,10 @@ impl BorgMetrics {
                 .f64_histogram("borg.tool.duration")
                 .with_description("Tool execution duration in seconds")
                 .with_unit("s")
+                .build(),
+            tool_repeats_blocked: meter
+                .u64_counter("borg.tool.repeats_blocked")
+                .with_description("Tool calls blocked as repeated identical consecutive calls")
                 .build(),
             gateway_requests: meter
                 .u64_counter("borg.gateway.requests")

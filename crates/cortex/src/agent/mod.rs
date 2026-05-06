@@ -245,6 +245,66 @@ fn should_nudge_for_response(
     text_content.trim().is_empty() && needs_response && !already_nudged
 }
 
+/// Detects runs of identical `(tool_name, arguments)` tool calls within a
+/// single user turn. Counts strictly-consecutive matches: a differing call
+/// resets the streak. The Nth and any subsequent identical calls (where N
+/// = `MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS`) report `block = true` so the
+/// caller can substitute a synthetic error tool_result instead of executing.
+///
+/// Equality is byte-exact on the raw `arguments` string — no whitespace or
+/// JSON-key-order normalization. A stuck LLM that emits the same canonical
+/// payload every iteration will be caught; one that randomizes whitespace
+/// will not. Trade-off accepted to keep the guard cheap and avoid
+/// hashing-vs-parsing correctness questions.
+///
+/// Defends against the OpenClaw failure mode: a stuck LLM looping on the
+/// same call burns rate-guard quota and pollutes context until the request
+/// overflows. The 25-iteration ceiling caps damage but doesn't notice
+/// duplication; this guard stops the spam earlier.
+#[derive(Default, Debug)]
+struct ToolCallRepeatTracker {
+    last_signature: Option<u64>,
+    consecutive_count: u32,
+}
+
+impl ToolCallRepeatTracker {
+    /// Hash `(name, args)`, update streak state, and return whether the
+    /// current call should be blocked. The signature is stored regardless
+    /// of the block decision so the streak can keep growing across
+    /// already-blocked calls (so test #2 sees indices 2,3,4 blocked, not
+    /// just index 2).
+    fn observe(&mut self, name: &str, args: &str) -> bool {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        args.hash(&mut hasher);
+        let sig = hasher.finish();
+        if self.last_signature == Some(sig) {
+            self.consecutive_count = self.consecutive_count.saturating_add(1);
+        } else {
+            self.last_signature = Some(sig);
+            self.consecutive_count = 1;
+        }
+        self.consecutive_count >= constants::MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS
+    }
+
+    fn reset(&mut self) {
+        self.last_signature = None;
+        self.consecutive_count = 0;
+    }
+}
+
+/// Synthetic tool_result body returned in place of a blocked repeated call.
+/// Static text (modulo the call count) so the LLM gets a clear signal to
+/// vary arguments or stop calling tools.
+fn repeated_tool_call_block_message(name: &str, count: u32) -> String {
+    format!(
+        "Error: repeated identical tool call detected ({count} consecutive calls to `{name}` \
+         with the same arguments). Vary arguments or stop calling tools and respond to the user."
+    )
+}
+
 /// Core conversation agent: manages history, tools, and the LLM interaction loop.
 pub struct Agent {
     /// Primary config. Must be kept in sync with `config_arc` — update both in `reload_config`.
@@ -304,6 +364,9 @@ pub struct Agent {
     /// ignore the prompt instruction). Reset after the prompt is built and the
     /// tool list is selected.
     setup_just_consumed: bool,
+    /// Tracks runs of identical consecutive tool calls within a turn.
+    /// Reset at the start of each `run_agent_loop`.
+    tool_call_repeat: ToolCallRepeatTracker,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -471,6 +534,7 @@ impl Agent {
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
             previous_summary: None,
             setup_just_consumed: false,
+            tool_call_repeat: ToolCallRepeatTracker::default(),
         }
     }
 
@@ -1475,6 +1539,11 @@ Rules:
         // (always returns context_overflow) from looping forever.
         let mut reactive_compacted_this_turn = false;
 
+        // Reset identical-tool-call streak at the start of each user turn so
+        // a fresh request starting with a previously-blocked call is not
+        // immediately blocked again.
+        self.tool_call_repeat.reset();
+
         self.prepare_loop().await;
 
         loop {
@@ -2165,7 +2234,23 @@ Rules:
                 })
                 .await;
         } else {
+            // Compaction freed nothing — protected head alone exceeds budget,
+            // or every message is structurally undroppable. The caller will
+            // retry the LLM stream once (`reactive_compacted_this_turn` is
+            // already set), and that retry will re-fail with the same
+            // context-overflow error. Surface an actionable message *now* so
+            // the user sees the cause rather than just the generic
+            // `[stream interrupted: context_length_exceeded]` marker that
+            // follows. See OpenClaw failure mode for context.
             warn!("reactive_compact_history: nothing dropped, retry will likely re-fail");
+            let after_tokens = history_tokens(&self.history);
+            let _ = event_tx
+                .send(AgentEvent::Error(format!(
+                    "Context overflow and history compaction freed nothing \
+                     ({after_tokens} tokens, target {target}). \
+                     Start a new session or raise `conversation.max_history_tokens`."
+                )))
+                .await;
         }
 
         Ok(())
@@ -2580,6 +2665,19 @@ Rules:
                 continue;
             }
 
+            // Identical-tool-call loop guard: must run BEFORE rate-guard so a
+            // blocked repeat does not consume rate-guard budget.
+            if self.tool_call_repeat.observe(name, args) {
+                let count = self.tool_call_repeat.consecutive_count;
+                warn!("Repeated identical tool call blocked: '{name}' x{count}");
+                self.metrics.tool_repeats_blocked.add(1, &[]);
+                self.skip_tool_call(
+                    &tool_call.id,
+                    &repeated_tool_call_block_message(name, count),
+                );
+                continue;
+            }
+
             // Rate limiting
             let action_type = classify_action(name);
             match self.rate_guard.record(action_type) {
@@ -2709,6 +2807,18 @@ Rules:
             {
                 slots.push(Slot::Skipped {
                     reason: "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.".into(),
+                });
+                continue;
+            }
+
+            // Identical-tool-call loop guard — must precede rate-guard so a
+            // blocked repeat does not consume rate-guard budget.
+            if self.tool_call_repeat.observe(&name, &args) {
+                let count = self.tool_call_repeat.consecutive_count;
+                warn!("Repeated identical tool call blocked: '{name}' x{count}");
+                self.metrics.tool_repeats_blocked.add(1, &[]);
+                slots.push(Slot::Skipped {
+                    reason: repeated_tool_call_block_message(&name, count),
                 });
                 continue;
             }
@@ -3572,6 +3682,7 @@ mod tests {
             short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
             previous_summary: None,
             setup_just_consumed: false,
+            tool_call_repeat: ToolCallRepeatTracker::default(),
         };
 
         agent.maybe_refresh_skills_after_tool(
@@ -4100,5 +4211,424 @@ mod tests {
             early_return < exec_call,
             "the empty-check must precede the execute call",
         );
+    }
+
+    // ── ToolCallRepeatTracker (Gap 2) ─────────────────────────────────
+    //
+    // The repeat tracker is the agent's defense against the OpenClaw
+    // "excessive tool use" failure mode: a stuck LLM looping on the same
+    // call burns rate-guard quota and pollutes context. These tests
+    // exercise the boundary conditions documented in the plan.
+
+    fn run_observe(seq: &[(&str, &str)]) -> Vec<bool> {
+        let mut t = ToolCallRepeatTracker::default();
+        seq.iter().map(|(n, a)| t.observe(n, a)).collect()
+    }
+
+    #[test]
+    fn tool_call_repeat_blocks_on_third_consecutive_identical() {
+        // [a,a,a] → first two execute, third is blocked. Mirrors the most
+        // common shape of the OpenClaw bug (LLM stuck on `run_shell echo X`).
+        let blocked = run_observe(&[("run_shell", "echo a"); 3]);
+        assert_eq!(blocked, vec![false, false, true]);
+    }
+
+    #[test]
+    fn tool_call_repeat_keeps_blocking_after_threshold() {
+        // [a,a,a,a,a] → indices 2,3,4 blocked (every call past the
+        // threshold). Without this, a stuck LLM in a long parallel batch
+        // would have only one call blocked and the rest would still execute.
+        let blocked = run_observe(&[("run_shell", "echo a"); 5]);
+        assert_eq!(blocked, vec![false, false, true, true, true]);
+    }
+
+    #[test]
+    fn tool_call_repeat_streak_resets_on_different_args() {
+        // [a,b,a,a,a] → only index 4 blocked. The "b" interleaves the
+        // streak, so the streak resets and the 3rd "a" *after* the reset
+        // is what hits the threshold.
+        let seq = [
+            ("run_shell", "echo a"),
+            ("run_shell", "echo b"),
+            ("run_shell", "echo a"),
+            ("run_shell", "echo a"),
+            ("run_shell", "echo a"),
+        ];
+        let blocked = run_observe(&seq);
+        assert_eq!(blocked, vec![false, false, false, false, true]);
+    }
+
+    #[test]
+    fn tool_call_repeat_interleaved_never_blocks() {
+        // Two tools alternating — never 3 consecutive of the same
+        // (name, args) — must never block. Otherwise legitimate
+        // pipeline-style use (read → process → read → process) breaks.
+        let seq = [
+            ("run_shell", "x"),
+            ("read_file", "x"),
+            ("run_shell", "x"),
+            ("read_file", "x"),
+            ("run_shell", "x"),
+            ("read_file", "x"),
+        ];
+        let blocked = run_observe(&seq);
+        assert!(blocked.iter().all(|&b| !b), "got: {blocked:?}");
+    }
+
+    #[test]
+    fn tool_call_repeat_below_threshold_never_blocks() {
+        // Two identical calls then 100 unrelated calls: the unrelated
+        // calls reset the streak, so even a later identical call is not
+        // blocked unless it forms its own streak of 3.
+        let mut seq: Vec<(&str, &str)> = vec![("run_shell", "echo a"); 2];
+        for i in 0..100 {
+            // distinct names AND distinct args so no streak forms
+            seq.push(("read_file", if i % 2 == 0 { "p1" } else { "p2" }));
+        }
+        let blocked = run_observe(&seq);
+        assert!(blocked.iter().all(|&b| !b));
+    }
+
+    #[test]
+    fn tool_call_repeat_whitespace_sensitive() {
+        // Documented behavior: hashing is whitespace-sensitive. A future
+        // "smart normalization" change should be deliberate, not accidental.
+        // If you change this, update the comment in ToolCallRepeatTracker.
+        let seq = [
+            ("run_shell", "echo a"),
+            ("run_shell", "echo a "), // trailing space differs
+            ("run_shell", "echo a"),
+        ];
+        let blocked = run_observe(&seq);
+        assert_eq!(blocked, vec![false, false, false]);
+    }
+
+    #[test]
+    fn tool_call_repeat_different_names_same_args_not_blocked() {
+        // Same args but different tool names should not collide. Otherwise
+        // a hashing collision in the tracker would block legitimate work.
+        let seq = [
+            ("read_file", "{\"path\":\"x\"}"),
+            ("list_dir", "{\"path\":\"x\"}"),
+            ("read_file", "{\"path\":\"x\"}"),
+        ];
+        let blocked = run_observe(&seq);
+        assert_eq!(blocked, vec![false, false, false]);
+    }
+
+    #[test]
+    fn tool_call_repeat_reset_clears_streak() {
+        // After reset, the previously-blocked call must execute again.
+        // run_agent_loop relies on this to start each user turn fresh.
+        let mut t = ToolCallRepeatTracker::default();
+        for _ in 0..3 {
+            t.observe("run_shell", "echo a");
+        }
+        assert_eq!(t.consecutive_count, 3);
+        t.reset();
+        assert_eq!(t.consecutive_count, 0);
+        assert_eq!(t.last_signature, None);
+        // Fresh streak after reset
+        assert!(!t.observe("run_shell", "echo a"));
+        assert!(!t.observe("run_shell", "echo a"));
+        assert!(t.observe("run_shell", "echo a"));
+    }
+
+    #[test]
+    fn tool_call_repeat_block_message_mentions_call_and_count() {
+        // The synthetic tool_result body must be informative enough that
+        // the LLM can see *why* its call was blocked — name and count.
+        // Vague messages ("Error: blocked") give the model no signal to
+        // change behavior. Counter-tautological: assert structure that
+        // a wrong implementation would not produce.
+        let body = repeated_tool_call_block_message("run_shell", 3);
+        assert!(body.contains("run_shell"), "must include tool name: {body}");
+        assert!(body.contains("3"), "must include count: {body}");
+        assert!(
+            body.contains("Vary arguments") || body.contains("vary arguments"),
+            "must instruct LLM to vary or stop: {body}"
+        );
+    }
+
+    #[test]
+    fn tool_call_repeat_guard_runs_before_rate_guard_in_run_tool_calls() {
+        // Source-grep guard: the repeat check must precede the rate-guard
+        // call so blocked repeats do not consume rate-guard budget. If
+        // someone reorders these, the per-session 200/500 tool-call
+        // budget burns down on calls that were never going to execute.
+        let fn_idx = AGENT_RS_SRC
+            .find("async fn run_tool_calls(")
+            .expect("run_tool_calls must exist");
+        let body = &AGENT_RS_SRC[fn_idx
+            ..AGENT_RS_SRC[fn_idx..]
+                .find("\n    async fn ")
+                .unwrap_or(8000)
+                + fn_idx];
+        let repeat_idx = body
+            .find("self.tool_call_repeat.observe(")
+            .expect("run_tool_calls must call self.tool_call_repeat.observe(...)");
+        let rate_idx = body
+            .find("self.rate_guard.record(action_type)")
+            .expect("run_tool_calls must call self.rate_guard.record(...)");
+        assert!(
+            repeat_idx < rate_idx,
+            "tool_call_repeat.observe must run BEFORE rate_guard.record \
+             (repeat_idx={repeat_idx}, rate_idx={rate_idx})",
+        );
+    }
+
+    #[test]
+    fn tool_call_repeat_guard_runs_before_rate_guard_in_parallel_path() {
+        // Same invariant as above for the parallel-execution path. Both
+        // paths share the rate-guard, so both must guard repeats first.
+        let fn_idx = AGENT_RS_SRC
+            .find("async fn run_tool_group_parallel(")
+            .expect("run_tool_group_parallel must exist");
+        let body = &AGENT_RS_SRC[fn_idx
+            ..AGENT_RS_SRC[fn_idx..]
+                .find("\n    async fn ")
+                .unwrap_or(12000)
+                + fn_idx];
+        let repeat_idx = body
+            .find("self.tool_call_repeat.observe(")
+            .expect("run_tool_group_parallel must call self.tool_call_repeat.observe(...)");
+        let rate_idx = body
+            .find("self.rate_guard.record(action_type)")
+            .expect("run_tool_group_parallel must call self.rate_guard.record(...)");
+        assert!(
+            repeat_idx < rate_idx,
+            "tool_call_repeat.observe must run BEFORE rate_guard.record in parallel path \
+             (repeat_idx={repeat_idx}, rate_idx={rate_idx})",
+        );
+    }
+
+    #[test]
+    fn run_agent_loop_resets_tool_call_repeat_tracker() {
+        // Source-grep guard: each user turn starts fresh. Without the
+        // reset, a turn that ended with a blocked streak would block the
+        // first identical call of the next turn — which the user may have
+        // explicitly asked for.
+        let loop_idx = AGENT_RS_SRC
+            .find("pub async fn run_agent_loop(")
+            .expect("run_agent_loop must exist");
+        let body = &AGENT_RS_SRC
+            [loop_idx..AGENT_RS_SRC[loop_idx..].find("\n    fn ").unwrap_or(20_000) + loop_idx];
+        assert!(
+            body.contains("self.tool_call_repeat.reset()"),
+            "run_agent_loop must reset the repeat tracker at start of turn"
+        );
+    }
+
+    // ── Reactive compaction stalled-state error (Gap 1) ───────────────
+    //
+    // When reactive compaction frees zero history, the next LLM stream
+    // will overflow again. Before this fix, the user only saw a generic
+    // `[stream interrupted: <provider error>]` after the second failure.
+    // The error must be surfaced *now* with the actionable cause.
+
+    fn extract_reactive_compact_body() -> &'static str {
+        let start = AGENT_RS_SRC
+            .find("async fn reactive_compact_history(")
+            .expect("reactive_compact_history must exist");
+        let after = &AGENT_RS_SRC[start..];
+        // Skip past our own signature (otherwise we'd match it as the
+        // "next fn"), then find the soonest of `\n    async fn ` and
+        // `\n    fn ` — whichever comes first marks the end of the body.
+        let body_start = 1; // step over the leading `a` of `async fn`
+        let search = &after[body_start..];
+        let next_async = search.find("\n    async fn ").map(|i| i + body_start);
+        let next_sync = search.find("\n    fn ").map(|i| i + body_start);
+        let end_rel = match (next_async, next_sync) {
+            (Some(a), Some(s)) => a.min(s),
+            (Some(a), None) => a,
+            (None, Some(s)) => s,
+            (None, None) => after.len(),
+        };
+        &after[..end_rel]
+    }
+
+    #[test]
+    fn reactive_compact_zero_drop_emits_error_event() {
+        // Source-grep guard: the dropped==0 branch must emit
+        // AgentEvent::Error so the TUI surfaces an actionable message.
+        // Replacing the warn! with only a log regresses to OpenClaw's
+        // "silent degradation" failure mode.
+        let body = extract_reactive_compact_body();
+        // The dropped==0 else branch must contain BOTH the warn! and a
+        // user-visible AgentEvent::Error send.
+        let else_idx = body
+            .find("warn!(\"reactive_compact_history: nothing dropped")
+            .expect("zero-drop warn! must exist as the trigger");
+        let after_else = &body[else_idx..];
+        assert!(
+            after_else.contains("AgentEvent::Error"),
+            "zero-drop branch must emit AgentEvent::Error after the warn!"
+        );
+    }
+
+    #[test]
+    fn reactive_compact_zero_drop_error_text_is_actionable() {
+        // The error text must name the cause AND the actionable knob.
+        // A vague message ("compaction failed") leaves the user with no
+        // path to recovery. Tokens checked are stable identifiers, not
+        // prose — small wording tweaks won't break this.
+        let body = extract_reactive_compact_body();
+        let err_idx = body
+            .find("Context overflow and history compaction freed nothing")
+            .expect("zero-drop error must mention 'Context overflow' cause");
+        let snippet = &body[err_idx..(err_idx + 400).min(body.len())];
+        assert!(
+            snippet.contains("conversation.max_history_tokens"),
+            "zero-drop error must reference the configurable knob: {snippet}"
+        );
+    }
+
+    #[test]
+    fn reactive_compact_history_compacted_event_remains_gated() {
+        // HistoryCompacted must only fire when dropped > 0. If someone
+        // hoists the send out of the `if dropped > 0` branch, the TUI
+        // will show a misleading "Compacted N messages" notice when
+        // nothing actually changed.
+        let body = extract_reactive_compact_body();
+        // Find the second HistoryCompacted send (the first is the
+        // cheap-pruning early-return). It must follow `if dropped > 0`.
+        let first = body
+            .find("AgentEvent::HistoryCompacted")
+            .expect("first HistoryCompacted send must exist");
+        let after_first = &body[first + 1..];
+        let second_rel = after_first
+            .find("AgentEvent::HistoryCompacted")
+            .expect("second HistoryCompacted send must exist");
+        let second = first + 1 + second_rel;
+        // Find the most recent `if dropped > 0` before the second send.
+        let preceding_guard = body[..second]
+            .rfind("if dropped > 0")
+            .expect("second HistoryCompacted send must be guarded by `if dropped > 0`");
+        // No `else` should appear between the guard and the send.
+        let between = &body[preceding_guard..second];
+        let else_count =
+            between.matches("\n        } else").count() + between.matches("} else {").count();
+        // The guard's own `else` only appears AFTER the send, not between.
+        assert_eq!(
+            else_count, 0,
+            "HistoryCompacted send at offset {second} must be inside the `if dropped > 0` \
+             block, not after an else (between snippet: {between:?})"
+        );
+    }
+
+    // ── No-user-message-replay regression guards (Gap 3) ──────────────
+    //
+    // The OpenClaw failure mode: on context-overflow retry, the tool
+    // re-injected the user's last message, so the agent answered the
+    // same prompt over and over. Borg must not regress to that. These
+    // are source-grep guards because the invariant ("the retry path
+    // does not synthesize Message::user") is structural — types can't
+    // express it. Precedent: the TUI mouse-capture and prompt-cache
+    // guards.
+
+    fn extract_run_agent_loop_stream_error_block() -> &'static str {
+        // The stream-error retry block: from `if let Some(err_msg) =
+        // &stream_error {` to its matching `continue;`.
+        let start = AGENT_RS_SRC
+            .find("if let Some(err_msg) = &stream_error {")
+            .expect("run_agent_loop must contain stream_error retry block");
+        let after = &AGENT_RS_SRC[start..];
+        let end_rel = after
+            .find("continue;\n                }")
+            .map(|i| i + "continue;\n                }".len())
+            .or_else(|| after.find("continue;").map(|i| i + "continue;".len()))
+            .expect("stream-error retry block must end with `continue;`");
+        &after[..end_rel]
+    }
+
+    const FORBIDDEN_USER_REPLAY_TOKENS: &[&str] = &[
+        "Message::user(",
+        "Role::User",
+        "inject_history_message",
+        "latest_user_message_text",
+    ];
+
+    #[test]
+    fn reactive_compact_history_must_not_replay_user_messages() {
+        // OpenClaw regression guard: the compaction path reads the
+        // user's history but must never *write* a new user message.
+        // If a future change adds (e.g.) "preserve last user msg by
+        // re-pushing it after summarization", it will trip this test.
+        let body = extract_reactive_compact_body();
+        for token in FORBIDDEN_USER_REPLAY_TOKENS {
+            assert!(
+                !body.contains(token),
+                "reactive_compact_history must not contain `{token}` \
+                 (OpenClaw failure mode: re-injecting user message on retry \
+                 causes agent to answer the same prompt repeatedly)"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_error_retry_path_must_not_replay_user_messages() {
+        // Same invariant for the run_agent_loop stream-error → continue
+        // block. The retry must just compact + re-stream; it must not
+        // synthesize a fresh user message.
+        let body = extract_run_agent_loop_stream_error_block();
+        for token in FORBIDDEN_USER_REPLAY_TOKENS {
+            assert!(
+                !body.contains(token),
+                "run_agent_loop stream-error retry block must not contain `{token}`: \
+                 see OpenClaw failure mode"
+            );
+        }
+    }
+
+    #[test]
+    fn reactive_compact_calls_continue_to_retry_not_replay() {
+        // Positive-shape assertion paired with the negative ones above:
+        // the retry mechanism is `continue` on the outer loop (re-using
+        // the existing history). If someone replaces `continue` with a
+        // recursive call to `run_agent_loop` or a re-push of the user
+        // message, both this and the negative tests above would fail.
+        let body = extract_run_agent_loop_stream_error_block();
+        assert!(
+            body.contains("continue;"),
+            "stream-error retry must use `continue` to re-run the outer loop \
+             with the same (compacted) history"
+        );
+        assert!(
+            body.contains("reactive_compact_history"),
+            "stream-error retry must invoke reactive_compact_history before retrying"
+        );
+    }
+
+    #[test]
+    fn reactive_compact_history_only_drops_user_messages_never_adds() {
+        // Behavioral assertion of the structural invariant: the only
+        // calls inside reactive_compact_history that mutate self.history
+        // are compact_tool_results, compact_history_v2, and
+        // compact_history — all of which are documented to be
+        // monotonically non-additive (they only drop or summarize).
+        // If a new mutator is introduced, this test trips and forces
+        // a deliberate audit.
+        let body = extract_reactive_compact_body();
+        let approved_mutators = [
+            "compact_tool_results(&mut self.history",
+            "compact_history_v2(",
+            "compact_history(&mut self.history",
+            "normalize_history(&mut self.history",
+        ];
+        // Forbid raw history mutations not in the approved list.
+        let forbidden_mutations = [
+            "self.history.push(",
+            "self.history.insert(",
+            "self.history.extend(",
+            "self.history.append(",
+        ];
+        for forbidden in &forbidden_mutations {
+            assert!(
+                !body.contains(forbidden),
+                "reactive_compact_history must not call `{forbidden}` — \
+                 history can only be drained/summarized, never extended. \
+                 Approved mutators: {approved_mutators:?}"
+            );
+        }
     }
 }

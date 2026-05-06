@@ -338,6 +338,18 @@ pub const MAX_TOOL_ARGS_LEN: usize = 1_000_000;
 /// Max number of tool calls allowed in a single LLM response.
 pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 50;
 
+/// Block the Nth (and beyond) consecutive tool call with identical
+/// `(name, arguments)` within a single user turn. The first two run; the
+/// third and any subsequent are replaced with a synthetic error tool_result
+/// instructing the model to vary arguments or stop. Counter resets on a
+/// differing call or at the start of each `run_agent_loop`.
+///
+/// Defense against the "excessive tool use polluting the session" failure
+/// mode: a stuck LLM that spams the same shell call burns rate-guard quota
+/// and fills history with duplicate tool results, eventually overflowing
+/// context. See `crates/cortex/src/agent/mod.rs::ToolCallRepeatTracker`.
+pub const MAX_CONSECUTIVE_IDENTICAL_TOOL_CALLS: u32 = 3;
+
 // ── LLM / Agent ───────────────────────────────────────────────────
 
 /// Default sampling temperature for LLM requests.
