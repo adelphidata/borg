@@ -3,11 +3,12 @@
 
 use chrono::Utc;
 
+use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 
 /// Compute routine success rate from task_runs in last 30 days.
 pub fn compute_routine_success_rate(db: &Database) -> f32 {
-    let since = Utc::now().timestamp() - 30 * 86400;
+    let since = Utc::now().timestamp() - 30 * SECS_PER_DAY;
     match db.count_task_runs_since(since, Some("success")) {
         Ok((success, total)) if total > 0 => success as f32 / total as f32,
         _ => 0.0,
@@ -16,7 +17,7 @@ pub fn compute_routine_success_rate(db: &Database) -> f32 {
 
 /// Compute correction rate from vitals_events in last 30 days.
 pub fn compute_correction_rate(db: &Database) -> f32 {
-    let since = Utc::now().timestamp() - 30 * 86400;
+    let since = Utc::now().timestamp() - 30 * SECS_PER_DAY;
     match db.count_vitals_events_by_category_since(since, "correction") {
         Ok((corrections, total)) if total > 0 => {
             let negatives = db
@@ -31,7 +32,7 @@ pub fn compute_correction_rate(db: &Database) -> f32 {
 
 /// Count creation events (preference learning proxy) from vitals_events in last 30 days.
 pub fn compute_preference_learning_count(db: &Database) -> u32 {
-    let since = Utc::now().timestamp() - 30 * 86400;
+    let since = Utc::now().timestamp() - 30 * SECS_PER_DAY;
     db.count_vitals_events_by_category_since(since, "creation")
         .map(|(count, _)| count)
         .unwrap_or(0)

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Subcommand;
+use cortex::constants::SECS_PER_DAY;
 
 #[derive(Subcommand)]
 pub(crate) enum DoctorAction {
@@ -73,7 +74,7 @@ fn run_list() -> Result<()> {
 
 fn run_squelch(category: &str, name: &str, ttl_days: i64, reason: Option<&str>) -> Result<()> {
     let now = now_unix();
-    let expires_at = now + ttl_days * 86400;
+    let expires_at = now + ttl_days * SECS_PER_DAY;
     let db = cortex::db::Database::open()?;
     db.doctor_squelch_set(category, name, now, expires_at, reason)?;
     let when = chrono::DateTime::from_timestamp(expires_at, 0)

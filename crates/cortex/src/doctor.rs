@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 use crate::provider::Provider;
 use crate::skills::load_all_skills;
@@ -790,7 +791,7 @@ pub fn format_relative_time(timestamp: i64) -> String {
         } else {
             format!("{mins} minutes ago")
         }
-    } else if secs < 86400 {
+    } else if secs < SECS_PER_DAY as u64 {
         let hours = secs / 3600;
         if hours == 1 {
             "1 hour ago".to_string()
@@ -798,7 +799,7 @@ pub fn format_relative_time(timestamp: i64) -> String {
             format!("{hours} hours ago")
         }
     } else {
-        let days = secs / 86400;
+        let days = secs / SECS_PER_DAY as u64;
         if days == 1 {
             "1 day ago".to_string()
         } else {

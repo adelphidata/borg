@@ -128,6 +128,8 @@ pub mod model_registry;
 pub mod multi_agent;
 /// Sender pairing and access control for gateway channels.
 pub mod pairing;
+/// Shared helpers for panic-isolated supervised loops.
+pub mod panic_utils;
 /// Execution policy for collaboration modes.
 pub mod policy;
 /// Token pricing per provider and model.

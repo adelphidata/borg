@@ -5,6 +5,7 @@
 use chrono::Utc;
 
 use super::types::{BondEvent, BondLevel, BondState};
+use crate::constants::SECS_PER_DAY;
 
 pub(super) fn bar(val: u8, width: usize) -> String {
     let filled = (val as usize * width + 50) / 100;
@@ -121,10 +122,10 @@ pub(super) fn format_ago(seconds: i64) -> String {
         "just now".to_string()
     } else if seconds < 3600 {
         format!("{}m ago", seconds / 60)
-    } else if seconds < 86400 {
+    } else if seconds < SECS_PER_DAY {
         format!("{}h ago", seconds / 3600)
     } else {
-        format!("{}d ago", seconds / 86400)
+        format!("{}d ago", seconds / SECS_PER_DAY)
     }
 }
 

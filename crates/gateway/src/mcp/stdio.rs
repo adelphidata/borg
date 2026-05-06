@@ -22,6 +22,13 @@ use super::server::McpServer;
 /// would otherwise allocate that much before the read fails.
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Buffer size for in-memory `tokio::io::duplex` channels used by the
+/// stdio test harness. 64 KB matches typical pipe buffers and keeps a
+/// single response (well under `MAX_FRAME_BYTES`) from blocking the
+/// writer.
+#[cfg(test)]
+const DUPLEX_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Drive the MCP server from arbitrary async byte streams.
 ///
 /// Reads framed JSON-RPC messages from `input`, dispatches each to
@@ -165,7 +172,7 @@ mod tests {
         input.extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
         input.extend_from_slice(&body);
 
-        let (mut out_reader, mut out_writer) = tokio::io::duplex(64 * 1024);
+        let (mut out_reader, mut out_writer) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let server = server();
         let task = tokio::spawn(async move {
             let cursor = std::io::Cursor::new(input);
@@ -209,7 +216,7 @@ mod tests {
         input.extend_from_slice(br#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#);
         input.extend_from_slice(b"\n");
 
-        let (mut out_reader, mut out_writer) = tokio::io::duplex(64 * 1024);
+        let (mut out_reader, mut out_writer) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let server = server();
         let task = tokio::spawn(async move {
             let cursor = std::io::Cursor::new(input);
@@ -246,7 +253,7 @@ mod tests {
         input.extend_from_slice(format!("Content-Length: {}\r\n\r\n", good_body.len()).as_bytes());
         input.extend_from_slice(&good_body);
 
-        let (mut out_reader, mut out_writer) = tokio::io::duplex(64 * 1024);
+        let (mut out_reader, mut out_writer) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
         let server = server();
         let task = tokio::spawn(async move {
             let cursor = std::io::Cursor::new(input);

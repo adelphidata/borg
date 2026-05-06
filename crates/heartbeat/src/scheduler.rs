@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use cortex::config::{Config, HeartbeatConfig};
+use cortex::panic_utils::panic_msg;
 use cortex::tasks::parse_interval;
 
 /// Hard floor enforced regardless of `heartbeat.min_interval_secs`. A
@@ -34,20 +35,6 @@ pub const LIVENESS_TICK_MAX: std::time::Duration = std::time::Duration::from_sec
 /// loop) would burn CPU spinning. 500ms gives enough time for the
 /// supervisor's degraded-state cap to engage if the panic is persistent.
 const POST_PANIC_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
-
-/// Convert the panic payload into a printable message. Most panics carry
-/// either a `&'static str` or a `String`; the `unknown` fallback exists
-/// so we never crash the log call itself by trying to downcast a
-/// payload of unexpected type.
-fn panic_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<unknown panic payload>".to_string()
-    }
-}
 
 /// Per-iteration control flow for the panic-isolated run loops.
 #[derive(Debug, PartialEq, Eq)]

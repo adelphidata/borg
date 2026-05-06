@@ -26,6 +26,7 @@
 //! shared `CancellationToken` returns cleanly without burning a restart.
 
 use cortex::db::Database;
+use cortex::panic_utils::panic_msg;
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -141,16 +142,6 @@ enum IterationOutcome {
     /// firing `JoinHandle::abort` on a stalled scheduler). Counts as
     /// a restart so persistent stalls escalate to degraded state.
     Aborted,
-}
-
-fn panic_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "<unknown panic payload>".to_string()
-    }
 }
 
 /// Spawn a supervised task. The `factory` closure is called once per

@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 
+use crate::constants::SECS_PER_DAY;
 use crate::db::{Database, MessageRow};
 
 /// Fixed UUID for the built-in Daily Summary task.
@@ -36,7 +37,7 @@ pub fn build_daily_summary_prompt() -> Result<String> {
 /// - Session transcripts (user/assistant messages only)
 /// - Task run statistics
 pub fn gather_daily_context(db: &Database) -> Result<String> {
-    let since = chrono::Utc::now().timestamp() - 86400;
+    let since = chrono::Utc::now().timestamp() - SECS_PER_DAY;
     let mut out = String::new();
 
     // ── Sessions ──
@@ -166,7 +167,7 @@ mod tests {
         let db = test_db();
         let now = chrono::Utc::now().timestamp();
         // Session from 2 days ago
-        let two_days_ago = now - 2 * 86400;
+        let two_days_ago = now - 2 * SECS_PER_DAY;
         db.upsert_session(
             "old",
             two_days_ago,

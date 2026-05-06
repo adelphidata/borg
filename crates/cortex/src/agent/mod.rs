@@ -557,7 +557,7 @@ impl Agent {
         };
 
         if ttl_days > 0 {
-            let max_age_secs = i64::from(ttl_days) * 86400;
+            let max_age_secs = i64::from(ttl_days) * constants::SECS_PER_DAY;
             match db.prune_embedding_cache(max_age_secs) {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(

@@ -48,6 +48,7 @@ pub use share_card::render_ascii_card;
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
 
@@ -568,7 +569,7 @@ pub fn compute_archetype_stable_days(db: &Database) -> u32 {
     };
     let now = chrono::Utc::now().timestamp();
     let seconds = (now - shift_ts).max(0) as u64;
-    (seconds / 86400) as u32
+    (seconds / SECS_PER_DAY as u64) as u32
 }
 
 // Status/history/context renderers live in `evolution::format`. The
@@ -937,7 +938,7 @@ impl EvolutionHook {
             Stage::Evolved => {
                 // Compute correction rate from vitals events (last 14 days)
                 // Includes both corrections and negative sentiment
-                let fourteen_days_ago = chrono::Utc::now().timestamp() - 14 * 86400;
+                let fourteen_days_ago = chrono::Utc::now().timestamp() - 14 * SECS_PER_DAY;
                 let (corrections, total) = match db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "correction")
                 {
