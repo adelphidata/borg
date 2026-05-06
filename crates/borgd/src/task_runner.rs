@@ -338,7 +338,11 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     let (summary, error_msg) = match result {
         Ok(Ok(report)) => {
             let summary = report.activity_line();
-            tracing::info!("Maintenance task '{task_name}': {summary}");
+            if report.is_noteworthy() {
+                tracing::info!("Maintenance task '{task_name}': {summary}");
+            } else {
+                tracing::debug!("Maintenance task '{task_name}': {summary}");
+            }
             (Some(summary), None)
         }
         Ok(Err(e)) => (None, Some(format!("maintenance sweep failed: {e}"))),

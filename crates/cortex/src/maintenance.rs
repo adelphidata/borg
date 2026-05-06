@@ -134,6 +134,33 @@ pub struct MaintenanceReport {
 }
 
 impl MaintenanceReport {
+    /// True when the sweep did or observed something worth surfacing at
+    /// INFO. A no-op sweep (everything zero, no warnings, no vacuum)
+    /// stays at DEBUG so production logs aren't dominated by hourly
+    /// "nothing to do" lines.
+    pub fn is_noteworthy(&self) -> bool {
+        if self.skipped {
+            return false;
+        }
+        self.warn_count > 0
+            || self.fail_count > 0
+            || self.log_files_deleted > 0
+            || self.activity_rows_deleted > 0
+            || self.embeddings_pruned > 0
+            || self.stalled_tasks_healed > 0
+            || self.wedged_runs_recovered > 0
+            || self.embeddings_repaired_files > 0
+            || self.messages_purged > 0
+            || self.audit_events_tombstoned > 0
+            || self.vacuum_ran
+            || self.budget_exhausted
+            || !self.persistent_warnings.is_empty()
+            || !self.unhealed_issues.is_empty()
+            || self.auto_fix_failed_issues > 0
+            || self.squelches_expired > 0
+            || self.wal_checkpoint_pages_reclaimed < 0
+    }
+
     /// Short one-line summary suitable for the activity log.
     pub fn activity_line(&self) -> String {
         if self.skipped {

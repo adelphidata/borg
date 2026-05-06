@@ -1922,7 +1922,7 @@ Rules:
                         })
                         .unwrap_or(false);
                     if first_time {
-                        warn!(
+                        debug!(
                             provider = %provider_id,
                             model = %usage.model,
                             legacy_cost_estimate = ?cost,
@@ -1930,7 +1930,7 @@ Rules:
                              (token usage still logged). Subsequent occurrences are silent."
                         );
                     } else {
-                        tracing::debug!(
+                        tracing::trace!(
                             provider = %provider_id,
                             model = %usage.model,
                             "No rate card; skipping budget reconcile"

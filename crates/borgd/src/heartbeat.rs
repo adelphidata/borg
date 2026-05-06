@@ -541,7 +541,7 @@ fn append_proactive_nudges(user_msg: &mut String, nudges: Vec<String>) {
         user_msg.push('\n');
     }
     user_msg.push_str("</proactive_nudges>");
-    tracing::info!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
+    tracing::debug!("Heartbeat: injected {} proactive nudge(s)", nudges.len());
 }
 
 fn open_heartbeat_db_for_nudges() -> Option<cortex::db::Database> {

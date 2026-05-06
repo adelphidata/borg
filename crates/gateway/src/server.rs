@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use cortex::config::Config;
 use cortex::db::Database;
@@ -206,7 +206,7 @@ impl GatewayServer {
         {
             let native_list = native_channels.list();
             if native_list.is_empty() {
-                info!("Gateway: no native channel integrations active");
+                debug!("Gateway: no native channel integrations active");
             } else {
                 let names: Vec<&str> = native_list.iter().map(|c| c.names()[0]).collect();
                 info!(
