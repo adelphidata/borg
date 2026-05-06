@@ -116,6 +116,12 @@ impl<'a> App<'a> {
     /// deliberately skips the tail to keep streaming cells mutable). The
     /// startup banner avoided this by writing to scrollback directly; `/card`
     /// must mirror that or it appears truncated to "BORG vX.Y.Z" + name only.
+    ///
+    /// A leading blank `Line` is prepended when there is already a preceding
+    /// cell — mirroring the inter-cell spacer that `render_cell_lines` would
+    /// have inserted. Skipped when the card is the first thing in the
+    /// transcript so `/card` as the opening action doesn't double-blank with
+    /// the startup banner's trailing separator.
     pub(crate) fn push_borg_card(&mut self) {
         let name = self.config.user.agent_name.as_deref().unwrap_or("Borg");
         let ambient = if self.config.evolution.ambient_header_enabled {
@@ -129,6 +135,9 @@ impl<'a> App<'a> {
             ambient,
             self.pending_update_version.as_deref(),
         );
+        if !self.cells.is_empty() {
+            self.pending_scrollback.push(Line::default());
+        }
         self.pending_scrollback.extend(lines.clone());
         self.cells.push(HistoryCell::Card { lines });
         // Mark the just-pushed Card as already emitted: the viewport's
@@ -1149,6 +1158,74 @@ mod tests {
         assert_eq!(
             consecutive_blanks, 1,
             "expected exactly one blank between warning card and heartbeat, got: {flushed:?}"
+        );
+    }
+
+    // ========================================================================
+    // push_borg_card — `/card` bypasses the viewport flush path (the card is
+    // taller than the inline viewport and would be clipped). It must mirror
+    // the inter-cell spacer policy itself: leading blank when there's a prev
+    // cell, no leading blank when it's the first thing in the transcript.
+    // ========================================================================
+
+    fn is_brand_line(l: &Line<'_>) -> bool {
+        l.spans.iter().any(|s| s.content == "BORG")
+    }
+
+    fn is_blank_line(l: &Line<'_>) -> bool {
+        l.spans.is_empty() || l.spans.iter().all(|s| s.content.is_empty())
+    }
+
+    #[test]
+    fn push_borg_card_prepends_spacer_after_prior_cell() {
+        // Regression: screenshot showed the assistant message and `/card`
+        // output running line-to-line with no separator. Any preceding cell
+        // must produce exactly one blank line before the BORG brand row.
+        let mut app = make_app();
+        app.cells.push(HistoryCell::assistant("hi".into(), false));
+        let before = app.pending_scrollback.len();
+        app.push_borg_card();
+        let flushed = &app.pending_scrollback[before..];
+
+        assert!(
+            !flushed.is_empty(),
+            "push_borg_card should emit lines into pending_scrollback"
+        );
+        assert!(
+            is_blank_line(&flushed[0]),
+            "first appended line must be a blank spacer, got: {:?}",
+            flushed[0]
+        );
+        let brand_idx = flushed
+            .iter()
+            .position(is_brand_line)
+            .expect("BORG brand line must be present");
+        assert_eq!(
+            brand_idx, 1,
+            "BORG brand should sit immediately after the single spacer; flushed = {flushed:?}"
+        );
+    }
+
+    #[test]
+    fn push_borg_card_no_leading_spacer_when_first() {
+        // Symmetry guard: when `/card` is the very first action (no prior
+        // cells), there is nothing to separate from. A leading blank here
+        // would double up with the startup banner's trailing blank and look
+        // wrong. The startup banner itself takes the same scrollback path
+        // and intentionally omits a leading blank for the same reason.
+        let mut app = make_app();
+        assert!(app.cells.is_empty(), "precondition: fresh app");
+        let before = app.pending_scrollback.len();
+        app.push_borg_card();
+        let flushed = &app.pending_scrollback[before..];
+
+        assert!(
+            !flushed.is_empty(),
+            "push_borg_card should emit lines into pending_scrollback"
+        );
+        assert!(
+            is_brand_line(&flushed[0]),
+            "first appended line must be the BORG brand, not a spacer; flushed = {flushed:?}"
         );
     }
 
