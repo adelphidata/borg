@@ -9,7 +9,7 @@
 //! delegated back to the cli's `service::*` helpers via `borgd::run_legacy`.
 //! This module is the loop body only.
 
-use crate::maintenance::Maintenance;
+use crate::maintenance::sweep;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{
@@ -77,8 +77,7 @@ pub async fn run(
     // overdue gets its `next_run` advanced so we don't replay every
     // missed window in a burst. Concentrated into the maintenance
     // module — see `crates/borgd/src/maintenance/sweep.rs`.
-    let maintenance = Maintenance::new(&config);
-    let boot_report = maintenance.recover_at_boot(&db);
+    let boot_report = sweep::boot_recovery(&db);
     if boot_report.stale_tasks_advanced > 0 {
         tracing::info!(
             advanced = boot_report.stale_tasks_advanced,
@@ -139,7 +138,7 @@ pub async fn run(
                 "Daemon resumed after {}s pause, re-checking stale tasks",
                 elapsed.as_secs()
             );
-            let drift_report = maintenance.recover_after_drift(&db);
+            let drift_report = sweep::drift_recovery(&db);
             if drift_report.stale_tasks_advanced > 0 {
                 tracing::info!(
                     advanced = drift_report.stale_tasks_advanced,
@@ -167,7 +166,7 @@ pub async fn run(
 
         if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
             last_stalled_scan = std::time::Instant::now();
-            let scan = maintenance.scan_stalled(&db, now, STALLED_TASK_GRACE_SECS);
+            let scan = sweep::stalled_scan(&db, now, STALLED_TASK_GRACE_SECS);
             if scan.tasks_healed > 0 || scan.wedged_runs_recovered > 0 {
                 tracing::info!(
                     healed = scan.tasks_healed,

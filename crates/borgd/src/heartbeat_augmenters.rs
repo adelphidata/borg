@@ -53,7 +53,9 @@
 //! required. [`collect`] picks up the new entry automatically on the next
 //! heartbeat tick.
 
-use crate::maintenance::cooldowns::{meta_key_for, CooldownTable};
+#[cfg(test)]
+use crate::maintenance::cooldowns::meta_key_for;
+use crate::maintenance::cooldowns::CooldownTable;
 use crate::maintenance::MonthlyBudgetTracker;
 use cortex::config::Config;
 use cortex::db::Database;
