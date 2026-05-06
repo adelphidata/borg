@@ -380,9 +380,13 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
     }
 
     nudge.push_str(
-        "The task IDs above are everything you need — do NOT ask the user for IDs. \
-         Mention the failed tasks by name; if the user wants a deeper dive, call \
-         `schedule` with action='runs' and one of the IDs listed. Keep it to 2–3 sentences.",
+        "Required content for your reply: (1) name each failed task verbatim from \
+         the list above, and (2) include a short phrase from its last_error so the \
+         user sees the cause without asking (e.g. \"Daily Summary and Heartbeat — \
+         402 from openrouter\"). Counts alone are not enough; bare offers like \
+         \"want me to look?\" without naming the tasks are wrong. The IDs are for \
+         your follow-up via `schedule` action='runs' — do NOT ask the user for them. \
+         Keep the whole reply to 2–3 sentences.",
     );
     Some(nudge)
 }
@@ -1111,8 +1115,59 @@ mod tests {
         );
         // Trailer explicitly tells the LLM not to ask the user for IDs.
         assert!(
-            nudge.contains("do NOT ask the user for IDs"),
+            nudge.contains("do NOT ask the user"),
             "trailer must forbid asking the user for IDs: {nudge}"
+        );
+    }
+
+    #[test]
+    fn task_health_trailer_demands_names_and_cause() {
+        // Regression: the LLM once produced "2 failed task runs — want me to
+        // take a look?" without naming the failed tasks or surfacing the
+        // cause, even though the augmenter shipped task names + last_error.
+        // The trailer treated naming as a polite suggestion under a brevity
+        // cap. This test pins the new contract: naming each failed task AND
+        // including a snippet from its last_error are *required content*,
+        // not nice-to-haves.
+        let db = in_memory_db();
+        make_task(&db, "tsk_a", "alpha");
+        let now = 1_000_000_i64;
+        db.record_task_run("tsk_a", now - 60, 100, None, Some("boom"))
+            .expect("record");
+        db.set_task_retry("tsk_a", 1, "still broken", now + 10_000)
+            .expect("set");
+
+        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        // Tie the trailer assertions to the full render pipeline — without
+        // this, the test passes even if the trailer were dropped from the
+        // builder and only the constant existed somewhere unreachable.
+        assert!(
+            nudge.contains("alpha"),
+            "seeded task name must reach the rendered nudge: {nudge}"
+        );
+        assert!(
+            nudge.contains("name each failed task verbatim"),
+            "trailer must require verbatim task names: {nudge}"
+        );
+        assert!(
+            nudge.contains("short phrase from its last_error"),
+            "trailer must require quoting last_error: {nudge}"
+        );
+        assert!(
+            nudge.contains("Counts alone are not enough"),
+            "trailer must reject count-only replies: {nudge}"
+        );
+        assert!(
+            nudge.contains("\"want me to look?\""),
+            "trailer must call out the bare-offer failure mode by example: {nudge}"
+        );
+        assert!(
+            nudge.contains("do NOT ask the user"),
+            "trailer must forbid asking the user for IDs: {nudge}"
+        );
+        assert!(
+            nudge.contains("2–3 sentences"),
+            "trailer must keep the length cap: {nudge}"
         );
     }
 
