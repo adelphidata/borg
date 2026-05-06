@@ -1425,7 +1425,7 @@ fn apply_message_cache_control_handles_fewer_than_two_messages() {
         "content": [{ "type": "text", "text": "only one" }],
     })];
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 2, &marker);
+    apply_message_cache_control(&mut msgs, 2, &marker, false);
     let blocks = msgs[0]["content"].as_array().unwrap();
     assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
 }
@@ -1439,7 +1439,7 @@ fn apply_message_cache_control_upgrades_string_content() {
         serde_json::json!({ "role": "user", "content": "latest" }),
     ];
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 2, &marker);
+    apply_message_cache_control(&mut msgs, 2, &marker, false);
     for msg in &msgs {
         let blocks = msg["content"]
             .as_array()
@@ -1508,7 +1508,7 @@ fn apply_message_cache_control_skips_thinking_block() {
         ],
     })];
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 1, &marker);
+    apply_message_cache_control(&mut msgs, 1, &marker, false);
     let blocks = msgs[0]["content"].as_array().unwrap();
     // Text block gets the marker.
     assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
@@ -1526,7 +1526,7 @@ fn apply_message_cache_control_skips_redacted_thinking_block() {
         ],
     })];
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 1, &marker);
+    apply_message_cache_control(&mut msgs, 1, &marker, false);
     let blocks = msgs[0]["content"].as_array().unwrap();
     assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
     assert!(blocks[1].get("cache_control").is_none());
@@ -1536,7 +1536,7 @@ fn apply_message_cache_control_skips_redacted_thinking_block() {
 fn apply_message_cache_control_empty_is_noop() {
     let mut msgs: Vec<serde_json::Value> = Vec::new();
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 2, &marker);
+    apply_message_cache_control(&mut msgs, 2, &marker, false);
     assert!(msgs.is_empty());
 }
 
@@ -1547,7 +1547,7 @@ fn apply_message_cache_control_zero_rolling_is_noop() {
         "content": [{ "type": "text", "text": "hi" }],
     })];
     let marker = build_cache_control_marker(crate::config::CacheTtl::FiveMin);
-    apply_message_cache_control(&mut msgs, 0, &marker);
+    apply_message_cache_control(&mut msgs, 0, &marker, false);
     assert!(
         msgs[0]["content"][0].get("cache_control").is_none(),
         "rolling=0 should not attach any marker"
@@ -1825,4 +1825,215 @@ fn make_tool(name: &str) -> ToolDefinition {
             parameters: serde_json::json!({ "type": "object", "properties": {} }),
         },
     }
+}
+
+// ── OpenRouter prompt-caching tests ──
+
+#[test]
+fn supports_anthropic_cache_control_table() {
+    // Native Anthropic always wins; OpenRouter only on Claude-family
+    // models; everything else is off. Locks the (provider, model)
+    // gating used by `stream_chat_openai_inner` and `chat_openai`.
+    let cases: &[(Provider, &str, bool)] = &[
+        (Provider::Anthropic, "claude-sonnet-4", true),
+        (Provider::Anthropic, "claude-opus-4-1", true),
+        (Provider::OpenRouter, "anthropic/claude-sonnet-4.6", true),
+        (Provider::OpenRouter, "anthropic/claude-opus-4.7", true),
+        // Bare claude/* slug (some routers normalize the prefix away)
+        (Provider::OpenRouter, "claude-3-5-sonnet", true),
+        // Non-Anthropic OpenRouter models: explicit deny
+        (Provider::OpenRouter, "openai/gpt-4o-mini", false),
+        (Provider::OpenRouter, "google/gemini-2.5-pro", false),
+        (Provider::OpenRouter, "deepseek/deepseek-r1", false),
+        // Other OpenAI-compatible providers: implicit cache only
+        (Provider::OpenAi, "gpt-4.1", false),
+        (Provider::Gemini, "gemini-2.5-flash", false),
+        (Provider::DeepSeek, "deepseek-chat", false),
+        (Provider::Groq, "llama-3.1-70b", false),
+        (Provider::Ollama, "llama3", false),
+        (Provider::ClaudeCli, "claude-sonnet-4", false),
+    ];
+    for (provider, model, want) in cases {
+        assert_eq!(
+            super::supports_anthropic_cache_control(*provider, model),
+            *want,
+            "supports_anthropic_cache_control({provider:?}, {model:?})"
+        );
+    }
+}
+
+/// Build a synthetic OpenAI-compat request body for cache-marker tests.
+/// Mirrors what `stream_chat_openai_inner` would produce: a system
+/// message, several user/assistant turns, and (optionally) a `role: tool`
+/// message in the rolling window.
+fn build_test_openai_body(include_tool_role: bool) -> serde_json::Value {
+    let mut messages = vec![
+        serde_json::json!({"role": "system", "content": "You are helpful."}),
+        serde_json::json!({"role": "user", "content": "first question"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "first answer",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "noop", "arguments": "{}"}
+            }],
+        }),
+    ];
+    if include_tool_role {
+        messages.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "tool result",
+        }));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": "follow up"}));
+    serde_json::json!({
+        "model": "anthropic/claude-sonnet-4.6",
+        "messages": messages,
+    })
+}
+
+fn message_has_cache_control(msg: &serde_json::Value) -> bool {
+    let Some(content) = msg.get("content") else {
+        return false;
+    };
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    blocks.iter().any(|b| {
+        b.get("cache_control")
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("ephemeral")
+    })
+}
+
+#[test]
+fn openrouter_claude_request_carries_cache_control_markers() {
+    // System prompt + last 2 messages should each carry an ephemeral
+    // cache_control marker under the default ToolsSystemAnd2 strategy
+    // (cache_tools is silently dropped on the OpenAI-compat path because
+    // OpenRouter's tools envelope can't carry the marker).
+    let mut body = build_test_openai_body(false);
+    let cfg = crate::config::PromptCacheConfig::default();
+    super::apply_openai_cache_markers(&mut body, &cfg);
+
+    let messages = body["messages"].as_array().expect("messages array");
+    let system = messages
+        .iter()
+        .find(|m| m["role"] == "system")
+        .expect("system message present");
+    assert!(
+        message_has_cache_control(system),
+        "system message must carry cache_control: {system}"
+    );
+
+    // Default rolling = 2 → last user message and the assistant message
+    // before it (the only non-system, non-tool tail messages here) get
+    // markers. The first user message at the head should not.
+    let first_user = &messages[1];
+    assert_eq!(first_user["role"], "user");
+    assert!(
+        !message_has_cache_control(first_user),
+        "head user message must NOT be marked: {first_user}"
+    );
+
+    let tail = messages.last().unwrap();
+    assert_eq!(tail["role"], "user");
+    assert!(
+        message_has_cache_control(tail),
+        "trailing user message must be marked: {tail}"
+    );
+
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant message present");
+    assert!(
+        message_has_cache_control(assistant),
+        "assistant message in rolling window must be marked: {assistant}"
+    );
+}
+
+#[test]
+fn openrouter_skips_cache_control_on_tool_role() {
+    // Hermes silent-hang guard: OpenRouter rejects `cache_control` on a
+    // role:tool message by hanging the request indefinitely. The rolling
+    // window must skip past tool messages without consuming a breakpoint.
+    let mut body = build_test_openai_body(true);
+    let cfg = crate::config::PromptCacheConfig::default();
+    super::apply_openai_cache_markers(&mut body, &cfg);
+
+    let messages = body["messages"].as_array().expect("messages array");
+    let tool_msg = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool message present");
+    assert!(
+        !message_has_cache_control(tool_msg),
+        "tool-role message must NEVER carry cache_control on OpenRouter: {tool_msg}"
+    );
+
+    // Skipping the tool message must not drop a breakpoint — the
+    // assistant message before it should still be marked.
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("assistant message present");
+    assert!(
+        message_has_cache_control(assistant),
+        "rolling window must keep walking past role:tool: {assistant}"
+    );
+}
+
+#[test]
+fn openrouter_disabled_cache_skips_helper_entirely() {
+    // The eligibility gate (`cache.enabled`) lives at the call site, but
+    // even if a caller invokes the helper with rolling=0 / cache_system
+    // off (the SystemAnd3 vs ToolsSystemAnd2 effective layout), no
+    // markers should escape onto the wire. Lock that here so a future
+    // refactor that conflates "disabled" with "off-by-default" is caught.
+    let mut body = build_test_openai_body(false);
+    let cfg = crate::config::PromptCacheConfig {
+        enabled: false,
+        cache_tools: false,
+        cache_system: false,
+        rolling_messages: 0,
+        ..crate::config::PromptCacheConfig::default()
+    };
+    super::apply_openai_cache_markers(&mut body, &cfg);
+
+    let messages = body["messages"].as_array().expect("messages array");
+    for msg in messages {
+        assert!(
+            !message_has_cache_control(msg),
+            "no message must be marked when cache layout is fully off: {msg}"
+        );
+    }
+}
+
+#[test]
+fn openrouter_sse_populates_cache_creation_tokens() {
+    // OpenRouter passes Anthropic's `cache_creation_input_tokens` field
+    // through verbatim on Claude responses. Without surfacing it the
+    // cost-event pipeline reports zero cache *write* tokens, so the
+    // first turn after a marker change has invisible cache spend.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"cache_creation_input_tokens":1234,"prompt_tokens_details":{"cached_tokens":56}}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.cache_creation_tokens, 1234);
+    assert_eq!(usage.cached_input_tokens, 56);
+    assert_eq!(usage.prompt_tokens, 100);
+}
+
+#[test]
+fn openrouter_sse_without_cache_creation_field_reports_zero() {
+    // Negative case: when the field is absent (e.g. non-Claude
+    // OpenRouter models, or Claude responses with no cache write on this
+    // turn) we must report zero, not None — the agent wires
+    // `cache_creation_tokens: u64` directly.
+    let line = r#"data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":70}}"#;
+    let usage = parse_openrouter_usage_from_sse(line);
+    assert_eq!(usage.cache_creation_tokens, 0);
+    assert_eq!(usage.cached_input_tokens, 0);
 }

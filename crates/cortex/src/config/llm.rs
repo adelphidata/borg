@@ -94,7 +94,12 @@ pub struct LlmConfig {
     /// Only used when provider is `claude-cli`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude_cli_path: Option<String>,
-    /// Prompt caching configuration (currently only used by the native Anthropic provider).
+    /// Prompt caching configuration. Honored by the native Anthropic
+    /// provider and by OpenRouter when the selected model is Claude-family
+    /// (the OpenAI-compat path injects Anthropic-style `cache_control`
+    /// markers on the system prompt and a rolling tail of recent messages).
+    /// Other OpenAI-compatible providers ignore the markers and rely on
+    /// their own implicit caching keyed by `prompt_cache_key`.
     #[serde(default)]
     pub cache: PromptCacheConfig,
 }

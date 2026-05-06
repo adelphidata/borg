@@ -29,6 +29,64 @@ fn short_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Whether the (provider, model) pair accepts Anthropic-style `cache_control`
+/// markers in the request body. Always true for the native Anthropic
+/// provider. True for OpenRouter only when the model is Anthropic-backed
+/// (Claude family) — sending the marker on, say, `openai/gpt-4o-mini` via
+/// OpenRouter is at best ignored and at worst rejected. False for every
+/// other provider, which use implicit caching keyed by `prompt_cache_key`
+/// or no cache at all.
+pub(crate) fn supports_anthropic_cache_control(provider: Provider, model: &str) -> bool {
+    match provider {
+        Provider::Anthropic => true,
+        Provider::OpenRouter => {
+            // Anchor on prefix rather than `contains("claude")` so hypothetical
+            // slugs like `anti-claude-7b` or vendor-prefixed `xai/claude-clone`
+            // can't sneak past. Covers the canonical OpenRouter form
+            // (`anthropic/claude-…`) and any router that strips the vendor
+            // prefix down to a bare `claude-…` slug.
+            let m = model.to_ascii_lowercase();
+            m.starts_with("anthropic/") || m.starts_with("claude-")
+        }
+        _ => false,
+    }
+}
+
+/// Inject Anthropic `cache_control` markers into an OpenAI-compatible chat
+/// request body in place. Used when proxying Claude through OpenRouter.
+///
+/// Marks the system message (when `cache_system` is set in the layout) and
+/// applies a rolling tail of breakpoints to the most recent
+/// `rolling_messages` non-tool messages. Tool-role messages are skipped
+/// because OpenRouter silently hangs when `cache_control` lands on them.
+/// The tools-array breakpoint from the Anthropic-native strategy is *not*
+/// applied here — OpenRouter's tools array uses OpenAI's
+/// `{type: "function", function: {…}}` envelope which doesn't accept
+/// `cache_control`.
+fn apply_openai_cache_markers(
+    body: &mut serde_json::Value,
+    cache_cfg: &crate::config::PromptCacheConfig,
+) {
+    let marker = build_cache_control_marker(cache_cfg.ttl);
+    // cache_tools_eff is intentionally ignored: OpenAI's tools envelope
+    // (`{type: "function", function: {…}}`) doesn't accept cache_control,
+    // so the breakpoint that lands on the last tool definition for native
+    // Anthropic has no analog here.
+    let (cache_system_eff, _cache_tools_eff, rolling_eff) = cache_cfg.effective_layout();
+    let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    if cache_system_eff {
+        if let Some(sys) = messages
+            .iter_mut()
+            .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        {
+            apply_cache_control_to_message(sys, &marker);
+        }
+    }
+    apply_message_cache_control(messages, rolling_eff, &marker, true);
+}
+
 use crate::config::{Config, LlmConfig};
 use crate::provider::Provider;
 use crate::retry::{backoff_with_config, BackoffConfig};
@@ -42,8 +100,8 @@ mod pricing;
 
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
-    apply_message_cache_control, build_anthropic_messages, build_cache_control_marker,
-    parse_anthropic_response, sanitize_openai_messages, strip_images,
+    apply_cache_control_to_message, apply_message_cache_control, build_anthropic_messages,
+    build_cache_control_marker, parse_anthropic_response, sanitize_openai_messages, strip_images,
 };
 pub use cost::{CostEvent, CostEventContext, CostEventSink};
 
@@ -165,6 +223,13 @@ struct StreamUsage {
     prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
     cached_tokens: Option<u64>,
+    /// OpenRouter passes Anthropic's `cache_creation_input_tokens` field
+    /// through verbatim when the upstream model is Claude. Without
+    /// extracting it here, the cache *write* tokens charged on the first
+    /// turn after a marker change would never reach the cost-event
+    /// pipeline and cache spend would be invisible.
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
     /// OpenRouter's streaming usage chunk reports the dollar total under
     /// `total_cost`; older / non-streaming shapes use `cost`. Accept both
     /// so cost-event attribution stays `openrouter_usage` instead of
@@ -1036,8 +1101,35 @@ impl LlmClient {
             self.provider, model
         );
 
+        // When proxying Claude through OpenRouter, inject Anthropic-style
+        // `cache_control` markers onto the system + rolling-tail messages.
+        // For every other (provider, model) combination this is a no-op and
+        // we send the typed `ChatRequest` directly.
+        let cache_cfg = &self.llm_config.cache;
+        let cached_body: Option<serde_json::Value> = if cache_cfg.enabled
+            && supports_anthropic_cache_control(self.provider, &model)
+            && self.provider != Provider::Anthropic
+        {
+            // ChatRequest's Serialize impl is the standard derive — this only
+            // fails if serde itself is broken, so propagate as Fatal rather
+            // than silently degrading caching with no user-visible signal.
+            let mut body = serde_json::to_value(&request).map_err(|e| LlmError::Fatal {
+                source: anyhow::anyhow!("serialize OpenAI ChatRequest for cache injection: {e}"),
+                reason: FailoverReason::Unknown,
+            })?;
+            apply_openai_cache_markers(&mut body, cache_cfg);
+            Some(body)
+        } else {
+            None
+        };
+
         if self.debug_logging {
-            if let Ok(json) = serde_json::to_string_pretty(&request) {
+            let dump = if let Some(body) = &cached_body {
+                serde_json::to_string_pretty(body).ok()
+            } else {
+                serde_json::to_string_pretty(&request).ok()
+            };
+            if let Some(json) = dump {
                 self.debug_log("request_openai", &json);
             }
         }
@@ -1056,7 +1148,13 @@ impl LlmClient {
             "openai-compat: request start"
         );
 
-        let response = match self.send_request(&request, cancel).await {
+        let send_result = if let Some(body) = &cached_body {
+            self.send_request(body, cancel).await
+        } else {
+            self.send_request(&request, cancel).await
+        };
+
+        let response = match send_result {
             Ok(r) => {
                 lc_log!(
                     verbose,
@@ -1173,7 +1271,7 @@ impl LlmClient {
                         completion_tokens: usage.completion_tokens.unwrap_or(0),
                         total_tokens: usage.total_tokens.unwrap_or(0),
                         cached_input_tokens,
-                        cache_creation_tokens: 0,
+                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
                         provider: provider.to_string(),
                         model: model.to_string(),
                         provider_cost_usd,
@@ -1243,7 +1341,7 @@ impl LlmClient {
             .openai_reasoning_effort()
             .map(String::from);
         let request = ChatRequest {
-            model,
+            model: model.clone(),
             messages: messages.to_vec(),
             tools: tools.map(<[ToolDefinition]>::to_vec),
             temperature: self.llm_config.temperature,
@@ -1255,6 +1353,23 @@ impl LlmClient {
             stream_options: None,
             usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled())
                 .then_some(UsageOptions { include: true }),
+        };
+
+        // Mirror the streaming path: inject Anthropic-style cache markers
+        // when we're proxying Claude through OpenRouter.
+        let cache_cfg = &self.llm_config.cache;
+        let cached_body: Option<serde_json::Value> = if cache_cfg.enabled
+            && supports_anthropic_cache_control(self.provider, &model)
+            && self.provider != Provider::Anthropic
+        {
+            // Propagate any serialize failure rather than silently shipping an
+            // un-cached request — see the streaming path for the rationale.
+            let mut body = serde_json::to_value(&request)
+                .context("serialize OpenAI ChatRequest for cache injection")?;
+            apply_openai_cache_markers(&mut body, cache_cfg);
+            Some(body)
+        } else {
+            None
         };
 
         #[derive(Deserialize)]
@@ -1275,7 +1390,11 @@ impl LlmClient {
         let request_model = self.llm_config.model.clone();
 
         for attempt in 0..=max_retries {
-            let result = self.send_request(&request, &cancel).await;
+            let result = if let Some(body) = &cached_body {
+                self.send_request(body, &cancel).await
+            } else {
+                self.send_request(&request, &cancel).await
+            };
             match result {
                 Ok(response) => {
                     let resp: ChatResponse = response.json().await?;
@@ -1295,7 +1414,7 @@ impl LlmClient {
                             .and_then(|d| d.cached_tokens)
                             .or(usage.cached_tokens)
                             .unwrap_or(0),
-                        cache_creation_tokens: 0,
+                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
                         provider: self.provider.as_str().to_string(),
                         model: request_model.clone(),
                         provider_cost_usd: Self::extract_provider_cost_usd(&usage),
@@ -1412,7 +1531,7 @@ impl LlmClient {
 
         let mut anthropic_messages = anthropic_messages;
         if cache_enabled {
-            apply_message_cache_control(&mut anthropic_messages, rolling_eff, &cache_marker);
+            apply_message_cache_control(&mut anthropic_messages, rolling_eff, &cache_marker, false);
         }
         body["messages"] = serde_json::json!(anthropic_messages);
         if let Some(mut tools_json) = anthropic_tools {

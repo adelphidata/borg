@@ -236,10 +236,18 @@ pub(super) fn build_cache_control_marker(ttl: crate::config::CacheTtl) -> serde_
 /// and the marker falls back to the previous block in the same message.
 /// Fewer than `rolling_messages` eligible messages is fine — we just mark
 /// whatever we can.
+///
+/// `skip_tool_messages` is the OpenRouter-compat escape hatch: marking a
+/// `role: tool` message with `cache_control` causes OpenRouter to silently
+/// hang the request. Native Anthropic flattens tool-results into user
+/// messages, so this never fires there — pass `false` from the Anthropic
+/// path. The OpenAI-compat path (used for OpenRouter) keeps `role: tool`
+/// messages around and must pass `true`.
 pub(super) fn apply_message_cache_control(
     messages: &mut [serde_json::Value],
     rolling_messages: usize,
     marker: &serde_json::Value,
+    skip_tool_messages: bool,
 ) {
     if messages.is_empty() || rolling_messages == 0 {
         return;
@@ -250,6 +258,15 @@ pub(super) fn apply_message_cache_control(
         if remaining == 0 {
             break;
         }
+
+        if skip_tool_messages && msg.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+        {
+            // OpenRouter rejects `cache_control` on tool-role messages by
+            // silently hanging — skip without consuming a breakpoint so the
+            // rolling window keeps walking back.
+            continue;
+        }
+
         let Some(content) = msg.get_mut("content") else {
             continue;
         };
@@ -284,6 +301,42 @@ pub(super) fn apply_message_cache_control(
         if marked {
             remaining -= 1;
         }
+    }
+}
+
+/// Attach a `cache_control` marker to a single message's content in place.
+/// Used by the OpenAI-compat path to mark the system message (which lives
+/// in the messages array, unlike on the native Anthropic path where the
+/// system prompt is a top-level field).
+///
+/// Mirrors the upgrade-string-to-block logic of `apply_message_cache_control`
+/// so a plain-string system content gets wrapped before the marker lands.
+pub(super) fn apply_cache_control_to_message(
+    msg: &mut serde_json::Value,
+    marker: &serde_json::Value,
+) {
+    let Some(content) = msg.get_mut("content") else {
+        return;
+    };
+    if let Some(s) = content.as_str() {
+        *content = serde_json::json!([{ "type": "text", "text": s }]);
+    }
+    let Some(blocks) = content.as_array_mut() else {
+        return;
+    };
+    for block in blocks.iter_mut().rev() {
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
+        let block_type = obj
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if matches!(block_type, "thinking" | "redacted_thinking") {
+            continue;
+        }
+        obj.insert("cache_control".to_string(), marker.clone());
+        return;
     }
 }
 
