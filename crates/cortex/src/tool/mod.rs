@@ -363,6 +363,56 @@ pub(crate) fn tool_group_for_name(name: &str) -> Option<ToolGroup> {
     }
 }
 
+/// True iff `name` corresponds to a tool variant whose [`Tool::parallel_safe`]
+/// is `true`. Mirrors the typed predicate but works on raw names (so callers
+/// can gate parallel dispatch before arg-parsing has happened).
+pub(crate) const fn is_parallel_safe_name(name: &str) -> bool {
+    // Cast through bytes so the function can stay `const fn`.
+    matches_any(
+        name,
+        &[
+            tn::READ_FILE,
+            tn::READ_MEMORY,
+            tn::MEMORY_SEARCH,
+            tn::LIST_SKILLS,
+            tn::LIST_CHANNELS,
+            tn::LIST_DIR,
+            tn::WEB_FETCH,
+            tn::WEB_SEARCH,
+            tn::APPLY_PATCH,
+            tn::APPLY_SKILL_PATCH,
+        ],
+    )
+}
+
+/// `const`-friendly `slice.contains`.
+const fn matches_any(name: &str, candidates: &[&str]) -> bool {
+    let mut i = 0;
+    while i < candidates.len() {
+        if str_eq(name, candidates[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < ab.len() {
+        if ab[i] != bb[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Names listed in the catalog but not directly dispatched by the agent loop
 /// (skill-driven integration tools). These are kept for catalog/profile
 /// filtering only.

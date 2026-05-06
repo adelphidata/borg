@@ -2979,7 +2979,7 @@ Rules:
         args_json: &str,
         event_tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<ToolOutput> {
-        let args: serde_json::Value = match serde_json::from_str(args_json) {
+        let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolOutput::Text(format!(
@@ -2988,58 +2988,80 @@ Rules:
             }
         };
 
-        // Tools that return ToolOutput directly (may contain multimodal content)
-        match name {
-            tn::READ_FILE => return tool_handlers::handle_read_file(&args, &self.config),
-            tn::BROWSER => {
-                return tool_handlers::handle_browser(
-                    &args,
-                    &self.config,
-                    &mut self.browser_session,
-                )
-                .await;
+        // Single tagged-deser entry point. Schema-validation errors surface
+        // here as structured tool output so the LLM can recover; the dispatch
+        // arms below see only typed `Args`.
+        let tool = match crate::tool::Tool::parse(name, raw_args.clone()) {
+            Ok(t) => t,
+            Err(crate::tool::ToolParseError::UnknownTool(n)) => {
+                return Err(anyhow::anyhow!("Unknown tool: {n}"));
             }
-            tn::TEXT_TO_SPEECH => {
+            Err(crate::tool::ToolParseError::InvalidArgs { tool, source }) => {
+                return Ok(ToolOutput::Text(format!(
+                    "Error: Invalid arguments for tool '{tool}': {source}"
+                )));
+            }
+        };
+
+        // Variants returning ToolOutput directly (may contain multimodal content).
+        match &tool {
+            crate::tool::Tool::ReadFile(args) => {
+                let out = crate::tool::read_file::handle(args, &self.config)?;
+                self.maybe_refresh_skills_after_tool(name, &raw_args, "");
+                return Ok(out);
+            }
+            crate::tool::Tool::Browser(args) => {
+                let out =
+                    crate::tool::browser::handle(args, &self.config, &mut self.browser_session)
+                        .await?;
+                self.maybe_refresh_skills_after_tool(name, &raw_args, "");
+                return Ok(out);
+            }
+            crate::tool::Tool::TextToSpeech(args) => {
                 if let Some(ref synth) = self.tts_synthesizer {
-                    return Ok(tool_handlers::handle_text_to_speech(&args, synth).await);
+                    return Ok(crate::tool::text_to_speech::handle(args, synth).await);
                 }
                 return Ok(ToolOutput::Text(
                     "TTS is not configured. Enable it via: borg settings set tts.enabled true"
                         .into(),
                 ));
             }
-            tn::REQUEST_USER_INPUT => {
-                return tool_handlers::handle_request_user_input(&args, event_tx).await;
+            crate::tool::Tool::RequestUserInput(args) => {
+                return crate::tool::request_user_input::handle(args, event_tx).await;
             }
             _ => {}
         }
 
-        // Tools that return Result<String> (wrapped to ToolOutput::Text below)
-        let text_result: Result<String> = match name {
-            // Memory
-            tn::WRITE_MEMORY => crate::tool_dispatch::handle_write_memory_with_effects(
-                &args,
+        // Variants returning Result<String> wrap to ToolOutput::Text below.
+        let text_result: Result<String> = match &tool {
+            crate::tool::Tool::WriteMemory(args) => crate::tool::write_memory::handle(
+                args,
                 &self.config,
                 &self.config_arc,
                 &mut self.cached_identity,
             ),
-            tn::READ_MEMORY => tool_handlers::handle_read_memory(&args),
-            tn::MEMORY_SEARCH => tool_handlers::handle_memory_search(&args, &self.config).await,
-            // Resource listing
-            tn::LIST => {
-                tool_handlers::handle_list(&args, &self.config, self.agent_control.as_ref())
+            crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args),
+            crate::tool::Tool::MemorySearch(args) => {
+                crate::tool::memory_search::handle(args, &self.config).await
             }
-            tn::LIST_SKILLS => tool_handlers::handle_list_skills(&self.config),
-            tn::LIST_CHANNELS => tool_handlers::handle_list_channels(&self.config),
-            // File operations
-            tn::APPLY_PATCH => tool_handlers::handle_apply_patch_unified(&args, &self.config),
-            tn::APPLY_SKILL_PATCH => tool_handlers::handle_apply_skill_patch(&args),
-            tn::CREATE_CHANNEL => tool_handlers::handle_create_channel(&args),
-            tn::LIST_DIR => tool_handlers::handle_list_dir(&args, &self.config),
-            // Shell & web
-            tn::RUN_SHELL => {
-                tool_handlers::handle_run_shell(
-                    &args,
+            crate::tool::Tool::List(args) => {
+                crate::tool::list::handle(args, &self.config, self.agent_control.as_ref())
+            }
+            crate::tool::Tool::ListSkills => crate::tool::list::handle_list_skills(&self.config),
+            crate::tool::Tool::ListChannels => crate::tool::list::handle_list_channels(&self.config),
+            crate::tool::Tool::ApplyPatch(args) => {
+                crate::tool::apply_patch::handle_apply_patch(args, &self.config)
+            }
+            crate::tool::Tool::ApplySkillPatch(args) => {
+                crate::tool::apply_patch::handle_apply_skill_patch(args)
+            }
+            crate::tool::Tool::CreateChannel(args) => {
+                crate::tool::apply_patch::handle_create_channel(args)
+            }
+            crate::tool::Tool::ListDir(args) => crate::tool::list_dir::handle(args, &self.config),
+            crate::tool::Tool::RunShell(args) => {
+                crate::tool::run_shell::handle(
+                    args,
                     &self.config,
                     &self.policy,
                     event_tx,
@@ -3047,38 +3069,58 @@ Rules:
                 )
                 .await
             }
-            tn::WEB_FETCH => tool_handlers::handle_web_fetch(&args, &self.config).await,
-            tn::WEB_SEARCH => tool_handlers::handle_web_search(&args, &self.config).await,
-            // Scheduling
-            tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON => {
-                tool_handlers::handle_schedule(&args, &self.config)
+            crate::tool::Tool::WebFetch(args) => {
+                crate::tool::web_fetch::handle(args, &self.config).await
             }
-            // Media
-            tn::GENERATE_IMAGE => tool_handlers::handle_generate_image(&args, &self.config).await,
-            // Multi-agent tools
-            name @ (tn::SPAWN_AGENT
-            | tn::SEND_TO_AGENT
-            | tn::WAIT_FOR_AGENT
-            | tn::LIST_AGENTS
-            | tn::CLOSE_AGENT
-            | tn::MANAGE_ROLES) => {
-                match crate::tool_dispatch::try_handle_multi_agent_tool(
-                    name,
-                    &args,
+            crate::tool::Tool::WebSearch(args) => {
+                crate::tool::web_search::handle(args, &self.config).await
+            }
+            crate::tool::Tool::Schedule(args) => {
+                crate::tool::schedule::handle_schedule(args, &self.config)
+            }
+            crate::tool::Tool::ManageTasks(args) => {
+                crate::tool::schedule::handle_manage_tasks(args, &self.config)
+            }
+            crate::tool::Tool::ManageCron(args) => {
+                crate::tool::schedule::handle_manage_cron(args, &self.config)
+            }
+            crate::tool::Tool::GenerateImage(args) => {
+                crate::tool::generate_image::handle(args, &self.config).await
+            }
+            crate::tool::Tool::SpawnAgent(args) => {
+                crate::tool::multi_agent::handle_spawn_agent(
+                    args,
                     &mut self.agent_control,
                     &self.config,
                     &self.history,
                 )
                 .await
-                {
-                    Some(result) => result,
-                    None => Err(anyhow::anyhow!("Unknown tool: {name}")),
-                }
             }
-            _ => Err(anyhow::anyhow!("Unknown tool: {name}")),
+            crate::tool::Tool::SendToAgent(args) => {
+                crate::tool::multi_agent::handle_send_to_agent(args)
+            }
+            crate::tool::Tool::WaitForAgent(args) => {
+                crate::tool::multi_agent::handle_wait_for_agent(args, &mut self.agent_control).await
+            }
+            crate::tool::Tool::ListAgents(_) => {
+                crate::tool::multi_agent::handle_list_agents(self.agent_control.as_ref())
+            }
+            crate::tool::Tool::CloseAgent(args) => {
+                crate::tool::multi_agent::handle_close_agent(args, &mut self.agent_control)
+            }
+            crate::tool::Tool::ManageRoles(args) => {
+                crate::tool::multi_agent::handle_manage_roles(args)
+            }
+            // Variants handled in the early-return block above.
+            crate::tool::Tool::ReadFile(_)
+            | crate::tool::Tool::Browser(_)
+            | crate::tool::Tool::TextToSpeech(_)
+            | crate::tool::Tool::RequestUserInput(_) => unreachable!(
+                "ReadFile/Browser/TextToSpeech/RequestUserInput are handled in the early-return match above"
+            ),
         };
         let text = text_result?;
-        self.maybe_refresh_skills_after_tool(name, &args, &text);
+        self.maybe_refresh_skills_after_tool(name, &raw_args, &text);
         Ok(ToolOutput::Text(text))
     }
 
@@ -3123,19 +3165,26 @@ Rules:
 
 /// Execute a tool call that the planner classified as parallel-safe.
 ///
-/// This mirrors the handler-selection table in `Agent::execute_tool` but is
-/// restricted to tools that (a) take `&Config` or less, (b) do not touch
-/// `&mut self`, and (c) only handle effects the planner deems safe to fan
-/// out concurrently. The set is kept in sync with `tool_effects::classify`;
-/// any mismatch is a bug — unsafe branches return a hard error so the
-/// condition is visible in tests rather than silently misbehaving.
+/// Parses through the typed [`crate::tool::Tool`] enum so the parallel-safety
+/// gate is enforced by exhaustive `match` on `Tool::parallel_safe` — drift
+/// between the planner and the dispatcher is impossible without a compile
+/// error. Non-parallel-safe variants return a hard error so the planner bug
+/// surfaces in tests instead of silent misbehaviour.
 async fn dispatch_parallel_safe_tool(
     name: &str,
     args_json: &str,
     config: &Config,
-    event_tx: &mpsc::Sender<AgentEvent>,
+    _event_tx: &mpsc::Sender<AgentEvent>,
 ) -> Result<ToolOutput> {
-    let args: serde_json::Value = match serde_json::from_str(args_json) {
+    // Reject unknown / non-parallel-safe tools by *name* before parsing args.
+    // Surface as a loud Err so a planner/dispatcher mismatch fails tests rather
+    // than masquerading as an arg-validation error.
+    if !crate::tool::is_parallel_safe_name(name) {
+        return Err(anyhow::anyhow!(
+            "dispatch_parallel_safe_tool called with non-parallel-safe tool '{name}' — planner/dispatch mismatch"
+        ));
+    }
+    let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => {
             return Ok(ToolOutput::Text(format!(
@@ -3143,36 +3192,57 @@ async fn dispatch_parallel_safe_tool(
             )));
         }
     };
+    let tool = match crate::tool::Tool::parse(name, raw_args) {
+        Ok(t) => t,
+        Err(crate::tool::ToolParseError::UnknownTool(n)) => {
+            return Err(anyhow::anyhow!(
+                "dispatch_parallel_safe_tool called with unknown tool '{n}' — planner/dispatch mismatch"
+            ));
+        }
+        Err(crate::tool::ToolParseError::InvalidArgs { tool, source }) => {
+            return Ok(ToolOutput::Text(format!(
+                "Error: Invalid arguments for tool '{tool}': {source}"
+            )));
+        }
+    };
 
-    match name {
-        tn::READ_FILE => tool_handlers::handle_read_file(&args, config),
-        tn::READ_MEMORY => tool_handlers::handle_read_memory(&args).map(ToolOutput::Text),
-        tn::MEMORY_SEARCH => tool_handlers::handle_memory_search(&args, config)
+    debug_assert!(tool.parallel_safe(), "is_parallel_safe_name drift");
+
+    match &tool {
+        crate::tool::Tool::ReadFile(args) => crate::tool::read_file::handle(args, config),
+        crate::tool::Tool::ReadMemory(args) => {
+            crate::tool::read_memory::handle(args).map(ToolOutput::Text)
+        }
+        crate::tool::Tool::MemorySearch(args) => crate::tool::memory_search::handle(args, config)
             .await
             .map(ToolOutput::Text),
-        tn::LIST_SKILLS => tool_handlers::handle_list_skills(config).map(ToolOutput::Text),
-        tn::LIST_CHANNELS => tool_handlers::handle_list_channels(config).map(ToolOutput::Text),
-        tn::LIST_DIR => tool_handlers::handle_list_dir(&args, config).map(ToolOutput::Text),
-        tn::WEB_FETCH => tool_handlers::handle_web_fetch(&args, config)
+        crate::tool::Tool::ListSkills => {
+            crate::tool::list::handle_list_skills(config).map(ToolOutput::Text)
+        }
+        crate::tool::Tool::ListChannels => {
+            crate::tool::list::handle_list_channels(config).map(ToolOutput::Text)
+        }
+        crate::tool::Tool::ListDir(args) => {
+            crate::tool::list_dir::handle(args, config).map(ToolOutput::Text)
+        }
+        crate::tool::Tool::WebFetch(args) => crate::tool::web_fetch::handle(args, config)
             .await
             .map(ToolOutput::Text),
-        tn::WEB_SEARCH => tool_handlers::handle_web_search(&args, config)
+        crate::tool::Tool::WebSearch(args) => crate::tool::web_search::handle(args, config)
             .await
             .map(ToolOutput::Text),
-        tn::APPLY_PATCH => {
-            tool_handlers::handle_apply_patch_unified(&args, config).map(ToolOutput::Text)
+        crate::tool::Tool::ApplyPatch(args) => {
+            crate::tool::apply_patch::handle_apply_patch(args, config).map(ToolOutput::Text)
         }
-        tn::APPLY_SKILL_PATCH => {
-            tool_handlers::handle_apply_skill_patch(&args).map(ToolOutput::Text)
+        crate::tool::Tool::ApplySkillPatch(args) => {
+            crate::tool::apply_patch::handle_apply_skill_patch(args).map(ToolOutput::Text)
         }
-        other => {
-            // Planner bug — fall back loudly rather than running sequentially
-            // via a different code path.
-            let _ = event_tx; // silence unused warning if all arms avoid it
-            Err(anyhow::anyhow!(
-                "dispatch_parallel_safe_tool called with non-parallel-safe tool '{other}' — planner/dispatch mismatch"
-            ))
-        }
+        // Anything still reaching here despite `parallel_safe()` returning true
+        // is a closed-set inconsistency — fail loudly so tests catch it.
+        other => Err(anyhow::anyhow!(
+            "dispatch_parallel_safe_tool: variant '{}' is parallel_safe() but lacks a handler arm",
+            other.name()
+        )),
     }
 }
 
