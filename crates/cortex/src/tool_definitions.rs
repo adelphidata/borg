@@ -111,19 +111,19 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     }
 
     // Request user input — always available (disabled at gateway level).
-    // Batched 1–3 question carousel; UI auto-appends an "Other" row per
+    // Batched 1–4 question carousel; UI auto-appends an "Other" row per
     // question and exposes a Tab-toggled notes box.
     defs.push(ToolDefinition::new(
         tool_names::REQUEST_USER_INPUT,
-        "Ask the user 1–3 short multiple-choice questions in one batch and wait for answers. The UI auto-appends an 'Other' option per question and shows a Tab-toggled notes field. Use this in Plan mode to clarify requirements, in onboarding to gather setup choices, or any time you're genuinely blocked on a decision. Don't use for routine confirmations.",
+        "Ask the user 1–4 short multiple-choice questions in one batch and wait for answers. The UI auto-appends an 'Other' option per question and shows a Tab-toggled notes field. Use this in Plan mode to clarify requirements, in onboarding to gather setup choices, or any time you're genuinely blocked on a decision. Don't use for routine confirmations.",
         serde_json::json!({
             "type": "object",
             "properties": {
                 "questions": {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 3,
-                    "description": "Questions to show the user. Prefer 1; never exceed 3.",
+                    "maxItems": 4,
+                    "description": "Questions to show the user. Prefer 1; never exceed 4.",
                     "items": {
                         "type": "object",
                         "required": ["id", "header", "question", "options"],

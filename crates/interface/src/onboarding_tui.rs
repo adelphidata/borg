@@ -38,7 +38,7 @@ const BORG_NAMES: &[&str] = &[
     "Bjorn Borg",
     "Piers Borgan",
     "Steven Spielborg",
-    "Ingeborg",
+    "Smorgasborg",
     "J.P. Borgan",
     "Tracy Borgan",
     "Borgan Fairchild",

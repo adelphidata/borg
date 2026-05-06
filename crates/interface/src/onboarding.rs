@@ -751,11 +751,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn setup_instructs_batched_questions_for_channels_and_timezone() {
+    fn setup_instructs_batched_questions_for_purpose_channels_personality() {
         // Regression guard: the first-boot template must tell the agent to use
-        // `request_user_input` with a batched `questions` array covering at
-        // least the two enumerable onboarding topics — messaging channels and
-        // timezone — so they're answered in one carousel rather than N round-trips.
+        // `request_user_input` with a batched `questions` array. The default
+        // batch covers three enumerable topics — purpose, channels, and
+        // personality/communication style. Timezone is auto-detected on the
+        // host so it's intentionally NOT in the default example.
         let setup = generate_setup("Borg", "Dave");
         let setup_lc = setup.to_lowercase();
         assert!(
@@ -766,15 +767,18 @@ mod tests {
             setup_lc.contains("\"questions\""),
             "SETUP.md must instruct using the batched `questions` array shape"
         );
-        // Both topic ids must appear so the model picks deterministic keys for
-        // downstream config writes.
+        for id in ["purpose", "channels", "personality"] {
+            assert!(
+                setup_lc.contains(&format!("\"id\": \"{id}\"")),
+                "SETUP.md must include a `{id}` question id"
+            );
+        }
+        // Timezone is auto-detected — it must NOT be in the default example.
+        // The template explicitly tells the model to only add a timezone
+        // question when the live time block shows UTC.
         assert!(
-            setup_lc.contains("\"id\": \"channels\""),
-            "SETUP.md must include a `channels` question id"
-        );
-        assert!(
-            setup_lc.contains("\"id\": \"timezone\""),
-            "SETUP.md must include a `timezone` question id"
+            !setup_lc.contains("\"id\": \"timezone\""),
+            "SETUP.md must NOT include a default `timezone` question — host timezone is auto-detected"
         );
         // The legacy `choices` parameter is gone — guard against the template
         // being copy-pasted back from history.

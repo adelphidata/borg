@@ -126,7 +126,7 @@ pub enum AppState {
     /// Agent has asked one or more questions mid-turn via `request_user_input`;
     /// waiting for the user to walk through the carousel and submit answers.
     ///
-    /// `questions` is the immutable batch (1-3 entries). `current_idx` is the
+    /// `questions` is the immutable batch (up to `MAX_QUESTIONS` entries). `current_idx` is the
     /// active question; `per_question_state` parallels `questions` and holds
     /// per-question UI state (cursor + selections + notes). `respond` carries
     /// the oneshot back to the agent — `None` once consumed.

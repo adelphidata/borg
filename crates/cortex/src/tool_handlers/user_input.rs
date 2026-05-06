@@ -52,7 +52,7 @@ pub struct Answer {
 }
 
 /// Maximum number of questions the LLM is allowed to batch in one call.
-pub const MAX_QUESTIONS: usize = 3;
+pub const MAX_QUESTIONS: usize = 4;
 /// Maximum byte length of a question's `header` chip label.
 pub const MAX_HEADER_CHARS: usize = 12;
 /// Min/max number of caller-provided options per question (the "Other"
@@ -188,7 +188,7 @@ pub fn parse_questions(args: &serde_json::Value) -> anyhow::Result<Vec<Question>
     Ok(questions)
 }
 
-/// Handle the `request_user_input` tool: ask the user 1-3 short multiple-choice
+/// Handle the `request_user_input` tool: ask the user 1-4 short multiple-choice
 /// questions and block until answers come back.
 ///
 /// On success, returns the LLM-facing JSON `{ "answers": { "<id>": { "answers": [...] } } }`.
@@ -373,16 +373,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_questions_rejects_more_than_three_questions() {
+    fn parse_questions_rejects_more_than_max_questions() {
         let q = one_valid_question();
-        let extras = json!([q.clone(), q.clone(), q.clone(), q.clone()]);
-        // Need unique ids — duplicate-id check would fire first. Patch ids.
-        let mut arr = extras.as_array().unwrap().clone();
-        for (i, it) in arr.iter_mut().enumerate() {
-            it["id"] = json!(format!("q{i}"));
-        }
+        // MAX_QUESTIONS + 1 entries → over the cap.
+        let arr: Vec<serde_json::Value> = (0..=MAX_QUESTIONS)
+            .map(|i| {
+                let mut item = q.clone();
+                item["id"] = json!(format!("q{i}"));
+                item
+            })
+            .collect();
         let err = parse_questions(&sample_args(serde_json::Value::Array(arr))).unwrap_err();
-        assert!(err.to_string().contains("at most 3"));
+        assert!(err
+            .to_string()
+            .contains(&format!("at most {MAX_QUESTIONS}")));
     }
 
     #[test]

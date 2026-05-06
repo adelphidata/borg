@@ -444,7 +444,7 @@ fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
 /// truth so this check matches what the agent loop actually loads. The
 /// directive mixes structured `request_user_input` choices with
 /// free-form chat follow-up because `request_user_input` is
-/// multiple-choice only (max 3 questions, 2-4 options each).
+/// multiple-choice only (max 4 questions, 2-4 options each).
 fn check_identity_unpersonalized(_config: &Config, _db: Option<&Database>) -> Option<String> {
     if cortex::identity::is_personalized() {
         return None;
