@@ -52,6 +52,17 @@ unfinished items stay here so a future contributor can see what's left.
   ones still restore cleanly. Add archive verification, manifest/hash
   checks, and periodic test-restore drills into a temp directory so
   "backup succeeded" also means "restore is likely to work."
+- **Sleep-inhibitor wire-up.** Deferred. A multi-platform RAII
+  `SleepInhibitor` (macOS `caffeinate -i -w <pid>`, Linux
+  `systemd-inhibit --what=sleep ... sleep infinity`, no-op elsewhere)
+  shipped in 2026-04 but was never instantiated by any caller and was
+  removed by the 2026-05 dead-code sweep. Restore it and hold a guard
+  for the lifetime of an active session and/or running scheduled task in
+  `borgd::session` / `borgd::task_runner` so a laptop borg doesn't get
+  suspended mid-tool-call. Restoration is mechanical — pull the file
+  from history (last present at `be2ae863`), re-add `pub mod
+  sleep_inhibitor;` in `crates/cortex/src/lib.rs`, then add the call
+  sites the original feature was missing.
 - **CVE advisory integration.** Deferred. Pulling rustsec / OSV advisories
   on a cadence would mean an outbound git/HTTP fetch from a background
   task, which is unwelcome on airgapped or locked-down deployments and

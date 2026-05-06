@@ -162,8 +162,6 @@ pub mod short_term_memory;
 pub mod skill_security;
 /// Skills loading, parsing, and progressive token budgeting.
 pub mod skills;
-/// macOS sleep inhibitor to keep daemon alive.
-pub mod sleep_inhibitor;
 /// Shared SSE stream processing for LLM providers.
 pub mod sse;
 /// Scheduled task management (prompt and command jobs).

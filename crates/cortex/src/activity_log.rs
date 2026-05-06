@@ -28,27 +28,17 @@ impl Hook for ActivityHook {
     }
 
     fn points(&self) -> &[HookPoint] {
-        &[HookPoint::SessionStart, HookPoint::OnError]
+        &[HookPoint::SessionStart]
     }
 
     fn execute(&self, ctx: &HookContext) -> HookAction {
         let Ok(db) = self.db.lock() else {
             return HookAction::Continue;
         };
-        match &ctx.data {
-            HookData::SessionStart { .. } => {
-                if let Err(e) = db.log_activity("info", "session", "New session started", None) {
-                    tracing::debug!("activity_log: session_start record failed: {e}");
-                }
+        if let HookData::SessionStart { .. } = &ctx.data {
+            if let Err(e) = db.log_activity("info", "session", "New session started", None) {
+                tracing::debug!("activity_log: session_start record failed: {e}");
             }
-            HookData::Error { message } => {
-                if let Err(e) =
-                    db.log_activity("error", "agent", &format!("Agent error: {message}"), None)
-                {
-                    tracing::debug!("activity_log: agent_error record failed: {e}");
-                }
-            }
-            _ => {}
         }
         HookAction::Continue
     }

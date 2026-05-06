@@ -22,8 +22,6 @@ pub enum HookPoint {
     AfterToolCall,
     /// After a full agent turn (all tool calls resolved).
     TurnComplete,
-    /// When an error occurs during the agent loop.
-    OnError,
 }
 
 /// Context passed to hooks when they are dispatched.
@@ -89,11 +87,6 @@ pub enum HookData {
     TurnEnd {
         /// Total tool calls in this turn.
         total_tool_calls: u32,
-    },
-    /// Error occurred.
-    Error {
-        /// Error description.
-        message: String,
     },
 }
 
@@ -430,9 +423,6 @@ mod tests {
         };
         let _ = HookData::TurnEnd {
             total_tool_calls: 5,
-        };
-        let _ = HookData::Error {
-            message: "oops".to_string(),
         };
     }
 

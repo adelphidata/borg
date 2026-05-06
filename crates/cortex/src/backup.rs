@@ -264,41 +264,6 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
     Ok(())
 }
 
-/// Prune oldest `borg-backup-*.tar.zst` files under `dir` until at most
-/// `keep` remain. Returns the number deleted. `keep == 0` deletes every
-/// auto-backup (used to nuke the cadence when the user disables backups).
-pub fn prune_backups(dir: &Path, keep: usize) -> Result<usize> {
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut entries: Vec<(i64, PathBuf)> = Vec::new();
-    for ent in fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let ent = ent?;
-        let path = ent.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("borg-backup-") || !name.ends_with(".tar.zst") {
-            continue;
-        }
-        let stem = name
-            .trim_start_matches("borg-backup-")
-            .trim_end_matches(".tar.zst");
-        let ts: i64 = stem.parse().unwrap_or(0);
-        entries.push((ts, path));
-    }
-    entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
-    let mut deleted = 0;
-    for (_, path) in entries.into_iter().skip(keep) {
-        if let Err(e) = fs::remove_file(&path) {
-            tracing::warn!("prune: failed to remove {}: {e}", path.display());
-            continue;
-        }
-        deleted += 1;
-    }
-    Ok(deleted)
-}
-
 // ── helpers ──
 
 fn append_dir_filtered<W: Write>(
@@ -656,46 +621,6 @@ mod tests {
         // will fail decompression long before tar parsing.
         fs::write(&bad, b"not a tarball").unwrap();
         assert!(verify_backup(&bad).is_err());
-    }
-
-    /// `prune_backups(keep=2)` retains the two newest by timestamp filename.
-    #[test]
-    fn prune_backups_keeps_n_newest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        for ts in [100, 200, 300, 400, 500] {
-            fs::write(dir.join(format!("borg-backup-{ts}.tar.zst")), b"x").unwrap();
-        }
-        // Add an unrelated file that must NOT be touched.
-        fs::write(dir.join("README.txt"), b"keep").unwrap();
-
-        let n = prune_backups(dir, 2).expect("prune");
-        assert_eq!(n, 3);
-        let mut surviving: Vec<String> = fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("borg-backup-"))
-            .collect();
-        surviving.sort();
-        assert_eq!(
-            surviving,
-            vec!["borg-backup-400.tar.zst", "borg-backup-500.tar.zst"]
-        );
-        assert!(dir.join("README.txt").exists());
-    }
-
-    /// `keep = 0` deletes every backup tarball under `dir`.
-    #[test]
-    fn prune_backups_keep_zero_removes_all() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        for ts in [1, 2, 3] {
-            fs::write(dir.join(format!("borg-backup-{ts}.tar.zst")), b"x").unwrap();
-        }
-        let n = prune_backups(dir, 0).expect("prune");
-        assert_eq!(n, 3);
-        assert!(fs::read_dir(dir).unwrap().next().is_none());
     }
 
     /// `should_skip_entry` filters out the four exclusion classes.

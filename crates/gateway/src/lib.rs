@@ -39,7 +39,6 @@ pub mod constants;
 pub mod crypto;
 pub mod dedup;
 pub mod discord;
-pub mod error_dedup;
 pub mod executor;
 /// Generic signed-payload webhook surface — `POST /v1/webhook/{name}`
 /// with HMAC-SHA256 verification. Lets users wire arbitrary upstream
