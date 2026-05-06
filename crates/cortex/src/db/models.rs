@@ -121,6 +121,23 @@ pub struct TaskRunRow {
     pub status: String,
 }
 
+/// Per-task failure summary over a time window. Built by joining
+/// `task_runs` (status='failed') back to `scheduled_tasks` so the
+/// heartbeat can name failed tasks instead of just counting them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedRunGroup {
+    /// Scheduled task ID — same value the `schedule` tool's `action='runs'` accepts.
+    pub task_id: String,
+    /// Human-readable task name from `scheduled_tasks.name`.
+    pub task_name: String,
+    /// Number of failed runs in the window.
+    pub failures: i64,
+    /// Most recent failure's `error` column, if any.
+    pub latest_error: Option<String>,
+    /// `started_at` of the most recent failure in the window.
+    pub latest_at: i64,
+}
+
 /// A task that has been atomically claimed for execution, with its associated run ID.
 #[derive(Debug, Clone)]
 pub struct ClaimedTask {

@@ -189,6 +189,14 @@ impl SessionHost {
         self.inner.backend.steer(text)
     }
 
+    /// Mirror a system-injected assistant message into the agent's
+    /// history. Used by the daemon to bridge proactive deliveries
+    /// (heartbeats) into the same session the user is replying in,
+    /// so the agent has the context for follow-up turns.
+    pub fn append_assistant_message(&self, text: &str) -> Result<()> {
+        self.inner.backend.append_assistant_message(text)
+    }
+
     /// Fork the active agent session at its last message. Forwards to the
     /// backend; daemon-side execution is required because SQLite has a single
     /// writer (the daemon) and the TUI cannot open a writer handle without
@@ -349,6 +357,7 @@ mod tests {
         deltas: Vec<String>,
         step_delay: Duration,
         close_calls: Arc<AtomicUsize>,
+        append_calls: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -387,6 +396,11 @@ mod tests {
             self.close_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
+            self.append_calls.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
     }
 
     fn stub(id: &str, deltas: &[&str], delay_ms: u64) -> Arc<StubBackend> {
@@ -395,6 +409,7 @@ mod tests {
             deltas: deltas.iter().map(ToString::to_string).collect(),
             step_delay: Duration::from_millis(delay_ms),
             close_calls: Arc::new(AtomicUsize::new(0)),
+            append_calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -607,6 +622,33 @@ mod tests {
             matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
             "expected terminal Error('cancelled'), got {:?}",
             last.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn append_assistant_message_reaches_backend() {
+        // Pinned by Bug B: a heartbeat the daemon streamed to the TUI must
+        // also be mirrored into the active session's history, so the user's
+        // next reply has it in context. The mirror path goes through the
+        // host wrapper; this test asserts the call is delegated to the
+        // backend with the exact text it was given.
+        let backend = stub("s-mirror", &[], 1);
+        let append_calls = backend.append_calls.clone();
+        let host = SessionHost::new(backend);
+
+        host.append_assistant_message("[heartbeat] 2 task runs failed")
+            .expect("append must succeed");
+        host.append_assistant_message("follow-up text")
+            .expect("append must succeed");
+
+        let recorded = append_calls.lock().unwrap();
+        assert_eq!(
+            recorded.as_slice(),
+            &[
+                "[heartbeat] 2 task runs failed".to_string(),
+                "follow-up text".to_string()
+            ],
+            "host must forward each call verbatim to the backend"
         );
     }
 }

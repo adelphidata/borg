@@ -295,7 +295,8 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
             return None;
         }
     };
-    let recent_failed = match db.count_failed_runs_since(now - TASK_HEALTH_WINDOW_SECS) {
+    let since = now - TASK_HEALTH_WINDOW_SECS;
+    let recent_failed = match db.count_failed_runs_since(since) {
         Ok(n) => n,
         Err(e) => {
             tracing::warn!("task_health: count_failed_runs_since failed: {e}");
@@ -307,10 +308,32 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
         return None;
     }
 
+    // Pull windowed failures grouped by task so the nudge can name task IDs
+    // even when `last_error` was already cleared by a later success. Without
+    // this, the agent saw a count and asked the user for IDs the system
+    // already knows.
+    let recent_groups = if recent_failed > 0 {
+        match db.failed_runs_grouped_since(since, TASK_HEALTH_MAX_LISTED) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("task_health: failed_runs_grouped_since failed: {e}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let mut nudge = String::from(
         "Scheduled task health check — these are real DB rows, not estimates. \
          Mention them concisely; do not fabricate counts beyond what's listed:\n",
     );
+
+    let listed_ids: std::collections::HashSet<String> = failing_tasks
+        .iter()
+        .take(TASK_HEALTH_MAX_LISTED)
+        .map(|t| t.id.clone())
+        .collect();
 
     if !failing_tasks.is_empty() {
         nudge.push_str(&format!(
@@ -326,7 +349,10 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
             // Cap the per-line error so a single noisy task can't blow the
             // proactive_nudges block past sane sizes.
             let err = if err.len() > 120 { &err[..120] } else { &err };
-            nudge.push_str(&format!("    - {} (last_error: \"{}\")\n", task.name, err));
+            nudge.push_str(&format!(
+                "    - {} (id={}, last_error: \"{}\")\n",
+                task.name, task.id, err
+            ));
         }
         if failing_tasks.len() > TASK_HEALTH_MAX_LISTED {
             nudge.push_str(&format!(
@@ -335,14 +361,41 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
             ));
         }
     }
+
     if recent_failed > 0 {
         nudge.push_str(&format!(
-            "  {recent_failed} task_run(s) have status='failed' in the last 24h.\n"
+            "  {recent_failed} task_run(s) failed in the last 24h:\n"
         ));
+        let mut listed = 0usize;
+        for group in &recent_groups {
+            // Skip tasks already named in the last_error block — same task,
+            // duplicated lines just add noise.
+            if listed_ids.contains(&group.task_id) {
+                continue;
+            }
+            let err = group
+                .latest_error
+                .as_deref()
+                .unwrap_or("(no error captured)")
+                .replace('\n', " ");
+            let err = if err.len() > 120 { &err[..120] } else { &err };
+            nudge.push_str(&format!(
+                "    - {} (id={}, {} failure(s), last_error: \"{}\")\n",
+                group.task_name, group.task_id, group.failures, err
+            ));
+            listed += 1;
+        }
+        if listed == 0 && !recent_groups.is_empty() {
+            // Every windowed failure was already covered above — leave a
+            // marker so the agent doesn't think the second count is unmoored.
+            nudge.push_str("    (all already listed above)\n");
+        }
     }
+
     nudge.push_str(
-        "Offer to investigate (run `schedule` with action='runs' for a specific task ID, \
-         or look at recent task_runs). Keep it to 2–3 sentences and use the names above verbatim.",
+        "The task IDs above are everything you need — do NOT ask the user for IDs. \
+         Mention the failed tasks by name; if the user wants a deeper dive, call \
+         `schedule` with action='runs' and one of the IDs listed. Keep it to 2–3 sentences.",
     );
     Some(nudge)
 }
@@ -1025,11 +1078,104 @@ mod tests {
 
         let nudge = build_task_health_nudge(&db, now).expect("must fire");
         assert!(
-            nudge.contains("2 task_run(s) have status='failed' in the last 24h"),
+            nudge.contains("2 task_run(s) failed in the last 24h"),
             "expected 24h failed-run count = 2, got: {nudge}"
+        );
+        // The whole point of the fix: the windowed block must name the task
+        // by name + id so the agent has concrete IDs to investigate, instead
+        // of asking the user "what are the task IDs?".
+        assert!(
+            nudge.contains("task1") && nudge.contains("id=t1"),
+            "windowed block must name the task and include its id: {nudge}"
         );
         // Negative: never claim "5" or any other fabricated number.
         assert!(!nudge.contains(" 5 "), "fabricated count leaked: {nudge}");
+    }
+
+    #[test]
+    fn task_health_lists_windowed_failures_when_last_error_already_cleared() {
+        // Regression for the bug behind this commit: the heartbeat once
+        // produced "2 task runs have failed in the last 24 hours. Want me to
+        // investigate? ... if you share the task IDs". The agent had no IDs
+        // because `tasks_with_last_error` was empty (failures cleared by a
+        // later success) and the recent-failed branch was just a count.
+        // After the fix, the nudge must list task IDs even in that case.
+        let db = in_memory_db();
+        make_task(&db, "tsk_alpha", "daily_summary");
+        make_task(&db, "tsk_beta", "weekly_report");
+
+        let now = 1_000_000_i64;
+        // Two failures inside the window for daily_summary, one for weekly_report.
+        db.record_task_run("tsk_alpha", now - 60, 100, None, Some("openrouter 429"))
+            .expect("record");
+        db.record_task_run("tsk_alpha", now - 120, 100, None, Some("upstream timeout"))
+            .expect("record");
+        db.record_task_run("tsk_beta", now - 90, 100, None, Some("rate limited"))
+            .expect("record");
+        // Successes after — important: simulates last_error being cleared.
+        db.record_task_run("tsk_alpha", now - 30, 100, Some("ok"), None)
+            .expect("record");
+        // No `set_task_retry` — `tasks_with_last_error()` is empty.
+
+        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        assert!(
+            !nudge.contains("task(s) carry a last_error"),
+            "first block should be skipped when no task carries last_error: {nudge}"
+        );
+        // Both task IDs must appear so the agent doesn't ask the user for them.
+        assert!(
+            nudge.contains("id=tsk_alpha"),
+            "missing tsk_alpha id: {nudge}"
+        );
+        assert!(
+            nudge.contains("id=tsk_beta"),
+            "missing tsk_beta id: {nudge}"
+        );
+        // Per-task failure counts are visible.
+        assert!(
+            nudge.contains("daily_summary") && nudge.contains("2 failure(s)"),
+            "expected daily_summary listed with 2 failures: {nudge}"
+        );
+        assert!(
+            nudge.contains("weekly_report") && nudge.contains("1 failure(s)"),
+            "expected weekly_report listed with 1 failure: {nudge}"
+        );
+        // Trailer explicitly tells the LLM not to ask the user for IDs.
+        assert!(
+            nudge.contains("do NOT ask the user for IDs"),
+            "trailer must forbid asking the user for IDs: {nudge}"
+        );
+    }
+
+    #[test]
+    fn task_health_dedupes_tasks_appearing_in_both_blocks() {
+        // A task that currently carries `last_error` AND has windowed failed
+        // runs should appear once (in the last_error block), not twice.
+        let db = in_memory_db();
+        make_task(&db, "tsk_dup", "duplicated");
+
+        let now = 1_000_000_i64;
+        db.record_task_run("tsk_dup", now - 60, 100, None, Some("boom"))
+            .expect("record");
+        db.set_task_retry("tsk_dup", 1, "still broken", now + 10_000)
+            .expect("set");
+
+        let nudge = build_task_health_nudge(&db, now).expect("must fire");
+        assert_eq!(
+            nudge.matches("id=tsk_dup").count(),
+            1,
+            "task should be listed exactly once across both blocks: {nudge}"
+        );
+        // The windowed block still appears (with marker) so the count line
+        // doesn't look unmoored.
+        assert!(
+            nudge.contains("1 task_run(s) failed in the last 24h"),
+            "windowed count line must still appear: {nudge}"
+        );
+        assert!(
+            nudge.contains("(all already listed above)"),
+            "marker should explain why the windowed block lists nothing: {nudge}"
+        );
     }
 
     #[test]

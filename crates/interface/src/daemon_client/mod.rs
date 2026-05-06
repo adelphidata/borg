@@ -40,11 +40,11 @@ use protocols::pki::{
 };
 use protocols::session::session_client::SessionClient;
 use protocols::session::{
-    AgentEvent, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest, CompactRequest,
-    CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, OpenRequest, PromptResponse, RewindRequest,
-    RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest, StreamRequest,
-    UndoRequest, UndoResponse,
+    AgentEvent, AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest,
+    CloseRequest, CompactRequest, CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest, PromptResponse,
+    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
+    StreamRequest, UndoRequest, UndoResponse,
 };
 use protocols::status::status_client::StatusClient;
 use protocols::status::{
@@ -562,6 +562,24 @@ impl DaemonClient {
             })
             .await
             .context("Session.Steer failed")?;
+        Ok(())
+    }
+
+    /// Mirror a system-injected assistant message (e.g. a heartbeat the
+    /// daemon streamed to this TUI) into the active session's history,
+    /// so the next user reply has the message in context.
+    pub async fn append_assistant_message(
+        &mut self,
+        session_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        self.session
+            .append_assistant_message(AppendAssistantMessageRequest {
+                session_id: session_id.to_string(),
+                content: content.to_string(),
+            })
+            .await
+            .context("Session.AppendAssistantMessage failed")?;
         Ok(())
     }
 

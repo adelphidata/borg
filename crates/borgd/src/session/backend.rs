@@ -150,6 +150,15 @@ pub trait SessionBackend: Send + Sync + 'static {
         Err(anyhow::anyhow!("steer not supported by this backend"))
     }
 
+    /// Append a system-injected assistant message to the agent's history.
+    /// Default unsupported; production backends mirror it into both
+    /// in-memory history and SQLite so the next user turn sees it.
+    fn append_assistant_message(&self, _text: &str) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!(
+            "append_assistant_message not supported by this backend"
+        ))
+    }
+
     /// Fork the active agent session at its last message. Daemon owns the
     /// single SQLite writer, so this MUST run here rather than in the client.
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {
@@ -368,6 +377,12 @@ impl SessionBackend for AgentBackend {
         self.steer_tx
             .send(text.to_string())
             .map_err(|e| anyhow::anyhow!("steer channel closed: {e}"))
+    }
+
+    fn append_assistant_message(&self, text: &str) -> anyhow::Result<()> {
+        let mut agent = lock_agent(&self.agent);
+        agent.append_assistant_message(text);
+        Ok(())
     }
 
     async fn fork(&self) -> anyhow::Result<ForkOutcome> {

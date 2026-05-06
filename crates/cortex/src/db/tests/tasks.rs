@@ -1201,6 +1201,65 @@ fn count_failed_runs_excludes_missed_and_running() {
     );
 }
 
+#[test]
+fn failed_runs_grouped_since_returns_per_task_summary() {
+    // Pinned by the heartbeat task_health augmenter: the agent must see
+    // task IDs (not just a count) so it never has to ask the user for
+    // them. Verifies grouping, time-window filtering, ordering by
+    // failure count, and `latest_error` resolution.
+    let db = test_db();
+    for (id, name) in &[
+        ("alpha", "task_alpha"),
+        ("beta", "task_beta"),
+        ("gamma", "task_gamma"),
+    ] {
+        db.create_task(&simple_task(id, name, "p", "interval", "30m", Some(100)))
+            .expect("create");
+    }
+
+    // alpha: 2 in-window, 1 out-of-window. Latest in-window error = "boom2".
+    db.record_task_run("alpha", 1000, 10, None, Some("ancient")) // outside
+        .expect("record");
+    db.record_task_run("alpha", 5000, 10, None, Some("boom1"))
+        .expect("record");
+    db.record_task_run("alpha", 6000, 10, None, Some("boom2"))
+        .expect("record");
+    // beta: 1 in-window, 1 success.
+    db.record_task_run("beta", 5500, 10, None, Some("rate limited"))
+        .expect("record");
+    db.record_task_run("beta", 6500, 10, Some("ok"), None)
+        .expect("record");
+    // gamma: only success — must not appear.
+    db.record_task_run("gamma", 6000, 10, Some("ok"), None)
+        .expect("record");
+
+    let groups = db.failed_runs_grouped_since(2000, 10).expect("query");
+    let names: Vec<&str> = groups.iter().map(|g| g.task_name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["task_alpha", "task_beta"],
+        "alpha first (2 failures > beta's 1), gamma absent (no failures): {groups:?}"
+    );
+
+    let alpha = &groups[0];
+    assert_eq!(alpha.failures, 2, "alpha should count 2 windowed failures");
+    assert_eq!(
+        alpha.latest_error.as_deref(),
+        Some("boom2"),
+        "latest_error must be the most recent failure inside the window"
+    );
+    assert_eq!(alpha.latest_at, 6000);
+
+    let beta = &groups[1];
+    assert_eq!(beta.failures, 1);
+    assert_eq!(beta.latest_error.as_deref(), Some("rate limited"));
+
+    // Limit truncates: cap=1 returns only the leader.
+    let only = db.failed_runs_grouped_since(2000, 1).expect("query");
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].task_name, "task_alpha");
+}
+
 // pre_run_command / pre_run_cwd / pre_run_timeout_ms must round-trip through
 // SQLite. A column-mapping regression (wrong index in TASK_COLUMNS or
 // map_task_row) silently drops the values; the read-back is the only way to

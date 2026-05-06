@@ -47,6 +47,12 @@ service Session {
 
   // Push a steer message into a running turn.
   rpc Steer(SteerRequest) returns (Empty);
+
+  // Append a system-injected assistant message into the session's history.
+  // Used to mirror proactive deliveries (e.g. a heartbeat the daemon
+  // streamed to the TUI) into the active session so the agent has them
+  // in context when the user replies.
+  rpc AppendAssistantMessage(AppendAssistantMessageRequest) returns (Empty);
 }
 
 message Empty {}
@@ -212,6 +218,11 @@ message LoadSessionRequest { string session_id = 1; string agent_session_id = 2;
 message LoadSessionResponse { string agent_session_id = 1; uint64 message_count = 2; }
 
 message SteerRequest { string session_id = 1; string text = 2; }
+
+message AppendAssistantMessageRequest {
+  string session_id = 1;
+  string content = 2;
+}
 
 message ForkRequest { string session_id = 1; }
 message ForkResponse {

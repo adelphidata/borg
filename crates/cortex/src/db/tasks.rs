@@ -1,4 +1,6 @@
-use super::models::{ClaimedTask, NewTask, ScheduledTaskRow, TaskRunRow, UpdateTask};
+use super::models::{
+    ClaimedTask, FailedRunGroup, NewTask, ScheduledTaskRow, TaskRunRow, UpdateTask,
+};
 use super::Database;
 use anyhow::Result;
 use rusqlite::params;
@@ -326,6 +328,48 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count)
+    }
+
+    /// Failed `task_runs` in `[since_ts, ∞)` grouped by their parent task,
+    /// joined with `scheduled_tasks` so callers see human-readable names.
+    /// Used by the heartbeat task_health augmenter to ground its claim that
+    /// "N runs failed" in the actual task IDs the agent can investigate.
+    /// Ordering: most failures first, ties broken by most recent failure.
+    pub fn failed_runs_grouped_since(
+        &self,
+        since_ts: i64,
+        limit: usize,
+    ) -> Result<Vec<FailedRunGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.name, COUNT(r.id) AS failures, \
+                    MAX(r.started_at) AS latest_at, \
+                    (SELECT r2.error FROM task_runs r2 \
+                     WHERE r2.task_id = s.id \
+                       AND r2.status = ?1 \
+                       AND r2.started_at >= ?2 \
+                     ORDER BY r2.started_at DESC LIMIT 1) AS latest_error \
+             FROM task_runs r \
+             JOIN scheduled_tasks s ON s.id = r.task_id \
+             WHERE r.status = ?1 AND r.started_at >= ?2 \
+             GROUP BY s.id, s.name \
+             ORDER BY failures DESC, latest_at DESC \
+             LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![crate::tasks::RUN_STATUS_FAILED, since_ts, limit as i64],
+                |row| {
+                    Ok(FailedRunGroup {
+                        task_id: row.get(0)?,
+                        task_name: row.get(1)?,
+                        failures: row.get(2)?,
+                        latest_at: row.get(3)?,
+                        latest_error: row.get(4)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Count `task_runs` rows with `status = 'completed'` (success) newer than `since_ts`.

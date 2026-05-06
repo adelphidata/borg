@@ -293,6 +293,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
     let poke_tx: Option<mpsc::Sender<()>> = None;
     {
         let mut sub_client = client.clone();
+        let mirror_session_id = session_id.clone();
         let cancel = heartbeat_cancel.clone();
         tokio::spawn(async move {
             let mut stream = match sub_client.subscribe_heartbeat_events().await {
@@ -309,6 +310,30 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                         match next {
                             Ok(Some(evt)) => {
                                 let result = proto_heartbeat_result(evt);
+                                // Mirror successful heartbeats into the active TUI
+                                // session BEFORE forwarding the event so the user
+                                // can't beat the mirror with a fast "yes please"
+                                // reply — if the next Send RPC outraced the
+                                // mirror, the agent's turn would assemble its
+                                // history without the heartbeat and we'd be back
+                                // to the original bug.
+                                if let heartbeat::scheduler::HeartbeatResult::Ran {
+                                    message,
+                                    ..
+                                } = &result
+                                {
+                                    if let Err(e) = sub_client
+                                        .append_assistant_message(
+                                            &mirror_session_id,
+                                            message,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "mirror heartbeat into session {mirror_session_id}: {e}"
+                                        );
+                                    }
+                                }
                                 if hb_proto_tx
                                     .send(HeartbeatEvent::Result(result))
                                     .await

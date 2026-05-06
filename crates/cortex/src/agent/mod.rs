@@ -777,6 +777,30 @@ impl Agent {
         }
     }
 
+    /// Append a system-injected assistant message to the agent's history.
+    ///
+    /// Used to mirror text the user already saw on this client (e.g. a
+    /// heartbeat that was streamed in by the daemon while the TUI was open)
+    /// into the active session so the next user reply has it in context.
+    /// Without this, the user's "yes please" reply lands in a session whose
+    /// history has no record of the heartbeat, and the agent answers the
+    /// previous turn instead.
+    ///
+    /// Refuses to inject if doing so would split an `assistant(tool_calls)`
+    /// message from its outstanding `tool` results — both Anthropic and
+    /// OpenAI reject orphaned tool_use blocks on the next turn, so a
+    /// well-meaning mid-turn mirror would brick the session.
+    pub fn append_assistant_message(&mut self, text: &str) {
+        if has_unresolved_tool_calls(&self.history) {
+            warn!(
+                "append_assistant_message: refused — last assistant turn has unresolved \
+                 tool_calls; injecting now would orphan them. Dropping the mirrored message."
+            );
+            return;
+        }
+        self.persist_message(Message::assistant(text));
+    }
+
     /// Log a message and push it to history + SQLite in one step.
     fn log_and_persist(&mut self, msg: Message) {
         log_message(&msg);
@@ -3295,6 +3319,36 @@ struct PartialToolCall {
     arguments: String,
 }
 
+/// Detect whether the latest assistant turn issued tool_calls that haven't
+/// all been answered yet. Used by [`Agent::append_assistant_message`] to
+/// avoid splitting a tool_use/tool_result pair, which both Anthropic and
+/// OpenAI reject on the next turn.
+///
+/// Walks back from the end through `Tool` messages, collecting answered
+/// `tool_call_id`s. Stops at the first non-tool message; if it is an
+/// assistant with `tool_calls`, every call id must be in the answered set.
+fn has_unresolved_tool_calls(history: &[Message]) -> bool {
+    use crate::types::Role;
+    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for msg in history.iter().rev() {
+        match msg.role {
+            Role::Tool => {
+                if let Some(id) = msg.tool_call_id.as_deref() {
+                    answered.insert(id);
+                }
+            }
+            Role::Assistant => {
+                if let Some(calls) = msg.tool_calls.as_ref() {
+                    return calls.iter().any(|c| !answered.contains(c.id.as_str()));
+                }
+                return false;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3318,6 +3372,71 @@ mod tests {
         // Extract ~6KB following the signature — plenty to cover the body.
         let end = (start + 6000).min(AGENT_RS_SRC.len());
         &AGENT_RS_SRC[start..end]
+    }
+
+    use crate::types::{FunctionCall, Role, ToolCall};
+
+    fn assistant_with_tools(ids: &[&str]) -> Message {
+        let calls = ids
+            .iter()
+            .map(|id| ToolCall {
+                id: (*id).to_string(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "noop".into(),
+                    arguments: "{}".into(),
+                },
+            })
+            .collect();
+        Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(calls),
+            tool_call_id: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn has_unresolved_tool_calls_idle_history_returns_false() {
+        // Pure text turns with no outstanding tool_calls — safe to inject.
+        let history = vec![
+            Message::user("hello"),
+            Message::assistant("hi there"),
+            Message::user("how are you"),
+            Message::assistant("fine"),
+        ];
+        assert!(!has_unresolved_tool_calls(&history));
+    }
+
+    #[test]
+    fn has_unresolved_tool_calls_empty_history_returns_false() {
+        assert!(!has_unresolved_tool_calls(&[]));
+    }
+
+    #[test]
+    fn has_unresolved_tool_calls_open_tool_call_returns_true() {
+        // Assistant requested two tool calls; only one has been answered.
+        // Mid-turn injection here would orphan the unanswered call.
+        let history = vec![
+            Message::user("run the thing"),
+            assistant_with_tools(&["call_a", "call_b"]),
+            Message::tool_result("call_a", "ok"),
+        ];
+        assert!(has_unresolved_tool_calls(&history));
+    }
+
+    #[test]
+    fn has_unresolved_tool_calls_all_answered_returns_false() {
+        // Both tool_calls answered — turn is back to a clean assistant
+        // boundary, safe to append a system-injected message after.
+        let history = vec![
+            Message::user("run the thing"),
+            assistant_with_tools(&["call_a", "call_b"]),
+            Message::tool_result("call_a", "ok"),
+            Message::tool_result("call_b", "ok"),
+        ];
+        assert!(!has_unresolved_tool_calls(&history));
     }
 
     #[test]

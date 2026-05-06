@@ -9,11 +9,12 @@ use crate::session::{convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
 use futures_util::Stream;
 use protocols::session::{
-    session_server::Session, AgentEvent, AutoSaveRequest, CancelRequest, CancelResponse,
-    ClearRequest, CloseRequest, CloseResponse, CompactRequest, CompactResponse, Empty, ForkRequest,
-    ForkResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    OpenRequest, OpenResponse, PromptResponse, RewindRequest, RewindResponse, SendRequest,
-    SessionState, SessionStateRequest, SteerRequest, StreamRequest, UndoRequest, UndoResponse,
+    session_server::Session, AgentEvent, AppendAssistantMessageRequest, AutoSaveRequest,
+    CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse, CompactRequest,
+    CompactResponse, Empty, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PromptResponse,
+    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
+    StreamRequest, UndoRequest, UndoResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -318,6 +319,31 @@ impl Session for SessionSvc {
         let host = self.host_or_err(&req.session_id)?;
         host.steer(&req.text)
             .map_err(|e| TStatus::failed_precondition(format!("steer: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn append_assistant_message(
+        &self,
+        req: Request<AppendAssistantMessageRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        if req.content.trim().is_empty() {
+            return Err(TStatus::invalid_argument("content must not be empty"));
+        }
+        // Heartbeats top out around a few hundred bytes; anything past 64KB
+        // is either a runaway sender or something that should have been
+        // chunked. Cheap upper bound — keeps a buggy caller from filling
+        // a session's history with a single mirror call.
+        const MAX_APPEND_BYTES: usize = 64 * 1024;
+        if req.content.len() > MAX_APPEND_BYTES {
+            return Err(TStatus::invalid_argument(format!(
+                "content is {} bytes; cap is {MAX_APPEND_BYTES}",
+                req.content.len()
+            )));
+        }
+        let host = self.host_or_err(&req.session_id)?;
+        host.append_assistant_message(&req.content)
+            .map_err(|e| TStatus::internal(format!("append_assistant_message: {e}")))?;
         Ok(Response::new(Empty {}))
     }
 
