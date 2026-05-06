@@ -88,6 +88,9 @@ bundled_skills! {
     "reminders"      => "reminders"      { category: "productivity", default_enabled: false, hidden: false },
     "linear"         => "linear"         { category: "productivity", default_enabled: false, hidden: false },
     "stripe-link"    => "stripe-link"    { category: "payments",  default_enabled: false, hidden: false },
+    "notion"         => "notion"         { category: "productivity", default_enabled: false, hidden: false },
+    "healthcheck"    => "healthcheck"    { category: "core",      default_enabled: false, hidden: false },
+    "video-frames"   => "video-frames"   { category: "utilities", default_enabled: false, hidden: false },
 }
 
 /// Filter `SKILL_REGISTRY` to the names satisfying a predicate, all at compile time.
