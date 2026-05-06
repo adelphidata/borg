@@ -32,7 +32,7 @@ fn concurrent_open_on_fresh_db_does_not_double_migrate() {
         handles.push(thread::spawn(move || -> anyhow::Result<u32> {
             barrier.wait();
             let db = Database::open_at(&path)?;
-            Ok(db.schema_version()?)
+            db.schema_version()
         }));
     }
 

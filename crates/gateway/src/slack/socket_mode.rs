@@ -103,6 +103,11 @@ pub fn build_ack(
 /// Capped exponential backoff for reconnect attempts.
 ///
 /// Sequence: 0.5s, 1s, 2s, 4s, 8s, 16s, 20s (cap), 20s, …
+///
+/// Intentionally bypasses `crate::backoff::calculate_backoff` (which delegates
+/// to `cortex::retry`) — Slack Socket Mode requires a deterministic, jitter-free
+/// reconnect cadence, distinct from the randomized poll backoff used by other
+/// channels.
 pub fn backoff_for(attempt: u32) -> Duration {
     let base_ms = MIN_BACKOFF.as_millis() as u64;
     let factor = 1u64 << attempt.min(8); // cap shift to avoid overflow

@@ -68,7 +68,8 @@ pub struct KnowledgeFileInfo {
     pub modified_at: Option<chrono::DateTime<chrono::Local>>,
 }
 
-fn resolved_scopes(config: &Config) -> Vec<String> {
+/// Resolve the active long-term/knowledge scopes for the current config.
+pub fn resolved_memory_scopes(config: &Config) -> Vec<String> {
     let mut scopes = vec!["global".to_string()];
     if let Some(scope) = config.memory.memory_scope.as_deref() {
         if !scope.trim().is_empty() && scope != "global" {
@@ -76,11 +77,6 @@ fn resolved_scopes(config: &Config) -> Vec<String> {
         }
     }
     scopes
-}
-
-/// Resolve the active long-term/knowledge scopes for the current config.
-pub fn resolved_memory_scopes(config: &Config) -> Vec<String> {
-    resolved_scopes(config)
 }
 
 // ── DB-Backed Memory API ──
@@ -447,7 +443,7 @@ pub fn load_memory_context_db_scoped(config: &Config, max_tokens: usize) -> Resu
         return Ok(String::new());
     }
     let db = crate::db::Database::open()?;
-    load_memory_context_db_scoped_with(&db, &resolved_scopes(config), max_tokens)
+    load_memory_context_db_scoped_with(&db, &resolved_memory_scopes(config), max_tokens)
 }
 
 /// DB-passing form of [`load_memory_context_db_scoped`].
@@ -494,7 +490,12 @@ pub fn load_memory_context_db_ranked_scoped(
         return Ok(String::new());
     }
     let db = crate::db::Database::open()?;
-    load_memory_context_db_ranked_scoped_with(&db, &resolved_scopes(config), max_tokens, ranked)
+    load_memory_context_db_ranked_scoped_with(
+        &db,
+        &resolved_memory_scopes(config),
+        max_tokens,
+        ranked,
+    )
 }
 
 /// DB-passing form of [`load_memory_context_db_ranked_scoped`].
@@ -664,7 +665,7 @@ fn scan_knowledge_files_in(
 
 /// List markdown knowledge files under `~/.borg/memory/` for the resolved scopes.
 pub fn list_knowledge_files(config: &Config) -> Result<Vec<KnowledgeFileInfo>> {
-    scan_knowledge_files_in(&Config::memory_dir()?, &resolved_scopes(config))
+    scan_knowledge_files_in(&Config::memory_dir()?, &resolved_memory_scopes(config))
 }
 
 fn query_terms(query: &str) -> Vec<String> {
@@ -777,7 +778,7 @@ pub fn search_knowledge_files(
 ) -> Result<Vec<crate::embeddings::SearchResult>> {
     search_knowledge_files_in(
         &Config::memory_dir()?,
-        &resolved_scopes(config),
+        &resolved_memory_scopes(config),
         query,
         max_results,
         min_score,
@@ -843,7 +844,7 @@ fn load_knowledge_context_in(
 pub fn load_knowledge_context(config: &Config, query: &str, max_tokens: usize) -> Result<String> {
     load_knowledge_context_in(
         &Config::memory_dir()?,
-        &resolved_scopes(config),
+        &resolved_memory_scopes(config),
         query,
         max_tokens,
     )
@@ -852,7 +853,7 @@ pub fn load_knowledge_context(config: &Config, query: &str, max_tokens: usize) -
 /// List SQLite long-term memory and markdown knowledge files for `/memory`.
 pub fn list_memory_inventory(config: &Config) -> Result<Vec<MemoryListItem>> {
     let db = crate::db::Database::open()?;
-    let scopes = resolved_scopes(config);
+    let scopes = resolved_memory_scopes(config);
     let mut items = Vec::new();
 
     for scope in &scopes {

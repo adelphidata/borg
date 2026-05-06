@@ -1550,7 +1550,7 @@ async fn drain_pending_deliveries(
             policy.max_retries = max;
         }
         if let Some(delay) = channel.manifest.settings.retry_initial_delay_ms {
-            policy.initial_delay_ms = delay;
+            policy.backoff.initial = std::time::Duration::from_millis(delay);
         }
         // For drain loop, use fewer retries to avoid blocking
         policy.max_retries = policy.max_retries.min(2);

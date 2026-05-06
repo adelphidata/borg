@@ -6,6 +6,7 @@ use sha2::Sha256;
 
 use crate::config::Config;
 use crate::db::{Database, NewScript, ScriptRow};
+use crate::hex::{hex_decode, hex_encode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -525,20 +526,6 @@ fn build_script_sandbox_policy(
 }
 
 // ── Helpers ──
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn hex_decode(hex: &str) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        bail!("Invalid hex string length");
-    }
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).context("Invalid hex character"))
-        .collect()
-}
 
 fn format_script_detail(s: &ScriptRow) -> String {
     let last_run = s

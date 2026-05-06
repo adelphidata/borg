@@ -81,6 +81,8 @@ pub mod gateway_context;
 pub mod git;
 /// Heartbeat task constants and helpers (seeded heartbeat row).
 pub mod heartbeat_task;
+/// Lowercase hex encode/decode helpers.
+pub mod hex;
 /// HMAC-SHA256 chain for tamper-proof event logs.
 pub mod hmac_chain;
 /// Lifecycle hook system for intercepting agent loop events.

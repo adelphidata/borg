@@ -165,6 +165,8 @@ Per-channel/sender LLM routing via `[[gateway.bindings]]`. Sender pairing via `d
 
 Proactive check-ins (default 60m or cron, quiet 00:00–06:00). `~/.borg/HEARTBEAT.md` checklist. Honors gateway bindings. Suppresses empty/duplicate/ack-only. Trigger: `borg poke` / `/poke`. `heartbeat.min_interval_secs` (default 60, hard floor 1) is the operator/eval-suite knob for sub-minute firings — leave at 60 in production.
 
+**Two schedulers, two roles.** `heartbeat::scheduler` is a pure tick generator: cron + quiet-hour evaluation, emits fire events, no task execution. `borgd::scheduler` is the dispatcher: consumes ticks plus DB-stored `scheduled_tasks`, and hands work to `borgd::task_runner`. Don't merge them — the heartbeat crate stays embeddable/testable without the daemon, and `borgd` owns the side-effecting execution path.
+
 ### Database
 
 SQLite at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessions, messages, scheduled_tasks, channel_*, settings, pairing_requests, approved_senders, embedding_cache, vitals_events.

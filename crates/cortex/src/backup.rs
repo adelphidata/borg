@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::{AuditChainOutcome, Database};
+use crate::hex::hex_encode;
 
 /// Read the live `BORG_HOME/borg.db`'s schema version through a read-only
 /// connection. Used by `borg backup create` to tag the new tarball without
@@ -476,15 +477,6 @@ fn copy_recursive(from: &Path, to: &Path) -> Result<()> {
         fs::copy(from, to)?;
     }
     Ok(())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 /// Inline SHA-256 stream wrapper — wraps a writer and feeds every byte

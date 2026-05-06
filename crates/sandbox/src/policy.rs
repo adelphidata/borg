@@ -67,23 +67,13 @@ fn filter_blocked(paths: &[String], blocked_paths: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Expand `~` prefix to the user's home directory.
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return format!("{}/{rest}", home.display());
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().to_string();
-        }
-    }
-    path.to_string()
-}
-
-/// Expand tilde in all paths.
+/// Expand tilde in all paths, returning Strings to preserve the
+/// `Vec<String>` shape used by `SandboxPolicy::fs_read`/`fs_write`.
 fn expand_tilde_paths(paths: &[String]) -> Vec<String> {
-    paths.iter().map(|p| expand_tilde(p)).collect()
+    paths
+        .iter()
+        .map(|p| crate::paths::expand_tilde(p).to_string_lossy().into_owned())
+        .collect()
 }
 
 impl SandboxPolicy {
@@ -354,39 +344,6 @@ mod tests {
         assert!(!is_path_blocked("/home/user/.aws_backup/data", &blocked));
         // `.aws` itself should still be blocked
         assert!(is_path_blocked("/home/user/.aws/config", &blocked));
-    }
-
-    #[test]
-    fn expand_tilde_expands_home_prefix() {
-        let home = dirs::home_dir().expect("home dir must exist for test");
-        let home_str = home.to_string_lossy();
-
-        assert_eq!(
-            expand_tilde("~/Library/Messages"),
-            format!("{home_str}/Library/Messages")
-        );
-        assert_eq!(
-            expand_tilde("~/.borg/channels"),
-            format!("{home_str}/.borg/channels")
-        );
-    }
-
-    #[test]
-    fn expand_tilde_preserves_absolute_paths() {
-        assert_eq!(expand_tilde("/usr/local/bin"), "/usr/local/bin");
-        assert_eq!(expand_tilde("/tmp/test"), "/tmp/test");
-    }
-
-    #[test]
-    fn expand_tilde_preserves_bare_tilde() {
-        let home = dirs::home_dir().expect("home dir must exist for test");
-        assert_eq!(expand_tilde("~"), home.to_string_lossy().to_string());
-    }
-
-    #[test]
-    fn expand_tilde_does_not_expand_mid_path() {
-        // Only leading ~ should be expanded
-        assert_eq!(expand_tilde("/data/~user"), "/data/~user");
     }
 
     #[test]

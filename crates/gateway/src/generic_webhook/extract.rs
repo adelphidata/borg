@@ -211,7 +211,7 @@ mod tests {
         mac.update(format!("{ts}.").as_bytes());
         mac.update(body);
         let bytes = mac.finalize().into_bytes();
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = cortex::hex::hex_encode(&bytes);
         format!("v1={hex}")
     }
 

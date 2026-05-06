@@ -11,6 +11,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 use crate::constants;
+use crate::hex::hex_encode;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -36,11 +37,6 @@ pub fn verify_chain_link(
     recomputed_hmac: &str,
 ) -> bool {
     stored_prev_hmac == expected_prev_hmac && stored_hmac == recomputed_hmac
-}
-
-/// Hex-encode a byte slice to a lowercase hex string.
-pub fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Look up a per-key rate-limit cap from a table, falling back to `default`.

@@ -12,6 +12,8 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SIGNATURE_LENGTH};
 
+use crate::hex::{hex_decode, hex_encode};
+
 /// Build the canonical payload bytes hashed for signing/verification.
 /// Field order and separators MUST stay stable — changing this breaks every
 /// previously-signed row. Mirrors the HMAC v2 layout.
@@ -82,7 +84,7 @@ pub(crate) fn verify_event(
     metadata: &str,
     created_at: i64,
 ) -> bool {
-    let Some(sig_bytes) = hex_decode(signature_hex) else {
+    let Ok(sig_bytes) = hex_decode(signature_hex) else {
         return false;
     };
     if sig_bytes.len() != SIGNATURE_LENGTH {
@@ -115,37 +117,6 @@ pub(crate) fn verifying_key_from_bytes(bytes: &[u8]) -> Result<VerifyingKey> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(bytes);
     VerifyingKey::from_bytes(&arr).context("invalid Ed25519 public key bytes")
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
-}
-
-fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for chunk in bytes.chunks(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-fn hex_nibble(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

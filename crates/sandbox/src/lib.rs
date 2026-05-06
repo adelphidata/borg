@@ -30,6 +30,8 @@
 
 /// Linux Bubblewrap (`bwrap`) sandboxing with namespace isolation.
 pub mod bubblewrap;
+/// Path utilities shared across sandbox and channel code.
+pub mod paths;
 /// Sandbox policy definition and command wrapping.
 pub mod policy;
 /// Script runner with sandboxed subprocess execution.

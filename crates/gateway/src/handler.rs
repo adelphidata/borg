@@ -173,7 +173,7 @@ fn build_retry_policy(channel: &RegisteredChannel) -> RetryPolicy {
         policy.max_retries = max;
     }
     if let Some(delay) = channel.manifest.settings.retry_initial_delay_ms {
-        policy.initial_delay_ms = delay;
+        policy.backoff.initial = std::time::Duration::from_millis(delay);
     }
     policy
 }
@@ -1423,8 +1423,8 @@ mod tests {
         let policy = build_retry_policy(&channel);
         assert_eq!(policy.max_retries, cortex::constants::RETRY_MAX_RETRIES);
         assert_eq!(
-            policy.initial_delay_ms,
-            cortex::constants::RETRY_INITIAL_DELAY_MS
+            policy.backoff.initial,
+            std::time::Duration::from_millis(cortex::constants::RETRY_INITIAL_DELAY_MS)
         );
     }
 
@@ -1440,7 +1440,10 @@ mod tests {
         };
         let policy = build_retry_policy(&channel);
         assert_eq!(policy.max_retries, 10);
-        assert_eq!(policy.initial_delay_ms, 500);
+        assert_eq!(
+            policy.backoff.initial,
+            std::time::Duration::from_millis(500)
+        );
     }
 
     #[test]

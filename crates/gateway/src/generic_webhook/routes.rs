@@ -11,6 +11,7 @@ use axum::{
     Json, Router,
 };
 use cortex::db::Database;
+use cortex::hex::hex_encode;
 use cortex::ingress::{
     AdmittedIngress, IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId,
 };
@@ -94,7 +95,7 @@ async fn webhook_handler(
     // CSPRNG secret. DB read implies sig-forge ability, same threat
     // profile as the existing `credentials` table; OS-keychain wrapping
     // for this column is a follow-up.
-    let secret_for_hmac = hex_lowercase(&definition.secret_hash);
+    let secret_for_hmac = hex_encode(&definition.secret_hash);
     let now = chrono::Utc::now().timestamp();
     let sig_header = headers
         .get("x-borg-signature")
@@ -172,14 +173,6 @@ fn error_response(status: StatusCode, msg: &str) -> Response {
     (status, Json(serde_json::json!({"error": {"message": msg}}))).into_response()
 }
 
-fn hex_lowercase(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,12 +247,12 @@ mod tests {
         mac.update(format!("{ts}.").as_bytes());
         mac.update(body);
         let bytes = mac.finalize().into_bytes();
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = hex_encode(&bytes);
         format!("v1={hex}")
     }
 
     fn secret_hex(created: &super::super::definitions::CreatedWebhook) -> String {
-        super::hex_lowercase(&created.row.secret_hash)
+        super::hex_encode(&created.row.secret_hash)
     }
 
     fn req(name: &str, sig: Option<&str>, ts: Option<&str>, body: &str) -> Request<Body> {

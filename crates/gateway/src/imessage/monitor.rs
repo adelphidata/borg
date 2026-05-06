@@ -9,6 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::constants::{PEER_KIND_DIRECT, PEER_KIND_GROUP};
 use cortex::config::Config;
+use sandbox::paths::expand_tilde;
 
 use super::echo_cache::EchoCache;
 use super::reflection_guard;
@@ -359,15 +360,6 @@ fn load_attachments(metas: &[AttachmentMeta]) -> Vec<InboundAttachment> {
         });
     }
     out
-}
-
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    }
-    PathBuf::from(path)
 }
 
 fn poll_new_messages(db_uri: &str, last_rowid: i64) -> Result<Vec<IMessagePayload>> {
@@ -1222,18 +1214,5 @@ mod tests {
         }];
         let out = load_attachments(&metas);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn expand_tilde_expands_home_prefix() {
-        let expanded = expand_tilde("~/some/file.txt");
-        let home = dirs::home_dir().unwrap();
-        assert_eq!(expanded, home.join("some/file.txt"));
-    }
-
-    #[test]
-    fn expand_tilde_passthrough_for_absolute() {
-        let expanded = expand_tilde("/abs/path/file");
-        assert_eq!(expanded, PathBuf::from("/abs/path/file"));
     }
 }

@@ -31,7 +31,7 @@ fn short_request_id() -> String {
 
 use crate::config::{Config, LlmConfig};
 use crate::provider::Provider;
-use crate::retry::backoff_delay;
+use crate::retry::{backoff_with_config, BackoffConfig};
 use crate::types::{Message, Role, ToolDefinition};
 
 const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
@@ -841,7 +841,13 @@ impl LlmClient {
                         {
                             *ra
                         } else {
-                            backoff_delay(attempt, initial_delay, 2.0)
+                            backoff_with_config(
+                                attempt,
+                                &BackoffConfig {
+                                    initial: initial_delay,
+                                    ..Default::default()
+                                },
+                            )
                         };
 
                         info!(
@@ -1308,7 +1314,13 @@ impl LlmClient {
                     {
                         *ra
                     } else {
-                        backoff_delay(attempt, initial_delay, 2.0)
+                        backoff_with_config(
+                            attempt,
+                            &BackoffConfig {
+                                initial: initial_delay,
+                                ..Default::default()
+                            },
+                        )
                     };
                     info!(
                         "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
@@ -1775,7 +1787,13 @@ impl LlmClient {
                     {
                         *ra
                     } else {
-                        backoff_delay(attempt, initial_delay, 2.0)
+                        backoff_with_config(
+                            attempt,
+                            &BackoffConfig {
+                                initial: initial_delay,
+                                ..Default::default()
+                            },
+                        )
                     };
                     info!(
                         "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",

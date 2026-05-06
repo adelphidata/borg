@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use cortex::db::Database;
+use cortex::hex::hex_encode;
 use gateway::generic_webhook::definitions;
 
 use super::format_ts;
@@ -65,7 +66,7 @@ fn run_create(
         resp.name, resp.name
     );
     println!();
-    println!("HMAC key (hex): {}", hex_lowercase(&resp.hmac_secret));
+    println!("HMAC key (hex): {}", hex_encode(&resp.hmac_secret));
     println!();
     println!(
         "Sign requests with: HMAC-SHA256(<key>, \"{{ts}}.{{body}}\")\n\
@@ -126,12 +127,4 @@ fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
-}
-
-fn hex_lowercase(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }

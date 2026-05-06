@@ -10,6 +10,7 @@ use rusqlite::params;
 use sha2::{Digest, Sha256};
 
 use super::Database;
+use crate::hex::hex_encode;
 
 /// Normalize then hash a query string. Lowercases, trims, and collapses
 /// internal whitespace before hashing so cosmetic differences share an entry.
@@ -21,14 +22,6 @@ pub fn hash_query(query: &str) -> String {
         .to_lowercase();
     let digest = Sha256::digest(normalized.as_bytes());
     hex_encode(&digest)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 /// A cached search row.

@@ -12,6 +12,8 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
 
+use crate::hex::{hex_decode, hex_encode};
+
 /// Service name used for both macOS Keychain and libsecret.
 pub const KEYCHAIN_SERVICE: &str = "com.borg.evolution.signing";
 /// Account/key name within the service.
@@ -264,40 +266,6 @@ fn write_linux(service: &str, account: &str, seed: &[u8; SECRET_KEY_LENGTH]) -> 
     Ok(())
 }
 
-// ── Hex helpers (kept private, identical to signature.rs but local to avoid
-// crate-internal coupling) ──
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
-fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        anyhow::bail!("hex string must have even length");
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    for chunk in bytes.chunks(2) {
-        let hi = nibble(chunk[0])?;
-        let lo = nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn nibble(c: u8) -> Result<u8> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => anyhow::bail!("invalid hex character: {c}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,15 +295,5 @@ mod tests {
         let (k1, _) = load_or_create_signing_key(&store).unwrap();
         let (k2, _) = load_or_create_signing_key(&store).unwrap();
         assert_eq!(k1.verifying_key().to_bytes(), k2.verifying_key().to_bytes());
-    }
-
-    #[test]
-    fn hex_roundtrip() {
-        let bytes = [0u8, 15, 16, 254, 255];
-        let s = hex_encode(&bytes);
-        assert_eq!(s, "000f10feff");
-        assert_eq!(hex_decode(&s).unwrap(), bytes);
-        assert!(hex_decode("zz").is_err());
-        assert!(hex_decode("abc").is_err()); // odd length
     }
 }
