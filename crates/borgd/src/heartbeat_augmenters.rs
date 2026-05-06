@@ -53,6 +53,8 @@
 //! required. [`collect`] picks up the new entry automatically on the next
 //! heartbeat tick.
 
+use crate::maintenance::cooldowns::{meta_key_for, CooldownTable};
+use crate::maintenance::MonthlyBudgetTracker;
 use cortex::config::Config;
 use cortex::db::Database;
 
@@ -142,6 +144,7 @@ fn collect_matching(
     include: impl Fn(&Augmenter) -> bool,
 ) -> Vec<String> {
     let now = unix_now();
+    let cooldowns = db.map(CooldownTable::new);
     let mut out = Vec::new();
     for aug in AUGMENTERS {
         if !include(aug) {
@@ -150,36 +153,18 @@ fn collect_matching(
         let Some(snippet) = (aug.check)(config, db) else {
             continue;
         };
-        if let Some(db) = db {
-            let key = meta_key(aug.id);
-            let last = match db.get_meta(&key) {
-                Ok(Some(s)) => s.parse::<u64>().unwrap_or(0),
-                Ok(None) => 0,
-                Err(e) => {
-                    tracing::warn!(
-                        "heartbeat_augmenters: failed to read cooldown for '{}': {e}",
-                        aug.id
-                    );
-                    continue;
-                }
-            };
-            if now.saturating_sub(last) < aug.cooldown_secs {
+        if let Some(table) = &cooldowns {
+            let cd = table.for_augmenter(aug.id, aug.cooldown_secs);
+            if !cd.is_ready(now) {
+                // Either the cooldown window hasn't elapsed or the meta
+                // read failed — both mean "skip" rather than "spam".
                 continue;
             }
-            if let Err(e) = db.set_meta(&key, &now.to_string()) {
-                tracing::warn!(
-                    "heartbeat_augmenters: failed to persist cooldown for '{}': {e}",
-                    aug.id
-                );
-            }
+            cd.record_fired(now);
         }
         out.push(snippet);
     }
     out
-}
-
-fn meta_key(id: &str) -> String {
-    format!("heartbeat_augmenter_last_fired_{id}")
 }
 
 /// No messaging channels configured — nudge the user to run `borg add`.
@@ -424,32 +409,14 @@ fn check_budget_threshold(config: &Config, db: Option<&Database>) -> Option<Stri
     };
 
     let total = db.monthly_token_total().ok()?;
-    let month_key = budget_month_key();
-    let last_bucket: u8 = db
-        .get_meta(&month_key)
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    if bucket <= last_bucket {
+    // Typed handle replaces the inline meta-string bookkeeping. The
+    // tracker owns the per-month key and the "is this bucket new?"
+    // bookkeeping; the augmenter just decides whether to emit text.
+    let tracker = MonthlyBudgetTracker::new(db);
+    if !tracker.should_announce(chrono::Utc::now(), bucket) {
         return None;
     }
-    if let Err(e) = db.set_meta(&month_key, &bucket.to_string()) {
-        tracing::warn!("budget_threshold: failed to persist month bucket: {e}");
-    }
-
     Some(build_budget_nudge(bucket, total, limit))
-}
-
-fn budget_month_key() -> String {
-    use chrono::Datelike;
-    let now = chrono::Utc::now();
-    format!(
-        "heartbeat_budget_last_bucket_{:04}-{:02}",
-        now.year(),
-        now.month(),
-    )
 }
 
 fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
@@ -752,7 +719,7 @@ mod tests {
 
         // Rewind the stored timestamp to simulate cooldown elapsing.
         let stale = unix_now().saturating_sub(25 * 60 * 60);
-        db.set_meta(&meta_key("no_channels_configured"), &stale.to_string())
+        db.set_meta(&meta_key_for("no_channels_configured"), &stale.to_string())
             .unwrap();
 
         let again = collect(&cfg, Some(&db));
@@ -1257,7 +1224,7 @@ mod tests {
 
         // Simulate 49h elapsed for the security augmenter.
         let stale = unix_now().saturating_sub(49 * 60 * 60);
-        db.set_meta(&meta_key("critical_host_security"), &stale.to_string())
+        db.set_meta(&meta_key_for("critical_host_security"), &stale.to_string())
             .unwrap();
 
         let result = collect(&cfg, Some(&db));
