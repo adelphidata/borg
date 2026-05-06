@@ -3,6 +3,11 @@ use std::time::Duration;
 /// Default HTTP timeout for gateway API clients.
 pub const GATEWAY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Sentinel binding id assigned when no `[[gateway.bindings]]` rule matched
+/// the inbound message. Compared in routing logic to distinguish a
+/// fallback route from a user-configured one.
+pub const DEFAULT_BINDING_ID: &str = "default";
+
 /// Default message chunk size for platforms with ~4000 char limits.
 pub const DEFAULT_MESSAGE_CHUNK_SIZE: usize = 4000;
 
@@ -22,6 +27,9 @@ pub const TELEGRAM_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Signal HTTP connect timeout for the signal-cli JSON-RPC daemon.
 pub const SIGNAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default port for a locally-running signal-cli JSON-RPC server.
+pub const SIGNAL_CLI_PORT_DEFAULT: u16 = 8080;
 
 /// Max characters preserved for the inbound `thread_id` after sanitization.
 /// The session key format `{sender_id}:{thread_id}` cannot tolerate unbounded

@@ -18,15 +18,13 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
+use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 use crate::doctor::{run_diagnostics, CheckStatus, DiagnosticCheck, RemediationKind};
 
 /// Single source of truth for the seeded maintenance task's UUID. The schema
 /// inserts this id and the dispatcher matches against it.
 pub const MAINTENANCE_TASK_ID: &str = "00000000-0000-4000-8000-ada1ca1e0001";
-
-/// Seconds per day. Retention settings are expressed in days.
-const SECS_PER_DAY: i64 = 86_400;
 
 /// How long an embedding-cache entry can sit unaccessed before the
 /// maintenance sweep evicts it. Mirrors the 30-day default elsewhere.

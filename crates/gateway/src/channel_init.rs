@@ -294,7 +294,7 @@ pub(crate) async fn init_signal(config: &Config) -> Option<Arc<SignalClient>> {
             let port = config
                 .gateway
                 .signal_cli_port
-                .unwrap_or(cortex::constants::SIGNAL_CLI_PORT_DEFAULT);
+                .unwrap_or(crate::constants::SIGNAL_CLI_PORT_DEFAULT);
             let base_url = format!("http://{host}:{port}");
             match SignalClient::new(&base_url, account) {
                 Ok(client) => match client.probe().await {

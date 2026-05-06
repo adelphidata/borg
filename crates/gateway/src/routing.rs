@@ -1,6 +1,8 @@
 use cortex::config::{ActivationMode, Config, GatewayBinding};
 use tracing::debug;
 
+use crate::constants::DEFAULT_BINDING_ID;
+
 /// Result of route resolution for a gateway message.
 pub struct ResolvedRoute {
     /// Base config with binding overrides applied.
@@ -104,10 +106,10 @@ pub fn matches_pattern(pattern: &str, value: &str) -> bool {
 fn default_route(config: &Config) -> ResolvedRoute {
     ResolvedRoute {
         config: config.clone(),
-        binding_id: "default".to_string(),
+        binding_id: DEFAULT_BINDING_ID.to_string(),
         memory_scope: None,
         identity_path: None,
-        matched_by: "default".to_string(),
+        matched_by: DEFAULT_BINDING_ID.to_string(),
         activation: None,
     }
 }
@@ -233,8 +235,8 @@ mod tests {
     fn resolve_route_no_bindings_returns_default() {
         let config = Config::default();
         let route = resolve_route(&config, "telegram", "user1", None);
-        assert_eq!(route.binding_id, "default");
-        assert_eq!(route.matched_by, "default");
+        assert_eq!(route.binding_id, DEFAULT_BINDING_ID);
+        assert_eq!(route.matched_by, DEFAULT_BINDING_ID);
         assert!(route.memory_scope.is_none());
         assert!(route.identity_path.is_none());
     }
@@ -412,7 +414,7 @@ mod tests {
         });
 
         let route = resolve_route(&config, "telegram", "user1", None);
-        assert_eq!(route.binding_id, "default");
+        assert_eq!(route.binding_id, DEFAULT_BINDING_ID);
     }
 
     #[test]

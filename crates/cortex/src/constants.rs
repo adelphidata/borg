@@ -539,9 +539,6 @@ pub const AGENT_EVENT_CHANNEL_CAPACITY: usize = 256;
 /// Default port for a locally-running Ollama server.
 pub const OLLAMA_PORT_DEFAULT: u16 = 11434;
 
-/// Default port for a locally-running signal-cli JSON-RPC server.
-pub const SIGNAL_CLI_PORT_DEFAULT: u16 = 8080;
-
 // ── Daemon loop ───────────────────────────────────────────────────
 
 /// Main daemon loop tick interval.

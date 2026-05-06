@@ -19,7 +19,7 @@ use crate::constants::MAX_THREAD_ID_LEN;
 
 use crate::challenge_throttle::ChallengeThrottle;
 use crate::chunker;
-use crate::constants::PEER_KIND_GROUP;
+use crate::constants::{DEFAULT_BINDING_ID, PEER_KIND_GROUP};
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
 use crate::registry::RegisteredChannel;
@@ -342,7 +342,7 @@ async fn resolve_session_and_commands(
         ),
         None => inbound.sender_id.clone(),
     };
-    let session_key = if route.binding_id != "default" {
+    let session_key = if route.binding_id != DEFAULT_BINDING_ID {
         format!("{}:{}", route.binding_id, base_key)
     } else {
         base_key
@@ -1460,10 +1460,10 @@ mod tests {
         let config = Config::default();
         crate::routing::ResolvedRoute {
             config,
-            binding_id: "default".to_string(),
+            binding_id: DEFAULT_BINDING_ID.to_string(),
             memory_scope: None,
             identity_path: None,
-            matched_by: "default".to_string(),
+            matched_by: DEFAULT_BINDING_ID.to_string(),
             activation: None,
         }
     }
