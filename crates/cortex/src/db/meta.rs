@@ -23,4 +23,10 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
 }

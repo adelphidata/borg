@@ -31,9 +31,10 @@ Thumbs.db
 # Live regression log (local only — surfaced from external eval suite)
 issues/
 
-# Claude Code local hooks
+# local hooks
 /.claude/hooks/
 /.claude/
+/.agents/
 
 # Local scratch scripts (one-off maintenance tooling)
 /scripts/scratch/

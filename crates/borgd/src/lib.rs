@@ -27,4 +27,5 @@ pub mod pidlock;
 pub mod pki_grpc;
 pub mod scheduler;
 pub mod session;
+pub mod supervisor;
 pub mod task_runner;

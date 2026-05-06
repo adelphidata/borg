@@ -9,13 +9,15 @@ use crate::heartbeat::HeartbeatTrigger;
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
+use crate::supervisor::{spawn_supervised, DbHandle, SupervisorConfig};
 use crate::task_runner;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{GATEWAY_MAX_CRASH_RESPAWNS, GATEWAY_RESPAWN_BASE_DELAY};
 use cortex::llm::CostEventSink;
 use cortex::telemetry::BorgMetrics;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -56,7 +58,6 @@ fn spawn_gateway(
 /// shut down the supervisor (the alternative is a noisy crash that
 /// hides the underlying gateway failure).
 fn mark_gateway_unrecoverable() {
-    use crate::heartbeat_augmenters::{GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY};
     let db = match cortex::db::Database::open() {
         Ok(db) => db,
         Err(e) => {
@@ -68,11 +69,26 @@ fn mark_gateway_unrecoverable() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1") {
-        tracing::warn!("mark_gateway_unrecoverable: failed to set flag: {e}");
-    }
+    write_gateway_unrecoverable_meta(&db, now);
+}
+
+/// Inner helper for [`mark_gateway_unrecoverable`] — pulled out so unit
+/// tests can exercise the actual write order against an in-memory DB
+/// without going through `Database::open()`.
+///
+/// Writes the timestamp BEFORE the flag — the augmenter's 1h grace
+/// check reads the timestamp to know when the abandonment happened. If
+/// the flag landed first and the process died before the timestamp
+/// write, the next heartbeat would see `flag="1"` with no `_at` and
+/// would race the daily 02:00 self-healing pass this layered design
+/// exists to avoid.
+fn write_gateway_unrecoverable_meta(db: &cortex::db::Database, now: i64) {
+    use crate::heartbeat_augmenters::{GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY};
     if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &now.to_string()) {
         tracing::warn!("mark_gateway_unrecoverable: failed to set timestamp: {e}");
+    }
+    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1") {
+        tracing::warn!("mark_gateway_unrecoverable: failed to set flag: {e}");
     }
 }
 
@@ -113,77 +129,115 @@ pub fn start(
         config_rx,
     );
 
-    // Gateway with respawn supervisor.
+    // Open one shared `Database` handle for supervisor activity-log
+    // writes. Supervisor uses `std::sync::Mutex` because rusqlite is
+    // !Sync; we accept the mutex contention for the rare error-path
+    // writes (panic, restart, degraded — none of which are hot).
+    //
+    // Failure here means the daemon DB is unavailable — every other
+    // subsystem will fail too. Panicking loud at orchestrator start
+    // is better than degrading silently. Production callers
+    // (run_lifecycle, daemon::run) have already validated DB access.
+    let supervisor_db: DbHandle = match cortex::db::Database::open() {
+        Ok(db) => Arc::new(Mutex::new(db)),
+        Err(e) => panic!(
+            "orchestrator: cortex::db::Database::open() failed: {e}; daemon cannot supervise without DB"
+        ),
+    };
+
+    // Gateway with respawn supervisor. Uses the same numeric config the
+    // pre-supervisor ad-hoc loop did so behavior is unchanged: max 5
+    // crashes in a 10-minute window, exp backoff capped by base × 2^4.
+    let gw_cfg = SupervisorConfig {
+        name: "gateway",
+        max_restarts: GATEWAY_MAX_CRASH_RESPAWNS,
+        restart_window: Duration::from_secs(600),
+        base_backoff: GATEWAY_RESPAWN_BASE_DELAY,
+        max_backoff: GATEWAY_RESPAWN_BASE_DELAY * 16,
+        on_degraded: Some(Box::new(mark_gateway_unrecoverable)),
+    };
     let gw_poke_tx = poke_tx.clone();
     let gw_outer_shutdown = shutdown.clone();
     let gw_config = config.clone();
-    tokio::spawn(async move {
-        let mut crash_count: u32 = 0;
-        loop {
-            if gw_outer_shutdown.is_cancelled() {
-                return;
+    spawn_supervised(
+        gw_cfg,
+        gw_outer_shutdown.clone(),
+        supervisor_db.clone(),
+        move || {
+            let gw_config = gw_config.clone();
+            let gw_poke_tx = gw_poke_tx.clone();
+            // Per-iteration child token — cancels when the outer
+            // shutdown does AND when this iteration's future drops, so
+            // we don't leak a long-lived bridge task across respawns.
+            let inner_shutdown = gw_outer_shutdown.child_token();
+            async move {
+                let handle = spawn_gateway(&gw_config, inner_shutdown, Some(gw_poke_tx));
+                // Treat any inner error or panic as a supervisor-level
+                // restart; convert into a Result so the supervisor's
+                // restart logic kicks in.
+                match handle.await {
+                    Ok(()) => Ok::<(), anyhow::Error>(()),
+                    Err(e) if e.is_cancelled() => Ok(()),
+                    Err(e) => Err(anyhow::anyhow!("gateway task join error: {e}")),
+                }
             }
-            let inner_shutdown = CancellationToken::new();
-            let inner_for_join = inner_shutdown.clone();
-            let outer_for_inner = gw_outer_shutdown.clone();
-
-            // Bridge outer → inner so a global cancel halts the gateway.
-            tokio::spawn(async move {
-                outer_for_inner.cancelled().await;
-                inner_for_join.cancel();
-            });
-
-            let handle =
-                spawn_gateway(&gw_config, inner_shutdown.clone(), Some(gw_poke_tx.clone()));
-            let result = handle.await;
-            if gw_outer_shutdown.is_cancelled() {
-                return;
-            }
-            crash_count += 1;
-            tracing::warn!("Gateway exited unexpectedly: {result:?}; respawning ({crash_count})");
-            if crash_count >= GATEWAY_MAX_CRASH_RESPAWNS {
-                tracing::error!("Gateway crashed {crash_count} times, abandoning respawn");
-                mark_gateway_unrecoverable();
-                return;
-            }
-            let delay = GATEWAY_RESPAWN_BASE_DELAY * (1 << crash_count.min(4));
-            tokio::time::sleep(delay).await;
-        }
-    });
+        },
+    );
 
     // iMessage monitor (macOS only, optional).
     #[cfg(target_os = "macos")]
     {
         let im_shutdown = shutdown.clone();
         let im_config = config.clone();
-        tokio::spawn(async move {
-            let imessage_dir = match Config::data_dir() {
-                Ok(d) => d.join("channels/imessage"),
-                Err(e) => {
-                    tracing::warn!("iMessage: data_dir failed: {e}");
-                    return;
-                }
-            };
-            if !imessage_dir.join("channel.toml").exists() {
-                return;
-            }
-            let probe = gateway::imessage::probe::probe_imessage();
-            match probe.status {
-                gateway::imessage::probe::ProbeStatus::Ok => {
-                    if let Err(e) =
-                        gateway::imessage::start_imessage_monitor(im_config, im_shutdown).await
-                    {
-                        tracing::warn!("iMessage monitor failed: {e}");
+        let im_db = supervisor_db.clone();
+        spawn_supervised(
+            SupervisorConfig::new("imessage-monitor"),
+            im_shutdown.clone(),
+            im_db,
+            move || {
+                let im_config = im_config.clone();
+                // Forward the daemon's outer shutdown into the monitor
+                // via a per-iteration child token. `child_token()`
+                // cancels when its parent does AND when the iteration's
+                // future drops, so on supervisor restart we don't leak
+                // a long-lived bridge task.
+                let im_cancel = im_shutdown.child_token();
+                async move {
+                    let imessage_dir = match Config::data_dir() {
+                        Ok(d) => d.join("channels/imessage"),
+                        Err(e) => {
+                            tracing::warn!("iMessage: data_dir failed: {e}");
+                            return Ok::<(), anyhow::Error>(());
+                        }
+                    };
+                    if !imessage_dir.join("channel.toml").exists() {
+                        return Ok(());
+                    }
+                    let probe = gateway::imessage::probe::probe_imessage();
+                    match probe.status {
+                        gateway::imessage::probe::ProbeStatus::Ok => {
+                            if let Err(e) =
+                                gateway::imessage::start_imessage_monitor(im_config, im_cancel)
+                                    .await
+                            {
+                                return Err(anyhow::anyhow!("iMessage monitor failed: {e}"));
+                            }
+                            Ok(())
+                        }
+                        gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
+                            tracing::warn!(
+                                "iMessage: Full Disk Access required. Skipping monitor."
+                            );
+                            Ok(())
+                        }
+                        other => {
+                            tracing::warn!("iMessage probe: {other}. Skipping monitor.");
+                            Ok(())
+                        }
                     }
                 }
-                gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
-                    tracing::warn!("iMessage: Full Disk Access required. Skipping monitor.");
-                }
-                other => {
-                    tracing::warn!("iMessage probe: {other}. Skipping monitor.");
-                }
-            }
-        });
+            },
+        );
     }
 
     // Scheduled-task dispatcher.
@@ -192,37 +246,50 @@ pub fn start(
     let scheduler_shutdown = shutdown;
     let scheduler_semaphore = semaphore;
     let task_cost_event_sink = cost_event_sink;
-    tokio::spawn(async move {
-        let hooks = scheduler::DispatcherHooks {
-            spawn_task: Arc::new(move |task, run_id, retry, sem, cfg| {
-                let cost_event_sink = task_cost_event_sink.clone();
-                Box::pin(async move {
-                    task_runner::spawn_task_execution(
-                        task,
-                        run_id,
-                        retry,
-                        sem,
-                        cfg,
-                        Some(cost_event_sink),
-                    )
-                    .await
-                })
-            }),
-            deliver_celebration: Arc::new(|cfg, c| {
-                Box::pin(async move { task_runner::deliver_celebration_to_channels(cfg, c).await })
-            }),
-        };
-        if let Err(e) = scheduler::run(
-            scheduler_config,
-            hooks,
-            scheduler_semaphore,
-            scheduler_shutdown,
-        )
-        .await
-        {
-            tracing::error!("Scheduled-task dispatcher exited: {e}");
-        }
-    });
+    let scheduler_db = supervisor_db;
+    spawn_supervised(
+        SupervisorConfig::new("scheduler-dispatch"),
+        scheduler_shutdown.clone(),
+        scheduler_db,
+        move || {
+            let scheduler_config = scheduler_config.clone();
+            let scheduler_semaphore = scheduler_semaphore.clone();
+            let scheduler_shutdown = scheduler_shutdown.clone();
+            let task_cost_event_sink = task_cost_event_sink.clone();
+            async move {
+                let cost_for_hook = task_cost_event_sink.clone();
+                let hooks = scheduler::DispatcherHooks {
+                    spawn_task: Arc::new(move |task, run_id, retry, sem, cfg| {
+                        let cost_event_sink = cost_for_hook.clone();
+                        Box::pin(async move {
+                            task_runner::spawn_task_execution(
+                                task,
+                                run_id,
+                                retry,
+                                sem,
+                                cfg,
+                                Some(cost_event_sink),
+                            )
+                            .await
+                        })
+                    }),
+                    deliver_celebration: Arc::new(|cfg, c| {
+                        Box::pin(async move {
+                            task_runner::deliver_celebration_to_channels(cfg, c).await
+                        })
+                    }),
+                };
+                scheduler::run(
+                    scheduler_config,
+                    hooks,
+                    scheduler_semaphore,
+                    scheduler_shutdown,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("scheduler dispatcher exited: {e}"))
+            }
+        },
+    );
 
     OrchestratorHandles {
         heartbeat_bus,
@@ -258,4 +325,83 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
     );
     shutdown.cancelled().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heartbeat_augmenters::{
+        check_gateway_unrecoverable, GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY,
+    };
+    use rusqlite::Connection;
+
+    fn in_memory_db() -> cortex::db::Database {
+        cortex::db::Database::from_connection(
+            Connection::open_in_memory().expect("open in-memory sqlite"),
+        )
+        .expect("init in-memory db")
+    }
+
+    /// Round-trip guard: the orchestrator's meta writes must be the exact
+    /// keys the augmenter reads. Catches future renames in either module
+    /// — without this test, a typo in `GATEWAY_UNRECOVERABLE_KEY` here
+    /// would silently disable the augmenter and only surface in
+    /// production after a real gateway crash.
+    #[test]
+    fn write_gateway_unrecoverable_meta_round_trips_to_augmenter() {
+        let db = in_memory_db();
+        // Stamp the abandonment two hours in the past so we're past the
+        // 1h grace and the augmenter actually fires.
+        let two_hours_ago = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            - 2 * 60 * 60;
+        write_gateway_unrecoverable_meta(&db, two_hours_ago);
+
+        assert_eq!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
+            Some("1"),
+            "flag must be persisted under the augmenter's key"
+        );
+        let cfg = Config::default();
+        assert!(
+            check_gateway_unrecoverable(&cfg, Some(&db)).is_some(),
+            "augmenter must observe the orchestrator's write and fire"
+        );
+    }
+
+    /// If the timestamp write succeeded but the process died before the
+    /// flag write, the augmenter must stay silent — there's nothing to
+    /// nudge about. Guards the reverse half of the write-order
+    /// invariant.
+    #[test]
+    fn timestamp_alone_without_flag_does_not_fire() {
+        let db = in_memory_db();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &(now - 7200).to_string())
+            .unwrap();
+        let cfg = Config::default();
+        assert!(
+            check_gateway_unrecoverable(&cfg, Some(&db)).is_none(),
+            "augmenter must require the flag, not just the timestamp"
+        );
+    }
+
+    /// Flag without a timestamp (simulating mid-write death) must NOT
+    /// instantly fire — the augmenter falls back to `now`, so the 1h
+    /// grace re-arms cleanly.
+    #[test]
+    fn flag_without_timestamp_does_not_fire_immediately() {
+        let db = in_memory_db();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        let cfg = Config::default();
+        assert!(
+            check_gateway_unrecoverable(&cfg, Some(&db)).is_none(),
+            "missing timestamp must not be treated as `0` (would race the daily heal)"
+        );
+    }
 }

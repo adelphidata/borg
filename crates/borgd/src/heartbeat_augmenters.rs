@@ -390,11 +390,12 @@ fn check_budget_threshold(config: &Config, db: Option<&Database>) -> Option<Stri
 }
 
 fn budget_month_key() -> String {
+    use chrono::Datelike;
     let now = chrono::Utc::now();
     format!(
         "heartbeat_budget_last_bucket_{:04}-{:02}",
-        now.format("%Y").to_string().parse::<i32>().unwrap_or(0),
-        now.format("%m").to_string().parse::<u32>().unwrap_or(0),
+        now.year(),
+        now.month(),
     )
 }
 
@@ -448,19 +449,27 @@ already asked recently.";
 /// Two guards: meta flag must be set, AND it must have been set at
 /// least `GATEWAY_NUDGE_GRACE_SECS` ago, so we don't race the daily
 /// 02:00 maintenance pass.
-fn check_gateway_unrecoverable(_config: &Config, db: Option<&Database>) -> Option<String> {
+pub(crate) fn check_gateway_unrecoverable(
+    _config: &Config,
+    db: Option<&Database>,
+) -> Option<String> {
     let db = db?;
     let flag = db.get_meta(GATEWAY_UNRECOVERABLE_KEY).ok().flatten()?;
     if flag != "1" {
         return None;
     }
+    // Fall back to `now` (not 0) when the timestamp is missing or
+    // unparseable — a `flag="1"` with no `_at` means we caught the
+    // orchestrator mid-write or somebody hand-edited the meta table.
+    // Either way, treating it as "set just now" makes the grace window
+    // re-arm cleanly instead of firing instantly.
+    let now = unix_now() as i64;
     let set_at: i64 = db
         .get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
         .ok()
         .flatten()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let now = unix_now() as i64;
+        .unwrap_or(now);
     if now.saturating_sub(set_at) < GATEWAY_NUDGE_GRACE_SECS {
         return None;
     }
@@ -554,8 +563,6 @@ mod tests {
             let tmp = tempfile::tempdir().expect("tempdir");
             guard.prev_data_dir = std::env::var("BORG_DATA_DIR").ok();
             std::env::set_var("BORG_DATA_DIR", tmp.path());
-            // Pre-create the .borg subdir so `identity_path()` resolves cleanly.
-            std::fs::create_dir_all(tmp.path().join(".borg")).expect("create .borg dir");
             guard._tmp = Some(tmp);
             guard
         }

@@ -2370,6 +2370,7 @@ dependencies = [
  "chrono-tz",
  "cortex",
  "cron",
+ "futures",
  "tokio",
  "tokio-util",
  "tracing",

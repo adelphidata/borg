@@ -111,6 +111,28 @@ pub struct MaintenanceReport {
     /// a successful sweep.
     #[serde(default)]
     pub skipped: bool,
+    /// Pages reclaimed by the WAL checkpoint that runs every sweep.
+    /// `-1` when the checkpoint failed; any non-negative value is a
+    /// real reclamation count from `PRAGMA wal_checkpoint(TRUNCATE)`.
+    #[serde(default)]
+    pub wal_checkpoint_pages_reclaimed: i64,
+    /// True when the conditional full `VACUUM` ran this sweep.
+    #[serde(default)]
+    pub vacuum_ran: bool,
+    /// Bytes the DB file shrank during the full VACUUM. `0` when VACUUM
+    /// didn't run or when the file size didn't change.
+    #[serde(default)]
+    pub vacuum_bytes_reclaimed: i64,
+    /// True when this sweep stopped early because
+    /// [`MaintenanceConfig::heal_action_budget`] was exhausted. Existing
+    /// step counters reflect what *did* run; later steps short-circuit.
+    #[serde(default)]
+    pub budget_exhausted: bool,
+    /// Number of mutating actions counted against the heal action
+    /// budget this sweep. Useful telemetry for tuning the default
+    /// budget (1000) — most healthy sweeps stay well below.
+    #[serde(default)]
+    pub heal_actions_spent: u32,
 }
 
 impl MaintenanceReport {
@@ -135,6 +157,51 @@ impl MaintenanceReport {
             self.messages_purged,
             self.audit_events_tombstoned,
         )
+    }
+}
+
+/// Caps the total number of mutating self-heal actions one sweep is
+/// allowed to perform. Once `spent >= budget`, every subsequent
+/// `try_spend` returns `false` and the sweep skips its remaining
+/// mutating steps. Pure data — testable without a real DB.
+#[derive(Debug)]
+struct BudgetTracker {
+    budget: u32,
+    spent: u32,
+    blown: bool,
+}
+
+impl BudgetTracker {
+    fn new(budget: u32) -> Self {
+        Self {
+            budget,
+            spent: 0,
+            blown: false,
+        }
+    }
+
+    /// Charge `n` actions to the budget. Returns `true` while there is
+    /// still room (i.e. the caller may proceed); returns `false` once
+    /// the budget is blown — and stays `false` for the rest of the
+    /// sweep. `saturating_add` guards against a step reporting a wildly
+    /// wrong count.
+    fn try_spend(&mut self, n: usize) -> bool {
+        if self.blown {
+            return false;
+        }
+        let charge = n.min(u32::MAX as usize) as u32;
+        self.spent = self.spent.saturating_add(charge);
+        if self.spent >= self.budget {
+            self.blown = true;
+        }
+        !self.blown
+    }
+
+    /// Read-only view: is the budget blown? (Independent of any pending
+    /// `try_spend` call — used by remediation loops to short-circuit
+    /// before doing more work.)
+    fn is_blown(&self) -> bool {
+        self.blown
     }
 }
 
@@ -176,6 +243,8 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         return Ok(report);
     }
 
+    let mut budget = BudgetTracker::new(config.maintenance.heal_action_budget);
+
     // 0. Self-heal fresh-install state. These are idempotent and cheap;
     //    running them every sweep makes the daemon's first start order
     //    irrelevant and lets the user delete subdirs without breaking
@@ -216,24 +285,39 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
 
     // 3. Prune activity-log rows beyond retention window.
     let activity_cutoff = now - (config.maintenance.activity_retention_days as i64) * SECS_PER_DAY;
-    match db.prune_activity_before(activity_cutoff) {
-        Ok(n) => report.activity_rows_deleted = n,
-        Err(e) => tracing::warn!("maintenance: activity pruning failed: {e}"),
+    if !budget.is_blown() {
+        match db.prune_activity_before(activity_cutoff) {
+            Ok(n) => {
+                report.activity_rows_deleted = n;
+                budget.try_spend(n);
+            }
+            Err(e) => tracing::warn!("maintenance: activity pruning failed: {e}"),
+        }
     }
 
     // 4. Prune stale embedding-cache entries.
-    match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS) {
-        Ok(n) => report.embeddings_pruned = n,
-        Err(e) => tracing::warn!("maintenance: embedding prune failed: {e}"),
+    if !budget.is_blown() {
+        match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS) {
+            Ok(n) => {
+                report.embeddings_pruned = n;
+                budget.try_spend(n);
+            }
+            Err(e) => tracing::warn!("maintenance: embedding prune failed: {e}"),
+        }
     }
 
     // 4a. Expire `/doctor` squelches whose TTL has passed. Once pruned,
     //     the corresponding warning re-surfaces in subsequent heartbeats —
     //     security findings the user has acknowledged are intentionally
     //     bounded so they don't disappear from the radar forever.
-    match db.doctor_squelch_prune_expired(now) {
-        Ok(n) => report.squelches_expired = n,
-        Err(e) => tracing::warn!("maintenance: doctor-squelch prune failed: {e}"),
+    if !budget.is_blown() {
+        match db.doctor_squelch_prune_expired(now) {
+            Ok(n) => {
+                report.squelches_expired = n;
+                budget.try_spend(n);
+            }
+            Err(e) => tracing::warn!("maintenance: doctor-squelch prune failed: {e}"),
+        }
     }
 
     // 4b. Apply data retention. Deletes `messages` rows past the cutoff
@@ -241,15 +325,23 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     //     preserving hash-chain linkage. Skipped when `retention_days`
     //     is unset or `purge_policy` is `Never` / `OnDemandOnly` — see
     //     `DataConfig::should_auto_purge`.
-    if config.data.should_auto_purge() {
+    if !budget.is_blown() && config.data.should_auto_purge() {
         if let Some(cutoff) = config.data.purge_cutoff(now) {
             match db.purge_messages_before(cutoff) {
-                Ok(n) => report.messages_purged = n,
+                Ok(n) => {
+                    report.messages_purged = n;
+                    budget.try_spend(n);
+                }
                 Err(e) => tracing::warn!("maintenance: messages retention purge failed: {e}"),
             }
-            match db.tombstone_audit_events_before(cutoff, now) {
-                Ok(n) => report.audit_events_tombstoned = n,
-                Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
+            if !budget.is_blown() {
+                match db.tombstone_audit_events_before(cutoff, now) {
+                    Ok(n) => {
+                        report.audit_events_tombstoned = n;
+                        budget.try_spend(n);
+                    }
+                    Err(e) => tracing::warn!("maintenance: audit tombstoning failed: {e}"),
+                }
             }
         }
     }
@@ -258,16 +350,38 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     //    what the daemon loop does on a 5-minute cadence, but running it
     //    here covers the case where the daemon isn't running and the user
     //    fires this task manually with `borg schedule run <id>`.
-    match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
-        Ok(h) => report.stalled_tasks_healed = h.reset,
-        Err(e) => tracing::warn!("maintenance: stalled-task scan failed: {e}"),
+    if !budget.is_blown() {
+        match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
+            Ok(h) => {
+                report.stalled_tasks_healed = h.reset;
+                budget.try_spend(h.reset);
+            }
+            Err(e) => tracing::warn!("maintenance: stalled-task scan failed: {e}"),
+        }
     }
-    match crate::tasks::recover_wedged_runs(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
-        Ok(n) => report.wedged_runs_recovered = n as usize,
-        Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
+    if !budget.is_blown() {
+        match crate::tasks::recover_wedged_runs(db, now, crate::constants::STALLED_TASK_GRACE_SECS)
+        {
+            Ok(n) => {
+                report.wedged_runs_recovered = n as usize;
+                budget.try_spend(n as usize);
+            }
+            Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
+        }
     }
 
-    // 5a. Gateway recovery probe. The orchestrator's respawn supervisor
+    // 5a. WAL checkpoint + conditional full VACUUM. Always runs the
+    //     cheap checkpoint after the heavy deletes above; gates full
+    //     VACUUM behind both an interval and a fragmentation signal.
+    //     Not counted against the action budget — these are SQLite
+    //     housekeeping, not row-mutating work, and the bounded VACUUM
+    //     gating is already a separate budget.
+    let wv = crate::db::wal::run_wal_and_vacuum(db, now, config.maintenance.vacuum_interval_days);
+    report.wal_checkpoint_pages_reclaimed = wv.wal_checkpoint_pages_reclaimed;
+    report.vacuum_ran = wv.vacuum_ran;
+    report.vacuum_bytes_reclaimed = wv.vacuum_bytes_reclaimed;
+
+    // 5b. Gateway recovery probe. The orchestrator's respawn supervisor
     //     gives up after `GATEWAY_MAX_CRASH_RESPAWNS` and writes
     //     `gateway_unrecoverable=1` to the meta table. The heartbeat
     //     `gateway_unrecoverable` augmenter then nudges the user — but
@@ -288,8 +402,15 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     }
 
     // 6. Run bounded auto-remediations exactly once per remediation key.
+    //    Budget-blown sweeps skip remediation entirely — the budget is the
+    //    "something is genuinely runaway" backstop, and re-running repairs
+    //    on a stuck row is exactly the failure mode it exists to prevent.
     let mut repair_execution = RepairExecution::default();
-    let grouped = group_issues_by_remediation(&initial_issues);
+    let grouped = if budget.is_blown() {
+        BTreeMap::new()
+    } else {
+        group_issues_by_remediation(&initial_issues)
+    };
     for (key, issues) in grouped {
         let result = match key {
             "data.ensure_subdirs" => Config::data_dir()
@@ -299,6 +420,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             "embeddings.repair" => repair_embedding_backlog(db, config).map(|r| {
                 report.embeddings_repaired_files += r.repaired_files;
                 report.embeddings_repaired_chunks += r.repaired_chunks;
+                budget.try_spend(r.repaired_files);
                 (
                     r.repaired_files > 0 || r.repaired_chunks > 0 || !r.failed,
                     Some(r),
@@ -432,6 +554,59 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
                 .collect()
         })
         .unwrap_or_default();
+
+    // Capture final budget state. `budget_exhausted` is observable to
+    // callers and surfaces on the next sweep as a persistent warning
+    // when it fires twice in a row (existing maintenance_issue_state
+    // plumbing handles the escalation).
+    report.budget_exhausted = budget.is_blown();
+    report.heal_actions_spent = budget.spent;
+
+    if budget.is_blown() {
+        tracing::warn!(
+            "maintenance: heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
+            budget.spent,
+            budget.budget,
+        );
+        if let Err(e) = db.log_activity(
+            "warn",
+            "maintenance",
+            &format!(
+                "heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
+                budget.spent, budget.budget
+            ),
+            None,
+        ) {
+            tracing::warn!("maintenance: failed to record budget-exhaust activity row: {e}");
+        }
+        // Surface as an issue so the existing persistent-warning lifecycle
+        // promotes it on the second consecutive exhaust.
+        if let Err(e) =
+            db.upsert_issue_state_observed("Maintenance:heal action budget", now, "warn")
+        {
+            tracing::warn!("maintenance: budget issue-state observe failed: {e}");
+        }
+        // Re-read persistent_warnings now that the budget issue may have
+        // been promoted; otherwise the report misses its own escalation
+        // for this sweep.
+        let active_squelches: std::collections::HashSet<String> = db
+            .doctor_squelch_list_active(now)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| format!("{}:{}", r.category, r.name))
+                    .collect()
+            })
+            .unwrap_or_default();
+        report.persistent_warnings = db
+            .list_persistent_open_issues()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| r.issue_key)
+                    .filter(|k| !active_squelches.contains(k))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
 
     // 8. Persist the run (best-effort; losing the audit row must not
     //    block the sweep).
@@ -581,8 +756,7 @@ const GATEWAY_UNRECOVERABLE_AT_KEY: &str = "gateway_unrecoverable_at";
 /// without it, the augmenter would keep nagging until someone
 /// hand-cleared the meta key.
 pub fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()> {
-    let flag = db.get_meta(GATEWAY_UNRECOVERABLE_KEY).ok().flatten();
-    if flag.as_deref() != Some("1") {
+    if db.get_meta(GATEWAY_UNRECOVERABLE_KEY)?.as_deref() != Some("1") {
         return Ok(());
     }
     let addr = format!("{}:{}", config.gateway.host, config.gateway.port);
@@ -598,8 +772,10 @@ pub fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()
     match probe {
         Ok(_) => {
             tracing::info!("gateway probe at {addr} succeeded — clearing unrecoverable flag");
-            db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "0")?;
-            db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "0")?;
+            // Delete rather than set to "0" — the augmenter only checks
+            // for "1", and a leftover sentinel pollutes DB exports.
+            db.delete_meta(GATEWAY_UNRECOVERABLE_KEY)?;
+            db.delete_meta(GATEWAY_UNRECOVERABLE_AT_KEY)?;
         }
         Err(e) => {
             tracing::debug!("gateway probe at {addr} still failing: {e}");
@@ -854,17 +1030,13 @@ mod tests {
 
         recover_gateway_if_abandoned(&db, &cfg).expect("probe");
 
-        assert_eq!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
-            Some("0"),
-            "successful probe must clear the flag"
+        assert!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().is_none(),
+            "successful probe must delete the flag row"
         );
-        assert_eq!(
-            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("0"),
-            "successful probe must zero the timestamp"
+        assert!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY).unwrap().is_none(),
+            "successful probe must delete the timestamp row"
         );
     }
 
@@ -1333,6 +1505,284 @@ mod tests {
         assert!(report.failed, "missing provider creds should skip repair");
         assert_eq!(report.repaired_files, 0);
         assert_eq!(report.repaired_chunks, 0);
+    }
+
+    #[test]
+    fn run_daily_maintenance_runs_wal_checkpoint_every_sweep() {
+        // SQLite's `journal_mode=WAL` and `wal_checkpoint` only apply to
+        // file-backed databases — `:memory:` silently falls back to
+        // `memory` journal mode, where `wal_checkpoint` returns an error.
+        // The maintenance sweep handles that gracefully (-1 sentinel,
+        // sweep continues), but the *real* invariant we're guarding —
+        // that production sweeps actually run a checkpoint — needs a
+        // file-backed DB to verify.
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("borg.db");
+        let db = crate::db::Database::open_at(&db_path).expect("open file-backed db");
+
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert!(
+            report.wal_checkpoint_pages_reclaimed >= 0,
+            "file-backed sweep must run a real checkpoint and report a non-negative page count, got {}",
+            report.wal_checkpoint_pages_reclaimed
+        );
+    }
+
+    #[test]
+    fn run_daily_maintenance_handles_wal_checkpoint_failure_gracefully() {
+        // Failure-mode coverage for the in-memory case: the sweep must
+        // still complete, surface the -1 sentinel, and not poison any
+        // other field. This is the regression guard for "what happens
+        // when the WAL pragma can't run."
+        let db = crate::db::Database::test_db();
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert_eq!(
+            report.wal_checkpoint_pages_reclaimed, -1,
+            "in-memory DB cannot checkpoint; sentinel must be -1"
+        );
+        // Other fields populated normally.
+        assert!(!report.skipped);
+    }
+
+    #[test]
+    fn run_daily_maintenance_runs_vacuum_when_fragmented_and_due() {
+        use crate::db::wal::META_LAST_VACUUM_AT;
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // Force interval-elapsed: pretend the last VACUUM was 30 days ago.
+        db.set_meta(META_LAST_VACUUM_AT, &(now - 30 * SECS_PER_DAY).to_string())
+            .unwrap();
+        // Inflate then delete to push freelist > 15% of pages.
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE bloat (id INTEGER, payload BLOB);
+                 INSERT INTO bloat (id, payload)
+                 SELECT n, randomblob(2048)
+                 FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5000)
+                       SELECT n FROM c);
+                 DELETE FROM bloat WHERE id > 100;",
+            )
+            .unwrap();
+
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert!(
+            report.vacuum_ran,
+            "fragmentation+interval should trigger VACUUM"
+        );
+        // Persisted timestamp must be updated so the next sweep skips
+        // VACUUM until interval elapses again.
+        let stored = db.get_meta(META_LAST_VACUUM_AT).unwrap();
+        let parsed: i64 = stored.unwrap().parse().unwrap();
+        assert!(
+            parsed >= now,
+            "last_vacuum_at must be advanced after a successful VACUUM (got {parsed}, expected >= {now})"
+        );
+    }
+
+    #[test]
+    fn run_daily_maintenance_skips_vacuum_when_recent() {
+        use crate::db::wal::META_LAST_VACUUM_AT;
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // Last VACUUM yesterday; default interval 7d → skip.
+        db.set_meta(META_LAST_VACUUM_AT, &(now - SECS_PER_DAY).to_string())
+            .unwrap();
+        db.conn()
+            .execute_batch(
+                "CREATE TABLE bloat (id INTEGER, payload BLOB);
+                 INSERT INTO bloat (id, payload)
+                 SELECT n, randomblob(2048)
+                 FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5000)
+                       SELECT n FROM c);
+                 DELETE FROM bloat WHERE id > 100;",
+            )
+            .unwrap();
+
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert!(!report.vacuum_ran, "interval guard should block VACUUM");
+        // Stored timestamp must be unchanged — skipped VACUUM is a no-op.
+        let stored: i64 = db
+            .get_meta(META_LAST_VACUUM_AT)
+            .unwrap()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(stored, now - SECS_PER_DAY);
+    }
+
+    #[test]
+    fn budget_tracker_blocks_after_exhaust_and_stays_blocked() {
+        let mut t = BudgetTracker::new(10);
+        assert!(t.try_spend(3));
+        assert!(t.try_spend(3));
+        // 6 spent; one more 3 puts us at 9 (still healthy).
+        assert!(t.try_spend(3));
+        // Now at 9. Spend 1 → 10 → blown.
+        assert!(!t.try_spend(1));
+        // Once blown, every subsequent attempt is a no-op: returns false,
+        // does NOT keep accumulating spent. The final `spent` value is
+        // the count at the moment the budget tipped — that's the number
+        // we report so users can tune the cap accurately.
+        assert!(!t.try_spend(50));
+        assert_eq!(
+            t.spent, 10,
+            "spent must freeze at the tipping value, not keep climbing"
+        );
+        assert!(t.is_blown());
+    }
+
+    #[test]
+    fn budget_tracker_saturates_on_giant_charge() {
+        let mut t = BudgetTracker::new(100);
+        // n past u32::MAX must not panic.
+        assert!(!t.try_spend(usize::MAX));
+        assert!(t.is_blown());
+    }
+
+    #[test]
+    fn run_daily_maintenance_short_circuits_when_budget_exhausted() {
+        use crate::db::NewTask;
+        use crate::tasks::RUN_STATUS_RUNNING;
+        use rusqlite::params;
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // 50 stale activity rows (will hit step 3, the first mutating step).
+        for i in 0..50 {
+            db.conn()
+                .execute(
+                    "INSERT INTO activity_log (level, category, message, detail, created_at)
+                     VALUES ('info', 'test', ?1, NULL, ?2)",
+                    params![format!("noise {i}"), now - 100 * SECS_PER_DAY],
+                )
+                .unwrap();
+        }
+        // 50 wedged task_runs (would hit step 5, *after* the budget blew).
+        db.create_task(&NewTask {
+            id: "wedged-budget",
+            name: "wedged",
+            prompt: "p",
+            schedule_type: "cron",
+            schedule_expr: "0 0 * * * *",
+            timezone: "local",
+            next_run: None,
+            max_retries: None,
+            timeout_ms: Some(60_000),
+            delivery_channel: None,
+            delivery_target: None,
+            allowed_tools: None,
+            task_type: "prompt",
+            pre_run_command: None,
+            pre_run_cwd: None,
+            pre_run_timeout_ms: None,
+            min_interval_secs: None,
+        })
+        .unwrap();
+        for _ in 0..50 {
+            db.conn()
+                .execute(
+                    "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+                     VALUES (?1, ?2, 0, ?3)",
+                    params!["wedged-budget", now - 3600, RUN_STATUS_RUNNING],
+                )
+                .unwrap();
+        }
+
+        let mut config = Config::default();
+        config.maintenance.heal_action_budget = 10;
+
+        let report = run_daily_maintenance(&db, &config).expect("sweep");
+
+        assert!(
+            report.budget_exhausted,
+            "50 prunes vs budget=10 should blow it"
+        );
+        assert_eq!(
+            report.activity_rows_deleted, 50,
+            "the active step still completes; the budget gate is checked between steps"
+        );
+        assert_eq!(
+            report.wedged_runs_recovered, 0,
+            "later step must short-circuit once budget is blown"
+        );
+        // Exactly one warn row recording the exhaustion was written.
+        let warn_msgs = db
+            .query_activity(100, Some("warn"), Some("maintenance"))
+            .unwrap();
+        let exhaust_rows: Vec<_> = warn_msgs
+            .iter()
+            .filter(|m| m.message.contains("heal action budget exhausted"))
+            .collect();
+        assert_eq!(
+            exhaust_rows.len(),
+            1,
+            "exactly one budget-exhaust activity row, got {}",
+            exhaust_rows.len()
+        );
+    }
+
+    #[test]
+    fn run_daily_maintenance_budget_warning_persists_after_two_consecutive_exhausts() {
+        use rusqlite::params;
+
+        let db = crate::db::Database::test_db();
+        let now = chrono::Utc::now().timestamp();
+        // Seed enough activity to blow budget=5.
+        for i in 0..20 {
+            db.conn()
+                .execute(
+                    "INSERT INTO activity_log (level, category, message, detail, created_at)
+                     VALUES ('info', 'test', ?1, NULL, ?2)",
+                    params![format!("noise {i}"), now - 100 * SECS_PER_DAY],
+                )
+                .unwrap();
+        }
+        let mut config = Config::default();
+        config.maintenance.heal_action_budget = 5;
+
+        let first = run_daily_maintenance(&db, &config).expect("first sweep");
+        assert!(first.budget_exhausted);
+        // First exhaust is informational — issue is observed but not yet
+        // persistent. We don't assert it's *absent*, only that the second
+        // surfaces it.
+
+        // Re-seed for a second sweep so there's still work to do.
+        for i in 0..20 {
+            db.conn()
+                .execute(
+                    "INSERT INTO activity_log (level, category, message, detail, created_at)
+                     VALUES ('info', 'test', ?1, NULL, ?2)",
+                    params![format!("noise2 {i}"), now - 100 * SECS_PER_DAY],
+                )
+                .unwrap();
+        }
+        let second = run_daily_maintenance(&db, &config).expect("second sweep");
+        assert!(second.budget_exhausted);
+        assert!(
+            second
+                .persistent_warnings
+                .iter()
+                .any(|w| w == "Maintenance:heal action budget"),
+            "second consecutive exhaust must promote to persistent_warnings, got {:?}",
+            second.persistent_warnings
+        );
+    }
+
+    #[test]
+    fn run_daily_maintenance_does_not_blow_budget_on_healthy_sweep() {
+        let db = crate::db::Database::test_db();
+        let mut config = Config::default();
+        // Generous cap, nothing to clean → must not exhaust.
+        config.maintenance.heal_action_budget = 10_000;
+        let report = run_daily_maintenance(&db, &config).expect("sweep");
+        assert!(!report.budget_exhausted);
+        assert!(
+            report.heal_actions_spent < 10_000,
+            "spent {} actions on a clean DB, expected far less",
+            report.heal_actions_spent
+        );
     }
 
     #[test]

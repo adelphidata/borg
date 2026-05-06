@@ -189,6 +189,12 @@ One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src
 
 Daily maintenance task fires 02:00 — prunes logs, evicts stale embeddings, heals stalled tasks, surfaces persistent warnings. No LLM call. Daemon scans every 5min for tasks with `next_run` drift > 1h. `write_memory` 20k-token cap enforced. `skill_audit` table catches user SKILL.md tampering. `/heal` invokes on demand. See `docs/self-healing.md`.
 
+Each sweep also runs `PRAGMA wal_checkpoint(TRUNCATE)` (always) and conditional full `VACUUM` (when fragmentation > 15% and `maintenance.vacuum_interval_days` (default 7) has elapsed). Mutating actions per sweep are capped by `maintenance.heal_action_budget` (default 1000) — a backstop against runaway repair loops; remaining steps short-circuit on exhaustion and the budget surfaces as a persistent warning after two consecutive exhausts.
+
+### Subsystem Supervision
+
+Every long-running task in `borgd` runs under `crates/borgd/src/supervisor.rs`'s `spawn_supervised` wrapper: panic-catching, exponential backoff respawn, degraded-state cap (5 restarts in 10min → marked Fail in `maintenance_issue_state`). The heartbeat scheduler's loop is panic-isolated per-iteration via `catch_unwind` plus a 60s liveness counter that an external watchdog uses to detect stalls. **Bare `tokio::spawn` for new long-running daemon subsystems is forbidden** — use `spawn_supervised`. See `docs/daemon-supervision.md`.
+
 ### Prompt Injection Defense
 
 5 layers: input sanitization (scoring), context segregation (XML trust boundaries), prompt hardening, rate limiting, secret redaction.

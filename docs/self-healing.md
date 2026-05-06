@@ -187,9 +187,102 @@ returns immediately after logging a skip message.
 | `maintenance.embedding_repair_max_files` | `16` | Maximum memory entries repaired in one sweep. |
 | `maintenance.embedding_repair_max_chunks` | `256` | Maximum chunks rebuilt in one sweep. |
 | `maintenance.issue_state_keep_days` | `30` | Resolved `maintenance_issue_state` rows older than this are pruned. |
+| `maintenance.security_squelch_ttl_days` | `30` | How long a `/doctor` squelch persists before it auto-expires and the warning resumes. |
+| `maintenance.vacuum_interval_days` | `7` | Minimum days between full `VACUUM` rewrites. WAL checkpoint runs every sweep regardless. |
+| `maintenance.heal_action_budget` | `1000` | Cap on mutating self-heal actions per sweep before short-circuiting. Backstop for runaway repair loops. |
 
-All nine are wired through `/settings` under the **Maintenance**
+All eleven are wired through `/settings` under the **Maintenance**
 section.
+
+## WAL checkpoint and conditional VACUUM
+
+Each sweep, after the heavy deletes (activity-log prune, embedding
+cache, retention purge, stalled-task heal, wedged-run recovery), the
+maintenance task runs:
+
+1. `PRAGMA wal_checkpoint(TRUNCATE)` — every sweep. Cheap (microseconds
+   when the WAL is small). Returns the page count to
+   `MaintenanceReport.wal_checkpoint_pages_reclaimed`. `-1` is the
+   sentinel for a checkpoint that failed (e.g. an in-memory test DB);
+   any non-negative value is a real count.
+
+2. `PRAGMA incremental_vacuum` — every sweep. Complements the
+   `auto_vacuum=INCREMENTAL` set at connection open by actually
+   reclaiming pages flagged by recent deletes.
+
+3. **Conditional full** `VACUUM` — only when **both**:
+   - `now - last_vacuum_at >= maintenance.vacuum_interval_days` (default
+     7), AND
+   - `freelist_count / page_count > 0.15` OR the freelist exceeds 64 MB
+     of waste.
+
+   Full VACUUM locks the DB and rewrites the file, so we run it only
+   when fragmentation is real. `last_vacuum_at` lives in the `meta`
+   table under key `maintenance.last_vacuum_at` and is updated only on
+   successful completion.
+
+Skipped VACUUM is a no-op (does not touch `last_vacuum_at`). Failed
+checkpoint logs a warn and continues — never aborts the sweep.
+
+Inspect telemetry:
+
+```sql
+SELECT ran_at, json_extract(report_json, '$.vacuum_ran') AS vacuumed,
+       json_extract(report_json, '$.vacuum_bytes_reclaimed') AS bytes_reclaimed,
+       json_extract(report_json, '$.wal_checkpoint_pages_reclaimed') AS wal_pages
+FROM doctor_runs
+ORDER BY ran_at DESC
+LIMIT 10;
+```
+
+## Healing action budget
+
+Maintenance steps that mutate state (delete rows, update task statuses,
+repair embeddings) charge the `BudgetTracker`. Once
+`maintenance.heal_action_budget` is exhausted, every subsequent
+mutating step short-circuits and `MaintenanceReport.budget_exhausted`
+is set true.
+
+**Why default 1000?** A healthy 30-day install processes a few hundred
+mutations per sweep. 1000 is the threshold at which "something is
+genuinely runaway" is the most likely explanation — a corrupted row
+that keeps re-triggering repair, or weeks of unprocessed backlog after
+an outage. Defaulting lower (the original design suggested 100) would
+false-positive on normal sweeps after a busy week.
+
+What's counted (per row, summed across all listed steps):
+
+- `activity_rows_deleted`
+- `embeddings_pruned`
+- `squelches_expired`
+- `messages_purged`
+- `audit_events_tombstoned`
+- `stalled_tasks_healed`
+- `wedged_runs_recovered`
+- `embeddings_repaired_files`
+
+What's **not** counted: log file deletions (filesystem, separate
+budget via retention), log truncation bytes (one aggregate op),
+embedding repair *chunks* (already capped by
+`embedding_repair_max_chunks`).
+
+Behavior on exhaustion:
+
+1. The current step finishes (the gate is checked between steps, not
+   mid-step).
+2. All later steps short-circuit.
+3. One `activity_log` row is written: `level=warn`, `category=maintenance`.
+4. An issue is observed under key `Maintenance:heal action budget` —
+   the existing persistent-warning lifecycle promotes it to a doctor
+   `Warn` after two consecutive exhausts.
+
+Inspect:
+
+```sql
+SELECT level, category, message FROM activity_log
+WHERE category = 'maintenance'
+ORDER BY created_at DESC LIMIT 20;
+```
 
 ## Wedged-run recovery inside the daemon loop
 

@@ -21,6 +21,7 @@ mod skill_audit;
 mod tasks;
 mod usage;
 mod vitals;
+pub mod wal;
 pub mod web_search_cache;
 
 #[cfg(test)]

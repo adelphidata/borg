@@ -1,10 +1,14 @@
 use chrono::NaiveTime;
 use chrono_tz::Tz;
 use cron::Schedule;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use cortex::config::{Config, HeartbeatConfig};
 use cortex::tasks::parse_interval;
@@ -13,6 +17,55 @@ use cortex::tasks::parse_interval;
 /// configured value of 0 is bumped to 1 second so a misconfiguration
 /// can't busy-loop the scheduler.
 const HARD_FLOOR_SECS: u64 = 1;
+
+/// The scheduler's liveness counter is updated on every loop iteration.
+/// To make stall detection possible even when the scheduler is
+/// legitimately sleeping for a long time (e.g. waiting for a cron fire
+/// hours away), we cap any single sleep at this value and force a wake
+/// to refresh the counter.
+///
+/// 60s is small enough that a watchdog with a 5min stale threshold has
+/// 10× headroom (no false positives), and large enough that the wake
+/// cost is negligible (one timer firing per minute).
+pub const LIVENESS_TICK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Brief pause after a panicked iteration. Without this, a deterministic
+/// panic source (e.g. malformed config that fails the same way every
+/// loop) would burn CPU spinning. 500ms gives enough time for the
+/// supervisor's degraded-state cap to engage if the panic is persistent.
+const POST_PANIC_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Convert the panic payload into a printable message. Most panics carry
+/// either a `&'static str` or a `String`; the `unknown` fallback exists
+/// so we never crash the log call itself by trying to downcast a
+/// payload of unexpected type.
+fn panic_msg(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<unknown panic payload>".to_string()
+    }
+}
+
+/// Per-iteration control flow for the panic-isolated run loops.
+#[derive(Debug, PartialEq, Eq)]
+enum LoopControl {
+    Continue,
+    Stop,
+}
+
+/// Per-iteration control flow specific to the cron run loop. Adds a
+/// `FallbackToInterval` arm for the case where the cron schedule has
+/// produced no upcoming fire times and we need to hand control to the
+/// interval-mode loop.
+#[derive(Debug, PartialEq, Eq)]
+enum CronStep {
+    Continue,
+    Stop,
+    FallbackToInterval,
+}
 
 /// Outcome of a heartbeat agent turn.
 #[derive(Debug, Clone)]
@@ -73,6 +126,26 @@ pub enum HeartbeatEvent {
 
 /// Pure timer that emits `Fire` events on schedule. Does not call LLM directly —
 /// the consumer (daemon or TUI) is responsible for running the agent turn.
+///
+/// The scheduler is structurally hardened against three failure modes:
+///
+/// 1. **Iteration panic.** Each loop iteration body is wrapped in
+///    `catch_unwind`; a panic in cron parsing, config apply, or any
+///    descendant logs and the loop continues. This stops a single bad
+///    cron row, a clock-jump arithmetic edge case, or an unexpected
+///    `unwrap` from killing proactive check-ins.
+///
+/// 2. **Stalled iteration.** The [`liveness`](Self::liveness) counter
+///    is updated after every select! return. An external watchdog can
+///    detect "loop alive but not iterating" (deadlock, hung await) and
+///    trigger a restart via the supervisor. Sleeps inside the loop are
+///    capped at [`LIVENESS_TICK_MAX`] so the counter advances even
+///    during legitimately long waits (e.g. cron fire hours away).
+///
+/// 3. **Crashed task.** When everything else fails — panic outside any
+///    iteration body, or a panic that escapes `catch_unwind` — the
+///    `borgd` subsystem supervisor catches the resulting `JoinError`
+///    and respawns. That's the last line of defense.
 pub struct HeartbeatScheduler {
     config: HeartbeatConfig,
     timezone: Tz,
@@ -82,6 +155,12 @@ pub struct HeartbeatScheduler {
     /// Optional live-reload subscription. When set, the run loop wakes on
     /// `changed()` and applies the new `heartbeat.*` settings without restart.
     config_rx: Option<watch::Receiver<Config>>,
+    /// Monotonic iteration counter. Incremented after every select!
+    /// return and every [`LIVENESS_TICK_MAX`] forced wake. Read by the
+    /// daemon-side watchdog: an unchanged value across the stale
+    /// threshold proves the loop is stuck (no real-time clock dependency,
+    /// works under `tokio::time::pause` for tests).
+    liveness: Arc<AtomicU64>,
 }
 
 impl HeartbeatScheduler {
@@ -94,7 +173,20 @@ impl HeartbeatScheduler {
             poke_rx: Some(poke_rx),
             quiet_hours,
             config_rx: None,
+            liveness: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Hand out a clone of the liveness counter. The daemon-side watchdog
+    /// reads this counter on a polling cadence — an unchanged value
+    /// across multiple polls (totaling its stale threshold) proves the
+    /// scheduler task is wedged.
+    pub fn liveness_handle(&self) -> Arc<AtomicU64> {
+        self.liveness.clone()
+    }
+
+    fn touch_liveness(&self) {
+        self.liveness.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Subscribe the scheduler to live config updates. After this, changes to
@@ -239,55 +331,108 @@ impl HeartbeatScheduler {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await; // Skip immediate first tick
 
+        // Independent ticker that wakes the loop every LIVENESS_TICK_MAX so
+        // the liveness counter stays current even when the main interval is
+        // longer than the watchdog's stale threshold.
+        let mut liveness_ticker = tokio::time::interval(LIVENESS_TICK_MAX);
+        liveness_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        liveness_ticker.tick().await; // Skip immediate first tick.
+
+        // Touch liveness once before the first await on the main select.
+        // Without this, a fresh scheduler reads 0 until the first
+        // iteration completes — which can be up to LIVENESS_TICK_MAX
+        // away, leaving the watchdog unable to distinguish "just
+        // booted, healthy" from "wedged at startup."
+        self.touch_liveness();
+
         loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    info!("Heartbeat scheduler shutting down");
-                    return;
+            // Each iteration body is panic-isolated: a panic in
+            // apply_config, try_fire, is_quiet_hours, or any descendant
+            // turns into a logged warn + brief backoff + next loop, never
+            // a task death. Combined with the supervisor's panic catcher
+            // (which catches anything that escapes this), proactive
+            // check-ins should keep firing through transient bugs.
+            let outcome = AssertUnwindSafe(self.interval_iteration(
+                &tx,
+                &cancel,
+                &mut config_rx,
+                &mut ticker,
+                &mut liveness_ticker,
+            ))
+            .catch_unwind()
+            .await;
+            self.touch_liveness();
+            match outcome {
+                Ok(LoopControl::Continue) => continue,
+                Ok(LoopControl::Stop) => return,
+                Err(payload) => {
+                    let msg = panic_msg(&payload);
+                    error!("Heartbeat: iteration panicked: {msg}");
+                    tokio::time::sleep(POST_PANIC_BACKOFF).await;
+                    continue;
                 }
-                ok = Self::recv_config_change(&mut config_rx) => {
-                    if !ok {
-                        debug!("Heartbeat: config watch closed, disabling reload");
-                        config_rx = None;
-                        continue;
+            }
+        }
+    }
+
+    /// Body of one interval-mode iteration. Returns whether the loop
+    /// should continue or stop. Extracted from `run_interval` so the
+    /// caller can wrap it in `catch_unwind` and turn an iteration panic
+    /// into a logged warn instead of a task death.
+    async fn interval_iteration(
+        &mut self,
+        tx: &mpsc::Sender<HeartbeatEvent>,
+        cancel: &CancellationToken,
+        config_rx: &mut Option<watch::Receiver<Config>>,
+        ticker: &mut tokio::time::Interval,
+        liveness_ticker: &mut tokio::time::Interval,
+    ) -> LoopControl {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Heartbeat scheduler shutting down");
+                LoopControl::Stop
+            }
+            _ = liveness_ticker.tick() => {
+                // Pure liveness tick; no other action. The caller calls
+                // touch_liveness() on every return so we don't need to
+                // touch it here as well.
+                LoopControl::Continue
+            }
+            ok = Self::recv_config_change(config_rx) => {
+                if !ok {
+                    debug!("Heartbeat: config watch closed, disabling reload");
+                    *config_rx = None;
+                    return LoopControl::Continue;
+                }
+                let new_hb = config_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().heartbeat.clone());
+                if let Some(new_hb) = new_hb {
+                    self.apply_config(new_hb);
+                    let new_interval = self.clamped_interval();
+                    info!("Heartbeat: config reload applied (interval: {new_interval:?})");
+                    *ticker = tokio::time::interval(new_interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    ticker.tick().await;
+                }
+                LoopControl::Continue
+            }
+            _ = self.recv_poke() => {
+                debug!("Heartbeat: poke signal received, firing immediately");
+                if !Self::try_fire(tx) { LoopControl::Stop } else { LoopControl::Continue }
+            }
+            _ = ticker.tick() => {
+                if self.is_quiet_hours() {
+                    debug!("Heartbeat: in quiet hours, skipping");
+                    if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                        reason: SkipReason::QuietHours,
+                    })) {
+                        debug!("Failed to send quiet-hours skip event: {e}");
                     }
-                    let new_hb = config_rx
-                        .as_ref()
-                        .map(|rx| rx.borrow().heartbeat.clone());
-                    if let Some(new_hb) = new_hb {
-                        self.apply_config(new_hb);
-                        let new_interval = self.clamped_interval();
-                        info!(
-                            "Heartbeat: config reload applied (interval: {new_interval:?})"
-                        );
-                        // Always rebuild the ticker on reload — cheap, and
-                        // resets the next tick from now (the desired UX when
-                        // the user just shortened the interval).
-                        ticker = tokio::time::interval(new_interval);
-                        ticker.set_missed_tick_behavior(
-                            tokio::time::MissedTickBehavior::Skip,
-                        );
-                        ticker.tick().await; // Skip the immediate first tick again.
-                    }
+                    return LoopControl::Continue;
                 }
-                _ = self.recv_poke() => {
-                    // Poke signal — fire immediately, skip quiet hours (intentional poke)
-                    debug!("Heartbeat: poke signal received, firing immediately");
-                    if !Self::try_fire(&tx) { return; }
-                }
-                _ = ticker.tick() => {
-                    if self.is_quiet_hours() {
-                        debug!("Heartbeat: in quiet hours, skipping");
-                        if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
-                            reason: SkipReason::QuietHours,
-                        })) {
-                            debug!("Failed to send quiet-hours skip event: {e}");
-                        }
-                        continue;
-                    }
-                    if !Self::try_fire(&tx) { return; }
-                }
+                if !Self::try_fire(tx) { LoopControl::Stop } else { LoopControl::Continue }
             }
         }
     }
@@ -342,63 +487,110 @@ impl HeartbeatScheduler {
         // `run_interval` so live-reload survives a cron-schedule exhaustion.
         let mut config_rx = self.config_rx.take();
 
+        // Same boot-touch as run_interval: ensures the watchdog reads a
+        // healthy liveness signal from the moment cron mode starts.
+        self.touch_liveness();
+
         loop {
-            let now = chrono::Local::now();
-            let next = match schedule.upcoming(chrono::Local).next() {
-                Some(t) => t,
-                None => {
-                    tracing::error!("Cron schedule exhausted, falling back to interval mode");
+            let outcome =
+                AssertUnwindSafe(self.cron_iteration(&schedule, &tx, &cancel, &mut config_rx))
+                    .catch_unwind()
+                    .await;
+            self.touch_liveness();
+            match outcome {
+                Ok(CronStep::Continue) => continue,
+                Ok(CronStep::Stop) => return,
+                Ok(CronStep::FallbackToInterval) => {
                     self.config_rx = config_rx;
                     self.run_interval(tx, cancel).await;
                     return;
                 }
-            };
-
-            let wait = (next - now)
-                .to_std()
-                .unwrap_or(std::time::Duration::from_secs(60));
-
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    info!("Heartbeat scheduler shutting down");
-                    return;
-                }
-                ok = Self::recv_config_change(&mut config_rx) => {
-                    if !ok {
-                        debug!("Heartbeat: config watch closed, disabling reload");
-                        config_rx = None;
-                        continue;
-                    }
-                    // TODO: live cron-expression reload + interval↔cron mode
-                    // switch. Today we only refresh quiet hours and config
-                    // values used at fire-time; changing `heartbeat.cron`
-                    // requires a daemon restart.
-                    let new_hb = config_rx
-                        .as_ref()
-                        .map(|rx| rx.borrow().heartbeat.clone());
-                    if let Some(new_hb) = new_hb {
-                        self.apply_config(new_hb);
-                        info!("Heartbeat: config reload applied (cron mode)");
-                    }
+                Err(payload) => {
+                    let msg = panic_msg(&payload);
+                    error!("Heartbeat: cron iteration panicked: {msg}");
+                    tokio::time::sleep(POST_PANIC_BACKOFF).await;
                     continue;
                 }
-                _ = self.recv_poke() => {
-                    debug!("Heartbeat: poke signal received, firing immediately");
-                    if !Self::try_fire(&tx) { return; }
+            }
+        }
+    }
+
+    /// Body of one cron-mode iteration. Mirrors `interval_iteration` —
+    /// each pass through the loop is panic-isolated and returns a
+    /// control-flow signal rather than directly returning from the
+    /// caller. `FallbackToInterval` is the cron-only escape hatch for a
+    /// schedule that produced no upcoming fire times.
+    async fn cron_iteration(
+        &mut self,
+        schedule: &Schedule,
+        tx: &mpsc::Sender<HeartbeatEvent>,
+        cancel: &CancellationToken,
+        config_rx: &mut Option<watch::Receiver<Config>>,
+    ) -> CronStep {
+        let now = chrono::Local::now();
+        let next = match schedule.upcoming(chrono::Local).next() {
+            Some(t) => t,
+            None => {
+                tracing::error!("Cron schedule exhausted, falling back to interval mode");
+                return CronStep::FallbackToInterval;
+            }
+        };
+
+        // Long cron waits are capped at LIVENESS_TICK_MAX so the watchdog
+        // sees a fresh liveness timestamp at least once per minute even
+        // when the next fire is hours away. When the cap clips the wait,
+        // we'll come back through the loop, log nothing, and reschedule.
+        let raw_wait = (next - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::from_secs(60));
+        let wait = raw_wait.min(LIVENESS_TICK_MAX);
+        let did_clip = wait < raw_wait;
+
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                info!("Heartbeat scheduler shutting down");
+                CronStep::Stop
+            }
+            ok = Self::recv_config_change(config_rx) => {
+                if !ok {
+                    debug!("Heartbeat: config watch closed, disabling reload");
+                    *config_rx = None;
+                    return CronStep::Continue;
                 }
-                _ = tokio::time::sleep(wait) => {
-                    if self.is_quiet_hours() {
-                        debug!("Heartbeat: in quiet hours, skipping");
-                        if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
-                            reason: SkipReason::QuietHours,
-                        })) {
-                            debug!("Failed to send quiet-hours skip event: {e}");
-                        }
-                        continue;
+                // TODO: live cron-expression reload + interval↔cron mode
+                // switch. Today we only refresh quiet hours and config
+                // values used at fire-time; changing `heartbeat.cron`
+                // requires a daemon restart.
+                let new_hb = config_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().heartbeat.clone());
+                if let Some(new_hb) = new_hb {
+                    self.apply_config(new_hb);
+                    info!("Heartbeat: config reload applied (cron mode)");
+                }
+                CronStep::Continue
+            }
+            _ = self.recv_poke() => {
+                debug!("Heartbeat: poke signal received, firing immediately");
+                if !Self::try_fire(tx) { CronStep::Stop } else { CronStep::Continue }
+            }
+            _ = tokio::time::sleep(wait) => {
+                if did_clip {
+                    // Liveness cap fired before the real fire time — go
+                    // back through the loop without firing or logging.
+                    return CronStep::Continue;
+                }
+                if self.is_quiet_hours() {
+                    debug!("Heartbeat: in quiet hours, skipping");
+                    if let Err(e) = tx.try_send(HeartbeatEvent::Result(HeartbeatResult::Skipped {
+                        reason: SkipReason::QuietHours,
+                    })) {
+                        debug!("Failed to send quiet-hours skip event: {e}");
                     }
-                    if !Self::try_fire(&tx) { return; }
+                    return CronStep::Continue;
                 }
+                if !Self::try_fire(tx) { CronStep::Stop } else { CronStep::Continue }
             }
         }
     }
@@ -436,6 +628,7 @@ mod tests {
             poke_rx: Some(rx),
             quiet_hours,
             config_rx: None,
+            liveness: Arc::new(AtomicU64::new(0)),
         }
     }
 

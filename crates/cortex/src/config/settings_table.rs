@@ -216,6 +216,8 @@ define_settings! {
         "maintenance.embedding_repair_max_chunks" => maintenance.embedding_repair_max_chunks, parsed(u32);
         "maintenance.issue_state_keep_days" => maintenance.issue_state_keep_days, parsed(u32);
         "maintenance.security_squelch_ttl_days" => maintenance.security_squelch_ttl_days, parsed(u32);
+        "maintenance.vacuum_interval_days" => maintenance.vacuum_interval_days, parsed(u32);
+        "maintenance.heal_action_budget" => maintenance.heal_action_budget, parsed(u32);
     }
 
     registry_only {
@@ -462,6 +464,8 @@ define_settings! {
         "maintenance.embedding_repair_max_chunks" => "Embed repair chunks", Uint, "Maintenance";
         "maintenance.issue_state_keep_days" => "Issue state retention", Uint, "Maintenance";
         "maintenance.security_squelch_ttl_days" => "Doctor squelch TTL (days)", Uint, "Maintenance";
+        "maintenance.vacuum_interval_days" => "VACUUM interval (days)", Uint, "Maintenance";
+        "maintenance.heal_action_budget" => "Heal action budget", Uint, "Maintenance";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

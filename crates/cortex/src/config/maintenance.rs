@@ -30,6 +30,15 @@ pub struct MaintenanceConfig {
     /// the user has acknowledged should re-surface periodically rather
     /// than disappear forever.
     pub security_squelch_ttl_days: u32,
+    /// Minimum days between full `VACUUM` rewrites of the SQLite database.
+    /// The maintenance sweep runs `wal_checkpoint(TRUNCATE)` every time;
+    /// full VACUUM is gated behind both an interval *and* a fragmentation
+    /// signal so we don't lock the DB unnecessarily.
+    pub vacuum_interval_days: u32,
+    /// Maximum number of mutating self-heal actions one sweep is allowed
+    /// to perform before it short-circuits remaining steps. Backstop
+    /// against a corrupted row that keeps re-triggering repair work.
+    pub heal_action_budget: u32,
 }
 
 impl Default for MaintenanceConfig {
@@ -44,6 +53,8 @@ impl Default for MaintenanceConfig {
             embedding_repair_max_chunks: 256,
             issue_state_keep_days: 30,
             security_squelch_ttl_days: 30,
+            vacuum_interval_days: 7,
+            heal_action_budget: 1000,
         }
     }
 }
@@ -64,6 +75,8 @@ mod tests {
         assert_eq!(cfg.embedding_repair_max_chunks, 256);
         assert_eq!(cfg.issue_state_keep_days, 30);
         assert_eq!(cfg.security_squelch_ttl_days, 30);
+        assert_eq!(cfg.vacuum_interval_days, 7);
+        assert_eq!(cfg.heal_action_budget, 1000);
     }
 
     #[test]
