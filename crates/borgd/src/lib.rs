@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod grpc;
 pub mod heartbeat;
 pub mod heartbeat_augmenters;
+pub(crate) mod maintenance;
 pub mod orchestrator;
 pub mod pairing;
 pub mod paths;
