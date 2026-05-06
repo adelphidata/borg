@@ -96,9 +96,24 @@ pub const AUGMENTERS: &[Augmenter] = &[
         cooldown_secs: 6 * 60 * 60,
         check: check_task_health,
     },
+    Augmenter {
+        id: "budget_threshold",
+        cooldown_secs: 6 * 60 * 60,
+        check: check_budget_threshold,
+    },
+    Augmenter {
+        id: "identity_unpersonalized",
+        cooldown_secs: 7 * 24 * 60 * 60,
+        check: check_identity_unpersonalized,
+    },
+    Augmenter {
+        id: "gateway_unrecoverable",
+        cooldown_secs: 24 * 60 * 60,
+        check: check_gateway_unrecoverable,
+    },
 ];
 
-const SESSION_START_AUGMENTER_IDS: &[&str] = &["no_channels_configured"];
+const SESSION_START_AUGMENTER_IDS: &[&str] = &["no_channels_configured", "identity_unpersonalized"];
 
 /// Run every augmenter in [`AUGMENTERS`] and return the snippets that both
 /// fire and are past their cooldown.
@@ -332,6 +347,142 @@ fn build_task_health_nudge(db: &Database, now: i64) -> Option<String> {
     Some(nudge)
 }
 
+/// Monthly token budget approaching its cap — fires at 75/90/100%.
+///
+/// Stays silent when the limit is unlimited (`0`). State is per-month
+/// (key includes `YYYY-MM`), so each crossed threshold fires exactly
+/// once per calendar month — re-firing for a *higher* threshold is
+/// allowed (75 → 90 → 100), but the same bucket won't repeat. Numbers
+/// in the directive are pre-bucketed by `monthly_budget_pct` so the
+/// LLM can't fabricate values between thresholds.
+///
+/// Coexists with `budget.warning_threshold` / `BudgetEngine` — that's
+/// the system-event side; this is the conversational side.
+fn check_budget_threshold(config: &Config, db: Option<&Database>) -> Option<String> {
+    let db = db?;
+    let limit = config.budget.monthly_token_limit;
+    let bucket = match db.monthly_budget_pct(limit) {
+        Ok(Some(b)) => b,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!("budget_threshold: monthly_budget_pct failed: {e}");
+            return None;
+        }
+    };
+
+    let total = db.monthly_token_total().ok()?;
+    let month_key = budget_month_key();
+    let last_bucket: u8 = db
+        .get_meta(&month_key)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    if bucket <= last_bucket {
+        return None;
+    }
+    if let Err(e) = db.set_meta(&month_key, &bucket.to_string()) {
+        tracing::warn!("budget_threshold: failed to persist month bucket: {e}");
+    }
+
+    Some(build_budget_nudge(bucket, total, limit))
+}
+
+fn budget_month_key() -> String {
+    let now = chrono::Utc::now();
+    format!(
+        "heartbeat_budget_last_bucket_{:04}-{:02}",
+        now.format("%Y").to_string().parse::<i32>().unwrap_or(0),
+        now.format("%m").to_string().parse::<u32>().unwrap_or(0),
+    )
+}
+
+fn build_budget_nudge(bucket: u8, total: u64, limit: u64) -> String {
+    format!(
+        "Monthly token budget check — these are real DB rows, not estimates. \
+         You're at {bucket}% of this month's token budget ({total} of {limit} tokens). \
+         Mention this concisely; do not fabricate dollar figures or percentages \
+         beyond what's listed. If you have a concrete suggestion for reducing \
+         usage (smaller model for routine work, fewer tool calls per turn, \
+         summarizing long context), share at most one. Keep it to 2 sentences \
+         and don't nag — this nudge is rate-limited but the user still notices."
+    )
+}
+
+/// IDENTITY.md hasn't been personalized — direct the agent to ask the
+/// user for the missing pieces and write a real identity file.
+///
+/// Uses `cortex::identity::is_personalized` as the single source of
+/// truth so this check matches what the agent loop actually loads. The
+/// directive mixes structured `request_user_input` choices with
+/// free-form chat follow-up because `request_user_input` is
+/// multiple-choice only (max 3 questions, 2-4 options each).
+fn check_identity_unpersonalized(_config: &Config, _db: Option<&Database>) -> Option<String> {
+    if cortex::identity::is_personalized() {
+        return None;
+    }
+    Some(IDENTITY_NUDGE.to_string())
+}
+
+const IDENTITY_NUDGE: &str = "\
+Your IDENTITY.md is still the unfilled scaffold (~/.borg/IDENTITY.md), \
+so you have no personality, no owner name, and no sense of what \
+matters to this user. In your reply, briefly say why personalization \
+helps (one sentence), then call `request_user_input` with up to 3 \
+multiple-choice questions: communication style (Terse / Warm / \
+Professional / Playful), top priority area (Work / Personal / Both), \
+and preferred check-in window (Morning / Midday / Evening / Quiet). \
+After they answer, ask one open follow-up in chat for their name and \
+a one-line personality sketch, then call `write_memory` with \
+scope=`global` name=`IDENTITY` to persist a personalized identity \
+filled from the template structure. Don't re-raise this if you've \
+already asked recently.";
+
+/// Gateway has been abandoned by the orchestrator's respawn supervisor
+/// AND the daily self-healing recovery step also failed. Last-resort
+/// nudge — outbound channel sends still work (native SDKs bypass the
+/// gateway), but inbound webhooks are dead, so the user can't reply
+/// through chat.
+///
+/// Two guards: meta flag must be set, AND it must have been set at
+/// least `GATEWAY_NUDGE_GRACE_SECS` ago, so we don't race the daily
+/// 02:00 maintenance pass.
+fn check_gateway_unrecoverable(_config: &Config, db: Option<&Database>) -> Option<String> {
+    let db = db?;
+    let flag = db.get_meta(GATEWAY_UNRECOVERABLE_KEY).ok().flatten()?;
+    if flag != "1" {
+        return None;
+    }
+    let set_at: i64 = db
+        .get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let now = unix_now() as i64;
+    if now.saturating_sub(set_at) < GATEWAY_NUDGE_GRACE_SECS {
+        return None;
+    }
+    Some(GATEWAY_NUDGE.to_string())
+}
+
+pub(crate) const GATEWAY_UNRECOVERABLE_KEY: &str = "gateway_unrecoverable";
+pub(crate) const GATEWAY_UNRECOVERABLE_AT_KEY: &str = "gateway_unrecoverable_at";
+const GATEWAY_NUDGE_GRACE_SECS: i64 = 60 * 60;
+
+const GATEWAY_NUDGE: &str = "\
+Gateway has been unrecoverable for over an hour — the supervisor \
+abandoned respawning after repeated crashes, and the daily \
+self-healing recovery step couldn't fix it either. Inbound channel \
+messages (Telegram, Slack, Discord webhooks) are not reaching you; \
+outbound replies still work via the native SDKs. Tell the user \
+clearly and calmly, point them at `~/.borg/logs/daemon.err` for the \
+panic, and suggest restarting the daemon (`borg service restart`, or \
+`borg daemon` if running it directly) once they've captured the log. \
+Keep it to 2-3 sentences — they can't message you back through chat \
+right now.";
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -370,6 +521,8 @@ mod tests {
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
+        prev_data_dir: Option<String>,
+        _tmp: Option<tempfile::TempDir>,
         _lock: MutexGuard<'static, ()>,
     }
 
@@ -383,7 +536,28 @@ mod tests {
             for k in NATIVE_KEYS {
                 std::env::remove_var(k);
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                prev_data_dir: None,
+                _tmp: None,
+                _lock: lock,
+            }
+        }
+
+        /// Variant that ALSO repoints `BORG_DATA_DIR` at a fresh tempdir,
+        /// so file-based checks (e.g. `cortex::identity::is_personalized`)
+        /// don't see the developer's real `~/.borg`. One lock acquisition
+        /// covers both — calling `clear_native()` then a separate
+        /// data-dir guard would re-enter the env_lock and deadlock.
+        fn clear_native_with_isolated_data_dir() -> Self {
+            let mut guard = Self::clear_native();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            guard.prev_data_dir = std::env::var("BORG_DATA_DIR").ok();
+            std::env::set_var("BORG_DATA_DIR", tmp.path());
+            // Pre-create the .borg subdir so `identity_path()` resolves cleanly.
+            std::fs::create_dir_all(tmp.path().join(".borg")).expect("create .borg dir");
+            guard._tmp = Some(tmp);
+            guard
         }
     }
 
@@ -420,6 +594,12 @@ mod tests {
                 match v {
                     Some(val) => std::env::set_var(k, val),
                     None => std::env::remove_var(k),
+                }
+            }
+            if self._tmp.is_some() {
+                match &self.prev_data_dir {
+                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
+                    None => std::env::remove_var("BORG_DATA_DIR"),
                 }
             }
         }
@@ -460,9 +640,21 @@ mod tests {
         cfg
     }
 
+    /// Count nudges from a single augmenter by matching a stable substring
+    /// in its directive. Used by collect-level tests so they stay narrowly
+    /// scoped to the augmenter under test even when other augmenters
+    /// happen to fire (e.g. `identity_unpersonalized` on a test box with
+    /// no IDENTITY.md).
+    fn count_no_channels(nudges: &[String]) -> usize {
+        nudges
+            .iter()
+            .filter(|n| n.contains("No messaging channels are configured yet"))
+            .count()
+    }
+
     #[test]
     fn collect_fires_once_then_respects_cooldown() {
-        let _guard = EnvGuard::clear_native();
+        let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
         if cfg.has_any_native_channel() {
@@ -471,18 +663,23 @@ mod tests {
         let db = in_memory_db();
 
         let first = collect(&cfg, Some(&db));
-        assert_eq!(first.len(), 1, "expected nudge on first call");
+        assert_eq!(
+            count_no_channels(&first),
+            1,
+            "expected no-channels nudge on first call, got: {first:?}"
+        );
 
         let second = collect(&cfg, Some(&db));
-        assert!(
-            second.is_empty(),
-            "expected cooldown to suppress second call, got {second:?}"
+        assert_eq!(
+            count_no_channels(&second),
+            0,
+            "expected cooldown to suppress no-channels nudge on second call, got: {second:?}"
         );
     }
 
     #[test]
     fn collect_fires_again_after_cooldown_elapses() {
-        let _guard = EnvGuard::clear_native();
+        let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
         if cfg.has_any_native_channel() {
@@ -491,7 +688,7 @@ mod tests {
         let db = in_memory_db();
 
         // First firing persists a timestamp.
-        assert_eq!(collect(&cfg, Some(&db)).len(), 1);
+        assert_eq!(count_no_channels(&collect(&cfg, Some(&db))), 1);
 
         // Rewind the stored timestamp to simulate cooldown elapsing.
         let stale = unix_now().saturating_sub(25 * 60 * 60);
@@ -499,29 +696,34 @@ mod tests {
             .unwrap();
 
         let again = collect(&cfg, Some(&db));
-        assert_eq!(again.len(), 1, "expected nudge to re-fire after cooldown");
+        assert_eq!(
+            count_no_channels(&again),
+            1,
+            "expected no-channels nudge to re-fire after cooldown, got: {again:?}"
+        );
     }
 
     #[test]
     fn collect_without_db_always_returns_firing_checks() {
-        let _guard = EnvGuard::clear_native();
+        let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         let cfg = channel_only_config();
         // Skip if OS keychain has real channel credentials
         if cfg.has_any_native_channel() {
             return;
         }
-        // No DB → no cooldown enforcement; every call returns the snippet.
-        assert_eq!(collect(&cfg, None).len(), 1);
-        assert_eq!(collect(&cfg, None).len(), 1);
+        // No DB → no cooldown enforcement; the no-channels snippet is
+        // returned on every call.
+        assert_eq!(count_no_channels(&collect(&cfg, None)), 1);
+        assert_eq!(count_no_channels(&collect(&cfg, None)), 1);
     }
 
     #[test]
     fn collect_silent_when_channel_configured() {
-        let _guard = EnvGuard::clear_native();
+        let _guard = EnvGuard::clear_native_with_isolated_data_dir();
         std::env::set_var("SLACK_BOT_TOKEN", "xoxb-test");
         let cfg = channel_only_config();
         let db = in_memory_db();
-        assert!(collect(&cfg, Some(&db)).is_empty());
+        assert_eq!(count_no_channels(&collect(&cfg, Some(&db))), 0);
         std::env::remove_var("SLACK_BOT_TOKEN");
     }
 
@@ -916,5 +1118,355 @@ mod tests {
                 "security nudge should be suppressed after re-firing"
             );
         }
+    }
+
+    // ── budget_threshold augmenter tests ──
+    //
+    // These pin the augmenter to real `token_usage` rows + `meta` per-month
+    // bucket state, mirroring the anti-hallucination shape of `task_health`.
+
+    fn budget_only_config(limit: u64) -> Config {
+        let mut cfg = Config::default();
+        cfg.security.host_audit = false;
+        cfg.budget.monthly_token_limit = limit;
+        cfg
+    }
+
+    #[test]
+    fn budget_threshold_returns_none_without_db() {
+        // No DB → can't ground numbers → must stay silent. Same regression
+        // shape as task_health.
+        let cfg = budget_only_config(1000);
+        assert!(check_budget_threshold(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn budget_threshold_silent_when_unlimited() {
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(0);
+        let db = in_memory_db();
+        db.log_token_usage(10_000_000, 0, 10_000_000, "openai", "gpt-4o", None)
+            .unwrap();
+        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn budget_threshold_silent_below_75pct() {
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(1000);
+        let db = in_memory_db();
+        db.log_token_usage(740, 0, 740, "openai", "gpt-4o", None)
+            .unwrap();
+        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn budget_threshold_fires_at_75pct_with_real_numbers() {
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(1000);
+        let db = in_memory_db();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+        let nudge = check_budget_threshold(&cfg, Some(&db)).expect("must fire at 80%");
+        // Anti-hallucination: bucketed pct, total, and limit must all be present.
+        assert!(nudge.contains("75%"), "missing bucket 75%: {nudge}");
+        assert!(nudge.contains("800"), "missing total tokens: {nudge}");
+        assert!(nudge.contains("1000"), "missing limit: {nudge}");
+        assert!(
+            nudge.contains("do not fabricate"),
+            "directive must forbid fabrication: {nudge}"
+        );
+    }
+
+    #[test]
+    fn budget_threshold_does_not_refire_at_same_bucket_within_month() {
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(1000);
+        let db = in_memory_db();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+        assert!(check_budget_threshold(&cfg, Some(&db)).is_some());
+        // Same bucket on the next tick → silent. The persisted month-bucket
+        // is the regression guard: without it, the user sees the same 75%
+        // nag every cooldown window.
+        assert!(check_budget_threshold(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn budget_threshold_refires_when_bucket_increases() {
+        // Crossing 75 → 90 must be allowed even within the same month —
+        // otherwise the user only ever hears about the first threshold and
+        // misses the more urgent ones.
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(1000);
+        let db = in_memory_db();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+        let first = check_budget_threshold(&cfg, Some(&db)).expect("75% must fire");
+        assert!(first.contains("75%"));
+
+        db.log_token_usage(150, 0, 150, "openai", "gpt-4o", None)
+            .unwrap();
+        let second = check_budget_threshold(&cfg, Some(&db)).expect("90% must fire");
+        assert!(second.contains("90%"), "expected 90% bucket: {second}");
+
+        db.log_token_usage(100, 0, 100, "openai", "gpt-4o", None)
+            .unwrap();
+        let third = check_budget_threshold(&cfg, Some(&db)).expect("100% must fire");
+        assert!(third.contains("100%"), "expected 100% bucket: {third}");
+    }
+
+    #[test]
+    fn budget_threshold_resets_on_new_month_key() {
+        // Simulate a previous month's bucket persisted under last month's
+        // key. A fresh month sees an empty key and fires from scratch.
+        let _guard = EnvGuard::clear_native();
+        let cfg = budget_only_config(1000);
+        let db = in_memory_db();
+        db.set_meta("heartbeat_budget_last_bucket_2099-01", "100")
+            .unwrap();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+        let nudge =
+            check_budget_threshold(&cfg, Some(&db)).expect("must fire — this month's key is empty");
+        assert!(nudge.contains("75%"));
+    }
+
+    #[test]
+    fn budget_nudge_size_stays_bounded() {
+        // The directive ships verbatim into <proactive_nudges>. Bake in an
+        // upper bound so a future field addition trips this test rather
+        // than silently bloating every heartbeat tick.
+        let nudge = build_budget_nudge(100, u64::MAX, u64::MAX);
+        assert!(
+            nudge.len() < 1024,
+            "budget nudge should stay under 1KB; got {} bytes:\n{nudge}",
+            nudge.len()
+        );
+    }
+
+    #[test]
+    fn budget_collect_respects_cooldown() {
+        let _guard = EnvGuard::clear_native();
+        let mut cfg = budget_only_config(1000);
+        // Skip if OS keychain has real channel credentials (no_channels would also fire)
+        if cfg.has_any_native_channel() {
+            return;
+        }
+        cfg.security.host_audit = false;
+        let db = in_memory_db();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+
+        let first = collect(&cfg, Some(&db));
+        assert!(
+            first.iter().any(|s| s.contains("75%")),
+            "first call should include budget nudge: {first:?}"
+        );
+        let second = collect(&cfg, Some(&db));
+        assert!(
+            !second.iter().any(|s| s.contains("75%")),
+            "cooldown should suppress budget nudge on second call: {second:?}"
+        );
+    }
+
+    // ── identity_unpersonalized augmenter tests ──
+    //
+    // These exercise `is_personalized_content` indirectly via the augmenter.
+    // The pure helper is also unit-tested in cortex/src/identity.rs.
+
+    #[test]
+    fn identity_directive_mentions_required_tools() {
+        // Regression guard: the LLM follow-up depends on these exact tool
+        // names. If a future refactor renames or drops them from the
+        // directive the agent will silently stop completing the flow.
+        assert!(IDENTITY_NUDGE.contains("request_user_input"));
+        assert!(IDENTITY_NUDGE.contains("write_memory"));
+        assert!(IDENTITY_NUDGE.contains("IDENTITY"));
+    }
+
+    #[test]
+    fn identity_directive_offers_structured_questions() {
+        // The `request_user_input` tool is multiple-choice only. The
+        // directive must seed concrete option labels so the LLM produces
+        // a valid tool call instead of inventing free-form prompts.
+        assert!(IDENTITY_NUDGE.contains("Terse"));
+        assert!(IDENTITY_NUDGE.contains("Warm"));
+        assert!(IDENTITY_NUDGE.contains("Work"));
+    }
+
+    #[test]
+    fn identity_nudge_size_stays_bounded() {
+        assert!(
+            IDENTITY_NUDGE.len() < 1024,
+            "identity nudge should stay under 1KB; got {} bytes",
+            IDENTITY_NUDGE.len()
+        );
+    }
+
+    #[test]
+    fn identity_unpersonalized_fires_when_file_missing() {
+        let _g = EnvGuard::clear_native_with_isolated_data_dir();
+        // No file at all → unpersonalized.
+        let cfg = Config::default();
+        let nudge = check_identity_unpersonalized(&cfg, None)
+            .expect("must fire when IDENTITY.md is missing");
+        assert!(nudge.contains("IDENTITY.md"));
+    }
+
+    #[test]
+    fn identity_unpersonalized_fires_on_raw_template() {
+        let _g = EnvGuard::clear_native_with_isolated_data_dir();
+        let template = include_str!("../../interface/templates/IDENTITY.md");
+        cortex::identity::save_identity(template).expect("write template");
+        let cfg = Config::default();
+        assert!(check_identity_unpersonalized(&cfg, None).is_some());
+    }
+
+    #[test]
+    fn identity_unpersonalized_silent_when_personalized() {
+        let _g = EnvGuard::clear_native_with_isolated_data_dir();
+        cortex::identity::save_identity(
+            "# Borg\n\nYou are Borg, an AI personal assistant belonging to Mike.\n\n## Personality\nWry, direct.\n\n## Communication Style\nTerse.\n\n## What Matters\nShipping.\n",
+        )
+        .expect("write filled");
+        let cfg = Config::default();
+        assert!(check_identity_unpersonalized(&cfg, None).is_none());
+    }
+
+    // ── gateway_unrecoverable augmenter tests ──
+
+    #[test]
+    fn gateway_silent_without_db() {
+        let cfg = Config::default();
+        assert!(check_gateway_unrecoverable(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn gateway_silent_when_meta_unset() {
+        let cfg = Config::default();
+        let db = in_memory_db();
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn gateway_silent_within_one_hour_grace() {
+        // The grace window is the whole point of layering this augmenter
+        // *behind* the daily 02:00 self-healing pass — without it, the
+        // augmenter would race maintenance and nag during the recovery
+        // attempt itself.
+        let cfg = Config::default();
+        let db = in_memory_db();
+        let now = unix_now() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &(now - 30).to_string())
+            .unwrap();
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn gateway_fires_after_grace() {
+        let cfg = Config::default();
+        let db = in_memory_db();
+        let now = unix_now() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(
+            GATEWAY_UNRECOVERABLE_AT_KEY,
+            &(now - 2 * 60 * 60).to_string(),
+        )
+        .unwrap();
+        let nudge =
+            check_gateway_unrecoverable(&cfg, Some(&db)).expect("must fire after grace elapsed");
+        // Directive must mention the log path + restart command — those
+        // are the user's actual escape hatches when chat is one-way.
+        assert!(nudge.contains("daemon.err"), "missing log path: {nudge}");
+        assert!(nudge.contains("restart"), "missing restart hint: {nudge}");
+        assert!(
+            nudge.contains("outbound"),
+            "must explain the channel asymmetry: {nudge}"
+        );
+    }
+
+    #[test]
+    fn gateway_silent_when_flag_cleared() {
+        // A successful recovery clears the flag — the augmenter must
+        // observe this immediately, even if `_at` is still set.
+        let cfg = Config::default();
+        let db = in_memory_db();
+        let now = unix_now() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "0").unwrap();
+        db.set_meta(
+            GATEWAY_UNRECOVERABLE_AT_KEY,
+            &(now - 2 * 60 * 60).to_string(),
+        )
+        .unwrap();
+        assert!(check_gateway_unrecoverable(&cfg, Some(&db)).is_none());
+    }
+
+    #[test]
+    fn gateway_collect_respects_cooldown() {
+        let _guard = EnvGuard::clear_native();
+        let mut cfg = Config::default();
+        cfg.security.host_audit = false;
+        if cfg.has_any_native_channel() {
+            return;
+        }
+        let db = in_memory_db();
+        let now = unix_now() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(
+            GATEWAY_UNRECOVERABLE_AT_KEY,
+            &(now - 2 * 60 * 60).to_string(),
+        )
+        .unwrap();
+        let first = collect(&cfg, Some(&db));
+        assert!(
+            first.iter().any(|s| s.contains("Gateway")),
+            "first tick should include gateway nudge: {first:?}"
+        );
+        let second = collect(&cfg, Some(&db));
+        assert!(
+            !second.iter().any(|s| s.contains("Gateway")),
+            "cooldown should suppress on second tick: {second:?}"
+        );
+    }
+
+    #[test]
+    fn session_start_includes_identity_nudge() {
+        // Opening the TUI with no IDENTITY.md should prompt the user to
+        // personalize — that's how new users discover the flow.
+        let _g = EnvGuard::clear_native_with_isolated_data_dir();
+        let cfg = Config::default();
+        let nudges = collect_session_start(&cfg, None);
+        assert!(
+            nudges.iter().any(|n| n.contains("IDENTITY.md")),
+            "expected identity nudge in session-start, got: {nudges:?}"
+        );
+    }
+
+    #[test]
+    fn session_start_excludes_budget_and_gateway_nudges() {
+        // The session-start subset must stay focused — the heavy
+        // operational nudges only fire on scheduled ticks.
+        let _g = EnvGuard::clear_native_with_isolated_data_dir();
+        let mut cfg = budget_only_config(1000);
+        cfg.security.host_audit = false;
+        let db = in_memory_db();
+        db.log_token_usage(800, 0, 800, "openai", "gpt-4o", None)
+            .unwrap();
+        let now = unix_now() as i64;
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(
+            GATEWAY_UNRECOVERABLE_AT_KEY,
+            &(now - 2 * 60 * 60).to_string(),
+        )
+        .unwrap();
+        let nudges = collect_session_start(&cfg, Some(&db));
+        assert!(
+            nudges
+                .iter()
+                .all(|n| !n.contains("75%") && !n.contains("Gateway")),
+            "session-start must exclude budget/gateway, got: {nudges:?}"
+        );
     }
 }

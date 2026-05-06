@@ -103,6 +103,28 @@ impl Database {
         Ok(cost)
     }
 
+    /// Bucket the current month's token usage against `limit` into the
+    /// nearest crossed warning threshold: `Some(75)`, `Some(90)`, or
+    /// `Some(100)`. Returns `None` when `limit` is `0` (unlimited) or
+    /// usage is below 75%. Numbers are pre-bucketed so the heartbeat
+    /// `budget_threshold` augmenter can't fabricate intermediate values.
+    pub fn monthly_budget_pct(&self, limit: u64) -> Result<Option<u8>> {
+        if limit == 0 {
+            return Ok(None);
+        }
+        let total = self.monthly_token_total()?;
+        let pct = (total as f64) / (limit as f64) * 100.0;
+        Ok(if pct >= 100.0 {
+            Some(100)
+        } else if pct >= 90.0 {
+            Some(90)
+        } else if pct >= 75.0 {
+            Some(75)
+        } else {
+            None
+        })
+    }
+
     #[instrument(skip_all)]
     pub fn monthly_usage_by_model(&self) -> Result<Vec<ModelUsageRow>> {
         let start_ts = Self::month_start_ts()?;

@@ -6,6 +6,17 @@ use crate::config::Config;
 
 const DEFAULT_IDENTITY: &str = "You are Borg, a personal AI assistant.\n";
 
+/// Tokens that indicate IDENTITY.md is still on the unfilled scaffold —
+/// either the raw template placeholders or any of its instructional
+/// HTML comments.
+const TEMPLATE_MARKERS: &[&str] = &[
+    "{agent_name}",
+    "{owner_name}",
+    "<!-- Develop this during your first conversation",
+    "<!-- Define this based on what works for",
+    "<!-- What does",
+];
+
 pub fn identity_path() -> Result<PathBuf> {
     Config::identity_path()
 }
@@ -38,6 +49,35 @@ pub fn load_identity_with_override(override_path: Option<&std::path::Path>) -> R
         );
         Ok(DEFAULT_IDENTITY.to_string())
     }
+}
+
+/// True when IDENTITY.md exists, isn't the bare default, and has no
+/// remaining template scaffold markers. Used by the heartbeat
+/// `identity_unpersonalized` augmenter to decide whether to nudge the
+/// user to personalize.
+pub fn is_personalized() -> bool {
+    let path = match identity_path() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    is_personalized_content(&content)
+}
+
+/// Pure form of [`is_personalized`] — exposed so the augmenter and unit
+/// tests can check arbitrary content without touching the filesystem.
+pub fn is_personalized_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed == DEFAULT_IDENTITY.trim() {
+        return false;
+    }
+    !TEMPLATE_MARKERS.iter().any(|m| content.contains(m))
 }
 
 pub fn save_identity(content: &str) -> Result<()> {
@@ -132,6 +172,47 @@ mod tests {
         std::fs::write(tmp.path(), "").unwrap();
         let loaded = load_identity_with_override(Some(tmp.path())).unwrap();
         assert_eq!(loaded, "");
+    }
+
+    #[test]
+    fn is_personalized_content_rejects_empty() {
+        assert!(!is_personalized_content(""));
+        assert!(!is_personalized_content("   \n\t  "));
+    }
+
+    #[test]
+    fn is_personalized_content_rejects_default_identity() {
+        assert!(!is_personalized_content(DEFAULT_IDENTITY));
+        assert!(!is_personalized_content(
+            "  You are Borg, a personal AI assistant.  \n"
+        ));
+    }
+
+    #[test]
+    fn is_personalized_content_rejects_raw_template() {
+        let template = include_str!("../../interface/templates/IDENTITY.md");
+        assert!(
+            !is_personalized_content(template),
+            "raw template should not count as personalized"
+        );
+    }
+
+    #[test]
+    fn is_personalized_content_rejects_partially_filled_template() {
+        // Names substituted but scaffold comments still present — common
+        // half-finished state where the file was scaffolded but the user
+        // never edited the sections.
+        let half = "# Borg\n\nYou are Borg, an AI personal assistant belonging to Mike.\n\n## Personality\n<!-- Develop this during your first conversation. Be specific about who you are. -->\n";
+        assert!(!is_personalized_content(half));
+    }
+
+    #[test]
+    fn is_personalized_content_accepts_filled_identity() {
+        let filled = "# Borg\n\nYou are Borg, an AI personal assistant belonging to Mike.\n\n## Personality\nWry, direct, and a little impatient with hand-waving.\n\n## Communication Style\nShort sentences. No emoji unless asked.\n\n## What Matters\nMike ships fast and hates churn — bias toward small reversible changes.\n";
+        assert!(
+            is_personalized_content(filled),
+            "fully filled identity should be personalized"
+        );
     }
 
     #[test]

@@ -114,3 +114,74 @@ Each heartbeat sends the agent's personality (IDENTITY.md), memory context, HEAR
 - Share something useful, timely, or caring if appropriate
 - Respond with an empty message if there's nothing meaningful to say
 - Keep it brief -- one or two sentences max
+
+## Proactive nudges (augmenters)
+
+Beyond the base prompt, every heartbeat tick runs a list of *augmenter*
+checks. Each check inspects current state (config, DB, files); when its
+condition is true it appends a directive to the heartbeat user message
+inside a `<proactive_nudges>` block. The agent rewrites the directive in
+its own voice. Each augmenter is rate-limited via the `meta` table.
+
+Source: `crates/borgd/src/heartbeat_augmenters.rs`.
+
+| ID | Cooldown | Fires when | Source of truth |
+|---|---|---|---|
+| `no_channels_configured` | 24h | No native messaging channel set up | Config |
+| `critical_host_security` | 48h | `borg doctor` host checks fail (firewall, risky ports, SSH config) | `host_audit` |
+| `task_health` | 6h | Tasks carry `last_error` or there are failed task_runs in the last 24h | DB: `scheduled_tasks`, `task_runs` |
+| `budget_threshold` | 6h | Monthly token usage crosses 75 / 90 / 100% (each bucket fires once per month) | DB: `token_usage` + `budget.monthly_token_limit` |
+| `identity_unpersonalized` | 7d | `~/.borg/IDENTITY.md` is missing, equals the bare default, or still contains template placeholders | File |
+| `gateway_unrecoverable` | 24h | Orchestrator supervisor abandoned the gateway after `GATEWAY_MAX_CRASH_RESPAWNS` AND the daily self-healing recovery probe couldn't bring it back | DB: `meta.gateway_unrecoverable` |
+
+Session-start greetings only run a focused subset — currently
+`no_channels_configured` and `identity_unpersonalized` — so opening the
+TUI nudges the user toward setup without dumping every operational
+warning at once.
+
+### Adding a new augmenter
+
+Append one entry to `AUGMENTERS` in
+`crates/borgd/src/heartbeat_augmenters.rs` — the module-level docs walk
+through the full pattern. Future ideas worth considering:
+
+- `prompt_cache_hit_rate_low` — Anthropic cache hit rate degrading.
+- `memory_index_stale` — `global/INDEX` last-rebuilt timestamp older
+  than N days.
+- `disk_space_low` — `~/.borg/` partition under 10% free.
+- `daemon_restart_loop` — daemon respawned more than N times in the
+  last hour.
+
+### Exceptions and TODOs
+
+- **`request_user_input` is multiple-choice only** (max 3 questions,
+  2-4 options each, with a UI-appended "Other" + Tab notes field for
+  free text). Open-ended questions need to be asked conversationally
+  in chat *after* the structured batch. The `identity_unpersonalized`
+  nudge uses this hybrid pattern — see the directive in
+  `heartbeat_augmenters.rs`.
+- **`gateway_unrecoverable` depends on a 1-hour grace period** so the
+  augmenter doesn't race the daily 02:00 maintenance pass. Three
+  layers of defense, in order:
+  1. Orchestrator's respawn supervisor — up to
+     `GATEWAY_MAX_CRASH_RESPAWNS` restarts with exponential backoff
+     (`crates/borgd/src/orchestrator.rs`). On abandonment it writes
+     `meta.gateway_unrecoverable=1` plus a timestamp.
+  2. Daily maintenance probes the configured listen address; if the
+     gateway is now answering, the flag clears (covers the "user
+     restarted the daemon" case). Source:
+     `cortex::maintenance::recover_gateway_if_abandoned`.
+  3. Heartbeat augmenter — last resort. Outbound channel sends still
+     work (native SDKs bypass the gateway), so the nudge reaches
+     channels too; inbound webhooks are dead, which is exactly what
+     the user needs to be told. If you change the maintenance schedule
+     also revisit the grace window.
+- **`budget_threshold` layers on top of `budget.warning_threshold`**
+  (the existing `BudgetEngine` hook in `crates/cortex/src/budgets/`).
+  Both can fire when monthly usage crosses a threshold; the heartbeat
+  one is conversational, the engine one is a system event. Each
+  threshold (75 / 90 / 100) fires at most once per calendar month —
+  the per-month meta key is
+  `heartbeat_budget_last_bucket_{YYYY-MM}`. Re-firing for a *higher*
+  threshold inside the same month is allowed (you'll hear about 75 →
+  90 → 100), but the same bucket will not repeat.

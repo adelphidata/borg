@@ -157,6 +157,44 @@ fn monthly_total_cost_sums_correctly() {
 }
 
 #[test]
+fn monthly_budget_pct_unlimited_limit_returns_none() {
+    let db = test_db();
+    db.log_token_usage(1_000_000, 0, 1_000_000, "openai", "gpt-4o", None)
+        .expect("log");
+    assert_eq!(db.monthly_budget_pct(0).expect("pct"), None);
+}
+
+#[test]
+fn monthly_budget_pct_below_75_returns_none() {
+    let db = test_db();
+    db.log_token_usage(700, 0, 700, "openai", "gpt-4o", None)
+        .expect("log");
+    assert_eq!(db.monthly_budget_pct(1000).expect("pct"), None);
+}
+
+#[test]
+fn monthly_budget_pct_buckets_at_each_threshold() {
+    // Use a fresh db per case so prior usage doesn't bleed across asserts.
+    for (used, expected) in [
+        (750_u64, Some(75)),
+        (899, Some(75)),
+        (900, Some(90)),
+        (999, Some(90)),
+        (1_000, Some(100)),
+        (5_000, Some(100)),
+    ] {
+        let db = test_db();
+        db.log_token_usage(used, 0, used, "openai", "gpt-4o", None)
+            .expect("log");
+        assert_eq!(
+            db.monthly_budget_pct(1000).expect("pct"),
+            expected,
+            "used={used}"
+        );
+    }
+}
+
+#[test]
 fn old_rows_without_provider_handled() {
     let db = test_db();
     // Simulate legacy row with no provider/model/cost

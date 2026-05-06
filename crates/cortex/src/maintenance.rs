@@ -267,6 +267,26 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
         Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
     }
 
+    // 5a. Gateway recovery probe. The orchestrator's respawn supervisor
+    //     gives up after `GATEWAY_MAX_CRASH_RESPAWNS` and writes
+    //     `gateway_unrecoverable=1` to the meta table. The heartbeat
+    //     `gateway_unrecoverable` augmenter then nudges the user — but
+    //     that nudge is the *backup* path; this step is the
+    //     self-healing path that runs first.
+    //
+    //     Recovery action here is intentionally narrow: probe the
+    //     configured listen address. If something now answers — daemon
+    //     was restarted, port was freed, an upstream crash cleared —
+    //     clear the flag so subsequent heartbeats stop nagging. We
+    //     don't try to re-spawn the supervisor task from sync code
+    //     (that requires runtime/orchestrator handles we don't have
+    //     here); a clean daemon restart is still required for true
+    //     recovery, but this stops the alert from being a permanent
+    //     scar after the user already fixed the underlying issue.
+    if let Err(e) = recover_gateway_if_abandoned(db, config) {
+        tracing::warn!("maintenance: gateway recovery probe failed: {e}");
+    }
+
     // 6. Run bounded auto-remediations exactly once per remediation key.
     let mut repair_execution = RepairExecution::default();
     let grouped = group_issues_by_remediation(&initial_issues);
@@ -540,6 +560,54 @@ fn prune_log_files(dir: &Path, cutoff: i64) -> Result<usize> {
 /// KEK file's parent on multi-user hosts. `FileKekStore` owns that path.
 const ENSURED_SUBDIRS: &[&str] = &["channels", "skills", "hooks", "backups", "logs"];
 
+/// Meta key set by the gateway respawn supervisor when it abandons after
+/// `GATEWAY_MAX_CRASH_RESPAWNS`. Mirrors the constants used by the
+/// heartbeat augmenter — kept here as a string literal so cortex doesn't
+/// need to depend on borgd.
+const GATEWAY_UNRECOVERABLE_KEY: &str = "gateway_unrecoverable";
+const GATEWAY_UNRECOVERABLE_AT_KEY: &str = "gateway_unrecoverable_at";
+
+/// Probe the configured gateway listen address. If it's reachable, the
+/// gateway must have come back (daemon restart, port freed, upstream
+/// crash cleared) — clear the abandonment flag so the heartbeat
+/// augmenter stops nudging. Leaves the flag intact when the probe
+/// fails.
+///
+/// Note: this does NOT re-spawn the supervisor task. That requires
+/// orchestrator/runtime handles we don't have in sync maintenance code,
+/// and a clean daemon restart is the deterministic recovery path.
+/// What this step *does* solve is the case where the user fixed the
+/// underlying problem (port conflict, OOM, etc.) and restarted —
+/// without it, the augmenter would keep nagging until someone
+/// hand-cleared the meta key.
+pub fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()> {
+    let flag = db.get_meta(GATEWAY_UNRECOVERABLE_KEY).ok().flatten();
+    if flag.as_deref() != Some("1") {
+        return Ok(());
+    }
+    let addr = format!("{}:{}", config.gateway.host, config.gateway.port);
+    let socket_addr: std::net::SocketAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("recover_gateway_if_abandoned: bad listen addr {addr}: {e}");
+            return Ok(());
+        }
+    };
+    let probe =
+        std::net::TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_millis(500));
+    match probe {
+        Ok(_) => {
+            tracing::info!("gateway probe at {addr} succeeded — clearing unrecoverable flag");
+            db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "0")?;
+            db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "0")?;
+        }
+        Err(e) => {
+            tracing::debug!("gateway probe at {addr} still failing: {e}");
+        }
+    }
+    Ok(())
+}
+
 /// Idempotently create the runtime subdirectories under `data_dir`. Public
 /// so the daemon can call this on startup as well as the daily sweep —
 /// either path produces the same end state.
@@ -740,6 +808,65 @@ fn repair_embedding_backlog(db: &Database, config: &Config) -> Result<EmbeddingR
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn recover_gateway_silent_when_flag_not_set() {
+        let db = Database::test_db();
+        let cfg = Config::default();
+        // Flag absent → no-op, no error.
+        recover_gateway_if_abandoned(&db, &cfg).expect("noop");
+        assert!(db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().is_none());
+    }
+
+    #[test]
+    fn recover_gateway_leaves_flag_when_probe_fails() {
+        let db = Database::test_db();
+        let mut cfg = Config::default();
+        // Point at a port that nobody could possibly be listening on.
+        cfg.gateway.host = "127.0.0.1".into();
+        cfg.gateway.port = 1; // privileged + universally closed in tests
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "1234567890")
+            .unwrap();
+        recover_gateway_if_abandoned(&db, &cfg).expect("probe");
+        // Flag must remain — no false recovery.
+        assert_eq!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
+            Some("1"),
+            "failed probe must leave the flag set"
+        );
+    }
+
+    #[test]
+    fn recover_gateway_clears_flag_when_probe_succeeds() {
+        // Bind a temporary listener on an OS-chosen port, then point the
+        // config at it. The probe succeeds → flag clears. This exercises
+        // the actual TCP-connect path rather than mocking it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let db = Database::test_db();
+        let mut cfg = Config::default();
+        cfg.gateway.host = addr.ip().to_string();
+        cfg.gateway.port = addr.port();
+        db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1").unwrap();
+        db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, "1234567890")
+            .unwrap();
+
+        recover_gateway_if_abandoned(&db, &cfg).expect("probe");
+
+        assert_eq!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_KEY).unwrap().as_deref(),
+            Some("0"),
+            "successful probe must clear the flag"
+        );
+        assert_eq!(
+            db.get_meta(GATEWAY_UNRECOVERABLE_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("0"),
+            "successful probe must zero the timestamp"
+        );
+    }
 
     #[test]
     fn ensure_data_subdirs_creates_missing_dirs_and_is_idempotent() {

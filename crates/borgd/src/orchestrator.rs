@@ -49,6 +49,33 @@ fn spawn_gateway(
     })
 }
 
+/// Persist the "gateway is unrecoverable" sentinel after the respawn
+/// supervisor abandons the gateway. The heartbeat
+/// `gateway_unrecoverable` augmenter and the maintenance recovery step
+/// both read this. Best-effort — if the DB can't be opened we still
+/// shut down the supervisor (the alternative is a noisy crash that
+/// hides the underlying gateway failure).
+fn mark_gateway_unrecoverable() {
+    use crate::heartbeat_augmenters::{GATEWAY_UNRECOVERABLE_AT_KEY, GATEWAY_UNRECOVERABLE_KEY};
+    let db = match cortex::db::Database::open() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("mark_gateway_unrecoverable: failed to open db: {e}");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_KEY, "1") {
+        tracing::warn!("mark_gateway_unrecoverable: failed to set flag: {e}");
+    }
+    if let Err(e) = db.set_meta(GATEWAY_UNRECOVERABLE_AT_KEY, &now.to_string()) {
+        tracing::warn!("mark_gateway_unrecoverable: failed to set timestamp: {e}");
+    }
+}
+
 /// Result of [`start`] — handles the caller needs to query/wire the live tasks.
 pub struct OrchestratorHandles {
     /// Bus subscribers read for `Admin.SubscribeHeartbeatEvents`.
@@ -116,6 +143,7 @@ pub fn start(
             tracing::warn!("Gateway exited unexpectedly: {result:?}; respawning ({crash_count})");
             if crash_count >= GATEWAY_MAX_CRASH_RESPAWNS {
                 tracing::error!("Gateway crashed {crash_count} times, abandoning respawn");
+                mark_gateway_unrecoverable();
                 return;
             }
             let delay = GATEWAY_RESPAWN_BASE_DELAY * (1 << crash_count.min(4));
