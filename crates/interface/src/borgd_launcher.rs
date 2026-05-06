@@ -276,7 +276,23 @@ pub async fn service_status() -> Result<()> {
         println!("Service status: running");
         if let Ok(mut client) = daemon_client::connect(None).await {
             match client.get_daemon_status().await {
-                Ok(status) => println!("{status:?}"),
+                Ok(status) => {
+                    // Explicit field render: avoids `{:?}` on a tonic-generated
+                    // struct so future fields don't leak by default if the
+                    // proto grows secret-bearing entries.
+                    println!("  version:           {}", status.version);
+                    println!("  uptime:            {}s", status.uptime_secs);
+                    println!("  live sessions:     {}", status.live_session_count);
+                    println!(
+                        "  llm:               {} / {}",
+                        status.llm_provider, status.llm_model
+                    );
+                    println!(
+                        "  tasks:             {} active, {} paused",
+                        status.active_tasks, status.paused_tasks
+                    );
+                    println!("  pending pairings:  {}", status.pending_pairings);
+                }
                 Err(e) => tracing::warn!("get_daemon_status failed: {e}"),
             }
         }

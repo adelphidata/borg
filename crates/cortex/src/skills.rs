@@ -756,7 +756,7 @@ pub fn load_skills_context(
         let meta = skill.format_at_level(SkillLoadLevel::Metadata);
         let tokens = estimate_tokens(&meta);
         if estimated_tokens.saturating_add(tokens) > max_tokens {
-            debug!(
+            trace!(
                 "Skipping skill '{}' entirely — metadata exceeds budget",
                 skill.manifest.name
             );
@@ -799,7 +799,7 @@ pub fn load_skills_context(
         let additional = full_tokens.saturating_sub(meta_tokens);
 
         if estimated_tokens + additional > max_tokens {
-            debug!(
+            trace!(
                 "Skipping full body for skill '{}' (would exceed token budget)",
                 skill.manifest.name
             );
@@ -808,7 +808,7 @@ pub fn load_skills_context(
         }
 
         estimated_tokens += additional;
-        debug!(
+        trace!(
             "Included full skill '{}' ({full_tokens} estimated tokens)",
             skill.manifest.name
         );
@@ -824,6 +824,19 @@ pub fn load_skills_context(
         .collect();
 
     report.used_tokens = estimated_tokens;
+
+    // Single per-turn summary in place of the previous per-skill spam.
+    let metadata_only = parts.len().saturating_sub(full_overrides.len());
+    debug!(
+        loaded = parts.len(),
+        full = full_overrides.len(),
+        metadata_only,
+        dropped_full = ?report.dropped_full_body,
+        omitted = ?report.omitted_entirely,
+        used_tokens = estimated_tokens,
+        budget_tokens = max_tokens,
+        "skills context built"
+    );
 
     let rendered = if parts.is_empty() {
         String::new()

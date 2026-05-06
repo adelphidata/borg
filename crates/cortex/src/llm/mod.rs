@@ -827,7 +827,7 @@ impl LlmClient {
                 self.llm_config.model
             );
             if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
-                tracing::debug!("llm: stream receiver closed while sending tool-support error");
+                tracing::trace!("llm: stream receiver closed while sending tool-support error");
             }
             anyhow::bail!("{msg}");
         }
@@ -844,7 +844,7 @@ impl LlmClient {
             for attempt in 0..=max_retries {
                 if cancel.is_cancelled() {
                     if tx.send(StreamEvent::Done).await.is_err() {
-                        tracing::debug!("llm: stream receiver closed");
+                        tracing::trace!("llm: stream receiver closed");
                     }
                     return Ok(());
                 }
@@ -894,7 +894,7 @@ impl LlmClient {
                             // No more providers — propagate error
                             let msg = format!("{e}");
                             if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
-                                tracing::debug!("llm: stream receiver closed while sending error");
+                                tracing::trace!("llm: stream receiver closed while sending error");
                             }
                             bail!("{msg}");
                         }
@@ -925,7 +925,7 @@ impl LlmClient {
                         tokio::select! {
                             _ = cancel.cancelled() => {
                                 if tx.send(StreamEvent::Done).await.is_err() {
-                                    tracing::debug!("llm: stream receiver closed");
+                                    tracing::trace!("llm: stream receiver closed");
                                 }
                                 return Ok(());
                             }
@@ -945,7 +945,7 @@ impl LlmClient {
             "All LLM providers exhausted. Please try again later or check your configuration."
                 .to_string();
         if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
-            tracing::debug!("llm: stream receiver closed while sending exhaustion error");
+            tracing::trace!("llm: stream receiver closed while sending exhaustion error");
         }
         bail!("{msg}")
     }

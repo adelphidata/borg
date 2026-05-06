@@ -7,7 +7,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{info_span, instrument, trace, warn, Instrument};
+use tracing::{debug, info_span, instrument, trace, warn, Instrument};
 
 use crate::config::Config;
 use crate::constants;
@@ -1120,7 +1120,10 @@ impl Agent {
             match crate::embeddings::generate_query_embedding(&self.config, &query).await {
                 Ok(result) => result,
                 Err(e) => {
-                    tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
+                    // The "no embedding provider" case is logged once at
+                    // embeddings.rs startup; this site fires per build_system_prompt
+                    // (every turn). Demote to TRACE to keep DEBUG signal-to-noise high.
+                    tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
                     return load_memory_context_db_scoped(&self.config, max_tokens);
                 }
             };
@@ -1139,7 +1142,7 @@ impl Agent {
             Ok(Ok(r)) if !r.is_empty() => r,
             Ok(Ok(_)) => return load_memory_context_db_scoped(&self.config, max_tokens),
             Ok(Err(e)) => {
-                tracing::debug!("Semantic ranking failed, falling back to recency: {e}");
+                tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
                 return load_memory_context_db_scoped(&self.config, max_tokens);
             }
             Err(e) => {
@@ -1897,11 +1900,42 @@ Rules:
                     (priced, Some(row.effective_at))
                 }
                 Ok(None) => {
-                    warn!(
-                        "No rate card for {provider_id}/{}; skipping budget reconcile \
-                         (token usage still logged). Cost estimate from legacy table: {:?}",
-                        usage.model, cost
-                    );
+                    // Per-turn warning was a major contributor to log spam for
+                    // any session on a model without a rate card. Promote to
+                    // WARN once per (provider, model); otherwise stay at DEBUG.
+                    // Cap the dedupe set so a misbehaving provider returning a
+                    // fresh `usage.model` per turn can't grow it without bound.
+                    const MAX_TRACKED: usize = 1024;
+                    static WARNED: std::sync::OnceLock<
+                        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+                    > = std::sync::OnceLock::new();
+                    let key = (provider_id.clone(), usage.model.clone());
+                    let first_time = WARNED
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+                        .lock()
+                        .map(|mut set| {
+                            if set.len() >= MAX_TRACKED {
+                                false
+                            } else {
+                                set.insert(key.clone())
+                            }
+                        })
+                        .unwrap_or(false);
+                    if first_time {
+                        warn!(
+                            provider = %provider_id,
+                            model = %usage.model,
+                            legacy_cost_estimate = ?cost,
+                            "No rate card for provider/model; skipping budget reconcile \
+                             (token usage still logged). Subsequent occurrences are silent."
+                        );
+                    } else {
+                        tracing::debug!(
+                            provider = %provider_id,
+                            model = %usage.model,
+                            "No rate card; skipping budget reconcile"
+                        );
+                    }
                     return;
                 }
                 Err(e) => {
@@ -2006,7 +2040,10 @@ Rules:
             if rx.has_changed().unwrap_or(false) {
                 let new_config = rx.borrow_and_update().clone();
                 info_span!("config_reload").in_scope(|| {
-                    warn!("Config reloaded from disk");
+                    // Routine event, not an error condition — DEBUG is the
+                    // right level. WARN here used to fire on the first turn of
+                    // every session and looked like a real warning to operators.
+                    debug!("Config reloaded from disk");
                 });
                 self.reload_config(new_config);
             }

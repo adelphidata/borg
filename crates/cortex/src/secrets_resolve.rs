@@ -76,7 +76,12 @@ fn validate_file_path(expanded: &str) -> Result<std::path::PathBuf> {
 
 /// A reference to a secret value that can be resolved at runtime.
 /// Supports multiple backends: environment variables, files, and external commands.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-rolled (see below) — `Exec.args` can plausibly contain a
+/// raw passphrase if a user wires `pass`/`bw`/`security` with inline tokens,
+/// and `File.path` can leak filesystem layout. The masked impl prints only
+/// the variant tag plus a coarse identifier so `{:?}` is safe in logs.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "source")]
 pub enum SecretRef {
     /// Read from an environment variable.
@@ -102,6 +107,22 @@ pub enum SecretRef {
     /// Look up a credential in the OS keychain (macOS Keychain / Linux secret-tool).
     #[serde(rename = "keychain")]
     Keychain { service: String, account: String },
+}
+
+impl std::fmt::Debug for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecretRef::Env { var } => write!(f, "SecretRef::Env({var})"),
+            SecretRef::File { .. } => write!(f, "SecretRef::File(<redacted path>)"),
+            SecretRef::Exec { command, .. } => {
+                // Show the command bin only — args may contain a passphrase.
+                write!(f, "SecretRef::Exec({command} <redacted args>)")
+            }
+            SecretRef::Keychain { service, account } => {
+                write!(f, "SecretRef::Keychain({service}/{account})")
+            }
+        }
+    }
 }
 
 /// Build a keychain secret reference using Borg's canonical service/account
@@ -257,6 +278,30 @@ pub fn resolve_first(refs: &[SecretRef]) -> Result<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_exec_args_and_file_path() {
+        // Exec.args can carry a raw passphrase; File.path can leak FS layout.
+        // Both must be masked when SecretRef is Debug-formatted (e.g. into
+        // a tracing! macro by accident).
+        let sr_exec = SecretRef::Exec {
+            command: "pass".into(),
+            args: vec!["my-secret-passphrase-DO-NOT-LEAK".into()],
+        };
+        let dbg = format!("{sr_exec:?}");
+        assert!(
+            !dbg.contains("my-secret-passphrase"),
+            "Exec args leaked: {dbg}"
+        );
+        assert!(dbg.contains("redacted"), "expected marker: {dbg}");
+
+        let sr_file = SecretRef::File {
+            path: "/Users/leakme/.borg/secrets/key.txt".into(),
+            key: None,
+        };
+        let dbg = format!("{sr_file:?}");
+        assert!(!dbg.contains("/Users/leakme"), "File path leaked: {dbg}");
+    }
 
     #[test]
     fn humanize_keychain_not_found_adds_remediation_hint() {

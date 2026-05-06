@@ -1,8 +1,58 @@
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::SystemTime;
 use tracing::debug;
 
 use crate::config::Config;
+
+/// Per-path cache of the last-logged mtime so `load_identity` only emits a
+/// log line on first load or when the file actually changes — it was firing
+/// every turn from `build_system_prompt`.
+static LOAD_LOG_CACHE: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<PathBuf, Option<SystemTime>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn should_log_load(path: &std::path::Path, mtime: Option<SystemTime>) -> bool {
+    // Recover from a poisoned mutex — the only state inside is a HashMap of
+    // mtimes; nothing about a panicked insert leaves it inconsistent. A
+    // poisoned-and-discarded lock would silently disable identity-load logs
+    // for the rest of the process, which is a surprising failure mode.
+    let mut cache = LOAD_LOG_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match cache.get(path) {
+        Some(prev) if *prev == mtime => false,
+        _ => {
+            cache.insert(path.to_path_buf(), mtime);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_cache_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn should_log_load_dedupes_on_same_path_and_mtime() {
+        let path = std::path::PathBuf::from("/tmp/borg-identity-test-fixture-1");
+        let t = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        assert!(should_log_load(&path, t), "first call must log");
+        assert!(!should_log_load(&path, t), "same mtime must not re-log");
+    }
+
+    #[test]
+    fn should_log_load_relogs_on_mtime_change() {
+        let path = std::path::PathBuf::from("/tmp/borg-identity-test-fixture-2");
+        let t1 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+        let t2 = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_001));
+        assert!(should_log_load(&path, t1), "first call must log");
+        assert!(should_log_load(&path, t2), "mtime change must log");
+        assert!(!should_log_load(&path, t2), "stable mtime suppresses again");
+    }
+}
 
 const DEFAULT_IDENTITY: &str = "You are Borg, a personal AI assistant.\n";
 
@@ -35,18 +85,25 @@ pub fn load_identity_with_override(override_path: Option<&std::path::Path>) -> R
     };
 
     if path.exists() {
+        let mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
         let content = std::fs::read_to_string(&path)?;
-        debug!(
-            "Loaded identity from {} ({} bytes)",
-            path.display(),
-            content.len()
-        );
+        if should_log_load(&path, mtime) {
+            debug!(
+                "Loaded identity from {} ({} bytes)",
+                path.display(),
+                content.len()
+            );
+        }
         Ok(content)
     } else {
-        debug!(
-            "No identity file found at {}, using default",
-            path.display()
-        );
+        if should_log_load(&path, None) {
+            debug!(
+                "No identity file found at {}, using default",
+                path.display()
+            );
+        }
         Ok(DEFAULT_IDENTITY.to_string())
     }
 }

@@ -237,7 +237,9 @@ fn persist_resolved_backend(db: &Database, backend: KekBackend) {
         }
         Ok(_) => {}
         Err(e) => {
-            tracing::warn!("read security.kek_backend before persist failed: {e}");
+            // Init race on first daemon start (settings table not yet seeded).
+            // Caller falls through to a write attempt; not operator-actionable.
+            tracing::debug!("read security.kek_backend before persist failed: {e}");
             return;
         }
     }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::sync::{mpsc, RwLock};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
@@ -395,7 +395,9 @@ async fn resolve_session_and_commands(
             None,
             Some(&session_id),
         ) {
-            warn!("Failed to log /cancel response: {e}");
+            // Secondary logging failure (the response itself succeeded).
+            // DEBUG keeps daemon.log clean on flaky DB locks.
+            debug!("Failed to log /cancel response: {e}");
         }
         return Ok(SessionResolution {
             db,
@@ -428,7 +430,7 @@ async fn resolve_session_and_commands(
             None,
             Some(&session_id),
         ) {
-            warn!("Failed to log /poke response: {e}");
+            debug!("Failed to log /poke response: {e}");
         }
         return Ok(SessionResolution {
             db,
@@ -456,7 +458,7 @@ async fn resolve_session_and_commands(
             None,
             Some(&session_id),
         ) {
-            warn!("Failed to log /dream response: {e}");
+            debug!("Failed to log /dream response: {e}");
         }
         return Ok(SessionResolution {
             db,
@@ -484,7 +486,7 @@ async fn resolve_session_and_commands(
             None,
             Some(&session_id),
         ) {
-            warn!("Failed to log command response: {e}");
+            debug!("Failed to log command response: {e}");
         }
         return Ok(SessionResolution {
             db,
@@ -706,7 +708,9 @@ async fn collect_agent_response(
                         }
                     }
                     AgentEvent::ShellConfirmation { respond, command } => {
-                        warn!("Auto-denying shell confirmation in gateway mode: {command}");
+                        // Audit-trail event, not an error condition. INFO so it's
+                        // visible without `RUST_LOG=warn` flagging it as a problem.
+                        info!(channel = %channel_name, command = %command, "auto-denying shell confirmation in gateway mode");
                         response_text
                             .push_str("\n[Operation denied: shell command requires confirmation]");
                         if respond.send(false).is_err() {

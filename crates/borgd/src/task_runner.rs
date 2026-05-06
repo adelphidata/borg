@@ -76,7 +76,9 @@ pub async fn spawn_task_execution(
         let _permit = match semaphore.acquire_owned().await {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!("Task '{task_name}': failed to acquire semaphore: {e}");
+                // Normal backpressure when concurrency cap is hit. Supervisor
+                // and scheduler tick will retry — not a WARN-level event.
+                tracing::debug!(task = %task_name, error = %e, "failed to acquire semaphore");
                 return;
             }
         };
@@ -137,7 +139,9 @@ pub async fn spawn_task_execution(
                 .map(String::as_str)
                 .or_else(|| panic_err.downcast_ref::<&str>().copied())
                 .unwrap_or("unknown panic");
-            tracing::error!("Task '{task_name}' panicked: {panic_msg}");
+            // Supervisor restarts the task on next tick; downgrade ERROR→WARN
+            // (recoverable) and surface task_name as a structured field.
+            tracing::warn!(task = %task_name, panic = %panic_msg, "task panicked");
             match cortex::db::Database::open() {
                 Ok(db) => {
                     let duration_ms = chrono::Utc::now().timestamp_millis() - started_at_ms;

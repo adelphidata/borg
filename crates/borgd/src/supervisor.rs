@@ -230,11 +230,13 @@ async fn supervised_loop<F, Fut, E>(
 
         match outcome {
             IterationOutcome::CleanExit => {
-                tracing::info!("subsystem {}: exited cleanly", cfg.name);
+                // Predictable startup/shutdown event — fires per subsystem
+                // (6+ on every daemon start). Operators don't need it at INFO.
+                tracing::debug!(subsystem = %cfg.name, "exited cleanly");
                 return;
             }
             IterationOutcome::Cancelled => {
-                tracing::info!("subsystem {}: cancelled, shutting down", cfg.name);
+                tracing::debug!(subsystem = %cfg.name, "cancelled, shutting down");
                 return;
             }
             IterationOutcome::TaskError(msg) => {
@@ -278,10 +280,11 @@ async fn supervised_loop<F, Fut, E>(
 
         if recent_restarts.len() as u32 > cfg.max_restarts {
             tracing::error!(
-                "subsystem {}: {} restarts in {:?} — entering degraded state",
-                cfg.name,
-                recent_restarts.len(),
-                cfg.restart_window,
+                subsystem = %cfg.name,
+                restart_count = recent_restarts.len(),
+                window_secs = cfg.restart_window.as_secs(),
+                max_restarts = cfg.max_restarts,
+                "subsystem entering degraded state"
             );
             let key = format!("Subsystem:{}", cfg.name);
             let unix_now = chrono::Utc::now().timestamp();

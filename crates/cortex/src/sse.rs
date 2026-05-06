@@ -130,7 +130,7 @@ where
                 SseAction::Emit(events) => {
                     for event in events {
                         if tx.send(event).await.is_err() {
-                            tracing::debug!("SSE: stream receiver closed");
+                            tracing::trace!("SSE: stream receiver closed");
                             return Ok(());
                         }
                     }
@@ -138,7 +138,7 @@ where
                 SseAction::Done(events) => {
                     for event in events {
                         if tx.send(event).await.is_err() {
-                            tracing::debug!("SSE: stream receiver closed");
+                            tracing::trace!("SSE: stream receiver closed");
                             return Ok(());
                         }
                     }

@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use tracing::{debug, instrument};
 
@@ -128,9 +129,14 @@ impl EmbeddingProvider {
             match found {
                 Some(pair) => pair,
                 None => {
-                    debug!(
-                        "Embeddings: no embedding-capable provider found, falling back to recency"
-                    );
+                    // Stable config state — emit once per process; otherwise
+                    // every memory_search / build_system_prompt would log it.
+                    static LOGGED: AtomicBool = AtomicBool::new(false);
+                    if !LOGGED.swap(true, Ordering::Relaxed) {
+                        debug!(
+                            "Embeddings: no embedding-capable provider found, falling back to recency"
+                        );
+                    }
                     return None;
                 }
             }

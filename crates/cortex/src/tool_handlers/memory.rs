@@ -187,7 +187,12 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         .ok();
 
     if query_embedding.is_none() {
-        tracing::debug!("memory_search: no embedding provider, falling back to FTS-only");
+        // Logged once at provider-resolution startup (see crates/cortex/src/embeddings.rs).
+        // Repeating it per memory_search just spams daemon.log without new info.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!("memory_search: no embedding provider, falling back to FTS-only");
+        }
     }
 
     for scope in &scopes {

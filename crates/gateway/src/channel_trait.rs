@@ -314,11 +314,16 @@ pub async fn dispatch_webhook(
                         let response_text = match agent_result {
                             Ok(Ok((text, _session_id))) => text,
                             Ok(Err(e)) => {
-                                tracing::warn!("{channel_name} agent error: {e:#}");
+                                // Per-message transient agent failure. The
+                                // formatted error is delivered back to the user
+                                // via the channel; logging at WARN every time
+                                // floods daemon.log on a flaky LLM. DEBUG with
+                                // structured channel field keeps it triagable.
+                                tracing::debug!(channel = %channel_name, error = %format!("{e:#}"), "agent error");
                                 crate::handler::format_gateway_error(&e)
                             }
                             Err(_) => {
-                                tracing::warn!("{channel_name} agent timed out");
+                                tracing::debug!(channel = %channel_name, "agent timed out");
                                 cortex::error_format::format_error_with_context(
                                     "request timed out",
                                     cortex::error_format::ErrorContext::Gateway,

@@ -2,6 +2,29 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::provider::Provider;
+use crate::secrets::redact_secrets;
+
+/// Maximum bytes of provider response body retained in error messages.
+/// Bodies are redacted first, then truncated — keeps logs bounded and avoids
+/// echoing large quota/billing payloads or accidental secret material.
+const ERROR_BODY_MAX_LEN: usize = 512;
+
+/// Sanitize a provider error response body before it is embedded in an
+/// `anyhow!` chain (which subsequently flows to `tracing::warn!`). Runs
+/// `redact_secrets` (catches sk-…, ghp_…, AKIA…, JWTs, KEY=value, DB URIs,
+/// private keys) and truncates to `ERROR_BODY_MAX_LEN` chars.
+fn sanitize_body(body: &str) -> String {
+    let redacted = redact_secrets(body);
+    if redacted.len() <= ERROR_BODY_MAX_LEN {
+        redacted
+    } else {
+        let mut end = ERROR_BODY_MAX_LEN;
+        while !redacted.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…[truncated]", &redacted[..end])
+    }
+}
 
 // ── Error classification ──
 
@@ -151,59 +174,63 @@ pub(crate) fn classify_status(
     provider: Provider,
 ) -> LlmError {
     let retry_after = parse_retry_after(body);
+    // Classifier predicates run on the raw body (their needles are intentionally
+    // benign), but anything embedded in the user-visible error chain is sanitized
+    // first — provider error bodies have leaked auth/billing context historically.
+    let safe = sanitize_body(body);
 
     match status.as_u16() {
         429 => LlmError::Retryable {
-            source: anyhow::anyhow!("{provider} returned 429 (rate limited): {body}"),
+            source: anyhow::anyhow!("{provider} returned 429 (rate limited): {safe}"),
             retry_after,
             reason: FailoverReason::RateLimit,
         },
         500 | 502 | 504 => LlmError::Retryable {
-            source: anyhow::anyhow!("{provider} returned {status}: {body}"),
+            source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
         503 => LlmError::Retryable {
-            source: anyhow::anyhow!("{provider} returned {status} (overloaded): {body}"),
+            source: anyhow::anyhow!("{provider} returned {status} (overloaded): {safe}"),
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
         401 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 401 (auth error): {body}"),
+            source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
             reason: FailoverReason::Auth,
         },
         403 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {body}"),
+            source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
         },
         402 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned {status} (billing error): {body}"),
+            source: anyhow::anyhow!("{provider} returned {status} (billing error): {safe}"),
             reason: FailoverReason::Billing,
         },
         404 if body_indicates_no_allowed_providers(body) => LlmError::Fatal {
             source: anyhow::anyhow!(
-                "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {body}"
+                "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {safe}"
             ),
             reason: FailoverReason::AuthPermanent,
         },
         404 if body_mentions_model(body) => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 404 (model not found): {body}"),
+            source: anyhow::anyhow!("{provider} returned 404 (model not found): {safe}"),
             reason: FailoverReason::ModelNotFound,
         },
         413 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 413 (payload too large): {body}"),
+            source: anyhow::anyhow!("{provider} returned 413 (payload too large): {safe}"),
             reason: FailoverReason::PayloadTooLarge,
         },
         400 if body_indicates_context_overflow(body) => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 400 (context overflow): {body}"),
+            source: anyhow::anyhow!("{provider} returned 400 (context overflow): {safe}"),
             reason: FailoverReason::ContextOverflow,
         },
         400 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned {status} (bad request): {body}"),
+            source: anyhow::anyhow!("{provider} returned {status} (bad request): {safe}"),
             reason: FailoverReason::Format,
         },
         _ => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned {status}: {body}"),
+            source: anyhow::anyhow!("{provider} returned {status}: {safe}"),
             reason: FailoverReason::Unknown,
         },
     }
@@ -723,6 +750,70 @@ mod tests {
         FailoverReason::ModelNotFound,
         FailoverReason::Unknown,
     ];
+
+    // ── Body redaction & truncation ──
+
+    #[test]
+    fn classify_redacts_anthropic_key_in_body() {
+        // Provider 401 echoing back the key Borg sent. Must not survive into the
+        // error chain (which is logged at WARN by agent and gateway).
+        let leaked = "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678ZZZ";
+        let body = format!(r#"{{"error":{{"message":"invalid key {leaked}"}}}}"#);
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            &body,
+            Provider::Anthropic,
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(leaked),
+            "raw key leaked into error: {rendered}"
+        );
+        assert!(
+            rendered.contains("[REDACTED"),
+            "expected redaction marker, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn classify_redacts_credential_assignment_in_body() {
+        // KEY=value style env-leaking response. capture_only pattern keeps the
+        // variable name visible but masks the value.
+        let body =
+            "OPENAI_API_KEY=sk-1234567890abcdef1234567890abcdef1234567890abcdef returned an error";
+        let err = classify_status(reqwest::StatusCode::BAD_GATEWAY, body, Provider::OpenAi);
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("sk-1234567890abcdef"),
+            "key leaked: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED"), "no marker: {rendered}");
+    }
+
+    #[test]
+    fn classify_truncates_oversized_body() {
+        // Bodies above ERROR_BODY_MAX_LEN must be truncated to keep daemon.log
+        // bounded under provider chattiness.
+        let body = "x".repeat(ERROR_BODY_MAX_LEN * 4);
+        let err = classify_status(
+            reqwest::StatusCode::BAD_GATEWAY,
+            &body,
+            Provider::OpenRouter,
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("…[truncated]"),
+            "expected truncation: len={}",
+            rendered.len()
+        );
+        // Total rendered string includes the prefix ("openrouter returned …: ");
+        // the body portion alone is what we're capping.
+        assert!(
+            rendered.len() < body.len(),
+            "body not truncated: {}",
+            rendered.len()
+        );
+    }
 
     #[test]
     fn classify_429_extracts_retry_after() {

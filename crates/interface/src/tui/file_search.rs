@@ -77,7 +77,8 @@ impl FileSearchService {
             return;
         };
         if tx.send(q.to_string()).is_err() {
-            tracing::warn!("file_search: background task exited, query dropped");
+            // Normal during TUI mode-switch / shutdown.
+            tracing::debug!("file_search: background task exited, query dropped");
         }
     }
 
@@ -102,7 +103,7 @@ async fn run_search_loop(
 ) {
     loop {
         if query_rx.changed().await.is_err() {
-            tracing::warn!("file_search: query channel closed, exiting");
+            tracing::debug!("file_search: query channel closed, exiting");
             return;
         }
 
@@ -111,7 +112,7 @@ async fn run_search_loop(
             tokio::select! {
                 res = query_rx.changed() => {
                     if res.is_err() {
-                        tracing::warn!("file_search: query channel closed, exiting");
+                        tracing::debug!("file_search: query channel closed, exiting");
                         return;
                     }
                 }
@@ -136,7 +137,7 @@ async fn run_search_loop(
             };
 
         if result_tx.send(FileSearchResult { query, matches }).is_err() {
-            tracing::warn!("file_search: result channel closed, exiting");
+            tracing::debug!("file_search: result channel closed, exiting");
             return;
         }
     }

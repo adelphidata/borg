@@ -1,4 +1,4 @@
-use tracing::debug;
+use tracing::{debug, trace};
 
 mod script;
 pub use script::ScriptHook;
@@ -130,7 +130,10 @@ impl HookRegistry {
 
     /// Register a hook to be dispatched on matching hook points.
     pub fn register(&mut self, hook: Box<dyn Hook>) {
-        debug!("Registered hook: {}", hook.name());
+        // Per-hook registration is logged at TRACE — startup spam is a known
+        // smell. Use `hook_count()` + a single DEBUG summary at the call site
+        // when registry assembly is complete.
+        trace!("Registered hook: {}", hook.name());
         self.hooks.push(hook);
     }
 
@@ -143,7 +146,9 @@ impl HookRegistry {
                 continue;
             }
 
-            debug!("Dispatching {:?} to hook '{}'", ctx.point, hook.name());
+            // Fires per (hook × dispatch_point) — up to ~30 lines/turn at
+            // DEBUG, which drowns the actual signal. TRACE is the right level.
+            trace!("Dispatching {:?} to hook '{}'", ctx.point, hook.name());
             match hook.execute(ctx) {
                 HookAction::Continue => {}
                 HookAction::InjectContext(text) => {

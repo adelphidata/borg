@@ -104,8 +104,9 @@ pub async fn run(
                 let now = chrono::Utc::now().timestamp();
                 if now - last > WATCHDOG_STALL_THRESHOLD.as_secs() as i64 {
                     tracing::error!(
-                        "Daemon watchdog: dispatcher loop stale for {}s, exiting",
-                        now - last
+                        elapsed_secs = now - last,
+                        threshold_secs = WATCHDOG_STALL_THRESHOLD.as_secs(),
+                        "Daemon watchdog: dispatcher loop stale, exiting"
                     );
                     std::process::exit(1);
                 }

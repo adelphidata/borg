@@ -55,7 +55,11 @@ pub(crate) fn boot_recovery(db: &Database) -> BootRecovery {
     let stale_runs_recovered = match db.recover_stale_runs("Daemon crashed during execution") {
         Ok(n) => {
             if n > 0 {
-                tracing::warn!("Recovered {n} stale task run(s) from previous daemon crash");
+                // Real anomaly worth surfacing — daemon crashed mid-run.
+                tracing::info!(
+                    count = n,
+                    "recovered stale task runs from previous daemon crash"
+                );
             }
             n
         }
