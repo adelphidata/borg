@@ -17,7 +17,12 @@ pub(crate) struct TextToSpeechArgs {
 
 impl TextToSpeechArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("TextToSpeechArgs is JSON-safe")
+        // Plain struct of primitives; serialization is infallible.
+        // The expect would only fire on a serde upstream bug.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("TextToSpeechArgs is JSON-safe")
+        }
     }
 }
 
@@ -39,10 +44,9 @@ mod tests {
 
     #[test]
     fn deserialize_with_voice_and_format() {
-        let args: TextToSpeechArgs = serde_json::from_value(
-            serde_json::json!({"text":"x","voice":"alloy","format":"mp3"}),
-        )
-        .unwrap();
+        let args: TextToSpeechArgs =
+            serde_json::from_value(serde_json::json!({"text":"x","voice":"alloy","format":"mp3"}))
+                .unwrap();
         assert_eq!(args.voice.as_deref(), Some("alloy"));
         assert_eq!(args.format.as_deref(), Some("mp3"));
     }

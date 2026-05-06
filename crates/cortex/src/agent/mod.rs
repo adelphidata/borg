@@ -33,6 +33,7 @@ use crate::session::Session;
 use crate::skills::load_skills_context;
 use crate::telemetry::BorgMetrics;
 use crate::template::Template;
+#[cfg(test)]
 use crate::tool_handlers;
 use crate::tool_names as tn;
 use crate::truncate::truncate_output;

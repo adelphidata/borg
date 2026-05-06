@@ -108,7 +108,9 @@ pub(crate) enum Tool {
     SpawnAgent(MultiAgentArgs),
     SendToAgent(MultiAgentArgs),
     WaitForAgent(MultiAgentArgs),
-    ListAgents(MultiAgentArgs),
+    /// `list_agents` carries the parsed args for symmetry, but the handler
+    /// only needs `agent_control` — fields are intentionally unread.
+    ListAgents(#[allow(dead_code)] MultiAgentArgs),
     CloseAgent(MultiAgentArgs),
     ManageRoles(MultiAgentArgs),
 }
@@ -140,10 +142,8 @@ impl Tool {
             tool: &'static str,
             args: Value,
         ) -> Result<T, ToolParseError> {
-            serde_json::from_value::<T>(args).map_err(|source| ToolParseError::InvalidArgs {
-                tool,
-                source,
-            })
+            serde_json::from_value::<T>(args)
+                .map_err(|source| ToolParseError::InvalidArgs { tool, source })
         }
 
         Ok(match name {
@@ -182,9 +182,7 @@ impl Tool {
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
 
             // User input
-            tn::REQUEST_USER_INPUT => {
-                Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?)
-            }
+            tn::REQUEST_USER_INPUT => Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?),
 
             // Multi-agent
             tn::SPAWN_AGENT => Tool::SpawnAgent(from(tn::SPAWN_AGENT, args)?),
@@ -271,6 +269,12 @@ impl Tool {
 
     /// True iff the tool may be invoked while the agent is in Plan mode
     /// (read-only collaboration mode that blocks mutating tools).
+    ///
+    /// Plan-mode gating happens at the agent loop's pre-parse stage via
+    /// [`allowed_in_plan_mode_name`] (raw-name lookup), but this typed
+    /// variant exists so any post-parse caller has the same single source
+    /// of truth without re-implementing the read-only allowlist.
+    #[allow(dead_code)]
     pub(crate) const fn allowed_in_plan_mode(&self) -> bool {
         match self {
             Tool::ReadFile(_)
@@ -305,6 +309,11 @@ impl Tool {
     }
 
     /// The catalog group this tool belongs to.
+    ///
+    /// The catalog uses raw-name lookup ([`crate::tool_catalog::tool_group`])
+    /// because alias names also need a group; this typed variant exists so a
+    /// post-parse caller can reach the same answer without a string compare.
+    #[allow(dead_code)]
     pub(crate) const fn group(&self) -> ToolGroup {
         match self {
             Tool::WriteMemory(_) | Tool::ReadMemory(_) | Tool::MemorySearch(_) => ToolGroup::Memory,
@@ -332,35 +341,27 @@ impl Tool {
     }
 }
 
-/// Map a tool name to its [`ToolGroup`], deriving from the closed enum.
-///
-/// Returns `None` for user-created / dynamic tools (and for the integration
-/// tools `gmail`, `notion`, etc. which the agent loop doesn't dispatch directly
-/// — those are still listed for catalog filtering by [`tool_group_extended`]).
-pub(crate) fn tool_group_for_name(name: &str) -> Option<ToolGroup> {
-    match name {
-        tn::WRITE_MEMORY | tn::READ_MEMORY | tn::MEMORY_SEARCH => Some(ToolGroup::Memory),
-        tn::APPLY_PATCH
-        | tn::APPLY_SKILL_PATCH
-        | tn::CREATE_CHANNEL
-        | tn::READ_FILE
-        | tn::LIST_DIR => Some(ToolGroup::Fs),
-        tn::RUN_SHELL => Some(ToolGroup::Runtime),
-        tn::LIST | tn::LIST_SKILLS | tn::LIST_CHANNELS | tn::LIST_AGENTS | tn::REQUEST_USER_INPUT => {
-            Some(ToolGroup::Discovery)
-        }
-        tn::WEB_FETCH | tn::WEB_SEARCH => Some(ToolGroup::Web),
-        tn::BROWSER => Some(ToolGroup::Ui),
-        tn::SCHEDULE | tn::MANAGE_TASKS | tn::MANAGE_CRON => Some(ToolGroup::Scheduling),
-        tn::GENERATE_IMAGE | tn::TEXT_TO_SPEECH => Some(ToolGroup::Media),
-        tn::GMAIL | tn::GOOGLE_CALENDAR | tn::NOTION | tn::LINEAR => Some(ToolGroup::Integration),
-        tn::SPAWN_AGENT
-        | tn::SEND_TO_AGENT
-        | tn::WAIT_FOR_AGENT
-        | tn::CLOSE_AGENT
-        | tn::MANAGE_ROLES => Some(ToolGroup::Agents),
-        _ => None,
-    }
+/// True iff `name` corresponds to a tool variant whose
+/// [`Tool::allowed_in_plan_mode`] is `true`. Mirrors the typed predicate but
+/// works on raw names (so callers can gate Plan-mode access before
+/// arg-parsing has happened).
+pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
+    matches_any(
+        name,
+        &[
+            tn::READ_FILE,
+            tn::LIST_DIR,
+            tn::LIST,
+            tn::LIST_SKILLS,
+            tn::LIST_CHANNELS,
+            tn::LIST_AGENTS,
+            tn::READ_MEMORY,
+            tn::MEMORY_SEARCH,
+            tn::WEB_FETCH,
+            tn::WEB_SEARCH,
+            tn::REQUEST_USER_INPUT,
+        ],
+    )
 }
 
 /// True iff `name` corresponds to a tool variant whose [`Tool::parallel_safe`]
@@ -411,47 +412,6 @@ const fn str_eq(a: &str, b: &str) -> bool {
         i += 1;
     }
     true
-}
-
-/// Names listed in the catalog but not directly dispatched by the agent loop
-/// (skill-driven integration tools). These are kept for catalog/profile
-/// filtering only.
-pub(crate) const INTEGRATION_TOOL_NAMES: &[&str] = &[
-    tn::GMAIL,
-    tn::GOOGLE_CALENDAR,
-    tn::NOTION,
-    tn::LINEAR,
-];
-
-/// All primary (non-alias) tool names served by the agent's typed dispatcher,
-/// plus integration names that participate in catalog filtering.
-pub(crate) const fn primary_tool_names() -> &'static [&'static str] {
-    &[
-        tn::WRITE_MEMORY,
-        tn::READ_MEMORY,
-        tn::MEMORY_SEARCH,
-        tn::APPLY_PATCH,
-        tn::READ_FILE,
-        tn::LIST_DIR,
-        tn::RUN_SHELL,
-        tn::LIST,
-        tn::REQUEST_USER_INPUT,
-        tn::WEB_FETCH,
-        tn::WEB_SEARCH,
-        tn::BROWSER,
-        tn::SCHEDULE,
-        tn::GENERATE_IMAGE,
-        tn::TEXT_TO_SPEECH,
-        tn::GMAIL,
-        tn::GOOGLE_CALENDAR,
-        tn::NOTION,
-        tn::LINEAR,
-        tn::SPAWN_AGENT,
-        tn::SEND_TO_AGENT,
-        tn::WAIT_FOR_AGENT,
-        tn::CLOSE_AGENT,
-        tn::MANAGE_ROLES,
-    ]
 }
 
 #[cfg(test)]
@@ -529,8 +489,8 @@ mod tests {
     fn parse_invalid_args_errors_with_tool_name() {
         // write_memory requires `filename` and `content` as strings; sending an
         // integer for `filename` must fail at the dispatcher edge.
-        let err = Tool::parse(tn::WRITE_MEMORY, json!({"filename": 7, "content": "x"}))
-            .unwrap_err();
+        let err =
+            Tool::parse(tn::WRITE_MEMORY, json!({"filename": 7, "content": "x"})).unwrap_err();
         match err {
             ToolParseError::InvalidArgs { tool, .. } => assert_eq!(tool, tn::WRITE_MEMORY),
             other => panic!("expected InvalidArgs, got: {other:?}"),

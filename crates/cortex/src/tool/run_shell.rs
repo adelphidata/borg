@@ -24,7 +24,12 @@ pub(crate) struct RunShellArgs {
 
 impl RunShellArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("RunShellArgs is JSON-safe")
+        // Plain struct of primitives; serialization is infallible.
+        // The expect would only fire on a serde upstream bug.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("RunShellArgs is JSON-safe")
+        }
     }
 }
 
@@ -35,8 +40,14 @@ pub(crate) async fn handle(
     event_tx: &mpsc::Sender<AgentEvent>,
     skill_env_allowlist: Option<&HashSet<String>>,
 ) -> Result<String> {
-    tool_handlers::handle_run_shell(&args.to_value(), config, policy, event_tx, skill_env_allowlist)
-        .await
+    tool_handlers::handle_run_shell(
+        &args.to_value(),
+        config,
+        policy,
+        event_tx,
+        skill_env_allowlist,
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -178,8 +178,6 @@ pub(crate) mod tool;
 pub mod tool_catalog;
 /// Core tool definitions sent to the LLM.
 pub mod tool_definitions;
-/// Tool dispatch helpers (write_memory effects, multi-agent routing).
-pub(crate) mod tool_dispatch;
 /// Tool-call effect classification and concurrent-grouping planner.
 pub mod tool_effects;
 /// Tool execution dispatch and result handling.

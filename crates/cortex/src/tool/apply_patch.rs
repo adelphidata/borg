@@ -20,7 +20,12 @@ pub(crate) struct ApplyPatchArgs {
 
 impl ApplyPatchArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("ApplyPatchArgs is JSON-safe")
+        // Plain struct of strings + Option<String>; serialization is infallible.
+        // The expect would only fire on a serde upstream bug, not runtime data.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("ApplyPatchArgs is JSON-safe")
+        }
     }
 }
 

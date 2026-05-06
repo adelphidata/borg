@@ -32,61 +32,48 @@ pub enum ToolGroup {
     Agents,
 }
 
-/// Single source of truth for tool-to-group mapping.
+/// Primary tools per group — derived from the typed [`crate::tool::Tool`]
+/// enum (the single source of truth) plus the integration-tool names that
+/// the agent loop doesn't dispatch directly but the catalog still filters on.
 ///
-/// Each entry is `(tool_name, group, is_alias)`. Primary tools (`is_alias = false`)
-/// are returned by `ToolGroup::tool_names()`. Aliases map to the same group in
-/// `tool_group()` but are not listed as primary tools.
-const TOOL_REGISTRY: &[(&str, ToolGroup, bool)] = &[
+/// Aliases (e.g. `apply_skill_patch`, `manage_tasks`, `list_skills`) are NOT
+/// listed as primary; they resolve to the same group via [`tool_group`] but
+/// are dispatched through their own typed [`crate::tool::Tool`] variants.
+const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     // Memory
-    (crate::tool_names::WRITE_MEMORY, ToolGroup::Memory, false),
-    (crate::tool_names::READ_MEMORY, ToolGroup::Memory, false),
-    (crate::tool_names::MEMORY_SEARCH, ToolGroup::Memory, false),
+    (crate::tool_names::WRITE_MEMORY, ToolGroup::Memory),
+    (crate::tool_names::READ_MEMORY, ToolGroup::Memory),
+    (crate::tool_names::MEMORY_SEARCH, ToolGroup::Memory),
     // Filesystem
-    (crate::tool_names::APPLY_PATCH, ToolGroup::Fs, false),
-    (crate::tool_names::READ_FILE, ToolGroup::Fs, false),
-    (crate::tool_names::LIST_DIR, ToolGroup::Fs, false),
-    (crate::tool_names::APPLY_SKILL_PATCH, ToolGroup::Fs, true),
-    (crate::tool_names::CREATE_CHANNEL, ToolGroup::Fs, true),
+    (crate::tool_names::APPLY_PATCH, ToolGroup::Fs),
+    (crate::tool_names::READ_FILE, ToolGroup::Fs),
+    (crate::tool_names::LIST_DIR, ToolGroup::Fs),
     // Runtime
-    (crate::tool_names::RUN_SHELL, ToolGroup::Runtime, false),
+    (crate::tool_names::RUN_SHELL, ToolGroup::Runtime),
     // Discovery
-    (crate::tool_names::LIST, ToolGroup::Discovery, false),
-    (
-        crate::tool_names::REQUEST_USER_INPUT,
-        ToolGroup::Discovery,
-        false,
-    ),
-    (crate::tool_names::LIST_SKILLS, ToolGroup::Discovery, true),
-    (crate::tool_names::LIST_CHANNELS, ToolGroup::Discovery, true),
-    (crate::tool_names::LIST_AGENTS, ToolGroup::Discovery, true),
+    (crate::tool_names::LIST, ToolGroup::Discovery),
+    (crate::tool_names::REQUEST_USER_INPUT, ToolGroup::Discovery),
     // Web
-    (crate::tool_names::WEB_FETCH, ToolGroup::Web, false),
-    (crate::tool_names::WEB_SEARCH, ToolGroup::Web, false),
+    (crate::tool_names::WEB_FETCH, ToolGroup::Web),
+    (crate::tool_names::WEB_SEARCH, ToolGroup::Web),
     // UI
-    (crate::tool_names::BROWSER, ToolGroup::Ui, false),
+    (crate::tool_names::BROWSER, ToolGroup::Ui),
     // Scheduling
-    (crate::tool_names::SCHEDULE, ToolGroup::Scheduling, false),
-    (crate::tool_names::MANAGE_TASKS, ToolGroup::Scheduling, true),
-    (crate::tool_names::MANAGE_CRON, ToolGroup::Scheduling, true),
+    (crate::tool_names::SCHEDULE, ToolGroup::Scheduling),
     // Media
-    (crate::tool_names::GENERATE_IMAGE, ToolGroup::Media, false),
-    (crate::tool_names::TEXT_TO_SPEECH, ToolGroup::Media, false),
-    // Integration
-    (crate::tool_names::GMAIL, ToolGroup::Integration, false),
-    (
-        crate::tool_names::GOOGLE_CALENDAR,
-        ToolGroup::Integration,
-        false,
-    ),
-    (crate::tool_names::NOTION, ToolGroup::Integration, false),
-    (crate::tool_names::LINEAR, ToolGroup::Integration, false),
+    (crate::tool_names::GENERATE_IMAGE, ToolGroup::Media),
+    (crate::tool_names::TEXT_TO_SPEECH, ToolGroup::Media),
+    // Integration (skill-driven; not dispatched by the agent loop directly)
+    (crate::tool_names::GMAIL, ToolGroup::Integration),
+    (crate::tool_names::GOOGLE_CALENDAR, ToolGroup::Integration),
+    (crate::tool_names::NOTION, ToolGroup::Integration),
+    (crate::tool_names::LINEAR, ToolGroup::Integration),
     // Agents
-    (crate::tool_names::SPAWN_AGENT, ToolGroup::Agents, false),
-    (crate::tool_names::SEND_TO_AGENT, ToolGroup::Agents, false),
-    (crate::tool_names::WAIT_FOR_AGENT, ToolGroup::Agents, false),
-    (crate::tool_names::CLOSE_AGENT, ToolGroup::Agents, false),
-    (crate::tool_names::MANAGE_ROLES, ToolGroup::Agents, false),
+    (crate::tool_names::SPAWN_AGENT, ToolGroup::Agents),
+    (crate::tool_names::SEND_TO_AGENT, ToolGroup::Agents),
+    (crate::tool_names::WAIT_FOR_AGENT, ToolGroup::Agents),
+    (crate::tool_names::CLOSE_AGENT, ToolGroup::Agents),
+    (crate::tool_names::MANAGE_ROLES, ToolGroup::Agents),
 ];
 
 impl ToolGroup {
@@ -125,10 +112,10 @@ impl ToolGroup {
 
     /// All primary (non-alias) tool names that belong to this group.
     pub fn tool_names(&self) -> Vec<&'static str> {
-        TOOL_REGISTRY
+        PRIMARY_TOOLS
             .iter()
-            .filter(|(_, group, is_alias)| group == self && !is_alias)
-            .map(|(name, _, _)| *name)
+            .filter(|(_, group)| group == self)
+            .map(|(name, _)| *name)
             .collect()
     }
 
@@ -231,11 +218,19 @@ pub fn filter_tools_by_relevance(
         }
     }
 
-    // Build set of allowed tool names from active groups
-    let allowed: HashSet<&str> = TOOL_REGISTRY
+    // Build set of allowed tool names from active groups (primary names plus
+    // their aliases — both resolve through [`tool_group`]).
+    let allowed: HashSet<&str> = PRIMARY_TOOLS
         .iter()
-        .filter(|(_, group, _)| active_groups.contains(group))
-        .map(|(name, _, _)| *name)
+        .filter(|(_, group)| active_groups.contains(group))
+        .map(|(name, _)| *name)
+        .chain(ALIAS_TOOLS.iter().filter_map(|(name, group)| {
+            if active_groups.contains(group) {
+                Some(*name)
+            } else {
+                None
+            }
+        }))
         .collect();
 
     tools
@@ -331,12 +326,26 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
     ToolGroup::Agents,
 ];
 
+/// Aliases — tools that share a group with a primary tool but are not listed
+/// as primary themselves. Aliases are dispatched through their own typed
+/// [`crate::tool::Tool`] variants but participate in catalog filtering.
+const ALIAS_TOOLS: &[(&str, ToolGroup)] = &[
+    (crate::tool_names::APPLY_SKILL_PATCH, ToolGroup::Fs),
+    (crate::tool_names::CREATE_CHANNEL, ToolGroup::Fs),
+    (crate::tool_names::LIST_SKILLS, ToolGroup::Discovery),
+    (crate::tool_names::LIST_CHANNELS, ToolGroup::Discovery),
+    (crate::tool_names::LIST_AGENTS, ToolGroup::Discovery),
+    (crate::tool_names::MANAGE_TASKS, ToolGroup::Scheduling),
+    (crate::tool_names::MANAGE_CRON, ToolGroup::Scheduling),
+];
+
 /// Map a tool name to its group. Returns `None` for user-created tools.
 pub fn tool_group(name: &str) -> Option<ToolGroup> {
-    TOOL_REGISTRY
+    PRIMARY_TOOLS
         .iter()
-        .find(|(n, _, _)| *n == name)
-        .map(|(_, group, _)| *group)
+        .chain(ALIAS_TOOLS.iter())
+        .find(|(n, _)| *n == name)
+        .map(|(_, group)| *group)
 }
 
 #[cfg(test)]
@@ -726,13 +735,18 @@ mod tests {
         ]
     }
 
-    /// Every tool name constant in tool_names must appear in TOOL_REGISTRY.
+    /// Every tool name constant in tool_names must appear in the catalog
+    /// (primary or alias). Drift means the LLM sees a tool the catalog can't
+    /// classify — and vice versa.
     #[test]
-    fn tool_name_constants_match_registry() {
+    fn tool_name_constants_match_catalog() {
         use crate::tool_names;
 
-        let registry_names: std::collections::HashSet<&str> =
-            TOOL_REGISTRY.iter().map(|(name, _, _)| *name).collect();
+        let catalog_names: std::collections::HashSet<&str> = PRIMARY_TOOLS
+            .iter()
+            .chain(ALIAS_TOOLS.iter())
+            .map(|(name, _)| *name)
+            .collect();
 
         let constants = [
             tool_names::WRITE_MEMORY,
@@ -770,16 +784,16 @@ mod tests {
 
         for name in &constants {
             assert!(
-                registry_names.contains(name),
-                "tool_names constant '{name}' not found in TOOL_REGISTRY"
+                catalog_names.contains(name),
+                "tool_names constant '{name}' not found in catalog"
             );
         }
 
-        // Also verify every registry entry has a matching constant
-        for name in &registry_names {
+        // Also verify every catalog entry has a matching constant
+        for name in &catalog_names {
             assert!(
                 constants.contains(name),
-                "TOOL_REGISTRY entry '{name}' has no matching tool_names constant"
+                "catalog entry '{name}' has no matching tool_names constant"
             );
         }
     }

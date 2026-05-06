@@ -17,7 +17,12 @@ pub(crate) struct GenerateImageArgs {
 
 impl GenerateImageArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("GenerateImageArgs is JSON-safe")
+        // Plain struct of primitives; serialization is infallible.
+        // The expect would only fire on a serde upstream bug.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("GenerateImageArgs is JSON-safe")
+        }
     }
 }
 
@@ -39,10 +44,9 @@ mod tests {
 
     #[test]
     fn deserialize_with_count_and_size() {
-        let args: GenerateImageArgs = serde_json::from_value(
-            serde_json::json!({"prompt":"x","count":2,"size":"1024x1024"}),
-        )
-        .unwrap();
+        let args: GenerateImageArgs =
+            serde_json::from_value(serde_json::json!({"prompt":"x","count":2,"size":"1024x1024"}))
+                .unwrap();
         assert_eq!(args.count, Some(2));
         assert_eq!(args.size.as_deref(), Some("1024x1024"));
     }

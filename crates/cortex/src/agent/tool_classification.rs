@@ -10,22 +10,11 @@ use crate::rate_guard::ActionType;
 /// Used to block mutating tools in Plan mode.
 ///
 /// Uses an allowlist of known-safe tools so that new tools default to blocked,
-/// preventing accidental mutation in plan mode.
+/// preventing accidental mutation in plan mode. Delegates to the typed
+/// [`crate::tool::allowed_in_plan_mode_name`] so the read-only set has a
+/// single source of truth on the [`crate::tool::Tool`] enum.
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
-    !matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "list"
-            | "list_skills"
-            | "list_channels"
-            | "list_agents"
-            | "read_memory"
-            | "memory_search"
-            | "web_fetch"
-            | "web_search"
-            | "request_user_input"
-    )
+    !crate::tool::allowed_in_plan_mode_name(name)
 }
 
 /// Names of every tool that `is_mutating_tool` considers mutating.

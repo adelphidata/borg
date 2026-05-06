@@ -20,7 +20,12 @@ pub(crate) struct ReadFileArgs {
 
 impl ReadFileArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("ReadFileArgs is JSON-safe")
+        // Plain struct of primitives; serialization is infallible.
+        // The expect would only fire on a serde upstream bug.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("ReadFileArgs is JSON-safe")
+        }
     }
 }
 
@@ -34,7 +39,8 @@ mod tests {
 
     #[test]
     fn deserialize_minimal_args() {
-        let args: ReadFileArgs = serde_json::from_value(serde_json::json!({"path":"a.rs"})).unwrap();
+        let args: ReadFileArgs =
+            serde_json::from_value(serde_json::json!({"path":"a.rs"})).unwrap();
         assert_eq!(args.path, "a.rs");
         assert!(args.offset.is_none());
     }

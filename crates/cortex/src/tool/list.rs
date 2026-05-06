@@ -14,7 +14,12 @@ pub(crate) struct ListArgs {
 
 impl ListArgs {
     fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("ListArgs is JSON-safe")
+        // Plain struct of primitives; serialization is infallible.
+        // The expect would only fire on a serde upstream bug.
+        #[allow(clippy::expect_used)]
+        {
+            serde_json::to_value(self).expect("ListArgs is JSON-safe")
+        }
     }
 }
 
