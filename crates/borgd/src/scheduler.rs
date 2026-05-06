@@ -9,6 +9,7 @@
 //! delegated back to the cli's `service::*` helpers via `borgd::run_legacy`.
 //! This module is the loop body only.
 
+use crate::maintenance::Maintenance;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{
@@ -71,13 +72,19 @@ pub async fn run(
         );
     }
 
-    // Recover stale runs from a previous crash.
-    if let Ok(count) = db.recover_stale_runs("Daemon crashed during execution") {
-        if count > 0 {
-            tracing::warn!("Recovered {count} stale task run(s) from previous daemon crash");
-        }
+    // Boot-time recovery: in-flight task runs from a crashed previous
+    // daemon are marked failed, and any task more than seven days
+    // overdue gets its `next_run` advanced so we don't replay every
+    // missed window in a burst. Concentrated into the maintenance
+    // module — see `crates/borgd/src/maintenance/sweep.rs`.
+    let maintenance = Maintenance::new(&config);
+    let boot_report = maintenance.recover_at_boot(&db);
+    if boot_report.stale_tasks_advanced > 0 {
+        tracing::info!(
+            advanced = boot_report.stale_tasks_advanced,
+            "boot recovery: advanced stale tasks past 7-day overdue threshold",
+        );
     }
-    skip_stale_tasks(&db);
 
     let mut interval = tokio::time::interval(DAEMON_LOOP_INTERVAL);
 
@@ -132,7 +139,13 @@ pub async fn run(
                 "Daemon resumed after {}s pause, re-checking stale tasks",
                 elapsed.as_secs()
             );
-            skip_stale_tasks(&db);
+            let drift_report = maintenance.recover_after_drift(&db);
+            if drift_report.stale_tasks_advanced > 0 {
+                tracing::info!(
+                    advanced = drift_report.stale_tasks_advanced,
+                    "drift recovery: advanced stale tasks after wake-from-sleep",
+                );
+            }
         }
 
         let now = chrono::Utc::now().timestamp();
@@ -154,11 +167,13 @@ pub async fn run(
 
         if last_stalled_scan.elapsed() >= STALLED_TASK_SCAN_INTERVAL {
             last_stalled_scan = std::time::Instant::now();
-            if let Err(e) = cortex::tasks::heal_stalled_tasks(&db, now, STALLED_TASK_GRACE_SECS) {
-                tracing::warn!("Stalled-task scan failed: {e}");
-            }
-            if let Err(e) = cortex::tasks::recover_wedged_runs(&db, now, STALLED_TASK_GRACE_SECS) {
-                tracing::warn!("Wedged-run sweep failed: {e}");
+            let scan = maintenance.scan_stalled(&db, now, STALLED_TASK_GRACE_SECS);
+            if scan.tasks_healed > 0 || scan.wedged_runs_recovered > 0 {
+                tracing::info!(
+                    healed = scan.tasks_healed,
+                    wedged = scan.wedged_runs_recovered,
+                    "stalled-task scan made repairs",
+                );
             }
         }
 
@@ -231,139 +246,6 @@ pub async fn run(
     }
 }
 
-fn skip_stale_tasks(db: &cortex::db::Database) {
-    let now = chrono::Utc::now().timestamp();
-    if let Ok(stale_tasks) = db.get_due_tasks(now) {
-        for task in &stale_tasks {
-            let age = now - task.next_run.unwrap_or(0);
-            if age > 7 * 86400 {
-                tracing::warn!(
-                    "Skipping stale task '{}' ({}d overdue)",
-                    task.name,
-                    age / 86400
-                );
-                if let Err(e) = cortex::tasks::advance_next_run(task, db) {
-                    tracing::warn!(
-                        error = %e,
-                        task = %task.name,
-                        "advance_next_run on stale task failed",
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::skip_stale_tasks;
-    use cortex::db::{Database, NewTask};
-
-    fn test_db() -> Database {
-        Database::from_connection(rusqlite::Connection::open_in_memory().expect("in-memory db"))
-            .expect("init test db")
-    }
-
-    fn seed_interval_task(db: &Database, id: &str, next_run: Option<i64>) {
-        db.create_task(&NewTask {
-            id,
-            name: id,
-            prompt: "noop",
-            schedule_type: "interval",
-            schedule_expr: "1m",
-            timezone: "UTC",
-            next_run,
-            max_retries: Some(0),
-            timeout_ms: Some(60_000),
-            delivery_channel: None,
-            delivery_target: None,
-            allowed_tools: None,
-            task_type: "prompt",
-            pre_run_command: None,
-            pre_run_cwd: None,
-            pre_run_timeout_ms: None,
-            min_interval_secs: None,
-        })
-        .expect("create_task");
-    }
-
-    fn next_run_of(db: &Database, id: &str) -> Option<i64> {
-        db.get_task_by_id(id)
-            .expect("read task")
-            .expect("task exists")
-            .next_run
-    }
-
-    #[test]
-    fn task_overdue_more_than_seven_days_gets_advanced() {
-        let db = test_db();
-        let now = chrono::Utc::now().timestamp();
-        let stale = now - 8 * 86_400;
-        seed_interval_task(&db, "stale", Some(stale));
-
-        skip_stale_tasks(&db);
-
-        // Interval schedule recomputes to roughly now + 60s.
-        let advanced = next_run_of(&db, "stale").expect("interval task always has next_run");
-        assert!(
-            advanced > now,
-            "expected next_run > now after advance, got {advanced} (now={now})"
-        );
-    }
-
-    /// Boundary: the predicate is `age > 7 * 86_400`, so exactly 7 days old
-    /// must NOT advance. Catches a future `>=` regression.
-    #[test]
-    fn task_exactly_seven_days_overdue_is_unchanged() {
-        let db = test_db();
-        let now = chrono::Utc::now().timestamp();
-        let boundary = now - 7 * 86_400;
-        seed_interval_task(&db, "boundary", Some(boundary));
-
-        skip_stale_tasks(&db);
-
-        assert_eq!(
-            next_run_of(&db, "boundary"),
-            Some(boundary),
-            "task at the 7-day boundary must not be advanced"
-        );
-    }
-
-    #[test]
-    fn task_under_seven_days_overdue_is_unchanged() {
-        let db = test_db();
-        let now = chrono::Utc::now().timestamp();
-        let recent = now - 6 * 86_400;
-        seed_interval_task(&db, "recent", Some(recent));
-
-        skip_stale_tasks(&db);
-
-        assert_eq!(next_run_of(&db, "recent"), Some(recent));
-    }
-
-    /// Mixed batch: stale tasks advance, fresh tasks don't. Guards against an
-    /// implementation that mutates every row in the due-task list.
-    #[test]
-    fn only_stale_tasks_in_a_mixed_batch_are_advanced() {
-        let db = test_db();
-        let now = chrono::Utc::now().timestamp();
-        let stale_ts = now - 10 * 86_400;
-        let fresh_ts = now - 60; // due, but not stale
-
-        seed_interval_task(&db, "stale", Some(stale_ts));
-        seed_interval_task(&db, "fresh", Some(fresh_ts));
-
-        skip_stale_tasks(&db);
-
-        assert_ne!(
-            next_run_of(&db, "stale"),
-            Some(stale_ts),
-            "stale task should have been advanced"
-        );
-        assert_eq!(
-            next_run_of(&db, "fresh"),
-            Some(fresh_ts),
-            "fresh task must not be touched"
-        );
-    }
-}
+// `skip_stale_tasks` and its boundary tests now live in
+// `crate::maintenance::sweep` — the dispatcher loop calls into that
+// module instead of inlining the recovery logic.
