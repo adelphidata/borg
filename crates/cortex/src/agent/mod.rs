@@ -43,7 +43,10 @@ use std::sync::LazyLock;
 
 pub mod btw;
 mod system_prompt;
+pub(crate) mod system_prompt_cache;
 mod tool_classification;
+
+use system_prompt_cache::SystemPromptCache;
 
 pub use btw::{parse_btw_command, run_btw};
 pub use tool_classification::mutating_tool_names;
@@ -98,18 +101,6 @@ const COLLAB_MODE_PLAN: &str = include_str!("../../templates/collaboration_mode/
 const MAX_TOOL_CALLS: usize = constants::MAX_AGENT_TOOL_CALLS;
 
 const SECURITY_POLICY: &str = include_str!("../../templates/security_policy.md");
-
-/// Return the cached value if present; otherwise call `load`, store the result
-/// in `slot`, and return a clone. Used to memoize cache-friendly computations
-/// whose inputs don't change within a session (identity, skills context).
-fn cache_or_load<T: Clone, F: FnOnce() -> Result<T>>(slot: &mut Option<T>, load: F) -> Result<T> {
-    if let Some(v) = slot.as_ref() {
-        return Ok(v.clone());
-    }
-    let v = load()?;
-    *slot = Some(v.clone());
-    Ok(v)
-}
 
 /// Result of monthly token budget check.
 enum BudgetCheck {
@@ -327,23 +318,14 @@ pub struct Agent {
     tts_synthesizer: Option<crate::tts::TtsSynthesizer>,
     config_rx: Option<tokio::sync::watch::Receiver<Config>>,
     db: Mutex<Option<Database>>,
-    /// Cached skills context string, keyed by the latest user request text.
-    cached_skills_context: Option<String>,
-    /// Latest user request text used to build `cached_skills_context`.
-    cached_skills_request: Option<String>,
-    /// Sorted set of skill names dropped/omitted on the last budget pass.
-    /// Used to suppress duplicate warnings when the dropped set hasn't changed.
-    last_skill_drop_signature: Option<Vec<String>>,
+    /// System-prompt input caches (identity, credentials, project docs, skills).
+    /// All invalidation goes through typed event methods on this struct —
+    /// callers do not poke fields directly. See [`SystemPromptCache`].
+    caches: SystemPromptCache,
     /// Ghost commit created at session start for atomic undo (coding agent).
     ghost_commit: Option<crate::git::GhostCommit>,
     /// Git repo root (if CWD is inside a git repo).
     git_repo_root: Option<std::path::PathBuf>,
-    /// Cached project doc contents (AGENTS.md / CLAUDE.md), loaded once.
-    cached_project_docs: Option<Option<String>>,
-    /// Cached identity string, invalidated on write_memory targeting IDENTITY.md.
-    cached_identity: Option<String>,
-    /// Cached resolved credentials, invalidated on config reload.
-    cached_credentials: Option<HashMap<String, String>>,
     /// Arc-wrapped config for cheap cloning into background tasks.
     config_arc: Arc<Config>,
     /// Channel for receiving user steer messages mid-turn (injected at tool boundaries).
@@ -439,9 +421,9 @@ impl Agent {
     /// Separated from the getter so the getter can return a borrow while leaving
     /// `&self` free for other immutable accesses.
     fn ensure_credentials_cached(&mut self) {
-        if self.cached_credentials.is_none() {
-            self.cached_credentials = Some(self.config.resolve_credentials());
-        }
+        let config = &self.config;
+        self.caches
+            .ensure_credentials(|| config.resolve_credentials());
     }
 
     fn latest_user_message_text(&self) -> &str {
@@ -454,9 +436,7 @@ impl Agent {
     }
 
     fn refresh_skill_runtime_state(&mut self) {
-        self.cached_skills_context = None;
-        self.cached_skills_request = None;
-        self.last_skill_drop_signature = None;
+        self.caches.on_skill_modified();
         self.ensure_credentials_cached();
         self.skill_env_allowlist = crate::skills::collect_required_env_vars(
             self.credentials_cached(),
@@ -485,8 +465,7 @@ impl Agent {
     /// [`Self::ensure_credentials_cached`] first; the fallback keeps the
     /// skill-loading path robust if that ordering ever regresses.
     fn credentials_cached(&self) -> &HashMap<String, String> {
-        static EMPTY: LazyLock<HashMap<String, String>> = LazyLock::new(HashMap::new);
-        self.cached_credentials.as_ref().unwrap_or(&EMPTY)
+        self.caches.credentials_or_empty()
     }
 
     /// Assemble an `Agent` from pre-computed parts shared by all constructors.
@@ -520,14 +499,9 @@ impl Agent {
             browser_session: None,
             config_rx: None,
             db: Mutex::new(common.db),
-            cached_skills_context: None,
-            cached_skills_request: None,
-            last_skill_drop_signature: None,
+            caches: SystemPromptCache::default(),
             ghost_commit: None,
             git_repo_root,
-            cached_project_docs: None,
-            cached_identity: None,
-            cached_credentials: None,
             config_arc,
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
@@ -625,10 +599,15 @@ impl Agent {
         self.rate_guard
             .update_limits(new_config.security.action_limits.clone());
         let resolved_creds = new_config.resolve_credentials();
-        self.cached_credentials = Some(resolved_creds);
+        self.caches.on_config_reloaded(resolved_creds);
         self.config_arc = Arc::new(new_config.clone());
         self.config = new_config;
-        self.refresh_skill_runtime_state();
+        // skills caches were just cleared by `on_config_reloaded`;
+        // recompute the env allowlist now that credentials are fresh.
+        self.skill_env_allowlist = crate::skills::collect_required_env_vars(
+            self.credentials_cached(),
+            &self.config.skills,
+        );
     }
 
     fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
@@ -964,7 +943,7 @@ impl Agent {
 
     #[instrument(skip_all)]
     async fn build_system_prompt(&mut self) -> Result<String> {
-        let identity = cache_or_load(&mut self.cached_identity, load_identity)?;
+        let identity = self.caches.identity_or_load(load_identity)?;
         let memory = self.load_memory_with_ranking().await?;
         let knowledge = self.load_knowledge_with_ranking().await?;
         let mut system = String::with_capacity(16_384);
@@ -995,30 +974,23 @@ impl Agent {
 
         if self.config.skills.enabled {
             let user_request = self.latest_user_message_text().to_string();
-            let skills = match (
-                self.cached_skills_context.as_ref(),
-                self.cached_skills_request.as_ref(),
-            ) {
-                (Some(cached), Some(cached_request)) if cached_request == &user_request => {
-                    cached.clone()
-                }
-                _ => {
-                    self.ensure_credentials_cached();
-                    let budget = crate::skills::effective_skill_budget(
-                        &self.config.skills,
-                        Some(self.active_context_window()),
-                    );
-                    let (rendered, report) = load_skills_context(
-                        budget,
-                        self.credentials_cached(),
-                        &self.config.skills,
-                        &user_request,
-                    )?;
-                    self.warn_skill_budget_loss(&report);
-                    self.cached_skills_context = Some(rendered.clone());
-                    self.cached_skills_request = Some(user_request);
-                    rendered
-                }
+            let skills = if let Some(cached) = self.caches.skills_for_request(&user_request) {
+                cached.to_string()
+            } else {
+                self.ensure_credentials_cached();
+                let budget = crate::skills::effective_skill_budget(
+                    &self.config.skills,
+                    Some(self.active_context_window()),
+                );
+                let (rendered, report) = load_skills_context(
+                    budget,
+                    self.credentials_cached(),
+                    &self.config.skills,
+                    &user_request,
+                )?;
+                self.warn_skill_budget_loss(&report);
+                self.caches.set_skills(user_request, rendered.clone());
+                rendered
             };
             if !skills.is_empty() {
                 system.push_str(
@@ -1062,14 +1034,13 @@ impl Agent {
         system.push_str(&self.build_reasoning_section());
 
         // Project documentation (AGENTS.md / CLAUDE.md)
-        let project_docs = match &self.cached_project_docs {
-            Some(cached) => cached.clone(),
-            None => std::env::current_dir().ok().and_then(|cwd| {
+        let project_docs = self.caches.project_docs_or_load(|| {
+            std::env::current_dir().ok().and_then(|cwd| {
                 crate::project_doc::discover_project_docs(&cwd)
                     .ok()
                     .flatten()
-            }),
-        };
+            })
+        });
         if let Some(ref docs) = project_docs {
             let _ = write!(
                 system,
@@ -1470,15 +1441,16 @@ Rules:
             }
         }
 
-        // Cache project docs on first run
-        if self.cached_project_docs.is_none() {
-            let docs = std::env::current_dir().ok().and_then(|cwd| {
+        // Cache project docs on first run (the system-prompt builder also
+        // calls this lazily; running it here once outside that hot path
+        // means the first build_system_prompt call doesn't pay for IO).
+        let _ = self.caches.project_docs_or_load(|| {
+            std::env::current_dir().ok().and_then(|cwd| {
                 crate::project_doc::discover_project_docs(&cwd)
                     .ok()
                     .flatten()
-            });
-            self.cached_project_docs = Some(docs);
-        }
+            })
+        });
 
         // Background: index extra paths and pending sessions on first run
         if self.config.memory.embeddings.enabled {
@@ -2284,27 +2256,26 @@ Rules:
     /// Warm the skills context cache on first call (avoids re-parsing every turn).
     fn warm_skills_cache(&mut self) {
         let user_request = self.latest_user_message_text().to_string();
-        let cache_stale = self.cached_skills_request.as_deref() != Some(user_request.as_str());
-        if (self.cached_skills_context.is_none() || cache_stale) && self.config.skills.enabled {
-            self.ensure_credentials_cached();
-            let budget = crate::skills::effective_skill_budget(
-                &self.config.skills,
-                Some(self.active_context_window()),
-            );
-            let result = load_skills_context(
-                budget,
-                self.credentials_cached(),
-                &self.config.skills,
-                &user_request,
-            );
-            match result {
-                Ok((ctx, report)) => {
-                    self.warn_skill_budget_loss(&report);
-                    self.cached_skills_context = Some(ctx);
-                    self.cached_skills_request = Some(user_request);
-                }
-                Err(e) => warn!("Failed to load skills context: {e}"),
+        if !self.config.skills.enabled || !self.caches.skills_stale_for(&user_request) {
+            return;
+        }
+        self.ensure_credentials_cached();
+        let budget = crate::skills::effective_skill_budget(
+            &self.config.skills,
+            Some(self.active_context_window()),
+        );
+        let result = load_skills_context(
+            budget,
+            self.credentials_cached(),
+            &self.config.skills,
+            &user_request,
+        );
+        match result {
+            Ok((ctx, report)) => {
+                self.warn_skill_budget_loss(&report);
+                self.caches.set_skills(user_request, ctx);
             }
+            Err(e) => warn!("Failed to load skills context: {e}"),
         }
     }
 
@@ -2328,14 +2299,10 @@ Rules:
             .cloned()
             .collect();
         signature.sort();
-        if self
-            .last_skill_drop_signature
-            .as_ref()
-            .is_some_and(|prev| prev == &signature)
-        {
+        if self.caches.skill_drop_signature_matches(&signature) {
             return;
         }
-        self.last_skill_drop_signature = Some(signature);
+        self.caches.set_skill_drop_signature(signature);
         warn!(
             budget_tokens = report.budget_tokens,
             used_tokens = report.used_tokens,
@@ -3039,7 +3006,7 @@ Rules:
                 args,
                 &self.config,
                 &self.config_arc,
-                &mut self.cached_identity,
+                &mut self.caches,
             ),
             crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args),
             crate::tool::Tool::MemorySearch(args) => {
@@ -3857,14 +3824,15 @@ mod tests {
             tts_synthesizer: None,
             config_rx: None,
             db: Mutex::new(None),
-            cached_skills_context: Some("cached".to_string()),
-            cached_skills_request: Some("old request".to_string()),
-            last_skill_drop_signature: Some(vec!["pdf".to_string()]),
+            caches: SystemPromptCache::with_test_state(
+                None,
+                Some(HashMap::new()),
+                Some("cached".to_string()),
+                Some("old request".to_string()),
+                Some(vec!["pdf".to_string()]),
+            ),
             ghost_commit: None,
             git_repo_root: None,
-            cached_project_docs: None,
-            cached_identity: None,
-            cached_credentials: Some(HashMap::new()),
             config_arc: Arc::new(config),
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
@@ -3881,12 +3849,82 @@ mod tests {
             "Patch applied successfully.",
         );
 
-        assert!(agent.cached_skills_context.is_none());
-        assert!(agent.cached_skills_request.is_none());
-        assert!(agent.last_skill_drop_signature.is_none());
+        assert!(agent.caches.skills_context_for_test().is_none());
+        assert!(agent.caches.skills_request_for_test().is_none());
+        assert!(agent.caches.last_skill_drop_signature_for_test().is_none());
         assert!(
             agent.skill_env_allowlist.contains("SLACK_BOT_TOKEN"),
             "skill env allowlist should be recomputed from loaded skills"
+        );
+    }
+
+    /// `reload_config` must clear the skills caches (the env-allowlist they
+    /// were rendered against is stale) and replace the credentials wholesale,
+    /// while preserving identity (config does not affect IDENTITY.md). This
+    /// is the Agent-side end-to-end of `SystemPromptCache::on_config_reloaded`.
+    #[test]
+    fn reload_config_clears_skills_and_replaces_credentials_preserving_identity() {
+        let config = Config::default();
+        let session = Session::new();
+        let session_id = session.meta.id.clone();
+        let mut agent = Agent {
+            config: config.clone(),
+            history: Vec::new(),
+            session,
+            policy: config.policy.clone(),
+            hook_registry: HookRegistry::new(),
+            turn_count: 0,
+            rate_guard: SessionRateGuard::new(config.security.action_limits.clone()),
+            agent_control: None,
+            spawn_depth: 0,
+            tools_filter: None,
+            skill_env_allowlist: std::collections::HashSet::new(),
+            metrics: BorgMetrics::default(),
+            browser_session: None,
+            tts_synthesizer: None,
+            config_rx: None,
+            db: Mutex::new(None),
+            caches: SystemPromptCache::with_test_state(
+                Some("identity-snapshot".into()),
+                Some(HashMap::from([("OLD_TOKEN".into(), "v".into())])),
+                Some("rendered-skills".into()),
+                Some("user-request".into()),
+                Some(vec!["pdf".into()]),
+            ),
+            ghost_commit: None,
+            git_repo_root: None,
+            config_arc: Arc::new(config.clone()),
+            steer_rx: None,
+            recent_tool_names: std::collections::HashSet::new(),
+            cost_event_sink: None,
+            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            previous_summary: None,
+            setup_just_consumed: false,
+            tool_call_repeat: ToolCallRepeatTracker::default(),
+        };
+
+        agent.reload_config(Config::default());
+
+        assert_eq!(
+            agent.caches.identity_for_test(),
+            Some("identity-snapshot"),
+            "identity must survive config reload"
+        );
+        assert!(
+            agent.caches.skills_context_for_test().is_none(),
+            "skills context must clear on reload"
+        );
+        assert!(
+            agent.caches.skills_request_for_test().is_none(),
+            "skills request key must clear on reload"
+        );
+        assert!(
+            agent.caches.last_skill_drop_signature_for_test().is_none(),
+            "drop signature must clear on reload"
+        );
+        assert!(
+            !agent.credentials_cached().contains_key("OLD_TOKEN"),
+            "old credentials must be replaced wholesale"
         );
     }
 

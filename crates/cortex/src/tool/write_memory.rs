@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::agent::system_prompt_cache::SystemPromptCache;
 use crate::config::Config;
-use crate::constants::IDENTITY_FILE;
 use crate::tool_handlers;
 
 /// Typed arguments for `write_memory`.
@@ -50,15 +50,14 @@ pub(crate) fn handle(
     args: &WriteMemoryArgs,
     config: &Config,
     config_arc: &Arc<Config>,
-    cached_identity: &mut Option<String>,
+    caches: &mut SystemPromptCache,
 ) -> Result<String> {
     let value = args.to_value();
     let result = tool_handlers::handle_write_memory(&value);
 
     if result.is_ok() {
-        if args.filename == IDENTITY_FILE {
-            *cached_identity = None;
-        }
+        let scope = args.scope.as_deref().unwrap_or("global");
+        caches.on_memory_written(scope, &args.filename);
         if config.memory.embeddings.enabled {
             spawn_embedding_task(args, config_arc);
         }
@@ -287,25 +286,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_invalid_args_propagates_error_and_skips_effects() {
-        // Empty filename + empty content → handle_write_memory currently still
-        // succeeds (write_memory_db accepts empty content), so the meaningful
-        // failure here is a write to an unwritable scope. We validate only the
-        // narrower invariant: `cached_identity` is touched ONLY for the
-        // IDENTITY.md filename.
+    async fn handle_non_identity_write_preserves_identity_cache() {
+        // The cache invalidation rule is "writing IDENTITY.md clears the
+        // identity cache." A write to any other filename must leave the
+        // identity slot intact even if the write itself succeeds or fails.
         let config = Config::default();
         let config_arc = Arc::new(Config::default());
-        let mut cached: Option<String> = Some("stale".to_string());
+        let mut caches = SystemPromptCache::with_test_state(
+            Some("stale-identity".into()),
+            None,
+            None,
+            None,
+            None,
+        );
         let args = WriteMemoryArgs {
             filename: "non_identity.md".into(),
             content: "x".into(),
             append: false,
             scope: Some("nonexistent_scope_just_for_test".into()),
         };
-        // Best-effort: even if write fails (DB unavailable in CI), identity
-        // cache must not be cleared because the filename isn't IDENTITY_FILE.
-        let _ = handle(&args, &config, &config_arc, &mut cached);
-        assert_eq!(cached.as_deref(), Some("stale"));
+        let _ = handle(&args, &config, &config_arc, &mut caches);
+        assert_eq!(
+            caches.identity_for_test(),
+            Some("stale-identity"),
+            "non-IDENTITY writes must not clear the identity cache"
+        );
     }
 
     #[test]
