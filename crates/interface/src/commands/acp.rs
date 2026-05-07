@@ -1213,6 +1213,24 @@ fn session_info_params(info: &SessionMetadata) -> Value {
     })
 }
 
+/// Map a Borg tool name to the ACP `tool_call` category. ACP clients (Zed,
+/// etc.) render tool calls based on this `kind` field; without it they fall
+/// back to a generic icon and label. Plan §"Tool lifecycle" specifies the
+/// `run_shell → execute`, fs → `other` baseline; we extend it to the full
+/// ACP `kind` enum (`read`, `edit`, `search`, `fetch`, `execute`, `other`)
+/// so that read-only inspection, mutation, and network access render
+/// distinctly. Unknown tools degrade to `"other"` rather than erroring.
+fn tool_kind_for(name: &str) -> &'static str {
+    match name {
+        "run_shell" => "execute",
+        "read_file" | "read_memory" | "list_dir" | "list" => "read",
+        "apply_patch" | "write_memory" => "edit",
+        "memory_search" => "search",
+        "web_fetch" | "web_search" | "browser" => "fetch",
+        _ => "other",
+    }
+}
+
 fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
     match event {
         AgentEvent::TextDelta(text) => Some(json!({
@@ -1232,6 +1250,7 @@ fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
                 "kind": "tool_call",
                 "toolCallId": tool_call_id,
                 "name": name,
+                "toolKind": tool_kind_for(name),
                 "status": "running",
                 "arguments": args,
             }
@@ -1247,6 +1266,7 @@ fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
                 "kind": "tool_call_update",
                 "toolCallId": tool_call_id,
                 "name": name,
+                "toolKind": tool_kind_for(name),
                 "status": "running",
                 "stream": if *is_stderr { "stderr" } else { "stdout" },
                 "content": strip_internal_tags(delta),
@@ -1262,6 +1282,7 @@ fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
                 "kind": "tool_call_update",
                 "toolCallId": tool_call_id,
                 "name": name,
+                "toolKind": tool_kind_for(name),
                 "status": "completed",
                 "content": strip_internal_tags(result),
             }
@@ -1648,10 +1669,74 @@ mod tests {
         assert_eq!(lines[2]["params"]["update"]["kind"], "agent_message_chunk");
         assert_eq!(lines[2]["params"]["update"]["text"], "ok  visible");
         assert_eq!(lines[3]["params"]["update"]["toolCallId"], "call_1");
+        // Plan §"Tool lifecycle": tool updates must carry an ACP toolKind so
+        // clients can render category-specific affordances. `read_file`
+        // categorises as `read`.
+        assert_eq!(lines[3]["params"]["update"]["toolKind"], "read");
+        assert_eq!(lines[4]["params"]["update"]["toolKind"], "read");
+        assert_eq!(lines[5]["params"]["update"]["toolKind"], "read");
         assert_eq!(
             lines.last().expect("final line")["result"]["stopReason"],
             "end_turn"
         );
+    }
+
+    /// Plan §"Tool lifecycle" — ACP toolKind mapping. Drives the
+    /// IDE-side rendering of tool calls. A new tool added to the catalog
+    /// will fall through to `other`, which is the safe default; promoting
+    /// it (e.g. a future `git` tool → `execute`) is an explicit edit.
+    #[test]
+    fn tool_kind_for_maps_categories() {
+        let cases: &[(&str, &str)] = &[
+            ("run_shell", "execute"),
+            ("read_file", "read"),
+            ("list_dir", "read"),
+            ("read_memory", "read"),
+            ("apply_patch", "edit"),
+            ("write_memory", "edit"),
+            ("memory_search", "search"),
+            ("web_fetch", "fetch"),
+            ("web_search", "fetch"),
+            ("browser", "fetch"),
+            ("text_to_speech", "other"),
+            ("a_tool_that_does_not_exist", "other"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                tool_kind_for(name),
+                *expected,
+                "tool_kind_for({name}) should be {expected}"
+            );
+        }
+    }
+
+    /// Plan §"Logging and Stdio Safety" + §"Text streaming" — `<internal>`
+    /// stripping is a translator-only concern. Other event consumers (TUI,
+    /// daemon log) keep raw text. Regression guard: if upstream cortex
+    /// starts stripping, this still passes; if the ACP translator stops
+    /// stripping on `ToolOutputDelta`, this fails.
+    #[test]
+    fn tool_output_delta_strips_internal_tags_on_wire() {
+        let event = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            delta: "before <internal>secret-plan</internal> after".into(),
+            is_stderr: false,
+        };
+        let update = event_to_update(&event, "sess-1").expect("update");
+        assert_eq!(update["update"]["content"], "before  after");
+        assert_eq!(update["update"]["toolKind"], "execute");
+        assert_eq!(update["update"]["stream"], "stdout");
+
+        let stderr_event = AgentEvent::ToolOutputDelta {
+            tool_call_id: "c1".into(),
+            name: "run_shell".into(),
+            delta: "<internal>x</internal>err".into(),
+            is_stderr: true,
+        };
+        let stderr_update = event_to_update(&stderr_event, "sess-1").expect("update");
+        assert_eq!(stderr_update["update"]["content"], "err");
+        assert_eq!(stderr_update["update"]["stream"], "stderr");
     }
 
     #[tokio::test]
