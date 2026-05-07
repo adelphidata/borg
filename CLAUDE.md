@@ -1,6 +1,6 @@
 # Borg
 
-AI personal assistant agent in Rust. The agent writes its own tools at runtime. Single binary, all integrations compiled in. Data dir: `~/.borg/`.
+AI personal assistant agent in Rust, security-first by default. The agent writes its own tools at runtime. Single binary, all integrations compiled in. Data dir: `~/.borg/`.
 
 ## Architecture
 

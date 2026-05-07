@@ -5,7 +5,7 @@
 [![Coverage](https://codecov.io/gh/borganization/borg/branch/main/graph/badge.svg)](https://codecov.io/gh/borganization/borg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Borg is your personal assistant, employee, developer, sidekick, and friend.**
+**Borg is your personal assistant, employee, developer, analyst, and sidekick. Security-first by default.**
 
 ## Quick Start
 
