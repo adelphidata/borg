@@ -56,6 +56,12 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }
 
+[features]
+# Exposes `borgd::session::scripted` (ScriptedBackend + ScriptedFactory) to
+# downstream crates' integration tests. Off in production binaries so a real
+# `borgd` build cannot accidentally instantiate a no-LLM stub backend.
+test-support = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rusqlite = { workspace = true }

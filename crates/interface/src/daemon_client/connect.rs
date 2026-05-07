@@ -15,9 +15,19 @@ use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
 
-/// Default UDS path: `$BORG_HOME/borgd.sock`, falling back to
-/// `~/.borg/borgd.sock`. Mirrors `borgd::paths::resolve_borg_home`.
+/// Default UDS path resolution:
+///
+/// 1. `$BORG_DAEMON_UDS` if set — explicit override, used by the ACP
+///    integration test harness to pin a subprocess at a per-test socket
+///    without auto-spawning a real daemon.
+/// 2. `$BORG_HOME/borgd.sock` if `$BORG_HOME` is set.
+/// 3. `~/.borg/borgd.sock` otherwise.
+///
+/// Mirrors `borgd::paths::resolve_borg_home` for cases 2 and 3.
 pub fn default_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("BORG_DAEMON_UDS") {
+        return PathBuf::from(p);
+    }
     let home = std::env::var("BORG_HOME")
         .ok()
         .map(PathBuf::from)
@@ -73,9 +83,19 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
 /// Like [`connect`] but launches `borgd` if the socket isn't present. The spawned daemon is detached — it lives on after this CLI
 /// process exits, so subsequent `borg` invocations reuse it. If you don't
 /// want that lifecycle, prefer [`connect`] + an externally supervised daemon.
+///
+/// Setting `BORG_ACP_NO_AUTOSPAWN=1` (or any non-empty value) disables the
+/// auto-spawn — used by the ACP integration test harness, which pins the
+/// subprocess to a test-managed UDS via `BORG_DAEMON_UDS` and must not have
+/// the subprocess race-spawn a second real daemon if the test daemon is
+/// slow to come up. With auto-spawn disabled and the socket missing,
+/// returns the same clean error as [`connect`].
 pub async fn connect_or_spawn() -> Result<DaemonClient> {
     let path = default_socket_path();
-    if !path.exists() {
+    let no_autospawn = std::env::var("BORG_ACP_NO_AUTOSPAWN")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !path.exists() && !no_autospawn {
         spawn_detached_daemon()?;
         wait_for_socket(&path, Duration::from_secs(5))
             .await
@@ -139,5 +159,33 @@ mod tests {
             msg.contains("nope.sock"),
             "error must name the path; got: {msg}"
         );
+    }
+
+    #[test]
+    fn default_socket_path_honors_borg_daemon_uds_override() {
+        // Real failure mode: the ACP test harness pins the subprocess to a
+        // per-test UDS via BORG_DAEMON_UDS. If this env knob silently
+        // ignored, the subprocess would either auto-spawn a real daemon or
+        // hit the user's `~/.borg/borgd.sock` and corrupt state.
+        //
+        // Mutating env mid-test is racy with parallel tests; serialize via
+        // a static mutex so this case is deterministic regardless of
+        // concurrent connect_returns_clean_error_when_socket_missing runs.
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prior_uds = std::env::var_os("BORG_DAEMON_UDS");
+        let prior_home = std::env::var_os("BORG_HOME");
+        std::env::set_var("BORG_DAEMON_UDS", "/tmp/explicit.sock");
+        let resolved = default_socket_path();
+        match prior_uds {
+            Some(v) => std::env::set_var("BORG_DAEMON_UDS", v),
+            None => std::env::remove_var("BORG_DAEMON_UDS"),
+        }
+        if let Some(v) = prior_home {
+            std::env::set_var("BORG_HOME", v);
+        }
+        assert_eq!(resolved, PathBuf::from("/tmp/explicit.sock"));
     }
 }

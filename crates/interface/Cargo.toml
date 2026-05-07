@@ -79,6 +79,16 @@ wiremock = "0.5"
 async-trait = { workspace = true }
 pretty_assertions = { workspace = true }
 itertools = { workspace = true }
+# Re-export borgd with the `test-support` feature for integration tests.
+# Cargo only enables features from dev-dependencies when building tests/
+# examples/benches; a regular `cargo build [--release]` of the `borg`
+# binary excludes dev-deps entirely, so the scripted module does NOT ship
+# in the production binary. (Verified: `cargo build --release -p interface`
+# does not pull in `borgd::session::scripted`.)
+borgd = { path = "../borgd", features = ["test-support"] }
+# `tokio::process::Command` (used by AcpClient to spawn `borg acp`) lives
+# behind the `process` feature; the workspace tokio dep doesn't include it.
+tokio = { workspace = true, features = ["test-util", "process"] }
 
 [lints]
 workspace = true

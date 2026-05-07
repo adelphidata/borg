@@ -2192,4 +2192,98 @@ mod tests {
             json!("daemon_disconnected"),
         );
     }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // Source-level guard: the ACP transport's hard invariant is that
+    // *nothing* writes to stdout/stderr except valid JSON-RPC frames going
+    // through the `run_transport` writer. A stray `println!` / `eprintln!`
+    // anywhere in this module corrupts the IDE's stdin parser and is the
+    // ACP equivalent of the TUI mouse-mode regression: easy to reintroduce,
+    // expensive to debug from the IDE side. This invariant cannot be
+    // expressed by types (the language permits printing from any function);
+    // a source-grep guard is the cheapest way to keep it locked down. Same
+    // template as the TUI mouse guards in `crates/interface/src/tui/mod.rs`.
+    //
+    // Comments and `#[cfg(test)]` blocks are stripped before scanning so
+    // documentation may reference the forbidden patterns and tests may
+    // legitimately use `eprintln!` for diagnostic output that never runs in
+    // production.
+    fn strip_tests_and_comments(src: &str) -> String {
+        let code = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+        code.lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn acp_module_emits_no_stdout_or_stderr_writes() {
+        // Forbid the print/eprint family (which auto-acquire stdout/stderr
+        // from any call site) and direct `std::io::{stdout,stderr}()` grabs.
+        //
+        // We deliberately do NOT forbid `tokio::io::stdout()` / `tokio::io::
+        // stderr()` because `run_acp_stdio` legitimately calls
+        // `tokio::io::stdout()` exactly once to hand the writer to
+        // `run_transport`. Restricting that call site is enforced by the
+        // count check below: more than one `tokio::io::stdout(` site means
+        // someone added another writer path.
+        const FORBIDDEN_MACROS_AND_STD_IO: &[&str] = &[
+            "println!",
+            "print!",
+            "eprintln!",
+            "eprint!",
+            "std::io::stdout(",
+            "std::io::stderr(",
+        ];
+        let src = include_str!("acp.rs");
+        let code = strip_tests_and_comments(src);
+        // Sentinel: the strip helper is naive (line-comments only, first
+        // `#[cfg(test)]` block onward). If it ever became aggressive
+        // enough to strip away the whole prod code section, every
+        // forbidden-pattern check would vacuously pass. Pin a known
+        // production identifier so a stripping bug fails the test
+        // instead.
+        assert!(
+            code.contains("run_acp_stdio"),
+            "strip_tests_and_comments removed prod code; the source-grep \
+             guard would silently pass against an empty input. Investigate \
+             the helper before trusting any subsequent assertion in this test."
+        );
+        for needle in FORBIDDEN_MACROS_AND_STD_IO {
+            assert!(
+                !code.contains(needle),
+                "crates/interface/src/commands/acp.rs contains forbidden output \
+                 pattern `{needle}` outside of `#[cfg(test)]`. ACP mode reserves \
+                 stdout for JSON-RPC frames and stderr for IDE-captured logs; \
+                 even one stray write corrupts the IDE's parser. Route \
+                 diagnostics through `tracing::*` (which goes to acp.log) \
+                 instead. See the comment block above this test for rationale."
+            );
+        }
+
+        // The single allowed stdout grab lives in `run_acp_stdio`. Any
+        // additional `tokio::io::stdout(` site means a second code path is
+        // writing to the transport — also a regression.
+        let stdout_count = code.matches("tokio::io::stdout(").count();
+        assert_eq!(
+            stdout_count, 1,
+            "exactly one `tokio::io::stdout()` call site is allowed (the one \
+             in `run_acp_stdio` that hands the writer to `run_transport`); \
+             found {stdout_count}. A second site means another code path \
+             is writing to stdout, which corrupts ACP framing."
+        );
+        let stderr_count = code.matches("tokio::io::stderr(").count();
+        assert_eq!(
+            stderr_count, 0,
+            "no `tokio::io::stderr()` calls are allowed in ACP mode; the \
+             panic hook + tracing layer route all diagnostic output to \
+             acp.log. Found {stderr_count}."
+        );
+    }
 }

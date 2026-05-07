@@ -326,13 +326,13 @@ impl DaemonClient {
         fs_client: F,
     ) -> Result<mpsc::Receiver<cortex::agent::AgentEvent>> {
         let (client_tx, client_rx) = mpsc::channel::<AcpClientMessage>(32);
-        let mut stream = self
-            .session
-            .acp_turn(ReceiverStream::new(client_rx))
-            .await
-            .context("Session.AcpTurn failed")?
-            .into_inner();
-
+        // Pre-load StartTurn into the channel BEFORE opening the bidi stream.
+        // The daemon-side `acp_turn` handler awaits the first inbound message
+        // before returning a Response — and `acp_turn(rx).await` on the
+        // client side doesn't resolve until that Response arrives. Sending
+        // StartTurn after the await would deadlock both sides; with the
+        // channel pre-loaded, tonic forwards the message as soon as the
+        // request body opens and the server unblocks immediately.
         client_tx
             .send(AcpClientMessage {
                 kind: Some(acp_client_message::Kind::StartTurn(AcpStartTurn {
@@ -343,7 +343,13 @@ impl DaemonClient {
                 })),
             })
             .await
-            .map_err(|e| anyhow!("failed to send ACP start_turn: {e}"))?;
+            .map_err(|e| anyhow!("failed to queue ACP start_turn: {e}"))?;
+        let mut stream = self
+            .session
+            .acp_turn(ReceiverStream::new(client_rx))
+            .await
+            .context("Session.AcpTurn failed")?
+            .into_inner();
 
         let (event_tx, event_rx) = mpsc::channel::<cortex::agent::AgentEvent>(256);
         let daemon_client = self.clone();

@@ -17,6 +17,8 @@ pub mod buffer;
 pub mod convert;
 pub mod executor;
 pub mod prompts;
+#[cfg(feature = "test-support")]
+pub mod scripted;
 
 pub use executor::DaemonSessionExecutor;
 
