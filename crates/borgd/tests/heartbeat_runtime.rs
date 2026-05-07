@@ -66,16 +66,44 @@ async fn admin_subscribe_heartbeat_events_round_trips_a_published_event() {
 }
 
 /// `SessionExecutor` stub whose `start_turn` returns a hand-built channel
-/// the test controls. Holds the sender end so the receiver never closes —
-/// simulates the "agent parked waiting for user input" hang that motivated
-/// the heartbeat-turn timeout.
+/// the test controls. Two modes:
+///
+/// - `close_after: false` — holds the sender end so the receiver never
+///   closes, simulating the "agent parked waiting for user input" hang
+///   that motivated the heartbeat-turn timeout.
+/// - `close_after: true` — drops the sender after delivering the script,
+///   simulating a clean turn-complete (the executor's bridge would close
+///   the channel after a `TurnComplete` event).
 struct StubExecutor {
-    /// Optional event to deliver immediately on start_turn (e.g. a
-    /// `prompt_request:user_input` SystemNotice). When `None`, the channel
-    /// stays empty and the heartbeat must rely on the wall-clock timeout.
-    inject: Mutex<Option<AgentEvent>>,
-    /// Held senders so the channel never closes for the duration of the test.
+    /// Events delivered (in order) on every `start_turn`. Drained on first
+    /// call so a single executor only fires one heartbeat turn.
+    script: Mutex<Vec<AgentEvent>>,
+    /// When true, drops the sender after sending the script — the heartbeat
+    /// helper sees a clean channel close (`Completed`). When false, the
+    /// sender is held in `held_senders` so the channel stays open until the
+    /// wall-clock timeout fires.
+    close_after: bool,
+    /// Senders held open across the test lifetime — only populated when
+    /// `close_after == false`.
     held_senders: Mutex<Vec<mpsc::Sender<AgentEvent>>>,
+}
+
+impl StubExecutor {
+    fn hanging(events: Vec<AgentEvent>) -> Self {
+        Self {
+            script: Mutex::new(events),
+            close_after: false,
+            held_senders: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn completing(events: Vec<AgentEvent>) -> Self {
+        Self {
+            script: Mutex::new(events),
+            close_after: true,
+            held_senders: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait]
@@ -85,10 +113,13 @@ impl SessionExecutor for StubExecutor {
         _turn: InboundTurn,
     ) -> anyhow::Result<(mpsc::Receiver<AgentEvent>, CancellationToken)> {
         let (tx, rx) = mpsc::channel::<AgentEvent>(8);
-        if let Some(evt) = self.inject.lock().await.take() {
-            tx.send(evt).await.expect("send injected event");
+        let events = std::mem::take(&mut *self.script.lock().await);
+        for evt in events {
+            tx.send(evt).await.expect("send scripted event");
         }
-        self.held_senders.lock().await.push(tx);
+        if !self.close_after {
+            self.held_senders.lock().await.push(tx);
+        }
         Ok((rx, CancellationToken::new()))
     }
 
@@ -125,13 +156,10 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_when_turn_hangs_o
         .expect("subscribe");
     let mut stream = resp.into_inner();
 
-    let executor = Arc::new(StubExecutor {
-        inject: Mutex::new(Some(AgentEvent::SystemNotice {
-            category: PROMPT_REQUEST_USER_INPUT.into(),
-            text: "1 questions".into(),
-        })),
-        held_senders: Mutex::new(Vec::new()),
-    });
+    let executor = Arc::new(StubExecutor::hanging(vec![AgentEvent::SystemNotice {
+        category: PROMPT_REQUEST_USER_INPUT.into(),
+        text: "1 questions".into(),
+    }]));
 
     // Disable quiet-hours and zero-info paths that would also produce a
     // terminal event — we want the assertion to specifically cover the
@@ -193,10 +221,7 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_on_hang_timeout()
         .expect("subscribe");
     let mut stream = resp.into_inner();
 
-    let executor = Arc::new(StubExecutor {
-        inject: Mutex::new(None),
-        held_senders: Mutex::new(Vec::new()),
-    });
+    let executor = Arc::new(StubExecutor::hanging(Vec::new()));
 
     let mut config = Config::default();
     config.heartbeat.quiet_hours_start = None;
@@ -236,5 +261,136 @@ async fn admin_subscribe_heartbeat_events_emits_terminal_event_on_hang_timeout()
         evt.message.contains("timeout"),
         "message should mention timeout, got {:?}",
         evt.message
+    );
+}
+
+/// Positive integration guard for the heartbeat happy path. The prompt-request
+/// short-circuit and wall-clock timeout fixes added on top of
+/// `run_and_broadcast` must not regress the case where the agent emits real
+/// content and closes the channel cleanly: that turn must publish a terminal
+/// `ran` event carrying the assistant's text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_subscribe_heartbeat_events_emits_ran_when_agent_completes_with_text() {
+    let registry = SessionRegistry::new();
+    let bus = HeartbeatBus::default();
+    let admin = AdminSvc::new(registry).with_heartbeat_bus(bus.clone());
+
+    let resp = Admin::subscribe_heartbeat_events(&admin, Request::new(AdminEmpty {}))
+        .await
+        .expect("subscribe");
+    let mut stream = resp.into_inner();
+
+    // Mix in a non-prompt SystemNotice (e.g. posture transition) before the
+    // text content to also pin that the prompt short-circuit doesn't
+    // over-fire on unrelated notices.
+    let executor = Arc::new(StubExecutor::completing(vec![
+        AgentEvent::SystemNotice {
+            category: "posture".into(),
+            text: "Boosted".into(),
+        },
+        AgentEvent::TextDelta("3 unread emails from the team".into()),
+    ]));
+
+    let mut config = Config::default();
+    config.heartbeat.quiet_hours_start = None;
+    config.heartbeat.quiet_hours_end = None;
+    config.heartbeat.turn_timeout_secs = 5;
+
+    let trigger = HeartbeatTrigger {
+        source: HeartbeatSource::Scheduled,
+        bypass_quiet_hours: true,
+    };
+
+    let executor_for_run = executor.clone();
+    let bus_for_run = bus.clone();
+    let config_for_run = config.clone();
+    tokio::spawn(async move {
+        heartbeat::run_and_broadcast(
+            executor_for_run.as_ref(),
+            &config_for_run,
+            trigger,
+            &bus_for_run,
+        )
+        .await;
+    });
+
+    let evt = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("terminal event must arrive promptly on clean completion")
+        .expect("stream not closed")
+        .expect("stream item ok");
+
+    assert_eq!(
+        evt.status, "ran",
+        "clean completion with non-trivial text must emit ran"
+    );
+    assert_eq!(evt.source, "scheduled");
+    assert_eq!(
+        evt.message, "3 unread emails from the team",
+        "ran event must carry the assistant's accumulated TextDelta payload"
+    );
+    assert_eq!(
+        evt.skip_reason, "",
+        "ran events have no skip_reason on the wire"
+    );
+}
+
+/// Negative-positive integration guard: a heartbeat that returns a
+/// zero-info ack ("ok") must publish `skipped` with `empty_response`, not
+/// `ran`. Pre-fix the channel could hang indefinitely on a UserInputRequest;
+/// post-fix it returns Completed and the existing zero-info filter applies.
+/// This locks the boundary between Failed (prompt/timeout) and Skipped
+/// (zero-info) so a future refactor can't collapse them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_subscribe_heartbeat_events_emits_skipped_when_agent_returns_zero_info() {
+    let registry = SessionRegistry::new();
+    let bus = HeartbeatBus::default();
+    let admin = AdminSvc::new(registry).with_heartbeat_bus(bus.clone());
+
+    let resp = Admin::subscribe_heartbeat_events(&admin, Request::new(AdminEmpty {}))
+        .await
+        .expect("subscribe");
+    let mut stream = resp.into_inner();
+
+    let executor = Arc::new(StubExecutor::completing(vec![AgentEvent::TextDelta(
+        "ok".into(),
+    )]));
+
+    let mut config = Config::default();
+    config.heartbeat.quiet_hours_start = None;
+    config.heartbeat.quiet_hours_end = None;
+    config.heartbeat.turn_timeout_secs = 5;
+
+    let trigger = HeartbeatTrigger {
+        source: HeartbeatSource::Scheduled,
+        bypass_quiet_hours: true,
+    };
+
+    let executor_for_run = executor.clone();
+    let bus_for_run = bus.clone();
+    let config_for_run = config.clone();
+    tokio::spawn(async move {
+        heartbeat::run_and_broadcast(
+            executor_for_run.as_ref(),
+            &config_for_run,
+            trigger,
+            &bus_for_run,
+        )
+        .await;
+    });
+
+    let evt = tokio::time::timeout(Duration::from_secs(3), stream.next())
+        .await
+        .expect("terminal event must arrive promptly on clean completion")
+        .expect("stream not closed")
+        .expect("stream item ok");
+
+    assert_eq!(
+        evt.status, "skipped",
+        "zero-info ack must publish skipped, not ran"
+    );
+    assert_eq!(
+        evt.skip_reason, "empty_response",
+        "skip_reason must identify the zero-info filter"
     );
 }
