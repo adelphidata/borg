@@ -12,6 +12,10 @@ service Session {
   // Closes when the agent emits TurnComplete or Error.
   rpc Send(SendRequest) returns (stream AgentEvent);
 
+  // ACP-specific bidi turn stream. Used only by `borg acp` so daemon-side
+  // tools can request IDE text-buffer reads/writes during the turn.
+  rpc AcpTurn(stream AcpClientMessage) returns (stream AcpServerMessage);
+
   // Subscribe to a session's event stream from a given cursor.
   // Used by additional clients (multi-TUI) and for resume-after-disconnect.
   rpc Stream(StreamRequest) returns (stream AgentEvent);
@@ -60,6 +64,10 @@ message Empty {}
 message OpenRequest {
   // Optional resume_id — if set, daemon resumes that session's history.
   string resume_id = 1;
+  // Optional workspace context for session-scoped execution.
+  string workspace_cwd = 2;
+  string workspace_root = 3;
+  bool enforce_workspace_root = 4;
 }
 
 message OpenResponse {
@@ -79,6 +87,77 @@ message InlineImage {
   string mime_type = 1;
   bytes data = 2; // raw bytes, NOT base64
   string filename = 3; // optional
+}
+
+message AcpFsCapabilities {
+  bool read_text_file = 1;
+  bool write_text_file = 2;
+}
+
+message AcpStartTurn {
+  string session_id = 1;
+  string text = 2;
+  repeated InlineImage images = 3;
+  AcpFsCapabilities fs_capabilities = 4;
+}
+
+// In-stream cancel signal. Borg's own ACP client uses the unary `Cancel` RPC
+// (line 24) instead — it's simpler and idempotent. This variant remains so
+// external ACP clients that prefer keeping cancellation on the same bidi
+// stream as the turn can do so; the daemon honors both paths identically.
+message AcpCancel {
+  string session_id = 1;
+}
+
+message AcpReadTextFileRequest {
+  string path = 1;
+}
+
+message AcpWriteTextFileRequest {
+  string path = 1;
+  string content = 2;
+}
+
+message AcpFsRequest {
+  string request_id = 1;
+  oneof kind {
+    AcpReadTextFileRequest read_text_file = 2;
+    AcpWriteTextFileRequest write_text_file = 3;
+  }
+}
+
+message AcpReadTextFileResponse {
+  string content = 1;
+}
+
+message AcpWriteTextFileResponse {}
+
+message AcpFsError {
+  string message = 1;
+}
+
+message AcpFsResponse {
+  string request_id = 1;
+  oneof kind {
+    AcpReadTextFileResponse read_text_file = 2;
+    AcpWriteTextFileResponse write_text_file = 3;
+    AcpFsError error = 4;
+  }
+}
+
+message AcpClientMessage {
+  oneof kind {
+    AcpStartTurn start_turn = 1;
+    AcpFsResponse fs_response = 2;
+    AcpCancel cancel = 3;
+  }
+}
+
+message AcpServerMessage {
+  oneof kind {
+    AgentEvent agent_event = 1;
+    AcpFsRequest fs_request = 2;
+  }
 }
 
 message StreamRequest {

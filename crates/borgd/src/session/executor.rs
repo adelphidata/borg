@@ -82,6 +82,7 @@ impl DaemonSessionExecutor {
             Some(session_key),
             self.config_rx.clone(),
             self.cost_event_sink.clone(),
+            None,
         )?;
         let host = SessionHost::new(backend);
         self.registry.insert(host.clone());
@@ -116,7 +117,7 @@ impl SessionExecutor for DaemonSessionExecutor {
 
         // Subscribe BEFORE start_turn so we can't miss the first event.
         let mut sub = host.subscribe();
-        let (cancel, baseline) = host.start_turn(turn.text, images).await;
+        let (cancel, baseline) = host.start_turn(turn.text, images, None).await;
         let (tx, rx) = mpsc::channel::<AgentEvent>(64);
 
         // Bridge proto broadcast events back to core AgentEvents for the

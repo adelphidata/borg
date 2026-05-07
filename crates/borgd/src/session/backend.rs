@@ -32,6 +32,39 @@ fn lock_agent(agent: &Mutex<Agent>) -> tokio::sync::MutexGuard<'_, Agent> {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(agent.lock()))
 }
 
+/// RAII guard that detaches an attached IDE-backed text-file bridge when it
+/// drops — including the panic-unwind path — so the next turn never inherits
+/// a stale bridge. Constructed from a `&mut Agent` whose owning `MutexGuard`
+/// strictly outlives this guard. The pointer indirection is what lets us
+/// call `set_text_file_bridge(None)` from `Drop` without a second &mut borrow
+/// fight with the `agent` ref the surrounding code is using.
+struct TextFileBridgeAutoDetach {
+    agent: *mut Agent,
+}
+
+// Safety: the pointer is exclusively owned for the guard's lifetime — the
+// async Mutex enforces single-writer access, and we only construct this
+// guard while holding the MutexGuard. No aliasing access happens until the
+// guard drops.
+unsafe impl Send for TextFileBridgeAutoDetach {}
+
+impl TextFileBridgeAutoDetach {
+    fn new(agent: &mut Agent) -> Self {
+        Self {
+            agent: agent as *mut Agent,
+        }
+    }
+}
+
+impl Drop for TextFileBridgeAutoDetach {
+    fn drop(&mut self) {
+        // Safety: caller invariant — the &mut Agent we were built from is
+        // still alive (held by the surrounding MutexGuard) and exclusively
+        // owned. set_text_file_bridge(None) is a pure mutation of one field.
+        unsafe { (*self.agent).set_text_file_bridge(None) };
+    }
+}
+
 /// Snapshot of the agent's user-facing state for `Session.GetState`.
 #[derive(Debug, Clone)]
 pub struct SessionStateSnapshot {
@@ -88,6 +121,7 @@ pub trait SessionBackend: Send + Sync + 'static {
         images: Vec<InlineImage>,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
+        text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
     );
 
     /// Stable session id (for logs / SessionRegistry indexing).
@@ -190,8 +224,12 @@ impl AgentBackend {
         resume_id: Option<&str>,
         config_rx: Option<watch::Receiver<Config>>,
         cost_event_sink: Option<Arc<dyn CostEventSink>>,
+        execution_context: Option<cortex::execution_context::ExecutionContext>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics)?;
+        if let Some(execution_context) = execution_context {
+            agent.set_execution_context(execution_context);
+        }
         if let Some(rx) = config_rx {
             agent.set_config_watcher(rx);
         }
@@ -255,6 +293,7 @@ impl SessionBackend for AgentBackend {
         images: Vec<InlineImage>,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
+        text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
     ) {
         // Reject overlapping turns explicitly rather than silently queuing on
         // an async lock — a hung second `Send` is indistinguishable from a
@@ -272,6 +311,16 @@ impl SessionBackend for AgentBackend {
                 return;
             }
         };
+
+        // Attach the IDE-backed text-file bridge for the duration of the turn
+        // and detach unconditionally — including on unwind. The async Mutex
+        // serializes turns on this backend, so the next turn must not inherit
+        // a stale bridge if this turn's future is dropped or panics.
+        let bridge_attached = text_file_bridge.is_some();
+        if bridge_attached {
+            agent.set_text_file_bridge(text_file_bridge);
+        }
+        let _bridge_guard = bridge_attached.then(|| TextFileBridgeAutoDetach::new(&mut agent));
 
         let result = if images.is_empty() {
             agent
@@ -294,6 +343,8 @@ impl SessionBackend for AgentBackend {
             let msg = Message::user_multimodal(parts);
             agent.send_message_raw(msg, event_tx.clone(), cancel).await
         };
+        // _bridge_guard's Drop runs here (or earlier on unwind) and detaches.
+        drop(_bridge_guard);
 
         if let Err(e) = result {
             // anyhow's `Display` only renders the topmost message; `{:#}` walks

@@ -7,20 +7,24 @@
 
 use crate::session::{convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use protocols::session::{
-    session_server::Session, AgentEvent, AppendAssistantMessageRequest, AutoSaveRequest,
-    CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse, CompactRequest,
-    CompactResponse, Empty, ForkRequest, ForkResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse, PromptResponse,
-    RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
-    StreamRequest, UndoRequest, UndoResponse,
+    acp_client_message, acp_fs_request, acp_fs_response, acp_server_message,
+    session_server::Session, AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsRequest,
+    AcpFsResponse, AcpReadTextFileRequest, AcpReadTextFileResponse, AcpServerMessage,
+    AcpWriteTextFileRequest, AcpWriteTextFileResponse, AgentEvent, AppendAssistantMessageRequest,
+    AutoSaveRequest, CancelRequest, CancelResponse, ClearRequest, CloseRequest, CloseResponse,
+    CompactRequest, CompactResponse, Empty, ForkRequest, ForkResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest, OpenResponse,
+    PromptResponse, RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest,
+    SteerRequest, StreamRequest, UndoRequest, UndoResponse,
 };
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{Request, Response, Status as TStatus};
+use tonic::{Request, Response, Status as TStatus, Streaming};
+use uuid::Uuid;
 
 /// Factory: given an optional `resume_id`, build a fresh [`SessionHost`].
 /// Boxed-future signature (instead of `async fn` in trait) keeps the trait
@@ -28,11 +32,129 @@ use tonic::{Request, Response, Status as TStatus};
 pub trait SessionFactory: Send + Sync + 'static {
     /// Construct a new session host. May return an error if the underlying
     /// agent failed to initialize (bad config, missing API key, etc.).
-    fn open(&self, resume_id: Option<&str>) -> Result<SessionHost, anyhow::Error>;
+    fn open(
+        &self,
+        resume_id: Option<&str>,
+        execution_context: Option<cortex::execution_context::ExecutionContext>,
+    ) -> Result<SessionHost, anyhow::Error>;
 }
 
 /// Type alias for the boxed server-stream future returned by Send/Stream.
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<AgentEvent, TStatus>> + Send + 'static>>;
+/// Type alias for the boxed ACP bidi server-stream.
+pub type AcpEventStream =
+    Pin<Box<dyn Stream<Item = Result<AcpServerMessage, TStatus>> + Send + 'static>>;
+
+/// Upper bound on a single ACP fs round-trip. The bridge holds the agent's
+/// async Mutex while it waits for the IDE — without a deadline a slow or
+/// hung client stalls the whole session indefinitely.
+const ACP_FS_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+type AcpFsResponseSender = oneshot::Sender<Result<AcpFsResponse, String>>;
+type PendingAcpFsRequests = Arc<Mutex<std::collections::HashMap<String, AcpFsResponseSender>>>;
+
+struct GrpcAcpTextFileBridge {
+    fs_tx: mpsc::Sender<Result<AcpServerMessage, TStatus>>,
+    pending: PendingAcpFsRequests,
+    capabilities: AcpFsCapabilities,
+}
+
+impl GrpcAcpTextFileBridge {
+    async fn request(&self, request: AcpFsRequest) -> Result<AcpFsResponse, String> {
+        let (tx, rx) = oneshot::channel();
+        let request_id = request.request_id.clone();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.insert(request_id.clone(), tx);
+        }
+        if let Err(e) = self
+            .fs_tx
+            .send(Ok(AcpServerMessage {
+                kind: Some(acp_server_message::Kind::FsRequest(request)),
+            }))
+            .await
+        {
+            let mut pending = self.pending.lock().await;
+            pending.remove(&request_id);
+            return Err(format!("failed to send ACP fs request to client: {e}"));
+        }
+        // Bound the wait so a hung IDE can't pin the agent's lock indefinitely.
+        // On timeout we proactively evict our pending entry so the inbound
+        // task doesn't accumulate orphaned senders for the lifetime of the
+        // session (A8).
+        match tokio::time::timeout(ACP_FS_CALLBACK_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&request_id);
+                Err("ACP fs client disconnected before replying".to_string())
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                Err(format!(
+                    "ACP fs client did not reply within {}s",
+                    ACP_FS_CALLBACK_TIMEOUT.as_secs()
+                ))
+            }
+        }
+    }
+}
+
+impl cortex::execution_context::TextFileBridge for GrpcAcpTextFileBridge {
+    fn supports_read_text_file(&self) -> bool {
+        self.capabilities.read_text_file
+    }
+
+    fn supports_write_text_file(&self) -> bool {
+        self.capabilities.write_text_file
+    }
+
+    fn read_text_file(&self, path: &std::path::Path) -> anyhow::Result<String> {
+        if !self.supports_read_text_file() {
+            anyhow::bail!("ACP client did not advertise fs.read_text_file");
+        }
+        let request = AcpFsRequest {
+            request_id: Uuid::new_v4().to_string(),
+            kind: Some(acp_fs_request::Kind::ReadTextFile(AcpReadTextFileRequest {
+                path: path.to_string_lossy().to_string(),
+            })),
+        };
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.request(request))
+        })
+        .map_err(anyhow::Error::msg)?;
+        match response.kind {
+            Some(acp_fs_response::Kind::ReadTextFile(AcpReadTextFileResponse { content })) => {
+                Ok(content)
+            }
+            Some(acp_fs_response::Kind::Error(AcpFsError { message })) => anyhow::bail!(message),
+            _ => anyhow::bail!("ACP fs client returned wrong response kind for read_text_file"),
+        }
+    }
+
+    fn write_text_file(&self, path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+        if !self.supports_write_text_file() {
+            anyhow::bail!("ACP client did not advertise fs.write_text_file");
+        }
+        let request = AcpFsRequest {
+            request_id: Uuid::new_v4().to_string(),
+            kind: Some(acp_fs_request::Kind::WriteTextFile(
+                AcpWriteTextFileRequest {
+                    path: path.to_string_lossy().to_string(),
+                    content: content.to_string(),
+                },
+            )),
+        };
+        let response = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.request(request))
+        })
+        .map_err(anyhow::Error::msg)?;
+        match response.kind {
+            Some(acp_fs_response::Kind::WriteTextFile(AcpWriteTextFileResponse {})) => Ok(()),
+            Some(acp_fs_response::Kind::Error(AcpFsError { message })) => anyhow::bail!(message),
+            _ => anyhow::bail!("ACP fs client returned wrong response kind for write_text_file"),
+        }
+    }
+}
 
 /// Session service implementation.
 pub struct SessionSvc {
@@ -59,10 +181,33 @@ impl SessionSvc {
 impl Session for SessionSvc {
     type SendStream = EventStream;
     type StreamStream = EventStream;
+    type AcpTurnStream = AcpEventStream;
 
     async fn open(&self, req: Request<OpenRequest>) -> Result<Response<OpenResponse>, TStatus> {
         let req = req.into_inner();
         let resume = (!req.resume_id.is_empty()).then_some(req.resume_id.as_str());
+        let execution_context = if !req.workspace_cwd.is_empty()
+            || !req.workspace_root.is_empty()
+            || req.enforce_workspace_root
+        {
+            let workspace_cwd = std::path::PathBuf::from(req.workspace_cwd);
+            let workspace_root = if req.workspace_root.is_empty() {
+                workspace_cwd.clone()
+            } else {
+                std::path::PathBuf::from(req.workspace_root)
+            };
+            Some(
+                cortex::execution_context::ExecutionContext::for_workspace(
+                    workspace_cwd,
+                    workspace_root,
+                )
+                .map_err(|e| {
+                    TStatus::invalid_argument(format!("invalid workspace context: {e}"))
+                })?,
+            )
+        } else {
+            None
+        };
 
         // If resuming and the host is still live, just hand back its cursor.
         if let Some(id) = resume {
@@ -76,7 +221,7 @@ impl Session for SessionSvc {
 
         let host = self
             .factory
-            .open(resume)
+            .open(resume, execution_context)
             .map_err(|e| TStatus::internal(format!("session open failed: {e}")))?;
         let session_id = host.id().to_string();
         let last_event_seq = host.last_event_seq();
@@ -107,7 +252,7 @@ impl Session for SessionSvc {
                 filename: (!i.filename.is_empty()).then_some(i.filename),
             })
             .collect();
-        let (_cancel, baseline_seq) = host.start_turn(req.text, images).await;
+        let (_cancel, baseline_seq) = host.start_turn(req.text, images, None).await;
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {
@@ -135,6 +280,138 @@ impl Session for SessionSvc {
                 }
             }
         });
+        Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
+    }
+
+    async fn acp_turn(
+        &self,
+        req: Request<Streaming<AcpClientMessage>>,
+    ) -> Result<Response<Self::AcpTurnStream>, TStatus> {
+        let mut inbound = req.into_inner();
+        let first = inbound
+            .next()
+            .await
+            .ok_or_else(|| TStatus::invalid_argument("client closed before AcpStartTurn"))?
+            .map_err(|e| TStatus::internal(format!("acp turn inbound error: {e}")))?;
+        let start = match first.kind {
+            Some(acp_client_message::Kind::StartTurn(start)) => start,
+            _ => {
+                return Err(TStatus::invalid_argument(
+                    "first ACP turn message must be start_turn",
+                ))
+            }
+        };
+
+        let host = self.host_or_err(&start.session_id)?;
+        let (tx, out_rx) = mpsc::channel::<Result<AcpServerMessage, TStatus>>(64);
+        let pending: PendingAcpFsRequests = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        let bridge = if start
+            .fs_capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.read_text_file || caps.write_text_file)
+        {
+            Some(Arc::new(GrpcAcpTextFileBridge {
+                fs_tx: tx.clone(),
+                pending: pending.clone(),
+                capabilities: start.fs_capabilities.unwrap_or(AcpFsCapabilities {
+                    read_text_file: false,
+                    write_text_file: false,
+                }),
+            })
+                as Arc<dyn cortex::execution_context::TextFileBridge>)
+        } else {
+            None
+        };
+
+        let mut rx = host.subscribe();
+        let images = start
+            .images
+            .into_iter()
+            .map(|i| crate::session::backend::InlineImage {
+                mime_type: i.mime_type,
+                data: i.data,
+                filename: (!i.filename.is_empty()).then_some(i.filename),
+            })
+            .collect();
+        let (_cancel, baseline_seq) = host.start_turn(start.text, images, bridge).await;
+
+        let host_for_inbound = host.clone();
+        let pending_for_inbound = pending.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = inbound.next().await {
+                match msg {
+                    Ok(AcpClientMessage {
+                        kind: Some(acp_client_message::Kind::FsResponse(response)),
+                    }) => {
+                        let tx = {
+                            let mut pending = pending_for_inbound.lock().await;
+                            pending.remove(&response.request_id)
+                        };
+                        if let Some(tx) = tx {
+                            let _ = tx.send(Ok(response));
+                        } else {
+                            tracing::warn!(request_id = %response.request_id, "unknown ACP fs response");
+                        }
+                    }
+                    Ok(AcpClientMessage {
+                        kind: Some(acp_client_message::Kind::Cancel(cancel)),
+                    }) => {
+                        if cancel.session_id == host_for_inbound.id() {
+                            host_for_inbound.cancel_turn().await;
+                        }
+                    }
+                    Ok(AcpClientMessage {
+                        kind: Some(acp_client_message::Kind::StartTurn(_)),
+                    }) => {
+                        tracing::warn!("received duplicate ACP start_turn on live stream");
+                    }
+                    Ok(AcpClientMessage { kind: None }) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ACP inbound stream failed");
+                        host_for_inbound.cancel_turn().await;
+                        break;
+                    }
+                }
+            }
+            let pending = {
+                let mut pending = pending_for_inbound.lock().await;
+                std::mem::take(&mut *pending)
+            };
+            for (_id, tx) in pending {
+                let _ = tx.send(Err("ACP fs stream closed before client replied".to_string()));
+            }
+        });
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(evt) => {
+                        if evt.event_seq <= baseline_seq {
+                            continue;
+                        }
+                        let terminal = convert::is_terminal(&evt);
+                        if tx
+                            .send(Ok(AcpServerMessage {
+                                kind: Some(acp_server_message::Kind::AgentEvent(evt)),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "session.acp_turn subscriber lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         Ok(Response::new(Box::pin(ReceiverStream::new(out_rx))))
     }
 

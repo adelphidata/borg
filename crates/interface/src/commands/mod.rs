@@ -1,3 +1,4 @@
+pub(crate) mod acp;
 pub(crate) mod audit;
 pub(crate) mod backup;
 pub(crate) mod client_token;

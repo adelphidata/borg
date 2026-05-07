@@ -19,6 +19,7 @@ pub use connect::{connect, default_socket_path};
 pub use event_stream::{forward_event_stream, spawn_event_adapter};
 
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
     ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyList, ApiKeyRef,
@@ -40,8 +41,11 @@ use protocols::pki::{
 };
 use protocols::session::session_client::SessionClient;
 use protocols::session::{
-    AgentEvent, AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest,
-    CloseRequest, CompactRequest, CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest,
+    acp_client_message, acp_fs_request, acp_fs_response, acp_server_message, AcpCancel,
+    AcpClientMessage, AcpFsCapabilities, AcpFsError, AcpFsResponse, AcpReadTextFileResponse,
+    AcpServerMessage, AcpStartTurn, AcpWriteTextFileResponse, AgentEvent,
+    AppendAssistantMessageRequest, AutoSaveRequest, CancelRequest, ClearRequest, CloseRequest,
+    CompactRequest, CompactResponse, ForkRequest, ForkResponse, LoadSessionRequest,
     LoadSessionResponse, NewSessionRequest, NewSessionResponse, OpenRequest, PromptResponse,
     RewindRequest, RewindResponse, SendRequest, SessionState, SessionStateRequest, SteerRequest,
     StreamRequest, UndoRequest, UndoResponse,
@@ -51,6 +55,8 @@ use protocols::status::{
     BondEventList, BondStateProto, Empty as StatusEmpty, EvolutionEventList, EvolutionStateProto,
     Int64Cursor, StatusText, StatusTextRequest, Vitals, VitalsEventList, XpSnapshot,
 };
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tonic::Streaming;
 
@@ -64,6 +70,13 @@ pub struct DaemonClient {
     admin: AdminClient<Channel>,
     status: StatusClient<Channel>,
     pki: PkiClient<Channel>,
+}
+
+#[async_trait]
+pub trait AcpFsClient: Clone + Send + Sync + 'static {
+    async fn read_text_file(&self, path: &str) -> Result<String>;
+    async fn write_text_file(&self, path: &str, content: &str) -> Result<()>;
+    fn capabilities(&self) -> AcpFsCapabilities;
 }
 
 impl DaemonClient {
@@ -242,10 +255,29 @@ impl DaemonClient {
     /// Open a fresh session (or resume the named one if `resume_id` is set).
     /// Returns `(session_id, last_event_seq)`.
     pub async fn open_session(&mut self, resume_id: Option<&str>) -> Result<(String, u64)> {
+        self.open_session_with_workspace(resume_id, None, None, false)
+            .await
+    }
+
+    /// Open a session with an optional explicit workspace context.
+    pub async fn open_session_with_workspace(
+        &mut self,
+        resume_id: Option<&str>,
+        workspace_cwd: Option<&std::path::Path>,
+        workspace_root: Option<&std::path::Path>,
+        enforce_workspace_root: bool,
+    ) -> Result<(String, u64)> {
         let resp = self
             .session
             .open(OpenRequest {
                 resume_id: resume_id.unwrap_or_default().to_string(),
+                workspace_cwd: workspace_cwd
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                workspace_root: workspace_root
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                enforce_workspace_root,
             })
             .await
             .context("Session.Open failed")?
@@ -282,6 +314,140 @@ impl DaemonClient {
             .context("Session.Send failed")?
             .into_inner();
         Ok(stream)
+    }
+
+    /// Send an ACP-backed prompt and service daemon fs callbacks over the
+    /// same bidi turn stream.
+    pub async fn send_acp_prompt<F: AcpFsClient>(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        images: Vec<protocols::session::InlineImage>,
+        fs_client: F,
+    ) -> Result<mpsc::Receiver<cortex::agent::AgentEvent>> {
+        let (client_tx, client_rx) = mpsc::channel::<AcpClientMessage>(32);
+        let mut stream = self
+            .session
+            .acp_turn(ReceiverStream::new(client_rx))
+            .await
+            .context("Session.AcpTurn failed")?
+            .into_inner();
+
+        client_tx
+            .send(AcpClientMessage {
+                kind: Some(acp_client_message::Kind::StartTurn(AcpStartTurn {
+                    session_id: session_id.to_string(),
+                    text: text.to_string(),
+                    images,
+                    fs_capabilities: Some(fs_client.capabilities()),
+                })),
+            })
+            .await
+            .map_err(|e| anyhow!("failed to send ACP start_turn: {e}"))?;
+
+        let (event_tx, event_rx) = mpsc::channel::<cortex::agent::AgentEvent>(256);
+        let daemon_client = self.clone();
+        let session_id_owned = session_id.to_string();
+        tokio::spawn(async move {
+            loop {
+                match stream.message().await {
+                    Ok(Some(AcpServerMessage {
+                        kind: Some(acp_server_message::Kind::AgentEvent(pb)),
+                    })) => {
+                        if let Some(core) = crate::daemon_client::event_stream::convert_pb_event(
+                            pb,
+                            &daemon_client,
+                            &session_id_owned,
+                        ) {
+                            if event_tx.send(core).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Some(AcpServerMessage {
+                        kind: Some(acp_server_message::Kind::FsRequest(request)),
+                    })) => {
+                        let response = match request.kind {
+                            Some(acp_fs_request::Kind::ReadTextFile(read)) => {
+                                match fs_client.read_text_file(&read.path).await {
+                                    Ok(content) => AcpFsResponse {
+                                        request_id: request.request_id,
+                                        kind: Some(acp_fs_response::Kind::ReadTextFile(
+                                            AcpReadTextFileResponse { content },
+                                        )),
+                                    },
+                                    Err(e) => AcpFsResponse {
+                                        request_id: request.request_id,
+                                        kind: Some(acp_fs_response::Kind::Error(AcpFsError {
+                                            message: e.to_string(),
+                                        })),
+                                    },
+                                }
+                            }
+                            Some(acp_fs_request::Kind::WriteTextFile(write)) => {
+                                match fs_client.write_text_file(&write.path, &write.content).await {
+                                    Ok(()) => AcpFsResponse {
+                                        request_id: request.request_id,
+                                        kind: Some(acp_fs_response::Kind::WriteTextFile(
+                                            AcpWriteTextFileResponse {},
+                                        )),
+                                    },
+                                    Err(e) => AcpFsResponse {
+                                        request_id: request.request_id,
+                                        kind: Some(acp_fs_response::Kind::Error(AcpFsError {
+                                            message: e.to_string(),
+                                        })),
+                                    },
+                                }
+                            }
+                            None => AcpFsResponse {
+                                request_id: request.request_id,
+                                kind: Some(acp_fs_response::Kind::Error(AcpFsError {
+                                    message: "missing ACP fs request kind".to_string(),
+                                })),
+                            },
+                        };
+                        if client_tx
+                            .send(AcpClientMessage {
+                                kind: Some(acp_client_message::Kind::FsResponse(response)),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            let _ = event_tx
+                                .send(cortex::agent::AgentEvent::Error(
+                                    "ACP turn stream closed while sending fs response".into(),
+                                ))
+                                .await;
+                            break;
+                        }
+                    }
+                    Ok(Some(AcpServerMessage { kind: None })) => {}
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = event_tx
+                            .send(cortex::agent::AgentEvent::Error(e.to_string()))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+        Ok(event_rx)
+    }
+
+    /// Send ACP cancellation on a live bidi turn stream.
+    pub async fn send_acp_cancel(
+        tx: &mpsc::Sender<AcpClientMessage>,
+        session_id: &str,
+    ) -> Result<()> {
+        tx.send(AcpClientMessage {
+            kind: Some(acp_client_message::Kind::Cancel(AcpCancel {
+                session_id: session_id.to_string(),
+            })),
+        })
+        .await
+        .map_err(|e| anyhow!("failed to send ACP cancel: {e}"))
     }
 
     /// Subscribe to a session's event stream from `since_event_seq` (use 0 to

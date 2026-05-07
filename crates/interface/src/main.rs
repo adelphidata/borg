@@ -229,6 +229,8 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::mcp::McpAction>,
     },
+    /// Run Borg as an Agent Client Protocol (ACP) server over stdio
+    Acp,
     /// Manage LLM providers (BYO endpoints, rate-card refresh)
     Providers {
         #[command(subcommand)]
@@ -358,6 +360,10 @@ async fn async_main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if matches!(cli.command, Some(Commands::Acp)) {
+        return commands::acp::run_acp_stdio().await;
+    }
 
     let tui_mode = matches!(cli.command, Some(Commands::Start) | None);
 
@@ -521,6 +527,7 @@ async fn async_main() -> Result<()> {
         }
         Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action)?,
         Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
+        Some(Commands::Acp) => unreachable!("ACP handled before interactive bootstrap"),
         Some(Commands::Uninstall) => commands::misc::run_uninstall()?,
         Some(Commands::Export {
             session_id,
@@ -1507,6 +1514,12 @@ mod tests {
     fn test_parse_heal() {
         let cli = Cli::try_parse_from(["borg", "heal"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::Heal)));
+    }
+
+    #[test]
+    fn test_parse_acp() {
+        let cli = Cli::try_parse_from(["borg", "acp"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Acp)));
     }
 
     #[test]

@@ -36,7 +36,11 @@ struct DaemonSessionFactory {
 }
 
 impl SessionFactory for DaemonSessionFactory {
-    fn open(&self, resume_id: Option<&str>) -> Result<SessionHost> {
+    fn open(
+        &self,
+        resume_id: Option<&str>,
+        execution_context: Option<cortex::execution_context::ExecutionContext>,
+    ) -> Result<SessionHost> {
         let config = self.config_rx.borrow().clone();
         let backend = AgentBackend::new(
             config,
@@ -44,6 +48,7 @@ impl SessionFactory for DaemonSessionFactory {
             resume_id,
             Some(self.config_rx.clone()),
             Some(self.cost_event_sink.clone()),
+            execution_context,
         )?;
         Ok(SessionHost::new(backend))
     }
