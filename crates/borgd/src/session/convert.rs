@@ -11,6 +11,21 @@ use cortex::agent::AgentEvent as CoreEvent;
 use protocols::session as pb;
 use std::sync::Arc;
 
+/// `SystemNotice.category` emitted by [`from_proto`] when the wire event was a
+/// `UserInputRequest`. The two prompt-bearing variants (`UserInputRequest`,
+/// `ShellConfirmation`) carry an `oneshot::Sender` on the core side that the
+/// wire path has already lowered to a `prompt_id` in the per-session
+/// [`PromptRegistry`]. Reverse-mapping back into the original `CoreEvent`
+/// variant would require fabricating a sender, so for in-process consumers
+/// (e.g. the heartbeat dispatcher's executor bridge) we surface the request
+/// as a sender-free `SystemNotice` instead. Heartbeat code matches on this
+/// constant to short-circuit non-interactive turns rather than waiting for
+/// the 5-minute oneshot timeout in `request_user_input`.
+pub const PROMPT_REQUEST_USER_INPUT: &str = "prompt_request:user_input";
+
+/// Companion to [`PROMPT_REQUEST_USER_INPUT`] for `ShellConfirmation`.
+pub const PROMPT_REQUEST_SHELL: &str = "prompt_request:shell";
+
 /// Translate one core event. Returns `None` only when the event has no
 /// useful wire representation (currently: no such case — every variant maps).
 pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEvent {
@@ -198,16 +213,14 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
             category: s.category,
             text: s.text,
         },
-        Kind::ShellConfirmation(sc) => {
-            tracing::warn!(prompt_id = %sc.prompt_id, command = %sc.command,
-                "from_proto: dropping ShellConfirmation");
-            return None;
-        }
-        Kind::UserInputRequest(ui) => {
-            tracing::warn!(prompt_id = %ui.prompt_id, question_count = ui.questions.len(),
-                "from_proto: dropping UserInputRequest");
-            return None;
-        }
+        Kind::ShellConfirmation(sc) => CoreEvent::SystemNotice {
+            category: PROMPT_REQUEST_SHELL.into(),
+            text: sc.command,
+        },
+        Kind::UserInputRequest(ui) => CoreEvent::SystemNotice {
+            category: PROMPT_REQUEST_USER_INPUT.into(),
+            text: format!("{} pending", ui.questions.len()),
+        },
     })
 }
 
@@ -287,6 +300,185 @@ mod tests {
         prompts
             .respond(&ui.prompt_id, r#"{"color":{"answers":["Red"]}}"#)
             .expect("respond ok");
+    }
+
+    #[test]
+    fn from_proto_user_input_request_translates_to_system_notice() {
+        // Real failure mode: returning None here (the pre-fix behavior) made
+        // the executor bridge swallow the event; an in-process heartbeat
+        // consumer then waited on a never-closing channel until the
+        // request_user_input tool's 5-minute oneshot fired. Surfacing as a
+        // SystemNotice is what lets the heartbeat short-circuit and emit a
+        // terminal bus event inside the smorgasborg eval's 90s budget.
+        let proto = pb::AgentEvent {
+            event_seq: 7,
+            kind: Some(pb::agent_event::Kind::UserInputRequest(
+                pb::UserInputRequest {
+                    prompt_id: "p-1".into(),
+                    questions: vec![pb::UserInputQuestion {
+                        id: "q1".into(),
+                        header: "h".into(),
+                        question: "ask".into(),
+                        multi_select: false,
+                        options: vec![],
+                    }],
+                },
+            )),
+        };
+        let core = from_proto(proto).expect("must not be dropped");
+        match core {
+            CoreEvent::SystemNotice { category, text } => {
+                assert_eq!(category, PROMPT_REQUEST_USER_INPUT);
+                assert!(
+                    text.contains('1'),
+                    "text should reflect the question count, got {text:?}"
+                );
+            }
+            _ => panic!("expected SystemNotice"),
+        }
+    }
+
+    #[test]
+    fn from_proto_shell_confirmation_translates_to_system_notice() {
+        // Symmetric guard for ShellConfirmation — the same silent-drop bug
+        // class. Heartbeat / hook in-process consumers must observe the
+        // event in some form so they can decide to cancel the turn.
+        let proto = pb::AgentEvent {
+            event_seq: 11,
+            kind: Some(pb::agent_event::Kind::ShellConfirmation(
+                pb::ShellConfirmation {
+                    prompt_id: "p-2".into(),
+                    command: "rm -rf /tmp/foo".into(),
+                },
+            )),
+        };
+        let core = from_proto(proto).expect("must not be dropped");
+        match core {
+            CoreEvent::SystemNotice { category, text } => {
+                assert_eq!(category, PROMPT_REQUEST_SHELL);
+                assert_eq!(text, "rm -rf /tmp/foo");
+            }
+            _ => panic!("expected SystemNotice"),
+        }
+    }
+
+    #[test]
+    fn from_proto_handles_every_oneof_variant_without_dropping() {
+        // Exhaustive regression guard: every `pb::agent_event::Kind` variant
+        // must produce `Some(_)`. The original bug was a silent
+        // `return None` for two variants — this test would have caught it,
+        // and would catch any future variant author who copy-pastes the
+        // same shape. Pairs with the type-level `match` in `from_proto` so
+        // adding a new Kind variant forces both a mapping and a row here.
+        use pb::agent_event::Kind;
+        let cases: Vec<(&'static str, Kind)> = vec![
+            (
+                "TextDelta",
+                Kind::TextDelta(pb::TextDelta { text: "hi".into() }),
+            ),
+            (
+                "ThinkingDelta",
+                Kind::ThinkingDelta(pb::ThinkingDelta { text: "t".into() }),
+            ),
+            (
+                "ToolExecuting",
+                Kind::ToolExecuting(pb::ToolExecuting {
+                    tool_call_id: "id".into(),
+                    name: "n".into(),
+                    args_json: "{}".into(),
+                }),
+            ),
+            (
+                "ToolResult",
+                Kind::ToolResult(pb::ToolResult {
+                    tool_call_id: "id".into(),
+                    name: "n".into(),
+                    result: "r".into(),
+                }),
+            ),
+            (
+                "ShellConfirmation",
+                Kind::ShellConfirmation(pb::ShellConfirmation {
+                    prompt_id: "p".into(),
+                    command: "ls".into(),
+                }),
+            ),
+            (
+                "ToolOutputDelta",
+                Kind::ToolOutputDelta(pb::ToolOutputDelta {
+                    tool_call_id: "id".into(),
+                    name: "n".into(),
+                    delta: "x".into(),
+                    is_stderr: false,
+                }),
+            ),
+            (
+                "Usage",
+                Kind::Usage(pb::Usage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                }),
+            ),
+            (
+                "SubAgentUpdate",
+                Kind::SubAgentUpdate(pb::SubAgentUpdate {
+                    agent_id: "a".into(),
+                    nickname: "n".into(),
+                    status: "s".into(),
+                }),
+            ),
+            (
+                "SteerReceived",
+                Kind::SteerReceived(pb::SteerReceived { text: "s".into() }),
+            ),
+            (
+                "PlanUpdated",
+                Kind::PlanUpdated(pb::PlanUpdated { steps: vec![] }),
+            ),
+            (
+                "UserInputRequest",
+                Kind::UserInputRequest(pb::UserInputRequest {
+                    prompt_id: "p".into(),
+                    questions: vec![],
+                }),
+            ),
+            ("Preparing", Kind::Preparing(pb::Preparing {})),
+            ("TurnComplete", Kind::TurnComplete(pb::TurnComplete {})),
+            (
+                "HistoryCompacted",
+                Kind::HistoryCompacted(pb::HistoryCompacted {
+                    dropped: 0,
+                    before_tokens: 0,
+                    after_tokens: 0,
+                    iterative: false,
+                }),
+            ),
+            (
+                "Error",
+                Kind::Error(pb::ErrorEvent {
+                    message: "x".into(),
+                }),
+            ),
+            (
+                "SystemNotice",
+                Kind::SystemNotice(pb::SystemNotice {
+                    category: "info".into(),
+                    text: "hello".into(),
+                }),
+            ),
+        ];
+        for (name, kind) in cases {
+            let event = pb::AgentEvent {
+                event_seq: 1,
+                kind: Some(kind),
+            };
+            assert!(
+                from_proto(event).is_some(),
+                "from_proto must not silently drop wire variant {name}"
+            );
+        }
     }
 
     #[test]

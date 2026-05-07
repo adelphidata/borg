@@ -8,6 +8,7 @@
 //! prompt builder moves inside the daemon's session machinery, this
 //! module routes through `DaemonSessionExecutor` instead.
 
+use crate::session::convert::{PROMPT_REQUEST_SHELL, PROMPT_REQUEST_USER_INPUT};
 use crate::session::DaemonSessionExecutor;
 use anyhow::Result;
 use cortex::agent::AgentEvent;
@@ -19,9 +20,105 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+
+/// Time we let the executor flush its terminal `Error` event after we
+/// cancel a hung turn, before dropping the receiver. Avoids spurious
+/// `broadcast::error::Closed` warnings in the bridge log when the backend
+/// is mid-shutdown.
+const HEARTBEAT_DRAIN_GRACE: Duration = Duration::from_millis(150);
+
+/// Outcome of [`collect_heartbeat_response`]. Modeled separately from
+/// `HeartbeatResult` so the helper stays a pure async-channel function with
+/// no DB / config / dedup coupling — the outer `execute_heartbeat_turn`
+/// owns all of that.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CollectOutcome {
+    /// The session executor closed `event_rx` cleanly. Carries the
+    /// concatenated `TextDelta` payload for downstream zero-info / dedup
+    /// logic to inspect.
+    Completed(String),
+    /// The configured wall-clock budget elapsed before the channel closed.
+    /// The cancel token has been triggered; the event_rx loop has already
+    /// done a brief grace drain.
+    Timeout,
+    /// The agent emitted a `SystemNotice` whose category matches one of the
+    /// `prompt_request:*` constants (the new wire shape produced by
+    /// [`crate::session::convert::from_proto`] for `UserInputRequest` /
+    /// `ShellConfirmation`). Heartbeats are non-interactive — there is no
+    /// client to call `RespondToPrompt`, so the underlying tool would park
+    /// for its 5-minute oneshot timeout. We cancel the turn and report
+    /// immediately so the bus sees a terminal event inside the
+    /// smorgasborg eval's 90s budget.
+    InteractivePromptRequested(String),
+}
+
+/// Drive the heartbeat agent's event channel until the turn ends, the
+/// configured `timeout` elapses, or the agent issues an interactive prompt
+/// request. Returns immediately on cancel-worthy conditions and triggers
+/// the cancel token so the executor's backend can wind down its turn.
+pub(crate) async fn collect_heartbeat_response(
+    mut event_rx: mpsc::Receiver<AgentEvent>,
+    cancel: CancellationToken,
+    timeout: Duration,
+) -> CollectOutcome {
+    let deadline = Instant::now() + timeout;
+    let mut response = String::new();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            cancel.cancel();
+            drain_briefly(&mut event_rx).await;
+            return CollectOutcome::Timeout;
+        }
+        let remaining = deadline - now;
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Err(_) => {
+                cancel.cancel();
+                drain_briefly(&mut event_rx).await;
+                return CollectOutcome::Timeout;
+            }
+            Ok(None) => return CollectOutcome::Completed(response),
+            Ok(Some(AgentEvent::TextDelta(delta))) => {
+                response.push_str(&delta);
+            }
+            Ok(Some(AgentEvent::SystemNotice { category, text }))
+                if category == PROMPT_REQUEST_USER_INPUT || category == PROMPT_REQUEST_SHELL =>
+            {
+                cancel.cancel();
+                drain_briefly(&mut event_rx).await;
+                // Cap at 200 chars (mirrors `log_heartbeat_activity`) so a
+                // pathological shell command can't bloat the activity log.
+                let snippet: String = text.chars().take(200).collect();
+                return CollectOutcome::InteractivePromptRequested(format!(
+                    "{category}: {snippet}"
+                ));
+            }
+            Ok(Some(_)) => {
+                // Other event variants (ToolExecuting, Usage, unrelated
+                // SystemNotices, …) don't contribute to the textual
+                // response but also don't end the turn.
+            }
+        }
+    }
+}
+
+async fn drain_briefly(event_rx: &mut mpsc::Receiver<AgentEvent>) {
+    let drain_deadline = Instant::now() + HEARTBEAT_DRAIN_GRACE;
+    loop {
+        let now = Instant::now();
+        if now >= drain_deadline {
+            return;
+        }
+        let remaining = drain_deadline - now;
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Err(_) | Ok(None) => return,
+            Ok(Some(_)) => {}
+        }
+    }
+}
 
 /// Why a heartbeat turn is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +289,7 @@ pub fn spawn(
                         continue;
                     }
                     run_and_broadcast(
-                        &runner_executor,
+                        runner_executor.as_ref(),
                         &runner_config,
                         trigger,
                         &bus_for_runner,
@@ -209,8 +306,13 @@ pub fn spawn(
 }
 
 /// Run a heartbeat turn and broadcast the result on `bus`. Fire-and-forget.
+///
+/// Takes `&dyn SessionExecutor` rather than the concrete
+/// `DaemonSessionExecutor` so integration tests can substitute a stub —
+/// the function only needs `executor.start_turn(...)`. Production callers
+/// pass the real `DaemonSessionExecutor` unchanged.
 pub async fn run_and_broadcast(
-    executor: &DaemonSessionExecutor,
+    executor: &dyn SessionExecutor,
     config: &Config,
     trigger: HeartbeatTrigger,
     bus: &HeartbeatBus,
@@ -329,7 +431,7 @@ fn publish_scheduler_result(bus: &HeartbeatBus, source: HeartbeatSource, result:
 /// SessionRegistry so hooks (vitals, evolution, …) fire the same way they do
 /// for user-driven turns. The dedup window and zero-info filter are identical.
 pub async fn execute_heartbeat_turn(
-    executor: &DaemonSessionExecutor,
+    executor: &dyn SessionExecutor,
     config: &Config,
     source: HeartbeatSource,
 ) -> HeartbeatResult {
@@ -352,7 +454,7 @@ pub async fn execute_heartbeat_turn(
         text: user_msg,
         images: Vec::new(),
     };
-    let (mut event_rx, _cancel) = match executor.start_turn(turn).await {
+    let (event_rx, cancel) = match executor.start_turn(turn).await {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Heartbeat: executor.start_turn failed: {e}");
@@ -362,14 +464,25 @@ pub async fn execute_heartbeat_turn(
         }
     };
 
-    let mut response = String::new();
-    while let Some(event) = event_rx.recv().await {
-        if let AgentEvent::TextDelta(delta) = event {
-            response.push_str(&delta);
-        }
-    }
-
+    let timeout_secs = config.heartbeat.turn_timeout_secs.max(1);
+    let outcome =
+        collect_heartbeat_response(event_rx, cancel, Duration::from_secs(timeout_secs)).await;
     let duration_ms = started.elapsed().as_millis() as u64;
+
+    let response = match outcome {
+        CollectOutcome::Completed(text) => text,
+        CollectOutcome::Timeout => {
+            return HeartbeatResult::Failed {
+                error: format!("heartbeat turn exceeded {timeout_secs}s timeout"),
+            };
+        }
+        CollectOutcome::InteractivePromptRequested(detail) => {
+            return HeartbeatResult::Failed {
+                error: format!("agent requested interactive input during heartbeat ({detail})"),
+            };
+        }
+    };
+
     let trimmed = response.trim().to_string();
 
     if trimmed.is_empty() || is_zero_info_heartbeat(&trimmed) {
@@ -711,6 +824,129 @@ mod tests {
             skip_reason_wire(&SkipReason::DuplicateResponse),
             "duplicate_response"
         );
+    }
+
+    #[tokio::test]
+    async fn collect_heartbeat_response_completes_on_channel_close() {
+        // Positive path: agent emits two TextDeltas and the executor closes
+        // the channel. We must concatenate the text and return Completed.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        tx.send(AgentEvent::TextDelta("hello, ".into()))
+            .await
+            .unwrap();
+        tx.send(AgentEvent::TextDelta("world".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let cancel = CancellationToken::new();
+        let outcome = collect_heartbeat_response(rx, cancel.clone(), Duration::from_secs(5)).await;
+        assert_eq!(outcome, CollectOutcome::Completed("hello, world".into()));
+        assert!(
+            !cancel.is_cancelled(),
+            "clean channel close must not cancel the turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_heartbeat_response_returns_timeout_when_no_terminal_event() {
+        // Negative regression for the original bug class: if the agent
+        // hangs (channel never closes, no TurnComplete), the helper must
+        // bound the wait and trigger the cancel token so the executor can
+        // wind down the turn. Pre-fix this path waited forever.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        let cancel = CancellationToken::new();
+        let outcome =
+            collect_heartbeat_response(rx, cancel.clone(), Duration::from_millis(50)).await;
+        assert_eq!(outcome, CollectOutcome::Timeout);
+        assert!(
+            cancel.is_cancelled(),
+            "timeout must cancel the turn so the backend stops working"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn collect_heartbeat_response_short_circuits_on_user_input_prompt_request() {
+        // Direct regression guard for issues/empty-state-heartbeat-poke-yields-zero-*.md.
+        // Pre-fix, `from_proto` dropped UserInputRequest; the bridge
+        // produced no event and the heartbeat hung for the request_user_input
+        // tool's 5-minute oneshot. Post-fix it surfaces as a SystemNotice with
+        // PROMPT_REQUEST_USER_INPUT, which we must treat as a terminal
+        // condition for the (non-interactive) heartbeat turn.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        tx.send(AgentEvent::SystemNotice {
+            category: PROMPT_REQUEST_USER_INPUT.into(),
+            text: "1 questions".into(),
+        })
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let started = Instant::now();
+        // Use a long timeout so a buggy implementation that fell through to
+        // the deadline would visibly take seconds.
+        let outcome = collect_heartbeat_response(rx, cancel.clone(), Duration::from_secs(30)).await;
+        let elapsed = started.elapsed();
+        match outcome {
+            CollectOutcome::InteractivePromptRequested(detail) => {
+                assert!(
+                    detail.contains(PROMPT_REQUEST_USER_INPUT),
+                    "detail should identify the prompt category, got {detail:?}"
+                );
+            }
+            other => panic!("expected InteractivePromptRequested, got {other:?}"),
+        }
+        assert!(cancel.is_cancelled(), "must cancel the agent turn");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must short-circuit fast (got {elapsed:?})"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn collect_heartbeat_response_short_circuits_on_shell_prompt_request() {
+        // Symmetric guard for ShellConfirmation. Same hang shape as the
+        // user-input case before from_proto stopped silently dropping it.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        tx.send(AgentEvent::SystemNotice {
+            category: PROMPT_REQUEST_SHELL.into(),
+            text: "rm -rf /tmp/foo".into(),
+        })
+        .await
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let outcome = collect_heartbeat_response(rx, cancel.clone(), Duration::from_secs(30)).await;
+        match outcome {
+            CollectOutcome::InteractivePromptRequested(detail) => {
+                assert!(detail.contains(PROMPT_REQUEST_SHELL));
+                assert!(detail.contains("rm -rf"));
+            }
+            other => panic!("expected InteractivePromptRequested, got {other:?}"),
+        }
+        assert!(cancel.is_cancelled());
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn collect_heartbeat_response_ignores_non_prompt_system_notices() {
+        // Guards against the short-circuit over-firing on any SystemNotice.
+        // Posture transitions / budget alerts arrive as system_notice events
+        // too — they must NOT abort the heartbeat turn.
+        let (tx, rx) = mpsc::channel::<AgentEvent>(8);
+        tx.send(AgentEvent::SystemNotice {
+            category: "posture".into(),
+            text: "boosted".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(AgentEvent::TextDelta("hello".into()))
+            .await
+            .unwrap();
+        drop(tx);
+        let cancel = CancellationToken::new();
+        let outcome = collect_heartbeat_response(rx, cancel.clone(), Duration::from_secs(5)).await;
+        assert_eq!(outcome, CollectOutcome::Completed("hello".into()));
+        assert!(!cancel.is_cancelled());
     }
 
     #[test]

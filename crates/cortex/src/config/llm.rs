@@ -398,6 +398,15 @@ pub struct HeartbeatConfig {
     pub pre_run_cwd: String,
     /// Timeout in milliseconds for `pre_run_command`. Default 60_000.
     pub pre_run_timeout_ms: u64,
+    /// Wall-clock cap on a single heartbeat agent turn, in seconds. The bus
+    /// always emits a terminal `DaemonHeartbeatEvent` within this window —
+    /// when the agent stalls (e.g. it calls `request_user_input`, whose
+    /// oneshot waits 5 minutes for a reply that never arrives because
+    /// heartbeats are non-interactive), the dispatcher cancels the turn
+    /// and publishes a `failed` event instead of letting subscribers wait.
+    /// Default 75 keeps a 15s margin under the smorgasborg eval's 90s
+    /// `collect_samples` timeout.
+    pub turn_timeout_secs: u64,
 }
 
 impl Default for HeartbeatConfig {
@@ -416,6 +425,7 @@ impl Default for HeartbeatConfig {
             pre_run_command: String::new(),
             pre_run_cwd: String::new(),
             pre_run_timeout_ms: 60_000,
+            turn_timeout_secs: 75,
         }
     }
 }

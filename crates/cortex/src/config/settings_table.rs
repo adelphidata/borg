@@ -124,6 +124,7 @@ define_settings! {
         "heartbeat.pre_run_command" => heartbeat.pre_run_command, string;
         "heartbeat.pre_run_cwd" => heartbeat.pre_run_cwd, string;
         "heartbeat.pre_run_timeout_ms" => heartbeat.pre_run_timeout_ms, parsed(u64);
+        "heartbeat.turn_timeout_secs" => heartbeat.turn_timeout_secs, parsed(u64);
 
         // ── User ──
         "user.name" => user.name, opt_string;
