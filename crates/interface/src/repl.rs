@@ -87,7 +87,7 @@ pub async fn one_shot(message: &str, json_output: bool, _mode: Option<&str>) -> 
                     eprintln!("[running {name}]");
                 }
             }
-            AgentEvent::ToolResult { name, result } => {
+            AgentEvent::ToolResult { name, result, .. } => {
                 if !json_output {
                     let preview = if result.len() > cortex::constants::TOOL_RESULT_PREVIEW_CHARS {
                         let mut end = cortex::constants::TOOL_RESULT_PREVIEW_CHARS;

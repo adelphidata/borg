@@ -38,6 +38,7 @@ impl SessionBackend for StubBackend {
         _images: Vec<InlineImage>,
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
+        _text_file_bridge: Option<std::sync::Arc<dyn cortex::execution_context::TextFileBridge>>,
     ) {
         for d in &self.deltas {
             tokio::select! {

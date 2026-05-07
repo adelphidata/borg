@@ -75,6 +75,7 @@ impl SessionBackend for ScriptedBackend {
         _images: Vec<borgd::session::backend::InlineImage>,
         event_tx: mpsc::Sender<CoreEvent>,
         cancel: CancellationToken,
+        _text_file_bridge: Option<std::sync::Arc<dyn cortex::execution_context::TextFileBridge>>,
     ) {
         // Take the script out, run it (synchronously — it spawns its own
         // task), put it back. Drop the guard before the only `.await` so the
@@ -115,7 +116,11 @@ impl StubFactory {
 }
 
 impl SessionFactory for StubFactory {
-    fn open(&self, _resume_id: Option<&str>) -> Result<SessionHost, anyhow::Error> {
+    fn open(
+        &self,
+        _resume_id: Option<&str>,
+        _execution_context: Option<cortex::execution_context::ExecutionContext>,
+    ) -> Result<SessionHost, anyhow::Error> {
         let backend = self
             .next
             .lock()
@@ -195,6 +200,9 @@ async fn open_send_streams_deltas_and_terminates_on_turn_complete() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open ok")
@@ -256,6 +264,9 @@ async fn cancel_during_turn_aborts_within_500ms_and_emits_error() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open ok")
@@ -319,6 +330,9 @@ async fn stream_resume_after_disconnect_replays_missed_events_with_no_dupes() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open ok")
@@ -401,6 +415,7 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
             let result = if approved { "approved" } else { "rejected" };
             let _ = tx
                 .send(CoreEvent::ToolResult {
+                    tool_call_id: "call-1".into(),
                     name: "run_shell".into(),
                     result: result.into(),
                 })
@@ -415,6 +430,9 @@ async fn shell_confirmation_round_trips_via_respond_to_prompt() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open ok")
@@ -488,6 +506,9 @@ async fn two_consecutive_sends_yield_disjoint_per_turn_event_streams() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open ok")

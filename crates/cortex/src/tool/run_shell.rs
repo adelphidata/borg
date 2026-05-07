@@ -38,14 +38,18 @@ pub(crate) async fn handle(
     config: &Config,
     policy: &ExecutionPolicy,
     event_tx: &mpsc::Sender<AgentEvent>,
+    tool_call_id: &str,
     skill_env_allowlist: Option<&HashSet<String>>,
+    ctx: &crate::execution_context::ExecutionContext,
 ) -> Result<String> {
-    tool_handlers::handle_run_shell(
+    tool_handlers::handle_run_shell_with_context(
         &args.to_value(),
         config,
         policy,
         event_tx,
+        tool_call_id,
         skill_env_allowlist,
+        ctx,
     )
     .await
 }

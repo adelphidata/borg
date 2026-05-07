@@ -33,6 +33,14 @@ pub(crate) fn handle(args: &ReadFileArgs, config: &Config) -> Result<ToolOutput>
     tool_handlers::handle_read_file(&args.to_value(), config)
 }
 
+pub(crate) fn handle_with_context(
+    args: &ReadFileArgs,
+    config: &Config,
+    ctx: &crate::execution_context::ExecutionContext,
+) -> Result<ToolOutput> {
+    tool_handlers::filesystem::handle_read_file_with_context(&args.to_value(), config, ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

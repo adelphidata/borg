@@ -73,6 +73,8 @@ pub mod embeddings;
 pub mod error_format;
 /// Conversation evolution and personality drift.
 pub mod evolution;
+/// Per-session workspace execution context and path resolution helpers.
+pub mod execution_context;
 /// Session export (JSON / CSV / TXT) shared by CLI `borg export` and TUI `/export`.
 pub mod export;
 /// Task-local gateway origin context for tool handlers.

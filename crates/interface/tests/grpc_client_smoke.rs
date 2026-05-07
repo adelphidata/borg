@@ -233,6 +233,9 @@ async fn start_harness() -> Harness {
             _images: Vec<InlineImage>,
             event_tx: mpsc::Sender<CoreEvent>,
             _cancel: CancellationToken,
+            _text_file_bridge: Option<
+                std::sync::Arc<dyn cortex::execution_context::TextFileBridge>,
+            >,
         ) {
             // Emit a delta + TurnComplete so the client observes the full
             // wire shape. A regression that lost either event would surface
@@ -251,7 +254,11 @@ async fn start_harness() -> Harness {
         next: StdMutex<Option<Arc<dyn SessionBackend>>>,
     }
     impl SessionFactory for StubFactory {
-        fn open(&self, _resume_id: Option<&str>) -> anyhow::Result<SessionHost> {
+        fn open(
+            &self,
+            _resume_id: Option<&str>,
+            _execution_context: Option<cortex::execution_context::ExecutionContext>,
+        ) -> anyhow::Result<SessionHost> {
             let backend = self
                 .next
                 .lock()
@@ -316,6 +323,9 @@ async fn daemon_client_round_trips_a_turn() {
     let opened = client
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("Open must succeed against a live daemon")

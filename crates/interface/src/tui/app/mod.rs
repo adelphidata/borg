@@ -3324,6 +3324,7 @@ mod tests {
         let mut app = make_app();
         app.enter_streaming();
         app.process_agent_event(AgentEvent::ToolExecuting {
+            tool_call_id: "call-1".into(),
             name: "run_shell".into(),
             args: r#"{"command":"cargo test --all"}"#.into(),
         });
@@ -3340,10 +3341,12 @@ mod tests {
         let mut app = make_app();
         app.enter_streaming();
         app.process_agent_event(AgentEvent::ToolExecuting {
+            tool_call_id: "call-1".into(),
             name: "run_shell".into(),
             args: r#"{"command":"ls"}"#.into(),
         });
         app.process_agent_event(AgentEvent::ToolResult {
+            tool_call_id: "call-1".into(),
             name: "run_shell".into(),
             result: "file1\nfile2".into(),
         });
@@ -3359,6 +3362,7 @@ mod tests {
         let mut app = make_app();
         app.enter_streaming();
         app.process_agent_event(AgentEvent::ToolOutputDelta {
+            tool_call_id: "call-1".into(),
             name: "run_shell".into(),
             delta: "compiling crate A\n\ncompiling crate B\n".into(),
             is_stderr: false,

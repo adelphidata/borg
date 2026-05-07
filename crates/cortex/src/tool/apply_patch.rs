@@ -34,6 +34,18 @@ pub(crate) fn handle_apply_patch(args: &ApplyPatchArgs, config: &Config) -> Resu
     tool_handlers::handle_apply_patch_unified(&args.to_value(), config)
 }
 
+pub(crate) fn handle_apply_patch_with_context(
+    args: &ApplyPatchArgs,
+    config: &Config,
+    ctx: &crate::execution_context::ExecutionContext,
+) -> Result<String> {
+    tool_handlers::filesystem::handle_apply_patch_unified_with_context(
+        &args.to_value(),
+        config,
+        ctx,
+    )
+}
+
 /// `apply_skill_patch` alias — always lands in `~/.borg/skills/`.
 pub(crate) fn handle_apply_skill_patch(args: &ApplyPatchArgs) -> Result<String> {
     tool_handlers::handle_apply_skill_patch(&args.to_value())

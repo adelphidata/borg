@@ -267,7 +267,7 @@ fn process_agent_event(
         crate::agent::AgentEvent::Usage(usage) => {
             *tokens_used = tokens_used.saturating_add(usage.total_tokens);
         }
-        crate::agent::AgentEvent::ToolResult { name, result } => {
+        crate::agent::AgentEvent::ToolResult { name, result, .. } => {
             if name == "write_memory" && result.starts_with("Written to memory: ") {
                 *successful_writes = successful_writes.saturating_add(1);
             }
@@ -538,6 +538,7 @@ mod tests {
         );
         process_agent_event(
             crate::agent::AgentEvent::ToolResult {
+                tool_call_id: "call-1".into(),
                 name: "write_memory".into(),
                 result: "Written to memory: topic (scope: global)".into(),
             },
@@ -546,6 +547,7 @@ mod tests {
         );
         process_agent_event(
             crate::agent::AgentEvent::ToolResult {
+                tool_call_id: "call-2".into(),
                 name: "read_memory".into(),
                 result: "ignored".into(),
             },

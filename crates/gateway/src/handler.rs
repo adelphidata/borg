@@ -2023,6 +2023,7 @@ mod tests {
         assert!(event_is_activity(&AgentEvent::TurnComplete));
         assert!(event_is_activity(&AgentEvent::Preparing));
         assert!(event_is_activity(&AgentEvent::ToolExecuting {
+            tool_call_id: "call-1".into(),
             name: "n".into(),
             args: "{}".into(),
         }));

@@ -39,6 +39,14 @@ pub(crate) fn handle(args: &ListDirArgs, config: &Config) -> Result<String> {
     tool_handlers::handle_list_dir(&args.to_value(), config)
 }
 
+pub(crate) fn handle_with_context(
+    args: &ListDirArgs,
+    config: &Config,
+    ctx: &crate::execution_context::ExecutionContext,
+) -> Result<String> {
+    tool_handlers::filesystem::handle_list_dir_with_context(&args.to_value(), config, ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

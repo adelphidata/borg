@@ -126,14 +126,27 @@ message AgentEvent {
 
 message TextDelta { string text = 1; }
 message ThinkingDelta { string text = 1; }
-message ToolExecuting { string name = 1; string args_json = 2; }
-message ToolResult { string name = 1; string result = 2; }
+message ToolExecuting {
+  string tool_call_id = 1;
+  string name = 2;
+  string args_json = 3;
+}
+message ToolResult {
+  string tool_call_id = 1;
+  string name = 2;
+  string result = 3;
+}
 message ShellConfirmation {
   string command = 1;
   // Client must reply via RespondToPrompt with this id.
   string prompt_id = 2;
 }
-message ToolOutputDelta { string name = 1; string delta = 2; bool is_stderr = 3; }
+message ToolOutputDelta {
+  string tool_call_id = 1;
+  string name = 2;
+  string delta = 3;
+  bool is_stderr = 4;
+}
 message Usage {
   uint64 input_tokens = 1;
   uint64 output_tokens = 2;

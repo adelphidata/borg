@@ -18,20 +18,35 @@ pub fn to_proto(event: CoreEvent, prompts: &Arc<PromptRegistry>) -> pb::AgentEve
     let kind = match event {
         CoreEvent::TextDelta(text) => Kind::TextDelta(pb::TextDelta { text }),
         CoreEvent::ThinkingDelta(text) => Kind::ThinkingDelta(pb::ThinkingDelta { text }),
-        CoreEvent::ToolExecuting { name, args } => Kind::ToolExecuting(pb::ToolExecuting {
+        CoreEvent::ToolExecuting {
+            tool_call_id,
+            name,
+            args,
+        } => Kind::ToolExecuting(pb::ToolExecuting {
+            tool_call_id,
             name,
             args_json: args,
         }),
-        CoreEvent::ToolResult { name, result } => Kind::ToolResult(pb::ToolResult { name, result }),
+        CoreEvent::ToolResult {
+            tool_call_id,
+            name,
+            result,
+        } => Kind::ToolResult(pb::ToolResult {
+            tool_call_id,
+            name,
+            result,
+        }),
         CoreEvent::ShellConfirmation { command, respond } => {
             let prompt_id = prompts.register(PendingPrompt::Shell(respond));
             Kind::ShellConfirmation(pb::ShellConfirmation { command, prompt_id })
         }
         CoreEvent::ToolOutputDelta {
+            tool_call_id,
             name,
             delta,
             is_stderr,
         } => Kind::ToolOutputDelta(pb::ToolOutputDelta {
+            tool_call_id,
             name,
             delta,
             is_stderr,
@@ -125,14 +140,17 @@ pub fn from_proto(event: pb::AgentEvent) -> Option<CoreEvent> {
         Kind::TextDelta(t) => CoreEvent::TextDelta(t.text),
         Kind::ThinkingDelta(t) => CoreEvent::ThinkingDelta(t.text),
         Kind::ToolExecuting(t) => CoreEvent::ToolExecuting {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             args: t.args_json,
         },
         Kind::ToolResult(t) => CoreEvent::ToolResult {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             result: t.result,
         },
         Kind::ToolOutputDelta(t) => CoreEvent::ToolOutputDelta {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             delta: t.delta,
             is_stderr: t.is_stderr,

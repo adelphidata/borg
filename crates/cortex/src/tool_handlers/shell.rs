@@ -7,6 +7,7 @@ use tracing::instrument;
 
 use crate::agent::AgentEvent;
 use crate::config::Config;
+use crate::execution_context::ExecutionContext;
 use crate::policy::ExecutionPolicy;
 
 /// Read stdout/stderr from a child process line-by-line, emitting `ToolOutputDelta` events.
@@ -14,6 +15,7 @@ async fn stream_child_output(
     child: &mut tokio::process::Child,
     timeout: Duration,
     event_tx: &mpsc::Sender<AgentEvent>,
+    tool_call_id: &str,
     tool_name: &str,
 ) -> Result<(String, String, Option<i32>)> {
     let stdout_pipe = child.stdout.take();
@@ -39,6 +41,7 @@ async fn stream_child_output(
                     match line {
                         Ok(Some(l)) => {
                             let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                                tool_call_id: tool_call_id.to_string(),
                                 name: tool_name.to_string(),
                                 delta: l.clone(),
                                 is_stderr: false,
@@ -58,6 +61,7 @@ async fn stream_child_output(
                     match line {
                         Ok(Some(l)) => {
                             let _ = event_tx.try_send(AgentEvent::ToolOutputDelta {
+                                tool_call_id: tool_call_id.to_string(),
                                 name: tool_name.to_string(),
                                 delta: l.clone(),
                                 is_stderr: true,
@@ -88,7 +92,30 @@ pub async fn handle_run_shell(
     config: &Config,
     policy: &ExecutionPolicy,
     event_tx: &mpsc::Sender<AgentEvent>,
+    tool_call_id: &str,
     skill_env_allowlist: Option<&std::collections::HashSet<String>>,
+) -> Result<String> {
+    let ctx = ExecutionContext::from_process()?;
+    handle_run_shell_with_context(
+        args,
+        config,
+        policy,
+        event_tx,
+        tool_call_id,
+        skill_env_allowlist,
+        &ctx,
+    )
+    .await
+}
+
+pub async fn handle_run_shell_with_context(
+    args: &serde_json::Value,
+    config: &Config,
+    policy: &ExecutionPolicy,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    tool_call_id: &str,
+    skill_env_allowlist: Option<&std::collections::HashSet<String>>,
+    ctx: &ExecutionContext,
 ) -> Result<String> {
     let command = args["command"].as_str().context("Missing 'command'")?;
     let timeout_ms = args
@@ -99,7 +126,8 @@ pub async fn handle_run_shell(
     let workdir = args
         .get("workdir")
         .and_then(serde_json::Value::as_str)
-        .map(std::path::PathBuf::from);
+        .map(|raw| ctx.resolve_existing_path(raw))
+        .transpose()?;
     let want_tty = args
         .get("tty")
         .and_then(serde_json::Value::as_bool)
@@ -148,33 +176,55 @@ pub async fn handle_run_shell(
     for (k, v) in skill_env {
         filtered_creds.entry(k).or_insert(v);
     }
+    // Resolve the shell to an absolute path so workspace-bounded sandbox
+    // profiles (M2) can validate it. Bare `sh` is rejected by Seatbelt
+    // profile generation (paths must be absolute).
     #[cfg(unix)]
-    let (shell, shell_flag) = ("sh", "-c");
+    let (shell, shell_flag) = ("/bin/sh", "-c");
     #[cfg(windows)]
     let (shell, shell_flag) = ("cmd.exe", "/C");
 
     if want_tty {
+        if ctx.enforce_workspace_root() {
+            // PTY-wrapped shells go through `portable_pty::CommandBuilder`,
+            // which does not interoperate with our `sandbox-exec`/`bwrap`
+            // wrapper. Refusing TTY in workspace-bounded sessions is the
+            // safer default — IDE clients rarely need a TTY for tooling
+            // anyway, and the failure is loud rather than silently
+            // unsandboxed. Drop this guard once the sandbox crate grows a
+            // pty-aware spawn path.
+            return Ok(
+                "tty=true is not supported in ACP sessions because the workspace sandbox \
+                 cannot be applied to a PTY-wrapped shell. Re-run with tty=false or run \
+                 the command outside an ACP session."
+                    .to_string(),
+            );
+        }
         return run_in_pty(
             shell,
             shell_flag,
             command,
-            workdir.as_deref(),
+            workdir.as_deref().or(Some(ctx.workspace_cwd())),
             &filtered_creds,
             timeout_dur,
             timeout_ms,
             event_tx,
+            tool_call_id,
         )
         .await;
     }
 
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg(shell_flag)
-        .arg(command)
+    let cwd_path = workdir
+        .as_deref()
+        .unwrap_or(ctx.workspace_cwd())
+        .to_path_buf();
+    let (program, full_args) =
+        wrap_run_shell_for_sandbox(ctx, config, shell, shell_flag, command, &cwd_path);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&full_args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(dir) = workdir.as_deref() {
-        cmd.current_dir(dir);
-    }
+    cmd.current_dir(&cwd_path);
     for (key, val) in &filtered_creds {
         cmd.env(key, val);
     }
@@ -184,7 +234,7 @@ pub async fn handle_run_shell(
         .spawn()
         .context("Failed to spawn shell command")?;
 
-    match stream_child_output(&mut child, timeout_dur, event_tx, "run_shell").await {
+    match stream_child_output(&mut child, timeout_dur, event_tx, tool_call_id, "run_shell").await {
         Ok((stdout, stderr, code)) => {
             let status = code.unwrap_or(-1);
             Ok(format!(
@@ -203,6 +253,41 @@ pub async fn handle_run_shell(
     }
 }
 
+/// Decide whether to wrap `run_shell` invocations in a workspace-scoped
+/// sandbox profile. ACP sessions (`ctx.enforce_workspace_root() == true`)
+/// MUST be sandboxed — that's the kernel-level boundary the plan
+/// (§"Tool-Specific Behavior — `run_shell`") requires so a `cd /tmp;
+/// echo > /etc/passwd` from an IDE-launched agent can't escape the
+/// declared workspace. Non-ACP callers retain the existing direct-spawn
+/// behavior to avoid changing semantics for the TUI/REPL.
+fn wrap_run_shell_for_sandbox(
+    ctx: &ExecutionContext,
+    config: &Config,
+    shell: &str,
+    shell_flag: &str,
+    command: &str,
+    cwd: &std::path::Path,
+) -> (String, Vec<String>) {
+    let bare_args = vec![shell_flag.to_string(), command.to_string()];
+    if !ctx.enforce_workspace_root() {
+        return (shell.to_string(), bare_args);
+    }
+    let workspace_root_str = ctx.workspace_root().to_string_lossy().into_owned();
+    let policy = sandbox::policy::SandboxPolicy {
+        // ACP shell turns frequently invoke build/test/curl flows. Network
+        // is permitted; strict boundary enforcement is filesystem-scoped.
+        network: true,
+        fs_read: vec![workspace_root_str.clone()],
+        fs_write: vec![workspace_root_str],
+        deny_read: Vec::new(),
+        deny_write: Vec::new(),
+        allowed_domains: Vec::new(),
+    }
+    .configured(&config.security.blocked_paths);
+    let wrapped = policy.wrap_command(shell, &bare_args, cwd);
+    (wrapped.program, wrapped.args)
+}
+
 /// Run `command` under a pseudo-terminal so it sees stdout as a TTY. Used for
 /// REPLs and tools whose output (or willingness to start) depends on `isatty`.
 /// Output is read off the master end into a single combined buffer; stdout
@@ -218,6 +303,7 @@ async fn run_in_pty(
     timeout: Duration,
     timeout_ms: u64,
     event_tx: &mpsc::Sender<AgentEvent>,
+    tool_call_id: &str,
 ) -> Result<String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -255,6 +341,7 @@ async fn run_in_pty(
         .try_clone_reader()
         .context("Failed to clone PTY reader")?;
     let event_tx_clone = event_tx.clone();
+    let tool_call_id = tool_call_id.to_string();
     let reader_task = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut combined = String::new();
@@ -265,6 +352,7 @@ async fn run_in_pty(
                 Ok(n) => {
                     let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
                     let _ = event_tx_clone.try_send(AgentEvent::ToolOutputDelta {
+                        tool_call_id: tool_call_id.clone(),
                         name: "run_shell".to_string(),
                         delta: chunk.clone(),
                         is_stderr: false,
@@ -386,7 +474,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let args = serde_json::json!({ "command": "printf 'ok\\n'" });
 
-        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("shell command should run");
         assert!(result.contains("Exit code: 0"), "got: {result}");
@@ -412,7 +500,7 @@ mod tests {
             "command": "test -t 1 && echo IS_TTY || echo NOT_TTY",
             "tty": true,
         });
-        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("tty shell should run");
         assert!(
@@ -437,7 +525,7 @@ mod tests {
         let args = serde_json::json!({
             "command": "test -t 1 && echo IS_TTY || echo NOT_TTY",
         });
-        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("non-tty shell should run");
         assert!(
@@ -468,7 +556,7 @@ mod tests {
             "tty": true,
             "workdir": tmp.path().to_string_lossy().as_ref(),
         });
-        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("workdir tty run");
         assert!(
@@ -481,7 +569,7 @@ mod tests {
             "tty": true,
             "timeout_ms": 200,
         });
-        let timed = handle_run_shell(&timeout_args, &config, &policy, &event_tx, None)
+        let timed = handle_run_shell(&timeout_args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("timeout path returns Ok with explanation");
         assert!(
@@ -508,7 +596,7 @@ mod tests {
         let cmd = "bash -lc \"apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: routed.txt\n+ok\n*** End Patch\nEOF\"";
         let args = serde_json::json!({ "command": cmd });
 
-        let result = handle_run_shell(&args, &config, &policy, &event_tx, None)
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
             .await
             .expect("rerouted apply_patch should succeed");
 

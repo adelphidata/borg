@@ -91,7 +91,7 @@ pub use filesystem::{
 };
 
 // Shell
-pub use shell::handle_run_shell;
+pub use shell::{handle_run_shell, handle_run_shell_with_context};
 
 // Web
 pub use web::{handle_web_fetch, handle_web_search};

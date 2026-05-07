@@ -21,9 +21,10 @@ impl Agent {
         let mut s = String::new();
         s.push_str("<environment>\n");
         s.push_str(&format!("Current Time: {now}\n"));
-        if let Ok(cwd) = std::env::current_dir() {
-            s.push_str(&format!("Working directory: {}\n", cwd.display()));
-        }
+        s.push_str(&format!(
+            "Working directory: {}\n",
+            self.execution_context.workspace_cwd().display()
+        ));
         if let Some(ref root) = self.git_repo_root {
             let git_ctx = crate::git::collect_git_context(root).await;
             let formatted = crate::git::format_git_context(&git_ctx);

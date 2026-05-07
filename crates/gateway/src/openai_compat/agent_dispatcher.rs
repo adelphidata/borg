@@ -95,10 +95,29 @@ fn translate_events(
         while let Some(event) = rx.recv().await {
             match event {
                 AgentEvent::TextDelta(s) => yield AgentEventChunk::Text(s),
-                AgentEvent::ToolExecuting { name, args } => {
+                AgentEvent::ToolExecuting {
+                    tool_call_id,
+                    name,
+                    args,
+                } => {
                     tool_seq += 1;
+                    let id = if tool_call_id.is_empty() {
+                        // The cortex agent loop populates tool_call_id for
+                        // every emitted ToolExecuting event. An empty value
+                        // here means upstream regressed — surface the
+                        // synthesized fallback so the regression doesn't
+                        // hide in OpenAI-shaped traffic.
+                        tracing::warn!(
+                            tool = %name,
+                            seq = tool_seq,
+                            "ToolExecuting arrived without tool_call_id; falling back to call_<seq>"
+                        );
+                        format!("call_{tool_seq}")
+                    } else {
+                        tool_call_id
+                    };
                     yield AgentEventChunk::ToolCall {
-                        id: format!("call_{tool_seq}"),
+                        id,
                         name,
                         arguments: args,
                     };
@@ -230,6 +249,7 @@ mod tests {
         let stub = Arc::new(StubExecutor {
             events: Mutex::new(Some(vec![
                 AgentEvent::ToolExecuting {
+                    tool_call_id: "call-stable-1".into(),
                     name: "memory_search".into(),
                     args: r#"{"q":"x"}"#.into(),
                 },
@@ -251,7 +271,7 @@ mod tests {
                 name,
                 arguments,
             } => {
-                assert!(id.starts_with("call_"), "id={id}");
+                assert_eq!(id, "call-stable-1");
                 assert_eq!(name, "memory_search");
                 assert_eq!(arguments, r#"{"q":"x"}"#);
             }

@@ -108,10 +108,12 @@ impl<'a> App<'a> {
             AgentEvent::Preparing => self.handle_event_preparing(),
             AgentEvent::TextDelta(delta) => self.handle_event_text_delta(delta),
             AgentEvent::ThinkingDelta(delta) => self.handle_event_thinking_delta(delta),
-            AgentEvent::ToolExecuting { name, args } => {
+            AgentEvent::ToolExecuting { name, args, .. } => {
                 self.handle_event_tool_executing(name, args)
             }
-            AgentEvent::ToolResult { name, result } => self.handle_event_tool_result(name, result),
+            AgentEvent::ToolResult { name, result, .. } => {
+                self.handle_event_tool_result(name, result)
+            }
             AgentEvent::ShellConfirmation { command, respond } => {
                 self.handle_event_shell_confirmation(command, respond)
             }

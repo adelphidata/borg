@@ -38,7 +38,7 @@ pub fn spawn_event_adapter(
         loop {
             match stream.message().await {
                 Ok(Some(pb)) => {
-                    if let Some(core_evt) = convert(pb, &client, &session_id) {
+                    if let Some(core_evt) = convert_pb_event(pb, &client, &session_id) {
                         if tx.send(core_evt).await.is_err() {
                             break;
                         }
@@ -101,7 +101,7 @@ async fn forward_one(
     session_id: &str,
     tx: &mpsc::Sender<CoreEvent>,
 ) -> bool {
-    if let Some(core_evt) = convert(pb, client, session_id) {
+    if let Some(core_evt) = convert_pb_event(pb, client, session_id) {
         if tx.send(core_evt).await.is_err() {
             return false;
         }
@@ -112,16 +112,22 @@ async fn forward_one(
 /// Translate one wire event. Returns `None` for events we don't know how to
 /// represent (forward-compat: a future proto variant is silently skipped
 /// rather than crashing the render loop).
-fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreEvent> {
+pub(crate) fn convert_pb_event(
+    pb: PbEvent,
+    client: &DaemonClient,
+    session_id: &str,
+) -> Option<CoreEvent> {
     let kind = pb.kind?;
     Some(match kind {
         Kind::TextDelta(d) => CoreEvent::TextDelta(d.text),
         Kind::ThinkingDelta(d) => CoreEvent::ThinkingDelta(d.text),
         Kind::ToolExecuting(t) => CoreEvent::ToolExecuting {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             args: t.args_json,
         },
         Kind::ToolResult(t) => CoreEvent::ToolResult {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             result: t.result,
         },
@@ -139,6 +145,7 @@ fn convert(pb: PbEvent, client: &DaemonClient, session_id: &str) -> Option<CoreE
             }
         }
         Kind::ToolOutputDelta(t) => CoreEvent::ToolOutputDelta {
+            tool_call_id: t.tool_call_id,
             name: t.name,
             delta: t.delta,
             is_stderr: t.is_stderr,
@@ -345,6 +352,7 @@ mod tests {
                 text: "hello".into(),
             })),
             pb(PbKind::ToolExecuting(ToolExecuting {
+                tool_call_id: "call-7".into(),
                 name: "shell".into(),
                 args_json: "{}".into(),
             })),
@@ -364,7 +372,12 @@ mod tests {
             _ => panic!("expected TextDelta"),
         }
         match rx.recv().await {
-            Some(CoreEvent::ToolExecuting { name, .. }) => assert_eq!(name, "shell"),
+            Some(CoreEvent::ToolExecuting {
+                tool_call_id, name, ..
+            }) => {
+                assert_eq!(tool_call_id, "call-7");
+                assert_eq!(name, "shell");
+            }
             _ => panic!("expected ToolExecuting"),
         }
         match rx.recv().await {

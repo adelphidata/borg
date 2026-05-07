@@ -188,6 +188,9 @@ pub fn register_stub_for_session(session_key: &str, events: Vec<AgentEvent>) {
             _images: Vec<InlineImage>,
             event_tx: mpsc::Sender<AgentEvent>,
             _cancel: CancellationToken,
+            _text_file_bridge: Option<
+                std::sync::Arc<dyn cortex::execution_context::TextFileBridge>,
+            >,
         ) {
             let batch = self.queue.lock().expect("lock").pop_front();
             let mut emitted_terminal = false;

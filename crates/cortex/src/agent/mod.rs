@@ -148,6 +148,8 @@ pub enum AgentEvent {
     ThinkingDelta(String),
     /// A tool is about to execute.
     ToolExecuting {
+        /// Stable tool call identifier for this lifecycle.
+        tool_call_id: String,
         /// Tool name.
         name: String,
         /// Serialized tool arguments.
@@ -155,6 +157,8 @@ pub enum AgentEvent {
     },
     /// A tool has finished executing.
     ToolResult {
+        /// Stable tool call identifier for this lifecycle.
+        tool_call_id: String,
         /// Tool name.
         name: String,
         /// Tool output text.
@@ -167,6 +171,8 @@ pub enum AgentEvent {
     },
     /// Real-time output line from a running tool.
     ToolOutputDelta {
+        /// Stable tool call identifier for this lifecycle.
+        tool_call_id: String,
         name: String,
         delta: String,
         is_stderr: bool,
@@ -324,6 +330,8 @@ pub struct Agent {
     caches: SystemPromptCache,
     /// Ghost commit created at session start for atomic undo (coding agent).
     ghost_commit: Option<crate::git::GhostCommit>,
+    /// Per-session workspace execution context used by tools and prompt assembly.
+    execution_context: crate::execution_context::ExecutionContext,
     /// Git repo root (if CWD is inside a git repo).
     git_repo_root: Option<std::path::PathBuf>,
     /// Arc-wrapped config for cheap cloning into background tasks.
@@ -477,9 +485,13 @@ impl Agent {
         tools_filter: Option<Vec<String>>,
         metrics: BorgMetrics,
     ) -> Self {
-        let git_repo_root = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| crate::git::find_repo_root(&cwd));
+        let execution_context = crate::execution_context::ExecutionContext::from_process()
+            .unwrap_or_else(|_| {
+                crate::execution_context::ExecutionContext::unrestricted(std::path::PathBuf::from(
+                    ".",
+                ))
+            });
+        let git_repo_root = crate::git::find_repo_root(execution_context.workspace_cwd());
         let config_arc = Arc::new(config.clone());
         let session_id = common.session.meta.id.clone();
         Self {
@@ -501,6 +513,7 @@ impl Agent {
             db: Mutex::new(common.db),
             caches: SystemPromptCache::default(),
             ghost_commit: None,
+            execution_context,
             git_repo_root,
             config_arc,
             steer_rx: None,
@@ -591,6 +604,34 @@ impl Agent {
     /// Install a best-effort cost-event sink for all session-backed LLM calls.
     pub fn set_cost_event_sink(&mut self, sink: Arc<dyn crate::llm::CostEventSink>) {
         self.cost_event_sink = Some(sink);
+    }
+
+    /// Override the session execution context. Use this when the workspace
+    /// changes (different cwd / root). Invalidates the project-docs cache and
+    /// re-derives `git_repo_root`. To swap *only* the IDE-backed text-file
+    /// bridge inside an ACP-backed turn, prefer `set_text_file_bridge` —
+    /// otherwise every turn pays for an `AGENTS.md` / `CLAUDE.md` re-read.
+    pub fn set_execution_context(
+        &mut self,
+        execution_context: crate::execution_context::ExecutionContext,
+    ) {
+        self.execution_context = execution_context;
+        self.git_repo_root = crate::git::find_repo_root(self.execution_context.workspace_cwd());
+        self.caches.clear_project_docs();
+    }
+
+    /// Attach or remove the IDE-backed text-file bridge without invalidating
+    /// the workspace-derived caches. Hot path on ACP-backed turns.
+    pub fn set_text_file_bridge(
+        &mut self,
+        bridge: Option<std::sync::Arc<dyn crate::execution_context::TextFileBridge>>,
+    ) {
+        self.execution_context = self.execution_context.clone().with_text_file_bridge(bridge);
+    }
+
+    /// Snapshot the current execution context.
+    pub fn execution_context(&self) -> crate::execution_context::ExecutionContext {
+        self.execution_context.clone()
     }
 
     /// Replace config, re-derive dependent state (policy, rate limits).
@@ -1035,11 +1076,9 @@ impl Agent {
 
         // Project documentation (AGENTS.md / CLAUDE.md)
         let project_docs = self.caches.project_docs_or_load(|| {
-            std::env::current_dir().ok().and_then(|cwd| {
-                crate::project_doc::discover_project_docs(&cwd)
-                    .ok()
-                    .flatten()
-            })
+            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
+                .ok()
+                .flatten()
         });
         if let Some(ref docs) = project_docs {
             let _ = write!(
@@ -1448,11 +1487,9 @@ Rules:
         // calls this lazily; running it here once outside that hot path
         // means the first build_system_prompt call doesn't pay for IO).
         let _ = self.caches.project_docs_or_load(|| {
-            std::env::current_dir().ok().and_then(|cwd| {
-                crate::project_doc::discover_project_docs(&cwd)
-                    .ok()
-                    .flatten()
-            })
+            crate::project_doc::discover_project_docs(self.execution_context.workspace_cwd())
+                .ok()
+                .flatten()
         });
 
         // Background: index extra paths and pending sessions on first run
@@ -2586,12 +2623,14 @@ Rules:
             // Before↔After pairs.
             let _ = event_tx
                 .send(AgentEvent::ToolExecuting {
+                    tool_call_id: inv.id.clone(),
                     name: inv.name.clone(),
                     args: inv.raw_arguments.clone(),
                 })
                 .await;
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
+                    tool_call_id: inv.id.clone(),
                     name: inv.name.clone(),
                     result: body.clone(),
                 })
@@ -2723,6 +2762,7 @@ Rules:
 
             let _ = event_tx
                 .send(AgentEvent::ToolExecuting {
+                    tool_call_id: tool_call.id.clone(),
                     name: name.clone(),
                     args: args.clone(),
                 })
@@ -2730,7 +2770,7 @@ Rules:
 
             let tool_start = Instant::now();
             let tool_output = self
-                .execute_tool(name, args, event_tx)
+                .execute_tool(name, args, event_tx, &tool_call.id)
                 .instrument(info_span!("tool.execute", tool.name = %name))
                 .await
                 .unwrap_or_else(|e| ToolOutput::Text(format!("Error: {e}")));
@@ -2759,6 +2799,7 @@ Rules:
             );
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
                     name: name.clone(),
                     result: redacted,
                 })
@@ -2876,6 +2917,7 @@ Rules:
         for (idx, slot) in slots.iter().enumerate() {
             if let Slot::Approved { name, args } = slot {
                 let config = std::sync::Arc::clone(&self.config_arc);
+                let execution_context = self.execution_context.clone();
                 let tx = event_tx.clone();
                 let permits = std::sync::Arc::clone(&permits);
                 let name_clone = name.clone();
@@ -2883,9 +2925,14 @@ Rules:
                 join_set.spawn(async move {
                     let _permit = permits.acquire_owned().await.ok();
                     let start = Instant::now();
-                    let result =
-                        dispatch_parallel_safe_tool(&name_clone, &args_clone, config.as_ref(), &tx)
-                            .await;
+                    let result = dispatch_parallel_safe_tool(
+                        &name_clone,
+                        &args_clone,
+                        config.as_ref(),
+                        &tx,
+                        Some(&execution_context),
+                    )
+                    .await;
                     (idx, name_clone, start, result)
                 });
             }
@@ -2930,6 +2977,7 @@ Rules:
 
             let _ = event_tx
                 .send(AgentEvent::ToolExecuting {
+                    tool_call_id: tool_call.id.clone(),
                     name: name.clone(),
                     args: args_for_event,
                 })
@@ -2958,6 +3006,7 @@ Rules:
             );
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
                     name: name.clone(),
                     result: redacted,
                 })
@@ -2983,6 +3032,7 @@ Rules:
         name: &str,
         args_json: &str,
         event_tx: &mpsc::Sender<AgentEvent>,
+        tool_call_id: &str,
     ) -> Result<ToolOutput> {
         let raw_args: serde_json::Value = match serde_json::from_str(args_json) {
             Ok(v) => v,
@@ -3011,7 +3061,11 @@ Rules:
         // Variants returning ToolOutput directly (may contain multimodal content).
         match &tool {
             crate::tool::Tool::ReadFile(args) => {
-                let out = crate::tool::read_file::handle(args, &self.config)?;
+                let out = crate::tool::read_file::handle_with_context(
+                    args,
+                    &self.config,
+                    &self.execution_context,
+                )?;
                 self.maybe_refresh_skills_after_tool(name, &raw_args, "");
                 return Ok(out);
             }
@@ -3055,7 +3109,11 @@ Rules:
             crate::tool::Tool::ListSkills => crate::tool::list::handle_list_skills(&self.config),
             crate::tool::Tool::ListChannels => crate::tool::list::handle_list_channels(&self.config),
             crate::tool::Tool::ApplyPatch(args) => {
-                crate::tool::apply_patch::handle_apply_patch(args, &self.config)
+                crate::tool::apply_patch::handle_apply_patch_with_context(
+                    args,
+                    &self.config,
+                    &self.execution_context,
+                )
             }
             crate::tool::Tool::ApplySkillPatch(args) => {
                 crate::tool::apply_patch::handle_apply_skill_patch(args)
@@ -3063,14 +3121,20 @@ Rules:
             crate::tool::Tool::CreateChannel(args) => {
                 crate::tool::apply_patch::handle_create_channel(args)
             }
-            crate::tool::Tool::ListDir(args) => crate::tool::list_dir::handle(args, &self.config),
+            crate::tool::Tool::ListDir(args) => crate::tool::list_dir::handle_with_context(
+                args,
+                &self.config,
+                &self.execution_context,
+            ),
             crate::tool::Tool::RunShell(args) => {
                 crate::tool::run_shell::handle(
                     args,
                     &self.config,
                     &self.policy,
                     event_tx,
+                    tool_call_id,
                     Some(&self.skill_env_allowlist),
+                    &self.execution_context,
                 )
                 .await
             }
@@ -3175,11 +3239,23 @@ Rules:
 /// between the planner and the dispatcher is impossible without a compile
 /// error. Non-parallel-safe variants return a hard error so the planner bug
 /// surfaces in tests instead of silent misbehaviour.
+///
+/// **No `ToolOutputDelta` from this path.** The surrounding loop emits
+/// `ToolExecuting` / `ToolResult` events with the correct `tool_call_id`,
+/// but the parallel dispatcher does not thread that id into the inner
+/// handlers. None of the parallel-safe tools today (`read_file`,
+/// `read_memory`, `memory_search`, `list_skills`, `list_channels`,
+/// `list_dir`, `web_fetch`, `web_search`, `apply_patch`) emit streaming
+/// output deltas, so the gap is invisible. Adding a tool here that wants
+/// `ToolOutputDelta` requires extending this signature with `tool_call_id`
+/// first, otherwise the delta will land at the OpenAI compat layer with an
+/// empty id (see `agent_dispatcher::translate_events`).
 async fn dispatch_parallel_safe_tool(
     name: &str,
     args_json: &str,
     config: &Config,
     _event_tx: &mpsc::Sender<AgentEvent>,
+    execution_context: Option<&crate::execution_context::ExecutionContext>,
 ) -> Result<ToolOutput> {
     // Reject unknown / non-parallel-safe tools by *name* before parsing args.
     // Surface as a loud Err so a planner/dispatcher mismatch fails tests rather
@@ -3214,7 +3290,10 @@ async fn dispatch_parallel_safe_tool(
     debug_assert!(tool.parallel_safe(), "is_parallel_safe_name drift");
 
     match &tool {
-        crate::tool::Tool::ReadFile(args) => crate::tool::read_file::handle(args, config),
+        crate::tool::Tool::ReadFile(args) => match execution_context {
+            Some(ctx) => crate::tool::read_file::handle_with_context(args, config, ctx),
+            None => crate::tool::read_file::handle(args, config),
+        },
         crate::tool::Tool::ReadMemory(args) => {
             crate::tool::read_memory::handle(args).map(ToolOutput::Text)
         }
@@ -3227,18 +3306,24 @@ async fn dispatch_parallel_safe_tool(
         crate::tool::Tool::ListChannels => {
             crate::tool::list::handle_list_channels(config).map(ToolOutput::Text)
         }
-        crate::tool::Tool::ListDir(args) => {
-            crate::tool::list_dir::handle(args, config).map(ToolOutput::Text)
+        crate::tool::Tool::ListDir(args) => match execution_context {
+            Some(ctx) => crate::tool::list_dir::handle_with_context(args, config, ctx),
+            None => crate::tool::list_dir::handle(args, config),
         }
+        .map(ToolOutput::Text),
         crate::tool::Tool::WebFetch(args) => crate::tool::web_fetch::handle(args, config)
             .await
             .map(ToolOutput::Text),
         crate::tool::Tool::WebSearch(args) => crate::tool::web_search::handle(args, config)
             .await
             .map(ToolOutput::Text),
-        crate::tool::Tool::ApplyPatch(args) => {
-            crate::tool::apply_patch::handle_apply_patch(args, config).map(ToolOutput::Text)
+        crate::tool::Tool::ApplyPatch(args) => match execution_context {
+            Some(ctx) => {
+                crate::tool::apply_patch::handle_apply_patch_with_context(args, config, ctx)
+            }
+            None => crate::tool::apply_patch::handle_apply_patch(args, config),
         }
+        .map(ToolOutput::Text),
         crate::tool::Tool::ApplySkillPatch(args) => {
             crate::tool::apply_patch::handle_apply_skill_patch(args).map(ToolOutput::Text)
         }
@@ -3869,6 +3954,9 @@ mod tests {
                 Some(vec!["pdf".to_string()]),
             ),
             ghost_commit: None,
+            execution_context: crate::execution_context::ExecutionContext::unrestricted(
+                std::path::PathBuf::from("."),
+            ),
             git_repo_root: None,
             config_arc: Arc::new(config),
             steer_rx: None,
@@ -3929,6 +4017,9 @@ mod tests {
                 Some(vec!["pdf".into()]),
             ),
             ghost_commit: None,
+            execution_context: crate::execution_context::ExecutionContext::unrestricted(
+                std::path::PathBuf::from("."),
+            ),
             git_repo_root: None,
             config_arc: Arc::new(config.clone()),
             steer_rx: None,
@@ -4010,7 +4101,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         let args = serde_json::json!({"path": path.to_str().unwrap()}).to_string();
-        let out = dispatch_parallel_safe_tool("read_file", &args, &config, &tx)
+        let out = dispatch_parallel_safe_tool("read_file", &args, &config, &tx, None)
             .await
             .unwrap();
         let text = match out {
@@ -4027,7 +4118,7 @@ mod tests {
         // silently misbehaving.
         let config = Config::default();
         let (tx, _rx) = mpsc::channel(8);
-        let result = dispatch_parallel_safe_tool("run_shell", "{}", &config, &tx).await;
+        let result = dispatch_parallel_safe_tool("run_shell", "{}", &config, &tx, None).await;
         assert!(result.is_err(), "unsafe tool must return Err");
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -4040,7 +4131,7 @@ mod tests {
     async fn dispatch_parallel_safe_tool_invalid_json_returns_text() {
         let config = Config::default();
         let (tx, _rx) = mpsc::channel(8);
-        let out = dispatch_parallel_safe_tool("read_file", "not json", &config, &tx)
+        let out = dispatch_parallel_safe_tool("read_file", "not json", &config, &tx, None)
             .await
             .unwrap();
         let text = match out {

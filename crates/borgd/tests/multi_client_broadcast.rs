@@ -37,6 +37,7 @@ impl SessionBackend for DelayedDeltas {
         _images: Vec<borgd::session::backend::InlineImage>,
         event_tx: mpsc::Sender<CoreEvent>,
         _cancel: CancellationToken,
+        _text_file_bridge: Option<std::sync::Arc<dyn cortex::execution_context::TextFileBridge>>,
     ) {
         for d in &self.deltas {
             tokio::time::sleep(self.pause).await;
@@ -53,7 +54,11 @@ impl SessionBackend for DelayedDeltas {
 struct OneShotFactory(Mutex<Option<Arc<dyn SessionBackend>>>);
 
 impl SessionFactory for OneShotFactory {
-    fn open(&self, _resume: Option<&str>) -> Result<SessionHost, anyhow::Error> {
+    fn open(
+        &self,
+        _resume: Option<&str>,
+        _execution_context: Option<cortex::execution_context::ExecutionContext>,
+    ) -> Result<SessionHost, anyhow::Error> {
         let b = self
             .0
             .lock()
@@ -125,6 +130,9 @@ async fn two_clients_subscribed_to_same_session_see_identical_event_streams() {
     let opened = client_a
         .open(OpenRequest {
             resume_id: String::new(),
+            workspace_cwd: String::new(),
+            workspace_root: String::new(),
+            enforce_workspace_root: false,
         })
         .await
         .expect("open")

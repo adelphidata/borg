@@ -94,6 +94,11 @@ impl SystemPromptCache {
         self.project_docs.as_ref().and_then(Clone::clone)
     }
 
+    /// Clear the cached project docs snapshot so it is reloaded on next access.
+    pub(crate) fn clear_project_docs(&mut self) {
+        self.project_docs = None;
+    }
+
     /// True when no skills context is cached, or when the cached request
     /// no longer matches `request`.
     pub(crate) fn skills_stale_for(&self, request: &str) -> bool {
