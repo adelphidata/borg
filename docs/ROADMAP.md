@@ -312,6 +312,32 @@ top-down by priority, not by section order.
   and evaluation. Listed for completeness — likely defer until there's
   a concrete training initiative.
 
+### Potential features (not committed)
+
+Ideas worth keeping an eye on. **Not** scheduled. Each trades real
+complexity for a benefit Borg doesn't currently offer — revisit if user
+demand materializes.
+
+- **Tool receipts.** Cryptographically chained signed receipts on every
+  tool call (sibling to the HMAC vitals chain, but tool-call-scoped
+  rather than event-sourced). Source of truth for "what did the agent
+  do yesterday." Better audit primitive than what Borg has today;
+  matters for compliance use cases. Cost: a new chain to maintain,
+  schema decisions, a CLI surface to query receipts.
+- **Hardware / IoT peripherals.** GPIO / I2C / SPI / USB on Raspberry
+  Pi, STM32, Arduino, ESP32 via a `Peripheral` trait. Out of scope for
+  current Borg users but would open homelab/SBC deployments. Cost:
+  cross-compilation matrix, hardware test rigs, embedded-Rust
+  expertise.
+- **WASM plugin system.** Capability-sandboxed third-party extensions
+  (compile to WASM in any language, host grants narrow capabilities,
+  endpoint allowlist + leak scanner at the host boundary). Today Borg
+  is compiled-in only; this is the path to a real plugin ecosystem
+  without the security cost of native loading. Cost: WASM runtime in
+  the binary (`wasmtime` ≈ several MB), capability-grant API design,
+  manifest signing/verification, confused-deputy hardening on every
+  host function.
+
 ### Tests & quality
 
 - **Live-LLM test lane.** `[O]` `BORG_LIVE_TEST=1 cargo test --features
