@@ -72,6 +72,8 @@ Every tool's JSON schema is sent to the LLM every turn (~5KB+). Prefer adding ac
 
 ### Test Quality — No Fluff Tests
 
+**Tests must encode expected/spec behavior, not rubber-stamp current implementation.** A test that's written by reading the code and asserting whatever it currently does will pass for the wrong reasons and silently lock in bugs. Start from the spec/invariant you intend to hold, then assert against it — if the implementation is wrong, the test should fail.
+
 **Every test must be able to fail for a real-world reason.** Reject:
 
 - **Tautological** — asserting on values the test set, on `Default`/`Clone` output, or compile-time constants.
