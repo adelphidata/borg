@@ -9,12 +9,14 @@ pub enum HookPoint {
     /// Fired once when a new session begins (before any turns).
     SessionStart,
     /// Fired when a session ends (graceful shutdown or explicit close).
+    /// Extension point for `~/.borg/hooks.json`; no built-in consumer. See `docs/hooks.md`.
     SessionEnd,
     /// Before the agent starts processing a user message.
     BeforeAgentStart,
     /// Before sending messages to the LLM.
     BeforeLlmCall,
     /// After receiving a complete LLM response.
+    /// Extension point for `~/.borg/hooks.json`; no built-in consumer. See `docs/hooks.md`.
     AfterLlmResponse,
     /// Before executing a tool call.
     BeforeToolCall,

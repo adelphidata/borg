@@ -22,6 +22,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cortex::config::Config;
+#[cfg(unix)]
+use cortex::unix_ext::set_unix_mode;
 
 use crate::daemon_client;
 
@@ -757,14 +759,6 @@ fn provision_keyring_env_file(home: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     set_unix_mode(&path, 0o600)?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn set_unix_mode(path: &std::path::Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("chmod {} {:o}", path.display(), mode))
 }
 
 /// True iff this process is running in a headless Linux context where

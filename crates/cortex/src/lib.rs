@@ -196,6 +196,8 @@ pub mod truncate;
 pub mod tts;
 /// Core types: Message, ToolCall, ToolDefinition, Role.
 pub mod types;
+/// Tiny Unix filesystem helpers (chmod) shared across crates.
+pub mod unix_ext;
 /// Self-update mechanism for the borg binary.
 pub mod update;
 /// Shared input validators and sanitizers.

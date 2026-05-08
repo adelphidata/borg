@@ -2,6 +2,28 @@
 //!
 //! All magic numbers live here. Config `Default` impls and runtime code
 //! reference these constants instead of scattering literals.
+//!
+//! # Tiers
+//!
+//! Constants here fall into three tiers; each section below is annotated.
+//! When adding a constant, pick the tier and place it under the matching
+//! section divider:
+//!
+//! - **Tier A — user-facing defaults.** The corresponding setting is also
+//!   registered in `config::settings_table::define_settings!` so a user
+//!   can override it at runtime via `/settings`, `borg config set`, or the
+//!   admin RPC. Examples: `TOOL_OUTPUT_MAX_TOKENS`, `DEFAULT_LLM_TEMPERATURE`,
+//!   `MIN_HEARTBEAT_INTERVAL_SECS`, `BROWSER_DEFAULT_*`.
+//!
+//! - **Tier B — operational internals.** Tunable in principle, but not
+//!   surfaced to end users. Backoff schedules, dedup capacities, retry
+//!   factors, cooldowns, watchdog thresholds. Changing these is a code
+//!   change, not a config change.
+//!
+//! - **Tier C — architectural caps.** Hard limits the system relies on for
+//!   correctness or safety. `MAX_TOOL_CALLS_PER_RESPONSE`, embedding
+//!   dimensions, token-overhead estimates, hash-chain checkpoints. Tweaking
+//!   these can break invariants downstream — touch with care.
 
 use std::time::Duration;
 
@@ -452,6 +474,11 @@ pub const TOOL_RESULT_COMPACT_THRESHOLD: usize = 20;
 pub const IMAGE_GEN_TIMEOUT_SECS: u64 = 120;
 
 // ── Web ───────────────────────────────────────────────────────────
+
+/// Default outbound HTTP/RPC timeout for non-streaming clients (provider
+/// REST calls, image-gen queue submissions, third-party APIs). Streaming
+/// clients use `DEFAULT_LLM_REQUEST_TIMEOUT_MS` / per-chunk timeouts.
+pub const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout in seconds for web fetch requests.
 pub const WEB_FETCH_TIMEOUT_SECS: u64 = 30;

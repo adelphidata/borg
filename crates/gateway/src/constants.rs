@@ -1,7 +1,9 @@
 use std::time::Duration;
 
-/// Default HTTP timeout for gateway API clients.
-pub const GATEWAY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default HTTP timeout for gateway API clients. Re-export of
+/// `cortex::constants::DEFAULT_HTTP_TIMEOUT` so call sites can name it
+/// in gateway-flavored language without forking the value.
+pub use cortex::constants::DEFAULT_HTTP_TIMEOUT as GATEWAY_HTTP_TIMEOUT;
 
 /// Sentinel binding id assigned when no `[[gateway.bindings]]` rule matched
 /// the inbound message. Compared in routing logic to distinguish a

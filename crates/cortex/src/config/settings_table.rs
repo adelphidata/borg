@@ -159,6 +159,10 @@ define_settings! {
         "gateway.link_understanding" => gateway.link_understanding, json_set;
         "gateway.channel_error_policies" => gateway.channel_error_policies, json_set;
         "gateway.imessage_group_allowlist" => gateway.imessage_group_allowlist, json;
+        "gateway.signal_cli_host" => gateway.signal_cli_host, opt_string;
+        "gateway.signal_cli_port" => gateway.signal_cli_port, opt_parsed(u16);
+        "gateway.discord_guild_allowlist" => gateway.discord_guild_allowlist, json;
+        "gateway.slack_channel_allowlist" => gateway.slack_channel_allowlist, json;
 
         // ── Agents ──
         "agents.enabled" => agents.enabled, parsed(bool);
@@ -449,6 +453,15 @@ define_settings! {
         "tts.enabled" => "Enabled", Bool, "Voice";
         "tts.auto_mode" => "Auto reply", Bool, "Voice";
 
+        // — Channels — only rows for channels with credentials configured
+        // are shown; the popup filters at render time. Registry entries
+        // exist regardless so the admin RPC / `borg config` can edit them.
+        "gateway.group_activation" => "Group activation", Select, "Channels";
+        "gateway.signal_cli_host" => "Signal CLI host", Text, "Channels";
+        "gateway.signal_cli_port" => "Signal CLI port", Uint, "Channels";
+        "gateway.discord_guild_allowlist" => "Discord guilds (JSON)", Text, "Channels";
+        "gateway.slack_channel_allowlist" => "Slack channels (JSON)", Text, "Channels";
+
         // — Security —
         "sandbox.enabled" => "Sandbox", Bool, "Security";
         "hooks.enabled" => "Allow user hooks", Bool, "Security";
@@ -491,6 +504,7 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
         &["tools_system_and_2", "system_and_3"],
     ),
     ("security.verifier", &["tofu", "tailscale"]),
+    ("gateway.group_activation", &["mention", "always"]),
 ];
 
 /// `(min, max, step)` for `Float`-kind TUI settings. Drives `step_float` in

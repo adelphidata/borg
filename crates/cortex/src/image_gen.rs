@@ -267,7 +267,7 @@ async fn generate_fal(
         .header("Authorization", format!("Key {}", provider.api_key))
         .header("Content-Type", "application/json")
         .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(constants::DEFAULT_HTTP_TIMEOUT)
         .send()
         .await?;
 

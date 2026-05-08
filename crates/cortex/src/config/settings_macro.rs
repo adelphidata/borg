@@ -5,6 +5,7 @@
 ///   - `string`            — assign `value.to_string()`
 ///   - `opt_string`        — `None` if empty, else `Some(value.to_string())`
 ///   - `parsed(T)`         — `value.parse::<T>()`
+///   - `opt_parsed(T)`     — empty value → `None`, else `value.parse::<T>()`
 ///   - `nonzero(T)`        — parsed + reject zero
 ///   - `range(T, min, max)`— parsed + range check
 ///   - `json`              — `serde_json::from_str(value)`
@@ -142,6 +143,15 @@ macro_rules! define_settings {
         Ok(format!("{} = {}", $key, $self.$($path).+))
     }};
 
+    (@apply $self:ident, $key:ident, $value:ident, $($path:ident).+ , opt_parsed($T:ty)) => {{
+        $self.$($path).+ = if $value.is_empty() {
+            None
+        } else {
+            Some($crate::config::parse_value::<$T>($value, $key)?)
+        };
+        Ok(format!("{} = {}", $key, $value))
+    }};
+
     (@apply $self:ident, $key:ident, $value:ident, $($path:ident).+ , nonzero($T:ty)) => {{
         $self.$($path).+ = $crate::config::parse_nonzero::<$T>($value, $key)?;
         Ok(format!("{} = {}", $key, $self.$($path).+))
@@ -188,6 +198,10 @@ macro_rules! define_settings {
 
     (@extract $($path:ident).+ , parsed($T:ty)) => {
         |c| format!("{}", c.$($path).+)
+    };
+
+    (@extract $($path:ident).+ , opt_parsed($T:ty)) => {
+        |c| c.$($path).+.map(|v| format!("{v}")).unwrap_or_default()
     };
 
     (@extract $($path:ident).+ , nonzero($T:ty)) => {

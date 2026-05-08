@@ -682,7 +682,7 @@ pub async fn generate_evolution_name(
     stage: Stage,
     top_tools: &[(String, u32)],
 ) -> (String, String) {
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    const TIMEOUT: std::time::Duration = crate::constants::DEFAULT_HTTP_TIMEOUT;
 
     let fallback = fallback_evolution_name(archetype, stage);
 

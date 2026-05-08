@@ -54,7 +54,10 @@ pub enum EditMode {
 
 pub struct SettingsPopup {
     visible: bool,
-    entries: &'static [SettingEntry],
+    /// Visible TUI rows for the current popup session. Rebuilt on each
+    /// `show()` so channel-specific rows (Signal/Discord/Slack) only appear
+    /// when their credentials are configured. Sourced from `TUI_SETTINGS`.
+    entries: Vec<&'static SettingEntry>,
     selected: usize,
     mode: EditMode,
     status_message: Option<(String, bool)>, // (message, is_success)
@@ -74,11 +77,38 @@ pub struct SettingsPopup {
 // The popup renders entries in their declared order; category changes
 // produce section headers.
 
+/// Filter `TUI_SETTINGS` down to the rows that should be visible for this
+/// `Config`. Channel-specific rows (Signal/Discord/Slack) only render when
+/// their credentials are configured — a Telegram-only user shouldn't see
+/// Signal-CLI settings cluttering the popup.
+///
+/// Predicates use credential presence (the same signal `channel_init.rs`
+/// uses to decide whether to spin up a client) rather than a hypothetical
+/// `gateway.<channel>_enabled` flag, which doesn't exist in the schema.
+fn visible_entries(config: &Config) -> Vec<&'static SettingEntry> {
+    let signal_on = config.resolve_credential_or_env("SIGNAL_ACCOUNT").is_some();
+    let discord_on = config
+        .resolve_credential_or_env("DISCORD_BOT_TOKEN")
+        .is_some();
+    let slack_on = config
+        .resolve_credential_or_env("SLACK_BOT_TOKEN")
+        .is_some();
+    TUI_SETTINGS
+        .iter()
+        .filter(|e| match e.key {
+            "gateway.signal_cli_host" | "gateway.signal_cli_port" => signal_on,
+            "gateway.discord_guild_allowlist" => discord_on,
+            "gateway.slack_channel_allowlist" => slack_on,
+            _ => true,
+        })
+        .collect()
+}
+
 impl SettingsPopup {
     pub fn new() -> Self {
         Self {
             visible: false,
-            entries: TUI_SETTINGS,
+            entries: TUI_SETTINGS.iter().collect(),
             selected: 0,
             mode: EditMode::Browsing,
             status_message: None,
@@ -95,6 +125,7 @@ impl SettingsPopup {
 
     pub fn show(&mut self, config: &Config, client: &Arc<Mutex<DaemonClient>>) {
         self.visible = true;
+        self.entries = visible_entries(config);
         self.selected = 0;
         self.mode = EditMode::Browsing;
         self.status_message = None;
@@ -210,7 +241,7 @@ impl SettingsPopup {
     }
 
     fn entry_for_key(&self, key: &str) -> Option<&'static SettingEntry> {
-        self.entries.iter().find(|e| e.key == key)
+        self.entries.iter().find(|e| e.key == key).copied()
     }
 
     /// Handle a bracketed paste event. Returns `true` if the paste was consumed
@@ -659,7 +690,7 @@ impl SettingsPopup {
     /// Reset all settings to compiled defaults by clearing DB overrides and reloading config.
     fn reset_all_to_defaults(&mut self, config: &mut Config) -> anyhow::Result<Option<AppAction>> {
         let mut failed = 0usize;
-        for entry in self.entries {
+        for entry in &self.entries {
             let key = entry.key.to_string();
             let res =
                 self.block_on_rpc(move |c| Box::pin(async move { c.unset_setting(&key).await }));
@@ -1097,7 +1128,7 @@ mod tests {
         );
 
         let cfg = Config::default();
-        for entry in popup.entries {
+        for entry in &popup.entries {
             let val = popup.current_value(&cfg, entry.key);
             assert_ne!(val, "?", "missing current_value for {}", entry.key);
         }
@@ -1490,7 +1521,7 @@ mod tests {
         let cfg = Config::default();
 
         // Verify no current_value contains [db] or [toml] — those are gone
-        for entry in popup.entries {
+        for entry in &popup.entries {
             let val = popup.current_value(&cfg, entry.key);
             assert!(
                 !val.contains("[db]") && !val.contains("[toml]"),
@@ -1506,7 +1537,7 @@ mod tests {
         // No daemon snapshot loaded → `customized_keys` is empty, so every
         // setting reports `SettingSource::Default`.
         let popup = SettingsPopup::new();
-        for entry in popup.entries {
+        for entry in &popup.entries {
             let source = popup.setting_source(entry.key);
             assert_eq!(
                 source,

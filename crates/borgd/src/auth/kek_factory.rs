@@ -19,6 +19,8 @@ use anyhow::{anyhow, Context, Result};
 use cortex::config::security::KekBackend;
 use cortex::config::Config as CoreConfig;
 use cortex::db::Database;
+#[cfg(unix)]
+use cortex::unix_ext::set_unix_mode;
 use identity::{FileKekStore, KekStore, KeychainStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -185,14 +187,6 @@ fn generate_passphrase() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-#[cfg(unix)]
-fn set_unix_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("chmod {} {:o}", path.display(), mode))
 }
 
 fn write_file_0600(path: &Path, body: &[u8]) -> Result<()> {
