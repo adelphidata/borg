@@ -10,11 +10,7 @@
 //! at a tempdir so each test owns its DB. Serialized with a process-wide
 //! mutex because `Database::open()` re-reads BORG_DATA_DIR on every call.
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::await_holding_lock
-)]
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::await_holding_lock)]
 
 use borgd::grpc::admin::AdminSvc;
 use borgd::session::SessionRegistry;
