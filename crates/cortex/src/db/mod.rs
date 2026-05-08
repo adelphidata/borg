@@ -159,6 +159,22 @@ impl Database {
 
     /// Connection initialization: pragmas + migrations.
     pub(crate) fn init_connection(conn: Connection, busy_timeout_ms: u64) -> Result<Self> {
+        // Serialize init across the process. SQLite's `busy_timeout` doesn't
+        // reliably cover the cold-start race where several connections all
+        // try to switch a fresh DB file from rollback-journal to WAL: the
+        // `PRAGMA journal_mode=WAL` path takes a brief exclusive lock and
+        // returns SQLITE_BUSY without retrying. Borgd hits this on every
+        // start (daemon.rs, budget_tick, config_watcher, PKI bootstrap each
+        // open their own handle in parallel). Holding `INIT_LOCK` for the
+        // ~tens-of-ms init window costs nothing in production but eliminates
+        // the race deterministically; the regression is covered by
+        // `tests/db_concurrent_open.rs`. Poison recovery: another thread
+        // panicking mid-init shouldn't permanently brick the lock — its
+        // partial state is on a different connection and doesn't affect us.
+        static INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _init_guard = INIT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // busy_timeout must be set first: subsequent pragma writes
         // (`journal_mode=WAL`, `auto_vacuum`) take a writer lock and would
         // otherwise return SQLITE_BUSY immediately when another connection is

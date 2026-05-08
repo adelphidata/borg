@@ -708,21 +708,28 @@ impl App<'_> {
             );
             return Ok(AppAction::Continue);
         };
-        let category = category.trim();
-        let name = name.trim();
+        let category = category.trim().to_string();
+        let name = name.trim().to_string();
         if category.is_empty() || name.is_empty() {
             self.push_system_message("Usage: /doctor squelch <Category>:<Name>".to_string());
             return Ok(AppAction::Continue);
         }
-        let ttl_secs = (self.config.maintenance.security_squelch_ttl_days as i64) * 86_400;
+        let ttl_days = self.config.maintenance.security_squelch_ttl_days as i64;
+        let ttl_secs = ttl_days * 86_400;
         let now = chrono::Utc::now().timestamp();
         let expires_at = now.saturating_add(ttl_secs);
-        match doctor_squelch_db()
-            .and_then(|db| db.doctor_squelch_set(category, name, now, expires_at, None))
-        {
+        let client = self.client.clone();
+        let cat = category.clone();
+        let nm = name.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.doctor_squelch_set(&cat, &nm, expires_at, None).await
+            })
+        });
+        match result {
             Ok(()) => self.push_system_message(format!(
-                "✓ squelched {category}:{name} for {} days — will resume after",
-                self.config.maintenance.security_squelch_ttl_days
+                "✓ squelched {category}:{name} for {ttl_days} days — will resume after"
             )),
             Err(e) => self.push_system_message(format!("/doctor squelch failed: {e}")),
         }
@@ -735,9 +742,18 @@ impl App<'_> {
             self.push_system_message("Usage: /doctor unsquelch <Category>:<Name>".to_string());
             return Ok(AppAction::Continue);
         };
-        let category = category.trim();
-        let name = name.trim();
-        match doctor_squelch_db().and_then(|db| db.doctor_squelch_clear(category, name)) {
+        let category = category.trim().to_string();
+        let name = name.trim().to_string();
+        let client = self.client.clone();
+        let cat = category.clone();
+        let nm = name.clone();
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.doctor_squelch_clear(&cat, &nm).await
+            })
+        });
+        match result {
             Ok(true) => self.push_system_message(format!("✓ unsquelched {category}:{name}")),
             Ok(false) => self.push_system_message(format!(
                 "no active squelch for {category}:{name} — nothing to clear"
@@ -750,7 +766,9 @@ impl App<'_> {
     /// Show the active squelch list, with how long each one has left.
     fn cmd_doctor_squelch_list(&mut self) -> Result<AppAction> {
         let now = chrono::Utc::now().timestamp();
-        match doctor_squelch_db().and_then(|db| db.doctor_squelch_list_active(now)) {
+        match cortex::db::Database::open_readonly()
+            .and_then(|db| db.doctor_squelch_list_active(now))
+        {
             Ok(rows) => {
                 if rows.is_empty() {
                     self.push_system_message(
@@ -803,14 +821,6 @@ impl App<'_> {
         self.state = AppState::ConfirmingUninstall;
         Ok(AppAction::Continue)
     }
-}
-
-/// Open `~/.borg/borg.db` for `/doctor squelch …` commands. The TUI
-/// otherwise routes everything through the daemon RPC, but the squelch
-/// table is small, append-mostly, and SQLite WAL is concurrent-safe — so
-/// adding a one-off RPC just to flip a row would be over-engineering.
-fn doctor_squelch_db() -> Result<cortex::db::Database> {
-    cortex::db::Database::open()
 }
 
 /// Render a daemon-side [`protocols::admin::HealReport`] as a system-message

@@ -16,15 +16,16 @@ use protocols::admin::{
     admin_server::Admin, ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus,
     ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender,
     ApprovedSenderList, ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest,
-    CreateWebhookResponse, DaemonStatus, DreamReport, Empty, ExportSessionRequest,
-    ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
-    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    KeychainRef, LogActivityRequest, MessageView, MonthlyTokenTotal, MonthlyTotalCost,
-    OnboardingState, PairingApproval, PairingFilter, PairingRequest, PairingRequestList,
-    PluginInstallRequest, PluginInstallResponse, RemoveProviderRequest, RevokedClientToken,
-    ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
-    ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
+    CreateWebhookResponse, DaemonStatus, DoctorSquelchClearRequest, DoctorSquelchClearResponse,
+    DoctorSquelchSetRequest, DreamReport, Empty, ExportSessionRequest, ExportSessionResponse,
+    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
+    IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
+    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
+    PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
+    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
+    ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
+    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
     TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use std::pin::Pin;
@@ -1301,6 +1302,53 @@ impl Admin for AdminSvc {
             label: row.label,
             revoked_at: row.revoked_at.unwrap_or(0) as u64,
         }))
+    }
+
+    async fn doctor_squelch_set(
+        &self,
+        req: Request<DoctorSquelchSetRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        if req.category.is_empty() || req.name.is_empty() {
+            return Err(TStatus::invalid_argument(
+                "category and name must be non-empty",
+            ));
+        }
+        let now = chrono::Utc::now().timestamp();
+        if req.expires_at_unix <= now {
+            return Err(TStatus::invalid_argument(
+                "expires_at_unix must be in the future",
+            ));
+        }
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            let reason = (!req.reason.is_empty()).then_some(req.reason.as_str());
+            db.doctor_squelch_set(&req.category, &req.name, now, req.expires_at_unix, reason)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("doctor_squelch_set task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("doctor_squelch_set failed: {e}")))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn doctor_squelch_clear(
+        &self,
+        req: Request<DoctorSquelchClearRequest>,
+    ) -> Result<Response<DoctorSquelchClearResponse>, TStatus> {
+        let req = req.into_inner();
+        if req.category.is_empty() || req.name.is_empty() {
+            return Err(TStatus::invalid_argument(
+                "category and name must be non-empty",
+            ));
+        }
+        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let db = Database::open()?;
+            db.doctor_squelch_clear(&req.category, &req.name)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("doctor_squelch_clear task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("doctor_squelch_clear failed: {e}")))?;
+        Ok(Response::new(DoctorSquelchClearResponse { removed }))
     }
 }
 

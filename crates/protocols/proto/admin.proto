@@ -98,6 +98,10 @@ service Admin {
   // token exactly once; the daemon stores only its hash.
   rpc IssueClientToken(IssueClientTokenRequest) returns (IssueClientTokenResponse);
   rpc RevokeClientToken(ClientTokenRef) returns (RevokedClientToken);
+
+  // Doctor squelch CRUD — writer-only. Reads can use Database::open_readonly.
+  rpc DoctorSquelchSet(DoctorSquelchSetRequest) returns (Empty);
+  rpc DoctorSquelchClear(DoctorSquelchClearRequest) returns (DoctorSquelchClearResponse);
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }
@@ -459,4 +463,24 @@ message RevokedClientToken {
   int64 id = 1;
   string label = 2;
   uint64 revoked_at = 3;
+}
+
+// Doctor squelch CRUD ───────────────────────────────────────────────────────
+message DoctorSquelchSetRequest {
+  string category = 1;
+  string name = 2;
+  // Unix timestamp of expiry. The daemon uses its own clock for `squelched_at`.
+  int64 expires_at_unix = 3;
+  // Optional free-form reason; empty = no reason recorded.
+  string reason = 4;
+}
+
+message DoctorSquelchClearRequest {
+  string category = 1;
+  string name = 2;
+}
+
+message DoctorSquelchClearResponse {
+  // True if a row was removed; false if no active squelch existed.
+  bool removed = 1;
 }

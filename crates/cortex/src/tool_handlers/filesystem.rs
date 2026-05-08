@@ -2331,21 +2331,26 @@ mod tests {
 
     #[test]
     fn apply_patch_success_includes_diff_output() {
+        // Tempdir, not CWD: a panic between `write` and the trailing
+        // `remove_file` used to leak `borg_patch_diff_<pid>.txt` into
+        // `crates/cortex/` on every failed run. Tempdir cleans up via Drop
+        // regardless of how the test exits.
         let config = Config::default();
-        let filename = format!("borg_patch_diff_{}.txt", std::process::id());
-        std::fs::write(&filename, "old\n").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("diff_target.txt");
+        std::fs::write(&path, "old\n").unwrap();
+        let path_str = path.display().to_string();
         let patch =
-            format!("*** Begin Patch\n*** Update File: {filename}\n@@\n-old\n+new\n*** End Patch");
+            format!("*** Begin Patch\n*** Update File: {path_str}\n@@\n-old\n+new\n*** End Patch");
         let args = json!({"patch": patch});
         let result = handle_apply_patch(&args, &config).unwrap();
         assert!(result.contains("Patch applied successfully."));
-        assert!(result.contains(&format!("M {filename}")), "got: {result}");
+        assert!(result.contains(&format!("M {path_str}")), "got: {result}");
         assert!(
-            result.contains(&format!("--- a/{filename}")),
+            result.contains(&format!("--- a/{path_str}")),
             "got: {result}"
         );
         assert!(result.contains("+new"), "got: {result}");
-        let _ = std::fs::remove_file(&filename);
     }
 
     /// Mixed relative and absolute paths in one patch should both work.

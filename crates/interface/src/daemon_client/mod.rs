@@ -24,8 +24,9 @@ use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
     ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyList, ApiKeyRef,
     ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
-    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, DreamReport, Empty as AdminEmpty,
-    ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
+    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, DoctorSquelchClearRequest,
+    DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty, ExportSessionRequest,
+    ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
     PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
@@ -1372,5 +1373,41 @@ impl DaemonClient {
             .await
             .context("Admin.RevokeClientToken failed")?
             .into_inner())
+    }
+
+    /// Squelch a doctor finding `(category, name)` until `expires_at_unix`.
+    /// Re-squelching an existing pair refreshes the timestamps + reason.
+    pub async fn doctor_squelch_set(
+        &mut self,
+        category: &str,
+        name: &str,
+        expires_at_unix: i64,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.admin
+            .doctor_squelch_set(DoctorSquelchSetRequest {
+                category: category.to_string(),
+                name: name.to_string(),
+                expires_at_unix,
+                reason: reason.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.DoctorSquelchSet failed")?;
+        Ok(())
+    }
+
+    /// Drop a previously-set doctor squelch. Returns whether a row was
+    /// removed (`false` = no active squelch existed for this pair).
+    pub async fn doctor_squelch_clear(&mut self, category: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .admin
+            .doctor_squelch_clear(DoctorSquelchClearRequest {
+                category: category.to_string(),
+                name: name.to_string(),
+            })
+            .await
+            .context("Admin.DoctorSquelchClear failed")?
+            .into_inner()
+            .removed)
     }
 }

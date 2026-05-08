@@ -656,16 +656,18 @@ fn install_systemd(
 
     // Provision the appropriate EnvironmentFile *before* the unit goes
     // active. Both files end up at 0600 and live under `~/.borg/secrets/`.
+    // The daemon's auto-resolver picks the right backend on first start
+    // (and persists it via the borgd-side `persist_resolved_backend`); the
+    // cli intentionally does not write `security.kek_backend` here so it
+    // never opens the SQLite writer the daemon owns.
     match mode {
         LinuxInstallMode::FileBackend => {
             provision_kek_env_file(home)
                 .context("provision file-KEK passphrase EnvironmentFile")?;
-            persist_kek_backend_setting("file");
         }
         LinuxInstallMode::SecureKeyring => {
             provision_keyring_env_file(home)
                 .context("provision keyring auto-unlock EnvironmentFile")?;
-            persist_kek_backend_setting("os_keychain");
         }
     }
 
@@ -814,25 +816,6 @@ fn random_passphrase() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Best-effort persistence of the resolved KEK backend into the SQLite
-/// settings table so the daemon picks it up on first start (without
-/// having to probe). Failures are logged + ignored; the auto-resolver
-/// in borgd will still do the right thing on first start.
-fn persist_kek_backend_setting(value: &str) {
-    let db = match cortex::db::Database::open() {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!(
-                "borg service install: cannot persist security.kek_backend={value}: {e}"
-            );
-            return;
-        }
-    };
-    if let Err(e) = db.set_setting("security.kek_backend", value) {
-        tracing::warn!("borg service install: failed to write security.kek_backend={value}: {e}");
-    }
 }
 
 fn uninstall_systemd() -> Result<()> {
