@@ -704,3 +704,41 @@ fn multi_hunk_update() {
     assert!(content.contains("LINE FIVE"));
     assert!(content.contains("line 3")); // untouched middle
 }
+
+// ── Test: empty `@@` chunk body surfaces actionable error end-to-end ──
+//
+// Regression guard: a malformed patch where a `@@` chunk header is followed
+// by no diff lines (here, immediately by `*** End Patch`) used to be silently
+// accepted by the batch parser, producing a no-op hunk and reporting success.
+// The agent would believe the patch landed; the file on disk would be
+// unchanged. Now parity with codex / streaming-parser: hard error, file
+// untouched, message tells the LLM exactly what went wrong.
+
+#[test]
+fn empty_chunk_body_surfaces_actionable_error() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    let original = "alpha\nbeta\ngamma\n";
+    fs::write(dir.join("f.txt"), original).expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir).expect_err("empty chunk body must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does not contain any lines"),
+        "error must explain the empty-chunk problem, got: {msg}"
+    );
+
+    // No partial write: file content must be byte-identical to before.
+    let after = fs::read_to_string(dir.join("f.txt")).expect("read");
+    assert_eq!(
+        after, original,
+        "file must be untouched on parser rejection"
+    );
+}

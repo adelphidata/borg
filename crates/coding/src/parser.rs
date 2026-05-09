@@ -434,6 +434,19 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                     let (search_lines, replace_lines, is_end_of_file) =
                         collect_diff_lines(&lines, &mut i);
 
+                    // Reject `@@` followed by no diff lines (e.g. immediate
+                    // `*** End Patch`, lone `*** End of File`, or the next
+                    // `***` operation). Codex parity (parser.rs:360-403) and
+                    // streaming-parser parity (streaming_parser.rs:383-392):
+                    // silently accepting this would let malformed patches
+                    // report "applied" with zero file changes.
+                    if search_lines.is_empty() && replace_lines.is_empty() {
+                        return Err(ParseError::InvalidHunk {
+                            message: "Update hunk does not contain any lines".to_string(),
+                            line_number: hunk_source_line,
+                        });
+                    }
+
                     hunks.push(Hunk {
                         context_hint,
                         search: search_lines.join("\n"),
@@ -447,6 +460,13 @@ fn parse_patch_dsl(input: &str) -> Result<Patch, ParseError> {
                     let hunk_source_line = i + 1;
                     let (search_lines, replace_lines, is_end_of_file) =
                         collect_diff_lines(&lines, &mut i);
+
+                    if search_lines.is_empty() && replace_lines.is_empty() {
+                        return Err(ParseError::InvalidHunk {
+                            message: "Update hunk does not contain any lines".to_string(),
+                            line_number: hunk_source_line,
+                        });
+                    }
 
                     hunks.push(Hunk {
                         context_hint: None,
@@ -1214,6 +1234,99 @@ mod tests {
                 assert_eq!(hunks[0].replace, "new");
             }
             other => panic!("Expected UpdateFile, got {:?}", other),
+        }
+    }
+
+    // ── Empty `@@` chunk-body rejection (codex / streaming-parser parity) ──
+    //
+    // Spec: a chunk header (`@@` or `@@ ctx`) MUST be followed by at least one
+    // diff line (` `, `+`, or `-`). An empty body is malformed input — silently
+    // accepting it would let a broken LLM patch report success with zero file
+    // changes. Codex and the streaming parser already enforce this; the batch
+    // parser used to be the outlier.
+
+    #[test]
+    fn parse_chunk_header_followed_by_end_patch_rejected() {
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+*** End Patch";
+        let err = parse_patch(input).expect_err("empty @@ body must be rejected");
+        match err {
+            ParseError::InvalidHunk { message, .. } => assert!(
+                message.contains("does not contain any lines"),
+                "expected 'does not contain any lines' message, got: {message}"
+            ),
+            other => panic!("Expected InvalidHunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chunk_header_followed_by_eof_marker_only_rejected() {
+        // The EOF sentinel alone — with no diff lines preceding it — is the
+        // exact case codex's `parser.rs:397-403` catches. The marker sets
+        // is_end_of_file but contributes no search/replace content, so the
+        // chunk would otherwise be a no-op masquerading as success.
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+*** End of File
+*** End Patch";
+        let err = parse_patch(input).expect_err("EOF-only @@ body must be rejected");
+        match err {
+            ParseError::InvalidHunk { message, .. } => assert!(
+                message.contains("does not contain any lines"),
+                "expected 'does not contain any lines' message, got: {message}"
+            ),
+            other => panic!("Expected InvalidHunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chunk_header_followed_by_next_operation_rejected() {
+        // `@@` then immediately the next `*** Add File:` — the `***` marker
+        // terminates `collect_diff_lines` (DiffLine::Stop), leaving the chunk
+        // with zero diff lines. Must error rather than appending an empty hunk.
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+*** Add File: g.txt
++x
+*** End Patch";
+        let err = parse_patch(input).expect_err("empty @@ before next op must be rejected");
+        match err {
+            ParseError::InvalidHunk { message, .. } => assert!(
+                message.contains("does not contain any lines"),
+                "expected 'does not contain any lines' message, got: {message}"
+            ),
+            other => panic!("Expected InvalidHunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_chunk_with_only_context_lines_accepted_as_noop() {
+        // Positive control: a chunk that only has context lines (no `+` or
+        // `-`) is silly but legal — codex accepts it (parsed_lines > 0 from
+        // the context line). The new check guards specifically against an
+        // *empty* body, not a non-empty no-op body. Apply will treat it as
+        // a successful match-and-replace-with-same-content.
+        let input = "\
+*** Begin Patch
+*** Update File: f.txt
+@@
+ some context line
+*** End Patch";
+        let patch = parse_patch(input).expect("context-only chunk must still parse");
+        match &patch.operations[0] {
+            PatchOperation::UpdateFile { hunks, .. } => {
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(hunks[0].search, "some context line");
+                assert_eq!(hunks[0].replace, "some context line");
+            }
+            other => panic!("Expected UpdateFile, got {other:?}"),
         }
     }
 
