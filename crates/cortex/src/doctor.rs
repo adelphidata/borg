@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::constants::SECS_PER_DAY;
+use crate::constants::{IDENTITY_FILE, SECS_PER_DAY};
 use crate::db::Database;
 use crate::provider::Provider;
 use crate::skills::load_all_skills;
@@ -624,7 +624,7 @@ fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
         Err(e) => {
             checks.push(DiagnosticCheck::fail(
                 "Memory",
-                "IDENTITY.md",
+                IDENTITY_FILE,
                 format!("{e}"),
             ));
         }

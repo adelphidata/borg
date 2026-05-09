@@ -157,7 +157,7 @@ impl ExecutionContext {
     }
 
     fn resolve_raw_path(&self, raw: &str) -> PathBuf {
-        let expanded = shellexpand::tilde(raw).to_string();
+        let expanded = crate::unix_ext::expand_tilde(raw);
         let path = Path::new(&expanded);
         if path.is_absolute() {
             path.to_path_buf()

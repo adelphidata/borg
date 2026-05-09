@@ -119,7 +119,14 @@ impl Platform {
     }
 }
 
-/// Specification for a credential required by a plugin.
+/// Specification for a credential required by a plugin in the marketplace
+/// catalog.
+///
+/// Distinct from `interface::plugins::CredentialSpec` (the legacy
+/// `borg add` CLI flow's prompt-data type), which carries a free-text
+/// `help` instead of `help_url` and lacks `is_optional`. Both intentionally
+/// coexist; see the doc comment on the interface-side struct for the
+/// rationale and the consolidation note.
 #[derive(Debug, Clone)]
 pub struct CredentialSpec {
     /// Environment variable or keychain key name.

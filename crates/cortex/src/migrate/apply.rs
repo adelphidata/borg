@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::constants::IDENTITY_FILE;
 use crate::db::Database;
 
 use super::{MigrationPlan, MigrationResult, SourceData};
@@ -133,7 +134,7 @@ fn apply_persona(
     result: &mut MigrationResult,
 ) -> Result<()> {
     if let Some(src) = &plan.persona_file {
-        let dest = borg_data_dir.join("IDENTITY.md");
+        let dest = borg_data_dir.join(IDENTITY_FILE);
         match std::fs::copy(src, &dest) {
             Ok(_) => result.persona_copied = true,
             Err(e) => result.warnings.push(format!("Failed to copy persona: {e}")),

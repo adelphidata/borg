@@ -918,7 +918,7 @@ pub fn scan_extra_paths(
 ) -> Vec<(String, std::path::PathBuf)> {
     let mut files = Vec::new();
     for raw_path in extra_paths {
-        let expanded = shellexpand::tilde(raw_path).to_string();
+        let expanded = crate::unix_ext::expand_tilde(raw_path);
 
         // Canonicalize after tilde expansion; reject traversal and inaccessible paths
         let canonical = match std::fs::canonicalize(&expanded) {

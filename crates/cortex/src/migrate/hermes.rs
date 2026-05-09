@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::constants::MEMORY_INDEX_FILE;
+
 use super::{ConfigChange, MigrationCategories, MigrationSource, SourceData};
 
 /// Known API key env var names to look for in .env files.
@@ -220,7 +222,7 @@ fn parse_memory(root: &Path, data: &mut SourceData) {
     let memories_dir = root.join("memories");
 
     // MEMORY.md
-    let memory_md = memories_dir.join("MEMORY.md");
+    let memory_md = memories_dir.join(MEMORY_INDEX_FILE);
     if memory_md.exists() {
         data.memory_files
             .push((memory_md, "hermes-MEMORY.md".to_string()));
@@ -234,8 +236,8 @@ fn parse_memory(root: &Path, data: &mut SourceData) {
     }
 
     // Also check root-level MEMORY.md (some installations)
-    let root_memory = root.join("MEMORY.md");
-    if root_memory.exists() && !memories_dir.join("MEMORY.md").exists() {
+    let root_memory = root.join(MEMORY_INDEX_FILE);
+    if root_memory.exists() && !memories_dir.join(MEMORY_INDEX_FILE).exists() {
         data.memory_files
             .push((root_memory, "hermes-MEMORY.md".to_string()));
     }

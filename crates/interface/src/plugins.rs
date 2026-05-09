@@ -11,6 +11,10 @@ pub struct PluginDef {
     pub is_channel: bool,
 }
 
+/// Credential prompt metadata for the legacy `borg add <plugin>` CLI flow.
+/// Distinct from [`plugins::CredentialSpec`] (marketplace catalog): `help`
+/// is interactive prompt text, not a doc URL. Do not merge — fold the CLI
+/// flow into the marketplace catalog instead.
 pub struct CredentialSpec {
     pub key: &'static str,
     pub label: &'static str,

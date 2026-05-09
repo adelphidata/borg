@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::config::Config;
+use crate::constants::IDENTITY_FILE;
 
 use super::{MigrationPlan, MigrationSource, PlanChange, SourceData};
 
@@ -106,9 +107,9 @@ fn build_memory_changes(
 
 fn build_persona_change(data: &SourceData, borg_data_dir: &Path) -> Option<std::path::PathBuf> {
     data.persona_file.as_ref().and_then(|src| {
-        let identity_path = borg_data_dir.join("IDENTITY.md");
+        let identity_path = borg_data_dir.join(IDENTITY_FILE);
         if identity_path.exists() {
-            None // Don't overwrite existing IDENTITY.md
+            None // Don't overwrite the user's existing persona file.
         } else {
             Some(src.clone())
         }

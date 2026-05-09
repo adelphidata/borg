@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::constants::MEMORY_INDEX_FILE;
+
 use super::{ConfigChange, MigrationCategories, MigrationSource, SourceData};
 
 // API key vars are handled by hermes::parse_env_content (shared .env parser).
@@ -337,7 +339,7 @@ fn provider_to_env_var(provider: &str) -> Option<&'static str> {
 fn parse_memory(root: &Path, data: &mut SourceData) {
     let workspace = root.join("workspace");
 
-    let memory_md = workspace.join("MEMORY.md");
+    let memory_md = workspace.join(MEMORY_INDEX_FILE);
     if memory_md.exists() {
         data.memory_files
             .push((memory_md, "openclaw-MEMORY.md".to_string()));
