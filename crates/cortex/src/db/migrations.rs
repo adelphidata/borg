@@ -202,6 +202,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     forked_from_message_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,6 +542,8 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
 );
 CREATE INDEX IF NOT EXISTS idx_embedding_cache_lookup
     ON embedding_cache(provider, model, content_hash);
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_last_accessed
+    ON embedding_cache(last_accessed_at);
 
 CREATE TABLE IF NOT EXISTS session_index_status (
     session_id    TEXT PRIMARY KEY,

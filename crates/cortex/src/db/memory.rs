@@ -4,6 +4,14 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use super::models::{ChunkData, ChunkRow, EmbeddingRow, MemoryEntryRow};
 use super::Database;
 
+/// Build a comma-separated `?` placeholder string for an SQL `IN (...)`
+/// clause. `n` must be > 0 — callers handle the empty case by short-circuiting
+/// before they would build SQL at all.
+fn in_placeholders(n: usize) -> String {
+    debug_assert!(n > 0, "IN () is not valid SQL");
+    vec!["?"; n].join(", ")
+}
+
 impl Database {
     // ── Embedding Cache CRUD ──
 
@@ -78,11 +86,16 @@ impl Database {
     }
 
     /// Get session IDs that haven't been indexed yet.
+    ///
+    /// Uses `NOT EXISTS` so SQLite performs an indexed anti-join against
+    /// `session_index_status`'s primary key, instead of materializing a full
+    /// `LEFT JOIN ... IS NULL`.
     pub fn get_unindexed_sessions(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id FROM sessions s
-             LEFT JOIN session_index_status si ON s.id = si.session_id
-             WHERE si.session_id IS NULL
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM session_index_status si WHERE si.session_id = s.id
+             )
              ORDER BY s.updated_at DESC
              LIMIT ?1",
         )?;
@@ -555,6 +568,72 @@ impl Database {
         Ok(rows)
     }
 
+    /// Batch form of [`Self::list_memory_entries`]: fetch all entries across
+    /// multiple scopes in a single query. Used by the agent loop on every turn,
+    /// where naively looping single-scope queries was an N+1 pattern.
+    pub fn list_memory_entries_for_scopes(&self, scopes: &[String]) -> Result<Vec<MemoryEntryRow>> {
+        if scopes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = in_placeholders(scopes.len());
+        let sql = format!(
+            "SELECT id, scope, name, content, content_hash, created_at, updated_at
+             FROM memory_entries
+             WHERE scope IN ({placeholders})
+             ORDER BY scope, updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = scopes
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(MemoryEntryRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    name: row.get(2)?,
+                    content: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Batch form of [`Self::list_memory_tokens_map`]: returns a map keyed by
+    /// `(scope, name)` so callers can disambiguate identical entry names across
+    /// scopes (e.g. `INDEX` exists in both `global` and `project:abc`).
+    pub fn list_memory_tokens_map_for_scopes(
+        &self,
+        scopes: &[String],
+    ) -> Result<std::collections::HashMap<(String, String), i64>> {
+        if scopes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = in_placeholders(scopes.len());
+        let sql = format!(
+            "SELECT scope, name, estimated_tokens FROM memory_entries
+             WHERE scope IN ({placeholders}) AND estimated_tokens IS NOT NULL"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = scopes
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<std::collections::HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
     /// Fetch the cached estimated-token counts for all entries in a scope where
     /// the column is non-NULL. Entries missing from the map should be re-tokenized
     /// and persisted via [`Self::set_memory_tokens`].
@@ -619,11 +698,18 @@ impl Database {
         Ok(count)
     }
 
-    /// Prune embedding cache to at most `max_entries`, removing oldest by last_accessed_at.
+    /// Prune embedding cache to at most `max_entries`, removing oldest by `last_accessed_at`.
+    ///
+    /// Uses `NOT IN (SELECT ... ORDER BY last_accessed_at DESC LIMIT N)`. The
+    /// inner subquery is driven by `idx_embedding_cache_last_accessed` so the
+    /// LIMIT short-circuits without a sort, and the `id` tiebreaker means
+    /// timestamp ties at the boundary still leave exactly `max_entries` rows
+    /// (a `last_accessed_at <= cutoff` shape would over-delete on ties).
     pub fn prune_embedding_cache_by_count(&self, max_entries: usize) -> Result<usize> {
         let count = self.conn.execute(
             "DELETE FROM embedding_cache WHERE id NOT IN (
-                SELECT id FROM embedding_cache ORDER BY last_accessed_at DESC LIMIT ?1
+                SELECT id FROM embedding_cache
+                ORDER BY last_accessed_at DESC, id DESC LIMIT ?1
             )",
             params![max_entries as i64],
         )?;

@@ -1,10 +1,16 @@
 use anyhow::Result;
 use rusqlite::params;
 use std::collections::HashMap;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use super::models::{ChannelActivityRow, MessageRow, SessionRow};
 use super::Database;
+
+/// Hard cap on rows returned by [`Database::sessions_since`]. Acts as a
+/// circuit-breaker against unbounded scans (e.g. heartbeat passes `since=0`).
+/// Sized well above any realistic working-set so legitimate queries are not
+/// silently truncated; if a deployment hits this we have a separate problem.
+const SESSIONS_SINCE_HARD_CAP: i64 = 10_000;
 
 impl Database {
     pub fn upsert_session(
@@ -74,14 +80,19 @@ impl Database {
     }
 
     /// Return sessions updated since a given Unix timestamp, ordered by most recent first.
+    ///
+    /// Capped at [`SESSIONS_SINCE_HARD_CAP`] rows as a circuit-breaker. Callers
+    /// like the heartbeat invoke this with `since=0` (= "all sessions"), which
+    /// would otherwise scan the entire table for power users.
     pub fn sessions_since(&self, since: i64) -> Result<Vec<SessionRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, created_at, updated_at, total_tokens, model, title,
                     parent_session_id, forked_from_message_id
-             FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC",
+             FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
+             LIMIT ?2",
         )?;
-        let rows = stmt
-            .query_map(params![since], |row| {
+        let rows: Vec<SessionRow> = stmt
+            .query_map(params![since, SESSIONS_SINCE_HARD_CAP], |row| {
                 Ok(SessionRow {
                     id: row.get(0)?,
                     created_at: row.get(1)?,
@@ -94,6 +105,15 @@ impl Database {
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() == SESSIONS_SINCE_HARD_CAP as usize {
+            // Hitting the cap means a future caller that walks the full set
+            // will silently process a stale tail. Surface it so we notice
+            // before someone relies on completeness.
+            warn!(
+                "sessions_since hit the {SESSIONS_SINCE_HARD_CAP}-row cap (since={since}); \
+                 results are truncated"
+            );
+        }
         Ok(rows)
     }
 

@@ -4,6 +4,11 @@ use rusqlite::params;
 use super::models::ChainHealth;
 use super::Database;
 
+/// Per-call batch size for pending-celebration drains. The daemon scheduler
+/// re-invokes on each tick, so a backlog clears across multiple ticks rather
+/// than pulling thousands of rows into a single response.
+const PENDING_CELEBRATIONS_BATCH: i64 = 256;
+
 impl Database {
     /// Save an HMAC chain checkpoint for recovery.
     pub fn save_hmac_checkpoint(
@@ -801,13 +806,16 @@ impl Database {
         Ok(())
     }
 
-    /// Get all undelivered celebrations.
+    /// Get all undelivered celebrations, capped at [`PENDING_CELEBRATIONS_BATCH`]
+    /// rows per call so a backed-up queue doesn't pull an unbounded set into
+    /// memory. The daemon drain loop calls again on the next tick to pick up
+    /// any remainder.
     pub fn get_pending_celebrations(&self) -> Result<Vec<PendingCelebration>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC",
+            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![PENDING_CELEBRATIONS_BATCH], |row| {
                 Ok(PendingCelebration {
                     id: row.get(0)?,
                     celebration_type: row.get(1)?,
@@ -823,14 +831,14 @@ impl Database {
     /// sentinel value (-1) and returning the claimed rows. This prevents
     /// concurrent daemon ticks from delivering the same celebration twice.
     /// Call `mark_celebration_delivered` on success or `unclaim_celebration` on
-    /// failure.
+    /// failure. Same per-call cap as [`Self::get_pending_celebrations`].
     pub fn claim_pending_celebrations(&self) -> Result<Vec<PendingCelebration>> {
         let sentinel: i64 = -1;
         let mut stmt = self.conn.prepare(
-            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC",
+            "SELECT id, celebration_type, payload_json, created_at FROM pending_celebrations WHERE delivered_at IS NULL ORDER BY created_at ASC LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![PENDING_CELEBRATIONS_BATCH], |row| {
                 Ok(PendingCelebration {
                     id: row.get(0)?,
                     celebration_type: row.get(1)?,

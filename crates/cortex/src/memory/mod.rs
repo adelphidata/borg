@@ -395,10 +395,7 @@ fn load_entries_for_scopes(
     db: &crate::db::Database,
     scopes: &[String],
 ) -> Result<Vec<MemoryEntryRow>> {
-    let mut entries = Vec::new();
-    for scope in scopes {
-        entries.extend(db.list_memory_entries(scope)?);
-    }
+    let mut entries = db.list_memory_entries_for_scopes(scopes)?;
     entries.sort_by(|a, b| {
         if a.name == "INDEX" && b.name != "INDEX" {
             std::cmp::Ordering::Less
@@ -418,22 +415,15 @@ fn token_cache_for_scopes(
     db: &crate::db::Database,
     scopes: &[String],
 ) -> std::collections::HashMap<(String, String), i64> {
-    let mut cache = std::collections::HashMap::new();
-    for scope in scopes {
-        match db.list_memory_tokens_map(scope) {
-            Ok(map) => {
-                for (name, tokens) in map {
-                    cache.insert((scope.clone(), name), tokens);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to load cached token estimates for scope {scope}, will recompute: {e}"
-                );
-            }
+    match db.list_memory_tokens_map_for_scopes(scopes) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!(
+                "failed to load cached token estimates for scopes {scopes:?}, will recompute: {e}"
+            );
+            std::collections::HashMap::new()
         }
     }
-    cache
 }
 
 /// Load long-term SQLite memory for the configured scopes.

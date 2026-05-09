@@ -51,6 +51,7 @@ mod migrations;
 mod multi_agent;
 mod pairing;
 mod plugins;
+mod query_plans;
 mod scripts;
 mod sessions;
 mod tasks;
