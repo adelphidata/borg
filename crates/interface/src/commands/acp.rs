@@ -517,6 +517,18 @@ impl AcpRequestError {
         }
     }
 
+    fn prompt_in_flight(session_id: &str) -> Self {
+        Self {
+            code: -32000,
+            message: "Server busy",
+            data: Some(json!({
+                "kind": "prompt_in_flight",
+                "sessionId": session_id,
+                "detail": "another session/prompt is already running on this session; cancel it first or wait for it to complete",
+            })),
+        }
+    }
+
     fn daemon_disconnected() -> Self {
         Self {
             code: -32603,
@@ -894,14 +906,39 @@ async fn handle_request<D: AcpDaemon>(
                 let session = sessions
                     .get_mut(&params.session_id)
                     .ok_or_else(|| anyhow!(AcpRequestError::unknown_session(&params.session_id)))?;
+                // Reject concurrent prompts on the same session: the daemon
+                // serializes turns server-side, but the transport's
+                // `cancel_requested` flag is per-session, not per-prompt — a
+                // racing second prompt would clobber the first prompt's
+                // pending cancel state. Rather than queueing (hermes-style)
+                // or replacing (openclaw-style), reject with a structured
+                // busy error so the IDE can surface it to the user.
+                if session.runtime.prompt_in_flight {
+                    return Err(anyhow!(AcpRequestError::prompt_in_flight(
+                        &params.session_id
+                    )));
+                }
                 session.runtime.prompt_in_flight = true;
                 session.runtime.cancel_requested = false;
             }
-            let mut events = state
+            let mut events = match state
                 .daemon
                 .send_prompt(&params.session_id, prompt, callback_client.clone())
                 .await
-                .map_err(|e| anyhow!(AcpRequestError::internal(format!("{e:#}"))))?;
+            {
+                Ok(rx) => rx,
+                Err(e) => {
+                    // The in-flight flag is now sticky (see busy-reject
+                    // above); reset it before propagating so this session
+                    // isn't permanently locked when the daemon hand-off
+                    // fails (e.g. transient gRPC error on the bidi open).
+                    let mut sessions = state.sessions.lock().await;
+                    if let Some(session) = sessions.get_mut(&params.session_id) {
+                        session.runtime.prompt_in_flight = false;
+                    }
+                    return Err(anyhow!(AcpRequestError::internal(format!("{e:#}"))));
+                }
+            };
             let mut stop_reason = "end_turn";
             let mut termination = StreamTermination::Disconnected;
             while let Some(event) = events.recv().await {
@@ -920,7 +957,19 @@ async fn handle_request<D: AcpDaemon>(
                     }
                     _ => {
                         if let Some(update) = event_to_update(&event, &params.session_id) {
-                            send_notification(&writer, "session/update", update).await?;
+                            // A writer failure here used to propagate via
+                            // `?`, bypassing the cleanup block below and
+                            // leaving `prompt_in_flight = true` forever.
+                            // Route the failure through `StreamTermination`
+                            // so the unified cleanup path resets the flag.
+                            if let Err(e) =
+                                send_notification(&writer, "session/update", update).await
+                            {
+                                termination = StreamTermination::Failed(format!(
+                                    "session/update write failed: {e:#}"
+                                ));
+                                break;
+                            }
                         }
                     }
                 }
@@ -938,6 +987,11 @@ async fn handle_request<D: AcpDaemon>(
                 StreamTermination::Complete => {}
                 StreamTermination::Cancelled => stop_reason = "cancelled",
                 StreamTermination::Failed(message) => {
+                    tracing::warn!(
+                        session = %params.session_id,
+                        reason = %message,
+                        "ACP turn failed; surfacing as JSON-RPC internal error",
+                    );
                     return Err(anyhow!(AcpRequestError::internal(message)));
                 }
                 StreamTermination::Disconnected => {
@@ -984,6 +1038,13 @@ async fn handle_request<D: AcpDaemon>(
                         "daemon cancel failed; treating as no-op",
                     );
                 }
+            }
+            // ACP spec defines `session/cancel` as a notification, but a
+            // tolerant client may send it as a request (with `id`). Honour
+            // either shape: when an id is present, return a null result so
+            // the client doesn't time out waiting for a response.
+            if req.id.is_some() {
+                send_result(&writer, req.id, Value::Null).await?;
             }
             Ok(())
         }
@@ -1037,6 +1098,14 @@ fn validate_workspace_cwd(cwd: &str) -> Result<PathBuf> {
     })
 }
 
+/// Upper bound on a single ACP prompt's combined text + decoded image bytes.
+/// Aligned with openclaw's `MAX_PROMPT_BYTES`. A misbehaving or malicious IDE
+/// can otherwise stream arbitrarily large prompts into the transport before
+/// the daemon ever sees them — this short-circuits during accumulation so we
+/// never materialise more than the cap. 2 MiB is well above any realistic
+/// IDE prompt (typical screenshots fit comfortably).
+const MAX_PROMPT_BYTES: usize = 2 * 1024 * 1024;
+
 /// Convert ACP prompt blocks into the daemon's `(text, images)` shape.
 ///
 /// **Interleaving is not preserved.** Text fragments are concatenated in
@@ -1047,16 +1116,38 @@ fn validate_workspace_cwd(cwd: &str) -> Result<PathBuf> {
 /// extend `AcpStartTurn` with an ordered `repeated PromptBlock` field and
 /// thread that through `Message::user_multimodal`.
 fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput> {
-    let mut text_parts = Vec::new();
+    let mut text_parts: Vec<String> = Vec::new();
     let mut images = Vec::new();
+    let mut budget = MAX_PROMPT_BYTES;
     for block in blocks {
         match block {
-            PromptBlock::Text { text } => text_parts.push(text.clone()),
+            PromptBlock::Text { text } => {
+                // `\n` separator added between non-first text blocks counts
+                // toward the cap so we don't undercount the final string.
+                let separator_bytes = if text_parts.is_empty() { 0 } else { 1 };
+                let cost = text.len().saturating_add(separator_bytes);
+                if cost > budget {
+                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
+                        "prompt too large: text block exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
+                    ))));
+                }
+                budget -= cost;
+                text_parts.push(text.clone());
+            }
             PromptBlock::Image {
                 mime_type,
                 data,
                 filename,
             } => {
+                // Cheap upper-bound check before spending CPU on base64 decode:
+                // decoded length is at most `data.len() * 3 / 4`, but use the
+                // raw input length as a generous early-reject, then verify
+                // against the actual decoded size.
+                if data.len() > budget.saturating_mul(2) {
+                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
+                        "prompt too large: image block {mime_type} exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)"
+                    ))));
+                }
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|e| {
@@ -1064,6 +1155,13 @@ fn parse_prompt_blocks(blocks: &[PromptBlock]) -> Result<PromptInput> {
                             "decode image block {mime_type}: {e}"
                         )))
                     })?;
+                if bytes.len() > budget {
+                    return Err(anyhow!(AcpRequestError::invalid_params(format!(
+                        "prompt too large: image block {mime_type} ({} bytes) exceeds remaining budget (cap {MAX_PROMPT_BYTES} bytes)",
+                        bytes.len()
+                    ))));
+                }
+                budget -= bytes.len();
                 images.push(PromptImage {
                     mime_type: mime_type.clone(),
                     data: bytes,
@@ -1237,6 +1335,13 @@ fn event_to_update(event: &AgentEvent, session_id: &str) -> Option<Value> {
             "sessionId": session_id,
             "update": {
                 "kind": "agent_message_chunk",
+                "text": strip_internal_tags(text),
+            }
+        })),
+        AgentEvent::ThinkingDelta(text) => Some(json!({
+            "sessionId": session_id,
+            "update": {
+                "kind": "agent_thought_chunk",
                 "text": strip_internal_tags(text),
             }
         })),
@@ -1985,6 +2090,301 @@ mod tests {
         }])
         .expect_err("invalid base64 must error");
         assert!(err.to_string().contains("decode image block"), "got: {err}");
+    }
+
+    /// Regression: `AgentEvent::ThinkingDelta` (Claude-CLI extended thinking,
+    /// OpenAI-style reasoning streams) used to fall through `event_to_update`
+    /// and never reach the IDE. Both reference ACP implementations
+    /// (openclaw, hermes-agent) surface reasoning as `agent_thought_chunk`.
+    /// `<internal>` stripping must apply to thoughts the same way it does to
+    /// `TextDelta` so a reasoning stream can't smuggle hidden scratchpad.
+    #[test]
+    fn thinking_delta_emits_agent_thought_chunk() {
+        let event =
+            AgentEvent::ThinkingDelta("let me think<internal>scratch</internal> about this".into());
+        let update =
+            event_to_update(&event, "sess-1").expect("ThinkingDelta must produce a session/update");
+        assert_eq!(update["sessionId"], json!("sess-1"));
+        assert_eq!(update["update"]["kind"], json!("agent_thought_chunk"));
+        assert_eq!(
+            update["update"]["text"],
+            json!("let me think about this"),
+            "internal tags must be stripped from agent_thought_chunk too: {update}"
+        );
+    }
+
+    /// Regression: a second `session/prompt` arriving while the first is
+    /// still streaming used to overwrite `prompt_in_flight = true` and reset
+    /// `cancel_requested = false`, racing the original prompt's cancel
+    /// handling. The transport must reject with a structured busy error
+    /// (-32000 / kind=`prompt_in_flight`) instead so the IDE can surface it.
+    ///
+    /// Tests `handle_request` directly with a session pre-marked in-flight.
+    /// The end-to-end timing race in `acp_e2e/lifecycle.rs` (cancel mid-turn)
+    /// covers the streaming path; here we pin the dispatcher's reject
+    /// behavior in isolation so the daemon is never invoked.
+    #[tokio::test]
+    async fn concurrent_prompt_on_same_session_rejects_with_busy_error() {
+        use std::sync::atomic::AtomicU64;
+        let daemon = fake_daemon();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let state = AcpState {
+            daemon: daemon.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            client_capabilities: Arc::new(StdMutex::new(ClientCapabilities::default())),
+            onboarding_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            daemon_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        // Pre-seed the session with prompt_in_flight = true to simulate a
+        // first turn that's still streaming.
+        state.sessions.lock().await.insert(
+            "sess-1".into(),
+            SessionRecord {
+                workspace_cwd: workspace.clone(),
+                workspace_root: workspace,
+                runtime: SessionRuntime {
+                    prompt_in_flight: true,
+                    cancel_requested: false,
+                },
+            },
+        );
+        let (writer, _output) = CaptureWriter::new();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
+        let callback_client = JsonRpcCallbackClient {
+            writer: writer.clone(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            capabilities: state.client_capabilities.clone(),
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(3)),
+            method: "session/prompt".to_string(),
+            params: Some(json!({
+                "sessionId": "sess-1",
+                "prompt": [{"type": "text", "text": "second"}],
+            })),
+        };
+        let result = handle_request(state.clone(), req, writer, callback_client).await;
+        let err = result.expect_err("second concurrent prompt must reject");
+        let mapped = AcpRequestError::from_anyhow(&err);
+        assert_eq!(
+            mapped.code, -32000,
+            "second prompt must surface server-busy code -32000; got {mapped:?}"
+        );
+        let data = mapped.data.expect("busy error must carry data");
+        assert_eq!(
+            data["kind"],
+            json!("prompt_in_flight"),
+            "busy error must carry kind=prompt_in_flight for routing: {data}"
+        );
+        assert_eq!(
+            data["sessionId"],
+            json!("sess-1"),
+            "busy error must echo sessionId so the IDE can correlate: {data}"
+        );
+        // Daemon must NOT have been invoked — busy reject happens before
+        // send_prompt, otherwise the cancel-flag race we're guarding
+        // against would still be reachable.
+        assert!(
+            daemon.prompts.lock().await.is_empty(),
+            "rejected prompt must never reach daemon.send_prompt"
+        );
+        // Flag must remain set (the first prompt is still in flight). A
+        // regression that reset it would let the next prompt slip through.
+        let sessions = state.sessions.lock().await;
+        assert!(
+            sessions
+                .get("sess-1")
+                .expect("session present")
+                .runtime
+                .prompt_in_flight,
+            "rejection must not flip prompt_in_flight off (still owned by the first prompt)"
+        );
+    }
+
+    /// Regression: when `daemon.send_prompt` itself fails (e.g. transient
+    /// gRPC error opening the bidi stream), the prompt handler used to
+    /// propagate the error without resetting `prompt_in_flight`. Combined
+    /// with the new busy-reject above, that would lock the session
+    /// permanently. Pin that the flag is restored on the daemon-failure
+    /// path so the next prompt can proceed.
+    #[tokio::test]
+    async fn prompt_handler_resets_in_flight_on_daemon_send_failure() {
+        use std::sync::atomic::AtomicU64;
+        // A purpose-built failing daemon: `FakeDaemon`'s `send_prompt` only
+        // errors on a missing session entry, which the dispatcher catches
+        // earlier (BEFORE setting the in-flight flag). We need the failure
+        // to come from `send_prompt` itself so the cleanup path runs.
+        #[derive(Clone)]
+        struct FailingDaemon;
+        #[async_trait]
+        impl AcpDaemon for FailingDaemon {
+            async fn onboarding_complete(&self) -> Result<bool> {
+                Ok(true)
+            }
+            async fn open_session(
+                &self,
+                _resume_id: Option<&str>,
+                _workspace_cwd: Option<&Path>,
+                _workspace_root: Option<&Path>,
+                _enforce_workspace_root: bool,
+            ) -> Result<(String, u64)> {
+                Ok(("sess-1".to_string(), 0))
+            }
+            async fn send_prompt<F: AcpFsClient>(
+                &self,
+                _session_id: &str,
+                _prompt: PromptInput,
+                _fs_client: F,
+            ) -> Result<mpsc::Receiver<AgentEvent>> {
+                Err(anyhow!("simulated daemon RPC failure"))
+            }
+            async fn cancel(&self, _session_id: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn state(&self, _session_id: &str) -> Result<SessionMetadata> {
+                Ok(SessionMetadata {
+                    session_id: "sess-1".into(),
+                    title: "t".into(),
+                    model: "m".into(),
+                    workspace_cwd: None,
+                    workspace_root: None,
+                })
+            }
+            async fn replay_history(&self, _session_id: &str) -> Result<Vec<HistoryMessage>> {
+                Ok(Vec::new())
+            }
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().to_path_buf();
+        let state = AcpState {
+            daemon: FailingDaemon,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            client_capabilities: Arc::new(StdMutex::new(ClientCapabilities::default())),
+            onboarding_confirmed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            daemon_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        };
+        state.sessions.lock().await.insert(
+            "sess-1".into(),
+            SessionRecord {
+                workspace_cwd: workspace.clone(),
+                workspace_root: workspace,
+                runtime: SessionRuntime::default(),
+            },
+        );
+        let (writer, _output) = CaptureWriter::new();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(writer)));
+        let callback_client = JsonRpcCallbackClient {
+            writer: writer.clone(),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            capabilities: state.client_capabilities.clone(),
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(2)),
+            method: "session/prompt".to_string(),
+            params: Some(json!({
+                "sessionId": "sess-1",
+                "prompt": [{"type": "text", "text": "go"}],
+            })),
+        };
+        let result = handle_request(state.clone(), req, writer, callback_client).await;
+        assert!(result.is_err(), "send_prompt failure must propagate");
+        let sessions = state.sessions.lock().await;
+        assert!(
+            !sessions
+                .get("sess-1")
+                .expect("session present")
+                .runtime
+                .prompt_in_flight,
+            "prompt_in_flight MUST reset on daemon failure or the session is permanently locked"
+        );
+    }
+
+    /// Regression: text blocks accumulated unbounded; a misbehaving IDE
+    /// could materialise an arbitrary-large prompt before the daemon ever
+    /// saw it (DoS surface). `parse_prompt_blocks` must short-circuit with
+    /// invalid_params once accumulated bytes exceed `MAX_PROMPT_BYTES`.
+    #[test]
+    fn oversize_prompt_text_rejected_as_invalid_params() {
+        let huge = "x".repeat(MAX_PROMPT_BYTES + 1);
+        let err = parse_prompt_blocks(&[PromptBlock::Text { text: huge }])
+            .expect_err("oversized text must reject");
+        let mapped = AcpRequestError::from_anyhow(&err);
+        assert_eq!(mapped.code, -32602, "must surface as invalid_params");
+        assert!(
+            err.to_string().contains("prompt too large"),
+            "error must explain the cap to the caller; got: {err}"
+        );
+    }
+
+    /// Regression for the image branch of the byte cap: base64 decode used
+    /// to run unconditionally, so an attacker could stream a multi-GB image
+    /// block and OOM the transport long before the daemon weighed in.
+    #[test]
+    fn oversize_prompt_image_rejected_as_invalid_params() {
+        // Build an image block whose decoded payload (3 MiB of zero bytes)
+        // exceeds MAX_PROMPT_BYTES. Base64 ratio is 4/3, so the encoded
+        // string is ~4 MiB — also above the early-reject threshold.
+        let bytes = vec![0u8; (MAX_PROMPT_BYTES * 3) / 2];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let err = parse_prompt_blocks(&[PromptBlock::Image {
+            mime_type: "image/png".into(),
+            data: encoded,
+            filename: Some("huge.png".into()),
+        }])
+        .expect_err("oversized image must reject");
+        let mapped = AcpRequestError::from_anyhow(&err);
+        assert_eq!(mapped.code, -32602, "must surface as invalid_params");
+        assert!(
+            err.to_string().contains("prompt too large"),
+            "error must explain the cap to the caller; got: {err}"
+        );
+    }
+
+    /// Regression: ACP spec defines `session/cancel` as a notification, but a
+    /// tolerant client can send it as a request (with `id`). The handler
+    /// previously returned `Ok(())` without writing any response, so a
+    /// request-shaped cancel made the IDE wait forever. Must respond with
+    /// `result: null` keyed to the request id.
+    #[tokio::test]
+    async fn session_cancel_with_id_returns_null_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = dir.path().to_string_lossy();
+        let input = format!(
+            concat!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/new\",\"params\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/cancel\",\"params\":{{\"sessionId\":\"sess-1\"}}}}\n"
+            ),
+            cwd
+        );
+        let (writer, output) = CaptureWriter::new();
+        run_transport(
+            fake_daemon(),
+            BufReader::new(std::io::Cursor::new(input.into_bytes())),
+            writer,
+        )
+        .await
+        .expect("transport");
+        let lines = parse_lines(output.lock().unwrap().clone());
+        let cancel_resp = lines
+            .iter()
+            .find(|l| l["id"] == json!(7))
+            .unwrap_or_else(|| panic!("no response for cancel-as-request id=7: {lines:?}"));
+        assert!(
+            cancel_resp.get("error").is_none(),
+            "cancel-as-request must succeed, not error: {cancel_resp}"
+        );
+        assert_eq!(
+            cancel_resp["result"],
+            Value::Null,
+            "ACP spec: cancel response is empty/null when one is sent"
+        );
     }
 
     #[tokio::test]
