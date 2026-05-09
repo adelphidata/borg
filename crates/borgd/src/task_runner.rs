@@ -300,6 +300,7 @@ fn maybe_attach_cost_event_sink(
     client: LlmClient,
     config: &Config,
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    kind: &str,
 ) -> LlmClient {
     if !config.telemetry.cost_events {
         return client;
@@ -310,7 +311,7 @@ fn maybe_attach_cost_event_sink(
             sink,
             CostEventContext {
                 session_id: String::new(),
-                kind: "chat".to_string(),
+                kind: kind.to_string(),
             },
         ),
         None => client,
@@ -630,8 +631,8 @@ async fn execute_prompt_task(ctx: &TaskExecContext) {
         cortex::types::Message::user(&user_msg),
     ];
 
-    let llm = match LlmClient::new(config) {
-        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone()),
+    let llm = match LlmClient::for_auxiliary(config) {
+        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
         Err(e) => {
             tracing::warn!("Failed to create LLM client for task '{task_name}': {e}");
             match cortex::db::Database::open() {
@@ -821,8 +822,8 @@ async fn execute_heartbeat_task(ctx: &TaskExecContext, task: &cortex::db::Schedu
         cortex::types::Message::system(system),
         cortex::types::Message::user(&user_msg),
     ];
-    let llm = match LlmClient::new(config) {
-        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone()),
+    let llm = match LlmClient::for_auxiliary(config) {
+        Ok(l) => maybe_attach_cost_event_sink(l, config, cost_event_sink.clone(), "auxiliary"),
         Err(e) => {
             let err_str = format!("{e}");
             record_heartbeat_failure(*run_id, *started_at_ms, &err_str, task_name);

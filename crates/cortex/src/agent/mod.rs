@@ -231,6 +231,20 @@ use tool_validation::{
     PartialToolCall, ToolCallRepeatTracker,
 };
 
+/// Which LLM chain a particular agent instance routes through.
+///
+/// `Primary` is the default for interactive turns and tool-spawned
+/// sub-agents. `Auxiliary` is reserved for background work (memory
+/// consolidation, heartbeat, scheduled prompts) that must keep running
+/// when the primary provider is degraded — those construct via
+/// [`LlmClient::for_auxiliary`] which routes through `[llm.aux]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlmRole {
+    #[default]
+    Primary,
+    Auxiliary,
+}
+
 /// Core conversation agent: manages history, tools, and the LLM interaction loop.
 pub struct Agent {
     /// Primary config. Must be kept in sync with `config_arc` — update both in `reload_config`.
@@ -286,6 +300,12 @@ pub struct Agent {
     /// Tracks runs of identical consecutive tool calls within a turn.
     /// Reset at the start of each `run_agent_loop`.
     pub(super) tool_call_repeat: ToolCallRepeatTracker,
+    /// Which LLM chain this agent's `make_llm_client_from_config` builds.
+    /// `Primary` is the default — interactive turns and tool-spawned
+    /// sub-agents always run on the user's primary chain. `Auxiliary` is
+    /// set by [`Agent::new_sub_agent_aux`] for background work so a
+    /// primary outage doesn't take down nightly cron.
+    pub(super) llm_role: LlmRole,
 }
 
 /// Common state produced by `build_common`, consumed by both `new()` and `new_sub_agent()`.
@@ -412,6 +432,7 @@ impl Agent {
         spawn_depth: u32,
         tools_filter: Option<Vec<String>>,
         metrics: BorgMetrics,
+        llm_role: LlmRole,
     ) -> Self {
         let execution_context = crate::execution_context::ExecutionContext::from_process()
             .unwrap_or_else(|_| {
@@ -451,6 +472,7 @@ impl Agent {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            llm_role,
         }
     }
 
@@ -477,6 +499,7 @@ impl Agent {
             0,
             None,
             metrics,
+            LlmRole::Primary,
         ))
     }
 
@@ -580,14 +603,24 @@ impl Agent {
     }
 
     fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
-        let mut client = LlmClient::new(config)?;
+        let mut client = match self.llm_role {
+            LlmRole::Primary => LlmClient::new(config)?,
+            LlmRole::Auxiliary => LlmClient::for_auxiliary(config)?,
+        };
         if let Some(ref sink) = self.cost_event_sink {
             if config.telemetry.cost_events {
+                // Tag the sink so dashboards can split spend by role —
+                // an aux outage budget is its own line item, not lumped
+                // into chat spend.
+                let kind = match self.llm_role {
+                    LlmRole::Primary => "chat",
+                    LlmRole::Auxiliary => "auxiliary",
+                };
                 client = client.with_cost_event_sink(
                     sink.clone(),
                     crate::llm::CostEventContext {
                         session_id: self.session.meta.id.clone(),
-                        kind: "chat".to_string(),
+                        kind: kind.to_string(),
                     },
                 );
             }
@@ -602,6 +635,46 @@ impl Agent {
         agents_config: &crate::config::MultiAgentConfig,
         metrics: BorgMetrics,
         tools_filter: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::new_sub_agent_with_role(
+            config,
+            spawn_depth,
+            agents_config,
+            metrics,
+            tools_filter,
+            LlmRole::Primary,
+        )
+    }
+
+    /// Create a sub-agent that routes through the auxiliary LLM chain
+    /// (`[llm.aux]`). Use for background work — memory consolidation,
+    /// scheduled prompts, heartbeat — so a primary-provider outage can't
+    /// take down nightly cron. Tool-spawned sub-agents and interactive
+    /// turns must keep using [`Agent::new_sub_agent`] (Primary).
+    pub fn new_sub_agent_aux(
+        config: Config,
+        spawn_depth: u32,
+        agents_config: &crate::config::MultiAgentConfig,
+        metrics: BorgMetrics,
+        tools_filter: Option<Vec<String>>,
+    ) -> Result<Self> {
+        Self::new_sub_agent_with_role(
+            config,
+            spawn_depth,
+            agents_config,
+            metrics,
+            tools_filter,
+            LlmRole::Auxiliary,
+        )
+    }
+
+    fn new_sub_agent_with_role(
+        config: Config,
+        spawn_depth: u32,
+        agents_config: &crate::config::MultiAgentConfig,
+        metrics: BorgMetrics,
+        tools_filter: Option<Vec<String>>,
+        llm_role: LlmRole,
     ) -> Result<Self> {
         let common = build_common(&config)?;
         let agent_control = if agents_config.enabled && spawn_depth < agents_config.max_spawn_depth
@@ -621,6 +694,7 @@ impl Agent {
             spawn_depth,
             tools_filter,
             metrics,
+            llm_role,
         ))
     }
 
@@ -2879,6 +2953,7 @@ mod tests {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            llm_role: LlmRole::Primary,
         };
 
         agent.maybe_refresh_skills_after_tool(
@@ -2942,6 +3017,7 @@ mod tests {
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
+            llm_role: LlmRole::Primary,
         };
 
         agent.reload_config(Config::default());

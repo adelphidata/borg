@@ -199,6 +199,13 @@ impl SettingsResolver {
         let prev = self.read_prior_for_audit(key);
         self.db.set_setting(key, value)?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value));
+        // Clearing a parent blob (`llm.aux = ""`) must also wipe its
+        // sub-key rows. Settings replay applies all rows in lex order, so
+        // a leftover `llm.aux.model = "<old>"` would auto-resurrect aux
+        // on the next reload — silently negating the user's clear.
+        if key == "llm.aux" && value.trim().is_empty() {
+            self.cascade_clear_aux_subkeys();
+        }
         Ok(confirmation)
     }
 
@@ -212,7 +219,30 @@ impl SettingsResolver {
         let prev = self.read_prior_for_audit(key);
         self.db.set_setting(key, &default_value)?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value));
+        // `unset llm.aux` writes the default ("") for the parent and must
+        // cascade — see the matching path in `set` for rationale.
+        if key == "llm.aux" {
+            self.cascade_clear_aux_subkeys();
+        }
         Ok(())
+    }
+
+    /// Best-effort delete of `llm.aux.model` / `llm.aux.fallback` rows so
+    /// they can't resurrect aux on the next `resolve()`. DB errors are
+    /// logged, not propagated — a stale sub-key is a soft-fail (worst
+    /// case: aux re-materializes with the old model id, which the user
+    /// can fix by editing the row).
+    fn cascade_clear_aux_subkeys(&self) {
+        for sub_key in ["llm.aux.model", "llm.aux.fallback"] {
+            if let Err(e) = self.db.delete_setting(sub_key) {
+                tracing::warn!(
+                    %sub_key,
+                    error = %e,
+                    "settings: cascade-delete of aux sub-key failed; \
+                     may resurrect aux on next reload"
+                );
+            }
+        }
     }
 
     /// Read the prior value of `key` for the `SETTINGS_CHANGED` audit row.
@@ -440,6 +470,130 @@ mod tests {
     fn invalid_value_errors() {
         let resolver = test_resolver();
         assert!(resolver.set("temperature", "5.0").is_err());
+    }
+
+    #[test]
+    fn llm_aux_round_trips_through_resolver() {
+        // The aux chain ships behind a JSON setter rather than a single-field
+        // path, so a regression in the custom_apply / custom_extract pair is
+        // easy to miss. This locks the back-compat invariant (unset = None,
+        // primary chain only) AND the set/clear cycle through the same code
+        // path the daemon uses on every reload.
+        let resolver = test_resolver();
+
+        // Default: unset → empty extractor output, aux remains None.
+        let cfg = resolver.resolve().unwrap();
+        assert!(
+            cfg.llm.aux.is_none(),
+            "aux must default to None, not auto-populated"
+        );
+        let (val, _) = resolver.get_with_source("llm.aux").unwrap();
+        assert!(val.is_empty(), "extractor for unset aux must be empty");
+
+        // Set whole-blob.
+        let blob = r#"{"provider":"anthropic","model":"auto","api_key_env":"ANTHROPIC_API_KEY"}"#;
+        resolver.set("llm.aux", blob).unwrap();
+        let cfg = resolver.resolve().unwrap();
+        let aux = cfg.llm.aux.as_ref().expect("aux must populate after set");
+        assert_eq!(aux.provider.as_deref(), Some("anthropic"));
+        assert!(aux.model_is_auto());
+        assert_eq!(aux.api_key_env, "ANTHROPIC_API_KEY");
+
+        // Override sub-field via dedicated key — must auto-create-if-needed
+        // semantics survive the round-trip (already created here, but the
+        // setter must NOT clobber unrelated fields).
+        resolver.set("llm.aux.model", "claude-haiku-4-5").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        let aux = cfg.llm.aux.unwrap();
+        assert_eq!(aux.model, "claude-haiku-4-5");
+        assert_eq!(
+            aux.provider.as_deref(),
+            Some("anthropic"),
+            "sub-field setter must not wipe sibling fields"
+        );
+        assert_eq!(aux.api_key_env, "ANTHROPIC_API_KEY");
+
+        // Clear via empty string returns to back-compat None state. The
+        // `set` path cascade-clears `llm.aux.model` / `llm.aux.fallback`
+        // rows so a leftover sub-key value can't resurrect aux on the
+        // next reload — see `cascade_clear_aux_subkeys`.
+        resolver.set("llm.aux", "").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        assert!(
+            cfg.llm.aux.is_none(),
+            "empty value must clear aux back to None (cascade)"
+        );
+    }
+
+    #[test]
+    fn llm_aux_clear_cascade_prevents_subkey_resurrection() {
+        // Regression: settings replay iterates rows in DB lex order. If
+        // the user sets `llm.aux.model = "claude-haiku-4-5"`, then sets
+        // `llm.aux = ""`, a naive implementation would leave the sub-key
+        // row in place. On the next `resolve()`, applying `llm.aux = ""`
+        // first clears aux to None, then `llm.aux.model = "..."` auto-
+        // creates a half-formed AuxLlmConfig with the leftover model
+        // id — silently negating the user's clear. This test locks the
+        // cascade-on-clear semantics that prevent that bug.
+        let resolver = test_resolver();
+        let blob = r#"{"provider":"anthropic","model":"auto","api_key_env":"ANTHROPIC_API_KEY"}"#;
+        resolver.set("llm.aux", blob).unwrap();
+        resolver.set("llm.aux.model", "claude-haiku-4-5").unwrap();
+        // Sanity: aux exists with the overridden model.
+        assert_eq!(
+            resolver.resolve().unwrap().llm.aux.unwrap().model,
+            "claude-haiku-4-5"
+        );
+
+        // Clear the parent. The cascade must wipe the sub-key row.
+        resolver.set("llm.aux", "").unwrap();
+        assert!(
+            resolver.resolve().unwrap().llm.aux.is_none(),
+            "cascade-on-clear must prevent zombie sub-key resurrection"
+        );
+    }
+
+    #[test]
+    fn llm_aux_model_auto_creates_aux_when_unset() {
+        // The TUI Resilience-category quick path: a user opens /settings,
+        // edits "Aux model" without ever having seen the JSON blob. Setter
+        // must materialize a default AuxLlmConfig so the user's change
+        // takes effect — silently failing because aux is None would be a
+        // confusing UX dead-end.
+        let resolver = test_resolver();
+        resolver.set("llm.aux.model", "gpt-5-mini").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        let aux = cfg.llm.aux.expect("aux must auto-create on sub-field set");
+        assert_eq!(aux.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn llm_aux_model_empty_value_is_noop() {
+        // Empty round-trips must NOT spuriously materialize aux on every
+        // reload — the extractor returns "" when aux is None, and feeding
+        // that back through the setter would auto-create aux ad infinitum.
+        // To reset to the resolver default, set the literal "auto"; to
+        // clear aux, use the parent `llm.aux` setter with empty value.
+        let resolver = test_resolver();
+        resolver.set("llm.aux.model", "").unwrap();
+        let cfg = resolver.resolve().unwrap();
+        assert!(
+            cfg.llm.aux.is_none(),
+            "empty value must not materialize an aux block"
+        );
+    }
+
+    #[test]
+    fn llm_aux_invalid_json_is_rejected() {
+        // The whole-blob setter must reject malformed JSON loudly — silent
+        // acceptance would clobber a working aux config with `None` on the
+        // next reload (since deserialize-fallback would yield None).
+        let resolver = test_resolver();
+        let result = resolver.set("llm.aux", "{not valid json");
+        assert!(
+            result.is_err(),
+            "invalid JSON must error, not silently null aux"
+        );
     }
 
     #[test]

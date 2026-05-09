@@ -95,6 +95,7 @@ use crate::types::{Message, Role, ToolDefinition};
 const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 
 mod anthropic;
+pub mod aux_model_picker;
 mod cost;
 mod pricing;
 
@@ -472,6 +473,92 @@ impl LlmClient {
             cost_event_sink: None,
             cost_event_context: None,
         })
+    }
+
+    /// Build an auxiliary LLM client dedicated to background tasks (memory
+    /// consolidation, heartbeats, scheduled prompts). Routes through the
+    /// `[llm.aux]` chain when configured, isolating its provider-slot
+    /// cooldown state from the primary client so a primary-provider outage
+    /// can't take down nightly cron.
+    ///
+    /// Falls through to [`LlmClient::new`] (primary chain) when:
+    /// - `config.llm.aux` is `None` (back-compat: pre-aux-feature configs)
+    /// - aux's resolved provider has no entry in [`aux_model_picker`]
+    ///   (local providers like Ollama / Claude CLI — no cheap sibling to
+    ///   pin to)
+    ///
+    /// Both fall-throughs are silent — auxiliary failover must never block
+    /// the daemon at boot.
+    pub fn for_auxiliary(config: &Config) -> Result<Self> {
+        let Some(aux) = config.llm.aux.as_ref() else {
+            return Self::new(config);
+        };
+
+        // Resolve provider: explicit aux override → primary's provider.
+        let provider_str = aux.provider.clone().or_else(|| config.llm.provider.clone());
+        let Some(provider_str) = provider_str else {
+            // Neither aux nor primary names a provider (rare — primary
+            // is also unset). Fall through so the existing primary-path
+            // error surfaces a coherent message rather than us inventing
+            // one here.
+            return Self::new(config);
+        };
+
+        // Resolve the `"auto"` sentinel via the hardcoded provider→model
+        // map. `None` means "no aux default for this provider" (Ollama,
+        // Claude CLI, custom strings) — fall through to the primary chain.
+        let resolved_model = if aux.model_is_auto() {
+            match aux_model_picker::pick_aux_model(&provider_str) {
+                Some(m) => m.to_string(),
+                None => return Self::new(config),
+            }
+        } else {
+            aux.model.clone()
+        };
+
+        // Synthesize an LlmConfig that mirrors the aux blob, then reuse
+        // `Self::new`. This funnels through the same air-gap check, key
+        // resolution, and fallback-slot construction the primary path
+        // uses — no duplicated logic, and the aux client's
+        // `provider_slots` vec is its own (cooldowns can't bleed into
+        // the primary instance).
+        let mut synthetic = config.llm.clone();
+        synthetic.provider = Some(provider_str);
+        synthetic.model = resolved_model;
+        if !aux.api_key_env.is_empty() {
+            synthetic.api_key_env = aux.api_key_env.clone();
+        }
+        if aux.api_key.is_some() {
+            synthetic.api_key = aux.api_key.clone();
+        }
+        if !aux.api_keys.is_empty() {
+            synthetic.api_keys = aux.api_keys.clone();
+        }
+        if let Some(t) = aux.temperature {
+            synthetic.temperature = t;
+        }
+        if let Some(t) = aux.max_tokens {
+            synthetic.max_tokens = t;
+        }
+        if aux.base_url.is_some() {
+            synthetic.base_url = aux.base_url.clone();
+        }
+        synthetic.fallback = aux.fallback.clone();
+        // Aux work (consolidation, heartbeat, scheduled prompts) is
+        // structured/templated and doesn't benefit from extended
+        // reasoning — and the cheap-sibling models in `aux_model_picker`
+        // either don't support it (haiku-4-5, gpt-5-mini) or pay a
+        // latency tax for nothing. Force `Off` so primary's
+        // `thinking="high"` doesn't bleed into nightly cron.
+        synthetic.thinking = crate::config::llm::ThinkingLevel::Off;
+        // Block re-entry: a synthetic config feeding back through
+        // `for_auxiliary` would loop. The aux client only ever has a
+        // primary head + its own fallback chain.
+        synthetic.aux = None;
+
+        let mut synthetic_config = config.clone();
+        synthetic_config.llm = synthetic;
+        Self::new(&synthetic_config)
     }
 
     /// Attach a stable prompt cache key (typically the session id) so that

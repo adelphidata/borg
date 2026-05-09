@@ -187,7 +187,7 @@ async fn run_pass(
     config: &crate::config::Config,
     pass: ConsolidationPass,
 ) -> Result<PassExecution> {
-    let mut agent = crate::agent::Agent::new_sub_agent(
+    let mut agent = crate::agent::Agent::new_sub_agent_aux(
         config.clone(),
         0,
         &config.agents,

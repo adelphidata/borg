@@ -329,6 +329,14 @@ pub fn generate_config(
         format!(r#"api_key_env = "{env_var}""#)
     };
 
+    // Auxiliary chain: same provider as primary, `model = "auto"` sentinel
+    // resolved at daemon-boot time via `aux_model_picker`. Background work
+    // (memory consolidation, heartbeat, scheduled prompts) routes through
+    // this chain so a primary outage doesn't kill nightly cron. We emit
+    // the block for every provider — even keyless ones like Ollama, where
+    // the resolver returns `None` and `for_auxiliary` silently falls
+    // through to primary. No special-casing in onboarding; the resolver
+    // is the single place that decides "no aux available."
     Ok(format!(
         r#"[user]
 name = "{user_name}"
@@ -340,6 +348,10 @@ provider = "{provider_id}"
 model = "{model_id}"
 temperature = 0.7
 max_tokens = 4096
+
+[llm.aux]
+provider = "{provider_id}"
+model = "auto"
 "#,
     ))
 }
@@ -930,6 +942,63 @@ mod tests {
         }
         // Should NOT contain api_key_env when using keychain
         assert!(!config.contains("api_key_env"));
+    }
+
+    #[test]
+    fn generate_config_emits_aux_sentinel_for_remote_provider() {
+        // Onboarding ships every config with `[llm.aux] provider=<same>
+        // model="auto"` so background work has its own failover chain by
+        // default. Sentinel-based — `for_auxiliary` resolves "auto" via
+        // `aux_model_picker` at daemon-boot, so model id drift in this
+        // file isn't a maintenance trap.
+        let config = generate_config("claude-sonnet-4", "anthropic", "Mike", "Buddy", false)
+            .expect("valid config");
+        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
+        let aux = parsed.llm.aux.expect("aux block must be emitted");
+        assert_eq!(aux.provider.as_deref(), Some("anthropic"));
+        assert!(
+            aux.model_is_auto(),
+            "aux model must be the 'auto' sentinel (got {:?})",
+            aux.model
+        );
+    }
+
+    #[test]
+    fn generate_config_emits_aux_sentinel_for_openrouter() {
+        // Mirrors the remote-provider test for openrouter, where the
+        // model id includes a slash (`anthropic/claude-…`). Validates
+        // the aux block stays on the same provider regardless of the
+        // primary's model-slug shape.
+        let config = generate_config(
+            "anthropic/claude-sonnet-4",
+            "openrouter",
+            "Mike",
+            "Buddy",
+            false,
+        )
+        .expect("valid config");
+        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
+        let aux = parsed.llm.aux.expect("aux block must be emitted");
+        assert_eq!(aux.provider.as_deref(), Some("openrouter"));
+        assert!(aux.model_is_auto());
+    }
+
+    #[test]
+    fn generate_config_emits_aux_sentinel_even_for_ollama() {
+        // Local providers get the sentinel too — no special-casing in
+        // onboarding. The runtime resolver returns `None` for ollama so
+        // `for_auxiliary` silently falls through to primary. This locks
+        // the "no special-casing" invariant: future contributors who add
+        // a local provider must NOT need to remember to skip aux here.
+        let config =
+            generate_config("llama3.3", "ollama", "Mike", "Buddy", false).expect("valid config");
+        let parsed: cortex::config::Config = toml::from_str(&config).expect("config parses");
+        let aux = parsed
+            .llm
+            .aux
+            .expect("aux block must be emitted for ollama too");
+        assert_eq!(aux.provider.as_deref(), Some("ollama"));
+        assert!(aux.model_is_auto());
     }
 
     #[test]

@@ -86,6 +86,13 @@ pub struct LlmConfig {
     /// Provider-level failover chain (tried in order when primary provider fails).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<LlmFallback>,
+    /// Auxiliary chain for background side-tasks (memory consolidation,
+    /// heartbeat, scheduled prompts). When set, `LlmClient::for_auxiliary`
+    /// returns a separate client whose cooldown/error state is isolated from
+    /// the primary chain — so a primary outage doesn't kill nightly cron.
+    /// Unset = back-compat: aux callers fall through to the primary chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aux: Option<AuxLlmConfig>,
     /// Extended thinking level: off, low, medium, high, xhigh.
     /// Enables native thinking for supported providers (Anthropic, OpenAI o-series).
     #[serde(default)]
@@ -256,6 +263,7 @@ impl Default for LlmConfig {
             stream_chunk_timeout_secs: DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
             base_url: None,
             fallback: Vec::new(),
+            aux: None,
             thinking: ThinkingLevel::Off,
             claude_cli_path: None,
             cache: PromptCacheConfig::default(),
@@ -309,6 +317,58 @@ pub struct LlmFallback {
     /// Override base URL for this fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+}
+
+/// Sentinel string for `AuxLlmConfig::model` that triggers runtime resolution
+/// against `aux_model_picker::pick_aux_model`. Set by onboarding so users get
+/// a working aux chain without picking a model id by hand.
+pub const AUX_MODEL_AUTO: &str = "auto";
+
+/// Auxiliary LLM chain — a parallel provider chain dedicated to background
+/// side-tasks (memory consolidation, heartbeat, scheduled prompts).
+///
+/// Lives next to [`LlmConfig`] but materializes into its own [`crate::llm::LlmClient`]
+/// instance with isolated `provider_slots`, so a primary outage cannot bleed
+/// into the aux client's cooldown state and vice versa.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuxLlmConfig {
+    /// Provider name. When `None`, inherits the primary's provider — the
+    /// same-provider default that onboarding emits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Model id, or `"auto"` to delegate to `aux_model_picker::pick_aux_model`.
+    pub model: String,
+    /// Env var holding the API key (e.g. "ANTHROPIC_API_KEY").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key_env: String,
+    /// Single SecretRef for API key (takes priority over `api_key_env`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<SecretRef>,
+    /// Multiple API keys for rotation on this aux head.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_keys: Vec<SecretRef>,
+    /// Override temperature (defaults to primary's `temperature` when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Override max tokens (defaults to primary's `max_tokens` when unset).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Override base URL (proxies, Ollama on remote host, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Aux-chain fallback list — providers tried in order when the aux head
+    /// fails. Independent of `LlmConfig::fallback`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback: Vec<LlmFallback>,
+}
+
+impl AuxLlmConfig {
+    /// True when `model` is the `"auto"` sentinel (or empty string), meaning
+    /// the runtime resolver should pick a default for this provider.
+    pub fn model_is_auto(&self) -> bool {
+        self.model.is_empty() || self.model == AUX_MODEL_AUTO
+    }
 }
 
 /// Configuration for the compaction model — use a different (cheaper/faster)
@@ -487,7 +547,98 @@ mod tests {
         assert_eq!(cfg.stream_chunk_timeout_secs, 90);
         assert!(cfg.base_url.is_none());
         assert!(cfg.fallback.is_empty());
+        assert!(
+            cfg.aux.is_none(),
+            "aux must default to None for back-compat"
+        );
         assert_eq!(cfg.thinking, ThinkingLevel::Off);
+    }
+
+    // ── AuxLlmConfig ──
+
+    #[test]
+    fn aux_default_model_is_auto_sentinel() {
+        // The default-constructed aux config has an empty model string, which
+        // model_is_auto() must treat the same as the explicit "auto" sentinel
+        // — otherwise an aux block written without a model field would surface
+        // an empty model id to the provider request.
+        let aux = AuxLlmConfig::default();
+        assert!(aux.model_is_auto());
+    }
+
+    #[test]
+    fn aux_explicit_auto_sentinel_recognized() {
+        let aux = AuxLlmConfig {
+            model: AUX_MODEL_AUTO.to_string(),
+            ..Default::default()
+        };
+        assert!(aux.model_is_auto());
+    }
+
+    #[test]
+    fn aux_concrete_model_is_not_auto() {
+        // Power-user override path: a concrete model id must bypass the
+        // resolver, otherwise their explicit choice gets overwritten.
+        let aux = AuxLlmConfig {
+            model: "claude-haiku-4-5".to_string(),
+            ..Default::default()
+        };
+        assert!(!aux.model_is_auto());
+    }
+
+    #[test]
+    fn aux_round_trips_through_toml() {
+        // Serialization must preserve enough to reconstruct the resolver
+        // contract: `model` field present, even when it's the empty/auto
+        // default. skip_serializing_if on Option fields keeps the blob clean.
+        // Compared via field-level asserts since SecretRef/LlmFallback don't
+        // implement PartialEq (and adding it would cascade).
+        let aux = AuxLlmConfig {
+            provider: Some("anthropic".into()),
+            model: AUX_MODEL_AUTO.into(),
+            api_key_env: "ANTHROPIC_API_KEY".into(),
+            ..Default::default()
+        };
+        let s = toml::to_string(&aux).expect("serialize");
+        let parsed: AuxLlmConfig = toml::from_str(&s).expect("parse");
+        assert_eq!(parsed.provider.as_deref(), Some("anthropic"));
+        assert!(parsed.model_is_auto());
+        assert_eq!(parsed.api_key_env, "ANTHROPIC_API_KEY");
+        assert!(parsed.fallback.is_empty());
+    }
+
+    #[test]
+    fn llm_config_with_aux_round_trips() {
+        // Whole-LlmConfig round-trip with aux populated. Locks the
+        // settings-registry contract: writing llm.aux via the JSON path then
+        // reloading Config must yield the same struct.
+        let toml_str = r#"
+            model = "claude-sonnet-4-7"
+            api_key_env = "ANTHROPIC_API_KEY"
+
+            [aux]
+            provider = "anthropic"
+            model = "auto"
+            api_key_env = "ANTHROPIC_API_KEY"
+        "#;
+        let cfg: LlmConfig = toml::from_str(toml_str).expect("parse");
+        let aux = cfg.aux.expect("aux must deserialize");
+        assert_eq!(aux.provider.as_deref(), Some("anthropic"));
+        assert!(aux.model_is_auto());
+        assert_eq!(aux.api_key_env, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn llm_config_without_aux_block_deserializes_to_none() {
+        // Back-compat: existing TOML / DB rows that predate this feature
+        // must keep working. aux must materialize as None, not panic / not
+        // populate a default that fires the resolver unexpectedly.
+        let toml_str = r#"
+            model = "gpt-4"
+            api_key_env = "OPENAI_API_KEY"
+        "#;
+        let cfg: LlmConfig = toml::from_str(toml_str).expect("parse");
+        assert!(cfg.aux.is_none());
     }
 
     // ── LlmConfig deserialization ──

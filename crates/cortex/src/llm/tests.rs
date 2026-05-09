@@ -2037,3 +2037,199 @@ fn openrouter_sse_without_cache_creation_field_reports_zero() {
     assert_eq!(usage.cache_creation_tokens, 0);
     assert_eq!(usage.cached_input_tokens, 0);
 }
+
+#[test]
+fn for_auxiliary_falls_through_to_primary_when_aux_unset() {
+    // Back-compat invariant: pre-aux-feature configs (`llm.aux = None`)
+    // must produce a working client identical to `LlmClient::new`. A
+    // regression here breaks every existing deployment on first reload.
+    let env_var = "BORG_TEST_AUX_FALLTHROUGH";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    assert!(config.llm.aux.is_none(), "aux defaults to None");
+
+    let client = LlmClient::for_auxiliary(&config).expect("aux-unset must fall through to primary");
+    assert_eq!(client.provider, Provider::Anthropic);
+    assert_eq!(client.llm_config.model, "claude-sonnet-4");
+}
+
+#[test]
+fn for_auxiliary_resolves_auto_sentinel_via_picker() {
+    // The onboarding-emitted `[llm.aux] model = "auto"` row gets
+    // materialized into a concrete model id at client-construction time.
+    // If the resolver dead-ends silently, every aux call would request a
+    // model named literally "auto" and 404 forever — locking this is the
+    // sentinel-to-concrete-model invariant.
+    let env_var = "BORG_TEST_AUX_AUTO_RESOLVE";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "auto".to_string(),
+        api_key_env: env_var.to_string(),
+        ..Default::default()
+    });
+
+    let client = LlmClient::for_auxiliary(&config).expect("auto sentinel must resolve");
+    assert_eq!(client.provider, Provider::Anthropic);
+    assert_eq!(
+        client.llm_config.model,
+        super::aux_model_picker::pick_aux_model("anthropic").unwrap(),
+        "auto must resolve to the picker's anthropic default"
+    );
+}
+
+#[test]
+fn for_auxiliary_passes_concrete_model_through() {
+    // Power-user override: setting `llm.aux.model` to a real model id
+    // bypasses the resolver entirely. Locks the override invariant — if
+    // we later add a "normalize aux model" pass, it must not stomp the
+    // explicit choice.
+    let env_var = "BORG_TEST_AUX_OVERRIDE";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        api_key_env: env_var.to_string(),
+        ..Default::default()
+    });
+
+    let client = LlmClient::for_auxiliary(&config).expect("concrete model must pass through");
+    assert_eq!(client.llm_config.model, "claude-haiku-4-5");
+}
+
+#[test]
+fn for_auxiliary_falls_through_for_local_provider() {
+    // Local providers (Ollama, Claude CLI) have no aux-default entry in
+    // the picker. A naive `unwrap_or("")` would route every aux call to
+    // the empty model id and 400 immediately — instead, we silently fall
+    // through to the primary chain. Soft-fail invariant.
+    let mut config = Config::default();
+    config.llm.provider = Some("ollama".to_string());
+    config.llm.model = "llama3".to_string();
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("ollama".to_string()),
+        model: "auto".to_string(),
+        ..Default::default()
+    });
+
+    let client =
+        LlmClient::for_auxiliary(&config).expect("local-provider aux must fall through, not error");
+    // Falls through to primary, which is also ollama.
+    assert_eq!(client.provider, Provider::Ollama);
+    assert_eq!(client.llm_config.model, "llama3");
+}
+
+#[test]
+fn for_auxiliary_synthesizes_separate_fallback_chain() {
+    // Isolation invariant: the aux client's `provider_slots` must be a
+    // distinct allocation that mirrors `aux.fallback`, NOT shared with
+    // (or derived from) the primary's `llm.fallback`. Shared cooldown
+    // state would mean a primary outage immediately disables aux too,
+    // defeating the feature.
+    //
+    // We give primary and aux DIFFERENT non-empty fallback chains with
+    // different model ids so any structural sharing surfaces in model-
+    // id assertions — a length-only check would pass even if the slot
+    // vec were aliased.
+    let primary_env = "BORG_TEST_AUX_ISOLATION_P";
+    let aux_env = "BORG_TEST_AUX_ISOLATION_A";
+    std::env::set_var(primary_env, "sk-test");
+    std::env::set_var(aux_env, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = primary_env.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    // Primary: 1-slot fallback (sonnet → haiku-4-5).
+    config.llm.fallback.push(crate::config::LlmFallback {
+        provider: "anthropic".to_string(),
+        model: "claude-haiku-4-5".to_string(),
+        api_key: None,
+        api_key_env: Some(primary_env.to_string()),
+        api_keys: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        base_url: None,
+    });
+    // Aux: 2-slot chain with DIFFERENT model ids than primary.
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        api_key_env: aux_env.to_string(),
+        fallback: vec![
+            crate::config::LlmFallback {
+                provider: "anthropic".to_string(),
+                model: "claude-3-5-haiku".to_string(),
+                api_key: None,
+                api_key_env: Some(aux_env.to_string()),
+                api_keys: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                base_url: None,
+            },
+            crate::config::LlmFallback {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4".to_string(),
+                api_key: None,
+                api_key_env: Some(aux_env.to_string()),
+                api_keys: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                base_url: None,
+            },
+        ],
+        ..Default::default()
+    });
+
+    let primary = LlmClient::new(&config).expect("primary must build");
+    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+
+    assert_eq!(primary.provider_slots.len(), 1);
+    assert_eq!(aux.provider_slots.len(), 2);
+    // Aux's chain reflects `aux.fallback`, not `llm.fallback`.
+    assert_eq!(aux.provider_slots[0].model, "claude-3-5-haiku");
+    assert_eq!(aux.provider_slots[1].model, "claude-sonnet-4");
+    // Primary's chain is intact.
+    assert_eq!(primary.provider_slots[0].model, "claude-haiku-4-5");
+    // Re-entry guard: aux client's own `llm.aux` is cleared so a
+    // synthetic config can't loop back through `for_auxiliary`.
+    assert!(aux.llm_config.aux.is_none(), "aux must not nest aux");
+}
+
+#[test]
+fn for_auxiliary_forces_thinking_off() {
+    // Aux work doesn't benefit from extended reasoning, and the cheap
+    // sibling models in `aux_model_picker` either don't support it or
+    // pay latency for nothing. Primary's `thinking="high"` must NOT
+    // bleed into the synthetic aux config.
+    let env_var = "BORG_TEST_AUX_THINKING";
+    std::env::set_var(env_var, "sk-test");
+    let mut config = Config::default();
+    config.llm.provider = Some("anthropic".to_string());
+    config.llm.api_key_env = env_var.to_string();
+    config.llm.model = "claude-sonnet-4".to_string();
+    config.llm.thinking = crate::config::llm::ThinkingLevel::High;
+    config.llm.aux = Some(crate::config::llm::AuxLlmConfig {
+        provider: Some("anthropic".to_string()),
+        model: "claude-haiku-4-5".to_string(),
+        api_key_env: env_var.to_string(),
+        ..Default::default()
+    });
+
+    let aux = LlmClient::for_auxiliary(&config).expect("aux must build");
+    assert_eq!(
+        aux.llm_config.thinking,
+        crate::config::llm::ThinkingLevel::Off,
+        "primary thinking level must not bleed into aux"
+    );
+}

@@ -379,6 +379,61 @@ define_settings! {
                 Ok(format!("{key} = {pct}"))
             }
         };
+
+        // llm.aux: Option<AuxLlmConfig> — entire aux blob. Empty string clears
+        // to None (back to primary chain). Non-empty must deserialize into
+        // AuxLlmConfig. The TUI Resilience category edits this whole blob;
+        // sub-setters below cover the common sub-fields.
+        "llm.aux" => |s, key, value| {
+            if value.trim().is_empty() {
+                s.llm.aux = None;
+                Ok(format!("{key} = (unset)"))
+            } else {
+                let aux: crate::config::llm::AuxLlmConfig = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                s.llm.aux = Some(aux);
+                Ok(format!("{key} = (set)"))
+            }
+        };
+
+        // llm.aux.model: convenience setter for the most commonly edited
+        // sub-field. Non-empty value auto-creates aux when None so the user
+        // can pick a model from the TUI Resilience row without first writing
+        // a full JSON blob. Empty value is a no-op — the extractor returns
+        // empty when aux is unset, so an empty round-trip must not
+        // spuriously materialize aux on every reload. To reset to the
+        // resolver's default, set this to the literal "auto"; to clear aux
+        // entirely, use the parent `llm.aux` setter with an empty value.
+        "llm.aux.model" => |s, key, value| {
+            if !value.is_empty() {
+                s.llm.aux
+                    .get_or_insert_with(crate::config::llm::AuxLlmConfig::default)
+                    .model = value.to_string();
+            }
+            Ok(format!("{key} = {value}"))
+        };
+
+        // llm.aux.fallback: Vec<LlmFallback> for the aux chain. A non-empty
+        // JSON list auto-creates aux when None (TUI quick-edit path). Empty
+        // string is a no-op when aux is None — same back-compat invariant
+        // as llm.aux.model. When aux exists, an empty string clears the
+        // fallback list while preserving the rest of the aux block.
+        "llm.aux.fallback" => |s, key, value| {
+            if value.trim().is_empty() {
+                if let Some(aux) = s.llm.aux.as_mut() {
+                    aux.fallback.clear();
+                }
+                Ok(format!("{key} = (0 providers)"))
+            } else {
+                let fallback: Vec<crate::config::llm::LlmFallback> = serde_json::from_str(value)
+                    .with_context(|| format!("Invalid JSON for {key}"))?;
+                let count = fallback.len();
+                s.llm.aux
+                    .get_or_insert_with(crate::config::llm::AuxLlmConfig::default)
+                    .fallback = fallback;
+                Ok(format!("{key} = ({count} providers)"))
+            }
+        };
     }
 
     custom_extract {
@@ -415,6 +470,32 @@ define_settings! {
             Some(ts) => ts.to_string(),
             None => String::new(),
         };
+        // Aux chain: round-trip the whole blob as JSON when set, empty when
+        // unset. Mirrors the apply contract (empty string = unset).
+        "llm.aux" => |c| match &c.llm.aux {
+            Some(aux) => serde_json::to_string(aux).unwrap_or_default(),
+            None => String::new(),
+        };
+        // Round-trip empty when aux is unset — feeding "auto" back through
+        // apply_setting would auto-create aux on every reload, breaking the
+        // back-compat default-None contract. The TUI extractor adapter can
+        // substitute "auto" at display time if it wants a friendlier label.
+        "llm.aux.model" => |c| c
+            .llm
+            .aux
+            .as_ref()
+            .map(|a| a.model.clone())
+            .unwrap_or_default();
+        // Round-trip empty when aux is unset OR fallback is empty — same
+        // rationale as llm.aux.model: feeding "[]" back through apply_setting
+        // would auto-create aux on every reload.
+        "llm.aux.fallback" => |c| c
+            .llm
+            .aux
+            .as_ref()
+            .filter(|a| !a.fallback.is_empty())
+            .map(|a| serde_json::to_string(&a.fallback).unwrap_or_default())
+            .unwrap_or_default();
     }
 
     // TUI-visible settings, in render order. Category breaks produce section
@@ -448,6 +529,14 @@ define_settings! {
         // — Heartbeat —
         "heartbeat.session_start_enabled" => "Greet on TUI open", Bool, "Heartbeat";
         "heartbeat.session_start_throttle_minutes" => "Greeting throttle (min)", Uint, "Heartbeat";
+
+        // — Resilience — auxiliary chain for background tasks (consolidation,
+        // heartbeat, scheduled prompts). When the primary provider has an
+        // outage, the aux chain keeps cron alive. Onboarding seeds these to
+        // a same-provider default; users can edit the model or paste a
+        // cross-provider fallback list here.
+        "llm.aux.model" => "Aux model (or 'auto')", Text, "Resilience";
+        "llm.aux.fallback" => "Aux fallback (JSON)", Text, "Resilience";
 
         // — Voice —
         "tts.enabled" => "Enabled", Bool, "Voice";

@@ -146,10 +146,6 @@ top-down by priority, not by section order.
   credentials per provider with cooldown TTL, auto-rotation on 402/429,
   and selectable strategy (`round_robin` / `least_used` / `fill_first`).
   Today a single exhausted key dead-ends the provider.
-- **Auxiliary-LLM failover chain.** `[H]` Side tasks (context
-  compression, summarization, embedding fallback) resolve through a
-  separate provider chain so a primary outage doesn't kill background
-  work like nightly memory consolidation.
 - **`run.attempt` metadata in logs.** `[O]` Tag each line in
   `~/.borg/logs/{date}.jsonl` with the retry attempt number so
   duplicated tool calls or agent turns are correlatable when grepping.
