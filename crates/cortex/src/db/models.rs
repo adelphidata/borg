@@ -417,6 +417,41 @@ pub struct ModelUsageRow {
     pub total_cost_usd: Option<f64>,
 }
 
+/// Aggregated token totals over a time window. `cost` is `None` and
+/// `cost_present` is `false` when no row in the window had a non-null
+/// `cost_usd` — the formatter uses this to hide the cost section rather
+/// than render a misleading `$0.00`.
+#[derive(Debug, Default, PartialEq)]
+pub struct TokenSummary {
+    /// Sum of `prompt_tokens` over the window.
+    pub prompt: u64,
+    /// Sum of `completion_tokens` over the window.
+    pub completion: u64,
+    /// Sum of `total_tokens` over the window.
+    pub total: u64,
+    /// Sum of `cached_input_tokens` over the window (Anthropic cache hits).
+    pub cached_input: u64,
+    /// Sum of `cache_creation_tokens` over the window.
+    pub cache_creation: u64,
+    /// Aggregate cost in USD across rows that carried a `cost_usd`.
+    /// `None` when no rate-card-priced rows fell in the window.
+    pub cost: Option<f64>,
+    /// True when at least one row in the window had a non-null `cost_usd`.
+    pub cost_present: bool,
+}
+
+/// Per-channel activity over a time window. `last_active_unix` is the MAX
+/// `created_at` for the channel in the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelActivityRow {
+    /// Channel name (`telegram`, `slack`, …).
+    pub channel_name: String,
+    /// Total `channel_messages` rows for this channel in the window.
+    pub message_count: u64,
+    /// Most recent message timestamp (Unix seconds) in the window.
+    pub last_active_unix: i64,
+}
+
 /// Parameters for creating a new scheduled task.
 pub struct NewTask<'a> {
     /// Unique task identifier.

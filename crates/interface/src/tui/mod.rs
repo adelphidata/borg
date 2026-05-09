@@ -14,6 +14,7 @@ mod goodbye;
 mod highlight;
 mod history;
 mod insert_history;
+mod insights_popup;
 mod layout;
 mod line_utils;
 mod markdown;

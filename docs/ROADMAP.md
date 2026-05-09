@@ -184,9 +184,6 @@ top-down by priority, not by section order.
   compresses old conversation logs into structured summaries, freeing
   DB space and improving retrieval recall. Distinct from in-turn
   compression — runs as a maintenance pass.
-- **Session insights (`/insights`).** `[H]` Per-session token spend,
-  cost estimate, tool-call distribution, model usage, activity trends
-  by channel. Slash command + TUI panel.
 - **Prompt-cache hit/miss observability.** `[O]` Structured logging of
   cache creation/hit/miss counts per turn. We use Anthropic prompt
   caching but currently can't measure whether it's actually working.

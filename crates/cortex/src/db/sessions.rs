@@ -1,8 +1,9 @@
 use anyhow::Result;
 use rusqlite::params;
+use std::collections::HashMap;
 use tracing::instrument;
 
-use super::models::{MessageRow, SessionRow};
+use super::models::{ChannelActivityRow, MessageRow, SessionRow};
 use super::Database;
 
 impl Database {
@@ -300,6 +301,118 @@ impl Database {
             .prepare("SELECT COUNT(*) FROM messages WHERE session_id = ?1")?;
         let count: i64 = stmt.query_row(params![session_id], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Count sessions whose `updated_at` is at or after `since_ts`. A session
+    /// counts as "active in window" if it was touched, not merely created
+    /// before the window — matches the wording in `/insights`.
+    pub fn session_count_since(&self, since_ts: i64) -> Result<u64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM sessions WHERE updated_at >= ?1")?;
+        let count: i64 = stmt.query_row(params![since_ts], |row| row.get(0))?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Count messages whose `created_at` is at or after `since_ts`.
+    pub fn message_count_since(&self, since_ts: i64) -> Result<u64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM messages WHERE created_at >= ?1")?;
+        let count: i64 = stmt.query_row(params![since_ts], |row| row.get(0))?;
+        Ok(count.max(0) as u64)
+    }
+
+    /// Aggregate tool-call counts across `messages.tool_calls_json` for rows
+    /// at or after `since_ts`, returning up to `top_n` `(name, count)` pairs
+    /// sorted by count descending.
+    ///
+    /// Two on-disk shapes are tolerated:
+    /// - OpenAI/Codex style: `[{ "function": { "name": "..." }, ... }, ...]`
+    /// - Anthropic-style assistant tool blocks: `[{ "name": "...", "input": {...} }, ...]`
+    ///
+    /// Rows whose `tool_calls_json` fails to parse are skipped with a
+    /// `tracing::warn!` and do not abort the aggregation — `/insights` must
+    /// not fail if one corrupted row exists somewhere in history.
+    #[instrument(skip_all)]
+    pub fn tool_call_counts_since(
+        &self,
+        since_ts: i64,
+        top_n: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_calls_json FROM messages
+             WHERE created_at >= ?1 AND tool_calls_json IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![since_ts], |row| row.get::<_, String>(0))?;
+
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for row in rows {
+            let json = match row {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("tool_call_counts_since: row read failed: {e}");
+                    continue;
+                }
+            };
+            let parsed: serde_json::Value = match serde_json::from_str(&json) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("tool_call_counts_since: skipping malformed row: {e}");
+                    continue;
+                }
+            };
+            let arr = match parsed.as_array() {
+                Some(a) => a,
+                None => {
+                    tracing::warn!("tool_call_counts_since: tool_calls_json not an array");
+                    continue;
+                }
+            };
+            for call in arr {
+                // OpenAI shape: { "function": { "name": "..." } }
+                // Anthropic-inline: { "name": "..." }
+                let name = call
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .or_else(|| call.get("name").and_then(|n| n.as_str()));
+                if let Some(n) = name {
+                    *counts.entry(n.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut sorted: Vec<(String, u64)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        sorted.truncate(top_n);
+        Ok(sorted)
+    }
+
+    /// Per-channel message activity for `channel_messages` rows at or after
+    /// `since_ts`. `last_active_unix` is the MAX `created_at` for the channel
+    /// in the window (asserting MAX, not arbitrary-row, is a tested
+    /// invariant). Sorted by message count descending.
+    #[instrument(skip_all)]
+    pub fn channel_activity_since(&self, since_ts: i64) -> Result<Vec<ChannelActivityRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT channel_name, COUNT(*) AS msg_count, MAX(created_at) AS last_active
+             FROM channel_messages
+             WHERE created_at >= ?1
+             GROUP BY channel_name
+             ORDER BY msg_count DESC, channel_name ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![since_ts], |row| {
+                let count: i64 = row.get(1)?;
+                Ok(ChannelActivityRow {
+                    channel_name: row.get(0)?,
+                    message_count: count.max(0) as u64,
+                    last_active_unix: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Keep the last `keep` messages in a session, deleting older ones.

@@ -28,6 +28,18 @@ service Status {
   rpc GetXpText(Empty) returns (StatusText);
   rpc GetArchetypeScoresText(Empty) returns (StatusText);
   rpc GetEvolutionHistoryText(Empty) returns (StatusText);
+
+  // `/insights` view: token spend, cost (hidden when no rate-card data),
+  // model usage, tool-call distribution, channel activity over a rolling
+  // window. `days = 0` is the proto sentinel for "use the default" (30);
+  // values above the cap clamp to 365 — the daemon clamps, the cli does
+  // not need to validate.
+  rpc GetInsightsText(InsightsRequest) returns (StatusText);
+}
+
+message InsightsRequest {
+  // Rolling window in days. 0 = default (30); >365 clamps to 365.
+  uint32 days = 1;
 }
 
 message StatusTextRequest {

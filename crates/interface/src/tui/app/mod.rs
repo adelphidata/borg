@@ -25,6 +25,7 @@ use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
 use super::file_search::FileSearchService;
 use super::history::HistoryCell;
+use super::insights_popup::InsightsPopup;
 use super::migrate_popup::{MigrateAction, MigratePopup};
 use super::model_popup::ModelPopup;
 use super::pairing_popup::{PairingAction, PairingPopup};
@@ -52,6 +53,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, schedule_popup);
         $body!($self, migrate_popup);
         $body!($self, status_popup);
+        $body!($self, insights_popup);
         $body!($self, btw_popup);
     };
 }
@@ -511,6 +513,7 @@ pub struct App<'a> {
     /// Version installed by `/update` in the current process, pending restart.
     pub pending_update_version: Option<String>,
     pub status_popup: StatusPopup,
+    pub insights_popup: InsightsPopup,
     pub btw_popup: BtwPopup,
     /// Cancel token for the currently-in-flight `/btw` background task, if
     /// any. A new `/btw` invocation cancels the previous one.
@@ -592,6 +595,7 @@ impl<'a> App<'a> {
             ambient_status: None,
             pending_update_version: None,
             status_popup: StatusPopup::new(),
+            insights_popup: InsightsPopup::new(),
             btw_popup: BtwPopup::new(),
             btw_cancel: None,
             btw_result_rx: None,
@@ -739,6 +743,7 @@ impl<'a> App<'a> {
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
+            || self.insights_popup.is_visible()
             || self.btw_popup.is_visible()
             || self.plugins_popup.is_visible()
     }

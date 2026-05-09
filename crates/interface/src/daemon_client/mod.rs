@@ -54,7 +54,8 @@ use protocols::session::{
 use protocols::status::status_client::StatusClient;
 use protocols::status::{
     BondEventList, BondStateProto, Empty as StatusEmpty, EvolutionEventList, EvolutionStateProto,
-    Int64Cursor, StatusText, StatusTextRequest, Vitals, VitalsEventList, XpSnapshot,
+    InsightsRequest, Int64Cursor, StatusText, StatusTextRequest, Vitals, VitalsEventList,
+    XpSnapshot,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -1079,6 +1080,18 @@ impl DaemonClient {
             .get_evolution_history_text(StatusEmpty {})
             .await
             .context("Status.GetEvolutionHistoryText failed")?
+            .into_inner())
+    }
+
+    /// Pre-rendered `/insights` text for the insights popup. `days = 0`
+    /// asks the daemon to use its default window (30); the daemon clamps
+    /// large values to 365 — the cli does not validate.
+    pub async fn get_insights_text(&mut self, days: u32) -> Result<StatusText> {
+        Ok(self
+            .status
+            .get_insights_text(InsightsRequest { days })
+            .await
+            .context("Status.GetInsightsText failed")?
             .into_inner())
     }
 

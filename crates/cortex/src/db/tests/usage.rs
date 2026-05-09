@@ -194,6 +194,140 @@ fn monthly_budget_pct_buckets_at_each_threshold() {
     }
 }
 
+// ── token_summary_since / usage_by_model_since ────────────────────────────
+// These back the `/insights` rolling-window view. Each test pins a real-world
+// failure mode the formatter relies on (cutoff filters, NULL-vs-zero cost,
+// ordering invariants).
+
+const DAY: i64 = 86_400;
+
+#[test]
+fn token_summary_since_excludes_rows_outside_window() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // In window: 100/50/150
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 100, 50, 150, 'openai', 'gpt-4o', NULL, 0, 0)",
+            params![now],
+        )
+        .expect("insert recent");
+    // Outside window (100 days old): 999/999/9999 — must NOT be summed.
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 999, 999, 9999, 'openai', 'gpt-4o', NULL, 0, 0)",
+            params![now - 100 * DAY],
+        )
+        .expect("insert ancient");
+
+    let summary = db
+        .token_summary_since(now - 30 * DAY)
+        .expect("token_summary_since");
+    // Cutoff regression mode: someone uses `<= since_ts` instead of `>=`,
+    // or applies the filter to the wrong column. Either bug doubles the
+    // total — these exact numbers prove only the recent row is summed.
+    assert_eq!(summary.prompt, 100);
+    assert_eq!(summary.completion, 50);
+    assert_eq!(summary.total, 150);
+}
+
+#[test]
+fn token_summary_since_cost_present_false_when_no_cost_rows() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // Two rows, neither with a cost — `cost_present` MUST be false so the
+    // formatter hides the Cost section. A regression returning `Some(0.0)`
+    // with `cost_present = true` would render "$0.00 estimated" — exactly
+    // the misleading value the hermes folks flagged as "pricing unreliable."
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 50, 25, 75, 'ollama', 'llama3', NULL, 0, 0)",
+            params![now],
+        )
+        .expect("insert");
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 50, 25, 75, 'ollama', 'llama3', NULL, 0, 0)",
+            params![now],
+        )
+        .expect("insert");
+
+    let summary = db.token_summary_since(now - DAY).expect("summary");
+    assert!(
+        !summary.cost_present,
+        "no cost rows must surface as cost_present=false"
+    );
+    assert!(
+        summary.cost.is_none(),
+        "no cost rows must surface as cost=None, not Some(0.0)"
+    );
+}
+
+#[test]
+fn token_summary_since_cost_present_true_when_any_cost_row() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 100, 50, 150, 'openai', 'gpt-4o', 0.005, 0, 0)",
+            params![now],
+        )
+        .expect("insert priced");
+    db.conn
+        .execute(
+            "INSERT INTO token_usage (timestamp, prompt_tokens, completion_tokens, total_tokens,
+                                       provider, model, cost_usd, cached_input_tokens, cache_creation_tokens)
+             VALUES (?1, 100, 50, 150, 'ollama', 'llama3', NULL, 0, 0)",
+            params![now],
+        )
+        .expect("insert unpriced");
+
+    let summary = db.token_summary_since(now - DAY).expect("summary");
+    assert!(
+        summary.cost_present,
+        "any cost_usd row triggers cost_present=true"
+    );
+    let cost = summary.cost.expect("cost should be Some");
+    assert!(
+        (cost - 0.005).abs() < 1e-9,
+        "cost summed only over priced rows: {cost}"
+    );
+}
+
+#[test]
+fn usage_by_model_since_orders_by_total_tokens_desc() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // Three groups; the test asserts the explicit ordering invariant the
+    // formatter's "top N" depends on. A regression that drops `ORDER BY
+    // SUM(total_tokens) DESC` in a refactor would silently render rows
+    // out of order — this test fails loudly.
+    db.log_token_usage(100, 50, 150, "openai", "gpt-4o-mini", None)
+        .expect("log small");
+    db.log_token_usage(800, 400, 1200, "anthropic", "sonnet", None)
+        .expect("log big");
+    db.log_token_usage(200, 100, 300, "openai", "gpt-4o", None)
+        .expect("log mid");
+
+    let rows = db
+        .usage_by_model_since(now - DAY)
+        .expect("usage_by_model_since");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].total_tokens, 1200, "biggest group first");
+    assert_eq!(rows[1].total_tokens, 300, "middle group second");
+    assert_eq!(rows[2].total_tokens, 150, "smallest group last");
+}
+
 #[test]
 fn old_rows_without_provider_handled() {
     let db = test_db();

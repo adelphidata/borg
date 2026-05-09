@@ -606,3 +606,153 @@ fn v35_fts_skips_null_and_empty_content() {
     let hits = fts_match_rowids(&db, "kubernetes");
     assert_eq!(hits, vec![text_id]);
 }
+
+// ── tool_call_counts_since / channel_activity_since ──────────────────────
+// These back the Tools / Channels sections of `/insights`. The asserts
+// pin shape-tolerance and cutoff-correctness invariants that a refactor
+// could quietly break.
+
+const SESSIONS_DAY: i64 = 86_400;
+
+fn insert_message_at(
+    db: &Database,
+    session_id: &str,
+    created_at: i64,
+    tool_calls_json: Option<&str>,
+) {
+    db.conn
+        .execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls_json, created_at)
+             VALUES (?1, 'assistant', NULL, ?2, ?3)",
+            params![session_id, tool_calls_json, created_at],
+        )
+        .expect("insert message");
+}
+
+#[test]
+fn tool_call_counts_since_aggregates_across_messages_and_skips_malformed() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    insert_message_at(
+        &db,
+        "s1",
+        now,
+        Some(r#"[{"function":{"name":"a"}},{"function":{"name":"b"}}]"#),
+    );
+    insert_message_at(&db, "s1", now, Some(r#"[{"function":{"name":"a"}}]"#));
+    // Malformed row — must be skipped, not abort the whole aggregation.
+    insert_message_at(&db, "s1", now, Some("not json"));
+
+    let counts = db
+        .tool_call_counts_since(now - SESSIONS_DAY, 10)
+        .expect("tool_call_counts_since");
+    // Sorted desc by count, ties broken alphabetically.
+    assert_eq!(counts, vec![("a".to_string(), 2), ("b".to_string(), 1)]);
+}
+
+#[test]
+fn tool_call_counts_since_handles_anthropic_inline_name() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // Anthropic-style assistant tool block: `name` lives at the top level,
+    // not nested under `function`. A regression that only reads
+    // `function.name` would silently drop these rows.
+    insert_message_at(&db, "s1", now, Some(r#"[{"name":"x","input":{}}]"#));
+
+    let counts = db
+        .tool_call_counts_since(now - SESSIONS_DAY, 10)
+        .expect("tool_call_counts_since");
+    assert_eq!(counts, vec![("x".to_string(), 1)]);
+}
+
+#[test]
+fn tool_call_counts_since_excludes_rows_outside_window() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // In window
+    insert_message_at(&db, "s1", now, Some(r#"[{"function":{"name":"a"}}]"#));
+    // 60 days old — must NOT be counted in a 30-day window.
+    insert_message_at(
+        &db,
+        "s1",
+        now - 60 * SESSIONS_DAY,
+        Some(r#"[{"function":{"name":"old"}}]"#),
+    );
+    let counts = db
+        .tool_call_counts_since(now - 30 * SESSIONS_DAY, 10)
+        .expect("counts");
+    assert_eq!(counts, vec![("a".to_string(), 1)]);
+}
+
+#[test]
+fn channel_activity_since_groups_and_returns_max_last_active() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    // Two channels with three messages each at varied timestamps. The
+    // returned `last_active_unix` must be the MAX, not the first/last
+    // inserted — a regression dropping MAX() would surface arbitrary
+    // values from SQLite.
+    let tg_times = [now - 100, now - 50, now - 10];
+    let sl_times = [now - 1_000, now - 500, now - 200];
+    for ts in tg_times {
+        db.conn
+            .execute(
+                "INSERT INTO channel_messages (channel_name, sender_id, direction, created_at)
+                 VALUES ('telegram', 'u1', 'inbound', ?1)",
+                params![ts],
+            )
+            .expect("insert tg");
+    }
+    for ts in sl_times {
+        db.conn
+            .execute(
+                "INSERT INTO channel_messages (channel_name, sender_id, direction, created_at)
+                 VALUES ('slack', 'u2', 'inbound', ?1)",
+                params![ts],
+            )
+            .expect("insert sl");
+    }
+    let rows = db
+        .channel_activity_since(now - SESSIONS_DAY)
+        .expect("channel_activity_since");
+    assert_eq!(rows.len(), 2);
+    let tg = rows
+        .iter()
+        .find(|r| r.channel_name == "telegram")
+        .expect("telegram row");
+    let sl = rows
+        .iter()
+        .find(|r| r.channel_name == "slack")
+        .expect("slack row");
+    assert_eq!(tg.message_count, 3);
+    assert_eq!(sl.message_count, 3);
+    // MAX, not arbitrary
+    assert_eq!(tg.last_active_unix, now - 10);
+    assert_eq!(sl.last_active_unix, now - 200);
+}
+
+#[test]
+fn channel_activity_since_excludes_rows_outside_window() {
+    let db = test_db();
+    let now = chrono::Utc::now().timestamp();
+    db.conn
+        .execute(
+            "INSERT INTO channel_messages (channel_name, sender_id, direction, created_at)
+             VALUES ('telegram', 'u1', 'inbound', ?1)",
+            params![now],
+        )
+        .expect("insert recent");
+    db.conn
+        .execute(
+            "INSERT INTO channel_messages (channel_name, sender_id, direction, created_at)
+             VALUES ('telegram', 'u1', 'inbound', ?1)",
+            params![now - 60 * SESSIONS_DAY],
+        )
+        .expect("insert ancient");
+
+    let rows = db
+        .channel_activity_since(now - 30 * SESSIONS_DAY)
+        .expect("channel_activity_since");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].message_count, 1, "ancient row must be filtered");
+}

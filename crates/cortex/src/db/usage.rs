@@ -3,7 +3,7 @@ use chrono::Datelike;
 use rusqlite::params;
 use tracing::instrument;
 
-use super::models::ModelUsageRow;
+use super::models::{ModelUsageRow, TokenSummary};
 use super::Database;
 
 impl Database {
@@ -127,7 +127,14 @@ impl Database {
 
     #[instrument(skip_all)]
     pub fn monthly_usage_by_model(&self) -> Result<Vec<ModelUsageRow>> {
-        let start_ts = Self::month_start_ts()?;
+        self.usage_by_model_since(Self::month_start_ts()?)
+    }
+
+    /// Aggregate token usage by `(provider, model)` for `token_usage` rows
+    /// at or after `since_ts`. Ordered by `total_tokens` descending so the
+    /// `/insights` formatter can take the top N.
+    #[instrument(skip_all)]
+    pub fn usage_by_model_since(&self, since_ts: i64) -> Result<Vec<ModelUsageRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT COALESCE(provider, '') as provider, COALESCE(model, '') as model,
                     COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
@@ -137,7 +144,7 @@ impl Database {
              ORDER BY SUM(total_tokens) DESC",
         )?;
         let rows = stmt
-            .query_map(params![start_ts], |row| {
+            .query_map(params![since_ts], |row| {
                 Ok(ModelUsageRow {
                     provider: row.get(0)?,
                     model: row.get(1)?,
@@ -149,5 +156,45 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Aggregate token totals over the window starting at `since_ts`.
+    ///
+    /// `cost_present` distinguishes "no rate-card data for any row" (false →
+    /// the cost section is hidden) from "real $0.00" (true). Without this
+    /// flag, a regression that returned `Some(0.0)` on no-cost rows would
+    /// silently render "$0.00 estimated" — exactly the misleading number
+    /// the hermes implementation flagged as "pricing unreliable."
+    #[instrument(skip_all)]
+    pub fn token_summary_since(&self, since_ts: i64) -> Result<TokenSummary> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(prompt_tokens), 0),
+                    COALESCE(SUM(completion_tokens), 0),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(cached_input_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0),
+                    SUM(cost_usd),
+                    COALESCE(SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END), 0)
+             FROM token_usage WHERE timestamp >= ?1",
+        )?;
+        let summary = stmt.query_row(params![since_ts], |row| {
+            let prompt: i64 = row.get(0)?;
+            let completion: i64 = row.get(1)?;
+            let total: i64 = row.get(2)?;
+            let cached_input: i64 = row.get(3)?;
+            let cache_creation: i64 = row.get(4)?;
+            let cost: Option<f64> = row.get(5)?;
+            let cost_row_count: i64 = row.get(6)?;
+            Ok(TokenSummary {
+                prompt: prompt.max(0) as u64,
+                completion: completion.max(0) as u64,
+                total: total.max(0) as u64,
+                cached_input: cached_input.max(0) as u64,
+                cache_creation: cache_creation.max(0) as u64,
+                cost,
+                cost_present: cost_row_count > 0,
+            })
+        })?;
+        Ok(summary)
     }
 }
