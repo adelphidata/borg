@@ -23,10 +23,6 @@ unfinished items stay here so a future contributor can see what's left.
   threat model. A defense-in-depth pass using `O_NOFOLLOW` on Linux
   opens or `/proc/self/fd` re-canonicalization would close it; deferred
   until there's a credible exploit path.
-- **CI coverage gate.** CLAUDE.md targets 80%+ but `.github/workflows/`
-  has no failing threshold. Add `cargo llvm-cov --fail-under-lines 80`
-  once the daemon session executor and scheduler grow real coverage,
-  or soften the doc claim.
 - **Nightly `--include-ignored` job.** `crates/cortex/src/browser/mod.rs`
   and the `borgd_launcher` integration tests are `#[ignore]`'d behind
   Chrome and daemon-spawn requirements. A nightly CI lane with those
@@ -61,7 +57,7 @@ unfinished items stay here so a future contributor can see what's left.
   `borgd::session` / `borgd::task_runner` so a laptop borg doesn't get
   suspended mid-tool-call. Restoration is mechanical — pull the file
   from history (last present at `be2ae863`), re-add `pub mod
-  sleep_inhibitor;` in `crates/cortex/src/lib.rs`, then add the call
+sleep_inhibitor;` in `crates/cortex/src/lib.rs`, then add the call
   sites the original feature was missing.
 - **CVE advisory integration.** Deferred. Pulling rustsec / OSV advisories
   on a cadence would mean an outbound git/HTTP fetch from a background
@@ -113,7 +109,7 @@ all warrant follow-up work.
   screen in `onboarding_tui.rs` ("Install secure (recommended)" /
   "Continue with file backend") would let the user opt into apt
   installs interactively rather than running `borg service install
-  --secure` as a separate step.
+--secure` as a separate step.
 - **`borg doctor` surface.** Surface the active backend + posture
   multiplier in `borg doctor` output so a user investigating low XP
   rate has an obvious explanation pointer rather than digging through
@@ -236,7 +232,7 @@ top-down by priority, not by section order.
   heavy imports. Keeps daemon startup fast as the plugin marketplace
   grows.
 - **Doctor-driven plugin dep auto-install.** `[O]` `borg doctor
-  --repair` installs missing bundled-plugin runtime deps (respecting
+--repair` installs missing bundled-plugin runtime deps (respecting
   explicit disablement). External plugins still manual.
 
 ### Onboarding & migration
@@ -295,12 +291,6 @@ top-down by priority, not by section order.
   hours, separate from the global 00:00–06:00 quiet window. Lets a
   user receive nightly digests on email but not on Telegram.
 
-### IDE integration
-
-- **ACP adapter for VS Code / Zed / JetBrains.** `[O+H]` Run `borgd`
-  as an ACP server so Borg can be the in-IDE coding agent. Reuses
-  existing tools + memory + skills + sandboxing.
-
 ### Batch / RL infrastructure
 
 - **Trajectory export for training.** `[H]` `borg export trajectories`
@@ -341,7 +331,7 @@ demand materializes.
 ### Tests & quality
 
 - **Live-LLM test lane.** `[O]` `BORG_LIVE_TEST=1 cargo test --features
-  live` for smoke tests that hit real APIs. Gated, off by default.
+live` for smoke tests that hit real APIs. Gated, off by default.
   Catches provider regressions (auth flow changes, response shape
   drift) that mocked tests can't see.
 - **Hot-path startup-time perf tests.** `[O]` CI test that fails if
