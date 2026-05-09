@@ -1,6 +1,8 @@
 //! Per-message and whole-history token estimation.
 
-use crate::constants::{self, AUDIO_TOKEN_ESTIMATE_MIN, IMAGE_TOKEN_ESTIMATE, MESSAGE_ROLE_TOKEN_OVERHEAD};
+use crate::constants::{
+    self, AUDIO_TOKEN_ESTIMATE_MIN, IMAGE_TOKEN_ESTIMATE, MESSAGE_ROLE_TOKEN_OVERHEAD,
+};
 use crate::tokenizer::estimate_tokens;
 use crate::types::{ContentPart, Message, MessageContent};
 

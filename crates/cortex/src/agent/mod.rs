@@ -225,11 +225,11 @@ fn should_nudge_for_response(
     text_content.trim().is_empty() && needs_response && !already_nudged
 }
 
+use tool_validation::repeated_tool_call_block_message;
 use tool_validation::{
     format_invalid_tool_result, has_unresolved_tool_calls, partition_tool_calls, InvalidToolCall,
     PartialToolCall, ToolCallRepeatTracker,
 };
-use tool_validation::repeated_tool_call_block_message;
 
 /// Core conversation agent: manages history, tools, and the LLM interaction loop.
 pub struct Agent {

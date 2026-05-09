@@ -22,7 +22,7 @@ pub use read::{handle_read_file, handle_read_file_with_context, handle_read_pdf}
 
 /// Build a default `ExecutionContext` from the running process. Used by the
 /// public `handle_X` thunks that don't take an explicit context.
-pub(super) fn default_execution_context() -> anyhow::Result<crate::execution_context::ExecutionContext>
-{
+pub(super) fn default_execution_context(
+) -> anyhow::Result<crate::execution_context::ExecutionContext> {
     crate::execution_context::ExecutionContext::from_process()
 }
