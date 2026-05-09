@@ -50,6 +50,55 @@ pub type AcpEventStream =
 /// hung client stalls the whole session indefinitely.
 const ACP_FS_CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Read the gRPC `grpc-timeout` header off an inbound request and convert it
+/// into an absolute wall-clock deadline. Returns `None` when the client did
+/// not set a deadline OR the header is malformed (treat malformed as absent
+/// rather than aborting the call — the watcher is a best-effort observability
+/// improvement, not a security boundary). Logs at WARN when a header was
+/// present but unparseable so future tickets can disambiguate "client sent
+/// no deadline" from "we ignored garbage".
+fn parse_grpc_deadline<T>(req: &Request<T>) -> Option<std::time::Instant> {
+    let header = req.metadata().get("grpc-timeout")?;
+    let raw = match header.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "grpc-timeout header is not valid UTF-8; ignoring");
+            return None;
+        }
+    };
+    match parse_grpc_timeout(raw) {
+        Some(timeout) => Some(std::time::Instant::now() + timeout),
+        None => {
+            tracing::warn!(raw, "grpc-timeout header malformed; ignoring");
+            None
+        }
+    }
+}
+
+/// Parse a gRPC timeout header value (`<num><unit>`, e.g. `120S`, `100m`).
+/// Units per https://grpc.io/docs/guides/wire-format-protocol/: H, M, S, m,
+/// u, n. Returns `None` for malformed input or for values that overflow `u64`
+/// nanoseconds. Rejects non-ASCII input — `split_at` operates on byte
+/// indices, so a multibyte trailing codepoint (e.g. `"120Ω"`) would otherwise
+/// panic mid-codepoint on attacker-supplied metadata.
+fn parse_grpc_timeout(s: &str) -> Option<std::time::Duration> {
+    if !s.is_ascii() || s.len() < 2 {
+        return None;
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num_str.parse().ok()?;
+    let nanos = match unit {
+        "H" => n.checked_mul(3_600_000_000_000)?,
+        "M" => n.checked_mul(60_000_000_000)?,
+        "S" => n.checked_mul(1_000_000_000)?,
+        "m" => n.checked_mul(1_000_000)?,
+        "u" => n.checked_mul(1_000)?,
+        "n" => n,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_nanos(nanos))
+}
+
 type AcpFsResponseSender = oneshot::Sender<Result<AcpFsResponse, String>>;
 type PendingAcpFsRequests = Arc<Mutex<std::collections::HashMap<String, AcpFsResponseSender>>>;
 
@@ -233,6 +282,11 @@ impl Session for SessionSvc {
     }
 
     async fn send(&self, req: Request<SendRequest>) -> Result<Response<Self::SendStream>, TStatus> {
+        // Capture the gRPC client's wall-clock deadline (if any) BEFORE consuming
+        // the request. The deadline arrives in the `grpc-timeout` header
+        // (https://grpc.io/docs/guides/wire-format-protocol/) which we parse
+        // off `req.metadata()`.
+        let deadline = parse_grpc_deadline(&req);
         let req = req.into_inner();
         let host = self.host_or_err(&req.session_id)?;
 
@@ -252,7 +306,7 @@ impl Session for SessionSvc {
                 filename: (!i.filename.is_empty()).then_some(i.filename),
             })
             .collect();
-        let (_cancel, baseline_seq) = host.start_turn(req.text, images, None).await;
+        let (_cancel, baseline_seq) = host.start_turn(req.text, images, None, deadline).await;
 
         let (tx, out_rx) = mpsc::channel::<Result<AgentEvent, TStatus>>(64);
         tokio::spawn(async move {
@@ -334,7 +388,12 @@ impl Session for SessionSvc {
                 filename: (!i.filename.is_empty()).then_some(i.filename),
             })
             .collect();
-        let (_cancel, baseline_seq) = host.start_turn(start.text, images, bridge).await;
+        // ACP turns ride a streaming inbound and don't carry a single
+        // request-level `grpc-timeout` header the way unary `Send` does — the
+        // ACP client batches its own per-message timing. Pass `None` for the
+        // turn deadline; ACP cancellation flows through `acp_client_message`
+        // explicit cancel frames instead.
+        let (_cancel, baseline_seq) = host.start_turn(start.text, images, bridge, None).await;
 
         let host_for_inbound = host.clone();
         let pending_for_inbound = pending.clone();
@@ -640,5 +699,71 @@ impl Session for SessionSvc {
             title: outcome.title,
             message_count: outcome.message_count,
         }))
+    }
+}
+
+#[cfg(test)]
+mod parse_grpc_timeout_tests {
+    use super::parse_grpc_timeout;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_each_unit_per_grpc_wire_format() {
+        // Real failure mode: a unit-table typo (e.g. swapping "S" and "m")
+        // would silently produce a deadline 1000x off — the watcher would
+        // either fire instantly on every Send or never fire at all. Cover
+        // each unit explicitly rather than testing a few representative ones.
+        let cases: &[(&str, Duration)] = &[
+            ("1H", Duration::from_secs(3600)),
+            ("2M", Duration::from_secs(120)),
+            ("120S", Duration::from_secs(120)),
+            ("100m", Duration::from_millis(100)),
+            ("500u", Duration::from_micros(500)),
+            ("750n", Duration::from_nanos(750)),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_grpc_timeout(raw),
+                Some(*expected),
+                "parse_grpc_timeout({raw:?}) mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_unknown_unit() {
+        // Treat malformed as absent (None) rather than aborting — see
+        // parse_grpc_deadline doc. A regression that returned a default
+        // duration here would silently apply a wrong deadline.
+        for raw in &["", "S", "120", "120X", "abcS", "1.5S", "-1S"] {
+            assert_eq!(
+                parse_grpc_timeout(raw),
+                None,
+                "parse_grpc_timeout({raw:?}) should be None"
+            );
+        }
+    }
+
+    #[test]
+    fn overflow_returns_none() {
+        // u64 nanoseconds caps around ~584 years; an attacker-supplied huge
+        // hour count must not panic or wrap.
+        assert_eq!(parse_grpc_timeout("99999999H"), None);
+    }
+
+    #[test]
+    fn non_ascii_input_does_not_panic_on_codepoint_boundary() {
+        // Real failure mode: `split_at(s.len() - 1)` works on byte indices.
+        // A multibyte trailing codepoint (e.g. `Ω` is 2 UTF-8 bytes) would
+        // panic mid-codepoint without an `is_ascii()` guard. Untrusted gRPC
+        // metadata can contain arbitrary UTF-8 — a per-request panic is a
+        // remotely triggerable DoS surface.
+        for raw in &["120Ω", "Ω120", "S\u{1F600}", "120\u{1F600}", "🚀"] {
+            assert_eq!(
+                parse_grpc_timeout(raw),
+                None,
+                "parse_grpc_timeout({raw:?}) must reject non-ASCII without panicking"
+            );
+        }
     }
 }

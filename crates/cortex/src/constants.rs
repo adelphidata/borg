@@ -393,7 +393,24 @@ pub const DEFAULT_LLM_MAX_RETRIES: u32 = 3;
 pub const DEFAULT_LLM_INITIAL_RETRY_DELAY_MS: u64 = 200;
 
 /// Default total request timeout (ms) for LLM requests (2 minutes).
+///
+/// Matches Hermes' `HERMES_STREAM_READ_TIMEOUT` cloud default (120s) and openclaw's
+/// LLM idle window — intentionally generous so slow thinking-mode requests
+/// reach first token. Callers that operate under a shorter external deadline
+/// (e.g. gRPC `Send` with a client deadline) should derive a tighter per-call
+/// timeout via [`LLM_DEADLINE_SAFETY_MARGIN_MS`] rather than lowering this
+/// default.
 pub const DEFAULT_LLM_REQUEST_TIMEOUT_MS: u64 = 120_000;
+
+/// Headroom (ms) reserved for translating a deadline-cancel into an
+/// `AgentEvent::Error` and flushing it through the gRPC stream before the
+/// client's deadline fires. Without this, a stalled LLM call eats the entire
+/// budget and the client sees `DEADLINE_EXCEEDED` instead of a structured
+/// error event. The deadline watcher in `borgd::session::start_turn` scales
+/// this down to `min(margin, remaining_budget / 2)` for tight client
+/// deadlines so a fast turn under a small budget isn't tagged with a spurious
+/// "deadline approaching" Error.
+pub const LLM_DEADLINE_SAFETY_MARGIN_MS: u64 = 5_000;
 
 /// Default per-chunk SSE timeout (seconds) while streaming.
 /// Thinking-capable models routinely pause >30s between chunks during reasoning,
@@ -660,6 +677,26 @@ mod tests {
     #[test]
     fn retry_initial_less_than_max() {
         assert!(RETRY_INITIAL_DELAY_MS < RETRY_MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn llm_deadline_safety_margin_is_smaller_than_default_budget() {
+        // Pinned by smorgasborg session-send-...05-09 ticket: the deadline
+        // watcher's safety margin must be small enough that a healthy default
+        // budget still has meaningful runway after subtracting it. A regression
+        // that grew the margin past the default budget would make every
+        // gRPC-deadline-bounded `Send` fire the watcher immediately on entry.
+        assert!(
+            LLM_DEADLINE_SAFETY_MARGIN_MS > 0,
+            "safety margin must be positive — zero margin defeats the watcher"
+        );
+        assert!(
+            LLM_DEADLINE_SAFETY_MARGIN_MS * 2 < DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+            "LLM_DEADLINE_SAFETY_MARGIN_MS ({LLM_DEADLINE_SAFETY_MARGIN_MS}) must be well \
+             under DEFAULT_LLM_REQUEST_TIMEOUT_MS ({DEFAULT_LLM_REQUEST_TIMEOUT_MS}) — at \
+             least 2x headroom — so a typical LLM call has time to make progress before the \
+             watcher fires"
+        );
     }
 
     #[test]

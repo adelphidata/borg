@@ -212,11 +212,21 @@ impl SessionHost {
     /// "events with seq > baseline_after_start belong to this turn". Returns
     /// `(cancel_token, baseline_seq_at_start)`. Subscribe to the buffer
     /// before calling and filter `evt.event_seq > baseline_seq_at_start`.
+    ///
+    /// `deadline` is an optional wall-clock instant by which the caller
+    /// expects the turn to have surfaced any structured outcome (typically
+    /// derived from a gRPC `Send` request's client deadline). When set, a
+    /// watcher fires `LLM_DEADLINE_SAFETY_MARGIN_MS` before the deadline
+    /// — it pushes an `AgentEvent::Error` describing the impending timeout
+    /// onto the event stream and then cancels the in-flight turn so the
+    /// client sees a structured `Error` event instead of a bare gRPC
+    /// `DEADLINE_EXCEEDED`.
     pub async fn start_turn(
         &self,
         text: String,
         images: Vec<backend::InlineImage>,
         text_file_bridge: Option<Arc<dyn cortex::execution_context::TextFileBridge>>,
+        deadline: Option<std::time::Instant>,
     ) -> (CancellationToken, u64) {
         let cancel = CancellationToken::new();
         let inner = self.inner.clone();
@@ -252,16 +262,115 @@ impl SessionHost {
             inner.buffer.last_seq()
         };
 
+        let event_tx_for_backend = event_tx.clone();
+        let session_id_for_watcher = inner.session_id.clone();
+        let cancel_for_deadline = cancel.clone();
+
         // Backend turn — runs concurrently with the forwarder above.
-        tokio::spawn(async move {
+        let backend_handle = tokio::spawn(async move {
             inner
                 .backend
-                .run_turn(text, images, event_tx, cancel_for_task, text_file_bridge)
+                .run_turn(
+                    text,
+                    images,
+                    event_tx_for_backend,
+                    cancel_for_task,
+                    text_file_bridge,
+                )
                 .await;
         });
 
+        if let Some(deadline) = deadline {
+            spawn_deadline_watcher(
+                deadline,
+                event_tx,
+                cancel_for_deadline,
+                session_id_for_watcher,
+                backend_handle,
+            );
+        } else {
+            drop(event_tx);
+        }
+
         (cancel, baseline)
     }
+}
+
+/// Spawn a task that surfaces an `AgentEvent::Error` and cancels the in-flight
+/// turn `LLM_DEADLINE_SAFETY_MARGIN_MS` before `deadline` fires. If the backend
+/// task finishes before the deadline, the watcher exits silently without
+/// touching the stream — `backend_handle` is the join handle on the backend's
+/// `run_turn` task, so we observe completion regardless of how the agent
+/// terminated (TurnComplete, Error, panic).
+///
+/// IMPORTANT: this task owns one of the two `event_tx` clones; the other
+/// lives inside the backend task. The forwarder loop in [`SessionHost::start_turn`]
+/// terminates only when BOTH senders drop, and the next turn's `start_turn`
+/// blocks on `prior.await` until that drain completes. Every termination arm
+/// below must therefore drop `event_tx` (which it does implicitly on `return`
+/// / end-of-async-block). Do not refactor to clone-and-pre-drop — that would
+/// break the prior-turn ordering invariant in `start_turn`.
+fn spawn_deadline_watcher(
+    deadline: std::time::Instant,
+    event_tx: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    session_id: String,
+    backend_handle: JoinHandle<()>,
+) {
+    use cortex::constants::LLM_DEADLINE_SAFETY_MARGIN_MS;
+    // Scale the safety margin to the remaining budget. With a generous
+    // 120s budget the full 5s margin applies (fire at t≈115s). With a tight
+    // 200ms budget the margin shrinks to ≤budget/2 so the watcher still
+    // sleeps half the budget before firing — otherwise `sleep(0)` wins the
+    // select! arm immediately, even when the backend was about to complete
+    // in microseconds, and every fast turn would be tagged with a spurious
+    // "deadline approaching" Error.
+    let now_at_spawn = std::time::Instant::now();
+    let total_budget = deadline.saturating_duration_since(now_at_spawn);
+    let configured_margin = std::time::Duration::from_millis(LLM_DEADLINE_SAFETY_MARGIN_MS);
+    let effective_margin = configured_margin.min(total_budget / 2);
+    let trigger_at = deadline.checked_sub(effective_margin).unwrap_or(deadline);
+    let total_budget_ms = u64::try_from(total_budget.as_millis()).unwrap_or(u64::MAX);
+    tokio::spawn(async move {
+        let sleep = trigger_at.saturating_duration_since(std::time::Instant::now());
+        tokio::pin!(backend_handle);
+        tokio::select! {
+            _ = tokio::time::sleep(sleep) => {}
+            _ = cancel.cancelled() => {
+                // Turn was cancelled by some other path (user cancel, close).
+                // Don't fire — let whoever cancelled own the message.
+                return;
+            }
+            _ = &mut backend_handle => {
+                // Backend finished naturally before the deadline. The agent
+                // already emitted its terminal event (TurnComplete or Error);
+                // injecting another Error would be a UX regression.
+                return;
+            }
+        }
+        let effective_margin_ms = u64::try_from(effective_margin.as_millis()).unwrap_or(u64::MAX);
+        let msg = format!(
+            "turn aborted: client deadline approaching (total budget {total_budget_ms}ms, \
+             effective margin {effective_margin_ms}ms) — LLM call did not surface a \
+             response in time"
+        );
+        tracing::warn!(
+            session_id = %session_id,
+            total_budget_ms,
+            effective_margin_ms,
+            "deadline watcher firing"
+        );
+        if let Err(e) = event_tx.send(AgentEvent::Error(msg)).await {
+            // Forwarder already drained and dropped its receiver — race between
+            // watcher and turn completion. Nothing to recover.
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "deadline watcher failed to surface Error event (turn already finished?)"
+            );
+        }
+        cancel.cancel();
+    });
 }
 
 /// Daemon-wide map of `session_id` → live `SessionHost`. Cheap-to-clone.
@@ -454,7 +563,7 @@ mod tests {
         // arrives via subscribe() with strictly increasing seqs.
         let host = SessionHost::new(stub("s1", &["a", "b", "c"], 1));
         let mut rx = host.subscribe();
-        host.start_turn("hi".into(), Vec::new(), None).await;
+        host.start_turn("hi".into(), Vec::new(), None, None).await;
         let evts = drain_until_terminal(&mut rx).await;
         let kinds: Vec<&str> = evts
             .iter()
@@ -478,7 +587,7 @@ mod tests {
         // would run to completion ignoring `/cancel`.
         let host = SessionHost::new(stub("s2", &["a", "b", "c", "d", "e"], 200));
         let mut rx = host.subscribe();
-        host.start_turn("go".into(), Vec::new(), None).await;
+        host.start_turn("go".into(), Vec::new(), None, None).await;
         // Let one delta land, then cancel.
         let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         let cancel_at = std::time::Instant::now();
@@ -504,7 +613,7 @@ mod tests {
         // miss the next one.
         let host = SessionHost::new(stub("s3", &["a", "b", "c"], 1));
         let mut rx = host.subscribe();
-        host.start_turn("hi".into(), Vec::new(), None).await;
+        host.start_turn("hi".into(), Vec::new(), None, None).await;
         drain_until_terminal(&mut rx).await;
         let after_two = host.replay_since(2);
         let kinds: Vec<u64> = after_two.iter().map(|e| e.event_seq).collect();
@@ -536,7 +645,7 @@ mod tests {
         let host = SessionHost::new(stub("s4", &["x", "y"], 1));
         let mut rx_a = host.subscribe();
         let mut rx_b = host.subscribe();
-        host.start_turn("go".into(), Vec::new(), None).await;
+        host.start_turn("go".into(), Vec::new(), None, None).await;
         let a = drain_until_terminal(&mut rx_a).await;
         let b = drain_until_terminal(&mut rx_b).await;
         let seqs_a: Vec<u64> = a.iter().map(|e| e.event_seq).collect();
@@ -614,7 +723,7 @@ mod tests {
         let close_calls = backend.close_calls.clone();
         let host = SessionHost::new(backend);
         let mut rx = host.subscribe();
-        host.start_turn("go".into(), Vec::new(), None).await;
+        host.start_turn("go".into(), Vec::new(), None, None).await;
 
         let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         host.close().await;
@@ -625,6 +734,172 @@ mod tests {
         assert!(
             matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
             "expected terminal Error('cancelled'), got {:?}",
+            last.kind
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_watcher_surfaces_error_before_deadline_when_turn_stalls() {
+        // Real failure mode (smorgasborg session-send-...05-09 ticket): a hung
+        // LLM call inside the agent loop runs out the gRPC client's deadline
+        // with no event on the wire — the client sees a bare DEADLINE_EXCEEDED
+        // and the borg-side `Error` event never reaches it. The deadline
+        // watcher must inject a structured `Error` event onto the stream
+        // *before* the wall-clock deadline so the client knows what happened.
+        //
+        // We use a stub that runs ~5s of "deltas" (well past our 200ms test
+        // budget). With LLM_DEADLINE_SAFETY_MARGIN_MS = 5_000, a 200ms-future
+        // deadline saturates the trigger_at to `now`, so the watcher fires
+        // immediately and surfaces an Error within milliseconds — well before
+        // the 200ms wall-clock deadline.
+        let host = SessionHost::new(stub("s-deadline", &["a", "b", "c", "d", "e"], 1_000));
+        let mut rx = host.subscribe();
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        host.start_turn("hang".into(), Vec::new(), None, Some(deadline))
+            .await;
+
+        // Drain until we see a terminal event. Bound the wait at 1s — way more
+        // than the 200ms deadline so a regression fails loudly.
+        let mut saw_deadline_error = false;
+        loop {
+            let evt = match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(e)) => e,
+                Ok(Err(_)) | Err(_) => break,
+            };
+            if let Some(Kind::Error(e)) = &evt.kind {
+                if e.message.contains("client deadline approaching") {
+                    saw_deadline_error = true;
+                }
+            }
+            if convert::is_terminal(&evt) {
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            saw_deadline_error,
+            "expected an Error event mentioning the client deadline; never saw one in {elapsed:?}"
+        );
+        // Watcher must beat the actual deadline plus a generous slack for CI.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "deadline watcher took {elapsed:?}; must surface Error well before the 200ms deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_watcher_stays_silent_when_user_cancels_before_deadline() {
+        // Real failure mode: if the watcher fires on the cancel arm, the user
+        // would see two terminal Errors back-to-back ("cancelled" from the
+        // backend + "client deadline approaching" from the watcher). Spec:
+        // whoever cancelled owns the message. The cancel arm of the
+        // watcher's select! must `return` without touching the stream.
+        let host = SessionHost::new(stub("s-cancel", &["a", "b", "c", "d", "e"], 200));
+        let mut rx = host.subscribe();
+        // Generous 5s deadline — well past the user-cancel that follows.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        host.start_turn("go".into(), Vec::new(), None, Some(deadline))
+            .await;
+        // Let one delta land so the turn is genuinely in flight.
+        let _ = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        host.cancel_turn().await;
+        let evts = drain_until_terminal(&mut rx).await;
+        let last = evts.last().expect("at least one event");
+        assert!(
+            matches!(&last.kind, Some(Kind::Error(e)) if e.message == "cancelled"),
+            "expected terminal Error('cancelled') from backend, got {:?}",
+            last.kind
+        );
+        let deadline_msgs: Vec<_> = evts
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(Kind::Error(err)) if err.message.contains("client deadline approaching") => {
+                    Some(err.message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            deadline_msgs.is_empty(),
+            "user-cancelled turn must not also receive a deadline Error, but saw {deadline_msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_watcher_scales_safety_margin_to_tight_budgets() {
+        // Real failure mode: if the watcher used the configured 5s margin
+        // unconditionally, every turn under a budget shorter than 10s would
+        // fire `sleep(0)` immediately and tag the turn with a deadline Error
+        // before the backend had any chance to make progress. The scaling
+        // rule `effective_margin = min(configured, total_budget / 2)` must
+        // hold so a stalled turn under a 200ms budget fires somewhere in
+        // [50ms, 150ms] — i.e. NOT instantly, AND well before the deadline.
+        let host = SessionHost::new(stub("s-scale", &["a", "b", "c", "d"], 1_000));
+        let mut rx = host.subscribe();
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        host.start_turn("hang".into(), Vec::new(), None, Some(deadline))
+            .await;
+        // Find the deadline Error and pin its arrival time.
+        let mut fire_at: Option<std::time::Instant> = None;
+        loop {
+            let evt = match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(e)) => e,
+                _ => break,
+            };
+            if let Some(Kind::Error(e)) = &evt.kind {
+                if e.message.contains("client deadline approaching") {
+                    fire_at = Some(std::time::Instant::now());
+                }
+            }
+            if convert::is_terminal(&evt) {
+                break;
+            }
+        }
+        let fire_at = fire_at.expect("watcher must fire a deadline Error under a stalled turn");
+        let elapsed = fire_at.duration_since(started);
+        // Lower bound: scaling must give the backend at least ~budget/2 to
+        // make progress (50ms is generous slack against scheduler jitter).
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "watcher fired at {elapsed:?}; must wait at least ~budget/2 (≥50ms) before firing"
+        );
+        // Upper bound: must beat the actual 200ms deadline with margin.
+        assert!(
+            elapsed < Duration::from_millis(180),
+            "watcher fired at {elapsed:?}; must beat the 200ms client deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_watcher_stays_silent_when_turn_completes_in_time() {
+        // Inverse of the prior test: if the turn finishes well before the
+        // deadline, the watcher must not inject a spurious Error event.
+        // Otherwise every fast turn would carry a confusing "deadline
+        // approaching" tail event.
+        let host = SessionHost::new(stub("s-fast", &["x"], 1));
+        let mut rx = host.subscribe();
+        // Generous 5s deadline — turn completes in milliseconds.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        host.start_turn("fast".into(), Vec::new(), None, Some(deadline))
+            .await;
+        let evts = drain_until_terminal(&mut rx).await;
+        let kinds: Vec<_> = evts
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Some(Kind::Error(err)) => Some(err.message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kinds.is_empty(),
+            "fast turn must not get a deadline Error event, but saw {kinds:?}"
+        );
+        let last = evts.last().expect("at least one event");
+        assert!(
+            matches!(&last.kind, Some(Kind::TurnComplete(_))),
+            "expected TurnComplete, got {:?}",
             last.kind
         );
     }
