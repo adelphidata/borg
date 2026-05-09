@@ -107,6 +107,18 @@ borg daemon
 
 The daemon runs the heartbeat scheduler alongside the gateway server. It executes heartbeat check-ins, session-start greetings, scheduled tasks, and messaging webhooks. Combine with `borg service install` to run it as a system service (launchd on macOS, systemd on Linux).
 
+### Tick lock
+
+The dispatcher holds a non-blocking `flock` on `~/.borg/scheduler.tick.lock` (`crates/borgd/src/tick_lock.rs`) across the claim+dispatch phase of each iteration. The lock is acquired after maintenance work (drift recovery, stalled-task scan) and dropped before the next `interval.tick()` await — task execution itself runs unlocked off the dispatcher loop.
+
+Three things this guards, beyond what `pidlock.rs` (single daemon) and SQLite's `BEGIN IMMEDIATE` (single writer) already cover:
+
+- **Out-of-process tick callers** — a future manual CLI tick, maintenance hook, or ACP trigger calling `claim_due_tasks` while the daemon is up.
+- **Re-entrant in-process iteration** — if a tick stalls past `DAEMON_LOOP_INTERVAL`, the next `interval.tick()` would otherwise fire immediately and re-enter the claim arm before the previous one finished.
+- **Architectural clarity** — "no two ticks run concurrently" is now an observable property gated by a named primitive, not an emergent one.
+
+On collision, the dispatcher logs at `debug` and skips the tick. The next interval (60 s) retries naturally because `next_run` is only advanced inside the locked section.
+
 ## Heartbeat prompt
 
 Each heartbeat sends the agent's personality (IDENTITY.md), memory context, HEARTBEAT.md checklist (if present), and current time, along with instructions to:

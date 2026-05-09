@@ -10,6 +10,8 @@
 //! This module is the loop body only.
 
 use crate::maintenance::sweep;
+use crate::paths::tick_lock_path;
+use crate::tick_lock::TickLock;
 use anyhow::Result;
 use cortex::config::Config;
 use cortex::constants::{
@@ -71,6 +73,11 @@ pub async fn run(
             "Another daemon instance is already running. Only one daemon can run at a time."
         );
     }
+
+    // Resolve the per-tick advisory lock path once. The lock itself is
+    // acquired and released *inside* each iteration of the dispatch loop —
+    // see the claim+dispatch arm below for rationale.
+    let tick_lock_file = tick_lock_path(&Config::data_dir()?);
 
     // Boot-time recovery: in-flight task runs from a crashed previous
     // daemon are marked failed, and any task more than seven days
@@ -177,6 +184,40 @@ pub async fn run(
             }
         }
 
+        // Claim+dispatch critical section. The non-blocking tick lock makes
+        // "no two ticks run concurrently" an explicit, observable property:
+        //
+        //  - SQLite's `BEGIN IMMEDIATE` already serializes concurrent
+        //    `claim_due_tasks` callers, but only at the row-write boundary —
+        //    the surrounding hook spawns are unprotected.
+        //  - If a tick stalls past `DAEMON_LOOP_INTERVAL`, the next
+        //    `interval.tick()` would otherwise re-enter this arm immediately.
+        //  - Out-of-process tick callers (manual CLI, future ACP triggers)
+        //    bypass the in-process loop sequencing entirely.
+        //
+        // Collision → debug log + skip; the next interval (60s) retries
+        // naturally because `next_run` was never advanced. The lock is
+        // dropped before re-entering `interval.tick().await`, so it does
+        // not extend across the inter-tick sleep.
+        let _tick_lock = match TickLock::try_acquire(&tick_lock_file) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                tracing::debug!(
+                    path = %tick_lock_file.display(),
+                    "scheduler tick skipped — another tick holds the lock"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %tick_lock_file.display(),
+                    "scheduler tick lock open failed; skipping iteration"
+                );
+                continue;
+            }
+        };
+
         // Claim due tasks.
         match db.claim_due_tasks(now) {
             Ok(claimed) => {
@@ -243,6 +284,9 @@ pub async fn run(
             }
             Err(e) => tracing::warn!("Failed to check pending celebrations: {e}"),
         }
+
+        // `_tick_lock` drops here at end of iteration, before the next
+        // `interval.tick().await`.
     }
 }
 

@@ -280,9 +280,6 @@ top-down by priority, not by section order.
 
 ### Scheduling
 
-- **File-lock on cron tick.** `[H]` Prevent overlapping scheduler
-  ticks if the daemon hiccups and two ticks land simultaneously.
-  Today nothing prevents double-fire of a 5-minute task.
 - **Heartbeat `lightContext` + `isolatedSession` modes.** `[O]`
   Heartbeat options: load only `HEARTBEAT.md` (skip full memory) or
   run in a fresh session with no history. Useful for "just check my
