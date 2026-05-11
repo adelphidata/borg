@@ -86,6 +86,12 @@ define_settings! {
         "security.action_limits" => security.action_limits, json_set;
         "security.gateway_action_limits" => security.gateway_action_limits, json_set;
         // security.verifier handled in custom_apply below (FromStr enum).
+        "security.url_policy.enabled" => security.url_policy.enabled, parsed(bool);
+        "security.url_policy.allow_private_urls" => security.url_policy.allow_private_urls, parsed(bool);
+        "security.url_policy.allowlist" => security.url_policy.allowlist, json;
+        "security.url_policy.denylist" => security.url_policy.denylist, json;
+        "security.url_policy.throttle_rules" => security.url_policy.throttle_rules, json;
+        "security.url_policy.transform_rules" => security.url_policy.transform_rules, json;
 
         // ── Budget ──
         "budget.monthly_token_limit" => budget.monthly_token_limit, parsed(u64);

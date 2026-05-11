@@ -125,6 +125,74 @@ impl Default for SandboxConfig {
     }
 }
 
+/// Per-site URL policy applied pre-flight to every `web_fetch` and
+/// `browser.navigate` URL. Composes scheme gating, SSRF defense
+/// (cloud-metadata + private-IP blocking), allowlist/denylist, transforms
+/// (strip query params, rewrite host, force https, strip fragment), and
+/// per-host throttling. Detailed semantics in [`crate::url_policy`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UrlPolicyConfig {
+    /// Master toggle. When false, classification is bypassed entirely —
+    /// ops escape hatch only; cloud-metadata IPs are no longer protected.
+    pub enabled: bool,
+    /// When true, private/loopback/link-local/CGNAT IPs may be fetched.
+    /// Cloud-metadata endpoints (169.254.169.254, metadata.google.internal,
+    /// etc.) remain blocked regardless — they are never legitimate targets.
+    pub allow_private_urls: bool,
+    /// When non-empty, only hosts matching one of these patterns pass.
+    /// Patterns support exact match, subdomain suffix, and `*.foo.com`
+    /// wildcards (see [`crate::url_policy::rules`]).
+    pub allowlist: Vec<String>,
+    /// Hosts matching any pattern here are blocked. Same matcher syntax
+    /// as `allowlist`. Denylist is checked after allowlist.
+    pub denylist: Vec<String>,
+    /// Per-host minimum interval between requests.
+    pub throttle_rules: Vec<ThrottleRule>,
+    /// Pre-flight URL rewrites applied in declared order.
+    pub transform_rules: Vec<TransformRule>,
+}
+
+impl Default for UrlPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allow_private_urls: false,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+            throttle_rules: Vec::new(),
+            transform_rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThrottleRule {
+    /// Domain pattern (e.g. `api.example.com`, `*.example.com`).
+    pub pattern: String,
+    /// Minimum milliseconds between consecutive requests to a matching host.
+    pub min_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransformRule {
+    pub pattern: String,
+    pub action: TransformAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TransformAction {
+    /// Remove named query parameters (exact names, case-sensitive).
+    StripQueryParams { names: Vec<String> },
+    /// Replace the URL's host with `to`. Path/query preserved.
+    RewriteHost { to: String },
+    /// Upgrade `http://` to `https://`.
+    ForceHttps,
+    /// Remove the URL fragment (`#section`).
+    StripFragment,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
@@ -158,6 +226,9 @@ pub struct SecurityConfig {
     /// and persists the resolved choice (`OsKeychain` or `File`).
     #[serde(default)]
     pub kek_backend: KekBackend,
+    /// Pre-flight gate for outbound URLs (`web_fetch`, `browser.navigate`).
+    #[serde(default)]
+    pub url_policy: UrlPolicyConfig,
 }
 
 fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
@@ -188,6 +259,7 @@ impl Default for SecurityConfig {
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
             verifier: VerifierKind::Tofu,
             kek_backend: KekBackend::Auto,
+            url_policy: UrlPolicyConfig::default(),
         }
     }
 }

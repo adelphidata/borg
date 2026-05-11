@@ -1202,6 +1202,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "uuid",
  "which 7.0.3",
  "wiremock",

@@ -109,9 +109,11 @@ pub async fn handle_web_fetch(args: &serde_json::Value, config: &Config) -> Resu
     }
     let url = require_str_param(args, "url")?;
     let max_chars = args["max_chars"].as_u64().map(|v| v as usize);
-    match web::web_fetch(url, max_chars).await {
+    match web::web_fetch(url, max_chars, &config.security.url_policy).await {
         Ok(content) => Ok(content),
-        Err(e) => Ok(format!("Error fetching URL: {e}")),
+        // `{:#}` walks the anyhow context chain so policy-block messages
+        // from the redirect callback surface alongside the top context.
+        Err(e) => Ok(format!("Error fetching URL: {e:#}")),
     }
 }
 

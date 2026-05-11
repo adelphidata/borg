@@ -129,6 +129,23 @@ pub async fn handle_browser(
         return Ok(ToolOutput::Text("No browser session to close.".to_string()));
     }
 
+    // Pre-flight: for navigate / new_tab, run the URL through the policy
+    // classifier BEFORE launching Chrome. This avoids paying the Chrome
+    // startup cost on a request the agent isn't allowed to make, and
+    // ensures the blocked-URL surface is identical whether or not a
+    // session exists. new_tab's URL is optional — only classify if set.
+    let preflight_url = match action {
+        "navigate" => Some(require_str_param(args, "url")?),
+        "new_tab" => args.get("url").and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    if let Some(url) = preflight_url {
+        let outcome = crate::url_policy::classify(url, &config.security.url_policy).await;
+        if let Some(msg) = crate::url_policy::describe_block_or_throttle(&outcome) {
+            return Ok(ToolOutput::Text(format!("Error: {msg}")));
+        }
+    }
+
     // Lazy-launch browser session
     if session.is_none() {
         match BrowserSession::launch(&config.browser).await {
@@ -168,7 +185,12 @@ pub async fn handle_browser(
     match action {
         "navigate" => {
             let url = require_str_param(args, "url")?;
-            browser_action_with_recovery!(browser, "navigate", browser.navigate(url, timeout).await)
+            let policy = &config.security.url_policy;
+            browser_action_with_recovery!(
+                browser,
+                "navigate",
+                browser.navigate(url, timeout, policy).await
+            )
         }
         "click" => {
             let selector = require_str_param(args, "selector")?;
@@ -302,7 +324,7 @@ pub async fn handle_browser(
         }
         "new_tab" => {
             let url = args.get("url").and_then(serde_json::Value::as_str);
-            browser_result(browser.new_tab(url).await)
+            browser_result(browser.new_tab(url, &config.security.url_policy).await)
         }
         "list_tabs" => browser_result(browser.list_tabs().await),
         "switch_tab" => {

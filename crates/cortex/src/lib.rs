@@ -204,6 +204,9 @@ pub mod types;
 pub mod unix_ext;
 /// Self-update mechanism for the borg binary.
 pub mod update;
+/// Pre-flight URL classifier and per-site policy (allow/deny, transform,
+/// throttle, SSRF defense) for `web_fetch` and `browser.navigate`.
+pub mod url_policy;
 /// `/usage` formatter — pre-renders the multi-section text view (token
 /// spend, cost, model usage, tool calls, channel activity) over a rolling
 /// time window. The TUI popup renders the returned string verbatim.

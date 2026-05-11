@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use scraper::{Html, Selector};
 use std::sync::LazyLock;
 
-use crate::config::WebConfig;
+use crate::config::{UrlPolicyConfig, WebConfig};
 use crate::constants;
+use crate::url_policy::{self, ClassifyOutcome};
 
 const MAX_FETCH_CHARS: usize = constants::WEB_FETCH_MAX_CHARS;
 const MAX_SEARCH_RESULTS: usize = constants::WEB_MAX_SEARCH_RESULTS;
@@ -83,28 +84,89 @@ pub fn resolve_provider_id(config: &WebConfig) -> &str {
 // ---------------------------------------------------------------------------
 
 /// Fetch a URL and return its text content. HTML is stripped to plain text.
-pub async fn web_fetch(url: &str, max_chars: Option<usize>) -> Result<String> {
+///
+/// The URL is run through [`url_policy::classify`] pre-flight; redirects
+/// are gated via a `Policy::custom` callback that runs the no-DNS
+/// classifier on each hop; and the final landing URL is re-checked with
+/// the full classifier post-fetch to defend against DNS rebinding.
+pub async fn web_fetch(
+    url: &str,
+    max_chars: Option<usize>,
+    policy: &UrlPolicyConfig,
+) -> Result<String> {
     let max = max_chars.unwrap_or(MAX_FETCH_CHARS);
+
+    // Pre-flight: full classify (DNS + transforms + throttle). Surface the
+    // block/throttle message via the canonical `describe_block_or_throttle`
+    // helper so `web_fetch` and `browser` callers always see identical
+    // wording (avoids silent desync between two error formatters).
+    let preflight = url_policy::classify(url, policy).await;
+    let effective_url = match &preflight {
+        ClassifyOutcome::Allow { effective_url } => effective_url.clone(),
+        _ => {
+            let msg = url_policy::describe_block_or_throttle(&preflight)
+                .unwrap_or_else(|| "URL policy refused request".to_string());
+            anyhow::bail!("{msg}");
+        }
+    };
+
+    // Per-hop redirect re-validation (no DNS — full re-classify is too
+    // expensive on every redirect; the post-fetch check below covers DNS).
+    let redirect_policy_cfg = policy.clone();
+    let redirect_limit = constants::WEB_REDIRECT_LIMIT;
+    let redirect = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= redirect_limit {
+            return attempt.error("too many redirects");
+        }
+        let next_url = attempt.url().to_string();
+        match url_policy::classify_offline(&next_url, &redirect_policy_cfg) {
+            ClassifyOutcome::Allow { .. } => attempt.follow(),
+            ClassifyOutcome::Block { reason, rule } => attempt.error(format!(
+                "URL policy blocked redirect to {next_url}: {reason} (rule: {rule})"
+            )),
+            ClassifyOutcome::Throttle { .. } => {
+                // Throttle has no meaning on a redirect hop — let it follow.
+                attempt.follow()
+            }
+        }
+    });
 
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(
             constants::WEB_FETCH_TIMEOUT_SECS,
         ))
-        .redirect(reqwest::redirect::Policy::limited(
-            constants::WEB_REDIRECT_LIMIT,
-        ))
+        .redirect(redirect)
         .build()?;
 
     let resp = client
-        .get(url)
+        .get(&effective_url)
         .send()
         .await
-        .with_context(|| format!("Failed to fetch {url}"))?;
+        .with_context(|| format!("Failed to fetch {effective_url}"))?;
+
+    // Post-fetch: re-validate the final landing URL with full DNS,
+    // *unconditionally*, to defend against DNS rebinding. Even a
+    // no-redirect 200 can have IPs at connect time that differ from the
+    // pre-flight lookup (TOCTOU), so we re-resolve regardless of whether
+    // a redirect occurred. The cost is one cached DNS lookup.
+    //
+    // True end-to-end DNS-rebinding defense requires pinning the
+    // pre-flight IPs into the connector (e.g. a custom
+    // `reqwest::dns::Resolve`). That's tracked as future work; the
+    // post-fetch recheck closes the window for the common case where the
+    // attacker's DNS TTL has not yet expired between resolves.
+    let final_url = resp.url().to_string();
+    let post = url_policy::classify_no_throttle(&final_url, policy).await;
+    if !matches!(post, ClassifyOutcome::Allow { .. }) {
+        let msg = url_policy::describe_block_or_throttle(&post)
+            .unwrap_or_else(|| "URL policy refused final URL".to_string());
+        anyhow::bail!("post-fetch: {msg} (final url: {final_url})");
+    }
 
     let status = resp.status();
     if !status.is_success() {
-        anyhow::bail!("HTTP {status} fetching {url}");
+        anyhow::bail!("HTTP {status} fetching {effective_url}");
     }
 
     let content_type = resp
@@ -117,7 +179,7 @@ pub async fn web_fetch(url: &str, max_chars: Option<usize>) -> Result<String> {
     let bytes = resp
         .bytes()
         .await
-        .with_context(|| format!("Failed to read body from {url}"))?;
+        .with_context(|| format!("Failed to read body from {effective_url}"))?;
     const MAX_BODY_BYTES: usize = constants::WEB_MAX_BODY_BYTES;
     if bytes.len() > MAX_BODY_BYTES {
         anyhow::bail!(

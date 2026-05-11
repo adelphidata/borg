@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use chromiumoxide::{Browser, Page};
 use tracing::instrument;
 
-use super::validate_url_scheme;
+use crate::config::UrlPolicyConfig;
+use crate::url_policy::{self, ClassifyOutcome};
 
 /// Multi-tab page manager. Tracks all open pages and the active index.
 pub struct TabManager {
@@ -35,16 +36,33 @@ impl TabManager {
     }
 
     /// Open a new tab, optionally navigating to a URL. Sets it as active.
-    /// Enforces the same URL scheme validation as `navigate`.
+    /// Routes the URL through [`url_policy::classify_offline`] for defense
+    /// in depth — the handler at [`crate::tool_handlers::media`] runs the
+    /// full DNS-aware classify pre-flight; this no-DNS variant ensures
+    /// direct callers of `new_tab` still get scheme + SSRF-host +
+    /// allow/deny gating without double-charging the throttle bucket.
     #[instrument(skip_all, fields(browser.action = "new_tab"))]
-    pub async fn new_tab(&mut self, browser: &Browser, url: Option<&str>) -> Result<String> {
-        let target = url.unwrap_or("about:blank");
-        // Validate URL scheme unless it's about:blank (the default)
-        if target != "about:blank" {
-            validate_url_scheme(target)?;
-        }
+    pub async fn new_tab(
+        &mut self,
+        browser: &Browser,
+        url: Option<&str>,
+        policy: &UrlPolicyConfig,
+    ) -> Result<String> {
+        let target = match url {
+            None => "about:blank".to_string(),
+            Some(u) => match url_policy::classify_offline(u, policy) {
+                ClassifyOutcome::Allow { effective_url } => effective_url,
+                ClassifyOutcome::Block { reason, rule } => {
+                    anyhow::bail!("URL policy blocked: {reason} (rule: {rule})");
+                }
+                ClassifyOutcome::Throttle { .. } => {
+                    tracing::error!("classify_offline returned Throttle — contract violation");
+                    anyhow::bail!("URL policy returned unexpected throttle verdict");
+                }
+            },
+        };
         let page = browser
-            .new_page(target)
+            .new_page(&target)
             .await
             .with_context(|| format!("Failed to open new tab: {target}"))?;
         self.pages.push(page);

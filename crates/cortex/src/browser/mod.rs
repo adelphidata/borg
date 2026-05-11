@@ -14,7 +14,8 @@ use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use futures::StreamExt;
 use tracing::instrument;
 
-use crate::config::BrowserConfig as BorgBrowserConfig;
+use crate::config::{BrowserConfig as BorgBrowserConfig, UrlPolicyConfig};
+use crate::url_policy::{self, ClassifyOutcome};
 
 // Re-export key types for backward compatibility
 pub use detection::{detect_agent_browser, find_chrome, ChromeDetection};
@@ -139,14 +140,39 @@ impl BrowserSession {
 
     // -- Core Actions --
 
-    /// Navigate to a URL. Only http/https URLs are allowed.
+    /// Navigate to a URL after running it through the URL policy
+    /// classifier. The handler at [`crate::tool_handlers::media`] runs
+    /// the full [`url_policy::classify`] (DNS + throttle) pre-flight; this
+    /// method re-runs the no-DNS variant as a defense-in-depth check so
+    /// any direct caller of `navigate` still gets scheme + SSRF-host +
+    /// allow/deny gating without double-charging the throttle bucket.
     #[instrument(skip_all, fields(browser.action = "navigate"))]
-    pub async fn navigate(&self, url: &str, timeout: Duration) -> Result<String> {
-        validate_url_scheme(url)?;
+    pub async fn navigate(
+        &self,
+        url: &str,
+        timeout: Duration,
+        policy: &UrlPolicyConfig,
+    ) -> Result<String> {
+        let effective_url = match url_policy::classify_offline(url, policy) {
+            ClassifyOutcome::Allow { effective_url } => effective_url,
+            ClassifyOutcome::Block { reason, rule } => {
+                anyhow::bail!("URL policy blocked: {reason} (rule: {rule})");
+            }
+            ClassifyOutcome::Throttle { .. } => {
+                // classify_offline does not run the throttle step. If
+                // that contract is ever broken, refuse rather than panic:
+                // a browser tool call that surprises us with a throttle
+                // verdict should bail, not crash the daemon.
+                tracing::error!("classify_offline returned Throttle — contract violation");
+                anyhow::bail!("URL policy returned unexpected throttle verdict");
+            }
+        };
 
         let page = self.tab_manager.active_page();
         tokio::time::timeout(timeout, async {
-            page.goto(url).await.context("Navigation failed")?;
+            page.goto(&effective_url)
+                .await
+                .context("Navigation failed")?;
             let title = page
                 .get_title()
                 .await
@@ -346,10 +372,11 @@ impl BrowserSession {
 
     // -- Tab Management --
 
-    /// Open a new tab.
+    /// Open a new tab. The URL (if any) is gated by `policy` so SSRF /
+    /// allow / deny checks apply identically to `navigate`.
     #[instrument(skip_all, fields(browser.action = "new_tab"))]
-    pub async fn new_tab(&mut self, url: Option<&str>) -> Result<String> {
-        let result = self.tab_manager.new_tab(&self.browser, url).await?;
+    pub async fn new_tab(&mut self, url: Option<&str>, policy: &UrlPolicyConfig) -> Result<String> {
+        let result = self.tab_manager.new_tab(&self.browser, url, policy).await?;
         // Attach event listeners to the new page
         let new_handles =
             console::spawn_event_listeners(self.tab_manager.active_page(), &self.event_buffers)

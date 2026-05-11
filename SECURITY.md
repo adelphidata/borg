@@ -54,4 +54,5 @@ Borg includes multiple layers of security by design:
 - **Output redaction** — agent output is stripped of detected secrets on the way out (channel deliveries, TUI transcript, logs), gated by `security.output_redaction` (default on) with an audit trail in `redaction_audit`
 - **Prompt injection detection** — scoring-based input sanitization flags suspicious content
 - **Rate limiting** — per-session caps on tool calls, shell commands, file writes, and web requests
+- **URL safety classifier + per-site policy** — pre-flight gate on `web_fetch` / `browser.navigate`: SSRF defense, allowlist/denylist, transforms, per-host throttle, redirect re-validation
 - **Sender pairing** — gateway messages from unknown senders require approval before processing
