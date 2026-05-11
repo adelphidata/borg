@@ -884,6 +884,13 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_resolved
 -- Per-provider pool of API keys with cooldown/exhaustion state. The plaintext
 -- key is never stored; rows are keyed by a 16-hex BLAKE3 fingerprint that
 -- re-attaches state to live keys at load time.
+--
+-- `auth_type` distinguishes API keys (default) from OAuth credentials, the
+-- latter of which carry `expires_at_ms` and (in memory only) a refresh token.
+-- `base_url` overrides the provider's default endpoint for OpenAI-compatible
+-- custom endpoints. `extra_json` is a per-provider blob (PKCE verifier, OAuth
+-- client_id) reserved for the refresh flow. Pre-release: schema is edited in
+-- place rather than chained — existing dev DBs blow away.
 CREATE TABLE IF NOT EXISTS credential_pool (
     provider               TEXT NOT NULL,
     fingerprint            TEXT NOT NULL,
@@ -899,6 +906,10 @@ CREATE TABLE IF NOT EXISTS credential_pool (
     last_error_message     TEXT,
     last_error_reset_at_ms INTEGER,
     removed_at_ms          INTEGER,
+    auth_type              TEXT NOT NULL DEFAULT 'api_key',
+    expires_at_ms          INTEGER,
+    base_url               TEXT,
+    extra_json             TEXT,
     PRIMARY KEY (provider, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_credential_pool_provider

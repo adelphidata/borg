@@ -110,6 +110,9 @@ service Admin {
   rpc RemoveCredential(RemoveCredentialRequest) returns (CredentialEntry);
   rpc ResetCredentials(ResetCredentialsRequest) returns (ResetCredentialsResponse);
   rpc SetCredentialStrategy(SetCredentialStrategyRequest) returns (Empty);
+  // OAuth pairing — runs the credential-source discoverer for `kind` against
+  // the daemon's home directory and seeds whatever it finds into the pool.
+  rpc PairCredential(PairCredentialRequest) returns (PairCredentialResponse);
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }
@@ -562,4 +565,15 @@ message SetCredentialStrategyRequest {
   string provider = 1;
   // "fill_first" | "round_robin" | "least_used" | "random"
   string strategy = 2;
+}
+
+message PairCredentialRequest {
+  // Discoverer kind — "claude_code" | "codex" | "copilot" | "qwen_cli".
+  string kind = 1;
+}
+
+message PairCredentialResponse {
+  // Newly-seeded entries. Empty if the discoverer found nothing on disk
+  // (e.g. user hasn't run `claude /login`). One entry per detected account.
+  repeated CredentialEntry entries = 1;
 }

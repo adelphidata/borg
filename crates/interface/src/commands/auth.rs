@@ -49,6 +49,14 @@ pub(crate) enum AuthAction {
         /// One of `fill_first`, `round_robin`, `least_used`, `random`.
         strategy: String,
     },
+    /// Pair an OAuth-capable account into the credential pool. Discovers
+    /// credentials from the matching on-disk store (Claude Code, ChatGPT
+    /// Codex, GitHub Copilot, Qwen-CLI) and seeds them under the
+    /// corresponding provider's pool.
+    Pair {
+        /// One of `claude-code | codex | copilot | qwen`.
+        kind: String,
+    },
 }
 
 /// Dispatch for `borg auth …`.
@@ -66,7 +74,32 @@ pub(crate) fn dispatch_auth(action: Option<AuthAction>) -> Result<()> {
         Some(AuthAction::SetStrategy { provider, strategy }) => {
             run_set_strategy(&provider, &strategy)
         }
+        Some(AuthAction::Pair { kind }) => run_pair(&kind),
     }
+}
+
+fn run_pair(kind: &str) -> Result<()> {
+    let entries = tokio::runtime::Handle::current().block_on(async {
+        let mut client = crate::daemon_client::connect_or_spawn().await?;
+        client
+            .pair_credential(kind)
+            .await
+            .with_context(|| format!("pairing OAuth credential `{kind}`"))
+    })?;
+    if entries.is_empty() {
+        println!(
+            "No credentials discovered for `{kind}`. Make sure the upstream CLI \
+             (e.g. `claude /login`, `codex`, `gh auth login`) has been run."
+        );
+        return Ok(());
+    }
+    for e in &entries {
+        println!(
+            "Paired `{}` (fingerprint {}, provider {}).",
+            e.label, e.fingerprint, e.provider
+        );
+    }
+    Ok(())
 }
 
 fn run_list(provider: Option<&str>) -> Result<()> {
@@ -193,6 +226,8 @@ fn format_source(e: &CredentialEntry) -> String {
     match e.source_kind.as_str() {
         "env" => format!("env:{}", e.source_value),
         "config" => format!("config:{}", e.source_value),
+        "oauth" => format!("oauth:{}", e.source_value),
+        "custom" => format!("custom:{}", e.source_value),
         "manual" => "manual".to_string(),
         other => other.to_string(),
     }

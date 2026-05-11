@@ -101,6 +101,12 @@ impl CredentialStatus {
 /// Where the credential came from. Drives the suppression model — operators
 /// running `borg auth remove openrouter 2` write a row keyed by source so
 /// re-seeding from env/config doesn't undo the removal on next start.
+///
+/// `OAuth` and `Custom` capture the provenance for accounts discovered on
+/// disk (Claude Code, ChatGPT Codex, etc.) and user-defined OpenAI-compatible
+/// endpoints. Discovery itself lives in `crates/cortex/src/llm/credential_sources/`;
+/// this enum only records the source so suppression and `borg auth list` can
+/// distinguish "operator added a key" from "discovered on disk".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialSource {
@@ -110,6 +116,15 @@ pub enum CredentialSource {
     Env { var: String },
     /// Seeded from a named config block (`llm.api_keys[i]` etc.).
     Config { name: String },
+    /// Seeded from an OAuth-capable on-disk credential store. `name` is the
+    /// source identifier — `"claude_code" | "codex" | "copilot" | "qwen_cli"`
+    /// today; the field is `name` (not `kind`) to avoid colliding with
+    /// serde's `tag = "kind"` discriminator on this enum.
+    OAuth { name: String },
+    /// User-defined OpenAI-compatible endpoint. `name` is the operator's label
+    /// (also the suppression key); `base_url` overrides the provider's default
+    /// for this credential's requests.
+    Custom { name: String, base_url: String },
 }
 
 impl CredentialSource {
@@ -118,6 +133,8 @@ impl CredentialSource {
             Self::Manual => "manual",
             Self::Env { .. } => "env",
             Self::Config { .. } => "config",
+            Self::OAuth { .. } => "oauth",
+            Self::Custom { .. } => "custom",
         }
     }
     fn value_db(&self) -> String {
@@ -125,6 +142,11 @@ impl CredentialSource {
             Self::Manual => String::new(),
             Self::Env { var } => var.clone(),
             Self::Config { name } => name.clone(),
+            Self::OAuth { name } => name.clone(),
+            // Suppression keys on `name`, not `base_url` — base_url can change
+            // (port flip on a self-hosted endpoint) but the credential's
+            // identity is the operator-chosen name.
+            Self::Custom { name, .. } => name.clone(),
         }
     }
     #[allow(dead_code)]
@@ -132,9 +154,29 @@ impl CredentialSource {
         match kind {
             "env" => Self::Env { var: value.into() },
             "config" => Self::Config { name: value.into() },
+            "oauth" => Self::OAuth { name: value.into() },
+            "custom" => Self::Custom {
+                name: value.into(),
+                // base_url is not round-trippable from the suppression value
+                // alone; suppression entries don't need it (the lookup key is
+                // (provider, kind="custom", name)). Empty here is fine.
+                base_url: String::new(),
+            },
             _ => Self::Manual,
         }
     }
+}
+
+/// Authentication style for the credential — drives header construction in
+/// `Provider::build_headers` and OAuth-token-refresh scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthType {
+    /// Static bearer-shaped secret (API key). No refresh.
+    #[default]
+    ApiKey,
+    /// OAuth access token. May have a refresh_token + expires_at.
+    OAuth,
 }
 
 // ── PooledCredential ──────────────────────────────────────────────────────
@@ -151,6 +193,9 @@ pub struct PooledCredential {
     pub label: String,
     pub priority: u32,
     pub source: CredentialSource,
+    /// Bearer-shaped secret. For `auth_type=ApiKey` this is the raw API key;
+    /// for `auth_type=OAuth` this is the current access token (replaced on
+    /// refresh). Empty for tombstones.
     pub key: String,
     pub fingerprint: String,
     pub use_count: u64,
@@ -161,6 +206,20 @@ pub struct PooledCredential {
     pub last_error_message: Option<String>,
     pub last_error_reset_at_ms: Option<i64>,
     pub removed_at_ms: Option<i64>,
+    /// API key vs OAuth — drives header construction in
+    /// `Provider::build_headers` and the OAuth-token-refresh path.
+    pub auth_type: AuthType,
+    /// OAuth refresh token, rotated on each refresh. None for API keys.
+    pub refresh_token: Option<String>,
+    /// Wall-clock millis when the access token expires. None means
+    /// non-expiring (API keys) or unknown.
+    pub expires_at_ms: Option<i64>,
+    /// Per-credential base URL override — set by `CredentialSource::Custom` to
+    /// point requests at a user-defined OpenAI-compatible endpoint.
+    pub base_url: Option<String>,
+    /// Per-provider opaque JSON blob (PKCE verifier, OAuth client_id, etc.).
+    /// Used by the OAuth-refresh flow.
+    pub extra_json: Option<String>,
 }
 
 impl PooledCredential {
@@ -204,6 +263,21 @@ impl std::fmt::Debug for PooledCredential {
             .field("last_error_message", &self.last_error_message)
             .field("last_error_reset_at_ms", &self.last_error_reset_at_ms)
             .field("removed_at_ms", &self.removed_at_ms)
+            .field("auth_type", &self.auth_type)
+            // SECURITY: refresh_token is also redacted — same logic as `key`.
+            .field(
+                "refresh_token",
+                &format_args!(
+                    "<{}>",
+                    self.refresh_token
+                        .as_ref()
+                        .map(|t| format!("redacted len={}", t.len()))
+                        .unwrap_or_else(|| "none".into())
+                ),
+            )
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("base_url", &self.base_url)
+            .field("extra_json", &self.extra_json)
             .finish()
     }
 }
@@ -281,6 +355,14 @@ pub struct CredentialPool {
     db_path: Option<std::path::PathBuf>,
     inner: Arc<Mutex<PoolInner>>,
     clock: Arc<dyn Clock>,
+    /// Per-credential refresh locks. Serializes concurrent OAuth refreshes
+    /// against the same credential id so a single-use refresh_token isn't
+    /// burned twice. Held only across the HTTP refresh call.
+    refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Endpoint override for the OAuth refresh client. `None` uses the
+    /// provider-default URLs. Tests inject a `wiremock` endpoint here via
+    /// [`Self::set_refresh_endpoint_for_tests`].
+    refresh_endpoint_override: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for CredentialPool {
@@ -307,6 +389,10 @@ pub struct PoolLoadConfig {
     /// but Anthropic supports multiple). Each present-and-nonempty var is
     /// seeded as `CredentialSource::Env`.
     pub env_vars: Vec<String>,
+    /// Override the home directory used by OAuth-credential discoverers.
+    /// `None` resolves via `dirs::home_dir()` at load time. Tests inject a
+    /// `tempdir` so synthetic credential files don't leak across runs.
+    pub oauth_home: Option<std::path::PathBuf>,
 }
 
 /// One config-sourced credential, resolved to plaintext.
@@ -369,10 +455,16 @@ impl CredentialPool {
             let mut stmt = conn.prepare(
                 "SELECT fingerprint, id, label, priority, source_json, use_count, \
                         last_status, last_status_at_ms, last_error_code, last_error_reason, \
-                        last_error_message, last_error_reset_at_ms, removed_at_ms \
+                        last_error_message, last_error_reset_at_ms, removed_at_ms, \
+                        auth_type, expires_at_ms, base_url, extra_json \
                  FROM credential_pool WHERE provider = ?1",
             )?;
             let rows = stmt.query_map(params![provider_str], |r| {
+                let auth_type_str: String = r.get(13)?;
+                let auth_type = match auth_type_str.as_str() {
+                    "oauth" => AuthType::OAuth,
+                    _ => AuthType::ApiKey,
+                };
                 Ok(PersistedRow {
                     fingerprint: r.get(0)?,
                     id: r.get(1)?,
@@ -387,6 +479,10 @@ impl CredentialPool {
                     last_error_message: r.get(10)?,
                     last_error_reset_at_ms: r.get(11)?,
                     removed_at_ms: r.get(12)?,
+                    auth_type,
+                    expires_at_ms: r.get(14)?,
+                    base_url: r.get(15)?,
+                    extra_json: r.get(16)?,
                 })
             })?;
             for r in rows {
@@ -460,6 +556,69 @@ impl CredentialPool {
             live.push(cred);
         }
 
+        // 3b. Seed: OAuth and custom-endpoint credentials discovered on disk.
+        //     Discoverers are matched per-provider; sources that find nothing
+        //     return Ok(vec![]). Parser errors log + continue — a malformed
+        //     credentials file must never crash pool load.
+        let oauth_home = cfg
+            .oauth_home
+            .clone()
+            .or_else(dirs::home_dir);
+        if let Some(home) = oauth_home.as_deref() {
+            for discoverer in crate::llm::credential_sources::discoverers_for(provider) {
+                let discovered = match discoverer.discover(home) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            target: "cortex::llm::credential_pool",
+                            source = discoverer.name(),
+                            error = %e,
+                            "credential pool: discoverer failed — skipping"
+                        );
+                        continue;
+                    }
+                };
+                for disc in discovered {
+                    let source = match discoverer.provider() {
+                        Provider::Custom => CredentialSource::Custom {
+                            name: discoverer.name().to_string(),
+                            base_url: disc.base_url.clone().unwrap_or_default(),
+                        },
+                        _ => CredentialSource::OAuth {
+                            name: discoverer.name().to_string(),
+                        },
+                    };
+                    if suppressed
+                        .contains(&(source.kind_db().to_string(), source.value_db()))
+                    {
+                        continue;
+                    }
+                    let fp = fingerprint(&disc.access_token);
+                    if !seen_fp.insert(fp.clone()) {
+                        continue;
+                    }
+                    // Qwen-CLI ships an API key with a base_url override, not
+                    // an OAuth refresh pair. Everything else is OAuth.
+                    let auth_type = if disc.refresh_token.is_some() {
+                        AuthType::OAuth
+                    } else {
+                        AuthType::ApiKey
+                    };
+                    let cred = reconcile_or_new_oauth(
+                        &persisted,
+                        fp,
+                        disc,
+                        source,
+                        auth_type,
+                        next_priority,
+                        clock.now_ms(),
+                    );
+                    next_priority += 1;
+                    live.push(cred);
+                }
+            }
+        }
+
         // 4. Carry forward removed-tombstone rows for `borg auth list` history.
         for (fp, row) in &persisted {
             if !seen_fp.contains(fp) && row.removed_at_ms.is_some() {
@@ -479,6 +638,11 @@ impl CredentialPool {
                         last_error_message: row.last_error_message.clone(),
                         last_error_reset_at_ms: row.last_error_reset_at_ms,
                         removed_at_ms: row.removed_at_ms,
+                        auth_type: row.auth_type,
+                        refresh_token: None, // tombstone — never resurrect refresh secret
+                        expires_at_ms: row.expires_at_ms,
+                        base_url: row.base_url.clone(),
+                        extra_json: row.extra_json.clone(),
                     });
                 }
             }
@@ -533,7 +697,20 @@ impl CredentialPool {
             db_path: Some(db_path.to_path_buf()),
             inner: Arc::new(Mutex::new(inner)),
             clock,
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            refresh_endpoint_override: Mutex::new(None),
         }))
+    }
+
+    /// Test-only: redirect OAuth refresh calls to the given URL (e.g. a
+    /// `wiremock` server). Production code never sets this.
+    #[doc(hidden)]
+    pub fn set_refresh_endpoint_for_tests(&self, url: Option<String>) {
+        let mut g = self
+            .refresh_endpoint_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *g = url;
     }
 
     /// Provider this pool serves.
@@ -614,6 +791,30 @@ impl CredentialPool {
             .filter(|c| !c.is_removed())
             .filter_map(|c| c.last_error_reset_at_ms)
             .min()
+    }
+
+    /// True when at least one cooling (non-removed) credential will recover
+    /// within `within`. Used by the LLM caller to *defer* provider fallback on
+    /// a transient 429/402 when a sibling key is about to come back — jumping
+    /// to the fallback provider while the primary pool is still draining its
+    /// cooldown burns budget on a degraded provider for no reason.
+    ///
+    /// Returns false when all entries are permanently failed (tombstoned with
+    /// no reset time), when the pool is empty, or when every cooldown is
+    /// outside the recovery window (in which case fallback should fire).
+    pub fn may_recover_within(&self, within: Duration) -> bool {
+        let now = self.clock.now_ms();
+        let horizon = now + within.as_millis() as i64;
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.iter().any(|c| {
+            !c.is_removed()
+                && c.last_error_reset_at_ms
+                    .map(|r| r > now && r <= horizon)
+                    .unwrap_or(false)
+        })
     }
 
     /// Snapshot of all entries (including removed tombstones) for `borg auth list`.
@@ -1082,6 +1283,11 @@ impl CredentialPool {
             last_error_message: None,
             last_error_reset_at_ms: None,
             removed_at_ms: None,
+            auth_type: AuthType::ApiKey,
+            refresh_token: None,
+            expires_at_ms: None,
+            base_url: None,
+            extra_json: None,
         };
         g.creds.push(cred.clone());
         g.emitted_exhausted_warn = false;
@@ -1192,7 +1398,7 @@ impl CredentialPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Explicit-id path: requested key must exist and not be removed. The
-        // soft concurrency cap is *advisory* here (mirrors Hermes — explicit
+        // soft concurrency cap is *advisory* here (explicit
         // acquire bypasses the cap). Cooldown is also bypassed: the caller
         // asked for this specific credential and the failover loop's
         // `pick_force` path relies on this to attempt a salvage request
@@ -1264,6 +1470,143 @@ impl CredentialPool {
             credential_id: id,
         })
     }
+
+    /// Like [`acquire_lease`], but refreshes the OAuth access token first if
+    /// it's expired (or within the 60-second skew window). Non-OAuth
+    /// credentials and OAuth credentials without a refresh_token take the
+    /// fast path — identical to `acquire_lease`.
+    ///
+    /// Concurrency: per-credential `tokio::Mutex` serializes parallel refresh
+    /// attempts against the same id so a single-use refresh_token can't be
+    /// double-spent. After the lock is acquired, expiration is re-checked —
+    /// another caller may have already refreshed.
+    ///
+    /// Failures: on refresh error, the credential is cooled (5min) but not
+    /// removed — the refresh server may simply be flaky. A 401/403 from the
+    /// refresh endpoint surfaces as a generic refresh failure (the upstream
+    /// 401-handling path on the actual LLM call will tombstone the entry).
+    pub async fn acquire_lease_refreshing(
+        &self,
+        requested_id: Option<&str>,
+    ) -> Option<LeaseHandle> {
+        let lease = self.acquire_lease(requested_id)?;
+        let snapshot = lease.credential()?;
+        if !matches!(snapshot.auth_type, AuthType::OAuth) {
+            return Some(lease);
+        }
+        let Some(refresh_token) = snapshot.refresh_token.clone() else {
+            return Some(lease);
+        };
+        if !needs_refresh(snapshot.expires_at_ms, self.clock.now_ms()) {
+            return Some(lease);
+        }
+
+        let entry_lock = {
+            let mut locks = self
+                .refresh_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks
+                .entry(snapshot.id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = entry_lock.lock().await;
+
+        // Re-check under the entry lock — a sibling caller may have refreshed
+        // while we were waiting on the mutex.
+        let snapshot = lease.credential()?;
+        if !needs_refresh(snapshot.expires_at_ms, self.clock.now_ms()) {
+            return Some(lease);
+        }
+
+        match self.refresh_oauth(&refresh_token).await {
+            Ok(tokens) => {
+                self.apply_refreshed(&snapshot.id, tokens);
+                Some(lease)
+            }
+            Err(e) => {
+                warn!(
+                    target: "cortex::llm::credential_pool",
+                    provider = self.provider.as_str(),
+                    credential = %snapshot.id,
+                    error = %e,
+                    "oauth refresh failed — cooling credential 5min"
+                );
+                // Reuse the RateLimit arm to cool the credential — semantically
+                // equivalent (transient, retryable, scheduled recovery) and it's
+                // the only arm that sets `last_error_reset_at_ms`. The error
+                // message disambiguates from a true 429 in audit logs.
+                self.report_failure(
+                    &snapshot.id,
+                    FailoverReason::RateLimit,
+                    None,
+                    Some(Duration::from_secs(300)),
+                    Some("oauth_refresh_failed"),
+                );
+                Some(lease)
+            }
+        }
+    }
+
+    async fn refresh_oauth(
+        &self,
+        refresh_token: &str,
+    ) -> anyhow::Result<crate::llm::oauth_refresh::RefreshedTokens> {
+        use crate::llm::oauth_refresh::{
+            refresh_anthropic, refresh_anthropic_against, refresh_codex, refresh_codex_against,
+        };
+        let override_url = {
+            let g = self
+                .refresh_endpoint_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.clone()
+        };
+        match (self.provider, override_url) {
+            (Provider::ClaudeCodeOAuth, Some(url)) => {
+                refresh_anthropic_against(refresh_token, &url).await
+            }
+            (Provider::ClaudeCodeOAuth, None) => refresh_anthropic(refresh_token).await,
+            (Provider::CodexOAuth, Some(url)) => refresh_codex_against(refresh_token, &url).await,
+            (Provider::CodexOAuth, None) => refresh_codex(refresh_token).await,
+            (other, _) => Err(anyhow::anyhow!(
+                "oauth refresh not implemented for provider {}",
+                other.as_str()
+            )),
+        }
+    }
+
+    fn apply_refreshed(
+        &self,
+        id: &str,
+        tokens: crate::llm::oauth_refresh::RefreshedTokens,
+    ) {
+        let snapshot = {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(c) = g.creds.iter_mut().find(|c| c.id == id) else {
+                return;
+            };
+            c.key = tokens.access_token;
+            c.refresh_token = Some(tokens.refresh_token);
+            c.expires_at_ms = Some(tokens.expires_at_ms);
+            c.clone()
+        };
+        self.persist_credential(&snapshot);
+    }
+}
+
+/// True when `expires_at_ms` is missing or within 60 seconds of `now_ms`.
+/// Missing expiry treated as "needs refresh" so a legacy persisted row with
+/// stale state forces one round-trip rather than gambling on a dead token.
+fn needs_refresh(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
+    match expires_at_ms {
+        None => true,
+        Some(exp) => exp <= now_ms + 60_000,
+    }
 }
 
 // ── LeaseHandle ───────────────────────────────────────────────────────────
@@ -1332,6 +1675,10 @@ struct PersistedRow {
     last_error_message: Option<String>,
     last_error_reset_at_ms: Option<i64>,
     removed_at_ms: Option<i64>,
+    auth_type: AuthType,
+    expires_at_ms: Option<i64>,
+    base_url: Option<String>,
+    extra_json: Option<String>,
 }
 
 fn reconcile_or_new(
@@ -1366,6 +1713,15 @@ fn reconcile_or_new(
             last_error_message: row.last_error_message.clone(),
             last_error_reset_at_ms: row.last_error_reset_at_ms,
             removed_at_ms: row.removed_at_ms,
+            auth_type: row.auth_type,
+            // Refresh tokens never round-trip through the seed path —
+            // OAuth credentials seed via the credential-source discoverers
+            // which carry refresh_token explicitly, not through fingerprint
+            // reconciliation.
+            refresh_token: None,
+            expires_at_ms: row.expires_at_ms,
+            base_url: row.base_url.clone(),
+            extra_json: row.extra_json.clone(),
         }
     } else {
         PooledCredential {
@@ -1383,18 +1739,97 @@ fn reconcile_or_new(
             last_error_message: None,
             last_error_reset_at_ms: None,
             removed_at_ms: None,
+            auth_type: AuthType::ApiKey,
+            refresh_token: None,
+            expires_at_ms: None,
+            base_url: None,
+            extra_json: None,
+        }
+    }
+}
+
+/// OAuth/custom-endpoint variant of [`reconcile_or_new`]. Preserves persisted
+/// state (use_count, cooldown, suppression) but always refreshes
+/// `key` / `refresh_token` / `expires_at_ms` / `base_url` / `extra_json` from
+/// the live discovery payload — those secrets aren't persisted to DB.
+fn reconcile_or_new_oauth(
+    persisted: &HashMap<String, PersistedRow>,
+    fingerprint: String,
+    disc: crate::llm::credential_sources::DiscoveredCredential,
+    source: CredentialSource,
+    auth_type: AuthType,
+    priority: u32,
+    now_ms: i64,
+) -> PooledCredential {
+    if let Some(row) = persisted.get(&fingerprint) {
+        PooledCredential {
+            id: row.id.clone(),
+            label: row.label.clone(),
+            priority,
+            source: serde_json::from_str(&row.source_json).unwrap_or(source),
+            key: if row.removed_at_ms.is_some() {
+                String::new()
+            } else {
+                disc.access_token
+            },
+            fingerprint,
+            use_count: row.use_count,
+            last_status: CredentialStatus::from_db(&row.last_status),
+            last_status_at_ms: row.last_status_at_ms,
+            last_error_code: row.last_error_code,
+            last_error_reason: row.last_error_reason.clone(),
+            last_error_message: row.last_error_message.clone(),
+            last_error_reset_at_ms: row.last_error_reset_at_ms,
+            removed_at_ms: row.removed_at_ms,
+            auth_type,
+            refresh_token: if row.removed_at_ms.is_some() {
+                None
+            } else {
+                disc.refresh_token
+            },
+            expires_at_ms: disc.expires_at_ms.or(row.expires_at_ms),
+            base_url: disc.base_url.or_else(|| row.base_url.clone()),
+            extra_json: disc.extra_json.or_else(|| row.extra_json.clone()),
+        }
+    } else {
+        PooledCredential {
+            id: random_id(),
+            label: disc.label,
+            priority,
+            source,
+            key: disc.access_token,
+            fingerprint,
+            use_count: 0,
+            last_status: CredentialStatus::Ok,
+            last_status_at_ms: Some(now_ms),
+            last_error_code: None,
+            last_error_reason: None,
+            last_error_message: None,
+            last_error_reset_at_ms: None,
+            removed_at_ms: None,
+            auth_type,
+            refresh_token: disc.refresh_token,
+            expires_at_ms: disc.expires_at_ms,
+            base_url: disc.base_url,
+            extra_json: disc.extra_json,
         }
     }
 }
 
 fn upsert_row(conn: &rusqlite::Connection, provider: &str, c: &PooledCredential) -> Result<()> {
     let source_json = serde_json::to_string(&c.source).context("serialize source")?;
+    let auth_type_db = match c.auth_type {
+        AuthType::ApiKey => "api_key",
+        AuthType::OAuth => "oauth",
+    };
     conn.execute(
         "INSERT INTO credential_pool
              (provider, fingerprint, id, label, priority, source_json, use_count,
               last_status, last_status_at_ms, last_error_code, last_error_reason,
-              last_error_message, last_error_reset_at_ms, removed_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+              last_error_message, last_error_reset_at_ms, removed_at_ms,
+              auth_type, expires_at_ms, base_url, extra_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18)
          ON CONFLICT(provider, fingerprint) DO UPDATE SET
              id = excluded.id,
              label = excluded.label,
@@ -1407,7 +1842,11 @@ fn upsert_row(conn: &rusqlite::Connection, provider: &str, c: &PooledCredential)
              last_error_reason = excluded.last_error_reason,
              last_error_message = excluded.last_error_message,
              last_error_reset_at_ms = excluded.last_error_reset_at_ms,
-             removed_at_ms = excluded.removed_at_ms",
+             removed_at_ms = excluded.removed_at_ms,
+             auth_type = excluded.auth_type,
+             expires_at_ms = excluded.expires_at_ms,
+             base_url = excluded.base_url,
+             extra_json = excluded.extra_json",
         params![
             provider,
             c.fingerprint,
@@ -1423,6 +1862,10 @@ fn upsert_row(conn: &rusqlite::Connection, provider: &str, c: &PooledCredential)
             c.last_error_message,
             c.last_error_reset_at_ms,
             c.removed_at_ms,
+            auth_type_db,
+            c.expires_at_ms,
+            c.base_url,
+            c.extra_json,
         ],
     )?;
     Ok(())
@@ -1537,6 +1980,7 @@ pub fn pool_load_config_for_provider(
         max_concurrent_per_credential,
         config_entries,
         env_vars,
+        oauth_home: None,
     }
 }
 
@@ -1653,6 +2097,7 @@ mod tests {
             max_concurrent_per_credential: 1,
             config_entries: entries,
             env_vars: vec![],
+            oauth_home: None,
         }
     }
 
@@ -1671,6 +2116,7 @@ mod tests {
                 max_concurrent_per_credential: 1,
                 config_entries: vec![],
                 env_vars: vec!["BORG_TEST_NEVER_SET_XYZ".into()],
+                oauth_home: None,
             },
         )
         .unwrap();
@@ -2207,6 +2653,140 @@ mod tests {
         assert!(pool.acquire_lease(Some("bogus")).is_none());
     }
 
+    #[test]
+    fn credential_source_round_trips_every_variant_through_serde() {
+        // Schema contract: every CredentialSource variant must serialize and
+        // deserialize losslessly through the same `source_json` column used by
+        // `upsert_row` and the `load` SELECT. A typo in `#[serde(rename)]` for
+        // any new variant would silently rewrite the persistence format,
+        // stranding existing rows.
+        let cases = vec![
+            CredentialSource::Manual,
+            CredentialSource::Env {
+                var: "OPENROUTER_API_KEY".into(),
+            },
+            CredentialSource::Config {
+                name: "llm.api_keys[0]".into(),
+            },
+            CredentialSource::OAuth {
+                name: "claude_code".into(),
+            },
+            CredentialSource::Custom {
+                name: "local-vllm".into(),
+                base_url: "http://127.0.0.1:8000".into(),
+            },
+        ];
+        for src in cases {
+            let s = serde_json::to_string(&src).expect("serialize");
+            let back: CredentialSource = serde_json::from_str(&s).expect("deserialize");
+            assert_eq!(back, src, "round-trip failed for {src:?}: {s}");
+        }
+    }
+
+    #[test]
+    fn credential_pool_table_has_phase_one_columns() {
+        // Migration contract: a fresh DB must expose the five new columns added
+        // for OAuth + custom-endpoint parity. Catches the case where someone
+        // adds a Rust field but forgets the SQL — load would then fail at
+        // SELECT-time and silently fall through to the legacy rotation path.
+        let (db, _path, _g) = open_test_db();
+        let conn = db.conn();
+        let mut stmt = conn.prepare("PRAGMA table_info(credential_pool)").unwrap();
+        let cols: HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for expected in [
+            "auth_type",
+            "expires_at_ms",
+            "base_url",
+            "extra_json",
+            // sanity-check one preexisting column to confirm the PRAGMA path
+            // actually returned schema and not an empty set.
+            "fingerprint",
+        ] {
+            assert!(
+                cols.contains(expected),
+                "missing column `{expected}` in credential_pool: have {cols:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_concurrent_cap_round_trips_through_config_and_clamps() {
+        // The cap must be read from PoolLoadConfig (not hard-coded) and the
+        // `.max(1)` clamp at load time keeps cap=0 from bricking the pool —
+        // every available credential would otherwise be over-cap forever.
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1")]);
+        cfg.max_concurrent_per_credential = 5;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        assert_eq!(pool.max_concurrent_per_credential(), 5);
+
+        let (db2, path2, _g2) = open_test_db();
+        let mut cfg2 = cfg_with(&[("a", "k1")]);
+        cfg2.max_concurrent_per_credential = 0;
+        let pool2 = CredentialPool::load(&db2, &path2, Provider::OpenRouter, cfg2).unwrap();
+        assert_eq!(
+            pool2.max_concurrent_per_credential(),
+            1,
+            "cap=0 must clamp to 1"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_cap_allows_multiple_leases_per_key_when_under_cap() {
+        // cap=2 + single key: two concurrent leases must both succeed against
+        // the same id (cap-aware path stays in the below_cap branch). If the
+        // cap were silently 1, the second lease would still succeed via the
+        // graceful-degradation fallback — but a third lease would not be
+        // distinguishable. So we also verify the per-key counter decrements
+        // on drop by re-leasing after one drop.
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1")]);
+        cfg.max_concurrent_per_credential = 2;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let l1 = pool.acquire_lease(None).unwrap();
+        let l2 = pool.acquire_lease(None).unwrap();
+        assert_eq!(l1.id(), l2.id(), "single key — both leases land on it");
+        let id1 = l1.id().to_string();
+        drop(l1);
+        let l3 = pool.acquire_lease(None).unwrap();
+        assert_eq!(l3.id(), id1, "post-drop lease re-uses the same key");
+    }
+
+    #[test]
+    fn max_concurrent_cap_distributes_across_keys_under_cap() {
+        // cap=2 + two keys: first two leases must land on *different* keys.
+        // The tiebreak `(active_leases, priority)` prefers the unleased key
+        // over re-leasing the first even though both are below cap. Four
+        // leases distribute evenly (2 per key). If anyone breaks the
+        // below-cap preference, the first key gets all leases.
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1"), ("b", "k2")]);
+        cfg.max_concurrent_per_credential = 2;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let l1 = pool.acquire_lease(None).unwrap();
+        let l2 = pool.acquire_lease(None).unwrap();
+        assert_ne!(
+            l1.id(),
+            l2.id(),
+            "below-cap preference must spread before doubling up"
+        );
+        let l3 = pool.acquire_lease(None).unwrap();
+        let l4 = pool.acquire_lease(None).unwrap();
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for id in [l1.id(), l2.id(), l3.id(), l4.id()] {
+            *counts.entry(id.to_string()).or_insert(0) += 1;
+        }
+        assert_eq!(counts.len(), 2, "both keys leased");
+        assert!(
+            counts.values().all(|&n| n == 2),
+            "even distribution under cap: got {counts:?}"
+        );
+    }
+
     // ── A10. add_entry / remove_index / resolve_target ──
 
     #[test]
@@ -2548,6 +3128,332 @@ mod tests {
         assert!(
             !parent_dbg.contains("supersecret-key-do-not-log"),
             "CredentialPool Debug must not leak key transitively"
+        );
+    }
+
+    // ── OAuth source seeding ──
+
+    fn oauth_cfg(home: &std::path::Path) -> PoolLoadConfig {
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            max_concurrent_per_credential: 1,
+            config_entries: vec![],
+            env_vars: vec![],
+            oauth_home: Some(home.to_path_buf()),
+        }
+    }
+
+    #[test]
+    fn load_seeds_claude_code_oauth_from_disk() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-abc","refreshToken":"sk-ant-ort-xyz","expiresAt":9999999999000,"subscriptionType":"pro","emailAddress":"alice@example.com"}}"#,
+        )
+        .unwrap();
+
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        let entries = pool.entries();
+        assert_eq!(entries.len(), 1, "one OAuth credential seeded");
+        let c = &entries[0];
+        assert_eq!(c.key, "sk-ant-oat-abc");
+        assert_eq!(c.refresh_token.as_deref(), Some("sk-ant-ort-xyz"));
+        assert_eq!(c.expires_at_ms, Some(9999999999000));
+        assert!(matches!(c.auth_type, AuthType::OAuth));
+        assert!(matches!(
+            c.source,
+            CredentialSource::OAuth { ref name } if name == "claude_code"
+        ));
+    }
+
+    #[test]
+    fn malformed_oauth_file_does_not_crash_load() {
+        // Parser error must log + continue — never panic the daemon's startup
+        // path because a single source file is corrupt.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            "not json {{ at all",
+        )
+        .unwrap();
+
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        assert!(pool.entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_refreshing_renews_expired_oauth_token() {
+        // Expired OAuth credential → refresh fires → access_token rotated,
+        // refresh_token rotated, expires_at_ms moved forward.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"access_token":"refreshed-access","refresh_token":"refreshed-r","expires_in":3600}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        // expiresAt in the past — forces refresh on next lease.
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh","expiresAt":1}}"#,
+        )
+        .unwrap();
+
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+
+        let lease = pool.acquire_lease_refreshing(None).await.unwrap();
+        let cred = lease.credential().unwrap();
+        assert_eq!(cred.key, "refreshed-access", "access token rotated");
+        assert_eq!(
+            cred.refresh_token.as_deref(),
+            Some("refreshed-r"),
+            "refresh token rotated"
+        );
+        assert!(
+            cred.expires_at_ms.unwrap() > pool.clock.now_ms(),
+            "expiry pushed into the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_lease_refreshing_skips_when_token_still_valid() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0) // must NOT be called
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"still-good","refreshToken":"r","expiresAt":9999999999000}}"#,
+        )
+        .unwrap();
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+
+        let lease = pool.acquire_lease_refreshing(None).await.unwrap();
+        assert_eq!(lease.credential().unwrap().key, "still-good");
+        // wiremock's `expect(0)` validates on drop.
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_cools_credential_without_removing_it() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}"#,
+        )
+        .unwrap();
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+
+        let _lease = pool.acquire_lease_refreshing(None).await.unwrap();
+        let entries = pool.entries();
+        assert!(!entries[0].is_removed(), "transient refresh failure is not a tombstone");
+        assert!(
+            entries[0].last_error_reset_at_ms.is_some(),
+            "cooldown set so retries are spaced"
+        );
+        assert_eq!(
+            entries[0].last_error_message.as_deref(),
+            Some("oauth_refresh_failed"),
+            "error message tags the cooldown as a refresh failure, distinguishing it from a true 429"
+        );
+    }
+
+    #[test]
+    fn may_recover_within_returns_true_for_imminent_cooldown_expiry() {
+        // Single key, 60s cooldown → may_recover_within(5min) is true,
+        // may_recover_within(30s) is false.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(60)),
+            None,
+        );
+        assert!(
+            pool.may_recover_within(Duration::from_secs(300)),
+            "60s cooldown is within 5min recovery window"
+        );
+        assert!(
+            !pool.may_recover_within(Duration::from_secs(30)),
+            "60s cooldown is outside 30s recovery window"
+        );
+    }
+
+    #[test]
+    fn may_recover_within_false_for_tombstoned_pool() {
+        // Auth failure permanently tombstones — no recovery possible, so
+        // fallback must engage.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::Auth, Some(401), None, None);
+        assert!(
+            !pool.may_recover_within(Duration::from_secs(3600)),
+            "tombstoned credential never recovers, no matter how long the window"
+        );
+    }
+
+    #[test]
+    fn may_recover_within_false_for_long_cooldown_beyond_horizon() {
+        // 2-hour Retry-After exceeds the 5-min recovery window → fallback fires.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(7200)),
+            None,
+        );
+        assert!(
+            !pool.may_recover_within(Duration::from_secs(300)),
+            "long cooldown beyond horizon → fallback should fire"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_treats_missing_expiry_as_stale() {
+        // Belt-and-suspenders: a legacy OAuth row with no expires_at_ms
+        // forces one refresh roundtrip rather than gambling on a dead token.
+        assert!(needs_refresh(None, 1_000_000));
+        // Within the 60s skew window → refresh.
+        assert!(needs_refresh(Some(1_000_000 + 30_000), 1_000_000));
+        // Outside the skew window → no refresh.
+        assert!(!needs_refresh(Some(1_000_000 + 120_000), 1_000_000));
+    }
+
+    #[test]
+    fn oauth_seeded_credential_round_trips_through_persistence() {
+        // Use-count and cooldown state from a prior run must survive a reload
+        // even though the refresh_token is re-supplied by the discoverer (not
+        // persisted to DB).
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok-1","refreshToken":"ref-1","expiresAt":1234567890000}}"#,
+        )
+        .unwrap();
+        let (db, path, _g) = open_test_db();
+        {
+            let pool = CredentialPool::load(
+                &db,
+                &path,
+                Provider::ClaudeCodeOAuth,
+                oauth_cfg(home.path()),
+            )
+            .unwrap();
+            let cred = pool.pick().unwrap();
+            pool.report_failure(
+                &cred.id,
+                FailoverReason::RateLimit,
+                None,
+                Some(Duration::from_secs(60)),
+                None,
+            );
+        }
+        let pool2 = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        let entries = pool2.entries();
+        assert_eq!(entries.len(), 1);
+        let c = &entries[0];
+        assert_eq!(c.refresh_token.as_deref(), Some("ref-1"), "refresh re-seeded from disk");
+        assert!(
+            c.last_error_reset_at_ms.is_some(),
+            "cooldown state survived reload"
         );
     }
 }

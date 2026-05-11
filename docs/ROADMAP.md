@@ -373,11 +373,6 @@ top-down by priority, not by section order.
   everything else stripped. Prevents accidental leak of
   `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` etc. into shell tool
   output that gets logged or echoed back.
-- **URL safety classifier + per-site policy.** `[H]` Pre-flight
-  URL classification (malware, phishing, allowlist/denylist) before any
-  `web_fetch` or `browser` navigation, plus a per-site policy file
-  (throttle, block, transform). Real defense surface — these tools
-  today have no per-URL gating. Pairs with prompt-injection defense.
 - **Output redaction toggle.** `[H]` Programmatic redaction of
   secrets and PII in agent output (channel deliveries, logs, transcript)
   with an operator toggle and an audit log of what was redacted. Borg

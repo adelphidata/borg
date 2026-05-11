@@ -1490,6 +1490,21 @@ impl DaemonClient {
             .cleared)
     }
 
+    /// Pair an OAuth credential. Runs the discoverer for `kind` against the
+    /// daemon's home directory and seeds whatever it finds. Returns one entry
+    /// per detected account (empty if the on-disk store is missing).
+    pub async fn pair_credential(&mut self, kind: &str) -> Result<Vec<CredentialEntry>> {
+        Ok(self
+            .admin
+            .pair_credential(protocols::admin::PairCredentialRequest {
+                kind: kind.to_string(),
+            })
+            .await
+            .context("Admin.PairCredential failed")?
+            .into_inner()
+            .entries)
+    }
+
     /// Change the selection strategy.
     pub async fn set_credential_strategy(&mut self, provider: &str, strategy: &str) -> Result<()> {
         self.admin

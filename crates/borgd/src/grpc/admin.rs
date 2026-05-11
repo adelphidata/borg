@@ -27,7 +27,8 @@ use protocols::admin::{
     ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
     ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SetCredentialStrategyRequest, SettingEntry, SettingKey, SettingMutation,
+    PairCredentialRequest, PairCredentialResponse, SessionSummary, SetCredentialStrategyRequest,
+    SettingEntry, SettingKey, SettingMutation,
     SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use std::pin::Pin;
@@ -1473,6 +1474,88 @@ impl Admin for AdminSvc {
         Ok(Response::new(ResetCredentialsResponse { cleared }))
     }
 
+    async fn pair_credential(
+        &self,
+        req: Request<PairCredentialRequest>,
+    ) -> Result<Response<PairCredentialResponse>, TStatus> {
+        let kind = req.into_inner().kind.trim().to_ascii_lowercase();
+        if kind.is_empty() {
+            return Err(TStatus::invalid_argument("kind must not be empty"));
+        }
+        let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CredentialEntry>> {
+            use cortex::llm::credential_pool::{
+                pool_load_config_for_provider, CredentialPool, PoolLoadConfig,
+            };
+            use anyhow::Context;
+            use cortex::llm::credential_sources::discoverers_for;
+            use cortex::provider::Provider;
+
+            let provider = match kind.as_str() {
+                "claude_code" | "claude-code" => Provider::ClaudeCodeOAuth,
+                "codex" => Provider::CodexOAuth,
+                "copilot" => Provider::CopilotOAuth,
+                "qwen_cli" | "qwen-cli" | "qwen" => Provider::Custom,
+                other => {
+                    anyhow::bail!(
+                        "unknown OAuth kind `{other}` — try claude_code | codex | copilot | qwen"
+                    );
+                }
+            };
+
+            let db = Database::open()?;
+            let db_path = cortex::config::Config::db_path()?;
+            let config = cortex::config::Config::load_from_db()?;
+
+            // Build a load config pointing at this OAuth provider — note this
+            // bypasses `config.llm.provider`, since pairing seeds the pool
+            // regardless of whether the operator has switched their primary
+            // to that flavor yet. Discovery resolves $HOME from the daemon's
+            // process env, which is the operator's account.
+            let mut load_cfg: PoolLoadConfig = pool_load_config_for_provider(
+                provider,
+                config.llm.credential_strategy,
+                config.llm.credential_cooldown_secs,
+                config.llm.max_concurrent_per_credential,
+                vec![],
+            );
+            load_cfg.env_vars.clear();
+            let pool = CredentialPool::load(&db, &db_path, provider, load_cfg)?;
+
+            let mut out = Vec::new();
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME for OAuth discovery"))?;
+            for d in discoverers_for(provider) {
+                if d.name() != kind && d.name() != kind.replace('-', "_") {
+                    continue;
+                }
+                let discovered = d
+                    .discover(&home)
+                    .with_context(|| format!("running discoverer `{}`", d.name()))?;
+                for disc in discovered {
+                    let source = match provider {
+                        Provider::Custom => {
+                            cortex::llm::credential_pool::CredentialSource::Custom {
+                                name: d.name().to_string(),
+                                base_url: disc.base_url.clone().unwrap_or_default(),
+                            }
+                        }
+                        _ => cortex::llm::credential_pool::CredentialSource::OAuth {
+                            name: d.name().to_string(),
+                        },
+                    };
+                    let cred = pool.add_entry(disc.access_token, disc.label, source);
+                    out.push(pooled_to_proto(pool.provider_str(), &cred));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("pair_credential task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("pair_credential: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
+        Ok(Response::new(PairCredentialResponse { entries }))
+    }
+
     async fn set_credential_strategy(
         &self,
         req: Request<SetCredentialStrategyRequest>,
@@ -1701,6 +1784,10 @@ fn pooled_to_proto(
         cortex::llm::credential_pool::CredentialSource::Manual => ("manual", String::new()),
         cortex::llm::credential_pool::CredentialSource::Env { var } => ("env", var.clone()),
         cortex::llm::credential_pool::CredentialSource::Config { name } => ("config", name.clone()),
+        cortex::llm::credential_pool::CredentialSource::OAuth { name } => ("oauth", name.clone()),
+        cortex::llm::credential_pool::CredentialSource::Custom { name, .. } => {
+            ("custom", name.clone())
+        }
     };
     let status = if c.is_removed() {
         "removed"

@@ -7,6 +7,10 @@ use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue};
 
 /// Supported LLM providers.
+///
+/// The four OAuth/Custom variants below stay unit-shaped so `Provider` remains
+/// `Copy`. Per-credential overrides (the `base_url` for `Custom`, the OAuth
+/// account label) live on the `PooledCredential` row, not on the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     OpenRouter,
@@ -18,6 +22,18 @@ pub enum Provider {
     Ollama,
     /// Claude Code CLI — uses the user's Claude subscription via subprocess.
     ClaudeCli,
+    /// Anthropic API with a Claude Code OAuth access token (Bearer auth).
+    /// Same wire format as `Anthropic`, swapped auth header.
+    ClaudeCodeOAuth,
+    /// OpenAI ChatGPT-Codex OAuth — OpenAI wire format with Bearer auth from
+    /// the Codex CLI's stored token.
+    CodexOAuth,
+    /// GitHub Copilot — OpenAI-compatible wire format with the Copilot
+    /// integration headers attached. Token sourced from `gh auth token`.
+    CopilotOAuth,
+    /// User-defined OpenAI-compatible endpoint. `base_url()` returns "" — the
+    /// concrete URL is read from `PooledCredential.base_url` at request time.
+    Custom,
 }
 
 impl Provider {
@@ -34,6 +50,13 @@ impl Provider {
             Provider::Groq => "https://api.groq.com/openai/v1/chat/completions",
             Provider::Ollama => "http://localhost:11434/v1/chat/completions",
             Provider::ClaudeCli => "", // Not used — communicates via subprocess
+            // OAuth flavors hit the same wire endpoints as their API-key
+            // counterparts; only the auth header changes.
+            Provider::ClaudeCodeOAuth => "https://api.anthropic.com/v1/messages",
+            Provider::CodexOAuth => "https://api.openai.com/v1/chat/completions",
+            Provider::CopilotOAuth => "https://api.githubcopilot.com/chat/completions",
+            // Custom resolves base_url from the lease at request time.
+            Provider::Custom => "",
         }
     }
 
@@ -48,6 +71,12 @@ impl Provider {
             Provider::Groq => "GROQ_API_KEY",
             Provider::Ollama => "OLLAMA_HOST",
             Provider::ClaudeCli => "CLAUDE_CLI_PATH", // Optional override for claude binary path
+            // OAuth + Custom credentials seed via on-disk discoverers, not
+            // env vars. Empty here disables the env-seed code path.
+            Provider::ClaudeCodeOAuth
+            | Provider::CodexOAuth
+            | Provider::CopilotOAuth
+            | Provider::Custom => "",
         }
     }
 
@@ -58,10 +87,18 @@ impl Provider {
 
     /// Whether this provider uses the OpenAI-compatible chat completions format.
     pub fn is_openai_compatible(&self) -> bool {
-        !matches!(self, Provider::Anthropic | Provider::ClaudeCli)
+        !matches!(
+            self,
+            Provider::Anthropic | Provider::ClaudeCli | Provider::ClaudeCodeOAuth
+        )
     }
 
     /// Build provider-specific HTTP headers.
+    ///
+    /// `api_key` is the bearer-shaped secret: a raw API key for `ApiKey`
+    /// credentials, or the current OAuth access token for OAuth credentials
+    /// (the caller pulls it from the lease — `Provider` doesn't need to know
+    /// the auth_type, only which header to set).
     pub fn build_headers(&self, api_key: &str) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
@@ -93,6 +130,40 @@ impl Provider {
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("Authorization", val);
             }
+            Provider::ClaudeCodeOAuth => {
+                // Anthropic wire format, but auth is OAuth Bearer (not x-api-key).
+                let bearer = format!("Bearer {api_key}");
+                let val = HeaderValue::from_str(&bearer)
+                    .context("Access token contains invalid characters for HTTP headers")?;
+                headers.insert("Authorization", val);
+                headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+                // Claude Code OAuth tokens are scoped via the
+                // `anthropic-beta: oauth-2025-04-20` header.
+                headers.insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static("oauth-2025-04-20"),
+                );
+            }
+            Provider::CodexOAuth | Provider::Custom => {
+                let bearer = format!("Bearer {api_key}");
+                let val = HeaderValue::from_str(&bearer)
+                    .context("Access token contains invalid characters for HTTP headers")?;
+                headers.insert("Authorization", val);
+            }
+            Provider::CopilotOAuth => {
+                // GitHub Copilot's chat endpoint requires both the OAuth bearer
+                // and an integration-id header. Editor-version is technically
+                // optional but Copilot warns when it's missing.
+                let bearer = format!("Bearer {api_key}");
+                let val = HeaderValue::from_str(&bearer)
+                    .context("Access token contains invalid characters for HTTP headers")?;
+                headers.insert("Authorization", val);
+                headers.insert(
+                    "Copilot-Integration-Id",
+                    HeaderValue::from_static("vscode-chat"),
+                );
+                headers.insert("Editor-Version", HeaderValue::from_static("Borg/1.0"));
+            }
         }
 
         Ok(headers)
@@ -115,6 +186,17 @@ impl Provider {
                 .strip_prefix("claude-cli/")
                 .unwrap_or(model)
                 .to_string(),
+            // OAuth flavors normalize like their API-key counterparts.
+            Provider::ClaudeCodeOAuth => model
+                .strip_prefix("anthropic/")
+                .unwrap_or(model)
+                .to_string(),
+            Provider::CodexOAuth => model.strip_prefix("openai/").unwrap_or(model).to_string(),
+            Provider::CopilotOAuth => model
+                .strip_prefix("copilot/")
+                .unwrap_or(model)
+                .to_string(),
+            Provider::Custom => model.to_string(),
         }
     }
 
@@ -173,6 +255,20 @@ impl Provider {
             }
             // Claude CLI: same as Anthropic — all Claude 3+ models support vision
             Provider::ClaudeCli => !m.contains("claude-2") && !m.contains("claude-instant"),
+            // OAuth flavors: same vision rules as their API-key counterparts.
+            Provider::ClaudeCodeOAuth => !m.contains("claude-2") && !m.contains("claude-instant"),
+            Provider::CodexOAuth => {
+                !m.contains("gpt-3.5")
+                    && !m.contains("davinci")
+                    && !m.contains("babbage")
+                    && !m.contains("ada")
+                    && !m.contains("whisper")
+                    && !m.contains("tts")
+                    && !m.contains("dall-e")
+                    && !m.contains("embedding")
+            }
+            Provider::CopilotOAuth => true,
+            Provider::Custom => true, // operator-driven; let the endpoint reject if unsupported
         }
     }
 
@@ -187,6 +283,10 @@ impl Provider {
             Provider::Groq => "groq",
             Provider::Ollama => "ollama",
             Provider::ClaudeCli => "claude-cli",
+            Provider::ClaudeCodeOAuth => "claude-code-oauth",
+            Provider::CodexOAuth => "codex-oauth",
+            Provider::CopilotOAuth => "copilot-oauth",
+            Provider::Custom => "custom",
         }
     }
 
@@ -246,8 +346,14 @@ impl FromStr for Provider {
             "groq" => Ok(Provider::Groq),
             "ollama" => Ok(Provider::Ollama),
             "claude-cli" | "claudecli" | "claude_cli" => Ok(Provider::ClaudeCli),
+            "claude-code-oauth" | "claude_code_oauth" | "claudecodeoauth" => {
+                Ok(Provider::ClaudeCodeOAuth)
+            }
+            "codex-oauth" | "codex_oauth" | "codexoauth" => Ok(Provider::CodexOAuth),
+            "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
+            "custom" => Ok(Provider::Custom),
             _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, gemini, deepseek, groq, ollama, claude-cli")
+                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, gemini, deepseek, groq, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
             }
         }
     }
@@ -268,12 +374,71 @@ mod tests {
             Provider::Groq,
             Provider::Ollama,
             Provider::ClaudeCli,
+            Provider::ClaudeCodeOAuth,
+            Provider::CodexOAuth,
+            Provider::CopilotOAuth,
+            Provider::Custom,
         ];
         for provider in &all {
             let s = provider.as_str();
             let parsed = Provider::from_str(s).unwrap();
             assert_eq!(parsed, *provider);
         }
+    }
+
+    #[test]
+    fn oauth_variants_use_bearer_not_x_api_key() {
+        // Claude Code OAuth wraps the Anthropic wire format but swaps
+        // `x-api-key` for `Authorization: Bearer <access_token>`. If anyone
+        // copy-pastes the Anthropic branch and forgets to flip the auth
+        // header, the upstream rejects with 401 — caught here.
+        let headers = Provider::ClaudeCodeOAuth.build_headers("oauth_at_xyz").unwrap();
+        assert!(
+            headers.get("x-api-key").is_none(),
+            "OAuth must not send x-api-key"
+        );
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer oauth_at_xyz"
+        );
+        assert!(headers.get("anthropic-version").is_some());
+
+        let headers = Provider::CodexOAuth.build_headers("oauth_at_abc").unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer oauth_at_abc"
+        );
+
+        let headers = Provider::CopilotOAuth.build_headers("gho_xyz").unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer gho_xyz"
+        );
+        assert!(headers.get("Copilot-Integration-Id").is_some());
+    }
+
+    #[test]
+    fn custom_provider_uses_bearer_and_empty_static_base_url() {
+        // Custom resolves base_url from the lease at request time; the static
+        // base_url() is empty so a caller that forgets to consult the lease
+        // hits an obvious "" URL parse error instead of a wrong-host request.
+        assert_eq!(Provider::Custom.base_url(), "");
+        let headers = Provider::Custom.build_headers("sk-local-vllm").unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer sk-local-vllm"
+        );
+    }
+
+    #[test]
+    fn claude_code_oauth_is_not_openai_compatible() {
+        // It uses the Anthropic /v1/messages wire format. Misclassifying it
+        // would route requests through the OpenAI chat-completions path and
+        // produce malformed payloads.
+        assert!(!Provider::ClaudeCodeOAuth.is_openai_compatible());
+        assert!(Provider::CodexOAuth.is_openai_compatible());
+        assert!(Provider::CopilotOAuth.is_openai_compatible());
+        assert!(Provider::Custom.is_openai_compatible());
     }
 
     #[test]

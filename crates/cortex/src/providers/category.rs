@@ -53,8 +53,15 @@ impl From<Provider> for ProviderCategory {
             | Provider::Anthropic
             | Provider::Gemini
             | Provider::DeepSeek
-            | Provider::Groq => ProviderCategory::PublicCloud,
+            | Provider::Groq
+            // OAuth flavors hit the same public clouds; same air-gap rules apply.
+            | Provider::ClaudeCodeOAuth
+            | Provider::CodexOAuth
+            | Provider::CopilotOAuth => ProviderCategory::PublicCloud,
             Provider::Ollama | Provider::ClaudeCli => ProviderCategory::Local,
+            // Custom is the BYO escape hatch — air-gap policy is enforced on
+            // the resolved address (loopback/RFC1918 OK), not compile-time.
+            Provider::Custom => ProviderCategory::BYOEndpoint,
         }
     }
 }

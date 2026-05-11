@@ -98,6 +98,8 @@ mod anthropic;
 pub mod aux_model_picker;
 mod cost;
 pub mod credential_pool;
+pub mod credential_sources;
+pub mod oauth_refresh;
 mod pricing;
 
 pub(crate) use anthropic::normalize_cache_tokens;
@@ -987,7 +989,7 @@ impl LlmClient {
                 // can fan out across keys (max_concurrent_per_credential
                 // governs the cap).
                 let lease_id: Option<String> = if let Some(pool) = self.primary_pool.clone() {
-                    if let Some(lease) = pool.acquire_lease(None) {
+                    if let Some(lease) = pool.acquire_lease_refreshing(None).await {
                         if let Some(k) = lease.key() {
                             self.api_key = k;
                         }
@@ -1091,7 +1093,22 @@ impl LlmClient {
                             // user-fixable, and pointlessly burning the whole
                             // fallback chain just delays the real error.
                             self.record_provider_failure(e.reason());
-                            if e.should_fallback() && self.try_failover_provider() {
+                            // Defer fallback when the primary pool will
+                            // recover soon — jumping providers while a
+                            // sibling key is about to cool off burns budget
+                            // on the degraded fallback for no reason.
+                            let defer_fallback = matches!(
+                                e.reason(),
+                                FailoverReason::RateLimit | FailoverReason::Billing
+                            ) && self
+                                .primary_pool
+                                .as_ref()
+                                .map(|p| p.may_recover_within(Duration::from_secs(300)))
+                                .unwrap_or(false);
+                            if !defer_fallback
+                                && e.should_fallback()
+                                && self.try_failover_provider()
+                            {
                                 should_failover = true;
                                 break;
                             }

@@ -200,7 +200,7 @@ One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src
 
 ### LLM Resilience
 
-Three-layer recovery: credential pool (per-provider keys with cooldown TTL + strategy), `llm.fallback` provider chain, and the `llm.aux` background client. The pool replaces FIFO key rotation — per-key cooldown via `Retry-After` (header → body hint → configured default), permanent removal on 401/403, persistence across restart, 402 disambiguation (transient usage-limit vs hard exhaustion). Knobs: `llm.credential_strategy`, `llm.credential_cooldown_secs`, `llm.max_concurrent_per_credential`. State tables: `credential_pool`, `credential_suppressions`. Full surface in `docs/llm-resilience.md`.
+Three-layer recovery: credential pool (per-provider keys with cooldown TTL + strategy), `llm.fallback` provider chain, and the `llm.aux` background client. The pool replaces FIFO key rotation — per-key cooldown via `Retry-After` (header → body hint → configured default), permanent removal on 401/403, persistence across restart, 402 disambiguation (transient usage-limit vs hard exhaustion). OAuth sources (Claude Code, ChatGPT Codex, Copilot, Qwen-CLI) and custom OpenAI-compatible endpoints are first-class credentials in the pool; access tokens auto-refresh, and provider fallback defers while the pool can still recover from a transient rate-limit. Knobs: `llm.credential_strategy`, `llm.credential_cooldown_secs`, `llm.max_concurrent_per_credential`. State tables: `credential_pool`, `credential_suppressions`. Full surface in `docs/llm-resilience.md`.
 
 ### Self-Healing
 

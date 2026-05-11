@@ -123,6 +123,45 @@ operators can:
 | `llm.credential_cooldown_secs`           | `60`         | Default cooldown when no `Retry-After`. |
 | `llm.max_concurrent_per_credential`      | `1`          | Soft lease cap per credential.          |
 
+### OAuth sources
+
+The pool seeds OAuth-capable credentials from on-disk stores when the
+provider matches. Each source is read at pool-load time and on every
+`borg auth pair <kind>` call.
+
+| Kind          | Provider             | File                              |
+| ------------- | -------------------- | --------------------------------- |
+| `claude_code` | `ClaudeCodeOAuth`    | `~/.claude/.credentials.json`     |
+| `codex`       | `CodexOAuth`         | `~/.codex/auth.json`              |
+| `qwen_cli`    | `Custom` (Qwen)      | `~/.qwen/oauth_creds.json`        |
+| `copilot`     | `CopilotOAuth`       | resolved via `borg auth pair`     |
+
+Expired access tokens are refreshed transparently before each request via
+the per-provider OAuth endpoint (60-second skew window). Refresh failures
+cool the credential for 5min — not removed, since the refresh server may
+be flaky. Concurrent refreshes against the same id are serialized by a
+per-credential async lock so the single-use refresh_token can't be
+double-spent.
+
+### Custom OpenAI-compatible endpoints
+
+`Provider::Custom` credentials carry a per-credential `base_url` that
+overrides the provider's default. Use this for self-hosted vLLM, Ollama-
+compat servers, or any OpenAI wire-format endpoint. Wire via `borg auth
+add --base-url <url> --name <name> <provider>`; the suppression model
+keys on `name`, not `base_url`, so port flips on a self-hosted endpoint
+survive operator removal/re-add.
+
+### Fallback deferral
+
+Before walking the `llm.fallback` chain on a 429/402, the pool is asked
+`may_recover_within(5min)` — true when at least one cooling credential
+will recover within the window. Deferral keeps the request on the
+primary provider so a sibling key gets a chance, rather than burning
+budget on a degraded fallback while the primary is still draining.
+Permanently failed (tombstoned) entries and out-of-window cooldowns
+don't defer — fallback engages as before.
+
 ## Provider failover
 
 When the active provider's pool exhausts (or a non-credential error makes
