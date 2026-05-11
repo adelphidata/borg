@@ -34,12 +34,10 @@ pub use verifier::{PeerCtx, TofuVerifier, Verifier, VerifierError};
 /// over its inputs and exercisable without a Tailscale install.
 ///
 /// **Wiring contract.** This is the single entry point for constructing the
-/// `Arc<dyn Verifier>` that gets passed to `auth_interceptor`. When mTLS is
-/// finally mounted on the daemon's gRPC server (today `daemon.rs` notes
-/// "mTLS not yet wired"), the verifier handed to `auth_interceptor` MUST
-/// come from this factory — calling `TofuVerifier::new` directly bypasses
-/// the `security.verifier` config and silently downgrades the operator's
-/// security choice.
+/// `Arc<dyn Verifier>` that gets passed to `auth_interceptor`. The verifier
+/// handed to `auth_interceptor` MUST come from this factory — calling
+/// `TofuVerifier::new` directly bypasses the `security.verifier` config
+/// and silently downgrades the operator's security choice.
 pub fn build_verifier(
     kind: VerifierKind,
     db: Arc<Mutex<Database>>,

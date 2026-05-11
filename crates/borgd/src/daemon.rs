@@ -1,7 +1,10 @@
 //! Daemon lifecycle: lock acquisition, transport setup, graceful shutdown.
 
 use crate::auth::kek_factory::build_kek_store;
-use crate::auth::{ensure_root_ca, ensure_server_cert, ServerCertMaterial};
+use crate::auth::{
+    auth_interceptor, build_server_tls_config, build_verifier, ensure_root_ca, ensure_server_cert,
+    ServerCertMaterial,
+};
 use crate::cost_events::CostEventBus;
 use crate::grpc;
 use crate::grpc::capability::CapabilityRouter;
@@ -242,7 +245,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         ensure_server_cert(&g, kek.as_ref(), &ca_cert_pem, &ca_key_pem, &san_dns)
             .context("ensure server cert")?
     };
-    let _server_tls_material = ServerCertMaterial {
+    let server_tls_material = ServerCertMaterial {
         server_cert_pem: server_cert_pem.clone(),
         server_key_pem: server_key_pem.clone(),
         ca_cert_pem: ca_cert_pem.clone(),
@@ -324,7 +327,13 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     let uds_stream = UnixListenerStream::new(uds);
 
-    let make_router = || {
+    // UDS router: filesystem permissions (0600) provide isolation; no TLS,
+    // no auth interceptor. CLI on the same machine connects here.
+    //
+    // INVARIANT: every service registered here MUST also be registered on the
+    // TCP router below — adding a service to only one path silently exposes
+    // (or hides) it depending on which transport is active.
+    let make_uds_router = || {
         tonic::transport::Server::builder()
             .add_service(services.status.clone())
             .add_service(services.admin.clone())
@@ -343,15 +352,61 @@ pub async fn run(cfg: Config) -> Result<()> {
         let parsed: std::net::SocketAddr = addr
             .parse()
             .with_context(|| format!("parsing --listen address `{addr}`"))?;
-        tracing::warn!(addr = %parsed, "loopback TCP listener enabled (mTLS not yet wired on this listener)");
+
+        // Resolve verifier kind from config; fails-closed on misconfigured
+        // Tailscale per build_verifier's contract. A DB load failure here
+        // would silently downgrade `security.verifier` to its default, so
+        // surface it instead.
+        let verifier_kind = CoreConfig::load_from_db()
+            .context("load config for TCP listener verifier")?
+            .security
+            .verifier;
+        let verifier = build_verifier(verifier_kind, pki_db.clone(), None)
+            .context("build verifier for TCP listener")?;
+        let tls_cfg = build_server_tls_config(&server_tls_material)
+            .context("build server TLS config for TCP listener")?;
+
+        let interceptor = auth_interceptor(verifier, audit.clone());
+        let tcp_pki = PkiServer::new(PkiSvc::new(
+            pki_db.clone(),
+            audit.clone(),
+            ca_cert_pem.clone(),
+            ca_key_pem.clone(),
+        ));
+        use tonic::service::interceptor::InterceptedService;
+        let tcp_router = tonic::transport::Server::builder()
+            .tls_config(tls_cfg)
+            .context("install TLS config on TCP server")?
+            .add_service(InterceptedService::new(
+                services.status.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.admin.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.session.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.capability.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(
+                services.telemetry.clone(),
+                interceptor.clone(),
+            ))
+            .add_service(InterceptedService::new(tcp_pki, interceptor));
+
+        tracing::info!(addr = %parsed, "TCP listener with mTLS enabled");
 
         let mut uds_rx = shutdown_tx.subscribe();
         let mut tcp_rx = shutdown_tx.subscribe();
-        let serve_uds = make_router().serve_with_incoming_shutdown(uds_stream, async move {
-            // Lagged/Closed both mean "drain now" — only one send(()) ever fires.
+        let serve_uds = make_uds_router().serve_with_incoming_shutdown(uds_stream, async move {
             let _ = uds_rx.recv().await;
         });
-        let serve_tcp = make_router().serve_with_shutdown(parsed, async move {
+        let serve_tcp = tcp_router.serve_with_shutdown(parsed, async move {
             let _ = tcp_rx.recv().await;
         });
 
@@ -360,9 +415,8 @@ pub async fn run(cfg: Config) -> Result<()> {
         tcp_res.context("TCP server")?;
     } else {
         let mut rx = shutdown_tx.subscribe();
-        make_router()
+        make_uds_router()
             .serve_with_incoming_shutdown(uds_stream, async move {
-                // Lagged/Closed both mean "drain now" — only one send(()) ever fires.
                 let _ = rx.recv().await;
             })
             .await

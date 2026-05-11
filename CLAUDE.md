@@ -115,6 +115,17 @@ When the same context lines could match multiple places, anchor the hunk with `@
 +    new_line
 ```
 
+### mTLS — TCP Listener
+
+The daemon's TCP listener (`borgd --listen <addr>`) requires mutual TLS: every connecting client MUST present a CA-signed cert. UDS is plaintext — filesystem permissions (0600 socket) own the isolation there. Two non-negotiables when touching the transport layer:
+
+- `build_server_tls_config` MUST be applied to any `tonic::Server` bound to a network socket. The `auth_interceptor` MUST come from `auth::build_verifier` — never construct `TofuVerifier` inline (silently bypasses `security.verifier`).
+- Clients connect via `daemon_client::connect_tcp`, which loads the three keychain-stashed PEMs (`CLIENT_CERT_KEY_ACCOUNT`, `CLIENT_KEY_KEY_ACCOUNT`, `CA_CERT_ACCOUNT`) and presents them to the server. Missing PEMs surface a "run `borg device pair` first" error rather than a generic TLS failure.
+
+Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreign-CA-cert clients are rejected; paired clients succeed; revoked fingerprints fail at the interceptor with a `grpc_auth_failure` audit row.
+
+**Loopback-only today.** The server cert SAN is `localhost` (`ensure_server_cert` at `daemon.rs`). Connecting to `--listen 0.0.0.0:PORT` from a non-loopback peer will fail SNI verification — exposing borgd beyond loopback needs the operator's hostname added to the SAN before it's usable.
+
 ### Security — Blocked Paths
 
 `[security] blocked_paths` defaults: `.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.env`, `credentials`, `private_key`. Filtered from `fs_read`/`fs_write` and checked in `list_dir`.

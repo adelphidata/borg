@@ -8,12 +8,64 @@
 
 use super::DaemonClient;
 use anyhow::{anyhow, Context, Result};
-use identity::KeychainStore;
+use identity::{KekStore, KeychainStore, PkiError};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
+
+/// Server name validated against the daemon's server cert SAN.
+/// `borgd` mints its server cert with `localhost` in the SAN
+/// (`crates/borgd/src/daemon.rs:237`); changing one side requires changing the
+/// other or the TLS handshake fails with `BadCertificate`.
+const TLS_SERVER_NAME: &str = "localhost";
+
+/// Connect to `borgd` over TCP with mutual TLS. Loads the client cert + key +
+/// CA PEM stashed by `borg device pair` from the OS keychain (or an injected
+/// `KekStore` in tests). Fails fast if any of the three PEMs is missing —
+/// presents a clear "run `borg device pair` first" message rather than a
+/// generic TLS handshake error.
+pub async fn connect_tcp(addr: SocketAddr) -> Result<DaemonClient> {
+    connect_tcp_with_kek(addr, &KeychainStore::new()).await
+}
+
+/// Like [`connect_tcp`] but with a caller-provided `KekStore` — used by the
+/// mTLS handshake e2e suite to inject an in-memory keychain without touching
+/// the user's OS keychain.
+pub async fn connect_tcp_with_kek<K: KekStore>(addr: SocketAddr, kek: &K) -> Result<DaemonClient> {
+    let cert_pem = require_kek_pem(kek, crate::commands::device_pair::CLIENT_CERT_KEY_ACCOUNT)?;
+    let key_pem = require_kek_pem(kek, crate::commands::device_pair::CLIENT_KEY_KEY_ACCOUNT)?;
+    let ca_pem = require_kek_pem(kek, crate::commands::device_pair::CA_CERT_ACCOUNT)?;
+
+    let identity = Identity::from_pem(cert_pem.as_bytes(), key_pem.as_bytes());
+    let ca = Certificate::from_pem(ca_pem.as_bytes());
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca)
+        .identity(identity)
+        .domain_name(TLS_SERVER_NAME);
+
+    let channel = Endpoint::from_shared(format!("https://{addr}"))
+        .context("constructing TCP endpoint")?
+        .tls_config(tls)
+        .context("install client TLS config")?
+        .connect()
+        .await
+        .with_context(|| format!("mTLS connect to borgd at {addr}"))?;
+    Ok(DaemonClient::from_channel(channel))
+}
+
+fn require_kek_pem<K: KekStore>(kek: &K, account: &str) -> Result<String> {
+    match kek.get(account) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .with_context(|| format!("keychain account `{account}` is not utf-8 PEM")),
+        Err(PkiError::NotFound(_)) => Err(anyhow!(
+            "no client cert in keychain (account `{account}` missing) — run `borg device pair` first"
+        )),
+        Err(e) => Err(anyhow!("load `{account}` from keychain: {e}")),
+    }
+}
 
 /// Default UDS path resolution:
 ///
@@ -158,6 +210,29 @@ mod tests {
         assert!(
             msg.contains("nope.sock"),
             "error must name the path; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_errors_clearly_when_no_client_cert_in_keychain() {
+        // Real failure mode: a fresh install (or wiped keychain) attempting
+        // `borg --connect 127.0.0.1:7777` must surface a recoverable error
+        // pointing the user at `borg device pair`, not a low-level TLS
+        // handshake failure that obscures the missing-cert root cause.
+        use identity::MemoryKekStore;
+        let kek = MemoryKekStore::new();
+        let addr: SocketAddr = "127.0.0.1:65535".parse().unwrap();
+        let err = super::connect_tcp_with_kek(addr, &kek)
+            .await
+            .expect_err("must fail with empty keychain");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no client cert"),
+            "error must signal missing cert; got: {msg}"
+        );
+        assert!(
+            msg.contains("borg device pair"),
+            "error must point at the recovery command; got: {msg}"
         );
     }
 
