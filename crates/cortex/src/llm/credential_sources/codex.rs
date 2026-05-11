@@ -16,10 +16,10 @@
 //! }
 //! ```
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::provider::Provider;
 
@@ -27,22 +27,33 @@ use super::{CredentialSource, DiscoveredCredential};
 
 pub struct CodexSource;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CodexAuthFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<Tokens>,
+    /// Round-trip unknown top-level fields verbatim so write-back doesn't drop
+    /// data the upstream CLI writes (e.g. `last_refresh`).
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct Tokens {
     #[serde(default)]
     access_token: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
     /// Codex doesn't write an explicit expires_at; the refresh path computes
     /// it from token TTL. `None` is correct — the refresh path schedules a
     /// probe-refresh when expires_at is missing.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at_ms: Option<i64>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn codex_auth_path(home: &Path) -> PathBuf {
+    home.join(".codex/auth.json")
 }
 
 impl CredentialSource for CodexSource {
@@ -55,10 +66,11 @@ impl CredentialSource for CodexSource {
     }
 
     fn discover(&self, home: &Path) -> anyhow::Result<Vec<DiscoveredCredential>> {
-        let path = home.join(".codex/auth.json");
+        let path = codex_auth_path(home);
         if !path.exists() {
             return Ok(vec![]);
         }
+        super::warn_if_world_readable(&path);
         let raw =
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: CodexAuthFile = serde_json::from_str(&raw)
@@ -71,15 +83,7 @@ impl CredentialSource for CodexSource {
         }
         let label = format!(
             "codex:{}",
-            tokens
-                .access_token
-                .chars()
-                .rev()
-                .take(6)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
+            super::short_label_fingerprint(&tokens.access_token)
         );
         Ok(vec![DiscoveredCredential {
             label,
@@ -93,6 +97,32 @@ impl CredentialSource for CodexSource {
             base_url: Some("https://chatgpt.com/backend-api/codex".to_string()),
             extra_json: None,
         }])
+    }
+
+    fn write_back(
+        &self,
+        home: &Path,
+        access_token: &str,
+        refresh_token: &str,
+        expires_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let path = codex_auth_path(home);
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("read {} for refresh write-back", path.display()))?;
+        let mut parsed: CodexAuthFile = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {} for refresh write-back", path.display()))?;
+        let block = parsed.tokens.get_or_insert(Tokens {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at_ms: None,
+            extra: serde_json::Map::new(),
+        });
+        block.access_token = access_token.to_string();
+        block.refresh_token = Some(refresh_token.to_string());
+        block.expires_at_ms = Some(expires_at_ms);
+        let serialized =
+            serde_json::to_string_pretty(&parsed).context("serialize rotated Codex credentials")?;
+        super::write_atomically(&path, &serialized)
     }
 }
 

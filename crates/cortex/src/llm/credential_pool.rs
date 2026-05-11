@@ -117,9 +117,9 @@ pub enum CredentialSource {
     /// Seeded from a named config block (`llm.api_keys[i]` etc.).
     Config { name: String },
     /// Seeded from an OAuth-capable on-disk credential store. `name` is the
-    /// source identifier — `"claude_code" | "codex" | "copilot" | "qwen_cli"`
-    /// today; the field is `name` (not `kind`) to avoid colliding with
-    /// serde's `tag = "kind"` discriminator on this enum.
+    /// source identifier — `"claude_code" | "codex" | "qwen_cli"` today;
+    /// the field is `name` (not `kind`) to avoid colliding with serde's
+    /// `tag = "kind"` discriminator on this enum.
     OAuth { name: String },
     /// User-defined OpenAI-compatible endpoint. `name` is the operator's label
     /// (also the suppression key); `base_url` overrides the provider's default
@@ -363,6 +363,10 @@ pub struct CredentialPool {
     /// provider-default URLs. Tests inject a `wiremock` endpoint here via
     /// [`Self::set_refresh_endpoint_for_tests`].
     refresh_endpoint_override: Mutex<Option<String>>,
+    /// Home directory used by source `write_back` hooks after a successful
+    /// OAuth refresh. Mirrors `PoolLoadConfig.oauth_home` (production resolves
+    /// via `dirs::home_dir`; tests inject a `tempdir`).
+    oauth_home_for_writeback: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for CredentialPool {
@@ -576,6 +580,21 @@ impl CredentialPool {
                     }
                 };
                 for disc in discovered {
+                    // Reject unsafe base_urls before the credential lands in
+                    // the pool — see `is_safe_base_url` for the threat model.
+                    // Auto-seed quietly skips (logs warn); manual `borg auth
+                    // pair` paths surface the error to the operator.
+                    if let Some(url) = disc.base_url.as_deref() {
+                        if !is_safe_base_url(url) {
+                            warn!(
+                                target: "cortex::llm::credential_pool",
+                                source = discoverer.name(),
+                                base_url = url,
+                                "credential pool: rejecting unsafe base_url from discoverer — skipping"
+                            );
+                            continue;
+                        }
+                    }
                     let source = match discoverer.provider() {
                         Provider::Custom => CredentialSource::Custom {
                             name: discoverer.name().to_string(),
@@ -694,11 +713,18 @@ impl CredentialPool {
             clock,
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             refresh_endpoint_override: Mutex::new(None),
+            oauth_home_for_writeback: cfg.oauth_home,
         }))
     }
 
     /// Test-only: redirect OAuth refresh calls to the given URL (e.g. a
     /// `wiremock` server). Production code never sets this.
+    ///
+    /// The override applies only to whichever refresh branch matches this
+    /// pool's `provider` (ClaudeCodeOAuth → anthropic refresh, CodexOAuth →
+    /// codex refresh). A single pool can't have two providers, so the
+    /// override is unambiguously scoped — but the body/payload shape sent
+    /// to the wiremock URL still matches the pool's provider.
     #[doc(hidden)]
     pub fn set_refresh_endpoint_for_tests(&self, url: Option<String>) {
         let mut g = self
@@ -1207,11 +1233,36 @@ impl CredentialPool {
     /// matching env var if they want it to come back. (`CredentialSource::Env`
     /// / `Config` survive restart via re-seeding.) Tombstones for any source
     /// always survive — `remove_index` writes a suppression row.
+    ///
+    /// For OAuth / custom-endpoint credentials, prefer [`Self::add_entry_full`]
+    /// which threads `auth_type`, `refresh_token`, `expires_at_ms`, and
+    /// `base_url` through. This method hard-codes `AuthType::ApiKey`.
     pub fn add_entry(
         &self,
         key: String,
         label: String,
         source: CredentialSource,
+    ) -> PooledCredential {
+        self.add_entry_full(key, label, source, AuthType::ApiKey, None, None, None, None)
+    }
+
+    /// Full-fidelity add: preserves OAuth/custom-endpoint metadata.
+    ///
+    /// Used by `borg auth pair` for OAuth credentials, and by future
+    /// `borg auth add --base-url` for custom endpoints. Idempotent on
+    /// fingerprint match — a live entry is returned unchanged; a tombstoned
+    /// entry is resurrected with the new metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_entry_full(
+        &self,
+        key: String,
+        label: String,
+        source: CredentialSource,
+        auth_type: AuthType,
+        refresh_token: Option<String>,
+        expires_at_ms: Option<i64>,
+        base_url: Option<String>,
+        extra_json: Option<String>,
     ) -> PooledCredential {
         let fingerprint = fingerprint(&key);
         let now = self.clock.now_ms();
@@ -1235,6 +1286,11 @@ impl CredentialPool {
                 entry.removed_at_ms = None;
                 entry.key = key;
                 entry.source = source;
+                entry.auth_type = auth_type;
+                entry.refresh_token = refresh_token;
+                entry.expires_at_ms = expires_at_ms;
+                entry.base_url = base_url;
+                entry.extra_json = extra_json;
                 entry.last_status = CredentialStatus::Ok;
                 entry.last_status_at_ms = Some(now);
                 entry.last_error_code = None;
@@ -1278,11 +1334,11 @@ impl CredentialPool {
             last_error_message: None,
             last_error_reset_at_ms: None,
             removed_at_ms: None,
-            auth_type: AuthType::ApiKey,
-            refresh_token: None,
-            expires_at_ms: None,
-            base_url: None,
-            extra_json: None,
+            auth_type,
+            refresh_token,
+            expires_at_ms,
+            base_url,
+            extra_json,
         };
         g.creds.push(cred.clone());
         g.emitted_exhausted_warn = false;
@@ -1489,9 +1545,9 @@ impl CredentialPool {
         if !matches!(snapshot.auth_type, AuthType::OAuth) {
             return Some(lease);
         }
-        let Some(refresh_token) = snapshot.refresh_token.clone() else {
+        if snapshot.refresh_token.is_none() {
             return Some(lease);
-        };
+        }
         if !needs_refresh(snapshot.expires_at_ms, self.clock.now_ms()) {
             return Some(lease);
         }
@@ -1508,12 +1564,19 @@ impl CredentialPool {
         };
         let _guard = entry_lock.lock().await;
 
-        // Re-check under the entry lock — a sibling caller may have refreshed
-        // while we were waiting on the mutex.
+        // Re-snapshot under the entry lock — a sibling caller may have just
+        // refreshed (rotating both access_token AND refresh_token). Using the
+        // pre-lock refresh_token would burn the now-invalidated value and
+        // produce an `invalid_grant` from the upstream.
         let snapshot = lease.credential()?;
         if !needs_refresh(snapshot.expires_at_ms, self.clock.now_ms()) {
             return Some(lease);
         }
+        let Some(refresh_token) = snapshot.refresh_token.clone() else {
+            // Sibling-refresh path: another caller wiped refresh_token while
+            // we waited. Skip — there's nothing to refresh with.
+            return Some(lease);
+        };
 
         match self.refresh_oauth(&refresh_token).await {
             Ok(tokens) => {
@@ -1581,12 +1644,41 @@ impl CredentialPool {
             let Some(c) = g.creds.iter_mut().find(|c| c.id == id) else {
                 return;
             };
-            c.key = tokens.access_token;
-            c.refresh_token = Some(tokens.refresh_token);
+            c.key = tokens.access_token.clone();
+            c.refresh_token = Some(tokens.refresh_token.clone());
             c.expires_at_ms = Some(tokens.expires_at_ms);
             c.clone()
         };
         self.persist_credential(&snapshot);
+        // Write the rotated refresh_token back to the source file so the next
+        // daemon reload doesn't replay a burnt refresh_token. Best-effort: a
+        // write failure logs `warn!` but doesn't fail the in-memory refresh
+        // (the new tokens are already live in the pool).
+        if let CredentialSource::OAuth { name } = &snapshot.source {
+            if let Some(discoverer) = crate::llm::credential_sources::discoverer_by_name(name) {
+                let home = self
+                    .oauth_home_for_writeback
+                    .clone()
+                    .or_else(dirs::home_dir);
+                if let Some(home) = home {
+                    if let Err(e) = discoverer.write_back(
+                        &home,
+                        &tokens.access_token,
+                        &tokens.refresh_token,
+                        tokens.expires_at_ms,
+                    ) {
+                        warn!(
+                            target: "cortex::llm::credential_pool",
+                            source = name.as_str(),
+                            credential = id,
+                            error = %e,
+                            "oauth refresh: write-back to source file failed — \
+                             next daemon reload may use a stale refresh_token"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1630,6 +1722,14 @@ impl LeaseHandle {
         self.credential()
             .filter(|c| !c.key.is_empty())
             .map(|c| c.key)
+    }
+
+    /// Per-credential `base_url` override (set by `CredentialSource::Custom`).
+    /// `None` when the credential uses the provider's default URL. The HTTP
+    /// path consults this before falling back to `LlmConfig.base_url` →
+    /// `Provider::base_url()`.
+    pub fn base_url(&self) -> Option<String> {
+        self.credential().and_then(|c| c.base_url)
     }
 }
 
@@ -1913,6 +2013,40 @@ pub fn fingerprint(key: &str) -> String {
     let hash = blake3::hash(key.as_bytes());
     let full = hash.to_hex();
     full[..16].to_string()
+}
+
+/// Validate that `url` is safe to use as a per-credential `base_url` override.
+///
+/// Accepts: `https://<any-host>` and `http://<loopback-host>`. Rejects
+/// anything else — schemes other than http(s) (file/ftp/gopher), plain
+/// `http://` to non-loopback hosts (clear-text bearer over the wire), or
+/// strings that don't parse as a URL.
+///
+/// The threat model: anyone with local-user write access to
+/// `~/.qwen/oauth_creds.json` (or a future operator-supplied custom-endpoint
+/// file) could otherwise redirect the bearer token to an attacker host on
+/// next pool reload. They already have code-exec at that point, but the
+/// validation closes the obvious "swap one URL string" vector and surfaces
+/// a clear error to the operator instead of silently exfiltrating tokens.
+pub fn is_safe_base_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.scheme() {
+        "https" => true,
+        "http" => parsed
+            .host_str()
+            .map(|h| {
+                h == "localhost"
+                    || h == "127.0.0.1"
+                    || h == "[::1]"
+                    || h == "::1"
+                    || h.starts_with("127.")
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn random_id() -> String {
@@ -2793,6 +2927,124 @@ mod tests {
     }
 
     #[test]
+    fn add_entry_full_preserves_oauth_metadata_across_reload() {
+        // Regression for the bug where `pair_credential` used `add_entry` and
+        // silently downgraded OAuth credentials to API keys (no auth_type=oauth,
+        // no refresh_token, no expires_at, no base_url). Refresh would never
+        // fire and the credential would die when the access token expired.
+        //
+        // Asserts on the reloaded pool, not the in-memory return value — the
+        // real win is that auth_type/expires_at survive SQLite round-trip.
+        // (refresh_token is intentionally NOT persisted to DB; the rotated
+        // value lives in the source file via `write_back`.)
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(std::path::Path::new("/nonexistent")),
+        )
+        .unwrap();
+        let cred = pool.add_entry_full(
+            "access-token".into(),
+            "claude-code:abc123".into(),
+            CredentialSource::OAuth {
+                name: "claude_code".into(),
+            },
+            AuthType::OAuth,
+            Some("refresh-token".into()),
+            Some(9_999_999_999_999),
+            None,
+            None,
+        );
+        assert_eq!(cred.auth_type, AuthType::OAuth);
+        assert_eq!(cred.refresh_token.as_deref(), Some("refresh-token"));
+
+        // Drop the live pool and reload — proves the OAuth metadata
+        // round-trips through SQLite. Without this assertion the test would
+        // pass even if `upsert_row` silently dropped auth_type=oauth.
+        drop(pool);
+        let pool2 = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(std::path::Path::new("/nonexistent")),
+        )
+        .unwrap();
+        let entries = pool2.entries();
+        let reloaded = entries
+            .iter()
+            .find(|c| c.id == cred.id)
+            .expect("entry must survive reload");
+        assert_eq!(
+            reloaded.auth_type,
+            AuthType::OAuth,
+            "auth_type must round-trip — otherwise refresh path takes the API-key fast-path"
+        );
+        assert_eq!(reloaded.expires_at_ms, Some(9_999_999_999_999));
+        assert!(matches!(
+            reloaded.source,
+            CredentialSource::OAuth { ref name } if name == "claude_code"
+        ));
+    }
+
+    #[test]
+    fn add_entry_full_with_custom_base_url_round_trips() {
+        // Custom-endpoint credentials carry a per-credential `base_url` that
+        // the HTTP path consults at request time. The pool must preserve it
+        // through `add_entry_full` so `LeaseHandle::base_url()` returns it.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::Custom,
+            oauth_cfg(std::path::Path::new("/nonexistent")),
+        )
+        .unwrap();
+        let cred = pool.add_entry_full(
+            "qwen-api-key".into(),
+            "qwen-cli".into(),
+            CredentialSource::Custom {
+                name: "qwen_cli".into(),
+                base_url: "https://dashscope.aliyuncs.com/api/v1".into(),
+            },
+            AuthType::ApiKey,
+            None,
+            None,
+            Some("https://dashscope.aliyuncs.com/api/v1".into()),
+            None,
+        );
+        assert_eq!(
+            cred.base_url.as_deref(),
+            Some("https://dashscope.aliyuncs.com/api/v1")
+        );
+        // Lease should surface the override.
+        let lease = pool.acquire_lease(Some(&cred.id)).unwrap();
+        assert_eq!(
+            lease.base_url().as_deref(),
+            Some("https://dashscope.aliyuncs.com/api/v1")
+        );
+    }
+
+    #[test]
+    fn is_safe_base_url_blocks_dangerous_schemes() {
+        // Defends against an attacker who can write `~/.qwen/oauth_creds.json`
+        // pointing the bearer at their host. https is open (TLS gates the
+        // wire), http requires loopback (clear-text is fine on localhost),
+        // everything else fails closed.
+        assert!(is_safe_base_url("https://api.example.com/v1"));
+        assert!(is_safe_base_url("http://localhost:8080/v1"));
+        assert!(is_safe_base_url("http://127.0.0.1:11434/v1"));
+        assert!(is_safe_base_url("http://[::1]/v1"));
+        assert!(!is_safe_base_url("http://evil.com/exfil"));
+        assert!(!is_safe_base_url("file:///etc/passwd"));
+        assert!(!is_safe_base_url("ftp://files.example.com/"));
+        assert!(!is_safe_base_url("javascript:alert(1)"));
+        assert!(!is_safe_base_url("not-a-url"));
+        assert!(!is_safe_base_url(""));
+    }
+
+    #[test]
     fn add_entry_resurrects_tombstoned_fingerprint() {
         // Regression: re-adding a previously-removed key used to silently
         // return the tombstone — operator saw "Added credential…" but the
@@ -3281,6 +3533,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
+            // `.expect(1)` proves the cooldown was set BY the failed refresh,
+            // not just by the credential happening to already be exhausted.
+            // Without this, an inert fast-path (e.g. refresh skipped) would
+            // silently pass — the "is not a tombstone" assertion alone is
+            // also satisfied by a healthy credential.
+            .expect(1)
             .mount(&server)
             .await;
 
@@ -3307,6 +3565,11 @@ mod tests {
             !entries[0].is_removed(),
             "transient refresh failure is not a tombstone"
         );
+        assert_eq!(
+            entries[0].last_status,
+            CredentialStatus::Exhausted,
+            "refresh failure cools the credential"
+        );
         assert!(
             entries[0].last_error_reset_at_ms.is_some(),
             "cooldown set so retries are spaced"
@@ -3316,6 +3579,8 @@ mod tests {
             Some("oauth_refresh_failed"),
             "error message tags the cooldown as a refresh failure, distinguishing it from a true 429"
         );
+        // wiremock's `.expect(1)` is verified on server drop.
+        drop(server);
     }
 
     #[test]

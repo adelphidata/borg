@@ -384,6 +384,11 @@ pub struct LlmClient {
     /// Lease held during an in-flight request. Drops at the end of each
     /// attempt to return the credential's lease counter to the pool.
     _active_lease: Option<credential_pool::LeaseHandle>,
+    /// Per-credential `base_url` override pulled from the active lease at
+    /// acquire time. `None` outside an in-flight request, or when the
+    /// leased credential uses the provider's default URL. `effective_base_url`
+    /// consults this first.
+    active_credential_base_url: Option<String>,
     /// Provider-level failover slots.
     provider_slots: Vec<ProviderSlot>,
     /// Index of the currently active provider slot (usize::MAX = primary).
@@ -429,10 +434,15 @@ impl LlmClient {
     /// Effective API URL: config override → provider default, with provider-
     /// specific normalization (e.g. Gemini base-URL suffix correction).
     fn effective_base_url(&self) -> Cow<'_, str> {
+        // Precedence: per-credential override (from the active lease) →
+        // config override → provider static default. The per-credential
+        // override exists for `Provider::Custom` and OAuth flavors whose
+        // wire endpoint differs from the static default (e.g. Codex's
+        // ChatGPT-backend URL).
         let raw = self
-            .llm_config
-            .base_url
+            .active_credential_base_url
             .as_deref()
+            .or(self.llm_config.base_url.as_deref())
             .unwrap_or_else(|| self.provider.base_url());
         match self.provider {
             Provider::Gemini => normalize_gemini_base(raw),
@@ -499,6 +509,7 @@ impl LlmClient {
             fallback_keys: keys_remaining,
             primary_pool,
             _active_lease: None,
+            active_credential_base_url: None,
             provider_slots,
             active_slot_index: usize::MAX,
             debug_logging,
@@ -993,6 +1004,10 @@ impl LlmClient {
                         if let Some(k) = lease.key() {
                             self.api_key = k;
                         }
+                        // Pick up any per-credential base_url override
+                        // (Custom endpoints / Codex backend URL). `None`
+                        // means the lease uses the provider's default URL.
+                        self.active_credential_base_url = lease.base_url();
                         let id = lease.id().to_string();
                         // Park the lease on `self` so its Drop fires after the
                         // result is processed below.
@@ -1003,6 +1018,7 @@ impl LlmClient {
                         // the soonest-recovery credential before falling
                         // through to provider failover.
                         self.api_key = forced.key.clone();
+                        self.active_credential_base_url = forced.base_url.clone();
                         Some(forced.id.clone())
                     } else {
                         // Pool fully exhausted (every key removed). Surface
@@ -1047,6 +1063,7 @@ impl LlmClient {
                             pool.report_success(id);
                         }
                         self._active_lease = None;
+                        self.active_credential_base_url = None;
                         self.record_provider_success();
                         return Ok(());
                     }
@@ -1073,6 +1090,7 @@ impl LlmClient {
                                 Some(&e.to_string()),
                             );
                             self._active_lease = None;
+                            self.active_credential_base_url = None;
                             if e.should_rotate_credential() && pool.has_available() {
                                 info!("{reason} error, pool re-picking next credential");
                                 continue;

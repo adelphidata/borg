@@ -1477,40 +1477,39 @@ impl Admin for AdminSvc {
         &self,
         req: Request<PairCredentialRequest>,
     ) -> Result<Response<PairCredentialResponse>, TStatus> {
-        let kind = req.into_inner().kind.trim().to_ascii_lowercase();
-        if kind.is_empty() {
+        let raw_kind = req.into_inner().kind.trim().to_ascii_lowercase();
+        if raw_kind.is_empty() {
             return Err(TStatus::invalid_argument("kind must not be empty"));
         }
+        // Normalize hyphenated forms (`claude-code`) to the discoverer's
+        // canonical `name()` (`claude_code`) — the registry keys on underscores.
+        let kind = raw_kind.replace('-', "_");
         let entries =
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CredentialEntry>> {
                 use anyhow::Context;
                 use cortex::llm::credential_pool::{
-                    pool_load_config_for_provider, CredentialPool, PoolLoadConfig,
+                    is_safe_base_url, pool_load_config_for_provider, AuthType, CredentialPool,
+                    PoolLoadConfig,
                 };
-                use cortex::llm::credential_sources::discoverers_for;
+                use cortex::llm::credential_sources::discoverer_by_name;
                 use cortex::provider::Provider;
 
-                let provider = match kind.as_str() {
-                    "claude_code" | "claude-code" => Provider::ClaudeCodeOAuth,
-                    "codex" => Provider::CodexOAuth,
-                    "copilot" => Provider::CopilotOAuth,
-                    "qwen_cli" | "qwen-cli" | "qwen" => Provider::Custom,
-                    other => {
-                        anyhow::bail!(
-                        "unknown OAuth kind `{other}` — try claude_code | codex | copilot | qwen"
-                    );
-                    }
-                };
+                let discoverer = discoverer_by_name(&kind).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown OAuth kind `{kind}` — try claude_code | codex | qwen_cli"
+                    )
+                })?;
+                let provider = discoverer.provider();
 
                 let db = Database::open()?;
                 let db_path = cortex::config::Config::db_path()?;
                 let config = cortex::config::Config::load_from_db()?;
 
-                // Build a load config pointing at this OAuth provider — note this
-                // bypasses `config.llm.provider`, since pairing seeds the pool
-                // regardless of whether the operator has switched their primary
-                // to that flavor yet. Discovery resolves $HOME from the daemon's
-                // process env, which is the operator's account.
+                // Build a load config pointing at this OAuth provider. Pairing
+                // seeds the pool regardless of whether the operator has switched
+                // their primary to that flavor yet, so we bypass
+                // `config.llm.provider`. Env-var seeding is disabled — pairing
+                // is an explicit operator action, not an env scan.
                 let mut load_cfg: PoolLoadConfig = pool_load_config_for_provider(
                     provider,
                     config.llm.credential_strategy,
@@ -1521,31 +1520,54 @@ impl Admin for AdminSvc {
                 load_cfg.env_vars.clear();
                 let pool = CredentialPool::load(&db, &db_path, provider, load_cfg)?;
 
-                let mut out = Vec::new();
                 let home = dirs::home_dir()
                     .ok_or_else(|| anyhow::anyhow!("cannot resolve $HOME for OAuth discovery"))?;
-                for d in discoverers_for(provider) {
-                    if d.name() != kind && d.name() != kind.replace('-', "_") {
-                        continue;
+                let discovered = discoverer
+                    .discover(&home)
+                    .with_context(|| format!("running discoverer `{}`", discoverer.name()))?;
+
+                let mut out = Vec::new();
+                for disc in discovered {
+                    // Custom-endpoint sources carry a per-credential base_url
+                    // that needs SSRF-style validation before it lands in the
+                    // pool — operator-writable files can otherwise redirect
+                    // traffic on next request.
+                    if let Some(url) = disc.base_url.as_deref() {
+                        if !is_safe_base_url(url) {
+                            anyhow::bail!(
+                                "discoverer `{}` returned unsafe base_url `{}` — must be https or http+loopback",
+                                discoverer.name(),
+                                url
+                            );
+                        }
                     }
-                    let discovered = d
-                        .discover(&home)
-                        .with_context(|| format!("running discoverer `{}`", d.name()))?;
-                    for disc in discovered {
-                        let source = match provider {
-                            Provider::Custom => {
-                                cortex::llm::credential_pool::CredentialSource::Custom {
-                                    name: d.name().to_string(),
-                                    base_url: disc.base_url.clone().unwrap_or_default(),
-                                }
+                    let source = match provider {
+                        Provider::Custom => {
+                            cortex::llm::credential_pool::CredentialSource::Custom {
+                                name: discoverer.name().to_string(),
+                                base_url: disc.base_url.clone().unwrap_or_default(),
                             }
-                            _ => cortex::llm::credential_pool::CredentialSource::OAuth {
-                                name: d.name().to_string(),
-                            },
-                        };
-                        let cred = pool.add_entry(disc.access_token, disc.label, source);
-                        out.push(pooled_to_proto(pool.provider_str(), &cred));
-                    }
+                        }
+                        _ => cortex::llm::credential_pool::CredentialSource::OAuth {
+                            name: discoverer.name().to_string(),
+                        },
+                    };
+                    let auth_type = if disc.refresh_token.is_some() {
+                        AuthType::OAuth
+                    } else {
+                        AuthType::ApiKey
+                    };
+                    let cred = pool.add_entry_full(
+                        disc.access_token,
+                        disc.label,
+                        source,
+                        auth_type,
+                        disc.refresh_token,
+                        disc.expires_at_ms,
+                        disc.base_url,
+                        disc.extra_json,
+                    );
+                    out.push(pooled_to_proto(pool.provider_str(), &cred));
                 }
                 Ok(out)
             })

@@ -12,7 +12,6 @@ use crate::provider::Provider;
 
 pub mod claude_code;
 pub mod codex;
-pub mod copilot;
 pub mod qwen_cli;
 
 /// One credential discovered on disk. The shape mirrors what callers need to
@@ -53,24 +52,147 @@ pub trait CredentialSource: Send + Sync {
     /// nothing" — `Err` is reserved for "looked, parser blew up", which the
     /// caller logs and continues past.
     fn discover(&self, home: &Path) -> anyhow::Result<Vec<DiscoveredCredential>>;
+
+    /// Write rotated OAuth tokens back to the source's on-disk file. The
+    /// refresh flow calls this after a successful refresh so the next reload
+    /// (or a parallel CLI consumer) sees the new refresh_token. Default impl
+    /// is a no-op for sources that don't refresh (`qwen_cli`).
+    ///
+    /// Best-effort: a write failure logs `warn!` but does not surface as a
+    /// refresh error — the in-memory rotation already succeeded.
+    fn write_back(
+        &self,
+        _home: &Path,
+        _access_token: &str,
+        _refresh_token: &str,
+        _expires_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
-/// Return the default set of discoverers for a given OAuth-capable provider.
-/// `Provider::ClaudeCodeOAuth` runs the Claude Code source; `Provider::Custom`
-/// has no discoverer (operators pair custom endpoints via `borg auth add
-/// --base-url`). Returning `&[]` for non-OAuth providers keeps the load path
+/// All discoverers, indexed by their stable `name()`. Used by both the pool's
+/// load path (`discoverers_for_provider`) and the `pair_credential` RPC's
+/// kind-keyed dispatch — the latter can't rely on provider lookup because
+/// Qwen-CLI feeds `Provider::Custom`, which would also match any other future
+/// custom-endpoint source.
+pub fn all_discoverers() -> &'static [&'static dyn CredentialSource] {
+    &[
+        &claude_code::ClaudeCodeSource,
+        &codex::CodexSource,
+        &qwen_cli::QwenCliSource,
+    ]
+}
+
+/// Look up a discoverer by its stable `name()` (e.g. `"claude_code"`,
+/// `"codex"`, `"qwen_cli"`). Accepts the underscore form only — callers
+/// (CLI / RPC) normalize hyphens to underscores before invoking.
+pub fn discoverer_by_name(name: &str) -> Option<&'static dyn CredentialSource> {
+    all_discoverers().iter().find(|d| d.name() == name).copied()
+}
+
+/// Return the set of discoverers that auto-seed for a given provider during
+/// pool load. Returning `&[]` for non-OAuth providers keeps the load path
 /// a single iteration loop.
+///
+/// Qwen-CLI is intentionally *not* auto-seeded under `Provider::Custom` —
+/// `Custom` is the catch-all for any operator-defined OpenAI-compatible
+/// endpoint, and auto-loading Qwen would inject credentials into pools that
+/// have no semantic relationship to Qwen-CLI. Operators pair Qwen-CLI
+/// explicitly via `borg auth pair qwen`.
 pub fn discoverers_for(provider: Provider) -> &'static [&'static dyn CredentialSource] {
     match provider {
         Provider::ClaudeCodeOAuth => &[&claude_code::ClaudeCodeSource],
         Provider::CodexOAuth => &[&codex::CodexSource],
-        Provider::CopilotOAuth => &[&copilot::CopilotSource],
-        Provider::Custom => &[],
-        // Qwen runs through `Provider::Custom` (custom OpenAI-compatible
-        // base_url) rather than getting its own enum variant — the
-        // discoverer exists for explicit invocation via the CLI but isn't
-        // auto-wired to a provider variant.
         _ => &[],
+    }
+}
+
+/// 6-hex prefix of the access-token fingerprint, for display in
+/// `borg auth list`. Stable across access-token rotations (the fingerprint
+/// is a one-way BLAKE3 truncation of the original token), and collision-
+/// unique enough that two paired accounts won't share a label.
+pub(crate) fn short_label_fingerprint(token: &str) -> String {
+    let fp = crate::llm::credential_pool::fingerprint(token);
+    fp.chars().take(6).collect()
+}
+
+/// Best-effort atomic write for credential-source write-back. Public to the
+/// crate so `codex.rs` and future sources can share it.
+pub(crate) fn write_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+    let tmp = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("credentials")
+    ));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("open {} for write", tmp.display()))?;
+        f.write_all(contents.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        if let Err(e) = f.sync_all() {
+            tracing::warn!(
+                target: "cortex::llm::credential_sources",
+                path = %tmp.display(),
+                error = %e,
+                "fsync of rotated credentials failed — write may not be durable"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 0o600: refresh tokens are bearer credentials. A chmod failure
+            // is rare but not silent — without this log a parallel-CLI race
+            // can leave the file group/world-readable until the next
+            // `warn_if_world_readable` pass.
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    target: "cortex::llm::credential_sources",
+                    path = %tmp.display(),
+                    error = %e,
+                    "chmod 600 on rotated credentials failed — refresh token may be world-readable"
+                );
+            }
+        }
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Warn (don't fail) when an OAuth credential file is group/world-readable.
+/// Operators on shared boxes deserve to know refresh tokens are exposed, but
+/// borg shouldn't refuse to start over a permissions nit. Unix-only.
+pub(crate) fn warn_if_world_readable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    target: "cortex::llm::credential_sources",
+                    path = %path.display(),
+                    mode = format!("{mode:o}"),
+                    "OAuth credentials file is group/world-readable — \
+                     consider `chmod 600` to protect the refresh token"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
     }
 }
 

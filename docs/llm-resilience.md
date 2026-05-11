@@ -129,19 +129,29 @@ The pool seeds OAuth-capable credentials from on-disk stores when the
 provider matches. Each source is read at pool-load time and on every
 `borg auth pair <kind>` call.
 
-| Kind          | Provider             | File                              |
-| ------------- | -------------------- | --------------------------------- |
-| `claude_code` | `ClaudeCodeOAuth`    | `~/.claude/.credentials.json`     |
-| `codex`       | `CodexOAuth`         | `~/.codex/auth.json`              |
-| `qwen_cli`    | `Custom` (Qwen)      | `~/.qwen/oauth_creds.json`        |
-| `copilot`     | `CopilotOAuth`       | resolved via `borg auth pair`     |
+| Kind          | Provider             | File                              | Auto-seed |
+| ------------- | -------------------- | --------------------------------- | --------- |
+| `claude_code` | `ClaudeCodeOAuth`    | `~/.claude/.credentials.json`     | yes       |
+| `codex`       | `CodexOAuth`         | `~/.codex/auth.json`              | yes       |
+| `qwen_cli`    | `Custom` (Qwen)      | `~/.qwen/oauth_creds.json`        | no, via `borg auth pair qwen` |
 
 Expired access tokens are refreshed transparently before each request via
 the per-provider OAuth endpoint (60-second skew window). Refresh failures
 cool the credential for 5min — not removed, since the refresh server may
 be flaky. Concurrent refreshes against the same id are serialized by a
 per-credential async lock so the single-use refresh_token can't be
-double-spent.
+double-spent. After a successful refresh the rotated `refresh_token` is
+written back to the source file (atomic rename) so a parallel CLI consumer
+or the next daemon reload doesn't replay the burnt token. Per-credential
+`base_url` overrides are validated against an https-or-loopback-http
+allowlist at discovery and `borg auth pair` entry; unsafe URLs are rejected
+rather than silently honored.
+
+GitHub Copilot is intentionally out of scope today — the discovery flow
+needs a `gh auth token` shell-out plus a token-exchange round-trip, and
+shipping a stub that always returns "no credentials" would mislead
+operators. `Provider::CopilotOAuth` remains for header construction so
+hand-pasted Copilot tokens still work via `borg auth add`.
 
 ### Custom OpenAI-compatible endpoints
 
