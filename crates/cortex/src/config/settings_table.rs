@@ -28,6 +28,11 @@ define_settings! {
         "llm.cache.rolling_messages" => llm.cache.rolling_messages, parsed(u8);
         "llm.cache.strategy" => llm.cache.strategy, json_quoted("Invalid cache strategy");
 
+        // ── Credential pool ──
+        "llm.credential_strategy" => llm.credential_strategy, json_quoted("Invalid credential strategy");
+        "llm.credential_cooldown_secs" => llm.credential_cooldown_secs, parsed(u64);
+        "llm.max_concurrent_per_credential" => llm.max_concurrent_per_credential, nonzero(u32);
+
         // ── Provider routing / air-gap ──
         "providers.outbound_allowed" => providers.outbound_allowed, parsed(bool);
 
@@ -537,6 +542,9 @@ define_settings! {
         // cross-provider fallback list here.
         "llm.aux.model" => "Aux model (or 'auto')", Text, "Resilience";
         "llm.aux.fallback" => "Aux fallback (JSON)", Text, "Resilience";
+        "llm.credential_strategy" => "Credential strategy", Select, "Resilience";
+        "llm.credential_cooldown_secs" => "Credential cooldown (s)", Uint, "Resilience";
+        "llm.max_concurrent_per_credential" => "Max concurrent / key", Uint, "Resilience";
 
         // — Voice —
         "tts.enabled" => "Enabled", Bool, "Voice";
@@ -591,6 +599,10 @@ pub const TUI_SELECT_CHOICES: &[(&str, &[&str])] = &[
     (
         "llm.cache.strategy",
         &["tools_system_and_2", "system_and_3"],
+    ),
+    (
+        "llm.credential_strategy",
+        &["fill_first", "round_robin", "least_used", "random"],
     ),
     ("security.verifier", &["tofu", "tailscale"]),
     ("gateway.group_activation", &["mention", "always"]),

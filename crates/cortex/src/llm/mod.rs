@@ -97,6 +97,7 @@ const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 mod anthropic;
 pub mod aux_model_picker;
 mod cost;
+pub mod credential_pool;
 mod pricing;
 
 pub(crate) use anthropic::normalize_cache_tokens;
@@ -105,6 +106,10 @@ use anthropic::{
     build_cache_control_marker, parse_anthropic_response, sanitize_openai_messages, strip_images,
 };
 pub use cost::{CostEvent, CostEventContext, CostEventSink};
+pub use credential_pool::{
+    CredentialPool, CredentialSource, CredentialStatus, CredentialStrategy, LeaseHandle,
+    PooledCredential, ResolveError,
+};
 
 pub use crate::llm_error::*;
 
@@ -351,6 +356,10 @@ struct ProviderSlot {
     provider: Provider,
     model: String,
     keys: Vec<String>,
+    /// Credential pool for this slot. `None` when the DB is unreachable at
+    /// construction time (tests, embedded usage); the failover loop falls
+    /// back to the legacy `keys` Vec.
+    pool: Option<Arc<credential_pool::CredentialPool>>,
     temperature: f32,
     max_tokens: u32,
     base_url: Option<String>,
@@ -363,8 +372,16 @@ pub struct LlmClient {
     llm_config: LlmConfig,
     provider: Provider,
     api_key: String,
-    /// Additional fallback keys (rotated on 401/429 errors).
+    /// Additional fallback keys. Used only as the legacy rotation path when
+    /// `primary_pool` is `None` (DB unreachable). When the pool is present,
+    /// it owns rotation and this Vec is unused at runtime.
     fallback_keys: Vec<String>,
+    /// Credential pool for the *active* provider. `None` only when the pool
+    /// could not be constructed (DB unavailable at LlmClient creation time).
+    primary_pool: Option<Arc<credential_pool::CredentialPool>>,
+    /// Lease held during an in-flight request. Drops at the end of each
+    /// attempt to return the credential's lease counter to the pool.
+    _active_lease: Option<credential_pool::LeaseHandle>,
     /// Provider-level failover slots.
     provider_slots: Vec<ProviderSlot>,
     /// Index of the currently active provider slot (usize::MAX = primary).
@@ -423,7 +440,7 @@ impl LlmClient {
 
     /// Create a new LLM client from config (resolves provider and API keys).
     pub fn new(config: &Config) -> Result<Self> {
-        let (provider, mut keys) = config.resolve_api_keys()?;
+        let (provider, keys) = config.resolve_api_keys()?;
         // Air-gap policy: when `providers.outbound_allowed = false` we refuse
         // any non-Local provider before constructing the client so no HTTP
         // socket is opened against a public endpoint.
@@ -435,7 +452,19 @@ impl LlmClient {
 
         let debug_logging = config.debug.llm_logging;
         let client = Client::new();
-        let api_key = keys.remove(0);
+        let mut keys_remaining = keys.clone();
+        let api_key = keys_remaining.remove(0);
+
+        // Try to build the primary credential pool. Best-effort: falls back
+        // to legacy rotation when the DB is unreachable (tests, headless
+        // embedded usage, first-boot before borgd has stamped a DB file).
+        let primary_pool = credential_pool::try_build_from_keys(
+            provider,
+            keys,
+            config.llm.credential_strategy,
+            config.llm.credential_cooldown_secs,
+            config.llm.max_concurrent_per_credential,
+        );
 
         // Build provider-level failover slots
         let mut provider_slots = Vec::new();
@@ -465,7 +494,9 @@ impl LlmClient {
             llm_config: config.llm.clone(),
             provider,
             api_key,
-            fallback_keys: keys,
+            fallback_keys: keys_remaining,
+            primary_pool,
+            _active_lease: None,
             provider_slots,
             active_slot_index: usize::MAX,
             debug_logging,
@@ -473,6 +504,11 @@ impl LlmClient {
             cost_event_sink: None,
             cost_event_context: None,
         })
+    }
+
+    /// Accessor for the active credential pool (e.g. for admin RPCs / CLI).
+    pub fn primary_pool(&self) -> Option<&Arc<credential_pool::CredentialPool>> {
+        self.primary_pool.as_ref()
     }
 
     /// Build an auxiliary LLM client dedicated to background tasks (memory
@@ -653,10 +689,19 @@ impl LlmClient {
             bail!("No API keys found for fallback provider {provider}");
         }
 
+        let pool = credential_pool::try_build_from_keys(
+            provider,
+            slot_keys.clone(),
+            config.llm.credential_strategy,
+            config.llm.credential_cooldown_secs,
+            config.llm.max_concurrent_per_credential,
+        );
+
         Ok(ProviderSlot {
             provider,
             model: fb.model.clone(),
             keys: slot_keys,
+            pool,
             temperature: fb.temperature.unwrap_or(config.llm.temperature),
             max_tokens: fb.max_tokens.unwrap_or(config.llm.max_tokens),
             base_url: fb.base_url.clone(),
@@ -682,6 +727,7 @@ impl LlmClient {
             self.provider = slot.provider;
             self.api_key = slot.keys[0].clone();
             self.fallback_keys = slot.keys[1..].to_vec();
+            self.primary_pool = slot.pool.clone();
             self.llm_config.model = slot.model.clone();
             self.llm_config.temperature = slot.temperature;
             self.llm_config.max_tokens = slot.max_tokens;
@@ -936,6 +982,48 @@ impl LlmClient {
                     return Ok(());
                 }
 
+                // Pool path: pick a fresh credential before each attempt. The
+                // lease is held for the request duration so concurrent calls
+                // can fan out across keys (max_concurrent_per_credential
+                // governs the cap).
+                let lease_id: Option<String> = if let Some(pool) = self.primary_pool.clone() {
+                    if let Some(lease) = pool.acquire_lease(None) {
+                        if let Some(k) = lease.key() {
+                            self.api_key = k;
+                        }
+                        let id = lease.id().to_string();
+                        // Park the lease on `self` so its Drop fires after the
+                        // result is processed below.
+                        self._active_lease = Some(lease);
+                        Some(id)
+                    } else if let Some(forced) = pool.pick_force() {
+                        // Every key cooling — make a last-gasp attempt against
+                        // the soonest-recovery credential before falling
+                        // through to provider failover.
+                        self.api_key = forced.key.clone();
+                        Some(forced.id.clone())
+                    } else {
+                        // Pool fully exhausted (every key removed). Surface
+                        // the error path so provider failover can engage.
+                        let msg = format!(
+                            "{} credential pool exhausted (all keys removed)",
+                            self.provider
+                        );
+                        warn!(target: "cortex::llm", "{msg}");
+                        self.record_provider_failure(FailoverReason::AuthPermanent);
+                        if self.try_failover_provider() {
+                            should_failover = true;
+                            break;
+                        }
+                        if tx.send(StreamEvent::Error(msg.clone())).await.is_err() {
+                            tracing::trace!("llm: stream receiver closed");
+                        }
+                        bail!("{msg}");
+                    }
+                } else {
+                    None
+                };
+
                 let result = if matches!(self.provider, Provider::ClaudeCli) {
                     self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
                         .await
@@ -947,8 +1035,16 @@ impl LlmClient {
                         .await
                 };
 
+                // Lease drop happens here as we re-bind below; report outcome
+                // to the pool by id before the lease's Drop returns it.
                 match result {
                     Ok(()) => {
+                        if let (Some(pool), Some(id)) =
+                            (self.primary_pool.as_ref(), lease_id.as_deref())
+                        {
+                            pool.report_success(id);
+                        }
+                        self._active_lease = None;
                         self.record_provider_success();
                         return Ok(());
                     }
@@ -959,10 +1055,31 @@ impl LlmClient {
                         let reason = e.reason();
                         let is_auth_error = matches!(reason, FailoverReason::Auth);
 
-                        if e.should_rotate_credential()
+                        // Pool path: report failure and re-pick next iter.
+                        if let (Some(pool), Some(id)) =
+                            (self.primary_pool.as_ref(), lease_id.as_deref())
+                        {
+                            let retry_after = match &e {
+                                LlmError::Retryable { retry_after, .. } => *retry_after,
+                                _ => None,
+                            };
+                            pool.report_failure(
+                                id,
+                                reason,
+                                None,
+                                retry_after,
+                                Some(&e.to_string()),
+                            );
+                            self._active_lease = None;
+                            if e.should_rotate_credential() && pool.has_available() {
+                                info!("{reason} error, pool re-picking next credential");
+                                continue;
+                            }
+                        } else if e.should_rotate_credential()
                             && keys_tried < total_keys
                             && self.try_rotate_key(!is_auth_error)
                         {
+                            // Legacy rotation path (pool unavailable).
                             keys_tried += 1;
                             info!("{reason} error, trying next API key...");
                             continue;
@@ -1103,11 +1220,24 @@ impl LlmClient {
 
         if !response.status().is_success() {
             let status = response.status();
+            // Capture the `Retry-After` header BEFORE consuming the body —
+            // `response.text()` moves the response and drops the headers.
+            // RFC 7231 makes this the authoritative cooldown signal, so it
+            // overrides anything we sniff out of the body below.
+            let header_retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::llm_error::parse_retry_after_header);
             let body = response.text().await.unwrap_or_else(|e| {
                 tracing::warn!("Failed to read error response body: {e}");
                 String::new()
             });
-            return Err(classify_status(status, &body, self.provider));
+            let err = classify_status(status, &body, self.provider);
+            return Err(crate::llm_error::override_retry_after(
+                err,
+                header_retry_after,
+            ));
         }
 
         Ok(response)

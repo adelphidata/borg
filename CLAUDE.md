@@ -198,6 +198,10 @@ Posture v2: 3 states with XP multiplier — `Reduced` ×0.85, `Default` ×1.00, 
 
 One `Hook` trait / `HookRegistry` / 9 `HookPoint` variants in `crates/cortex/src/hooks.rs`. Compiled-in: `VitalsHook`, `ActivityHook`, `BondHook`, `EvolutionHook`. User scripts at `~/.borg/hooks.json` (Claude Code-compatible schema). `PreToolUse` non-zero exit aborts the tool call. All other failures log + continue — **hooks can never break the agent**. See `docs/hooks.md`.
 
+### LLM Resilience
+
+Three-layer recovery: credential pool (per-provider keys with cooldown TTL + strategy), `llm.fallback` provider chain, and the `llm.aux` background client. The pool replaces FIFO key rotation — per-key cooldown via `Retry-After` (header → body hint → configured default), permanent removal on 401/403, persistence across restart, 402 disambiguation (transient usage-limit vs hard exhaustion). Knobs: `llm.credential_strategy`, `llm.credential_cooldown_secs`, `llm.max_concurrent_per_credential`. State tables: `credential_pool`, `credential_suppressions`. Full surface in `docs/llm-resilience.md`.
+
 ### Self-Healing
 
 Daily maintenance task fires 02:00 — prunes logs, evicts stale embeddings, heals stalled tasks, surfaces persistent warnings. No LLM call. Daemon scans every 5min for tasks with `next_run` drift > 1h. `write_memory` 20k-token cap enforced. `skill_audit` table catches user SKILL.md tampering. `/heal` invokes on demand. See `docs/self-healing.md`.

@@ -109,6 +109,28 @@ pub struct LlmConfig {
     /// their own implicit caching keyed by `prompt_cache_key`.
     #[serde(default)]
     pub cache: PromptCacheConfig,
+    /// Credential-pool selection strategy. Applies uniformly to the primary,
+    /// every `fallback` slot, and the aux head — each provider gets its own
+    /// pool but they share these knobs.
+    #[serde(default)]
+    pub credential_strategy: crate::llm::credential_pool::CredentialStrategy,
+    /// Default per-credential cooldown when a 402/429 response carries no
+    /// `Retry-After` hint. Provider-supplied hints always win.
+    #[serde(default = "default_credential_cooldown_secs")]
+    pub credential_cooldown_secs: u64,
+    /// Soft cap on concurrent leases per credential. Above this, leases
+    /// fan out across other keys; once every key is at the cap, the
+    /// least-leased key wins ties.
+    #[serde(default = "default_max_concurrent_per_credential")]
+    pub max_concurrent_per_credential: u32,
+}
+
+fn default_credential_cooldown_secs() -> u64 {
+    60
+}
+
+fn default_max_concurrent_per_credential() -> u32 {
+    1
 }
 
 /// TTL for Anthropic `cache_control` markers.
@@ -267,6 +289,9 @@ impl Default for LlmConfig {
             thinking: ThinkingLevel::Off,
             claude_cli_path: None,
             cache: PromptCacheConfig::default(),
+            credential_strategy: crate::llm::credential_pool::CredentialStrategy::default(),
+            credential_cooldown_secs: default_credential_cooldown_secs(),
+            max_concurrent_per_credential: default_max_concurrent_per_credential(),
         }
     }
 }

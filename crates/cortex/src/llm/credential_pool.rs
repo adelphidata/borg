@@ -1,0 +1,2453 @@
+//! Per-provider credential pool with exhaustion tracking.
+//!
+//! Replaces the legacy FIFO key rotation. Each `Provider` owns a pool of
+//! `PooledCredential` entries. The pool selects keys by strategy
+//! (fill_first / round_robin / least_used / random), tracks per-credential
+//! cooldown TTL on 402/429, soft-deletes on 401/403, and persists state to
+//! SQLite so daemon restarts respect in-flight cooldowns.
+//!
+//! See `docs/llm-resilience.md` for the operator-facing surface.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context, Result};
+use rand::prelude::IndexedRandom;
+use rand::Rng;
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+use crate::db::Database;
+use crate::llm_error::FailoverReason;
+use crate::provider::Provider;
+
+/// Hard ceiling for any cooldown duration — defends against absurd provider
+/// hints like `retry_after: 999999999` (yes, it happens).
+const COOLDOWN_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Truncate persisted error messages to keep `borg auth list` and daemon.log bounded.
+const ERROR_MESSAGE_MAX_LEN: usize = 500;
+
+// ── Strategy / status / source ────────────────────────────────────────────
+
+/// How `pick()` chooses the next credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStrategy {
+    /// Use the lowest-priority available key; only advance on failure.
+    #[default]
+    FillFirst,
+    /// Rotate to the next key after each pick.
+    RoundRobin,
+    /// Pick the key with the lowest `use_count`.
+    LeastUsed,
+    /// Uniform random across available keys.
+    Random,
+}
+
+impl std::str::FromStr for CredentialStrategy {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "fill_first" | "fillfirst" => Ok(Self::FillFirst),
+            "round_robin" | "roundrobin" => Ok(Self::RoundRobin),
+            "least_used" | "leastused" => Ok(Self::LeastUsed),
+            "random" => Ok(Self::Random),
+            other => Err(anyhow!(
+                "Unknown credential strategy '{other}'. Valid: fill_first, round_robin, least_used, random"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FillFirst => "fill_first",
+            Self::RoundRobin => "round_robin",
+            Self::LeastUsed => "least_used",
+            Self::Random => "random",
+        })
+    }
+}
+
+/// Per-credential health state. Removed entries are kept as tombstones for
+/// `borg auth list` history but are excluded from `pick()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatus {
+    #[default]
+    Ok,
+    Exhausted,
+}
+
+impl CredentialStatus {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Exhausted => "exhausted",
+        }
+    }
+    fn from_db(s: &str) -> Self {
+        match s {
+            "exhausted" => Self::Exhausted,
+            _ => Self::Ok,
+        }
+    }
+}
+
+/// Where the credential came from. Drives the suppression model — operators
+/// running `borg auth remove openrouter 2` write a row keyed by source so
+/// re-seeding from env/config doesn't undo the removal on next start.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// Explicitly added via `borg auth add` or a freeform config entry.
+    Manual,
+    /// Seeded from an environment variable (e.g. `OPENROUTER_API_KEY`).
+    Env { var: String },
+    /// Seeded from a named config block (`llm.api_keys[i]` etc.).
+    Config { name: String },
+}
+
+impl CredentialSource {
+    fn kind_db(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Env { .. } => "env",
+            Self::Config { .. } => "config",
+        }
+    }
+    fn value_db(&self) -> String {
+        match self {
+            Self::Manual => String::new(),
+            Self::Env { var } => var.clone(),
+            Self::Config { name } => name.clone(),
+        }
+    }
+    #[allow(dead_code)]
+    fn from_db(kind: &str, value: &str) -> Self {
+        match kind {
+            "env" => Self::Env { var: value.into() },
+            "config" => Self::Config { name: value.into() },
+            _ => Self::Manual,
+        }
+    }
+}
+
+// ── PooledCredential ──────────────────────────────────────────────────────
+
+/// One credential in the pool. The plaintext `key` is held in memory only;
+/// the DB row is keyed by `fingerprint` (16-hex BLAKE3 truncation).
+///
+/// `Debug` is hand-implemented to redact the plaintext `key` — accidentally
+/// `{:?}`-ing a credential (directly or transitively through `PoolInner`)
+/// must not leak the secret.
+#[derive(Clone)]
+pub struct PooledCredential {
+    pub id: String,
+    pub label: String,
+    pub priority: u32,
+    pub source: CredentialSource,
+    pub key: String,
+    pub fingerprint: String,
+    pub use_count: u64,
+    pub last_status: CredentialStatus,
+    pub last_status_at_ms: Option<i64>,
+    pub last_error_code: Option<u16>,
+    pub last_error_reason: Option<String>,
+    pub last_error_message: Option<String>,
+    pub last_error_reset_at_ms: Option<i64>,
+    pub removed_at_ms: Option<i64>,
+}
+
+impl PooledCredential {
+    /// True when this credential should never be returned by `pick()`.
+    pub fn is_removed(&self) -> bool {
+        self.removed_at_ms.is_some()
+    }
+
+    /// True when this credential is currently cooling and not yet recovered.
+    pub fn is_cooling(&self, now_ms: i64) -> bool {
+        !self.is_removed()
+            && matches!(self.last_status, CredentialStatus::Exhausted)
+            && self
+                .last_error_reset_at_ms
+                .is_some_and(|until| until > now_ms)
+    }
+
+    /// True when this credential is available for `pick()` right now.
+    pub fn is_available(&self, now_ms: i64) -> bool {
+        !self.is_removed() && !self.is_cooling(now_ms)
+    }
+}
+
+impl std::fmt::Debug for PooledCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledCredential")
+            .field("id", &self.id)
+            .field("label", &self.label)
+            .field("priority", &self.priority)
+            .field("source", &self.source)
+            // SECURITY: key is redacted. Never include `self.key` here, even
+            // truncated — a partial key in a log can still be a password
+            // grease attack vector. Use `fingerprint` for identification.
+            .field("key", &format_args!("<redacted len={}>", self.key.len()))
+            .field("fingerprint", &self.fingerprint)
+            .field("use_count", &self.use_count)
+            .field("last_status", &self.last_status)
+            .field("last_status_at_ms", &self.last_status_at_ms)
+            .field("last_error_code", &self.last_error_code)
+            .field("last_error_reason", &self.last_error_reason)
+            .field("last_error_message", &self.last_error_message)
+            .field("last_error_reset_at_ms", &self.last_error_reset_at_ms)
+            .field("removed_at_ms", &self.removed_at_ms)
+            .finish()
+    }
+}
+
+// ── Clock seam (test-injectable) ─────────────────────────────────────────
+
+/// Wall-clock seam. Production is `SystemClock`; tests inject a mock that
+/// returns deterministic millis so cooldown logic can be exercised without
+/// `tokio::time::sleep`.
+pub trait Clock: Send + Sync + std::fmt::Debug {
+    fn now_ms(&self) -> i64;
+}
+
+/// Production clock — `SystemTime::now()`.
+#[derive(Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+}
+
+// ── Errors ────────────────────────────────────────────────────────────────
+
+/// Outcome of resolving an operator-supplied credential target.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    /// No credential matched the target.
+    #[error("No credential matches '{0}'")]
+    NotFound(String),
+    /// Multiple credentials matched (e.g. by ambiguous label).
+    #[error("Target '{0}' is ambiguous — {1} matches")]
+    Ambiguous(String, usize),
+    /// Index is out of bounds.
+    #[error("Index {0} is out of bounds (pool has {1} entries)")]
+    OutOfRange(usize, usize),
+}
+
+// ── Pool inner state ──────────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct PoolInner {
+    creds: Vec<PooledCredential>,
+    strategy: CredentialStrategy,
+    cooldown: Duration,
+    current_id: Option<String>,
+    active_leases: HashMap<String, u32>,
+    max_concurrent_per_credential: u32,
+    suppressed: HashSet<(String, String)>, // (source_kind, source_value)
+    /// Track which exhaustion warnings we've already emitted so we don't
+    /// spam logs on every subsequent failed `pick()`. Cleared on any
+    /// recovery (cooldown expiry or operator reset).
+    emitted_exhausted_warn: bool,
+}
+
+// ── CredentialPool ────────────────────────────────────────────────────────
+
+/// Per-provider pool of API credentials with cooldown, leasing, and persistence.
+///
+/// Pools are constructed via [`CredentialPool::load`] which reconciles three
+/// sources of truth: the DB (persisted state from prior runs), the
+/// `LlmConfig.api_keys` Vec, and provider-default environment variables.
+/// Removed sources are skipped on re-seed via the `credential_suppressions`
+/// table.
+///
+/// Concurrency: `Arc<Mutex<PoolInner>>` — the lock is held for the duration
+/// of `pick`, `report_*`, and lease checkout. All lease bookkeeping happens
+/// behind the same lock; `LeaseHandle::drop` re-acquires it to decrement.
+pub struct CredentialPool {
+    provider: Provider,
+    db_path: Option<std::path::PathBuf>,
+    inner: Arc<Mutex<PoolInner>>,
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for CredentialPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialPool")
+            .field("provider", &self.provider)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// Config inputs for [`CredentialPool::load`]. Decoupled from `LlmConfig` so
+/// `LlmFallback` and `AuxLlmConfig` can drive the same loader.
+#[derive(Debug, Clone)]
+pub struct PoolLoadConfig {
+    pub strategy: CredentialStrategy,
+    pub cooldown_secs: u64,
+    pub max_concurrent_per_credential: u32,
+    /// Resolved (label, key) pairs from `api_keys` config blocks. The loader
+    /// computes fingerprints and de-dupes. Labels are operator-friendly tags
+    /// for `borg auth list`.
+    pub config_entries: Vec<ConfigEntry>,
+    /// Provider env vars to scan (typically just `provider.default_env_var()`,
+    /// but Anthropic supports multiple). Each present-and-nonempty var is
+    /// seeded as `CredentialSource::Env`.
+    pub env_vars: Vec<String>,
+}
+
+/// One config-sourced credential, resolved to plaintext.
+#[derive(Debug, Clone)]
+pub struct ConfigEntry {
+    pub key: String,
+    /// Optional operator-friendly label; defaults to `"config[N]"`.
+    pub label: Option<String>,
+    /// Stable name for the suppression model (e.g. `"llm.api_keys[0]"`).
+    pub config_name: String,
+}
+
+impl CredentialPool {
+    /// Open the pool for `provider`, reconciling DB / config / env into a
+    /// coherent set of entries. See module docs for the seeding rules.
+    ///
+    /// `db_path` is the SQLite file the pool will write to for state
+    /// persistence (use the same path the `Database` was opened with — the
+    /// pool opens short-lived connections rather than threading the
+    /// `rusqlite::Connection` through `Arc<Mutex<…>>`).
+    pub fn load(
+        db: &Database,
+        db_path: &std::path::Path,
+        provider: Provider,
+        cfg: PoolLoadConfig,
+    ) -> Result<Arc<Self>> {
+        Self::load_with_clock(db, db_path, provider, cfg, Arc::new(SystemClock))
+    }
+
+    /// Like `load`, but with an injected clock for tests.
+    pub fn load_with_clock(
+        db: &Database,
+        db_path: &std::path::Path,
+        provider: Provider,
+        cfg: PoolLoadConfig,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Arc<Self>> {
+        let conn = db.conn();
+        let provider_str = provider.as_str();
+
+        // 1. Load suppression set.
+        let mut suppressed: HashSet<(String, String)> = HashSet::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT source_kind, source_value FROM credential_suppressions \
+                 WHERE provider = ?1",
+            )?;
+            let rows = stmt.query_map(params![provider_str], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (k, v) = r?;
+                suppressed.insert((k, v));
+            }
+        }
+
+        // 2. Load persisted rows (state-bearing tombstones included).
+        let mut persisted: HashMap<String, PersistedRow> = HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT fingerprint, id, label, priority, source_json, use_count, \
+                        last_status, last_status_at_ms, last_error_code, last_error_reason, \
+                        last_error_message, last_error_reset_at_ms, removed_at_ms \
+                 FROM credential_pool WHERE provider = ?1",
+            )?;
+            let rows = stmt.query_map(params![provider_str], |r| {
+                Ok(PersistedRow {
+                    fingerprint: r.get(0)?,
+                    id: r.get(1)?,
+                    label: r.get(2)?,
+                    priority: r.get::<_, i64>(3)? as u32,
+                    source_json: r.get(4)?,
+                    use_count: r.get::<_, i64>(5)? as u64,
+                    last_status: r.get(6)?,
+                    last_status_at_ms: r.get(7)?,
+                    last_error_code: r.get::<_, Option<i64>>(8)?.map(|x| x as u16),
+                    last_error_reason: r.get(9)?,
+                    last_error_message: r.get(10)?,
+                    last_error_reset_at_ms: r.get(11)?,
+                    removed_at_ms: r.get(12)?,
+                })
+            })?;
+            for r in rows {
+                let row = r?;
+                persisted.insert(row.fingerprint.clone(), row);
+            }
+        }
+
+        // 3. Seed: config entries, then env vars. Suppressed sources skipped.
+        let mut live: Vec<PooledCredential> = Vec::new();
+        let mut seen_fp: HashSet<String> = HashSet::new();
+        let mut next_priority: u32 = 0;
+
+        for entry in &cfg.config_entries {
+            if entry.key.trim().is_empty() {
+                continue;
+            }
+            let source = CredentialSource::Config {
+                name: entry.config_name.clone(),
+            };
+            if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
+                continue;
+            }
+            let fingerprint = fingerprint(&entry.key);
+            if !seen_fp.insert(fingerprint.clone()) {
+                continue;
+            }
+            let label = entry
+                .label
+                .clone()
+                .unwrap_or_else(|| entry.config_name.clone());
+            let cred = reconcile_or_new(
+                &persisted,
+                fingerprint,
+                entry.key.clone(),
+                label,
+                source,
+                next_priority,
+                clock.now_ms(),
+            );
+            next_priority += 1;
+            live.push(cred);
+        }
+
+        for var in &cfg.env_vars {
+            let Ok(val) = std::env::var(var) else {
+                continue;
+            };
+            let val = val.trim().to_string();
+            if val.is_empty() {
+                continue;
+            }
+            let source = CredentialSource::Env { var: var.clone() };
+            if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
+                continue;
+            }
+            let fingerprint = fingerprint(&val);
+            if !seen_fp.insert(fingerprint.clone()) {
+                continue;
+            }
+            let cred = reconcile_or_new(
+                &persisted,
+                fingerprint,
+                val,
+                var.clone(),
+                source,
+                next_priority,
+                clock.now_ms(),
+            );
+            next_priority += 1;
+            live.push(cred);
+        }
+
+        // 4. Carry forward removed-tombstone rows for `borg auth list` history.
+        for (fp, row) in &persisted {
+            if !seen_fp.contains(fp) && row.removed_at_ms.is_some() {
+                if let Ok(source) = serde_json::from_str::<CredentialSource>(&row.source_json) {
+                    live.push(PooledCredential {
+                        id: row.id.clone(),
+                        label: row.label.clone(),
+                        priority: row.priority,
+                        source,
+                        key: String::new(), // no live key — tombstone
+                        fingerprint: fp.clone(),
+                        use_count: row.use_count,
+                        last_status: CredentialStatus::from_db(&row.last_status),
+                        last_status_at_ms: row.last_status_at_ms,
+                        last_error_code: row.last_error_code,
+                        last_error_reason: row.last_error_reason.clone(),
+                        last_error_message: row.last_error_message.clone(),
+                        last_error_reset_at_ms: row.last_error_reset_at_ms,
+                        removed_at_ms: row.removed_at_ms,
+                    });
+                }
+            }
+        }
+
+        // 5. Prune persisted rows whose source disappeared from env/config and
+        //    that aren't tombstoned (so `borg auth list` still shows manual
+        //    removals); the live ones we already reconciled above.
+        let live_fps: HashSet<String> = live.iter().map(|c| c.fingerprint.clone()).collect();
+        let to_prune: Vec<String> = persisted
+            .keys()
+            .filter(|fp| !live_fps.contains(*fp))
+            .cloned()
+            .collect();
+        if !to_prune.is_empty() {
+            let mut stmt = conn
+                .prepare("DELETE FROM credential_pool WHERE provider = ?1 AND fingerprint = ?2")?;
+            for fp in to_prune {
+                stmt.execute(params![provider_str, fp])?;
+            }
+        }
+
+        // 6. Normalize priorities (live first, tombstones at the end).
+        live.sort_by(|a, b| {
+            a.removed_at_ms
+                .is_some()
+                .cmp(&b.removed_at_ms.is_some())
+                .then(a.priority.cmp(&b.priority))
+        });
+        for (i, c) in live.iter_mut().enumerate() {
+            c.priority = i as u32;
+        }
+
+        // 7. Persist (write-through reflects normalized priorities).
+        for c in &live {
+            upsert_row(conn, provider_str, c)?;
+        }
+
+        let inner = PoolInner {
+            creds: live,
+            strategy: cfg.strategy,
+            cooldown: Duration::from_secs(cfg.cooldown_secs.max(1)),
+            current_id: None,
+            active_leases: HashMap::new(),
+            max_concurrent_per_credential: cfg.max_concurrent_per_credential.max(1),
+            suppressed,
+            emitted_exhausted_warn: false,
+        };
+
+        Ok(Arc::new(Self {
+            provider,
+            db_path: Some(db_path.to_path_buf()),
+            inner: Arc::new(Mutex::new(inner)),
+            clock,
+        }))
+    }
+
+    /// Provider this pool serves.
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
+    /// True when the pool has any non-removed credential (regardless of cooling).
+    pub fn has_credentials(&self) -> bool {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.iter().any(|c| !c.is_removed())
+    }
+
+    /// True when at least one credential is pickable right now (not removed, not cooling).
+    pub fn has_available(&self) -> bool {
+        let now = self.clock.now_ms();
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.iter().any(|c| c.is_available(now))
+    }
+
+    /// String name of this pool's provider (e.g. `"openrouter"`). Used by
+    /// the daemon's admin RPC layer to render results without exposing the
+    /// underlying `Provider` enum to the proto schema.
+    pub fn provider_str(&self) -> &'static str {
+        self.provider.as_str()
+    }
+
+    /// The strategy + cooldown + concurrency knobs the pool was constructed
+    /// with. Reads are O(1) under the lock.
+    pub fn cooldown_secs(&self) -> u64 {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.cooldown.as_secs()
+    }
+
+    /// Soft per-credential concurrency cap.
+    pub fn max_concurrent_per_credential(&self) -> u32 {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.max_concurrent_per_credential
+    }
+
+    /// Number of credentials available right now.
+    pub fn len_active(&self) -> usize {
+        let now = self.clock.now_ms();
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.iter().filter(|c| c.is_available(now)).count()
+    }
+
+    /// True when every credential is either removed or cooling. Inverse of `has_available`.
+    pub fn is_exhausted(&self) -> bool {
+        !self.has_available()
+    }
+
+    /// Earliest wall-clock millis at which any cooling credential recovers, or
+    /// `None` if every non-removed credential is either available or permanently
+    /// removed.
+    pub fn next_recovery_at_ms(&self) -> Option<i64> {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds
+            .iter()
+            .filter(|c| !c.is_removed())
+            .filter_map(|c| c.last_error_reset_at_ms)
+            .min()
+    }
+
+    /// Snapshot of all entries (including removed tombstones) for `borg auth list`.
+    pub fn entries(&self) -> Vec<PooledCredential> {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.clone()
+    }
+
+    /// Best-effort persist of one credential row. Logs at `warn` on failure so
+    /// operators see read-only-mount / locked-db / corrupted-DB errors instead
+    /// of silently losing pool state across restart.
+    fn persist_credential(&self, cred: &PooledCredential) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        if let Err(e) = persist_one(path, self.provider.as_str(), cred) {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                provider = %self.provider.as_str(),
+                fingerprint = %cred.fingerprint,
+                error = %e,
+                "credential pool: persist failed"
+            );
+        }
+    }
+
+    /// Best-effort persist of a suppression row. Same logging contract as
+    /// `persist_credential`.
+    fn persist_suppression_row(&self, source: &CredentialSource, now: i64) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        if let Err(e) = persist_suppression(path, self.provider.as_str(), source, now) {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                provider = %self.provider.as_str(),
+                error = %e,
+                "credential pool: suppression persist failed"
+            );
+        }
+    }
+
+    /// Current strategy.
+    pub fn strategy(&self) -> CredentialStrategy {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .strategy
+    }
+
+    /// Currently-selected credential (set by the last `pick()` / `acquire_lease()`).
+    pub fn current(&self) -> Option<PooledCredential> {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = g.current_id.as_ref()?;
+        g.creds.iter().find(|c| &c.id == id).cloned()
+    }
+
+    /// Non-mutating: returns `current()` if still available, else the first
+    /// available credential by current strategy. Does **not** bump `use_count`
+    /// or update `current_id`.
+    pub fn peek(&self) -> Option<PooledCredential> {
+        let now = self.clock.now_ms();
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(id) = &g.current_id {
+            if let Some(c) = g.creds.iter().find(|c| &c.id == id) {
+                if c.is_available(now) {
+                    return Some(c.clone());
+                }
+            }
+        }
+        g.creds
+            .iter()
+            .filter(|c| c.is_available(now))
+            .min_by_key(|c| c.priority)
+            .cloned()
+    }
+
+    /// Strategy-driven selection. Updates `current_id` and bumps `use_count`.
+    /// Returns `None` when every credential is removed or cooling — callers
+    /// should fall through to `pick_force` or surface an exhausted error.
+    pub fn pick(&self) -> Option<PooledCredential> {
+        let now = self.clock.now_ms();
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Snapshot available indices to make the strategy match deterministic.
+        let avail: Vec<usize> = g
+            .creds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_available(now))
+            .map(|(i, _)| i)
+            .collect();
+
+        if avail.is_empty() {
+            if !g.emitted_exhausted_warn {
+                let next = g
+                    .creds
+                    .iter()
+                    .filter(|c| !c.is_removed())
+                    .filter_map(|c| c.last_error_reset_at_ms)
+                    .min();
+                let total = g.creds.iter().filter(|c| !c.is_removed()).count();
+                warn!(
+                    target: "cortex::llm::credential_pool",
+                    provider = %self.provider,
+                    pool_size = total,
+                    next_recovery_at_ms = ?next,
+                    "credential pool exhausted"
+                );
+                g.emitted_exhausted_warn = true;
+            }
+            return None;
+        }
+
+        let strategy = g.strategy;
+        // `avail` is non-empty (checked above), so each strategy's selection
+        // is infallible. Use `?` so a future change to the empty-check above
+        // can't accidentally trigger a panic in production.
+        let picked_idx = match strategy {
+            CredentialStrategy::FillFirst => {
+                // Lowest-priority available.
+                *avail.iter().min_by_key(|&&i| g.creds[i].priority)?
+            }
+            CredentialStrategy::RoundRobin => {
+                // First available after the current one (by priority);
+                // after picking, rotate the picked entry to the back.
+                let after = g
+                    .current_id
+                    .as_ref()
+                    .and_then(|id| g.creds.iter().position(|c| &c.id == id));
+                match after {
+                    Some(cur_idx) => avail
+                        .iter()
+                        .find(|&&i| g.creds[i].priority > g.creds[cur_idx].priority)
+                        .or_else(|| avail.iter().min_by_key(|&&i| g.creds[i].priority))
+                        .copied()?,
+                    None => *avail.iter().min_by_key(|&&i| g.creds[i].priority)?,
+                }
+            }
+            CredentialStrategy::LeastUsed => *avail.iter().min_by(|&&a, &&b| {
+                g.creds[a]
+                    .use_count
+                    .cmp(&g.creds[b].use_count)
+                    .then(g.creds[a].priority.cmp(&g.creds[b].priority))
+            })?,
+            CredentialStrategy::Random => {
+                let mut rng = rand::rng();
+                *avail.choose(&mut rng)?
+            }
+        };
+
+        g.creds[picked_idx].use_count += 1;
+        let picked = g.creds[picked_idx].clone();
+        g.current_id = Some(picked.id.clone());
+        g.emitted_exhausted_warn = false;
+        debug!(
+            target: "cortex::llm::credential_pool",
+            id = %picked.id,
+            label = %picked.label,
+            strategy = %strategy,
+            "pick"
+        );
+        // Drop the guard before disk I/O — SQLite open+write can block other
+        // pool callers (lease/report/pick) and `acquire_lease` runs on every
+        // request in the failover loop.
+        drop(g);
+        self.persist_credential(&picked);
+        Some(picked)
+    }
+
+    /// Salvage attempt when every credential is cooling. Returns the credential
+    /// whose cooldown expires soonest (regardless of strategy). Used by the
+    /// failover loop as a last-gasp before propagating an exhaustion error.
+    /// Returns `None` only when every entry is removed.
+    pub fn pick_force(&self) -> Option<PooledCredential> {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let candidate = g
+            .creds
+            .iter()
+            .filter(|c| !c.is_removed())
+            .min_by_key(|c| {
+                // Cooling entries: soonest reset_at wins.
+                // Available entries: treat as i64::MIN so they're preferred.
+                c.last_error_reset_at_ms.unwrap_or(i64::MIN)
+            })
+            .cloned();
+        if let Some(ref c) = candidate {
+            g.current_id = Some(c.id.clone());
+            debug!(
+                target: "cortex::llm::credential_pool",
+                id = %c.id,
+                label = %c.label,
+                "pick_force"
+            );
+        }
+        candidate
+    }
+
+    /// Record a successful request against `credential_id`. Bumps `use_count`,
+    /// clears any prior error state, and resets any cooldown (a success means
+    /// the throttle lifted).
+    pub fn report_success(&self, credential_id: &str) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(c) = g.creds.iter_mut().find(|c| c.id == credential_id) else {
+            return;
+        };
+        if c.is_removed() {
+            return;
+        }
+        // `use_count` was already bumped at pick time; report_success is the
+        // "outcome arrived" hook. Don't double-bump.
+        c.last_status = CredentialStatus::Ok;
+        c.last_status_at_ms = Some(self.clock.now_ms());
+        c.last_error_code = None;
+        c.last_error_reason = None;
+        c.last_error_message = None;
+        c.last_error_reset_at_ms = None;
+        g.emitted_exhausted_warn = false;
+        let cred = g.creds.iter().find(|c| c.id == credential_id).cloned();
+        drop(g);
+        if let Some(c) = cred {
+            self.persist_credential(&c);
+        }
+    }
+
+    /// Record a failed request. Maps `reason` to the appropriate state
+    /// transition: Auth/AuthPermanent → soft-delete; RateLimit/Billing →
+    /// cooldown (via `retry_after` or configured TTL); everything else is
+    /// a no-op on the pool (transport / payload concerns).
+    pub fn report_failure(
+        &self,
+        credential_id: &str,
+        reason: FailoverReason,
+        status_code: Option<u16>,
+        retry_after: Option<Duration>,
+        error_message: Option<&str>,
+    ) {
+        let now = self.clock.now_ms();
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cooldown = g.cooldown;
+        let Some(c) = g.creds.iter_mut().find(|c| c.id == credential_id) else {
+            return;
+        };
+        if c.is_removed() {
+            return;
+        }
+        let truncated = error_message.map(truncate_error_msg);
+
+        match reason {
+            FailoverReason::Auth | FailoverReason::AuthPermanent => {
+                c.removed_at_ms = Some(now);
+                c.last_status = CredentialStatus::Exhausted;
+                c.last_status_at_ms = Some(now);
+                c.last_error_code = status_code;
+                c.last_error_reason = Some(reason.to_string());
+                c.last_error_message = truncated;
+                c.last_error_reset_at_ms = None;
+                info!(
+                    target: "cortex::llm::credential_pool",
+                    id = %c.id,
+                    label = %c.label,
+                    fingerprint = %c.fingerprint,
+                    reason = %reason,
+                    status_code = ?status_code,
+                    "credential removed (auth failure)"
+                );
+            }
+            FailoverReason::RateLimit | FailoverReason::Billing => {
+                let dur = retry_after
+                    .map(|d| d.as_secs().clamp(1, COOLDOWN_MAX_SECS))
+                    .unwrap_or_else(|| cooldown.as_secs().clamp(1, COOLDOWN_MAX_SECS));
+                let new_until = now + (dur as i64) * 1000;
+                // Extend, never shorten — a second 429 with a longer hint
+                // should win.
+                c.last_error_reset_at_ms = Some(match c.last_error_reset_at_ms {
+                    Some(existing) if existing > new_until => existing,
+                    _ => new_until,
+                });
+                c.last_status = CredentialStatus::Exhausted;
+                c.last_status_at_ms = Some(now);
+                c.last_error_code = status_code;
+                c.last_error_reason = Some(reason.to_string());
+                c.last_error_message = truncated;
+                info!(
+                    target: "cortex::llm::credential_pool",
+                    id = %c.id,
+                    reason = %reason,
+                    status_code = ?status_code,
+                    cooldown_secs = dur,
+                    "credential cooled"
+                );
+            }
+            _ => {
+                // Transport / payload / format / overflow — not a credential concern.
+            }
+        }
+
+        let cred = g.creds.iter().find(|c| c.id == credential_id).cloned();
+        drop(g);
+        if let Some(c) = cred {
+            self.persist_credential(&c);
+        }
+    }
+
+    /// Combined helper for the failover loop: rotates `current_id` away from
+    /// the just-failed credential after reporting the failure, then returns
+    /// the next pick. Mirrors Hermes' `mark_exhausted_and_rotate`.
+    pub fn mark_exhausted_and_rotate(
+        &self,
+        credential_id: &str,
+        reason: FailoverReason,
+        status_code: Option<u16>,
+        retry_after: Option<Duration>,
+        error_message: Option<&str>,
+    ) -> Option<PooledCredential> {
+        self.report_failure(
+            credential_id,
+            reason,
+            status_code,
+            retry_after,
+            error_message,
+        );
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if g.current_id.as_deref() == Some(credential_id) {
+                g.current_id = None;
+            }
+        }
+        self.pick()
+    }
+
+    /// Clear all `Exhausted` entries back to `Ok`. Does **not** touch removed
+    /// entries. Returns the count cleared. Persists.
+    pub fn reset_cooldowns(&self) -> usize {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cleared = 0;
+        for c in g.creds.iter_mut() {
+            if c.is_removed() {
+                continue;
+            }
+            if matches!(c.last_status, CredentialStatus::Exhausted) {
+                c.last_status = CredentialStatus::Ok;
+                c.last_error_reset_at_ms = None;
+                cleared += 1;
+            }
+        }
+        g.emitted_exhausted_warn = false;
+        let snapshot = g.creds.clone();
+        drop(g);
+        for c in &snapshot {
+            self.persist_credential(c);
+        }
+        cleared
+    }
+
+    /// Runtime strategy change. Persists nothing on its own — the LLM config
+    /// owns persistence of the strategy. Use this when an operator changes
+    /// `llm.credential_strategy` and we need the live pool to honor it.
+    pub fn set_strategy(&self, strategy: CredentialStrategy) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.strategy = strategy;
+    }
+
+    /// Add a credential at runtime. If the fingerprint already matches an
+    /// existing entry, returns that entry unchanged (idempotent).
+    ///
+    /// **Persistence note.** We intentionally never write plaintext keys to
+    /// the DB; a runtime-added `Manual` credential therefore *does not survive
+    /// restart*. The operator must also add the key to config or set the
+    /// matching env var if they want it to come back. (`CredentialSource::Env`
+    /// / `Config` survive restart via re-seeding.) Tombstones for any source
+    /// always survive — `remove_index` writes a suppression row.
+    pub fn add_entry(
+        &self,
+        key: String,
+        label: String,
+        source: CredentialSource,
+    ) -> PooledCredential {
+        let fingerprint = fingerprint(&key);
+        let now = self.clock.now_ms();
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = g.creds.iter().find(|c| c.fingerprint == fingerprint) {
+            return existing.clone();
+        }
+        // Assign a priority strictly above every existing entry (live or
+        // tombstoned) so priorities stay unique — tombstones keep their
+        // historical slot until pruned.
+        let priority = g
+            .creds
+            .iter()
+            .map(|c| c.priority)
+            .max()
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let cred = PooledCredential {
+            id: random_id(),
+            label,
+            priority,
+            source,
+            key,
+            fingerprint,
+            use_count: 0,
+            last_status: CredentialStatus::Ok,
+            last_status_at_ms: Some(now),
+            last_error_code: None,
+            last_error_reason: None,
+            last_error_message: None,
+            last_error_reset_at_ms: None,
+            removed_at_ms: None,
+        };
+        g.creds.push(cred.clone());
+        g.emitted_exhausted_warn = false;
+        drop(g);
+        self.persist_credential(&cred);
+        cred
+    }
+
+    /// Soft-delete by 1-based index. Also writes a suppression row so the
+    /// same source isn't re-seeded on next start. Returns the removed entry,
+    /// or `None` for an out-of-range index.
+    pub fn remove_index(&self, one_based: usize) -> Option<PooledCredential> {
+        if one_based == 0 {
+            return None;
+        }
+        let now = self.clock.now_ms();
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Convert 1-based to a position in `creds` ordered by current Vec layout.
+        let idx = one_based - 1;
+        if idx >= g.creds.len() {
+            return None;
+        }
+        let cred = &mut g.creds[idx];
+        if cred.is_removed() {
+            return Some(cred.clone());
+        }
+        cred.removed_at_ms = Some(now);
+        cred.key.clear();
+        let removed = cred.clone();
+        let source = removed.source.clone();
+        g.suppressed
+            .insert((source.kind_db().to_string(), source.value_db()));
+        drop(g);
+
+        self.persist_credential(&removed);
+        self.persist_suppression_row(&source, now);
+        Some(removed)
+    }
+
+    /// Resolve an operator-supplied target string to a (0-based-index, credential)
+    /// pair. Matching priority: id prefix → exact label → numeric 1-based index.
+    pub fn resolve_target(
+        &self,
+        target: &str,
+    ) -> std::result::Result<(usize, PooledCredential), ResolveError> {
+        let g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Try id (full or unique 4+ hex prefix).
+        let id_matches: Vec<usize> = g
+            .creds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.id == target || (target.len() >= 4 && c.id.starts_with(target)))
+            .map(|(i, _)| i)
+            .collect();
+        if id_matches.len() == 1 {
+            let i = id_matches[0];
+            return Ok((i, g.creds[i].clone()));
+        }
+        if id_matches.len() > 1 {
+            return Err(ResolveError::Ambiguous(target.into(), id_matches.len()));
+        }
+
+        // Try exact label.
+        let label_matches: Vec<usize> = g
+            .creds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.label == target)
+            .map(|(i, _)| i)
+            .collect();
+        if label_matches.len() == 1 {
+            let i = label_matches[0];
+            return Ok((i, g.creds[i].clone()));
+        }
+        if label_matches.len() > 1 {
+            return Err(ResolveError::Ambiguous(target.into(), label_matches.len()));
+        }
+
+        // Try 1-based numeric index.
+        if let Ok(n) = target.parse::<usize>() {
+            if n == 0 || n > g.creds.len() {
+                return Err(ResolveError::OutOfRange(n, g.creds.len()));
+            }
+            let i = n - 1;
+            return Ok((i, g.creds[i].clone()));
+        }
+
+        Err(ResolveError::NotFound(target.into()))
+    }
+
+    /// Acquire a lease on a credential, preferring below-cap entries by
+    /// `(active_leases, priority)` ascending. When every available credential
+    /// is at the cap, returns the least-leased anyway. Returns `None` only
+    /// when no non-removed credential exists or every credential is cooling
+    /// (after `pick_force` would still have returned a tombstone-only set).
+    pub fn acquire_lease(&self, requested_id: Option<&str>) -> Option<LeaseHandle> {
+        let now = self.clock.now_ms();
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Explicit-id path: requested key must exist and not be removed. The
+        // soft concurrency cap is *advisory* here (mirrors Hermes — explicit
+        // acquire bypasses the cap). Cooldown is also bypassed: the caller
+        // asked for this specific credential and the failover loop's
+        // `pick_force` path relies on this to attempt a salvage request
+        // against a still-cooling key.
+        if let Some(want) = requested_id {
+            let idx = g
+                .creds
+                .iter()
+                .position(|c| c.id == want && !c.is_removed())?;
+            g.creds[idx].use_count += 1;
+            let snapshot = g.creds[idx].clone();
+            let id = snapshot.id.clone();
+            let count = g.active_leases.entry(id.clone()).or_insert(0);
+            *count += 1;
+            g.current_id = Some(id.clone());
+            drop(g);
+            self.persist_credential(&snapshot);
+            return Some(LeaseHandle {
+                pool: self.inner.clone(),
+                credential_id: id,
+            });
+        }
+
+        let cap = g.max_concurrent_per_credential;
+        let available: Vec<usize> = g
+            .creds
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_available(now))
+            .map(|(i, _)| i)
+            .collect();
+        if available.is_empty() {
+            return None;
+        }
+        // Prefer below-cap by (leases, priority).
+        let below_cap: Vec<usize> = available
+            .iter()
+            .copied()
+            .filter(|&i| g.active_leases.get(&g.creds[i].id).copied().unwrap_or(0) < cap)
+            .collect();
+        // Pick from `below_cap` if any are under the cap; otherwise from
+        // `available` (every available credential is at the cap — return
+        // the least-leased anyway). `available` is non-empty (checked above).
+        let candidates: &[usize] = if below_cap.is_empty() {
+            &available
+        } else {
+            &below_cap
+        };
+        let pool_idx = candidates
+            .iter()
+            .min_by(|&&a, &&b| {
+                let la = g.active_leases.get(&g.creds[a].id).copied().unwrap_or(0);
+                let lb = g.active_leases.get(&g.creds[b].id).copied().unwrap_or(0);
+                la.cmp(&lb)
+                    .then(g.creds[a].priority.cmp(&g.creds[b].priority))
+            })
+            .copied()?;
+
+        g.creds[pool_idx].use_count += 1;
+        let snapshot = g.creds[pool_idx].clone();
+        let id = snapshot.id.clone();
+        let count = g.active_leases.entry(id.clone()).or_insert(0);
+        *count += 1;
+        g.current_id = Some(id.clone());
+        drop(g);
+        self.persist_credential(&snapshot);
+        Some(LeaseHandle {
+            pool: self.inner.clone(),
+            credential_id: id,
+        })
+    }
+}
+
+// ── LeaseHandle ───────────────────────────────────────────────────────────
+
+/// RAII guard for an active lease. Drop decrements the per-credential
+/// counter; never decrements below zero.
+pub struct LeaseHandle {
+    pool: Arc<Mutex<PoolInner>>,
+    credential_id: String,
+}
+
+impl LeaseHandle {
+    /// The leased credential's id.
+    pub fn id(&self) -> &str {
+        &self.credential_id
+    }
+
+    /// Snapshot of the leased credential. Returns `None` only if the
+    /// credential was concurrently removed from the pool (unusual).
+    pub fn credential(&self) -> Option<PooledCredential> {
+        let g = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.creds.iter().find(|c| c.id == self.credential_id).cloned()
+    }
+
+    /// Plaintext API key. Returns `None` for a tombstoned credential.
+    pub fn key(&self) -> Option<String> {
+        self.credential()
+            .filter(|c| !c.key.is_empty())
+            .map(|c| c.key)
+    }
+}
+
+impl Drop for LeaseHandle {
+    fn drop(&mut self) {
+        let mut g = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = g.active_leases.get_mut(&self.credential_id) {
+            if *count <= 1 {
+                g.active_leases.remove(&self.credential_id);
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+}
+
+// ── Persistence helpers ───────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct PersistedRow {
+    fingerprint: String,
+    id: String,
+    label: String,
+    priority: u32,
+    source_json: String,
+    use_count: u64,
+    last_status: String,
+    last_status_at_ms: Option<i64>,
+    last_error_code: Option<u16>,
+    last_error_reason: Option<String>,
+    last_error_message: Option<String>,
+    last_error_reset_at_ms: Option<i64>,
+    removed_at_ms: Option<i64>,
+}
+
+fn reconcile_or_new(
+    persisted: &HashMap<String, PersistedRow>,
+    fingerprint: String,
+    key: String,
+    label: String,
+    source: CredentialSource,
+    priority: u32,
+    now_ms: i64,
+) -> PooledCredential {
+    if let Some(row) = persisted.get(&fingerprint) {
+        // Auth-class removals (401/403) are sticky: even if the source is still
+        // present in config/env, the credential stays tombstoned until the
+        // operator runs `borg auth reset` or removes/replaces the source.
+        PooledCredential {
+            id: row.id.clone(),
+            label: row.label.clone(),
+            priority,
+            source: serde_json::from_str(&row.source_json).unwrap_or(source),
+            key: if row.removed_at_ms.is_some() {
+                String::new()
+            } else {
+                key
+            },
+            fingerprint,
+            use_count: row.use_count,
+            last_status: CredentialStatus::from_db(&row.last_status),
+            last_status_at_ms: row.last_status_at_ms,
+            last_error_code: row.last_error_code,
+            last_error_reason: row.last_error_reason.clone(),
+            last_error_message: row.last_error_message.clone(),
+            last_error_reset_at_ms: row.last_error_reset_at_ms,
+            removed_at_ms: row.removed_at_ms,
+        }
+    } else {
+        PooledCredential {
+            id: random_id(),
+            label,
+            priority,
+            source,
+            key,
+            fingerprint,
+            use_count: 0,
+            last_status: CredentialStatus::Ok,
+            last_status_at_ms: Some(now_ms),
+            last_error_code: None,
+            last_error_reason: None,
+            last_error_message: None,
+            last_error_reset_at_ms: None,
+            removed_at_ms: None,
+        }
+    }
+}
+
+fn upsert_row(conn: &rusqlite::Connection, provider: &str, c: &PooledCredential) -> Result<()> {
+    let source_json = serde_json::to_string(&c.source).context("serialize source")?;
+    conn.execute(
+        "INSERT INTO credential_pool
+             (provider, fingerprint, id, label, priority, source_json, use_count,
+              last_status, last_status_at_ms, last_error_code, last_error_reason,
+              last_error_message, last_error_reset_at_ms, removed_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(provider, fingerprint) DO UPDATE SET
+             id = excluded.id,
+             label = excluded.label,
+             priority = excluded.priority,
+             source_json = excluded.source_json,
+             use_count = excluded.use_count,
+             last_status = excluded.last_status,
+             last_status_at_ms = excluded.last_status_at_ms,
+             last_error_code = excluded.last_error_code,
+             last_error_reason = excluded.last_error_reason,
+             last_error_message = excluded.last_error_message,
+             last_error_reset_at_ms = excluded.last_error_reset_at_ms,
+             removed_at_ms = excluded.removed_at_ms",
+        params![
+            provider,
+            c.fingerprint,
+            c.id,
+            c.label,
+            c.priority as i64,
+            source_json,
+            c.use_count as i64,
+            c.last_status.as_db(),
+            c.last_status_at_ms,
+            c.last_error_code.map(|x| x as i64),
+            c.last_error_reason,
+            c.last_error_message,
+            c.last_error_reset_at_ms,
+            c.removed_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Write a single row, opening a short-lived connection. Used after the
+/// initial `load()` so we don't have to thread a long-lived rusqlite handle
+/// through `Arc<Mutex<…>>`.
+fn persist_one(db_path: &std::path::Path, provider: &str, c: &PooledCredential) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let _: i64 = conn.query_row("PRAGMA busy_timeout=5000", [], |r| r.get(0))?;
+    upsert_row(&conn, provider, c)
+}
+
+fn persist_suppression(
+    db_path: &std::path::Path,
+    provider: &str,
+    source: &CredentialSource,
+    now_ms: i64,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let _: i64 = conn.query_row("PRAGMA busy_timeout=5000", [], |r| r.get(0))?;
+    conn.execute(
+        "INSERT INTO credential_suppressions (provider, source_kind, source_value, suppressed_at_ms)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(provider, source_kind, source_value) DO UPDATE SET
+             suppressed_at_ms = excluded.suppressed_at_ms",
+        params![provider, source.kind_db(), source.value_db(), now_ms],
+    )?;
+    Ok(())
+}
+
+// ── Small utilities ───────────────────────────────────────────────────────
+
+/// 16-hex truncated BLAKE3 of the plaintext key. Stable identifier;
+/// reveals nothing about the key (one-way + truncation).
+pub fn fingerprint(key: &str) -> String {
+    let hash = blake3::hash(key.as_bytes());
+    let full = hash.to_hex();
+    full[..16].to_string()
+}
+
+fn random_id() -> String {
+    let mut rng = rand::rng();
+    let mut buf = [0u8; 4];
+    rng.fill(&mut buf);
+    // 8-hex (4 bytes ≈ 4.3B values). Matches the `borg auth list` ID column
+    // truncate and gives `resolve_target`'s 4-hex-prefix matcher real headroom.
+    const TBL: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(8);
+    for b in buf {
+        out.push(TBL[(b >> 4) as usize] as char);
+        out.push(TBL[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn truncate_error_msg(s: &str) -> String {
+    // Redact first — upstream error bodies occasionally echo the bearer
+    // token tail back, and `last_error_message` ends up on operator
+    // terminals via `borg auth list` (and into shell history).
+    let redacted = crate::secrets::redact_secrets(s);
+    if redacted.len() <= ERROR_MESSAGE_MAX_LEN {
+        return redacted;
+    }
+    let mut end = ERROR_MESSAGE_MAX_LEN;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated]", &redacted[..end])
+}
+
+/// Build a [`PoolLoadConfig`] from the primary `LlmConfig` plus the resolved
+/// provider. `api_keys` is resolved by the caller (which has the `SecretRef`
+/// chain) and passed in as already-plaintext entries.
+pub fn pool_load_config_for_provider(
+    provider: Provider,
+    strategy: CredentialStrategy,
+    cooldown_secs: u64,
+    max_concurrent_per_credential: u32,
+    config_entries: Vec<ConfigEntry>,
+) -> PoolLoadConfig {
+    let mut env_vars = vec![provider.default_env_var().to_string()];
+    if matches!(provider, Provider::Anthropic) {
+        // Anthropic users sometimes set both ANTHROPIC_API_KEY and
+        // CLAUDE_API_KEY; surface both so a typo doesn't dead-end the user.
+        for v in ["ANTHROPIC_AUTH_TOKEN", "CLAUDE_API_KEY"] {
+            if !env_vars.contains(&v.to_string()) {
+                env_vars.push(v.to_string());
+            }
+        }
+    }
+    PoolLoadConfig {
+        strategy,
+        cooldown_secs,
+        max_concurrent_per_credential,
+        config_entries,
+        env_vars,
+    }
+}
+
+/// Convenience: build a pool from already-resolved plaintext keys. Skips the
+/// `api_keys`-SecretRef-resolution dance — the caller already did it (see
+/// `Config::resolve_api_keys`). Best-effort: returns `None` if the DB path
+/// can't be resolved or the load fails. Logs at WARN on failure so prod
+/// regressions are observable.
+pub fn try_build_from_keys(
+    provider: Provider,
+    plaintext_keys: Vec<String>,
+    strategy: CredentialStrategy,
+    cooldown_secs: u64,
+    max_concurrent_per_credential: u32,
+) -> Option<Arc<CredentialPool>> {
+    let db_path = match crate::config::Config::db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                error = %e,
+                "credential pool: cannot resolve db path — falling through to legacy rotation"
+            );
+            return None;
+        }
+    };
+    let db = match Database::open_at(&db_path) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                error = %e,
+                "credential pool: cannot open DB — falling through to legacy rotation"
+            );
+            return None;
+        }
+    };
+    let config_entries: Vec<ConfigEntry> = plaintext_keys
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| ConfigEntry {
+            key: k,
+            label: None,
+            config_name: format!("llm.api_keys[{i}]"),
+        })
+        .collect();
+    let cfg = pool_load_config_for_provider(
+        provider,
+        strategy,
+        cooldown_secs,
+        max_concurrent_per_credential,
+        config_entries,
+    );
+    match CredentialPool::load(&db, &db_path, provider, cfg) {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                error = %e,
+                "credential pool: load failed — falling through to legacy rotation"
+            );
+            None
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[derive(Debug)]
+    struct TestClock {
+        now: AtomicI64,
+    }
+    impl TestClock {
+        fn new(start_ms: i64) -> Arc<Self> {
+            Arc::new(Self {
+                now: AtomicI64::new(start_ms),
+            })
+        }
+        fn advance(&self, d: Duration) {
+            self.now.fetch_add(d.as_millis() as i64, Ordering::SeqCst);
+        }
+    }
+    impl Clock for TestClock {
+        fn now_ms(&self) -> i64 {
+            self.now.load(Ordering::SeqCst)
+        }
+    }
+
+    fn open_test_db() -> (Database, std::path::PathBuf, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Database::open_at(&path).unwrap();
+        (db, path, dir)
+    }
+
+    fn cfg_with(keys: &[(&str, &str)]) -> PoolLoadConfig {
+        let entries = keys
+            .iter()
+            .enumerate()
+            .map(|(i, (lbl, k))| ConfigEntry {
+                key: (*k).into(),
+                label: Some((*lbl).into()),
+                config_name: format!("llm.api_keys[{i}]"),
+            })
+            .collect();
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            max_concurrent_per_credential: 1,
+            config_entries: entries,
+            env_vars: vec![],
+        }
+    }
+
+    // ── A1. Construction + load + seeding ──
+
+    #[test]
+    fn load_empty_config_no_env_yields_empty_pool() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            PoolLoadConfig {
+                strategy: CredentialStrategy::FillFirst,
+                cooldown_secs: 60,
+                max_concurrent_per_credential: 1,
+                config_entries: vec![],
+                env_vars: vec!["BORG_TEST_NEVER_SET_XYZ".into()],
+            },
+        )
+        .unwrap();
+        assert!(!pool.has_credentials());
+        assert!(pool.pick().is_none());
+    }
+
+    #[test]
+    fn load_with_one_manual_key_seeds_one_entry() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        assert_eq!(pool.entries().len(), 1);
+        assert_eq!(pool.entries()[0].label, "alpha");
+    }
+
+    #[test]
+    fn load_dedupes_same_key_under_two_refs() {
+        // Same plaintext key under two `SecretRef` entries collapses to one.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "samekey"), ("b", "samekey")]),
+        )
+        .unwrap();
+        assert_eq!(pool.entries().len(), 1);
+    }
+
+    #[test]
+    fn load_keeps_distinct_keys_separate() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        assert_eq!(pool.entries().len(), 2);
+    }
+
+    // ── A2. peek / pick per strategy ──
+
+    #[test]
+    fn fill_first_sticks_to_head() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        let first = pool.pick().unwrap();
+        let second = pool.pick().unwrap();
+        let third = pool.pick().unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.id, third.id);
+    }
+
+    #[test]
+    fn round_robin_rotates() {
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]);
+        cfg.strategy = CredentialStrategy::RoundRobin;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for _ in 0..9 {
+            let c = pool.pick().unwrap();
+            *counts.entry(c.id).or_insert(0) += 1;
+        }
+        for (_, v) in counts {
+            assert_eq!(v, 3);
+        }
+    }
+
+    #[test]
+    fn least_used_picks_lowest_count() {
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]);
+        cfg.strategy = CredentialStrategy::LeastUsed;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let mut seen: HashSet<String> = HashSet::new();
+        for _ in 0..3 {
+            seen.insert(pool.pick().unwrap().id);
+        }
+        // First three picks must touch every key.
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn random_spreads_picks() {
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]);
+        cfg.strategy = CredentialStrategy::Random;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let mut counts: HashMap<String, u32> = HashMap::new();
+        for _ in 0..600 {
+            *counts.entry(pool.pick().unwrap().id).or_insert(0) += 1;
+        }
+        for (_, v) in counts {
+            assert!(v > 100, "expected even-ish spread, got {v}");
+        }
+    }
+
+    // ── A3. report_failure transitions ──
+
+    #[test]
+    fn rate_limit_cools_entry() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+            clock.clone(),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, Some(429), None, None);
+        assert!(pool.is_exhausted());
+        clock.advance(Duration::from_secs(61));
+        assert!(!pool.is_exhausted());
+    }
+
+    #[test]
+    fn auth_failure_removes_permanently() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::Auth, Some(401), None, None);
+        let entries = pool.entries();
+        let removed = entries.iter().find(|c| c.id == cred.id).unwrap();
+        assert!(removed.is_removed());
+        // Pool still has the other key.
+        assert!(pool.has_available());
+    }
+
+    #[test]
+    fn auth_permanent_also_removes() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::AuthPermanent,
+            Some(403),
+            None,
+            None,
+        );
+        assert!(pool.entries()[0].is_removed());
+    }
+
+    #[test]
+    fn transport_errors_dont_mutate_pool() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        let baseline_use = pool.entries()[0].use_count;
+        for r in [
+            FailoverReason::Overloaded,
+            FailoverReason::Timeout,
+            FailoverReason::Format,
+            FailoverReason::ContextOverflow,
+            FailoverReason::PayloadTooLarge,
+            FailoverReason::ModelNotFound,
+            FailoverReason::Unknown,
+        ] {
+            pool.report_failure(&cred.id, r, None, None, None);
+        }
+        let after = &pool.entries()[0];
+        assert_eq!(after.use_count, baseline_use);
+        assert!(!after.is_removed());
+        assert!(matches!(after.last_status, CredentialStatus::Ok));
+    }
+
+    #[test]
+    fn retry_after_overrides_default_cooldown() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+            clock.clone(),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::RateLimit,
+            Some(429),
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        let until = pool.entries()[0].last_error_reset_at_ms.unwrap();
+        assert!(until >= 1_000_000 + 600_000);
+    }
+
+    #[test]
+    fn cooldown_extends_never_shortens() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+            clock.clone(),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        let long = pool.entries()[0].last_error_reset_at_ms.unwrap();
+        pool.report_failure(
+            &cred.id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        let after = pool.entries()[0].last_error_reset_at_ms.unwrap();
+        assert_eq!(after, long, "shorter cooldown must not win");
+    }
+
+    #[test]
+    fn report_failure_on_removed_is_noop() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::Auth, Some(401), None, None);
+        let removed_at = pool.entries()[0].removed_at_ms;
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, Some(429), None, None);
+        // No state change after the removal.
+        assert_eq!(pool.entries()[0].removed_at_ms, removed_at);
+        assert!(pool.entries()[0].last_error_reset_at_ms.is_none());
+    }
+
+    #[test]
+    fn error_message_truncates_at_cap() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        let big = "x".repeat(ERROR_MESSAGE_MAX_LEN * 3);
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, None, None, Some(&big));
+        let msg = pool.entries()[0].last_error_message.clone().unwrap();
+        assert!(msg.contains("truncated"));
+        assert!(msg.len() < big.len());
+    }
+
+    // ── A4. report_success ──
+
+    #[test]
+    fn success_clears_cooldown_and_error_state() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+            clock,
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, Some(429), None, None);
+        assert!(pool.is_exhausted());
+        pool.report_success(&cred.id);
+        let after = &pool.entries()[0];
+        assert!(matches!(after.last_status, CredentialStatus::Ok));
+        assert!(after.last_error_code.is_none());
+        assert!(after.last_error_reset_at_ms.is_none());
+        assert!(pool.has_available());
+    }
+
+    #[test]
+    fn success_on_removed_is_noop() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::Auth, Some(401), None, None);
+        pool.report_success(&cred.id);
+        assert!(pool.entries()[0].is_removed());
+    }
+
+    // ── A5. Exhaustion / recovery ──
+
+    #[test]
+    fn single_key_exhausts() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1")]),
+            clock.clone(),
+        )
+        .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, None, None, None);
+        assert!(pool.is_exhausted());
+        clock.advance(Duration::from_secs(61));
+        assert!(!pool.is_exhausted());
+    }
+
+    #[test]
+    fn next_recovery_at_returns_earliest() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+            clock,
+        )
+        .unwrap();
+        let entries = pool.entries();
+        pool.report_failure(
+            &entries[0].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(100)),
+            None,
+        );
+        pool.report_failure(
+            &entries[1].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(50)),
+            None,
+        );
+        let next = pool.next_recovery_at_ms().unwrap();
+        // Earliest = entry[1] at +50s.
+        assert!(next < 1_000_000 + 60_000);
+    }
+
+    // ── A6. pick_force ──
+
+    #[test]
+    fn pick_force_returns_soonest_recovery() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]),
+            clock,
+        )
+        .unwrap();
+        let entries = pool.entries();
+        pool.report_failure(
+            &entries[0].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(100)),
+            None,
+        );
+        pool.report_failure(
+            &entries[1].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(50)),
+            None,
+        );
+        pool.report_failure(
+            &entries[2].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(200)),
+            None,
+        );
+        let chosen = pool.pick_force().unwrap();
+        assert_eq!(chosen.id, entries[1].id);
+    }
+
+    #[test]
+    fn pick_force_returns_none_when_all_removed() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        for e in pool.entries() {
+            pool.report_failure(&e.id, FailoverReason::Auth, Some(401), None, None);
+        }
+        assert!(pool.pick_force().is_none());
+    }
+
+    // ── A8. reset_cooldowns ──
+
+    #[test]
+    fn reset_cooldowns_clears_exhausted_only() {
+        let (db, path, _g) = open_test_db();
+        let clock = TestClock::new(1_000_000);
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]),
+            clock,
+        )
+        .unwrap();
+        let entries = pool.entries();
+        pool.report_failure(&entries[0].id, FailoverReason::RateLimit, None, None, None);
+        pool.report_failure(&entries[1].id, FailoverReason::Auth, Some(401), None, None);
+        let cleared = pool.reset_cooldowns();
+        assert_eq!(cleared, 1);
+        // The removed entry stays removed.
+        let after = pool.entries();
+        assert!(after
+            .iter()
+            .find(|c| c.id == entries[1].id)
+            .unwrap()
+            .is_removed());
+        // The cooled entry is now Ok.
+        let zero = after.iter().find(|c| c.id == entries[0].id).unwrap();
+        assert!(matches!(zero.last_status, CredentialStatus::Ok));
+    }
+
+    #[test]
+    fn reset_cooldowns_idempotent() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, None, None, None);
+        let n1 = pool.reset_cooldowns();
+        let n2 = pool.reset_cooldowns();
+        assert_eq!(n1, 1);
+        assert_eq!(n2, 0);
+    }
+
+    // ── A9. Leasing ──
+
+    #[test]
+    fn acquire_lease_returns_below_cap_keys() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2"), ("c", "k3")]),
+        )
+        .unwrap();
+        let l1 = pool.acquire_lease(None).unwrap();
+        let l2 = pool.acquire_lease(None).unwrap();
+        let l3 = pool.acquire_lease(None).unwrap();
+        let ids: HashSet<String> = [&l1, &l2, &l3].iter().map(|l| l.id().to_string()).collect();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn lease_drop_decrements_counter() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        {
+            let _l = pool.acquire_lease(None).unwrap();
+        }
+        // After drop, a fresh lease still succeeds (counter decremented).
+        let _l2 = pool.acquire_lease(None).unwrap();
+    }
+
+    #[test]
+    fn acquire_lease_when_all_capped_still_returns_one() {
+        let (db, path, _g) = open_test_db();
+        let mut cfg = cfg_with(&[("a", "k1")]);
+        cfg.max_concurrent_per_credential = 1;
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+        let _l1 = pool.acquire_lease(None).unwrap();
+        let l2 = pool.acquire_lease(None);
+        // Single key + cap=1 still returns a lease (least-leased fallback),
+        // letting concurrent requests degrade gracefully rather than block.
+        assert!(l2.is_some());
+    }
+
+    #[test]
+    fn acquire_lease_unknown_id_returns_none() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        assert!(pool.acquire_lease(Some("bogus")).is_none());
+    }
+
+    // ── A10. add_entry / remove_index / resolve_target ──
+
+    #[test]
+    fn add_entry_appends_and_returns_idempotent_on_dup() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let added = pool.add_entry("k2".into(), "added".into(), CredentialSource::Manual);
+        assert_eq!(pool.entries().len(), 2);
+        let again = pool.add_entry("k2".into(), "ignored".into(), CredentialSource::Manual);
+        assert_eq!(again.id, added.id);
+        assert_eq!(pool.entries().len(), 2);
+    }
+
+    #[test]
+    fn remove_index_soft_deletes() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        let removed = pool.remove_index(1).unwrap();
+        assert!(removed.is_removed());
+        // At least one other entry remains pickable.
+        let live = pool
+            .entries()
+            .into_iter()
+            .filter(|c| !c.is_removed())
+            .count();
+        assert_eq!(live, 1);
+        assert!(pool.has_available());
+    }
+
+    #[test]
+    fn remove_index_out_of_range_returns_none() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        assert!(pool.remove_index(99).is_none());
+        assert!(pool.remove_index(0).is_none());
+    }
+
+    #[test]
+    fn resolve_target_by_label_index_and_id() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("primary", "k1"), ("backup", "k2")]),
+        )
+        .unwrap();
+        // By label.
+        let (_, c) = pool.resolve_target("backup").unwrap();
+        assert_eq!(c.label, "backup");
+        // By 1-based index.
+        let (_, c) = pool.resolve_target("1").unwrap();
+        assert_eq!(c.label, "primary");
+        // By id.
+        let id = pool.entries()[0].id.clone();
+        let (_, c) = pool.resolve_target(&id).unwrap();
+        assert_eq!(c.id, id);
+        // Unknown.
+        assert!(matches!(
+            pool.resolve_target("nope"),
+            Err(ResolveError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_target_ambiguous_label() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("same", "k1"), ("same", "k2")]),
+        )
+        .unwrap();
+        assert!(matches!(
+            pool.resolve_target("same"),
+            Err(ResolveError::Ambiguous(_, _))
+        ));
+    }
+
+    // ── A11. Persistence round-trip ──
+
+    #[test]
+    fn persistence_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let clock = TestClock::new(1_000_000);
+        {
+            let db = Database::open_at(&path).unwrap();
+            let pool = CredentialPool::load_with_clock(
+                &db,
+                &path,
+                Provider::OpenRouter,
+                cfg_with(&[("a", "k1"), ("b", "k2")]),
+                clock.clone(),
+            )
+            .unwrap();
+            // Pick once so 'a' gets a use_count bump that must round-trip.
+            let picked = pool.pick().unwrap();
+            assert_eq!(picked.label, "a");
+            let entries = pool.entries();
+            let other_id = entries.iter().find(|c| c.label == "b").unwrap().id.clone();
+            pool.report_failure(&other_id, FailoverReason::Auth, Some(401), None, None);
+            pool.report_success(&picked.id);
+        }
+        // Re-open; state should persist.
+        let db = Database::open_at(&path).unwrap();
+        let pool = CredentialPool::load_with_clock(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+            clock,
+        )
+        .unwrap();
+        let entries = pool.entries();
+        let removed = entries.iter().find(|c| c.label == "b").unwrap();
+        assert!(removed.is_removed());
+        let first = entries.iter().find(|c| c.label == "a").unwrap();
+        // use_count was bumped at pick() time.
+        assert!(first.use_count >= 1);
+    }
+
+    #[test]
+    fn remove_index_writes_suppression_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let var = "BORG_TEST_SUPPRESS_VAR";
+        std::env::set_var(var, "envkey-secret");
+        {
+            let db = Database::open_at(&path).unwrap();
+            let mut cfg = cfg_with(&[]);
+            cfg.env_vars = vec![var.to_string()];
+            let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+            assert_eq!(pool.entries().len(), 1);
+            pool.remove_index(1).unwrap();
+        }
+        // Re-load with the env var still set — suppression should win.
+        {
+            let db = Database::open_at(&path).unwrap();
+            let mut cfg = cfg_with(&[]);
+            cfg.env_vars = vec![var.to_string()];
+            let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+            let live = pool
+                .entries()
+                .into_iter()
+                .filter(|c| !c.is_removed())
+                .count();
+            assert_eq!(live, 0, "suppression should prevent re-seed");
+        }
+        std::env::remove_var(var);
+    }
+
+    // ── Misc ──
+
+    #[test]
+    fn fingerprint_is_stable_and_distinct() {
+        assert_eq!(fingerprint("abc"), fingerprint("abc"));
+        assert_ne!(fingerprint("abc"), fingerprint("abd"));
+        assert_eq!(fingerprint("abc").len(), 16);
+    }
+
+    #[test]
+    fn strategy_parses_and_roundtrips() {
+        use std::str::FromStr;
+        for s in ["fill_first", "round_robin", "least_used", "random"] {
+            let parsed = CredentialStrategy::from_str(s).unwrap();
+            assert_eq!(parsed.to_string(), s);
+        }
+        assert!(CredentialStrategy::from_str("nope").is_err());
+    }
+
+    #[test]
+    fn entries_includes_removed_tombstones() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        pool.remove_index(1);
+        let entries = pool.entries();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|c| c.is_removed()));
+    }
+
+    // ── Code-review regressions ──
+
+    /// `peek` must not bump use_count or set `current_id`. The spec contract
+    /// is "non-mutating preview"; tests pin it so a future refactor that
+    /// inlines `peek -> pick` doesn't sneak past review.
+    #[test]
+    fn peek_is_non_mutating() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        for _ in 0..5 {
+            let _ = pool.peek();
+        }
+        assert!(
+            pool.entries().iter().all(|c| c.use_count == 0),
+            "peek must not bump use_count"
+        );
+        assert!(pool.current().is_none(), "peek must not set current_id");
+    }
+
+    /// `acquire_lease(None)` must bump `use_count` — `LeastUsed` strategy
+    /// relies on it. Regression for the bug where the lease path silently
+    /// degraded LeastUsed to priority-only ordering.
+    #[test]
+    fn acquire_lease_bumps_use_count() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let lease = pool.acquire_lease(None).expect("lease");
+        drop(lease);
+        let count = pool.entries()[0].use_count;
+        assert_eq!(count, 1, "acquire_lease must bump use_count");
+    }
+
+    /// A credential removed by 401/403 must stay removed across restart even
+    /// when its env var is still set. Regression for the bug where
+    /// `reconcile_or_new` dropped `removed_at_ms` on re-seed.
+    #[test]
+    fn auth_removal_survives_reload_with_env_still_set() {
+        let (_db, path, _g) = open_test_db();
+        let var = "BORG_TEST_AUTH_STICKY";
+        std::env::set_var(var, "stickyk");
+        let cred_id = {
+            let db = Database::open_at(&path).unwrap();
+            let mut cfg = cfg_with(&[]);
+            cfg.env_vars = vec![var.to_string()];
+            let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+            let live = pool.entries().into_iter().next().unwrap();
+            pool.report_failure(
+                &live.id,
+                FailoverReason::Auth,
+                Some(401),
+                None,
+                Some("revoked"),
+            );
+            assert!(pool.entries()[0].is_removed());
+            live.id
+        };
+        // Re-load with the env var still present — removal must persist.
+        {
+            let db = Database::open_at(&path).unwrap();
+            let mut cfg = cfg_with(&[]);
+            cfg.env_vars = vec![var.to_string()];
+            let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg).unwrap();
+            let reloaded = pool
+                .entries()
+                .into_iter()
+                .find(|c| c.id == cred_id)
+                .expect("removed cred should still appear in entries");
+            assert!(
+                reloaded.is_removed(),
+                "401-removed cred must not resurrect when env var still set"
+            );
+        }
+        std::env::remove_var(var);
+    }
+
+    /// Plaintext `key` must never appear in `{:?}` output — accidental
+    /// tracing of a `PooledCredential` (or a parent `PoolInner`) cannot
+    /// leak the secret.
+    #[test]
+    fn debug_redacts_plaintext_key() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "supersecret-key-do-not-log")]),
+        )
+        .unwrap();
+        let cred = &pool.entries()[0];
+        let dbg_str = format!("{cred:?}");
+        assert!(
+            !dbg_str.contains("supersecret-key-do-not-log"),
+            "Debug must not include plaintext key: {dbg_str}"
+        );
+        assert!(dbg_str.contains("redacted"), "Debug must mark redaction");
+        // Also exercise the parent CredentialPool Debug (transitive through inner).
+        let parent_dbg = format!("{pool:?}");
+        assert!(
+            !parent_dbg.contains("supersecret-key-do-not-log"),
+            "CredentialPool Debug must not leak key transitively"
+        );
+    }
+}

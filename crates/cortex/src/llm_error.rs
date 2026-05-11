@@ -173,7 +173,9 @@ pub(crate) fn classify_status(
     body: &str,
     provider: Provider,
 ) -> LlmError {
-    let retry_after = parse_retry_after(body);
+    // Prefer the structured `retry_after` field; fall back to free-form body hints
+    // (`quotaResetDelay`, `resets_at`, "try again in N seconds", …).
+    let retry_after = parse_retry_after(body).or_else(|| parse_retry_hint_from_body(body));
     // Classifier predicates run on the raw body (their needles are intentionally
     // benign), but anything embedded in the user-visible error chain is sanitized
     // first — provider error bodies have leaked auth/billing context historically.
@@ -203,10 +205,29 @@ pub(crate) fn classify_status(
             source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
         },
-        402 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned {status} (billing error): {safe}"),
-            reason: FailoverReason::Billing,
-        },
+        402 => {
+            // 402 is overloaded — some providers return it for transient
+            // usage-limit windows that recover on their own, others for a
+            // hard credit-exhaustion. Both rotate, but the messaging differs.
+            let reason = classify_402(body);
+            let label = match reason {
+                FailoverReason::RateLimit => "usage limit",
+                _ => "billing error",
+            };
+            // Retry-after may be set when the 402 is a transient usage-limit.
+            if matches!(reason, FailoverReason::RateLimit) {
+                LlmError::Retryable {
+                    source: anyhow::anyhow!("{provider} returned {status} ({label}): {safe}"),
+                    retry_after,
+                    reason,
+                }
+            } else {
+                LlmError::Fatal {
+                    source: anyhow::anyhow!("{provider} returned {status} ({label}): {safe}"),
+                    reason,
+                }
+            }
+        }
         404 if body_indicates_no_allowed_providers(body) => LlmError::Fatal {
             source: anyhow::anyhow!(
                 "{provider} returned 404 (no allowed providers for model — check account provider preferences at https://openrouter.ai/settings/preferences): {safe}"
@@ -329,16 +350,238 @@ pub(crate) fn classify_network_error(err: anyhow::Error) -> LlmError {
     }
 }
 
-/// Extract a `retry_after` duration from a JSON error response body.
+/// Parse an HTTP `Retry-After` header value. RFC 7231 allows two forms:
+/// a delta in seconds (e.g. `"300"`) or an HTTP-date. We accept the seconds
+/// form (provider servers we talk to use it exclusively) and clamp to a
+/// 24-hour ceiling so a degenerate `Retry-After: 99999999` can't park a
+/// credential for a month.
+pub fn parse_retry_after_header(value: &str) -> Option<Duration> {
+    let secs: f64 = value.trim().parse().ok()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
+    Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+}
+
+/// Replace the `retry_after` field on a `Retryable` error with the supplied
+/// override. Used by the request path to plumb the HTTP `Retry-After` header
+/// in after `classify_status` has already inspected the body. Header wins
+/// when both are present (it's authoritative from the provider).
+pub(crate) fn override_retry_after(err: LlmError, override_value: Option<Duration>) -> LlmError {
+    let Some(ra) = override_value else {
+        return err;
+    };
+    match err {
+        LlmError::Retryable { source, reason, .. } => LlmError::Retryable {
+            source,
+            retry_after: Some(ra),
+            reason,
+        },
+        other => other,
+    }
+}
+
+/// Extract a `retry_after` duration from a JSON error response body. Applies
+/// the same finite/positive/24h-clamp guards as `parse_retry_after_header` so
+/// a degenerate `"retry_after": -1` or `999999999` doesn't park a credential
+/// for absurd durations.
 pub fn parse_retry_after(body: &str) -> Option<Duration> {
-    // Try to extract retry_after from JSON error body
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(secs) = v["error"]["retry_after"].as_f64() {
-            return Some(Duration::from_secs_f64(secs));
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let secs = v["error"]["retry_after"].as_f64()?;
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
+    Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+}
+
+/// Fallback extraction for free-form provider retry hints when the structured
+/// `retry_after` field is absent. Recognizes:
+///
+/// - JSON `reset_at` / `resets_at` / `retry_until` (top-level OR nested under
+///   `error.metadata.raw` — OpenRouter wraps upstream errors there).
+/// - Epoch seconds and epoch milliseconds (autodetected via magnitude).
+/// - ISO-8601 timestamps.
+/// - Free-form patterns in error messages: `quotaResetDelay: 2500ms` (Google),
+///   `try again in 5 minutes`, `retry after 45 seconds`.
+///
+/// Clamps the result to `[1s, 24h]` — defends against absurd hints like
+/// `retry_after: 999999999`.
+pub fn parse_retry_hint_from_body(body: &str) -> Option<Duration> {
+    if body.is_empty() {
+        return None;
+    }
+    let now = SystemTime::now();
+    let now_unix_ms = now
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)?;
+
+    let try_value = |v: &serde_json::Value| -> Option<Duration> {
+        // Try numeric (epoch s or ms).
+        if let Some(n) = v.as_f64() {
+            let ms = if n.abs() > 1_000_000_000_000.0 {
+                n as i64
+            } else {
+                (n * 1000.0) as i64
+            };
+            let delta_ms = ms - now_unix_ms;
+            if delta_ms > 0 {
+                return Some(clamp_retry(Duration::from_millis(delta_ms as u64)));
+            }
+            return None;
         }
+        // Try string (ISO-8601 or numeric-as-string).
+        if let Some(s) = v.as_str() {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(s) {
+                let ts_ms = ts.timestamp_millis();
+                let delta_ms = ts_ms - now_unix_ms;
+                if delta_ms > 0 {
+                    return Some(clamp_retry(Duration::from_millis(delta_ms as u64)));
+                }
+            }
+            if let Ok(n) = s.parse::<f64>() {
+                let ms = if n.abs() > 1_000_000_000_000.0 {
+                    n as i64
+                } else {
+                    (n * 1000.0) as i64
+                };
+                let delta_ms = ms - now_unix_ms;
+                if delta_ms > 0 {
+                    return Some(clamp_retry(Duration::from_millis(delta_ms as u64)));
+                }
+            }
+        }
+        None
+    };
+
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+
+    for key in ["reset_at", "resets_at", "retry_until"] {
+        if let Some(d) = try_value(&parsed[key]) {
+            return Some(d);
+        }
+        // Nested at error.metadata.raw (OpenRouter wraps upstream errors).
+        if let Some(d) = try_value(&parsed["error"]["metadata"]["raw"][key]) {
+            return Some(d);
+        }
+        // Sometimes the upstream body is a JSON-encoded string inside `raw`.
+        if let Some(s) = parsed["error"]["metadata"]["raw"].as_str() {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(s) {
+                if let Some(d) = try_value(&inner[key]) {
+                    return Some(d);
+                }
+                if let Some(d) = try_value(&inner["error"][key]) {
+                    return Some(d);
+                }
+            }
+        }
+    }
+
+    // Free-form patterns in `error.message` or root.
+    let msg_haystack = [
+        parsed["error"]["message"].as_str().unwrap_or(""),
+        parsed["message"].as_str().unwrap_or(""),
+        body,
+    ]
+    .join(" ");
+    let lower = msg_haystack.to_ascii_lowercase();
+
+    // Google quotaResetDelay
+    if let Some(d) = parse_unit_value(&lower, &["quotaresetdelay"]) {
+        return Some(clamp_retry(d));
+    }
+    // "try again in N units" / "retry after N units"
+    if let Some(d) = parse_unit_value(&lower, &["try again in", "retry after", "retry in"]) {
+        return Some(clamp_retry(d));
     }
     None
 }
+
+fn clamp_retry(d: Duration) -> Duration {
+    let secs = d.as_secs().clamp(1, 24 * 60 * 60);
+    Duration::from_secs(secs)
+}
+
+/// Scan `text` for any of `markers` and parse a duration following the marker.
+/// Accepts `ms`, `s`/`sec`/`seconds`, `m`/`min`/`minutes`, `h`/`hours`.
+fn parse_unit_value(text: &str, markers: &[&str]) -> Option<Duration> {
+    for marker in markers {
+        let Some(start) = text.find(marker) else {
+            continue;
+        };
+        let rest = &text[start + marker.len()..];
+        // Skip non-digit chars (colons, spaces, quotes).
+        let digits_start = rest.find(|c: char| c.is_ascii_digit())?;
+        let after = &rest[digits_start..];
+        let mut num = String::new();
+        for ch in after.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                num.push(ch);
+            } else {
+                break;
+            }
+        }
+        if num.is_empty() {
+            continue;
+        }
+        let n: f64 = num.parse().ok()?;
+        let tail = &after[num.len()..].trim_start();
+        let mult_ms: f64 = if tail.starts_with("ms") {
+            1.0
+        } else if tail.starts_with("hour") || tail.starts_with('h') {
+            3_600_000.0
+        } else if tail.starts_with("min") || tail.starts_with('m') {
+            60_000.0
+        } else {
+            // Default to seconds for "sec"/"s"/missing unit and any unrecognized
+            // unit suffix — matches Hermes' parser's permissive fallback.
+            1000.0
+        };
+        return Some(Duration::from_millis((n * mult_ms) as u64));
+    }
+    None
+}
+
+/// Disambiguate a 402 response between transient usage-limit windows
+/// (returns to service) and hard credit exhaustion (operator must act).
+/// Transient-style 402s are classified as `RateLimit` so the credential pool
+/// cools them; permanent-style 402s are classified as `Billing`.
+///
+/// Heuristic mirrors Hermes: usage/quota markers AND a transient signal
+/// (try-again / window / reset) → RateLimit; otherwise Billing.
+pub fn classify_402(error_msg: &str) -> FailoverReason {
+    let lower = error_msg.to_ascii_lowercase();
+    const USAGE_LIMIT_PATTERNS: &[&str] = &[
+        "usage limit",
+        "quota",
+        "limit exceeded",
+        "key limit exceeded",
+        "rate limit",
+    ];
+    const TRANSIENT_SIGNALS: &[&str] = &[
+        "try again",
+        "retry",
+        "resets at",
+        "reset in",
+        "reset_at",
+        "resets_at",
+        "wait",
+        "requests remaining",
+        "periodic",
+        "window",
+    ];
+    let has_usage_limit = USAGE_LIMIT_PATTERNS.iter().any(|p| lower.contains(p));
+    let has_transient = TRANSIENT_SIGNALS.iter().any(|p| lower.contains(p));
+    if has_usage_limit && has_transient {
+        FailoverReason::RateLimit
+    } else {
+        FailoverReason::Billing
+    }
+}
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 mod tests {
@@ -541,6 +784,107 @@ mod tests {
     #[test]
     fn parse_retry_after_empty_body() {
         assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn parse_retry_after_rejects_zero_and_negative() {
+        // Defends the cooldown floor — a hostile/degenerate `retry_after: -1`
+        // or `0` shouldn't unpark a credential immediately.
+        assert_eq!(parse_retry_after(r#"{"error":{"retry_after":0}}"#), None);
+        assert_eq!(parse_retry_after(r#"{"error":{"retry_after":-5}}"#), None);
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_to_24h() {
+        let dur =
+            parse_retry_after(r#"{"error":{"retry_after":999999999}}"#).expect("clamped, not None");
+        assert_eq!(dur, Duration::from_secs(24 * 60 * 60));
+    }
+
+    // ── parse_retry_after_header ──
+
+    #[test]
+    fn parse_retry_after_header_seconds_form() {
+        assert_eq!(
+            parse_retry_after_header("300"),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_header_with_whitespace() {
+        assert_eq!(
+            parse_retry_after_header(" 45 "),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_header_rejects_zero_and_negative() {
+        assert_eq!(parse_retry_after_header("0"), None);
+        assert_eq!(parse_retry_after_header("-5"), None);
+    }
+
+    #[test]
+    fn parse_retry_after_header_clamps_to_24h() {
+        // 99_999_999 seconds → clamped to 86_400 (24h).
+        let d = parse_retry_after_header("99999999").expect("clamped value");
+        assert_eq!(d, Duration::from_secs(86_400));
+    }
+
+    #[test]
+    fn parse_retry_after_header_rejects_non_numeric() {
+        // HTTP-date form is technically valid per RFC 7231 but we don't
+        // parse it — providers we talk to always emit the seconds form.
+        assert_eq!(
+            parse_retry_after_header("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(parse_retry_after_header(""), None);
+        assert_eq!(parse_retry_after_header("abc"), None);
+    }
+
+    // ── override_retry_after ──
+
+    #[test]
+    fn override_retry_after_replaces_on_retryable() {
+        let err = LlmError::Retryable {
+            source: anyhow::anyhow!("rate limited"),
+            retry_after: Some(Duration::from_secs(5)),
+            reason: FailoverReason::RateLimit,
+        };
+        let overridden = override_retry_after(err, Some(Duration::from_secs(300)));
+        if let LlmError::Retryable { retry_after, .. } = overridden {
+            assert_eq!(retry_after, Some(Duration::from_secs(300)));
+        } else {
+            panic!("variant preserved");
+        }
+    }
+
+    #[test]
+    fn override_retry_after_noop_when_override_is_none() {
+        let err = LlmError::Retryable {
+            source: anyhow::anyhow!("rate limited"),
+            retry_after: Some(Duration::from_secs(5)),
+            reason: FailoverReason::RateLimit,
+        };
+        let kept = override_retry_after(err, None);
+        if let LlmError::Retryable { retry_after, .. } = kept {
+            assert_eq!(retry_after, Some(Duration::from_secs(5)));
+        } else {
+            panic!("variant preserved");
+        }
+    }
+
+    #[test]
+    fn override_retry_after_passthrough_on_fatal() {
+        let err = LlmError::Fatal {
+            source: anyhow::anyhow!("auth"),
+            reason: FailoverReason::Auth,
+        };
+        // Fatal variants don't carry retry_after — override should be a no-op.
+        let kept = override_retry_after(err, Some(Duration::from_secs(300)));
+        assert!(matches!(kept, LlmError::Fatal { .. }));
     }
 
     // ── classify_status with retry_after in body ──
@@ -829,5 +1173,159 @@ mod tests {
         } else {
             panic!("expected Retryable");
         }
+    }
+
+    // ── parse_retry_hint_from_body ──
+
+    #[test]
+    fn retry_hint_empty_body_is_none() {
+        assert!(parse_retry_hint_from_body("").is_none());
+    }
+
+    #[test]
+    fn retry_hint_iso8601_resets_at() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(300);
+        let body = format!(r#"{{"resets_at":"{}"}}"#, future.to_rfc3339());
+        let d = parse_retry_hint_from_body(&body).expect("should parse");
+        assert!(
+            d.as_secs() >= 298 && d.as_secs() <= 301,
+            "got {}",
+            d.as_secs()
+        );
+    }
+
+    #[test]
+    fn retry_hint_epoch_seconds() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = format!(r#"{{"resets_at":{}}}"#, now + 120);
+        let d = parse_retry_hint_from_body(&body).expect("should parse");
+        assert!(d.as_secs() >= 118 && d.as_secs() <= 121);
+    }
+
+    #[test]
+    fn retry_hint_epoch_millis_autodetected() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let body = format!(r#"{{"resets_at":{}}}"#, now_ms + 60_000);
+        let d = parse_retry_hint_from_body(&body).expect("should parse");
+        assert!(d.as_secs() >= 58 && d.as_secs() <= 61);
+    }
+
+    #[test]
+    fn retry_hint_quota_reset_delay_ms() {
+        let body = r#"{"error":{"message":"quotaResetDelay: 2500ms"}}"#;
+        let d = parse_retry_hint_from_body(body).expect("should parse");
+        // clamp_retry enforces a 1s floor.
+        assert!(d.as_secs() >= 1);
+    }
+
+    #[test]
+    fn retry_hint_quota_reset_delay_seconds() {
+        let body = r#"{"error":{"message":"quotaResetDelay: 30s"}}"#;
+        let d = parse_retry_hint_from_body(body).expect("should parse");
+        assert_eq!(d.as_secs(), 30);
+    }
+
+    #[test]
+    fn retry_hint_try_again_in_minutes() {
+        let body = r#"{"error":{"message":"please try again in 5 minutes"}}"#;
+        let d = parse_retry_hint_from_body(body).expect("should parse");
+        assert_eq!(d.as_secs(), 300);
+    }
+
+    #[test]
+    fn retry_hint_retry_after_seconds() {
+        let body = r#"{"error":{"message":"please retry after 45 seconds"}}"#;
+        let d = parse_retry_hint_from_body(body).expect("should parse");
+        assert_eq!(d.as_secs(), 45);
+    }
+
+    #[test]
+    fn retry_hint_past_timestamp_is_none() {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let body = format!(r#"{{"resets_at":"{}"}}"#, past.to_rfc3339());
+        assert!(parse_retry_hint_from_body(&body).is_none());
+    }
+
+    #[test]
+    fn retry_hint_clamps_to_24h() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 5 days in the future — must clamp to 24h.
+        let body = format!(r#"{{"resets_at":{}}}"#, now + 5 * 86_400);
+        let d = parse_retry_hint_from_body(&body).expect("should parse");
+        assert_eq!(d.as_secs(), 24 * 60 * 60);
+    }
+
+    #[test]
+    fn retry_hint_malformed_json_no_panic() {
+        // Body is not JSON but contains a free-form hint.
+        let d = parse_retry_hint_from_body("not json, try again in 30 seconds");
+        assert_eq!(d, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn retry_hint_openrouter_wrapped() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let inner = format!(r#"{{"error":{{"resets_at":{}}}}}"#, now + 90);
+        let body = format!(
+            r#"{{"error":{{"message":"upstream","metadata":{{"raw":{}}}}}}}"#,
+            serde_json::to_string(&inner).unwrap()
+        );
+        let d = parse_retry_hint_from_body(&body).expect("should parse");
+        assert!(d.as_secs() >= 88 && d.as_secs() <= 92);
+    }
+
+    // ── classify_402 ──
+
+    #[test]
+    fn classify_402_usage_limit_transient_is_rate_limit() {
+        assert_eq!(
+            classify_402("usage limit reached, try again in 5 minutes"),
+            FailoverReason::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_402_credit_exhausted_is_billing() {
+        assert_eq!(
+            classify_402("credit balance exhausted"),
+            FailoverReason::Billing
+        );
+    }
+
+    #[test]
+    fn classify_402_plain_payment_required_is_billing() {
+        assert_eq!(classify_402("payment required"), FailoverReason::Billing);
+    }
+
+    #[test]
+    fn classify_402_quota_resets_in_is_rate_limit() {
+        assert_eq!(
+            classify_402("quota exceeded; resets at 2026-05-12"),
+            FailoverReason::RateLimit
+        );
+    }
+
+    #[test]
+    fn classify_status_402_with_transient_phrasing_is_retryable() {
+        let body = r#"{"error":{"message":"usage limit reached, try again in 60 seconds"}}"#;
+        let err = classify_status(
+            reqwest::StatusCode::PAYMENT_REQUIRED,
+            body,
+            Provider::OpenRouter,
+        );
+        assert!(err.is_retryable(), "transient 402 should be retryable");
+        assert_eq!(err.reason(), FailoverReason::RateLimit);
     }
 }

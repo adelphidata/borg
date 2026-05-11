@@ -13,20 +13,22 @@ use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
-    admin_server::Admin, ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus,
-    ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSender,
-    ApprovedSenderList, ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest,
-    CreateWebhookResponse, DaemonStatus, DoctorSquelchClearRequest, DoctorSquelchClearResponse,
-    DoctorSquelchSetRequest, DreamReport, Empty, ExportSessionRequest, ExportSessionResponse,
-    GetScheduledTaskRunsRequest, HealReport, HeartbeatEvent as PbHeartbeatEvent,
-    IssueClientTokenRequest, IssueClientTokenResponse, KeychainRef, LogActivityRequest,
-    MessageView, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
-    PairingFilter, PairingRequest, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
-    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    admin_server::Admin, ActivityLogQuery, ActivityLogText, AddCredentialRequest,
+    AddProviderRequest, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue,
+    ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
+    CreateWebhookRequest, CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
+    DoctorSquelchClearRequest, DoctorSquelchClearResponse, DoctorSquelchSetRequest, DreamReport,
+    Empty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
+    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
+    KeychainRef, ListCredentialsRequest, LogActivityRequest, MessageView, MonthlyTokenTotal,
+    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequest,
+    PairingRequestList, PluginInstallRequest, PluginInstallResponse, ProviderCredentials,
+    RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
+    ResetCredentialsResponse, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
     ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRun,
     ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef,
-    SessionSummary, SettingEntry, SettingKey, SettingMutation, SettingsSnapshot,
-    TriggerHeartbeatRequest, WarningList, WebhookRef,
+    SessionSummary, SetCredentialStrategyRequest, SettingEntry, SettingKey, SettingMutation,
+    SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -1350,6 +1352,158 @@ impl Admin for AdminSvc {
         .map_err(|e| TStatus::internal(format!("doctor_squelch_clear failed: {e}")))?;
         Ok(Response::new(DoctorSquelchClearResponse { removed }))
     }
+
+    // ── Credential pool ─────────────────────────────────────────────────
+    //
+    // The pool's persisted state is the source of truth: each mutation
+    // writes the SQLite row; running `LlmClient`s see the change on their
+    // next pool reload (config-notify path) or restart.
+    //
+    // Today these RPCs operate on the **primary** provider only — the
+    // configured `llm.provider` plus its `llm.api_keys`. Fallback-provider
+    // admin will land alongside per-slot strategy/cooldown settings.
+    async fn list_credentials(
+        &self,
+        req: Request<ListCredentialsRequest>,
+    ) -> Result<Response<CredentialList>, TStatus> {
+        let req = req.into_inner();
+        let providers =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ProviderCredentials>> {
+                let db = Database::open()?;
+                let config = cortex::config::Config::load_from_db()?;
+                let pool = build_primary_pool(&config, &db)?;
+                if !req.provider.is_empty() && !pool_provider_matches(&pool, &req.provider) {
+                    return Ok(vec![]);
+                }
+                Ok(vec![credential_pool_to_proto(&config, &pool)])
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("list_credentials task panicked: {e}")))?
+            .map_err(|e| TStatus::internal(format!("list_credentials failed: {e}")))?;
+        Ok(Response::new(CredentialList { providers }))
+    }
+
+    async fn add_credential(
+        &self,
+        req: Request<AddCredentialRequest>,
+    ) -> Result<Response<CredentialEntry>, TStatus> {
+        let req = req.into_inner();
+        let key = req.key.trim().to_string();
+        if key.is_empty() {
+            return Err(TStatus::invalid_argument("key must not be empty"));
+        }
+        let provider = req.provider;
+        let label_in = req.label;
+        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<CredentialEntry> {
+            let db = Database::open()?;
+            let config = cortex::config::Config::load_from_db()?;
+            let pool = build_primary_pool(&config, &db)?;
+            require_provider_match(&pool, &provider)?;
+            let label = if label_in.trim().is_empty() {
+                format!("manual-{}", pool.entries().len() + 1)
+            } else {
+                label_in.trim().to_string()
+            };
+            let cred = pool.add_entry(
+                key,
+                label,
+                cortex::llm::credential_pool::CredentialSource::Manual,
+            );
+            Ok(pooled_to_proto(pool.provider_str(), &cred))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("add_credential task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("add_credential: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
+        Ok(Response::new(entry))
+    }
+
+    async fn remove_credential(
+        &self,
+        req: Request<RemoveCredentialRequest>,
+    ) -> Result<Response<CredentialEntry>, TStatus> {
+        let req = req.into_inner();
+        if req.target.trim().is_empty() {
+            return Err(TStatus::invalid_argument("target must not be empty"));
+        }
+        let entry = tokio::task::spawn_blocking(move || -> anyhow::Result<CredentialEntry> {
+            let db = Database::open()?;
+            let config = cortex::config::Config::load_from_db()?;
+            let pool = build_primary_pool(&config, &db)?;
+            require_provider_match(&pool, &req.provider)?;
+            let (idx_zero, _existing) = pool
+                .resolve_target(&req.target)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let removed = pool
+                .remove_index(idx_zero + 1)
+                .ok_or_else(|| anyhow::anyhow!("index out of range after resolve"))?;
+            Ok(pooled_to_proto(pool.provider_str(), &removed))
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("remove_credential task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("remove_credential: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
+        Ok(Response::new(entry))
+    }
+
+    async fn reset_credentials(
+        &self,
+        req: Request<ResetCredentialsRequest>,
+    ) -> Result<Response<ResetCredentialsResponse>, TStatus> {
+        let req = req.into_inner();
+        let cleared = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let db = Database::open()?;
+            let config = cortex::config::Config::load_from_db()?;
+            let pool = build_primary_pool(&config, &db)?;
+            require_provider_match(&pool, &req.provider)?;
+            Ok(pool.reset_cooldowns() as u64)
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("reset_credentials task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("reset_credentials: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
+        Ok(Response::new(ResetCredentialsResponse { cleared }))
+    }
+
+    async fn set_credential_strategy(
+        &self,
+        req: Request<SetCredentialStrategyRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        // Validate input early so we don't write garbage to settings.
+        use std::str::FromStr;
+        cortex::llm::credential_pool::CredentialStrategy::from_str(&req.strategy).map_err(
+            |_| {
+                TStatus::invalid_argument(format!(
+                    "unknown strategy `{}` — try fill_first, round_robin, least_used, random",
+                    req.strategy
+                ))
+            },
+        )?;
+        let provider = req.provider;
+        let strategy_value = req.strategy;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let db = Database::open()?;
+            let config = cortex::config::Config::load_from_db()?;
+            let pool = build_primary_pool(&config, &db)?;
+            require_provider_match(&pool, &provider)?;
+            // Persist via the settings registry so it's restart-stable, and
+            // notify the runtime config reload so the live LlmClient picks
+            // up the new strategy on its next rebuild.
+            let resolver = cortex::settings::SettingsResolver::load()?;
+            // The `json_quoted` setter wraps the value itself before
+            // deserializing — we pass the raw variant string.
+            resolver
+                .set("llm.credential_strategy", &strategy_value)
+                .map_err(|e| anyhow::anyhow!("set llm.credential_strategy: {e}"))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("set_credential_strategy task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("set_credential_strategy: {e}")))?;
+        notify_runtime_config_reload(&self.config_notify_tx);
+        Ok(Response::new(Empty {}))
+    }
 }
 
 fn notify_runtime_config_reload(
@@ -1465,5 +1619,104 @@ fn approved_sender_row_to_proto(r: cortex::db::ApprovedSenderRow) -> ApprovedSen
         sender_id: r.sender_id,
         display_name: r.display_name.unwrap_or_default(),
         approved_at: r.approved_at as u64,
+    }
+}
+
+// ── Credential pool helpers ─────────────────────────────────────────────
+
+fn build_primary_pool(
+    config: &cortex::config::Config,
+    _db: &cortex::db::Database,
+) -> anyhow::Result<std::sync::Arc<cortex::llm::credential_pool::CredentialPool>> {
+    let (provider, keys) = config.resolve_api_keys()?;
+    let pool = cortex::llm::credential_pool::try_build_from_keys(
+        provider,
+        keys,
+        config.llm.credential_strategy,
+        config.llm.credential_cooldown_secs,
+        config.llm.max_concurrent_per_credential,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not build credential pool for primary provider — check DB path and llm.api_keys config"
+        )
+    })?;
+    Ok(pool)
+}
+
+fn pool_provider_matches(
+    pool: &cortex::llm::credential_pool::CredentialPool,
+    requested: &str,
+) -> bool {
+    let req = requested.trim().to_ascii_lowercase();
+    req.is_empty() || pool.provider_str().eq_ignore_ascii_case(&req)
+}
+
+fn require_provider_match(
+    pool: &cortex::llm::credential_pool::CredentialPool,
+    requested: &str,
+) -> anyhow::Result<()> {
+    if pool_provider_matches(pool, requested) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "provider `{}` is not the configured primary (`{}`) — fallback-provider admin is not yet wired",
+            requested,
+            pool.provider_str()
+        ))
+    }
+}
+
+fn credential_pool_to_proto(
+    config: &cortex::config::Config,
+    pool: &cortex::llm::credential_pool::CredentialPool,
+) -> ProviderCredentials {
+    let entries = pool
+        .entries()
+        .iter()
+        .map(|c| pooled_to_proto(pool.provider_str(), c))
+        .collect();
+    ProviderCredentials {
+        provider: pool.provider_str().to_string(),
+        strategy: config.llm.credential_strategy.to_string(),
+        cooldown_secs: pool.cooldown_secs(),
+        max_concurrent_per_credential: pool.max_concurrent_per_credential(),
+        entries,
+    }
+}
+
+fn pooled_to_proto(
+    provider: &str,
+    c: &cortex::llm::credential_pool::PooledCredential,
+) -> CredentialEntry {
+    let (source_kind, source_value) = match &c.source {
+        cortex::llm::credential_pool::CredentialSource::Manual => ("manual", String::new()),
+        cortex::llm::credential_pool::CredentialSource::Env { var } => ("env", var.clone()),
+        cortex::llm::credential_pool::CredentialSource::Config { name } => ("config", name.clone()),
+    };
+    let status = if c.is_removed() {
+        "removed"
+    } else {
+        match c.last_status {
+            cortex::llm::credential_pool::CredentialStatus::Ok => "ok",
+            cortex::llm::credential_pool::CredentialStatus::Exhausted => "exhausted",
+        }
+    };
+    CredentialEntry {
+        id: c.id.clone(),
+        label: c.label.clone(),
+        provider: provider.to_string(),
+        priority: c.priority,
+        source_kind: source_kind.to_string(),
+        source_value,
+        fingerprint: c.fingerprint.clone(),
+        use_count: c.use_count,
+        status: status.to_string(),
+        last_status_at_ms: c.last_status_at_ms.unwrap_or(0),
+        last_error_code: c.last_error_code.map(u32::from).unwrap_or(0),
+        last_error_reason: c.last_error_reason.clone().unwrap_or_default(),
+        last_error_message: c.last_error_message.clone().unwrap_or_default(),
+        last_error_reset_at_ms: c.last_error_reset_at_ms.unwrap_or(0),
+        removed_at_ms: c.removed_at_ms.unwrap_or(0),
     }
 }

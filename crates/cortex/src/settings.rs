@@ -1007,4 +1007,86 @@ mod tests {
             let _value = extractor(&config);
         }
     }
+
+    // ── Credential pool settings round-trip ───────────────────────────
+    //
+    // Each strategy variant must round-trip through the resolver. A future
+    // refactor that drops a variant from the `json_quoted` parser would
+    // surface here as a failing arm, not as silent loss of `random`/etc.
+
+    #[test]
+    fn credential_strategy_round_trips_every_variant() {
+        use crate::llm::credential_pool::CredentialStrategy;
+        // `json_quoted` adds the JSON quoting itself, so the operator-supplied
+        // value is the raw enum variant string.
+        let cases: &[(&str, CredentialStrategy)] = &[
+            ("fill_first", CredentialStrategy::FillFirst),
+            ("round_robin", CredentialStrategy::RoundRobin),
+            ("least_used", CredentialStrategy::LeastUsed),
+            ("random", CredentialStrategy::Random),
+        ];
+        for (db_value, expected) in cases {
+            let resolver = test_resolver();
+            resolver
+                .set("llm.credential_strategy", db_value)
+                .unwrap_or_else(|e| panic!("set {db_value}: {e}"));
+            let cfg = resolver.resolve().unwrap();
+            assert_eq!(
+                cfg.llm.credential_strategy, *expected,
+                "{db_value} should resolve to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn credential_strategy_rejects_garbage() {
+        let resolver = test_resolver();
+        assert!(
+            resolver.set("llm.credential_strategy", "sideways").is_err(),
+            "unknown strategy should be rejected at set-time"
+        );
+    }
+
+    #[test]
+    fn credential_cooldown_secs_round_trips_at_boundaries() {
+        let resolver = test_resolver();
+        for raw in &["0", "60", "86400"] {
+            resolver.set("llm.credential_cooldown_secs", raw).unwrap();
+            let cfg = resolver.resolve().unwrap();
+            assert_eq!(
+                cfg.llm.credential_cooldown_secs,
+                raw.parse::<u64>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn credential_cooldown_rejects_negative() {
+        let resolver = test_resolver();
+        assert!(
+            resolver.set("llm.credential_cooldown_secs", "-1").is_err(),
+            "negative cooldown should be rejected"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_per_credential_rejects_zero() {
+        let resolver = test_resolver();
+        assert!(
+            resolver
+                .set("llm.max_concurrent_per_credential", "0")
+                .is_err(),
+            "max concurrent must be nonzero — zero would dead-end every lease"
+        );
+    }
+
+    #[test]
+    fn max_concurrent_per_credential_accepts_positive() {
+        let resolver = test_resolver();
+        resolver
+            .set("llm.max_concurrent_per_credential", "4")
+            .unwrap();
+        let cfg = resolver.resolve().unwrap();
+        assert_eq!(cfg.llm.max_concurrent_per_credential, 4);
+    }
 }

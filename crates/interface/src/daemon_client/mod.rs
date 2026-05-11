@@ -22,18 +22,20 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use protocols::admin::admin_client::AdminClient;
 use protocols::admin::{
-    ActivityLogQuery, ActivityLogText, AddProviderRequest, AmbientStatus, ApiKeyList, ApiKeyRef,
-    ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
-    CreateWebhookRequest, CreateWebhookResponse, DaemonStatus, DoctorSquelchClearRequest,
+    ActivityLogQuery, ActivityLogText, AddCredentialRequest, AddProviderRequest, AmbientStatus,
+    ApiKeyList, ApiKeyRef, ApiKeyValue, ApprovalGreetingRequest, ApprovedSenderList,
+    ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest, CreateWebhookResponse,
+    CredentialEntry, CredentialList, DaemonStatus, DoctorSquelchClearRequest,
     DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty, ExportSessionRequest,
     ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost, OnboardingState, PairingApproval,
-    PairingFilter, PairingRequestList, PluginInstallRequest, PluginInstallResponse,
-    RemoveProviderRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
-    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
-    ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SettingKey, SettingMutation,
-    SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
+    ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost,
+    OnboardingState, PairingApproval, PairingFilter, PairingRequestList, PluginInstallRequest,
+    PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
+    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
+    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
+    SessionRef, SetCredentialStrategyRequest, SettingKey, SettingMutation, SettingsSnapshot,
+    TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -1422,5 +1424,82 @@ impl DaemonClient {
             .context("Admin.DoctorSquelchClear failed")?
             .into_inner()
             .removed)
+    }
+
+    // ── Credential pool ────────────────────────────────────────────────
+
+    /// List credential pools. `provider` empty = all configured providers.
+    pub async fn list_credentials(&mut self, provider: Option<&str>) -> Result<CredentialList> {
+        Ok(self
+            .admin
+            .list_credentials(ListCredentialsRequest {
+                provider: provider.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.ListCredentials failed")?
+            .into_inner())
+    }
+
+    /// Add a credential to a pool. Returns the persisted entry with its
+    /// fingerprint (plaintext key is not echoed back).
+    pub async fn add_credential(
+        &mut self,
+        provider: &str,
+        key: &str,
+        label: Option<&str>,
+    ) -> Result<CredentialEntry> {
+        Ok(self
+            .admin
+            .add_credential(AddCredentialRequest {
+                provider: provider.to_string(),
+                key: key.to_string(),
+                label: label.unwrap_or("").to_string(),
+            })
+            .await
+            .context("Admin.AddCredential failed")?
+            .into_inner())
+    }
+
+    /// Remove a credential (soft-delete + write suppression row).
+    pub async fn remove_credential(
+        &mut self,
+        provider: &str,
+        target: &str,
+    ) -> Result<CredentialEntry> {
+        Ok(self
+            .admin
+            .remove_credential(RemoveCredentialRequest {
+                provider: provider.to_string(),
+                target: target.to_string(),
+            })
+            .await
+            .context("Admin.RemoveCredential failed")?
+            .into_inner())
+    }
+
+    /// Clear all cooled credentials. Returns the count cleared (does not
+    /// touch removed entries).
+    pub async fn reset_credentials(&mut self, provider: &str) -> Result<u64> {
+        Ok(self
+            .admin
+            .reset_credentials(ResetCredentialsRequest {
+                provider: provider.to_string(),
+            })
+            .await
+            .context("Admin.ResetCredentials failed")?
+            .into_inner()
+            .cleared)
+    }
+
+    /// Change the selection strategy.
+    pub async fn set_credential_strategy(&mut self, provider: &str, strategy: &str) -> Result<()> {
+        self.admin
+            .set_credential_strategy(SetCredentialStrategyRequest {
+                provider: provider.to_string(),
+                strategy: strategy.to_string(),
+            })
+            .await
+            .context("Admin.SetCredentialStrategy failed")?;
+        Ok(())
     }
 }

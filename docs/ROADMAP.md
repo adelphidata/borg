@@ -142,10 +142,6 @@ top-down by priority, not by section order.
   `timeout` / `context_length`) returning a structured `FailoverReason`
   that drives recovery strategy. Replaces the scattered string-matching
   spread across provider modules today.
-- **Credential pool with exhaustion tracking.** `[H]` Multiple
-  credentials per provider with cooldown TTL, auto-rotation on 402/429,
-  and selectable strategy (`round_robin` / `least_used` / `fill_first`).
-  Today a single exhausted key dead-ends the provider.
 - **`run.attempt` metadata in logs.** `[O]` Tag each line in
   `~/.borg/logs/{date}.jsonl` with the retry attempt number so
   duplicated tool calls or agent turns are correlatable when grepping.

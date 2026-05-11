@@ -879,4 +879,38 @@ CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_open
     ON maintenance_issue_state(last_status, consecutive_count, issue_key);
 CREATE INDEX IF NOT EXISTS idx_maintenance_issue_state_resolved
     ON maintenance_issue_state(resolved_at);
+
+-- Credential pool ----------------------------------------------------------
+-- Per-provider pool of API keys with cooldown/exhaustion state. The plaintext
+-- key is never stored; rows are keyed by a 16-hex BLAKE3 fingerprint that
+-- re-attaches state to live keys at load time.
+CREATE TABLE IF NOT EXISTS credential_pool (
+    provider               TEXT NOT NULL,
+    fingerprint            TEXT NOT NULL,
+    id                     TEXT NOT NULL,
+    label                  TEXT NOT NULL,
+    priority               INTEGER NOT NULL,
+    source_json            TEXT NOT NULL,
+    use_count              INTEGER NOT NULL DEFAULT 0,
+    last_status            TEXT NOT NULL DEFAULT 'ok',
+    last_status_at_ms      INTEGER,
+    last_error_code        INTEGER,
+    last_error_reason      TEXT,
+    last_error_message     TEXT,
+    last_error_reset_at_ms INTEGER,
+    removed_at_ms          INTEGER,
+    PRIMARY KEY (provider, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_credential_pool_provider
+    ON credential_pool(provider);
+
+-- Suppressed credential sources. Operators removing a key via `borg auth
+-- remove` write a row here so re-seeding from env/config doesn't undo it.
+CREATE TABLE IF NOT EXISTS credential_suppressions (
+    provider         TEXT NOT NULL,
+    source_kind      TEXT NOT NULL,
+    source_value     TEXT NOT NULL,
+    suppressed_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (provider, source_kind, source_value)
+);
 "#;

@@ -219,6 +219,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<commands::client_token::ClientTokenAction>,
     },
+    /// Manage the per-provider LLM credential pool (see docs/llm-resilience.md)
+    Auth {
+        #[command(subcommand)]
+        action: Option<commands::auth::AuthAction>,
+    },
     /// Manage signed webhook definitions for /v1/webhook/{name}
     Webhook {
         #[command(subcommand)]
@@ -525,6 +530,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::ClientToken { action }) => {
             commands::client_token::dispatch_client_token(action)?
         }
+        Some(Commands::Auth { action }) => commands::auth::dispatch_auth(action)?,
         Some(Commands::Webhook { action }) => commands::webhook::dispatch_webhook(action)?,
         Some(Commands::Mcp { action }) => commands::mcp::dispatch_mcp(action).await?,
         Some(Commands::Acp) => unreachable!("ACP handled before interactive bootstrap"),
