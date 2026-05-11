@@ -141,6 +141,30 @@ top-down by priority, not by section order.
   `~/.borg/logs/{date}.jsonl` with the retry attempt number so
   duplicated tool calls or agent turns are correlatable when grepping.
 
+### Provider abstraction
+
+- **Transport trait for provider protocols.** `[H]` Deferred. Today each
+  LLM provider has hand-rolled retry, streaming, and caching paths. A
+  `Transport` trait covering the major shapes (Anthropic / ChatCompletions
+  / Responses / Bedrock / Gemini) would normalize those paths so adding a
+  new provider is roughly a ten-line job instead of a full module. Slots
+  in under the credential-pool work already in flight.
+- **Live model discovery manifest.** `[H]` Deferred. Fetch a remote model
+  catalog (price, context window, capabilities) at startup instead of
+  carrying compiled-in lists. Operators see new Claude / GPT / Gemini
+  models in the picker without waiting for a Borg release. Pairs with the
+  cost-emission roadmap items below.
+- **Per-turn auxiliary model override.** `[H]` Deferred. Pick a different
+  model for a single tool call or turn — vision-capable for one
+  screenshot analysis, cheap default for the rest. Today Borg switches
+  the whole gateway binding; per-turn override is finer-grained. CLI flag
+  plus a TUI affordance.
+- **Proactive rate-limit tracker.** `[H]` Deferred. Track observed
+  token/request rates per provider and rotate keys _before_ the provider
+  returns 429 instead of reacting to it. Extends the credential pool
+  (currently reactive — waits for the 429) with proactive avoidance.
+  Reduces mean latency under sustained load.
+
 ### Streaming & channel delivery
 
 - **Block streaming with coalescing.** `[O]` Stream completed semantic
@@ -159,6 +183,24 @@ top-down by priority, not by section order.
   `offline` per gateway binding and surface in `borg status`. Today we
   have no notion of a sick channel — a Telegram outage is invisible
   until the user complains.
+- **Channel mirror/relay.** `[H]` Deferred. Rule-based forwarding between
+  channels (Telegram inbound → Slack notification, Discord activity →
+  email digest). Non-trivial config surface; useful for multi-platform
+  users running a single Borg.
+- **Per-channel auto-restart supervisor.** `[H]` Deferred. Today a wedged
+  Telegram poll loop requires a full daemon restart. A per-channel
+  supervisor with state preservation across restart folds into the
+  `spawn_supervised` invariant — each channel gets its own watchdog and
+  backoff.
+- **Webhook direct-delivery mode.** `[H]` Deferred. Allow webhook routes
+  to skip the LLM and deliver formatted output straight to a channel —
+  for low-value high-frequency payloads (uptime pings, log alerts, CI
+  notifications). Cost/latency win for monitoring-style use; adds a
+  formatter config surface.
+- **WhatsApp Business native channel.** `[H]` Deferred. Today Borg
+  reaches WhatsApp via the Twilio bridge. A direct WhatsApp Business
+  integration would skip Twilio's per-message markup and unlock
+  first-class threading, reactions, and media.
 
 ### Context & memory
 
@@ -174,6 +216,48 @@ top-down by priority, not by section order.
 - **Prompt-cache hit/miss observability.** `[O]` Structured logging of
   cache creation/hit/miss counts per turn. We use Anthropic prompt
   caching but currently can't measure whether it's actually working.
+- **Tool result spill-to-disk with handles.** `[H]` Deferred. Large tool
+  outputs (e.g. a `run_shell` returning 200 KB of logs) get persisted to
+  a temp file and replaced in context with a handle reference; the agent
+  re-reads on demand via `read_file`. Prevents context bloat from a
+  single chatty tool call. Pairs with the deferred mid-turn context
+  compression.
+- **Thinking-block scrubber.** `[H]` Deferred. Strip `<thinking>` content
+  from persisted messages before they're re-fed in subsequent turns.
+  Borg strips `<internal>` in real-time today, but the saved bytes in
+  the `messages` table may still re-enter context on replay. Real token
+  savings on reasoning-heavy models once confirmed not already covered.
+
+### Agent loop ergonomics
+
+- **Mid-run steering.** `[H]` Deferred. Operator sends a directive
+  between turns without restarting the session — "skip the auth module,
+  try the parser instead." Injected as a system-level nudge for the next
+  turn, not as a user message, so the assistant's reply chain stays
+  clean. Removes the restart cycle for long-running autonomous tasks.
+- **Todo tool / in-session task list.** `[H]` Deferred. Agent-managed
+  task list persisted across turns and visible to the operator. Borg has
+  `scheduled_tasks` (cron-style) but no in-session lightweight TODO
+  surface. Possible Tool Conservation play: add as a `schedule.todo`
+  action rather than a new tool.
+- **Session search tool.** `[H]` Deferred. Full-text + semantic search
+  across prior conversations as an agent-callable tool, distinct from
+  `memory_search` which only hits consolidated long-term entries. "What
+  did I do last Tuesday?" works today only if the relevant turn was
+  consolidated — live session search is a separate retrieval pass.
+- **Session title auto-generation.** `[H]` Deferred. Cheap aux-LLM call
+  after the first user turn that names the session for transcript-pager
+  navigation. Small UX win; uses the existing `llm.aux` background
+  client.
+- **Mixture-of-agents tool.** `[H]` Deferred. Query multiple models in
+  parallel and synthesize a single answer. High cost; reserved for
+  high-stakes single-turn use cases. Niche — defer until explicit
+  demand.
+- **Structured clarify tool.** `[H]` Deferred. Multi-choice clarification
+  with structured options the operator picks from, distinct from
+  `request_user_input` (free-form). Marginal value; likely covered by
+  extending `request_user_input` with an `options` parameter rather than
+  adding a new tool.
 
 ## Cost emission: additional providers
 
@@ -205,6 +289,25 @@ top-down by priority, not by section order.
   search_files, patch, terminal). Resource caps on stdout/stderr/
   timeout/tool-calls. Useful for ad-hoc data crunching.
 
+### MCP & external integrations
+
+- **MCP server mode (`borgd serve-mcp`).** `[H]` Deferred. Expose
+  sessions, messages, events, and permissions as MCP tools so external
+  IDEs (Claude Code, Cursor, Codex) can read and write Borg
+  conversations. Same surface as the existing ACP transport but
+  IDE-facing. Useful for "view my Borg state from my editor" workflows.
+- **MCP OAuth client.** `[H]` Deferred. Borg as MCP **client** with an
+  OAuth flow for servers that require it. Most enterprise MCP servers
+  do — without OAuth, a meaningful slice of the existing MCP ecosystem
+  is unreachable. Tokens stored in the keychain alongside paired-device
+  certs.
+- **OSV malware check for third-party subprocesses.** `[H]` Deferred.
+  Pre-flight query against the OSV database before spawning any `npx` /
+  `uvx` / pip-installed MCP subprocess. Refuse on known-bad; cache
+  results with TTL. Concrete supply-chain hardening that aligns with
+  the security-first posture; light footprint (lookup table plus a
+  cached HTTP fetch).
+
 ### Plugins & extensibility
 
 - **Plugin manifest + onboard hooks.** `[O]` `plugin.json` declaring
@@ -218,6 +321,26 @@ top-down by priority, not by section order.
 - **Doctor-driven plugin dep auto-install.** `[O]` `borg doctor
 --repair` installs missing bundled-plugin runtime deps (respecting
   explicit disablement). External plugins still manual.
+
+### Skill ecosystem
+
+- **Autonomous skill curator.** `[H]` Deferred. Background task grades,
+  dedupes, and consolidates the skill library on a cadence, writing a
+  ranked report under `~/.borg/logs/curator/` and flagging
+  low-performing or unsafe skills for removal. Distinct from the
+  existing `skill_audit` tamper-only detection — this is quality and
+  decay-rate auditing. Folds into the daily self-heal sweep.
+- **Agent-callable skill install/sync.** `[H]` Deferred. Today skills
+  are baked into the binary or hand-placed at `~/.borg/skills/`. A new
+  `skill_manager` action would let the agent install or sync skills
+  from a curated hub at runtime, with per-skill usage tracking so the
+  curator can rank them. Pairs with Tool Conservation — adds actions to
+  an existing tool rather than a new tool.
+- **Skill provenance + signed manifests.** `[H]` Deferred. Skills carry
+  signed provenance (origin, author, content hash chain) and the loader
+  verifies signatures before invoking. Extends `skill_audit`
+  (tamper-only) toward a full supply-chain story. Useful once skills
+  can be agent-installed from a hub.
 
 ### Onboarding & migration
 
@@ -250,6 +373,27 @@ top-down by priority, not by section order.
   everything else stripped. Prevents accidental leak of
   `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` etc. into shell tool
   output that gets logged or echoed back.
+- **URL safety classifier + per-site policy.** `[H]` Pre-flight
+  URL classification (malware, phishing, allowlist/denylist) before any
+  `web_fetch` or `browser` navigation, plus a per-site policy file
+  (throttle, block, transform). Real defense surface — these tools
+  today have no per-URL gating. Pairs with prompt-injection defense.
+- **Output redaction toggle.** `[H]` Programmatic redaction of
+  secrets and PII in agent output (channel deliveries, logs, transcript)
+  with an operator toggle and an audit log of what was redacted. Borg
+  has input-side secret-redaction in the prompt-injection layer;
+  output-side is separate. Critical for shared-screen / posted-log
+  scenarios.
+- **Subprocess process registry.** `[H]` Track every
+  subprocess Borg spawns (PID, command, start time, owning session) and
+  surface it in `borg status` / `borg doctor`. An orphaned `browser`
+  child or stuck shell is invisible today until the user notices CPU.
+  Folds into self-healing.
+- **Browser anti-detection + supervisor.** `[H]` Drop-in
+  browser provider with anti-bot stealth headers, dialog auto-handling,
+  and a supervisor that restarts crashed sessions. Borg's `browser`
+  exists but anti-detection posture is unverified, and the deferred
+  Tier 2 browser-recovery work should adopt the same supervisor.
 
 ### Observability
 
@@ -308,6 +452,31 @@ demand materializes.
   the binary (`wasmtime` ≈ several MB), capability-grant API design,
   manifest signing/verification, confused-deputy hardening on every
   host function.
+- **Web dashboard.** `[H]` Optional remote-monitoring web UI for
+  headless/VPS deployments — React SPA served by `borgd` over the
+  existing mTLS-authed TCP listener. Conflicts with the TUI-first
+  design and adds a frontend dependency to the single-binary story.
+  Revisit if headless deployments materialize as a major user segment.
+- **Knowledge-graph memory backend.** `[H]` Heavyweight alternative to
+  the current hybrid vector+BM25 memory retrieval — entity resolution,
+  multi-strategy retrieval, reflect-style synthesis. Adds a
+  daemon/process plus an entity-resolution service. Revisit only if
+  measured hybrid-retrieval recall underperforms.
+- **Home Assistant tool.** `[H]` Smart-home entity control
+  (`list_entities`, `get_state`, `call_service`) gated on a
+  `HASS_TOKEN`. Niche; revisit if explicit personal-use demand emerges.
+- **Offline local TTS bundled in-binary.** `[H]` Neural-TTS model
+  embedded so `text_to_speech` works without external API calls.
+  Trades single-binary size budget for offline capability. Skip unless
+  airgapped deployments push for it.
+- **Image-gen provider routing.** `[H]` Multi-provider router for
+  `generate_image` (DALL-E vs SDXL vs Imagen based on cost or
+  capability). Marginal benefit; skip unless explicit cost/quality
+  complaints surface.
+- **Vision tool for image analysis.** `[H]` Standalone image-analysis
+  tool (screenshots, photos). Most providers now accept images directly
+  in the message stream, making a separate tool partly redundant.
+  Defer until concrete demand emerges.
 
 ### Tests & quality
 
