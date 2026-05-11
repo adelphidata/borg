@@ -165,6 +165,8 @@ pub mod secrets_resolve;
 pub mod session;
 /// Session transcript indexing for searchable conversations.
 pub mod session_indexer;
+/// Shared per-turn payload types crossing the gateway ↔ daemon boundary.
+pub mod session_types;
 /// Settings resolver: DB → TOML → compiled defaults.
 pub mod settings;
 /// Short-term (working) memory for the current session.

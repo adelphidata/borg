@@ -33,6 +33,12 @@ pub const SIGNAL_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default port for a locally-running signal-cli JSON-RPC server.
 pub const SIGNAL_CLI_PORT_DEFAULT: u16 = 8080;
 
+/// Signal API circuit breaker: trips after N consecutive failures.
+pub const SIGNAL_CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
+
+/// Signal API circuit breaker: suspension duration in seconds.
+pub const SIGNAL_CIRCUIT_SUSPENSION_SECS: u64 = 60;
+
 /// Max characters preserved for the inbound `thread_id` after sanitization.
 /// The session key format `{sender_id}:{thread_id}` cannot tolerate unbounded
 /// growth, so the sanitizer truncates here.

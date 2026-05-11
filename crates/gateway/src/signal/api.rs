@@ -11,14 +11,12 @@ use reqwest::Client;
 
 use cortex::constants;
 
-use crate::constants::SIGNAL_HTTP_CONNECT_TIMEOUT;
+use crate::constants::{
+    SIGNAL_CIRCUIT_FAILURE_THRESHOLD, SIGNAL_CIRCUIT_SUSPENSION_SECS, SIGNAL_HTTP_CONNECT_TIMEOUT,
+};
 
 const MESSAGE_CHUNK_SIZE: usize = constants::SIGNAL_MESSAGE_CHUNK_SIZE;
 const RPC_TIMEOUT: Duration = Duration::from_secs(constants::SIGNAL_RPC_TIMEOUT_SECS);
-
-/// Circuit breaker thresholds for Signal API calls.
-const CIRCUIT_FAILURE_THRESHOLD: u32 = 5;
-const CIRCUIT_SUSPENSION_SECS: u64 = 60;
 
 /// Monotonically increasing counter for JSON-RPC request IDs.
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -43,8 +41,8 @@ impl SignalClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             account: account.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new(
-                CIRCUIT_FAILURE_THRESHOLD,
-                CIRCUIT_SUSPENSION_SECS,
+                SIGNAL_CIRCUIT_FAILURE_THRESHOLD,
+                SIGNAL_CIRCUIT_SUSPENSION_SECS,
             )),
         })
     }

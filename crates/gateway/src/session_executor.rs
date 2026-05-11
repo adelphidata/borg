@@ -17,13 +17,7 @@ pub struct InboundTurn {
     pub images: Vec<InlineImage>,
 }
 
-/// Inline image attached to an inbound turn.
-#[derive(Debug, Clone)]
-pub struct InlineImage {
-    pub mime_type: String,
-    pub data: Vec<u8>,
-    pub filename: Option<String>,
-}
+pub use cortex::session_types::InlineImage;
 
 #[async_trait]
 pub trait SessionExecutor: Send + Sync + 'static {

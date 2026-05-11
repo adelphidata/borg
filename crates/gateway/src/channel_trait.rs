@@ -789,7 +789,7 @@ mod tests {
             "",
             &ctx,
             &queue,
-            std::time::Duration::from_secs(30),
+            crate::constants::GATEWAY_HTTP_TIMEOUT,
         )
         .await;
 
@@ -815,7 +815,7 @@ mod tests {
             "",
             &ctx,
             &queue,
-            std::time::Duration::from_secs(30),
+            crate::constants::GATEWAY_HTTP_TIMEOUT,
         )
         .await;
 
@@ -845,7 +845,7 @@ mod tests {
             "test body",
             &ctx,
             &queue,
-            std::time::Duration::from_secs(30),
+            crate::constants::GATEWAY_HTTP_TIMEOUT,
         )
         .await;
 

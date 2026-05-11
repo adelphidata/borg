@@ -8,10 +8,7 @@
 //! everything routes through the daemon's single-writer-per-session
 //! [`SessionRegistry`] now.
 
-use crate::session::{
-    backend::{AgentBackend, InlineImage as BackendImage},
-    convert, SessionHost, SessionRegistry,
-};
+use crate::session::{backend::AgentBackend, convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
 use cortex::agent::AgentEvent;
 use cortex::config::Config;
@@ -105,19 +102,9 @@ impl SessionExecutor for DaemonSessionExecutor {
         // backend turn unblock its mutex before our new turn tries to grab it).
         host.cancel_turn().await;
 
-        let images: Vec<BackendImage> = turn
-            .images
-            .into_iter()
-            .map(|img| BackendImage {
-                mime_type: img.mime_type,
-                data: img.data,
-                filename: img.filename,
-            })
-            .collect();
-
         // Subscribe BEFORE start_turn so we can't miss the first event.
         let mut sub = host.subscribe();
-        let (cancel, baseline) = host.start_turn(turn.text, images, None, None).await;
+        let (cancel, baseline) = host.start_turn(turn.text, turn.images, None, None).await;
         let (tx, rx) = mpsc::channel::<AgentEvent>(64);
 
         // Bridge proto broadcast events back to core AgentEvents for the

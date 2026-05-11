@@ -97,16 +97,7 @@ pub struct ForkOutcome {
     pub message_count: u64,
 }
 
-/// One inline image to attach to a multimodal turn.
-#[derive(Debug, Clone)]
-pub struct InlineImage {
-    /// MIME type of the image (e.g. `image/png`).
-    pub mime_type: String,
-    /// Raw image bytes (not base64).
-    pub data: Vec<u8>,
-    /// Optional filename for display.
-    pub filename: Option<String>,
-}
+pub use cortex::session_types::InlineImage;
 
 /// Per-session backend that runs one agent turn at a time.
 #[async_trait]
