@@ -1013,22 +1013,29 @@ impl LlmClient {
                         // result is processed below.
                         self._active_lease = Some(lease);
                         Some(id)
-                    } else if let Some(forced) = pool.pick_force() {
-                        // Every key cooling — make a last-gasp attempt against
-                        // the soonest-recovery credential before falling
-                        // through to provider failover.
-                        self.api_key = forced.key.clone();
-                        self.active_credential_base_url = forced.base_url.clone();
-                        Some(forced.id.clone())
                     } else {
-                        // Pool fully exhausted (every key removed). Surface
-                        // the error path so provider failover can engage.
-                        let msg = format!(
-                            "{} credential pool exhausted (all keys removed)",
-                            self.provider
-                        );
+                        // No credential is currently usable. That means either
+                        // the pool is fully removed, or every surviving entry
+                        // is cooling and fallback/retry policy must decide what
+                        // to do next.
+                        let msg = if pool.has_credentials() {
+                            format!(
+                                "{} credential pool exhausted (all keys cooling)",
+                                self.provider
+                            )
+                        } else {
+                            format!(
+                                "{} credential pool exhausted (all keys removed)",
+                                self.provider
+                            )
+                        };
                         warn!(target: "cortex::llm", "{msg}");
-                        self.record_provider_failure(FailoverReason::AuthPermanent);
+                        let reason = if pool.has_credentials() {
+                            FailoverReason::RateLimit
+                        } else {
+                            FailoverReason::AuthPermanent
+                        };
+                        self.record_provider_failure(reason);
                         if self.try_failover_provider() {
                             should_failover = true;
                             break;

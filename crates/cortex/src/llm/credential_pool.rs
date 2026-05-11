@@ -830,6 +830,10 @@ impl CredentialPool {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live_credential_count = g.creds.iter().filter(|c| !c.is_removed()).count();
+        if live_credential_count < 2 {
+            return false;
+        }
         g.creds.iter().any(|c| {
             !c.is_removed()
                 && c.last_error_reset_at_ms
@@ -1602,7 +1606,8 @@ impl CredentialPool {
                     Some(Duration::from_secs(300)),
                     Some("oauth_refresh_failed"),
                 );
-                Some(lease)
+                drop(lease);
+                self.acquire_lease(None)
             }
         }
     }
@@ -2937,12 +2942,19 @@ mod tests {
         // real win is that auth_type/expires_at survive SQLite round-trip.
         // (refresh_token is intentionally NOT persisted to DB; the rotated
         // value lives in the source file via `write_back`.)
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
         let (db, path, _g) = open_test_db();
         let pool = CredentialPool::load(
             &db,
             &path,
             Provider::ClaudeCodeOAuth,
-            oauth_cfg(std::path::Path::new("/nonexistent")),
+            oauth_cfg(home.path()),
         )
         .unwrap();
         let cred = pool.add_entry_full(
@@ -2968,7 +2980,7 @@ mod tests {
             &db,
             &path,
             Provider::ClaudeCodeOAuth,
-            oauth_cfg(std::path::Path::new("/nonexistent")),
+            oauth_cfg(home.path()),
         )
         .unwrap();
         let entries = pool2.entries();
@@ -3559,7 +3571,11 @@ mod tests {
         .unwrap();
         pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
 
-        let _lease = pool.acquire_lease_refreshing(None).await.unwrap();
+        let lease = pool.acquire_lease_refreshing(None).await;
+        assert!(
+            lease.is_none(),
+            "single expired OAuth credential with failed refresh should fall through to fallback, not reuse stale token"
+        );
         let entries = pool.entries();
         assert!(
             !entries[0].is_removed(),
@@ -3583,10 +3599,55 @@ mod tests {
         drop(server);
     }
 
+    #[tokio::test]
+    async fn refresh_failure_reacquires_a_healthy_sibling_credential() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/.credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"expired-access","refreshToken":"refresh-r","expiresAt":1}}"#,
+        )
+        .unwrap();
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::ClaudeCodeOAuth,
+            oauth_cfg(home.path()),
+        )
+        .unwrap();
+        pool.set_refresh_endpoint_for_tests(Some(format!("{}/v1/oauth/token", server.uri())));
+        let sibling = pool.add_entry(
+            "healthy-api-key".into(),
+            "manual-sibling".into(),
+            CredentialSource::Manual,
+        );
+
+        let lease = pool
+            .acquire_lease_refreshing(None)
+            .await
+            .expect("healthy sibling should be re-acquired");
+        assert_eq!(
+            lease.id(),
+            sibling.id,
+            "failed refresh must rotate to another available credential instead of keeping the stale one"
+        );
+    }
+
     #[test]
-    fn may_recover_within_returns_true_for_imminent_cooldown_expiry() {
-        // Single key, 60s cooldown → may_recover_within(5min) is true,
-        // may_recover_within(30s) is false.
+    fn may_recover_within_false_for_single_key_pool() {
+        // Single key, 60s cooldown: there is nothing to rotate to, so
+        // fallback should fire instead of waiting on the same exhausted key.
         let (db, path, _g) = open_test_db();
         let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
             .unwrap();
@@ -3599,12 +3660,40 @@ mod tests {
             None,
         );
         assert!(
-            pool.may_recover_within(Duration::from_secs(300)),
-            "60s cooldown is within 5min recovery window"
+            !pool.may_recover_within(Duration::from_secs(300)),
+            "single-key pool should not defer provider fallback"
         );
         assert!(
             !pool.may_recover_within(Duration::from_secs(30)),
-            "60s cooldown is outside 30s recovery window"
+            "single-key pool should never report recoverable-by-rotation"
+        );
+    }
+
+    #[test]
+    fn may_recover_within_true_for_multi_key_imminent_recovery() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("b", "k2")]),
+        )
+        .unwrap();
+        let entries = pool.entries();
+        pool.report_failure(
+            &entries[0].id,
+            FailoverReason::RateLimit,
+            None,
+            Some(Duration::from_secs(60)),
+            None,
+        );
+        assert!(
+            pool.may_recover_within(Duration::from_secs(300)),
+            "multi-key pool with an imminent recovery should defer fallback"
+        );
+        assert!(
+            !pool.may_recover_within(Duration::from_secs(30)),
+            "recovery outside the horizon should not defer fallback"
         );
     }
 

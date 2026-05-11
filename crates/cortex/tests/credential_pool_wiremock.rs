@@ -72,6 +72,36 @@ fn two_key_config(server_uri: &str) -> (Config, String, String) {
     (config, key_a, key_b)
 }
 
+/// Build a one-key primary config with a same-provider fallback slot that
+/// points at a second wiremock server.
+fn one_key_with_fallback_config(primary_uri: &str, fallback_uri: &str) -> (Config, String) {
+    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let var_a = format!("BORG_TEST_POOL_PRIMARY_KEY_{n}");
+    let key_a = format!("sk-pool-primary-{n}");
+    unsafe {
+        std::env::set_var(&var_a, &key_a);
+    }
+
+    let mut config = Config::default();
+    config.llm.provider = Some("openai".into());
+    config.llm.api_key_env = var_a.clone();
+    config.llm.base_url = Some(format!("{primary_uri}/v1/chat/completions"));
+    config.llm.max_retries = 0;
+    config.llm.api_keys = vec![SecretRef::Env { var: var_a.clone() }];
+    config.llm.credential_cooldown_secs = 60;
+    config.llm.fallback.push(cortex::config::LlmFallback {
+        provider: "openai".into(),
+        model: config.llm.model.clone(),
+        api_key: None,
+        api_key_env: Some(var_a),
+        api_keys: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        base_url: Some(format!("{fallback_uri}/v1/chat/completions")),
+    });
+    (config, key_a)
+}
+
 fn user_message(text: &str) -> Vec<Message> {
     vec![Message {
         role: Role::User,
@@ -277,4 +307,49 @@ async fn retry_after_header_overrides_config_cooldown() {
         (290..=305).contains(&remaining_secs),
         "Retry-After header value (300s) must drive the cooldown, got {remaining_secs}s"
     );
+}
+
+// ── Test 86: single-key pool falls through to fallback provider ──────────
+
+#[tokio::test]
+async fn single_key_pool_429_uses_fallback_provider() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    let (config, key_a) = one_key_with_fallback_config(&primary.uri(), &fallback.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "300")
+                .set_body_string("rate limited"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(sse_done("fallback-ok"), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&fallback)
+        .await;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("hi"), None, tx)
+        .await
+        .expect("stream_chat should succeed via fallback provider");
+
+    let events = collect_events(rx).await;
+    assert_eq!(events, vec!["text:fallback-ok", "done"]);
 }

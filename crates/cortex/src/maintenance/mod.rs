@@ -217,7 +217,6 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     run_daily_maintenance_with_registry(db, config, None)
 }
 
-
 /// Run the full daily maintenance sweep. Never propagates errors from
 /// individual steps — each is logged and the sweep continues so one
 /// broken step can't block the others.
@@ -1282,5 +1281,4 @@ mod tests {
         assert_eq!(report.subprocess_dead_reaped, 0);
         assert_eq!(report.subprocess_auto_killed, 0);
     }
-
 }

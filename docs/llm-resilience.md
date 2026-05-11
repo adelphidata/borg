@@ -138,14 +138,17 @@ provider matches. Each source is read at pool-load time and on every
 Expired access tokens are refreshed transparently before each request via
 the per-provider OAuth endpoint (60-second skew window). Refresh failures
 cool the credential for 5min — not removed, since the refresh server may
-be flaky. Concurrent refreshes against the same id are serialized by a
-per-credential async lock so the single-use refresh_token can't be
-double-spent. After a successful refresh the rotated `refresh_token` is
-written back to the source file (atomic rename) so a parallel CLI consumer
-or the next daemon reload doesn't replay the burnt token. Per-credential
-`base_url` overrides are validated against an https-or-loopback-http
-allowlist at discovery and `borg auth pair` entry; unsafe URLs are rejected
-rather than silently honored.
+be flaky. Borg then re-picks a healthy sibling credential from the same
+pool when one exists; otherwise the request falls through to the normal
+provider-fallback path rather than sending a known-stale access token.
+Concurrent refreshes against the same id are serialized by a per-credential
+async lock so the single-use refresh_token can't be double-spent. After a
+successful refresh the rotated `refresh_token` is written back to the
+source file (atomic rename) so a parallel CLI consumer or the next daemon
+reload doesn't replay the burnt token. Per-credential `base_url` overrides
+are validated against an https-or-loopback-http allowlist at discovery and
+`borg auth pair` entry; unsafe URLs are rejected rather than silently
+honored.
 
 GitHub Copilot is intentionally out of scope today — the discovery flow
 needs a `gh auth token` shell-out plus a token-exchange round-trip, and
@@ -165,12 +168,13 @@ survive operator removal/re-add.
 ### Fallback deferral
 
 Before walking the `llm.fallback` chain on a 429/402, the pool is asked
-`may_recover_within(5min)` — true when at least one cooling credential
-will recover within the window. Deferral keeps the request on the
-primary provider so a sibling key gets a chance, rather than burning
-budget on a degraded fallback while the primary is still draining.
-Permanently failed (tombstoned) entries and out-of-window cooldowns
-don't defer — fallback engages as before.
+`may_recover_within(5min)` — true only when the pool has at least two live
+credentials and at least one cooling credential will recover within the
+window. Deferral keeps the request on the primary provider so a sibling key
+gets a chance, rather than burning budget on a degraded fallback while the
+primary is still draining. Single-credential pools never defer fallback on
+429/402 — there is nothing to rotate to. Permanently failed (tombstoned)
+entries and out-of-window cooldowns also don't defer.
 
 ## Provider failover
 
