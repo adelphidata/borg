@@ -659,6 +659,25 @@ impl CredentialPool {
         }
     }
 
+    /// Best-effort delete of a suppression row. Used when an operator re-adds
+    /// a previously-removed credential — the tombstone is resurrected and the
+    /// matching suppression must be cleared so re-seeding from env/config
+    /// doesn't immediately re-tombstone it on next start.
+    fn delete_suppression_row(&self, source_kind: &str, source_value: &str) {
+        let Some(path) = self.db_path.as_ref() else {
+            return;
+        };
+        if let Err(e) = delete_suppression(path, self.provider.as_str(), source_kind, source_value)
+        {
+            warn!(
+                target: "cortex::llm::credential_pool",
+                provider = %self.provider.as_str(),
+                error = %e,
+                "credential pool: suppression delete failed"
+            );
+        }
+    }
+
     /// Current strategy.
     pub fn strategy(&self) -> CredentialStrategy {
         self.inner
@@ -805,7 +824,7 @@ impl CredentialPool {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let candidate = g
+        let pick_id = g
             .creds
             .iter()
             .filter(|c| !c.is_removed())
@@ -814,17 +833,23 @@ impl CredentialPool {
                 // Available entries: treat as i64::MIN so they're preferred.
                 c.last_error_reset_at_ms.unwrap_or(i64::MIN)
             })
-            .cloned();
-        if let Some(ref c) = candidate {
-            g.current_id = Some(c.id.clone());
-            debug!(
-                target: "cortex::llm::credential_pool",
-                id = %c.id,
-                label = %c.label,
-                "pick_force"
-            );
-        }
-        candidate
+            .map(|c| c.id.clone())?;
+        // Bump use_count so the salvage attempt shows up in least_used
+        // accounting and in `borg auth list` — otherwise the pool reports
+        // "used 0×" against a credential the loop just hammered.
+        let entry = g.creds.iter_mut().find(|c| c.id == pick_id)?;
+        entry.use_count = entry.use_count.saturating_add(1);
+        let cred = entry.clone();
+        g.current_id = Some(cred.id.clone());
+        debug!(
+            target: "cortex::llm::credential_pool",
+            id = %cred.id,
+            label = %cred.label,
+            "pick_force"
+        );
+        drop(g);
+        self.persist_credential(&cred);
+        Some(cred)
     }
 
     /// Record a successful request against `credential_id`. Bumps `use_count`,
@@ -939,36 +964,6 @@ impl CredentialPool {
         }
     }
 
-    /// Combined helper for the failover loop: rotates `current_id` away from
-    /// the just-failed credential after reporting the failure, then returns
-    /// the next pick. Mirrors Hermes' `mark_exhausted_and_rotate`.
-    pub fn mark_exhausted_and_rotate(
-        &self,
-        credential_id: &str,
-        reason: FailoverReason,
-        status_code: Option<u16>,
-        retry_after: Option<Duration>,
-        error_message: Option<&str>,
-    ) -> Option<PooledCredential> {
-        self.report_failure(
-            credential_id,
-            reason,
-            status_code,
-            retry_after,
-            error_message,
-        );
-        {
-            let mut g = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if g.current_id.as_deref() == Some(credential_id) {
-                g.current_id = None;
-            }
-        }
-        self.pick()
-    }
-
     /// Clear all `Exhausted` entries back to `Ok`. Does **not** touch removed
     /// entries. Returns the count cleared. Persists.
     pub fn reset_cooldowns(&self) -> usize {
@@ -1028,8 +1023,39 @@ impl CredentialPool {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = g.creds.iter().find(|c| c.fingerprint == fingerprint) {
-            return existing.clone();
+        // Fingerprint collision against a live entry → idempotent no-op.
+        // Against a tombstone → resurrect (clear removal + suppression so the
+        // pool actually starts using it again). Without this branch, a
+        // remove-then-readd of the same plaintext silently returned the dead
+        // entry, giving the operator a "success" message and a pool that
+        // never used the key.
+        if let Some(pos) = g.creds.iter().position(|c| c.fingerprint == fingerprint) {
+            if g.creds[pos].is_removed() {
+                let suppression_key = (
+                    g.creds[pos].source.kind_db().to_string(),
+                    g.creds[pos].source.value_db(),
+                );
+                let entry = &mut g.creds[pos];
+                entry.removed_at_ms = None;
+                entry.key = key;
+                entry.source = source;
+                entry.last_status = CredentialStatus::Ok;
+                entry.last_status_at_ms = Some(now);
+                entry.last_error_code = None;
+                entry.last_error_reason = None;
+                entry.last_error_message = None;
+                entry.last_error_reset_at_ms = None;
+                let resurrected = entry.clone();
+                let had_suppression = g.suppressed.remove(&suppression_key);
+                g.emitted_exhausted_warn = false;
+                drop(g);
+                self.persist_credential(&resurrected);
+                if had_suppression {
+                    self.delete_suppression_row(&suppression_key.0, &suppression_key.1);
+                }
+                return resurrected;
+            }
+            return g.creds[pos].clone();
         }
         // Assign a priority strictly above every existing entry (live or
         // tombstoned) so priorities stay unique — tombstones keep their
@@ -1425,6 +1451,22 @@ fn persist_suppression(
          ON CONFLICT(provider, source_kind, source_value) DO UPDATE SET
              suppressed_at_ms = excluded.suppressed_at_ms",
         params![provider, source.kind_db(), source.value_db(), now_ms],
+    )?;
+    Ok(())
+}
+
+fn delete_suppression(
+    db_path: &std::path::Path,
+    provider: &str,
+    source_kind: &str,
+    source_value: &str,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let _: i64 = conn.query_row("PRAGMA busy_timeout=5000", [], |r| r.get(0))?;
+    conn.execute(
+        "DELETE FROM credential_suppressions
+         WHERE provider = ?1 AND source_kind = ?2 AND source_value = ?3",
+        params![provider, source_kind, source_value],
     )?;
     Ok(())
 }
@@ -1842,7 +1884,11 @@ mod tests {
             None,
         );
         let until = pool.entries()[0].last_error_reset_at_ms.unwrap();
-        assert!(until >= 1_000_000 + 600_000);
+        // Tight equality, not `>=`: the explicit 600s retry_after must drive
+        // the cooldown exactly. A regression that fell back to the configured
+        // 60s default would land at 1_060_000 (caught); a runaway clamp to 24h
+        // would land at 1_000_000 + 86_400_000 (also caught).
+        assert_eq!(until, 1_000_000 + 600_000);
     }
 
     #[test]
@@ -2034,6 +2080,22 @@ mod tests {
     }
 
     #[test]
+    fn pick_force_bumps_use_count() {
+        // Regression for the "salvage shows used 0×" bug: pick_force is the
+        // last-gasp path against a cooled key, and its accounting feeds both
+        // least_used selection and operator-visible `borg auth list` columns.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let cred = pool.pick().unwrap();
+        pool.report_failure(&cred.id, FailoverReason::RateLimit, None, None, None);
+        let before = pool.entries()[0].use_count;
+        let _ = pool.pick_force().unwrap();
+        let after = pool.entries()[0].use_count;
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
     fn pick_force_returns_none_when_all_removed() {
         let (db, path, _g) = open_test_db();
         let pool = CredentialPool::load(
@@ -2157,6 +2219,44 @@ mod tests {
         let again = pool.add_entry("k2".into(), "ignored".into(), CredentialSource::Manual);
         assert_eq!(again.id, added.id);
         assert_eq!(pool.entries().len(), 2);
+    }
+
+    #[test]
+    fn add_entry_resurrects_tombstoned_fingerprint() {
+        // Regression: re-adding a previously-removed key used to silently
+        // return the tombstone — operator saw "Added credential…" but the
+        // pool never used the key. The resurrection path must clear the
+        // tombstone, restore the plaintext, and delete the suppression row.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
+        let added = pool.add_entry("k2".into(), "personal".into(), CredentialSource::Manual);
+        let _removed = pool.remove_index(2).unwrap();
+        assert!(pool.entries()[1].is_removed());
+
+        let resurrected = pool.add_entry("k2".into(), "ignored".into(), CredentialSource::Manual);
+        assert_eq!(resurrected.id, added.id, "same entry resurrected, not new");
+        assert!(!resurrected.is_removed());
+        assert_eq!(resurrected.key, "k2");
+        assert!(pool.has_available());
+        // Reload from DB to confirm the suppression row was deleted —
+        // otherwise the next start would re-tombstone it via the seed path.
+        let pool2 = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("a", "k1"), ("personal", "k2")]),
+        )
+        .unwrap();
+        let live: Vec<_> = pool2
+            .entries()
+            .into_iter()
+            .filter(|c| !c.is_removed())
+            .collect();
+        assert!(
+            live.iter().any(|c| c.key == "k2"),
+            "resurrected key survives reload, suppression cleared"
+        );
     }
 
     #[test]

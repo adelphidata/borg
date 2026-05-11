@@ -1400,7 +1400,15 @@ impl Admin for AdminSvc {
             let pool = build_primary_pool(&config, &db)?;
             require_provider_match(&pool, &provider)?;
             let label = if label_in.trim().is_empty() {
-                format!("manual-{}", pool.entries().len() + 1)
+                // Count live entries only — tombstones shouldn't bump the
+                // default label counter ("manual-7" after one add post-remove
+                // looks like a bug to operators).
+                let live = pool
+                    .entries()
+                    .iter()
+                    .filter(|c| c.removed_at_ms.is_none())
+                    .count();
+                format!("manual-{}", live + 1)
             } else {
                 label_in.trim().to_string()
             };
