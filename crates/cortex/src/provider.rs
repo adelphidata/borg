@@ -192,10 +192,7 @@ impl Provider {
                 .unwrap_or(model)
                 .to_string(),
             Provider::CodexOAuth => model.strip_prefix("openai/").unwrap_or(model).to_string(),
-            Provider::CopilotOAuth => model
-                .strip_prefix("copilot/")
-                .unwrap_or(model)
-                .to_string(),
+            Provider::CopilotOAuth => model.strip_prefix("copilot/").unwrap_or(model).to_string(),
             Provider::Custom => model.to_string(),
         }
     }
@@ -392,7 +389,9 @@ mod tests {
         // `x-api-key` for `Authorization: Bearer <access_token>`. If anyone
         // copy-pastes the Anthropic branch and forgets to flip the auth
         // header, the upstream rejects with 401 — caught here.
-        let headers = Provider::ClaudeCodeOAuth.build_headers("oauth_at_xyz").unwrap();
+        let headers = Provider::ClaudeCodeOAuth
+            .build_headers("oauth_at_xyz")
+            .unwrap();
         assert!(
             headers.get("x-api-key").is_none(),
             "OAuth must not send x-api-key"

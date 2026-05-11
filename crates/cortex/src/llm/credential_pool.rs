@@ -560,10 +560,7 @@ impl CredentialPool {
         //     Discoverers are matched per-provider; sources that find nothing
         //     return Ok(vec![]). Parser errors log + continue — a malformed
         //     credentials file must never crash pool load.
-        let oauth_home = cfg
-            .oauth_home
-            .clone()
-            .or_else(dirs::home_dir);
+        let oauth_home = cfg.oauth_home.clone().or_else(dirs::home_dir);
         if let Some(home) = oauth_home.as_deref() {
             for discoverer in crate::llm::credential_sources::discoverers_for(provider) {
                 let discovered = match discoverer.discover(home) {
@@ -588,9 +585,7 @@ impl CredentialPool {
                             name: discoverer.name().to_string(),
                         },
                     };
-                    if suppressed
-                        .contains(&(source.kind_db().to_string(), source.value_db()))
-                    {
+                    if suppressed.contains(&(source.kind_db().to_string(), source.value_db())) {
                         continue;
                     }
                     let fp = fingerprint(&disc.access_token);
@@ -1577,11 +1572,7 @@ impl CredentialPool {
         }
     }
 
-    fn apply_refreshed(
-        &self,
-        id: &str,
-        tokens: crate::llm::oauth_refresh::RefreshedTokens,
-    ) {
+    fn apply_refreshed(&self, id: &str, tokens: crate::llm::oauth_refresh::RefreshedTokens) {
         let snapshot = {
             let mut g = self
                 .inner
@@ -3312,7 +3303,10 @@ mod tests {
 
         let _lease = pool.acquire_lease_refreshing(None).await.unwrap();
         let entries = pool.entries();
-        assert!(!entries[0].is_removed(), "transient refresh failure is not a tombstone");
+        assert!(
+            !entries[0].is_removed(),
+            "transient refresh failure is not a tombstone"
+        );
         assert!(
             entries[0].last_error_reset_at_ms.is_some(),
             "cooldown set so retries are spaced"
@@ -3329,13 +3323,8 @@ mod tests {
         // Single key, 60s cooldown → may_recover_within(5min) is true,
         // may_recover_within(30s) is false.
         let (db, path, _g) = open_test_db();
-        let pool = CredentialPool::load(
-            &db,
-            &path,
-            Provider::OpenRouter,
-            cfg_with(&[("a", "k1")]),
-        )
-        .unwrap();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
         let cred = pool.pick().unwrap();
         pool.report_failure(
             &cred.id,
@@ -3359,13 +3348,8 @@ mod tests {
         // Auth failure permanently tombstones — no recovery possible, so
         // fallback must engage.
         let (db, path, _g) = open_test_db();
-        let pool = CredentialPool::load(
-            &db,
-            &path,
-            Provider::OpenRouter,
-            cfg_with(&[("a", "k1")]),
-        )
-        .unwrap();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
         let cred = pool.pick().unwrap();
         pool.report_failure(&cred.id, FailoverReason::Auth, Some(401), None, None);
         assert!(
@@ -3378,13 +3362,8 @@ mod tests {
     fn may_recover_within_false_for_long_cooldown_beyond_horizon() {
         // 2-hour Retry-After exceeds the 5-min recovery window → fallback fires.
         let (db, path, _g) = open_test_db();
-        let pool = CredentialPool::load(
-            &db,
-            &path,
-            Provider::OpenRouter,
-            cfg_with(&[("a", "k1")]),
-        )
-        .unwrap();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, cfg_with(&[("a", "k1")]))
+            .unwrap();
         let cred = pool.pick().unwrap();
         pool.report_failure(
             &cred.id,
@@ -3450,7 +3429,11 @@ mod tests {
         let entries = pool2.entries();
         assert_eq!(entries.len(), 1);
         let c = &entries[0];
-        assert_eq!(c.refresh_token.as_deref(), Some("ref-1"), "refresh re-seeded from disk");
+        assert_eq!(
+            c.refresh_token.as_deref(),
+            Some("ref-1"),
+            "refresh re-seeded from disk"
+        );
         assert!(
             c.last_error_reset_at_ms.is_some(),
             "cooldown state survived reload"

@@ -10,7 +10,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 /// Outcome of a refresh call. `expires_at_ms` is wall-clock millis at which
@@ -70,10 +70,7 @@ pub async fn refresh_anthropic_against(
         .await
         .context("anthropic oauth refresh: send")?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .context("anthropic oauth refresh: body")?;
+    let body = resp.text().await.context("anthropic oauth refresh: body")?;
     if !status.is_success() {
         return Err(anyhow!(
             "anthropic oauth refresh: HTTP {status}: {}",
@@ -103,10 +100,7 @@ pub async fn refresh_codex(refresh_token: &str) -> Result<RefreshedTokens> {
     refresh_codex_against(refresh_token, "https://auth.openai.com/oauth/token").await
 }
 
-pub async fn refresh_codex_against(
-    refresh_token: &str,
-    endpoint: &str,
-) -> Result<RefreshedTokens> {
+pub async fn refresh_codex_against(refresh_token: &str, endpoint: &str) -> Result<RefreshedTokens> {
     if refresh_token.is_empty() {
         return Err(anyhow!("refresh_token is empty"));
     }
@@ -126,10 +120,7 @@ pub async fn refresh_codex_against(
         .await
         .context("codex oauth refresh: send")?;
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .context("codex oauth refresh: body")?;
+    let body = resp.text().await.context("codex oauth refresh: body")?;
     if !status.is_success() {
         return Err(anyhow!(
             "codex oauth refresh: HTTP {status}: {}",
@@ -190,7 +181,9 @@ mod tests {
             .await;
 
         let url = format!("{}/v1/oauth/token", server.uri());
-        let r = refresh_anthropic_against("old-refresh", &url).await.unwrap();
+        let r = refresh_anthropic_against("old-refresh", &url)
+            .await
+            .unwrap();
         assert_eq!(r.access_token, "new-access");
         assert_eq!(r.refresh_token, "new-refresh");
         assert!(r.expires_at_ms > now_ms());
@@ -204,9 +197,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/oauth/token"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"access_token":"new-access","expires_in":3600}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"access_token":"new-access","expires_in":3600}"#),
+            )
             .mount(&server)
             .await;
         let url = format!("{}/v1/oauth/token", server.uri());
@@ -241,7 +235,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/oauth/token"))
-            .and(body_string_contains("client_id=app_EMoamEEZ73f0CkXaXp7hrann"))
+            .and(body_string_contains(
+                "client_id=app_EMoamEEZ73f0CkXaXp7hrann",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"access_token":"cx-new","refresh_token":"cx-new-r","expires_in":604800}"#,
             ))
@@ -255,7 +251,9 @@ mod tests {
 
     #[tokio::test]
     async fn empty_refresh_token_fails_fast() {
-        assert!(refresh_anthropic_against("", "http://unused").await.is_err());
+        assert!(refresh_anthropic_against("", "http://unused")
+            .await
+            .is_err());
         assert!(refresh_codex_against("", "http://unused").await.is_err());
     }
 }

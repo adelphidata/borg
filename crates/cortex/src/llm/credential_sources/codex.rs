@@ -59,8 +59,8 @@ impl CredentialSource for CodexSource {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: CodexAuthFile = serde_json::from_str(&raw)
             .with_context(|| format!("parse {} as Codex auth", path.display()))?;
         let Some(tokens) = parsed.tokens else {

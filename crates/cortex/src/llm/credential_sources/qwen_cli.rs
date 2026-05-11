@@ -52,8 +52,8 @@ impl CredentialSource for QwenCliSource {
         if !path.exists() {
             return Ok(vec![]);
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: QwenFile = serde_json::from_str(&raw)
             .with_context(|| format!("parse {} as Qwen-CLI credentials", path.display()))?;
         if parsed.api_key.is_empty() {
