@@ -53,122 +53,48 @@ impl fmt::Display for ErrorCategory {
     }
 }
 
-/// Context-overflow substrings, shared between the pattern table and the
-/// rate-limit disambiguation logic. Defined once to prevent drift.
-const CONTEXT_OVERFLOW_PATTERNS: &[&str] = &[
-    "context window",
-    "context length",
-    "context_length",
-    "maximum context",
-    "request too large",
-    "prompt too long",
-    "prompt is too long",
-    "maximum token",
-    "exceeds the model",
-    "input too long",
-];
-
-/// Pattern table mapping error substrings to categories (checked in order).
-const ERROR_PATTERNS: &[(&[&str], ErrorCategory)] = &[
-    (
-        &[
-            "429",
-            "rate limit",
-            "rate_limit",
-            "too many requests",
-            "throttl",
-        ],
-        ErrorCategory::RateLimit,
-    ),
-    (
-        &[
-            "402",
-            "billing",
-            "payment required",
-            "insufficient_quota",
-            "quota exceeded",
-            "out of credits",
-            "no credits",
-            "exceeded your current quota",
-        ],
-        ErrorCategory::Billing,
-    ),
-    (
-        &[
-            "401",
-            "403",
-            "unauthorized",
-            "forbidden",
-            "invalid api key",
-            "invalid_api_key",
-            "auth error",
-            "authentication failed",
-        ],
-        ErrorCategory::Auth,
-    ),
-    (CONTEXT_OVERFLOW_PATTERNS, ErrorCategory::ContextOverflow),
-    (
-        &[
-            "500",
-            "502",
-            "503",
-            "504",
-            "overloaded",
-            "server error",
-            "service unavailable",
-            "bad gateway",
-            "internal server error",
-        ],
-        ErrorCategory::Overloaded,
-    ),
-    (
-        &[
-            "connection refused",
-            "connection reset",
-            "dns",
-            "network unreachable",
-            "no route to host",
-            "broken pipe",
-            "connect timeout",
-            "tls",
-            "ssl",
-            "certificate",
-        ],
-        ErrorCategory::Transport,
-    ),
-    (
-        &[
-            "timed out",
-            "timeout",
-            "request timed out",
-            "deadline exceeded",
-        ],
-        ErrorCategory::Timeout,
-    ),
-];
-
 /// Classify a raw error string into an `ErrorCategory`.
 ///
-/// Uses pattern matching on common provider error patterns, HTTP status codes,
-/// and network error signatures.
+/// Delegates to the central LLM-error classifier (`classify_error_text`) so
+/// the user-facing message-formatting path and the failover-decision path
+/// share one taxonomy. The mapping here is the boundary between the
+/// `FailoverReason` enum (recovery-strategy primitive) and `ErrorCategory`
+/// (UI-text primitive):
+///
+/// - `Auth` and `AuthPermanent` collapse — the user-visible advice is the
+///   same ("check your API key"); the rotate-vs-skip distinction is the
+///   failover layer's concern, not the user's.
+/// - `Timeout` is refined into `Transport` here when the underlying message
+///   looks like a network failure (connection refused, DNS, TLS) so the
+///   user gets actionable network guidance vs. generic "timed out".
+/// - `PayloadTooLarge` rolls into `ContextOverflow` for messaging — both
+///   mean "the request was too big," and the recovery advice is identical.
 pub fn classify_error(raw: &str) -> ErrorCategory {
-    let lower = raw.to_lowercase();
+    use crate::llm_error::{classify_error_text, FailoverReason};
 
-    for &(patterns, category) in ERROR_PATTERNS {
-        if patterns.iter().any(|p| lower.contains(p)) {
-            // Disambiguate: rate-limit + context-overflow signals →
-            // prefer ContextOverflow unless it's a TPM rate limit.
-            if category == ErrorCategory::RateLimit
-                && CONTEXT_OVERFLOW_PATTERNS.iter().any(|p| lower.contains(p))
-                && !lower.contains("tokens per minute")
-            {
-                return ErrorCategory::ContextOverflow;
-            }
-            return category;
+    match classify_error_text(raw) {
+        Some(FailoverReason::RateLimit) => ErrorCategory::RateLimit,
+        Some(FailoverReason::Billing) => ErrorCategory::Billing,
+        Some(FailoverReason::Auth) | Some(FailoverReason::AuthPermanent) => ErrorCategory::Auth,
+        Some(FailoverReason::Overloaded) => ErrorCategory::Overloaded,
+        Some(FailoverReason::ContextOverflow) | Some(FailoverReason::PayloadTooLarge) => {
+            ErrorCategory::ContextOverflow
         }
+        Some(FailoverReason::Timeout) => {
+            // UI refinement: distinguish "couldn't reach you" from
+            // "took too long" so the user-facing message is actionable.
+            // Both map to FailoverReason::Timeout for retry purposes.
+            if extract_transport_detail(raw).is_some() {
+                ErrorCategory::Transport
+            } else {
+                ErrorCategory::Timeout
+            }
+        }
+        Some(FailoverReason::ModelNotFound)
+        | Some(FailoverReason::Format)
+        | Some(FailoverReason::Unknown)
+        | None => ErrorCategory::Unknown,
     }
-
-    ErrorCategory::Unknown
 }
 
 /// Strip HTML content from error messages (e.g., Cloudflare error pages).

@@ -2233,3 +2233,130 @@ fn for_auxiliary_forces_thinking_off() {
         "primary thinking level must not bleed into aux"
     );
 }
+
+// ── Anthropic SSE error-event classification ──
+//
+// Regression guard for the bug that motivated centralizing
+// `FailoverReason`: the SSE "error" branch used to bucket every Anthropic
+// stream error as `Overloaded`, so an in-stream auth failure burned the
+// retry budget and never rotated credentials. The handler now consults
+// `classify_anthropic_stream_error` and lifts the result to a `Fatal`
+// vs. `Retryable` shape that matches the failover layer's contract.
+
+fn parse_anthropic_error_sse(err_type: &str, err_msg: &str) -> crate::sse::SseAction {
+    let line = format!(
+        r#"data: {{"type":"error","error":{{"type":"{err_type}","message":"{err_msg}"}}}}"#
+    );
+    let mut tool_idx = 0usize;
+    let mut is_tool = false;
+    let mut is_thinking = false;
+    let mut pending_input = 0u64;
+    let mut pending_cached = 0u64;
+    let mut pending_created = 0u64;
+    LlmClient::parse_anthropic_sse_line(
+        &line,
+        "anthropic",
+        "claude-sonnet-4",
+        &mut tool_idx,
+        &mut is_tool,
+        &mut is_thinking,
+        &mut pending_input,
+        &mut pending_cached,
+        &mut pending_created,
+    )
+}
+
+#[test]
+fn anthropic_sse_overloaded_error_is_retryable_overloaded() {
+    let action = parse_anthropic_error_sse("overloaded_error", "Overloaded");
+    match action {
+        crate::sse::SseAction::Error(LlmError::Retryable { reason, .. }) => {
+            assert_eq!(reason, FailoverReason::Overloaded);
+        }
+        _ => panic!("expected Retryable Overloaded"),
+    }
+}
+
+#[test]
+fn anthropic_sse_rate_limit_error_is_retryable_rate_limit() {
+    // RateLimit is Retryable (cool down and try again) but distinct from
+    // Overloaded so the cooldown table can hold separate backoff bases.
+    let action = parse_anthropic_error_sse("rate_limit_error", "too many requests");
+    match action {
+        crate::sse::SseAction::Error(LlmError::Retryable { reason, .. }) => {
+            assert_eq!(reason, FailoverReason::RateLimit);
+        }
+        _ => panic!("expected Retryable RateLimit"),
+    }
+}
+
+#[test]
+fn anthropic_sse_authentication_error_is_fatal_auth() {
+    // The whole point of the fix: a 401-class stream error must be Fatal
+    // so the failover layer rotates the credential or skips the provider
+    // instead of retrying max_retries times.
+    let action = parse_anthropic_error_sse("authentication_error", "invalid x-api-key");
+    match action {
+        crate::sse::SseAction::Error(LlmError::Fatal { reason, .. }) => {
+            assert_eq!(reason, FailoverReason::Auth);
+        }
+        _ => panic!("expected Fatal Auth"),
+    }
+}
+
+#[test]
+fn anthropic_sse_permission_error_is_fatal_auth_permanent() {
+    // 403-class — credential rotation cannot fix this; the whole account
+    // is denied. Must NOT trigger should_rotate_credential.
+    let action = parse_anthropic_error_sse("permission_error", "organization disabled");
+    match action {
+        crate::sse::SseAction::Error(LlmError::Fatal { reason, source }) => {
+            assert_eq!(reason, FailoverReason::AuthPermanent);
+            let err = LlmError::Fatal { source, reason };
+            assert!(
+                !err.should_rotate_credential(),
+                "AuthPermanent must not rotate credentials",
+            );
+        }
+        _ => panic!("expected Fatal AuthPermanent"),
+    }
+}
+
+#[test]
+fn anthropic_sse_invalid_request_with_context_overflow_is_fatal_compress() {
+    // invalid_request_error splits by message text: a prompt-length body
+    // must drive reactive compaction (should_compress true) rather than a
+    // generic Format fatal.
+    let action = parse_anthropic_error_sse(
+        "invalid_request_error",
+        "prompt is too long: 205000 tokens > 200000 maximum",
+    );
+    match action {
+        crate::sse::SseAction::Error(err) => {
+            assert_eq!(err.reason(), FailoverReason::ContextOverflow);
+            assert!(
+                err.should_compress(),
+                "context overflow must drive compaction"
+            );
+        }
+        _ => panic!("expected Error variant"),
+    }
+}
+
+#[test]
+fn anthropic_sse_invalid_request_generic_is_fatal_format() {
+    // The opposite half of the split — a malformed body that has nothing
+    // to do with context length must NOT drive compaction (which would
+    // silently drop history).
+    let action = parse_anthropic_error_sse(
+        "invalid_request_error",
+        "messages: at least one message is required",
+    );
+    match action {
+        crate::sse::SseAction::Error(err) => {
+            assert_eq!(err.reason(), FailoverReason::Format);
+            assert!(!err.should_compress());
+        }
+        _ => panic!("expected Error variant"),
+    }
+}

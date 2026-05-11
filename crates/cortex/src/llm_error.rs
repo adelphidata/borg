@@ -257,25 +257,130 @@ pub(crate) fn classify_status(
     }
 }
 
-/// Detect provider error bodies that signal the request exceeded the model's
-/// context window. Providers return 400 with varied phrasing; keep this
-/// conservative — a false positive would trigger an unnecessary compaction,
-/// but a false negative just degrades to the previous behavior (fatal error).
+/// Phrases that signal the request exceeded the model's context window.
+/// Shared between `body_indicates_context_overflow` (the 400-body refinement
+/// in `classify_status`), the Anthropic `invalid_request_error` SSE branch,
+/// and `classify_error_text` so the typed-status, structured-stream, and
+/// opaque-string paths stay in sync.
+const OVERFLOW_NEEDLES: &[&str] = &[
+    "context length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+    "exceeds the maximum",
+    "exceeds context",
+    "token limit",
+    "request too large",
+    "prompt too long",
+    "maximum token",
+    "exceeds the model",
+];
+
+const AUTH_PERMANENT_NEEDLES: &[&str] = &[
+    " 403 ",
+    "(403)",
+    "http 403",
+    "status 403",
+    "forbidden",
+    "permission_error",
+    "permission_denied",
+];
+
+const AUTH_NEEDLES: &[&str] = &[
+    " 401 ",
+    "(401)",
+    "http 401",
+    "status 401",
+    "unauthorized",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication failed",
+    "authentication_error",
+    "auth error",
+];
+
+const BILLING_NEEDLES: &[&str] = &[
+    " 402 ",
+    "(402)",
+    "http 402",
+    "status 402",
+    "payment required",
+    "insufficient_quota",
+    "quota exceeded",
+    "exceeded your current quota",
+    "out of credits",
+    "no credits",
+    "billing error",
+];
+
+const RATE_LIMIT_NEEDLES: &[&str] = &[
+    " 429 ",
+    "(429)",
+    "http 429",
+    "status 429",
+    " rate limit",
+    "rate-limit",
+    "rate_limit",
+    "rate_limit_error",
+    "too many requests",
+    "throttl",
+];
+
+const OVERLOADED_NEEDLES: &[&str] = &[
+    " 500 ",
+    "(500)",
+    "http 500",
+    "status 500",
+    " 502 ",
+    "(502)",
+    "http 502",
+    "status 502",
+    " 503 ",
+    "(503)",
+    "http 503",
+    "status 503",
+    " 504 ",
+    "(504)",
+    "http 504",
+    "status 504",
+    "overloaded_error",
+    "overloaded",
+    "service unavailable",
+    "bad gateway",
+    "internal server error",
+    "api_error",
+];
+
+const TIMEOUT_NEEDLES: &[&str] = &[
+    "timed out",
+    "timeout",
+    "timeout_error",
+    "request timed out",
+    "deadline exceeded",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "network unreachable",
+    "no route to host",
+    " dns ",
+    "dns lookup",
+    "dns resolution",
+    " tls ",
+    "tls handshake",
+    " ssl ",
+    "ssl handshake",
+    "certificate verify",
+];
+
+fn matches_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| haystack.contains(n))
+}
+
 fn body_indicates_context_overflow(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    // Common phrases across OpenAI, Anthropic, Gemini, OpenRouter, Groq.
-    const NEEDLES: &[&str] = &[
-        "context length",
-        "context window",
-        "maximum context",
-        "too many tokens",
-        "prompt is too long",
-        "input is too long",
-        "exceeds the maximum",
-        "exceeds context",
-        "token limit",
-    ];
-    NEEDLES.iter().any(|n| lower.contains(n))
+    matches_any(&lower, OVERFLOW_NEEDLES)
 }
 
 /// True when a 404 body mentions the model, suggesting the model id itself is
@@ -295,20 +400,29 @@ fn body_indicates_no_allowed_providers(body: &str) -> bool {
     lower.contains("no allowed providers") || lower.contains("available_providers")
 }
 
-/// Recover a `FailoverReason` from an error message string.
+/// Recover a `FailoverReason` from an opaque error message string.
 ///
-/// Used by the agent layer to make recovery decisions (e.g. reactive
-/// compaction) when the only available signal is the `StreamEvent::Error`
-/// payload — the typed error was already serialized by the time it crossed
-/// the stream channel.
+/// This is the single string-matching front for every place in cortex that
+/// can only see an error as text — the agent loop's reactive-compaction
+/// trigger, the user-facing `error_format` layer, the scheduled-task retry
+/// decision, and any provider adapter (e.g. Claude CLI) that surfaces
+/// `StreamEvent::Error(String)` after the typed `LlmError` was already
+/// stringified. Keeping one shared classifier prevents the three subsystems
+/// from drifting apart on what counts as "auth" vs "billing" vs "transient".
 ///
-/// Matches on both `classify_status`-produced markers (e.g. "context overflow")
-/// and raw provider phrases, for cases where the error came from outside the
-/// classifier (transport errors, upstream adapters).
+/// Order matters because some phrases overlap:
+/// - context-overflow phrases beat rate-limit unless the body explicitly
+///   names a TPM/RPM rate (Anthropic 429s name the window),
+/// - auth-permanent beats auth (403 needles would otherwise look like 401),
+/// - billing beats rate-limit ("throttl" rarely co-occurs with billing
+///   phrases, but quota-style errors should not retry).
 pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
-    let lower = msg.to_ascii_lowercase();
+    // Pad with spaces so " 429 ", " 500 ", " dns " etc. style needles match
+    // at message edges as well as in the middle.
+    let padded = format!(" {} ", msg.to_ascii_lowercase());
+    let lower = padded.as_str();
 
-    // Classifier-produced markers first — cheap exact substrings.
+    // Classifier-produced markers first — cheap, unambiguous.
     if lower.contains("(context overflow)") {
         return Some(FailoverReason::ContextOverflow);
     }
@@ -322,24 +436,68 @@ pub fn classify_error_text(msg: &str) -> Option<FailoverReason> {
         return Some(FailoverReason::AuthPermanent);
     }
 
-    // Fallback: raw provider phrases (for errors that bypassed classify_status,
-    // e.g. Claude CLI adapter). Kept in sync with body_indicates_context_overflow.
-    const OVERFLOW_NEEDLES: &[&str] = &[
-        "context length",
-        "context window",
-        "maximum context",
-        "too many tokens",
-        "prompt is too long",
-        "input is too long",
-        "exceeds the maximum",
-        "exceeds context",
-        "token limit",
-    ];
-    if OVERFLOW_NEEDLES.iter().any(|n| lower.contains(n)) {
+    // Disambiguation: a context-overflow phrase wins over rate-limit unless
+    // the body explicitly mentions a per-minute rate (TPM/RPM). Anthropic
+    // 429s often include both "rate_limit_error" and a prompt-length number,
+    // so without this guard the wrong branch fires on each direction.
+    let mentions_overflow = matches_any(lower, OVERFLOW_NEEDLES);
+    let mentions_tpm = lower.contains("tokens per minute") || lower.contains("requests per minute");
+    if mentions_overflow && !mentions_tpm {
         return Some(FailoverReason::ContextOverflow);
     }
 
+    if matches_any(lower, AUTH_PERMANENT_NEEDLES) {
+        return Some(FailoverReason::AuthPermanent);
+    }
+    if matches_any(lower, AUTH_NEEDLES) {
+        return Some(FailoverReason::Auth);
+    }
+    if matches_any(lower, BILLING_NEEDLES) {
+        return Some(FailoverReason::Billing);
+    }
+    if matches_any(lower, RATE_LIMIT_NEEDLES) {
+        return Some(FailoverReason::RateLimit);
+    }
+    if matches_any(lower, OVERLOADED_NEEDLES) {
+        return Some(FailoverReason::Overloaded);
+    }
+    if matches_any(lower, TIMEOUT_NEEDLES) {
+        return Some(FailoverReason::Timeout);
+    }
+
     None
+}
+
+/// Map an Anthropic SSE `error.type` string to a `FailoverReason`.
+///
+/// Anthropic stream errors carry a structured `error.type` (e.g.
+/// `overloaded_error`, `rate_limit_error`, `authentication_error`).
+/// Before this helper existed, the SSE handler bucketed every variant as
+/// `Overloaded`, defeating credential rotation and fast-fail on the
+/// streaming path. For `invalid_request_error` (the catch-all for
+/// malformed bodies) the message text disambiguates: a prompt-length body
+/// should drive compaction; anything else is `Format`. Unknown
+/// `error.type` strings fall through to `classify_error_text` so a
+/// provider rolling out a new variant still classifies usefully.
+pub(crate) fn classify_anthropic_stream_error(err_type: &str, err_msg: &str) -> FailoverReason {
+    match err_type {
+        "overloaded_error" | "api_error" => FailoverReason::Overloaded,
+        "rate_limit_error" => FailoverReason::RateLimit,
+        "authentication_error" => FailoverReason::Auth,
+        "permission_error" => FailoverReason::AuthPermanent,
+        "not_found_error" => FailoverReason::ModelNotFound,
+        "timeout_error" => FailoverReason::Timeout,
+        "request_too_large" => FailoverReason::PayloadTooLarge,
+        "invalid_request_error" => {
+            let lower = err_msg.to_ascii_lowercase();
+            if matches_any(&lower, OVERFLOW_NEEDLES) {
+                FailoverReason::ContextOverflow
+            } else {
+                FailoverReason::Format
+            }
+        }
+        _ => classify_error_text(err_msg).unwrap_or(FailoverReason::Unknown),
+    }
 }
 
 pub(crate) fn classify_network_error(err: anyhow::Error) -> LlmError {
@@ -388,7 +546,13 @@ pub(crate) fn override_retry_after(err: LlmError, override_value: Option<Duratio
 /// for absurd durations.
 pub fn parse_retry_after(body: &str) -> Option<Duration> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let secs = v["error"]["retry_after"].as_f64()?;
+    let raw = &v["error"]["retry_after"];
+    // Number form is the spec'd shape (OpenAI, OpenRouter native); string form
+    // ("30", "1.5") is a fallback for upstreams that pass through a stringified
+    // value via OpenRouter's `error.metadata.raw` wrapper.
+    let secs = raw
+        .as_f64()
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
     if !secs.is_finite() || secs <= 0.0 {
         return None;
     }
@@ -1054,15 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_error_text_returns_none_for_unrelated() {
-        assert_eq!(classify_error_text("connection reset by peer"), None);
-        assert_eq!(
-            classify_error_text("rate limit exceeded, retry in 30s"),
-            None
-        );
-    }
-
-    #[test]
     fn classify_error_text_recognizes_other_markers() {
         assert_eq!(
             classify_error_text("openai returned 404 (model not found): gpt-6"),
@@ -1075,6 +1230,302 @@ mod tests {
         assert_eq!(
             classify_error_text("anthropic returned 403 (auth permanent): "),
             Some(FailoverReason::AuthPermanent)
+        );
+    }
+
+    // ── classify_error_text: extended taxonomy (auth / billing / rate_limit /
+    //    overloaded / timeout). One table per direction so a missing needle
+    //    or a misordered branch fails a concrete row instead of a generic
+    //    "didn't classify" assertion.
+
+    /// Real provider phrases that MUST classify. Each entry is the kind of
+    /// string that can land in a `StreamEvent::Error(_)` body or a logged
+    /// anyhow chain — none of these are synthesized for the test. If a
+    /// real provider rolls out a phrasing not covered here, this is the
+    /// table to add a row to.
+    const POSITIVE_CASES: &[(&str, FailoverReason)] = &[
+        // Auth: classifier marker + raw phrases providers actually emit.
+        (
+            "openai returned 401 (auth error): bad key",
+            FailoverReason::Auth,
+        ),
+        ("Invalid API key provided", FailoverReason::Auth),
+        (
+            "authentication_error: x-api-key header is invalid",
+            FailoverReason::Auth,
+        ),
+        // AuthPermanent: 403 outranks 401 — listed first so the table also
+        // exercises the precedence rule, not just the needle.
+        (
+            "anthropic returned 403 (auth permanent): account disabled",
+            FailoverReason::AuthPermanent,
+        ),
+        (
+            "permission_error: organization does not have access to model",
+            FailoverReason::AuthPermanent,
+        ),
+        // Billing: includes provider-marker and raw OpenAI-style phrasing.
+        (
+            "openrouter returned 402 (billing error): insufficient_quota",
+            FailoverReason::Billing,
+        ),
+        (
+            "You exceeded your current quota, please check your plan",
+            FailoverReason::Billing,
+        ),
+        ("HTTP 402 Payment Required", FailoverReason::Billing),
+        // RateLimit: classifier marker + raw 429 phrasing + the Anthropic
+        // structured-error name. The TPM-mention case is the disambiguation
+        // guard — it must beat the OVERFLOW_NEEDLES "tokens" overlap.
+        (
+            "openai returned 429 (rate limited): too many requests",
+            FailoverReason::RateLimit,
+        ),
+        ("HTTP 429 Too Many Requests", FailoverReason::RateLimit),
+        (
+            "rate_limit_error: 5000 input tokens per minute exceeded",
+            FailoverReason::RateLimit,
+        ),
+        // Overloaded: server-side 5xx, both classifier-marker-shaped and
+        // the SSE `overloaded_error` structured-error name.
+        (
+            "anthropic stream error (overloaded_error): Overloaded",
+            FailoverReason::Overloaded,
+        ),
+        ("HTTP 502 Bad Gateway", FailoverReason::Overloaded),
+        ("internal server error", FailoverReason::Overloaded),
+        // Timeout: network failures collapse into Timeout because the
+        // failover layer retries+falls-back identically for both. Each row
+        // pins a distinct phrasing path.
+        ("connection reset by peer", FailoverReason::Timeout),
+        ("request timed out after 30000ms", FailoverReason::Timeout),
+        ("deadline exceeded", FailoverReason::Timeout),
+        (
+            "DNS lookup failed for api.openai.com",
+            FailoverReason::Timeout,
+        ),
+        // ContextOverflow: raw provider phrasing variants.
+        (
+            "This model's maximum context length is 200000 tokens",
+            FailoverReason::ContextOverflow,
+        ),
+        (
+            "prompt is too long: 205000 tokens > 200000 maximum",
+            FailoverReason::ContextOverflow,
+        ),
+    ];
+
+    /// Strings that MUST NOT classify. Regression net against an overly-eager
+    /// needle: substring traps ("5000" matching "500"), false-positive verbs
+    /// ("connected" / "cached"), and empty input.
+    const NEGATIVE_CASES: &[&str] = &[
+        "Hello world",
+        "processed 5000 items",
+        "connected on port 4290",
+        "successfully cached prompt",
+        "",
+    ];
+
+    #[test]
+    fn classify_error_text_positive_table() {
+        for (input, expected) in POSITIVE_CASES {
+            assert_eq!(
+                classify_error_text(input),
+                Some(*expected),
+                "input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_error_text_negative_table() {
+        for input in NEGATIVE_CASES {
+            assert_eq!(
+                classify_error_text(input),
+                None,
+                "expected None for input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_error_text_recovery_hints_match_reason() {
+        // Each FailoverReason flips a specific set of recovery hints
+        // (`should_compress`, `should_rotate_credential`, `should_fallback`,
+        // `is_fast_fail`). Spec-pin those for every category the agent layer
+        // actually keys on. If the LlmError variant or hint logic changes,
+        // this fails on the actual behavior, not the enum tag.
+        for (input, reason) in POSITIVE_CASES {
+            let err = match reason {
+                FailoverReason::Auth
+                | FailoverReason::AuthPermanent
+                | FailoverReason::Billing
+                | FailoverReason::ContextOverflow
+                | FailoverReason::PayloadTooLarge
+                | FailoverReason::ModelNotFound
+                | FailoverReason::Format => LlmError::Fatal {
+                    source: anyhow::anyhow!("{input}"),
+                    reason: *reason,
+                },
+                _ => LlmError::Retryable {
+                    source: anyhow::anyhow!("{input}"),
+                    retry_after: None,
+                    reason: *reason,
+                },
+            };
+            // Compaction only fires for ContextOverflow.
+            assert_eq!(
+                err.should_compress(),
+                *reason == FailoverReason::ContextOverflow,
+                "should_compress for {reason:?} on input={input:?}",
+            );
+            // Credential rotation only for transient-auth / rate-limit.
+            let rotate_expected =
+                matches!(reason, FailoverReason::Auth | FailoverReason::RateLimit);
+            assert_eq!(
+                err.should_rotate_credential(),
+                rotate_expected,
+                "should_rotate_credential for {reason:?} on input={input:?}",
+            );
+            // Fast-fail only for the user-fixable / structurally-broken cases.
+            let fast_fail_expected = matches!(
+                reason,
+                FailoverReason::ModelNotFound
+                    | FailoverReason::AuthPermanent
+                    | FailoverReason::PayloadTooLarge
+            );
+            assert_eq!(
+                err.is_fast_fail(),
+                fast_fail_expected,
+                "is_fast_fail for {reason:?} on input={input:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_error_text_tpm_rate_limit_beats_context_overflow() {
+        // Anthropic 429s include "rate_limit_error" and a per-minute token
+        // count, and the OVERFLOW_NEEDLES set contains "tokens" via
+        // "too many tokens". The TPM mention must keep this as RateLimit;
+        // mis-classifying as ContextOverflow would silently trigger
+        // history compaction on a transient throttle.
+        assert_eq!(
+            classify_error_text("rate_limit_error: 200000 tokens per minute exceeded"),
+            Some(FailoverReason::RateLimit),
+        );
+        assert_eq!(
+            classify_error_text("rate limit reached. Limit: 100000 requests per minute"),
+            Some(FailoverReason::RateLimit),
+        );
+    }
+
+    #[test]
+    fn classify_error_text_context_overflow_with_429_substring_still_overflow() {
+        // The opposite direction: an explicit context-length message that
+        // happens to mention a 429 code (e.g. a logged proxy hop) must
+        // remain ContextOverflow — compacting is the recovery, not retry.
+        assert_eq!(
+            classify_error_text(
+                "this model's maximum context length is 200000 tokens (provider returned 429)"
+            ),
+            Some(FailoverReason::ContextOverflow),
+        );
+    }
+
+    #[test]
+    fn classify_error_text_auth_permanent_outranks_auth() {
+        // 403 markers must win over 401 markers when both happen to appear.
+        assert_eq!(
+            classify_error_text(
+                "anthropic returned 403 (auth permanent): also mentions 401 in the metadata"
+            ),
+            Some(FailoverReason::AuthPermanent),
+        );
+    }
+
+    // ── classify_anthropic_stream_error ──
+
+    /// Every Anthropic SSE error.type value we know about plus the
+    /// invalid_request_error split. The bug this method fixes was: every
+    /// stream error landed as Overloaded, so an auth-during-stream burned
+    /// the retry budget. Each row here is a regression on that.
+    const ANTHROPIC_STREAM_CASES: &[(&str, &str, FailoverReason)] = &[
+        ("overloaded_error", "Overloaded", FailoverReason::Overloaded),
+        ("api_error", "internal error", FailoverReason::Overloaded),
+        (
+            "rate_limit_error",
+            "too many requests",
+            FailoverReason::RateLimit,
+        ),
+        (
+            "authentication_error",
+            "invalid x-api-key",
+            FailoverReason::Auth,
+        ),
+        (
+            "permission_error",
+            "org disabled",
+            FailoverReason::AuthPermanent,
+        ),
+        (
+            "not_found_error",
+            "model not found",
+            FailoverReason::ModelNotFound,
+        ),
+        ("timeout_error", "took too long", FailoverReason::Timeout),
+        (
+            "request_too_large",
+            "100MB body",
+            FailoverReason::PayloadTooLarge,
+        ),
+        // invalid_request_error → ContextOverflow ONLY when the message
+        // names a context-length issue; otherwise Format.
+        (
+            "invalid_request_error",
+            "prompt is too long: 205k > 200k",
+            FailoverReason::ContextOverflow,
+        ),
+        (
+            "invalid_request_error",
+            "messages: at least one message is required",
+            FailoverReason::Format,
+        ),
+    ];
+
+    #[test]
+    fn classify_anthropic_stream_error_table() {
+        for (err_type, err_msg, expected) in ANTHROPIC_STREAM_CASES {
+            assert_eq!(
+                classify_anthropic_stream_error(err_type, err_msg),
+                *expected,
+                "type={err_type:?} msg={err_msg:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_anthropic_stream_error_unknown_type_with_overflow_message_falls_through() {
+        // A future Anthropic error.type we don't recognize should still
+        // classify usefully from the message body — that's the
+        // classify_error_text fallback. A context-overflow phrase must
+        // surface as ContextOverflow, not Unknown.
+        assert_eq!(
+            classify_anthropic_stream_error(
+                "future_unknown_error",
+                "this model's maximum context length is 200000 tokens"
+            ),
+            FailoverReason::ContextOverflow,
+        );
+    }
+
+    #[test]
+    fn classify_anthropic_stream_error_unknown_type_with_opaque_message_is_unknown() {
+        // The original bug: an unrecognized stream error was forced to
+        // Overloaded. Now it must surface as Unknown so the failover layer
+        // doesn't retry forever on something that isn't actually transient.
+        assert_eq!(
+            classify_anthropic_stream_error("future_unknown_error", "something happened"),
+            FailoverReason::Unknown,
         );
     }
 

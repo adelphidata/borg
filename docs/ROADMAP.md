@@ -137,11 +137,6 @@ top-down by priority, not by section order.
 - **Stale session lock detection.** `[O]` If a daemon crashes
   mid-session, the next launch should detect and clear the orphaned
   lock rather than dead-ending. Folds into `borg doctor`.
-- **Error classifier for LLM API failures.** `[H]` Centralized
-  taxonomy (`auth` / `billing` / `rate_limit` / `overloaded` /
-  `timeout` / `context_length`) returning a structured `FailoverReason`
-  that drives recovery strategy. Replaces the scattered string-matching
-  spread across provider modules today.
 - **`run.attempt` metadata in logs.** `[O]` Tag each line in
   `~/.borg/logs/{date}.jsonl` with the retry attempt number so
   duplicated tool calls or agent turns are correlatable when grepping.

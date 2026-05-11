@@ -418,26 +418,20 @@ pub fn parse_cron_line(line: &str) -> Result<(String, String)> {
 }
 
 /// Check if an error message indicates a transient failure worth retrying.
+///
+/// Delegates to the central `FailoverReason` taxonomy in `llm_error` so the
+/// scheduled-task retry policy and the LLM-failover policy stay aligned on
+/// what counts as "transient". The three retryable categories are
+/// `RateLimit`, `Overloaded`, and `Timeout`; everything else (auth, billing,
+/// context overflow, format) would just burn retries.
 pub fn is_transient_error(error: &str) -> bool {
-    let lower = error.to_lowercase();
-    lower.contains("timeout")
-        || lower.contains("timed out")
-        || lower.contains("rate limit")
-        || lower.contains("connection refused")
-        || lower.contains("connection reset")
-        || lower.contains("broken pipe")
-        || lower.contains("status 429")
-        || lower.contains("http 429")
-        || lower.contains(" 429 ")
-        || lower.contains("status 503")
-        || lower.contains("http 503")
-        || lower.contains(" 503 ")
-        || lower.contains("status 502")
-        || lower.contains("http 502")
-        || lower.contains(" 502 ")
-        || lower.contains("status 500")
-        || lower.contains("http 500")
-        || lower.contains(" 500 ")
+    use crate::llm_error::{classify_error_text, FailoverReason};
+    matches!(
+        classify_error_text(error),
+        Some(FailoverReason::RateLimit)
+            | Some(FailoverReason::Overloaded)
+            | Some(FailoverReason::Timeout)
+    )
 }
 
 #[cfg(test)]
@@ -721,5 +715,41 @@ mod tests {
         assert!(!is_transient_error("connected on port 4290"));
         // But "timeout after 5000ms" IS transient (matches "timeout")
         assert!(is_transient_error("timeout after 5000ms"));
+    }
+
+    #[test]
+    fn is_transient_error_auth_and_billing_are_not_transient() {
+        // Retrying a 401/403/402 on a scheduled task burns attempts: the
+        // problem is account-state, not load. The whole reason the central
+        // classifier exists is to keep this contract aligned with the LLM
+        // failover layer. If a future needle drift starts treating these
+        // as transient, the scheduler will silently retry-loop.
+        assert!(
+            !is_transient_error("invalid_api_key: bad credentials"),
+            "auth must not be transient",
+        );
+        assert!(
+            !is_transient_error("HTTP 401 Unauthorized"),
+            "401 must not be transient",
+        );
+        assert!(
+            !is_transient_error("HTTP 403 Forbidden: account suspended"),
+            "403 must not be transient",
+        );
+        assert!(
+            !is_transient_error("HTTP 402 Payment Required"),
+            "402 must not be transient",
+        );
+        assert!(
+            !is_transient_error("insufficient_quota: please add credits"),
+            "billing must not be transient",
+        );
+        // Format / context-overflow errors are also non-transient — retrying
+        // a malformed payload doesn't fix it; compaction is the remedy for
+        // context overflow, not retry.
+        assert!(
+            !is_transient_error("prompt is too long: 205k > 200k"),
+            "context overflow must not be transient — needs compaction, not retry",
+        );
     }
 }

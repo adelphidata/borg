@@ -2049,14 +2049,31 @@ impl LlmClient {
                 }
             }
             "error" => {
+                // Anthropic stream errors carry a structured `error.type`.
+                // Before this branch routed through `classify_anthropic_stream_error`,
+                // every variant landed as `Overloaded` — an in-stream 401
+                // then burned the retry budget instead of fast-failing
+                // the provider.
+                let err_type = event["error"]["type"].as_str().unwrap_or("");
                 let err_msg = event["error"]["message"]
                     .as_str()
                     .unwrap_or("unknown error");
-                SseAction::Error(LlmError::Retryable {
-                    source: anyhow::anyhow!("Anthropic stream error: {err_msg}"),
-                    retry_after: None,
-                    reason: FailoverReason::Overloaded,
-                })
+                let reason = classify_anthropic_stream_error(err_type, err_msg);
+                let source = anyhow::anyhow!("Anthropic stream error ({err_type}): {err_msg}");
+                let llm_err = match reason {
+                    FailoverReason::Auth
+                    | FailoverReason::AuthPermanent
+                    | FailoverReason::Billing
+                    | FailoverReason::ModelNotFound
+                    | FailoverReason::PayloadTooLarge
+                    | FailoverReason::Format => LlmError::Fatal { source, reason },
+                    _ => LlmError::Retryable {
+                        source,
+                        retry_after: None,
+                        reason,
+                    },
+                };
+                SseAction::Error(llm_err)
             }
             _ => SseAction::Continue,
         }
