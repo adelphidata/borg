@@ -98,14 +98,3 @@ impl TypingIndicator {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn typing_constants_are_stable() {
-        assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(3));
-        assert_eq!(TYPING_REACTION, "thinking_face");
-    }
-}

@@ -778,10 +778,13 @@ mod tests {
 
     #[test]
     fn parse_pf_disabled() {
-        assert!(matches!(
-            parse_pf_status("Status: Disabled"),
-            CheckStatus::Warn(_),
-        ));
+        let CheckStatus::Warn(msg) = parse_pf_status("Status: Disabled") else {
+            panic!("disabled PF must surface as Warn");
+        };
+        assert!(
+            msg.contains("PF") && msg.contains("disabled"),
+            "warn message must name PF and its state, got: {msg}"
+        );
     }
 
     #[test]
@@ -791,10 +794,13 @@ mod tests {
 
     #[test]
     fn parse_ufw_inactive() {
-        assert!(matches!(
-            parse_ufw_status("Status: inactive\n"),
-            CheckStatus::Warn(_),
-        ));
+        let CheckStatus::Warn(msg) = parse_ufw_status("Status: inactive\n") else {
+            panic!("inactive UFW must surface as Warn");
+        };
+        assert!(
+            msg.contains("UFW") && msg.contains("inactive"),
+            "warn message must name UFW and its state, got: {msg}"
+        );
     }
 
     #[test]
@@ -877,10 +883,13 @@ mod tests {
 
     #[test]
     fn parse_fde_off() {
-        assert!(matches!(
-            parse_fde_status("FileVault is Off."),
-            CheckStatus::Warn(_),
-        ));
+        let CheckStatus::Warn(msg) = parse_fde_status("FileVault is Off.") else {
+            panic!("FileVault Off must surface as Warn");
+        };
+        assert!(
+            msg.contains("FileVault") && msg.contains("disabled"),
+            "warn message must name FileVault and its state, got: {msg}"
+        );
     }
 
     #[test]
@@ -893,10 +902,15 @@ mod tests {
 
     #[test]
     fn parse_softwareupdate_available() {
-        assert!(matches!(
-            parse_softwareupdate("Software Update found the following:\n* macOS 14.1"),
-            CheckStatus::Warn(_),
-        ));
+        let CheckStatus::Warn(msg) =
+            parse_softwareupdate("Software Update found the following:\n* macOS 14.1")
+        else {
+            panic!("pending software updates must surface as Warn");
+        };
+        assert!(
+            msg.contains("update"),
+            "warn message must mention updates so the user knows what to do, got: {msg}"
+        );
     }
 
     #[test]

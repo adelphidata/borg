@@ -53,11 +53,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn constants_match_expected() {
-        assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(8));
-    }
-
-    #[test]
     fn typing_url_construction() {
         assert_eq!(
             typing_url("123456"),

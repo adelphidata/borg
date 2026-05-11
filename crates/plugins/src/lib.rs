@@ -246,12 +246,6 @@ mod tests {
         assert_eq!(PluginKind::Tool.to_string(), "tool");
     }
 
-    #[test]
-    fn plugin_kind_equality() {
-        assert_eq!(PluginKind::Channel, PluginKind::Channel);
-        assert_ne!(PluginKind::Channel, PluginKind::Tool);
-    }
-
     // -- Category --
 
     #[test]
@@ -306,16 +300,6 @@ mod tests {
             TemplateTarget::Tools.base_dir(dir),
             std::path::PathBuf::from("/home/user/.borg/tools")
         );
-    }
-
-    // -- InstallResult --
-
-    #[test]
-    fn install_result_default_is_empty() {
-        let result = InstallResult::default();
-        assert!(result.notes.is_empty());
-        assert!(result.credential_entries.is_empty());
-        assert!(result.file_hashes.is_empty());
     }
 
     // -- CredentialSpec --

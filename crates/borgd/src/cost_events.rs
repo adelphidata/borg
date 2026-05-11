@@ -103,20 +103,79 @@ impl CostEventSink for CostEventBus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn disabled_config_starts_without_channel() {
-        let bus = CostEventBus::new(&Config::default(), BorgMetrics::noop());
-        let rx = bus.subscribe_state();
-        assert!(rx.borrow().is_none());
+    fn sample_event(request_id: &str) -> CostEvent {
+        CostEvent {
+            request_id: request_id.to_string(),
+            session_id: "sess-1".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            cost_usd: Some("0.0042".to_string()),
+            cost_usd_present: true,
+            cost_source: "provider".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            timestamp_unix_ms: 1_700_000_000_000,
+            kind: "chat".to_string(),
+        }
     }
 
     #[test]
-    fn enable_creates_and_disable_drops_channel() {
+    fn disabled_bus_drops_emitted_events() {
+        // Config::default() has telemetry.cost_events = false. emit() must
+        // be a no-op: no inner channel exists, so a late subscriber cannot
+        // observe past events either.
+        let bus = CostEventBus::new(&Config::default(), BorgMetrics::noop());
+        bus.emit(sample_event("dropped"));
+
+        bus.set_enabled(true);
+        let inner = bus
+            .subscribe_state()
+            .borrow()
+            .clone()
+            .expect("enabled bus must publish an inner channel");
+        let mut rx = inner.tx.subscribe();
+        // Channel was just created — no buffered events from before enable.
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "events emitted while disabled must not surface after enable"
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_bus_broadcasts_events_to_subscribers() {
         let bus = CostEventBus::new(&Config::default(), BorgMetrics::noop());
         bus.set_enabled(true);
-        let rx = bus.subscribe_state();
-        assert!(rx.borrow().is_some());
+
+        let inner = bus
+            .subscribe_state()
+            .borrow()
+            .clone()
+            .expect("enabled bus must publish an inner channel");
+        let mut rx = inner.tx.subscribe();
+
+        let event = sample_event("delivered");
+        bus.emit(event.clone());
+
+        let received = rx.recv().await.expect("subscriber must receive event");
+        assert_eq!(received, event);
+
+        // Disabling tears down the inner channel; future subscribers cannot
+        // be created from the dropped sender, and emit() becomes a no-op.
         bus.set_enabled(false);
-        assert!(rx.borrow().is_none());
+        assert!(
+            bus.subscribe_state().borrow().is_none(),
+            "disable must clear the inner channel handle"
+        );
+        bus.emit(sample_event("after-disable"));
+        // The pre-existing receiver may see Closed once the sender is dropped,
+        // but it MUST NOT receive the post-disable event.
+        match rx.try_recv() {
+            Ok(ev) => panic!("post-disable emit must not deliver, got {ev:?}"),
+            Err(broadcast::error::TryRecvError::Empty)
+            | Err(broadcast::error::TryRecvError::Closed) => {}
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                panic!("unexpected lag on idle channel")
+            }
+        }
     }
 }

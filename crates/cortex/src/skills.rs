@@ -1138,14 +1138,24 @@ Body here.
 
     #[test]
     fn parse_missing_frontmatter() {
-        let result = parse_skill_md("# No frontmatter\nJust a body.");
-        assert!(result.is_err());
+        let err = parse_skill_md("# No frontmatter\nJust a body.")
+            .expect_err("missing frontmatter must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("frontmatter"),
+            "error must point at the missing frontmatter, got: {msg}"
+        );
     }
 
     #[test]
     fn parse_missing_closing_delimiter() {
-        let result = parse_skill_md("---\nname: broken\ndescription: oops\n# no closing");
-        assert!(result.is_err());
+        let err = parse_skill_md("---\nname: broken\ndescription: oops\n# no closing")
+            .expect_err("missing closing --- must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("closing"),
+            "error must point at the missing closing delimiter, got: {msg}"
+        );
     }
 
     #[test]

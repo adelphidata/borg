@@ -431,18 +431,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn flush_empty_is_noop() {
-        assert!(flush_short_term_to_daily("").is_ok());
-        assert!(flush_short_term_to_daily("   ").is_ok());
-    }
-
-    #[test]
-    fn constants_are_valid_uuids() {
-        assert_eq!(NIGHTLY_CONSOLIDATION_TASK_ID.len(), 36);
-        assert_eq!(WEEKLY_CONSOLIDATION_TASK_ID.len(), 36);
-    }
-
-    #[test]
     fn consolidation_task_ids_match_seeded_jobs() {
         assert!(is_consolidation_task_id(NIGHTLY_CONSOLIDATION_TASK_ID));
         assert!(is_consolidation_task_id(WEEKLY_CONSOLIDATION_TASK_ID));

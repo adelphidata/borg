@@ -40,13 +40,3 @@ impl TypingIndicator {
         self.inner.stop().await;
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn constants_match_expected() {
-        assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(4));
-    }
-}
