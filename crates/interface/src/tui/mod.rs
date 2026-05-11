@@ -29,6 +29,7 @@ mod sessions_popup;
 mod settings_popup;
 mod shimmer;
 mod status_popup;
+mod subprocesses_popup;
 pub(crate) mod theme;
 mod toast;
 mod tool_display;

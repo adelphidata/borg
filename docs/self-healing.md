@@ -343,6 +343,95 @@ The maintenance sweep runs the same scan, so a single manual invocation
 of `borg schedule run <maintenance-task-id>` will heal stalled tasks
 even when the daemon isn't running.
 
+## Subprocess process registry
+
+Every agent-initiated subprocess — `run_shell` children, the headless
+`browser` (Chrome), hook scripts, scheduled command tasks, and
+`pre_run_command` preambles — is registered in a daemon-side
+`ProcessRegistry` at spawn time. The registry stores PID, command,
+owning session, kind, and start time, and tracks lifecycle transitions
+(Running → Exited / TimedOut / Killed / Dead) via an RAII `ProcessGuard`
+so spawn sites cannot forget to deregister.
+
+Short-lived internal utilities (`git`, `sips`, `security`, `launchctl`)
+are intentionally **not** tracked — they finish in milliseconds and
+would crowd out the signal we actually want, which is "what's still
+running that shouldn't be."
+
+Surfaces:
+
+- `borg status` / `/status` — one section listing running children
+  with age and kind. Hidden when empty.
+- `borg doctor` / `/doctor` — `Subprocesses:Long-running children`
+  check: Pass when all entries are younger than
+  `process_registry.orphan_warn_secs` (default 1h), Warn when any
+  exceed it, Fail at `process_registry.orphan_fail_secs` (default 4h).
+  Remediation is `Manual` — Borg surfaces the orphan; the operator
+  decides whether to kill it. Squelchable via
+  `/doctor squelch Subprocesses:Long-running children`.
+
+Each daily maintenance sweep runs three registry steps after the
+embedding-cache prune:
+
+1. **Liveness reap** — sends `signal(0)` to every Running entry's PID.
+   Any entry whose PID has vanished (daemon crash mid-spawn, kernel
+   reaped the process before the guard could fire) is marked `Dead`
+   and moved to the finished queue. Reported as
+   `MaintenanceReport.subprocess_dead_reaped`.
+2. **Auto-reap** — entries older than `process_registry.auto_reap_secs`
+   (default 24h) are SIGTERM'd, then SIGKILL'd after
+   `process_registry.sigterm_grace_secs` (default 5s). The original
+   command is captured to `activity_log` at `category=process_registry`
+   before the kill so post-mortem is always possible. Reported as
+   `MaintenanceReport.subprocess_auto_killed`. Set
+   `process_registry.auto_reap_secs = 0` to disable auto-reap entirely.
+3. **Finished-queue prune** — finished entries older than
+   `process_registry.finished_ttl_secs` (default 30 min) are evicted,
+   and the queue is bounded by `process_registry.max_finished_entries`
+   (default 256) with LRU eviction. Reported as
+   `MaintenanceReport.subprocess_finished_pruned`.
+
+All three actions charge the `heal_action_budget` so a registry that's
+somehow grown unbounded cannot turn a sweep into a multi-second hang.
+
+### Auto-reap whitelist
+
+Three layers prevent legitimate long-running workloads from being
+killed at 24h:
+
+1. **Kind exemption (hard-coded).** `Browser` (headless Chrome) is
+   never auto-killed. The browser session is meant to outlive any
+   single tool call, and there is no useful "stuck Chrome" heuristic
+   that doesn't also break correct usage. Counted as
+   `subprocess_auto_exempted`, not killed.
+2. **Pattern allowlist.** `process_registry.never_kill_patterns`
+   (default `["cargo build*", "cargo test*", "cargo run*",
+   "cargo clippy*", "make*", "pytest*", "npm run*", "bun *"]`) is
+   glob-matched against the command string. Add host-specific entries
+   with `borg settings set process_registry.never_kill_patterns ...`.
+3. **Per-process pin.** When `/doctor` shows a Warn for a workload you
+   know is legitimately running long, pin it from the TUI subprocess
+   view: cursor onto the row and press `p` to toggle the pin (same
+   inline-toggle pattern as `/settings`). Pinned entries are exempt
+   from auto-reap and contribute to neither Warn nor Fail counts. The
+   pin clears automatically when the process exits — there is no need
+   to unpin.
+
+If the same command is auto-reaped on two consecutive sweeps,
+maintenance surfaces a persistent warning at `Subprocesses:repeated
+auto-reap` with the hint `add to process_registry.never_kill_patterns`
+— a "you keep killing this; whitelist it" nudge.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `process_registry.orphan_warn_secs` | `3600` | Age past which a running subprocess triggers a doctor Warn. |
+| `process_registry.orphan_fail_secs` | `14400` | Age past which a running subprocess triggers a doctor Fail. |
+| `process_registry.auto_reap_secs` | `86400` | Age past which the daily sweep SIGTERMs+SIGKILLs the subprocess. `0` disables auto-reap. |
+| `process_registry.sigterm_grace_secs` | `5` | Seconds between SIGTERM and SIGKILL during auto-reap. |
+| `process_registry.never_kill_patterns` | (8 build/test globs) | Glob patterns exempt from auto-reap. |
+| `process_registry.finished_ttl_secs` | `1800` | How long completed entries linger before the sweep evicts them. |
+| `process_registry.max_finished_entries` | `256` | Hard cap on the finished queue; oldest evicted first. |
+
 ## Memory entry size limits
 
 `write_memory` rejects any write that would produce an entry larger than

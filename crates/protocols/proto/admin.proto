@@ -102,6 +102,13 @@ service Admin {
   // Doctor squelch CRUD — writer-only. Reads can use Database::open_readonly.
   rpc DoctorSquelchSet(DoctorSquelchSetRequest) returns (Empty);
   rpc DoctorSquelchClear(DoctorSquelchClearRequest) returns (DoctorSquelchClearResponse);
+
+  // Subprocess registry — daemon-side ProcessRegistry inspection + pinning.
+  // `GetSubprocesses` returns a snapshot of running + recently-finished
+  // entries; `SetSubprocessPinned` flips the auto-reap pin on a specific
+  // running entry (the TUI subprocess view drives both).
+  rpc GetSubprocesses(Empty) returns (SubprocessSnapshot);
+  rpc SetSubprocessPinned(SetSubprocessPinnedRequest) returns (Empty);
 }
 
 message MonthlyTokenTotal { uint64 total = 1; }
@@ -483,4 +490,41 @@ message DoctorSquelchClearRequest {
 message DoctorSquelchClearResponse {
   // True if a row was removed; false if no active squelch existed.
   bool removed = 1;
+}
+
+// Subprocess registry ──────────────────────────────────────────────────────
+message Subprocess {
+  // Monotonic registry id assigned at spawn (not PID — PIDs reuse).
+  uint64 id = 1;
+  // OS process id at spawn time. `0` for the headless browser, which
+  // chromiumoxide doesn't surface — orphan detection works on kind+age.
+  uint32 pid = 2;
+  // "RunShell" | "Browser" | "Hook" | "ScheduledCommand" | "PreRun"
+  string kind = 3;
+  // Redacted command string, truncated to 256 chars at register time.
+  string command = 4;
+  // Owning session id, empty if not tied to a session (e.g. heartbeat).
+  string session_id = 5;
+  int64 started_at_unix = 6;
+  // Empty when still running.
+  int64 finished_at_unix = 7;
+  bool finished = 8;
+  // 0 when not exited / still running. `exit_code_present` distinguishes
+  // "real exit 0" from "no exit captured".
+  int32 exit_code = 9;
+  bool exit_code_present = 10;
+  // "Running" | "Exited" | "TimedOut" | "Killed" | "Dead"
+  string status = 11;
+  // True when the operator has opted this entry out of auto-reap.
+  bool pinned = 12;
+}
+
+message SubprocessSnapshot {
+  repeated Subprocess running = 1;
+  repeated Subprocess finished = 2;
+}
+
+message SetSubprocessPinnedRequest {
+  uint64 id = 1;
+  bool pinned = 2;
 }

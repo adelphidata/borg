@@ -54,6 +54,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     // Sessions
     ("/sessions", "Browse and load saved sessions"),
+    (
+        "/subprocesses",
+        "View tracked subprocesses (p: toggle pin, r: reload)",
+    ),
     ("/save", "Save current session"),
     ("/new", "Start new session"),
     ("/fork", "Branch the current session into a new one"),
@@ -485,6 +489,7 @@ mod tests {
             "/schedule",
             "/migrate",
             "/restart",
+            "/subprocesses",
             "/exit",
         ];
         assert_eq!(

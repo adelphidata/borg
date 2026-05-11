@@ -210,6 +210,7 @@ pub async fn handle_run_shell_with_context(
             timeout_ms,
             event_tx,
             tool_call_id,
+            ctx,
         )
         .await;
     }
@@ -234,8 +235,26 @@ pub async fn handle_run_shell_with_context(
         .spawn()
         .context("Failed to spawn shell command")?;
 
+    // Register with the process registry so `borg status` / `/doctor`
+    // can see the child mid-flight. The guard's Drop marks the entry
+    // Killed if `?` early-returns below, so an error path doesn't
+    // leave a phantom Running entry.
+    let _guard = ctx.process_registry().and_then(|reg| {
+        child.id().map(|pid| {
+            reg.register(
+                pid,
+                crate::process_registry::ProcessKind::RunShell,
+                command,
+                ctx.session_id().map(str::to_string),
+            )
+        })
+    });
+
     match stream_child_output(&mut child, timeout_dur, event_tx, tool_call_id, "run_shell").await {
         Ok((stdout, stderr, code)) => {
+            if let Some(g) = _guard {
+                g.complete(code);
+            }
             let status = code.unwrap_or(-1);
             Ok(format!(
                 "Exit code: {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
@@ -243,10 +262,14 @@ pub async fn handle_run_shell_with_context(
         }
         Err(e) => {
             if e.to_string().contains("timed out") {
+                if let Some(g) = _guard {
+                    g.timed_out();
+                }
                 Ok(format!(
                     "Error: command timed out after {timeout_ms}ms\nCommand: {command}"
                 ))
             } else {
+                // Guard's Drop will mark Killed.
                 Err(e)
             }
         }
@@ -304,6 +327,7 @@ async fn run_in_pty(
     timeout_ms: u64,
     event_tx: &mpsc::Sender<AgentEvent>,
     tool_call_id: &str,
+    ctx: &ExecutionContext,
 ) -> Result<String> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -335,6 +359,21 @@ async fn run_in_pty(
     // the reader once the child exits — otherwise the read loop blocks
     // forever waiting on a dangling fd.
     drop(pair.slave);
+
+    // Mirror the non-PTY spawn site: register the PID so PTY-mode REPLs
+    // are visible to `borg status` / `/doctor` and reaped by the
+    // self-healing sweep. Drop semantics apply: a panic or unwrapped
+    // error below marks the entry Killed.
+    let _guard = ctx.process_registry().and_then(|reg| {
+        child.process_id().map(|pid| {
+            reg.register(
+                pid,
+                crate::process_registry::ProcessKind::RunShell,
+                command,
+                ctx.session_id().map(str::to_string),
+            )
+        })
+    });
 
     let mut reader = pair
         .master
@@ -378,13 +417,23 @@ async fn run_in_pty(
     .await;
 
     match combined_result {
-        Ok(Ok((combined, exit_code))) => Ok(format!(
-            "Exit code: {exit_code}\n--- output (tty) ---\n{combined}"
-        )),
+        Ok(Ok((combined, exit_code))) => {
+            if let Some(g) = _guard {
+                g.complete(Some(exit_code as i32));
+            }
+            Ok(format!(
+                "Exit code: {exit_code}\n--- output (tty) ---\n{combined}"
+            ))
+        }
         Ok(Err(e)) => Err(e),
-        Err(_) => Ok(format!(
-            "Error: command timed out after {timeout_ms}ms (tty)\nCommand: {command}"
-        )),
+        Err(_) => {
+            if let Some(g) = _guard {
+                g.timed_out();
+            }
+            Ok(format!(
+                "Error: command timed out after {timeout_ms}ms (tty)\nCommand: {command}"
+            ))
+        }
     }
 }
 
