@@ -25,7 +25,6 @@ use super::composer::Composer;
 use super::file_popup::FileSearchPopup;
 use super::file_search::FileSearchService;
 use super::history::HistoryCell;
-use super::insights_popup::InsightsPopup;
 use super::migrate_popup::{MigrateAction, MigratePopup};
 use super::model_popup::ModelPopup;
 use super::pairing_popup::{PairingAction, PairingPopup};
@@ -36,6 +35,7 @@ use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
 use super::transcript_pager::TranscriptPager;
+use super::usage_popup::UsagePopup;
 
 /// Single source of truth for the list of popups that participate in
 /// key/paste/visibility routing. Every dispatch site in this file uses this
@@ -53,7 +53,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, schedule_popup);
         $body!($self, migrate_popup);
         $body!($self, status_popup);
-        $body!($self, insights_popup);
+        $body!($self, usage_popup);
         $body!($self, btw_popup);
     };
 }
@@ -367,7 +367,6 @@ pub enum AppAction {
     /// the DB-level copy, and then dispatches a `LoadSession` for the fork.
     ForkSession,
     ClearHistory,
-    ShowUsage,
     UndoLastTurn,
     /// Rewind conversation to the Nth user message (0-indexed, oldest-first).
     RewindTo {
@@ -513,7 +512,7 @@ pub struct App<'a> {
     /// Version installed by `/update` in the current process, pending restart.
     pub pending_update_version: Option<String>,
     pub status_popup: StatusPopup,
-    pub insights_popup: InsightsPopup,
+    pub usage_popup: UsagePopup,
     pub btw_popup: BtwPopup,
     /// Cancel token for the currently-in-flight `/btw` background task, if
     /// any. A new `/btw` invocation cancels the previous one.
@@ -595,7 +594,7 @@ impl<'a> App<'a> {
             ambient_status: None,
             pending_update_version: None,
             status_popup: StatusPopup::new(),
-            insights_popup: InsightsPopup::new(),
+            usage_popup: UsagePopup::new(),
             btw_popup: BtwPopup::new(),
             btw_cancel: None,
             btw_result_rx: None,
@@ -743,7 +742,7 @@ impl<'a> App<'a> {
             || self.schedule_popup.is_visible()
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
-            || self.insights_popup.is_visible()
+            || self.usage_popup.is_visible()
             || self.btw_popup.is_visible()
             || self.plugins_popup.is_visible()
     }

@@ -608,7 +608,7 @@ fn v35_fts_skips_null_and_empty_content() {
 }
 
 // ── tool_call_counts_since / channel_activity_since ──────────────────────
-// These back the Tools / Channels sections of `/insights`. The asserts
+// These back the Tools / Channels sections of `/usage`. The asserts
 // pin shape-tolerance and cutoff-correctness invariants that a refactor
 // could quietly break.
 

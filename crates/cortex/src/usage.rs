@@ -1,4 +1,4 @@
-//! `/insights` text formatter — token spend, model usage, tool-call
+//! `/usage` text formatter — token spend, model usage, tool-call
 //! distribution, and channel activity over a rolling time window.
 //!
 //! The daemon owns the formatter (mirroring `GetXpText` / `GetEvolutionText`
@@ -17,7 +17,7 @@ pub const DEFAULT_DAYS: u32 = 30;
 /// Hard upper bound — token_usage is unbounded retention but rendering
 /// 5 years of activity in a popup is a footgun.
 pub const MAX_DAYS: u32 = 365;
-/// Minimum (anything smaller is almost certainly a bug — `/insights 0`
+/// Minimum (anything smaller is almost certainly a bug — `/usage 0`
 /// should land on `DEFAULT_DAYS`, not silently empty).
 pub const MIN_DAYS: u32 = 1;
 /// Cap on rows rendered in the Models section.
@@ -37,19 +37,19 @@ pub fn clamp_days(days: u32) -> u32 {
     days.clamp(MIN_DAYS, MAX_DAYS)
 }
 
-/// Render `/insights` as a multi-section plain-text block over a window of
+/// Render `/usage` as a multi-section plain-text block over a window of
 /// `days` days. `days = 0` resolves to [`DEFAULT_DAYS`].
 ///
 /// Sections, in order — each separated by a blank line:
 ///
-/// 1. Header (`Insights ({days} days, since YYYY-MM-DD)`)
+/// 1. Header (`Usage ({days} days, since YYYY-MM-DD)`)
 /// 2. Activity (sessions / messages / tool calls)
 /// 3. Tokens (prompt / completion / cached / cache-write / total)
 /// 4. Cost — **omitted entirely** when no row in window has a non-null `cost_usd`
 /// 5. Models (top [`TOP_MODELS`])
 /// 6. Tools — **omitted** when zero tool calls in window
 /// 7. Channels — **omitted** when zero channel activity in window
-pub fn format_insights_text(db: &Database, days: u32) -> Result<String> {
+pub fn format_usage_text(db: &Database, days: u32) -> Result<String> {
     let resolved = clamp_days(days);
     let now = Utc::now().timestamp();
     let since_ts = now - (resolved as i64) * 86_400;
@@ -64,7 +64,7 @@ pub fn format_insights_text(db: &Database, days: u32) -> Result<String> {
 
     let since_str = format_since_date(since_ts);
     let mut out = String::new();
-    out.push_str(&format!("Insights ({resolved} days, since {since_str})\n"));
+    out.push_str(&format!("Usage ({resolved} days, since {since_str})\n"));
 
     out.push('\n');
     out.push_str("Activity:\n");
@@ -256,7 +256,7 @@ mod tests {
         ensure_session(&db, "s1", now());
         // No cost_usd on any row → cost_present = false.
         insert_token_row(&db, now(), 100, 50, 150, 0, 0, "ollama", "llama3", None);
-        let out = format_insights_text(&db, 30).unwrap();
+        let out = format_usage_text(&db, 30).unwrap();
         // The literal section header "Cost:" must not appear when no row has
         // a non-null cost_usd. Failure mode: regression rendering "$0.00"
         // when the rate card is silent — exactly what hermes flagged as
@@ -283,7 +283,7 @@ mod tests {
             "gpt-4o",
             Some(0.0125),
         );
-        let out = format_insights_text(&db, 30).unwrap();
+        let out = format_usage_text(&db, 30).unwrap();
         assert!(
             out.contains("Cost:"),
             "Cost section should render. Got:\n{out}"
@@ -300,7 +300,7 @@ mod tests {
         ensure_session(&db, "s1", now());
         // Insert a plain message without tool_calls_json.
         insert_message(&db, "s1", now(), None);
-        let out = format_insights_text(&db, 30).unwrap();
+        let out = format_usage_text(&db, 30).unwrap();
         assert!(
             !out.contains("Tools:"),
             "Tools section should be hidden when zero tool calls. Got:\n{out}"
@@ -311,7 +311,7 @@ mod tests {
     fn formatter_omits_channels_section_when_no_channel_messages() {
         let db = Database::test_db();
         ensure_session(&db, "s1", now());
-        let out = format_insights_text(&db, 30).unwrap();
+        let out = format_usage_text(&db, 30).unwrap();
         assert!(
             !out.contains("Channels:"),
             "Channels section should be hidden when channel_messages is empty. Got:\n{out}"
@@ -337,7 +337,7 @@ mod tests {
                 None,
             );
         }
-        let out = format_insights_text(&db, 30).unwrap();
+        let out = format_usage_text(&db, 30).unwrap();
         // Count `openai/model-` occurrences in the rendered text.
         let rendered = out.matches("openai/model-").count();
         assert_eq!(
@@ -364,14 +364,14 @@ mod tests {
         // visibly reflects DEFAULT_DAYS so end-to-end users can see what
         // window they're looking at.
         let db = Database::test_db();
-        let out = format_insights_text(&db, 0).expect("zero clamps to default");
+        let out = format_usage_text(&db, 0).expect("zero clamps to default");
         assert!(
             out.contains(&format!("{DEFAULT_DAYS} days")),
             "header must reflect the default window. Got:\n{out}"
         );
 
         // Above MAX_DAYS clamps to MAX_DAYS, not to default.
-        let out_max = format_insights_text(&db, 100_000).expect("max-clamp");
+        let out_max = format_usage_text(&db, 100_000).expect("max-clamp");
         assert!(
             out_max.contains(&format!("{MAX_DAYS} days")),
             "header must reflect MAX_DAYS when over the cap. Got:\n{out_max}"

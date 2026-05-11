@@ -325,7 +325,7 @@ impl Database {
 
     /// Count sessions whose `updated_at` is at or after `since_ts`. A session
     /// counts as "active in window" if it was touched, not merely created
-    /// before the window — matches the wording in `/insights`.
+    /// before the window — matches the wording in `/usage`.
     pub fn session_count_since(&self, since_ts: i64) -> Result<u64> {
         let mut stmt = self
             .conn
@@ -352,7 +352,7 @@ impl Database {
     /// - Anthropic-style assistant tool blocks: `[{ "name": "...", "input": {...} }, ...]`
     ///
     /// Rows whose `tool_calls_json` fails to parse are skipped with a
-    /// `tracing::warn!` and do not abort the aggregation — `/insights` must
+    /// `tracing::warn!` and do not abort the aggregation — `/usage` must
     /// not fail if one corrupted row exists somewhere in history.
     #[instrument(skip_all)]
     pub fn tool_call_counts_since(

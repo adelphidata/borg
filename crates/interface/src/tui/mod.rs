@@ -14,7 +14,6 @@ mod goodbye;
 mod highlight;
 mod history;
 mod insert_history;
-mod insights_popup;
 mod layout;
 mod line_utils;
 mod markdown;
@@ -36,6 +35,7 @@ mod tool_display;
 mod transcript_pager;
 mod tui_lifecycle;
 mod update_prompt;
+mod usage_popup;
 mod wrapping;
 
 use std::io::stdout;
@@ -629,21 +629,6 @@ fn draw_viewport(tui: &mut tui_lifecycle::Tui, app: &mut App<'_>) -> Result<()> 
     Ok(())
 }
 
-/// Format an integer with comma thousands separators (e.g. `3999` → `"3,999"`).
-/// Used by the `/usage` display so large token counts are scannable.
-fn fmt_commas(n: u64) -> String {
-    let s = n.to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     tui: &mut tui_lifecycle::Tui,
@@ -887,71 +872,6 @@ async fn run_event_loop(
                 }
                 Err(e) => app.push_system_message(format!("Clear failed: {e}")),
             },
-            AppAction::ShowUsage => {
-                let (msg_count, token_count) = match client.get_state(session_id).await {
-                    Ok(s) => (s.message_count as usize, s.token_estimate as usize),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "GetState for /usage failed");
-                        (0, 0)
-                    }
-                };
-
-                let prompt_tok = app.session_prompt_tokens;
-                let completion_tok = app.session_completion_tokens;
-                let total_tok = prompt_tok + completion_tok;
-
-                let mut text = format!(
-                    "Session: {} messages, ~{} estimated tokens\n\
-                     LLM usage: {} prompt + {} completion = {} total tokens\n",
-                    fmt_commas(msg_count as u64),
-                    fmt_commas(token_count as u64),
-                    fmt_commas(prompt_tok),
-                    fmt_commas(completion_tok),
-                    fmt_commas(total_tok),
-                );
-
-                for (label, days) in [("24h", 1), ("7d", 7), ("30d", 30)] {
-                    match cortex::logging::count_messages_for_period(days) {
-                        Ok(stats) => {
-                            text.push_str(&format!(
-                                "{label}: {} user, {} assistant, {} tool calls\n",
-                                fmt_commas(stats.user_messages as u64),
-                                fmt_commas(stats.assistant_messages as u64),
-                                fmt_commas(stats.tool_calls as u64),
-                            ));
-                        }
-                        Err(e) => {
-                            text.push_str(&format!("{label}: error reading logs: {e}\n"));
-                        }
-                    }
-                }
-
-                // Show monthly budget info (routed through the daemon).
-                let budget_limit = app.config.budget.monthly_token_limit;
-                if budget_limit > 0 {
-                    match client.get_monthly_token_total().await {
-                        Ok(t) => {
-                            let used = t.total;
-                            let pct = (used as f64 / budget_limit as f64 * 100.0) as u64;
-                            text.push_str(&format!(
-                                "Budget: {}/{} tokens ({pct}%) used this month\n",
-                                fmt_commas(used),
-                                fmt_commas(budget_limit),
-                            ));
-                        }
-                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTokenTotal failed"),
-                    }
-                    match client.get_monthly_total_cost().await {
-                        Ok(c) if c.present => {
-                            text.push_str(&format!("Estimated cost: ${:.4}\n", c.cost));
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "GetMonthlyTotalCost failed"),
-                    }
-                }
-
-                app.push_system_message(text.trim_end().to_string());
-            }
             AppAction::UndoLastTurn => match client.undo(session_id).await {
                 Ok(r) => {
                     let removed = r.removed as usize;
@@ -1834,23 +1754,6 @@ mod tests {
             msg.contains("restart"),
             "user must be told to restart: {msg}"
         );
-    }
-
-    #[test]
-    fn fmt_commas_groups_digits() {
-        let cases: &[(u64, &str)] = &[
-            (0, "0"),
-            (42, "42"),
-            (999, "999"),
-            (1_000, "1,000"),
-            (3_999, "3,999"),
-            (1_000_000, "1,000,000"),
-            (12_345_678, "12,345,678"),
-            (u64::MAX, "18,446,744,073,709,551,615"),
-        ];
-        for (n, expected) in cases {
-            assert_eq!(fmt_commas(*n), *expected, "fmt_commas({n})");
-        }
     }
 
     #[test]

@@ -21,7 +21,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     // Essentials
     ("/help", "Show available commands"),
     ("/settings", "Configure settings"),
-    ("/usage", "Show usage stats"),
+    (
+        "/usage",
+        "Token spend, model + tool usage over a window (default 30 days)",
+    ),
     ("/plan", "Toggle plan mode"),
     ("/mode", "Switch collaboration mode"),
     ("/model", "Switch LLM provider/model"),
@@ -45,10 +48,6 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/status", "Show agent vitals (alias of /stats)"),
     ("/stats", "Show agent vitals"),
-    (
-        "/insights",
-        "Token spend, model + tool usage over a window (default 30 days)",
-    ),
     ("/evolution", "Show evolution overview"),
     ("/card", "Print an ASCII share card"),
     ("/pairing", "Manage sender pairing"),
@@ -473,7 +472,6 @@ mod tests {
             "/poke",
             "/status",
             "/stats",
-            "/insights",
             "/xp",
             "/evolution",
             "/card",

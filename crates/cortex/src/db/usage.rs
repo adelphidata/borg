@@ -132,7 +132,7 @@ impl Database {
 
     /// Aggregate token usage by `(provider, model)` for `token_usage` rows
     /// at or after `since_ts`. Ordered by `total_tokens` descending so the
-    /// `/insights` formatter can take the top N.
+    /// `/usage` formatter can take the top N.
     #[instrument(skip_all)]
     pub fn usage_by_model_since(&self, since_ts: i64) -> Result<Vec<ModelUsageRow>> {
         let mut stmt = self.conn.prepare(

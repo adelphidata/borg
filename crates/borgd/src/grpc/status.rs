@@ -11,7 +11,7 @@ use cortex::db::Database;
 use protocols::status::{
     status_server::Status, BondEvent as PbBondEvent, BondEventList, BondStateProto, Budget, Empty,
     EvolutionEvent as PbEvolutionEvent, EvolutionEventList, EvolutionStateProto, Heartbeat,
-    InsightsRequest, Int64Cursor, Posture, StatusText, StatusTextRequest, Vitals,
+    Int64Cursor, Posture, StatusText, StatusTextRequest, UsageRequest, Vitals,
     VitalsEvent as PbVitalsEvent, VitalsEventList, XpEvent, XpSnapshot,
 };
 use tonic::{Request, Response, Status as TStatus};
@@ -461,18 +461,18 @@ impl Status for StatusSvc {
         }))
     }
 
-    async fn get_insights_text(
+    async fn get_usage_text(
         &self,
-        req: Request<InsightsRequest>,
+        req: Request<UsageRequest>,
     ) -> Result<Response<StatusText>, TStatus> {
         let days = req.into_inner().days;
         let text = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
             let db = Database::open()?;
-            cortex::insights::format_insights_text(&db, days)
+            cortex::usage::format_usage_text(&db, days)
         })
         .await
-        .map_err(|e| TStatus::internal(format!("insights text task panicked: {e}")))?
-        .map_err(|e| TStatus::internal(format!("insights text failed: {e}")))?;
+        .map_err(|e| TStatus::internal(format!("usage text task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("usage text failed: {e}")))?;
         Ok(Response::new(StatusText {
             text,
             compact_class_line: String::new(),

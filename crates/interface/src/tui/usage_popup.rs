@@ -1,4 +1,4 @@
-//! `/insights` popup — renders the daemon-formatted text view in an
+//! `/usage` popup — renders the daemon-formatted text view in an
 //! alt-screen popup. The daemon owns the formatter (mirroring the
 //! `StatusPopup` pattern with `GetXpText` / `GetEvolutionText`); this
 //! popup just blocks on the RPC and paints the returned string.
@@ -20,7 +20,7 @@ use crate::daemon_client::DaemonClient;
 use super::app::{AppAction, PopupHandler};
 use super::theme;
 
-pub struct InsightsPopup {
+pub struct UsagePopup {
     visible: bool,
     scroll_offset: usize,
     lines: Vec<Line<'static>>,
@@ -28,11 +28,11 @@ pub struct InsightsPopup {
     /// can show the active window even after a `reload()`. `None` means
     /// the popup has never been opened in this process.
     days: Option<u32>,
-    /// Daemon client for the `GetInsightsText` RPC.
+    /// Daemon client for the `GetUsageText` RPC.
     client: Option<Arc<Mutex<DaemonClient>>>,
 }
 
-impl InsightsPopup {
+impl UsagePopup {
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -65,7 +65,7 @@ impl InsightsPopup {
         self.scroll_offset = 0;
         self.lines.clear();
         let days = self.days.unwrap_or(0);
-        let snap = self.block_on_rpc(move |c| Box::pin(c.get_insights_text(days)));
+        let snap = self.block_on_rpc(move |c| Box::pin(c.get_usage_text(days)));
         match snap {
             Ok(text) => {
                 for line in text.text.lines() {
@@ -73,9 +73,9 @@ impl InsightsPopup {
                 }
             }
             Err(e) => {
-                tracing::warn!("insights_popup: GetInsightsText RPC failed: {e:#}");
+                tracing::warn!("usage_popup: GetUsageText RPC failed: {e:#}");
                 self.lines
-                    .push(Line::from("Insights unavailable.".to_string()));
+                    .push(Line::from("Usage unavailable.".to_string()));
             }
         }
     }
@@ -148,8 +148,8 @@ impl InsightsPopup {
         frame.render_widget(Clear, popup_area);
 
         let title = match self.days {
-            Some(0) | None => " Insights ".to_string(),
-            Some(d) => format!(" Insights · {d}d "),
+            Some(0) | None => " Usage ".to_string(),
+            Some(d) => format!(" Usage · {d}d "),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -180,7 +180,7 @@ impl InsightsPopup {
     }
 }
 
-impl PopupHandler for InsightsPopup {
+impl PopupHandler for UsagePopup {
     fn is_visible(&self) -> bool {
         self.visible
     }
@@ -200,13 +200,13 @@ mod tests {
 
     #[test]
     fn new_popup_not_visible() {
-        let popup = InsightsPopup::new();
+        let popup = UsagePopup::new();
         assert!(!popup.is_visible());
     }
 
     #[test]
     fn dismiss_hides_popup() {
-        let mut popup = InsightsPopup::new();
+        let mut popup = UsagePopup::new();
         popup.visible = true;
         popup.dismiss();
         assert!(!popup.is_visible());
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn esc_dismisses_when_visible() {
-        let mut popup = InsightsPopup::new();
+        let mut popup = UsagePopup::new();
         popup.visible = true;
         let action = popup.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(action, Some(AppAction::Continue)));
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn keys_no_op_when_invisible() {
-        let mut popup = InsightsPopup::new();
+        let mut popup = UsagePopup::new();
         // Not visible: even Esc should be a no-op so global handlers can run.
         let action = popup.handle_key(KeyEvent::from(KeyCode::Esc));
         assert!(action.is_none());

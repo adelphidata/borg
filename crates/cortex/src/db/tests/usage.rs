@@ -195,7 +195,7 @@ fn monthly_budget_pct_buckets_at_each_threshold() {
 }
 
 // ── token_summary_since / usage_by_model_since ────────────────────────────
-// These back the `/insights` rolling-window view. Each test pins a real-world
+// These back the `/usage` rolling-window view. Each test pins a real-world
 // failure mode the formatter relies on (cutoff filters, NULL-vs-zero cost,
 // ordering invariants).
 

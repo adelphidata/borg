@@ -29,10 +29,10 @@ impl App<'_> {
                 self.status_popup.show(&self.config, &client);
                 return Some(Ok(AppAction::EnterAltScreen));
             }
-            "/insights" => {
+            "/usage" => {
                 let client = self.client.clone();
                 // 0 = ask the daemon to use its default window (30 days).
-                self.insights_popup.show(0, &client);
+                self.usage_popup.show(0, &client);
                 return Some(Ok(AppAction::EnterAltScreen));
             }
             "/xp" => {
@@ -100,7 +100,6 @@ impl App<'_> {
                 self.queued_messages.clear();
                 return Some(Ok(AppAction::ClearHistory));
             }
-            "/usage" => return Some(Ok(AppAction::ShowUsage)),
             "/undo" => return Some(Ok(AppAction::UndoLastTurn)),
             "/sessions" => {
                 let client = self.client.clone();
@@ -203,23 +202,23 @@ impl App<'_> {
             return Some(self.cmd_model_set(rest.trim()));
         }
 
-        // `/insights <days>` — open the popup with an explicit window. Bad
+        // `/usage <days>` — open the popup with an explicit window. Bad
         // input falls back to the default with a one-line system message
         // rather than silently zeroing — silent zero would render an empty
         // popup with no signal that the arg was rejected.
-        if let Some(rest) = trimmed.strip_prefix("/insights ") {
+        if let Some(rest) = trimmed.strip_prefix("/usage ") {
             let arg = rest.trim();
             let days = match arg.parse::<u32>() {
                 Ok(n) => n,
                 Err(_) => {
                     self.push_system_message(format!(
-                        "/insights: couldn't parse '{arg}' as days; using default."
+                        "/usage: couldn't parse '{arg}' as days; using default."
                     ));
                     0
                 }
             };
             let client = self.client.clone();
-            self.insights_popup.show(days, &client);
+            self.usage_popup.show(days, &client);
             return Some(Ok(AppAction::EnterAltScreen));
         }
 
@@ -297,7 +296,7 @@ impl App<'_> {
             "Commands:\n  \
              /help      - Show this help\n  \
              /settings  - Configure settings\n  \
-             /usage     - Show usage stats\n  \
+             /usage [days] - Token spend, model + tool usage over a window (default 30 days)\n  \
              /mode      - Switch collaboration mode (default/execute/plan)\n  \
              /plan      - Shortcut for /mode plan (toggles read-only plan mode)\n\
              \n  \
@@ -317,7 +316,6 @@ impl App<'_> {
              /doctor unsquelch <Category>:<Name> - Resume reminders for it\n  \
              /heal      - Run the self-healing maintenance sweep on demand\n  \
              /status    - Show agent vitals\n  \
-             /insights [days] - Token spend, model + tool usage over a window (default 30 days)\n  \
              /poke      - Trigger immediate heartbeat\n  \
              /pairing   - Manage sender pairing\n  \
              /pairing approve <code> - Approve a pairing request\n  \

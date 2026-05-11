@@ -99,10 +99,6 @@ pub mod image_gen;
 /// sanitize, audit). Shared by every ingress surface — native channels,
 /// OpenAI-compat HTTP, generic webhook, MCP server.
 pub mod ingress;
-/// `/insights` formatter — pre-renders the multi-section text view (token
-/// spend, cost, model usage, tool calls, channel activity) over a rolling
-/// time window. The TUI popup renders the returned string verbatim.
-pub mod insights;
 /// Installation integrity verification.
 pub mod integrity;
 /// Real-time `<internal>` tag stripping from streamed output.
@@ -204,6 +200,10 @@ pub mod types;
 pub mod unix_ext;
 /// Self-update mechanism for the borg binary.
 pub mod update;
+/// `/usage` formatter — pre-renders the multi-section text view (token
+/// spend, cost, model usage, tool calls, channel activity) over a rolling
+/// time window. The TUI popup renders the returned string verbatim.
+pub mod usage;
 /// Shared input validators and sanitizers.
 pub mod validation;
 /// Vitals system: passive agent health tracking via hooks.
