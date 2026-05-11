@@ -18,7 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::Config;
 use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
-use crate::doctor::{run_diagnostics, DiagnosticCheck, RemediationKind};
+use crate::doctor::{run_diagnostics_with_registry, DiagnosticCheck, RemediationKind};
+use crate::process_registry::{compile_never_kill_patterns, AutoReapPolicy, ProcessRegistry};
 
 mod budget;
 mod embeddings;
@@ -130,6 +131,25 @@ pub struct MaintenanceReport {
     /// budget (1000) — most healthy sweeps stay well below.
     #[serde(default)]
     pub heal_actions_spent: u32,
+    /// Subprocess registry entries whose PID vanished (daemon crash
+    /// mid-spawn or kernel-reaped before the guard fired) — moved from
+    /// running to finished as `Dead`.
+    #[serde(default)]
+    pub subprocess_dead_reaped: usize,
+    /// Subprocess registry finished-queue entries evicted by TTL/LRU.
+    #[serde(default)]
+    pub subprocess_finished_pruned: usize,
+    /// Non-pinned running entries past the warn/fail thresholds. Drives
+    /// the `Subprocesses:Long-running children` doctor check.
+    #[serde(default)]
+    pub subprocess_long_running: usize,
+    /// Entries SIGTERM'd / SIGKILL'd by `auto_reap` this sweep.
+    #[serde(default)]
+    pub subprocess_auto_killed: usize,
+    /// Entries past the auto-reap age threshold but spared by an
+    /// exemption (kind, pattern, or pin).
+    #[serde(default)]
+    pub subprocess_auto_exempted: usize,
 }
 
 impl MaintenanceReport {
@@ -158,6 +178,8 @@ impl MaintenanceReport {
             || self.auto_fix_failed_issues > 0
             || self.squelches_expired > 0
             || self.wal_checkpoint_pages_reclaimed < 0
+            || self.subprocess_dead_reaped > 0
+            || self.subprocess_auto_killed > 0
     }
 
     /// Short one-line summary suitable for the activity log.
@@ -184,10 +206,26 @@ impl MaintenanceReport {
     }
 }
 
+/// Run the full daily maintenance sweep without a process registry —
+/// preserved for call sites (CLI standalone runs, tests) that don't
+/// have access to the daemon's live registry. Equivalent to
+/// [`run_daily_maintenance_with_registry`] with `None`.
+///
+/// The daemon's task dispatcher and `Admin.Heal` RPC call the registry
+/// variant so subprocess reap/auto-kill actually runs in production.
+pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<MaintenanceReport> {
+    run_daily_maintenance_with_registry(db, config, None)
+}
+
+
 /// Run the full daily maintenance sweep. Never propagates errors from
 /// individual steps — each is logged and the sweep continues so one
 /// broken step can't block the others.
-pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<MaintenanceReport> {
+pub fn run_daily_maintenance_with_registry(
+    db: &Database,
+    config: &Config,
+    registry: Option<&ProcessRegistry>,
+) -> Result<MaintenanceReport> {
     let now = chrono::Utc::now().timestamp();
     let mut report = MaintenanceReport {
         ran_at: now,
@@ -216,7 +254,7 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     }
 
     // 1. Headless doctor sweep, before bounded auto-repairs.
-    let initial_diag = run_diagnostics(config);
+    let initial_diag = run_diagnostics_with_registry(config, registry);
     let initial_issues = issue_snapshots(&initial_diag.checks);
 
     // 2. Prune filesystem logs. Best-effort — missing dir is fine.
@@ -325,6 +363,89 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
             }
             Err(e) => tracing::warn!("maintenance: wedged-run sweep failed: {e}"),
         }
+    }
+
+    // 5_subproc. Subprocess registry sweep. Three sub-steps:
+    //   1. reap_dead — kill -0 probe on every Running PID; vanished
+    //      ones (daemon crashed mid-spawn, kernel reaped before guard
+    //      fired) move to finished as Dead.
+    //   2. auto_reap — SIGTERM/SIGKILL any non-exempt entry past the
+    //      `process_registry.auto_reap_secs` threshold (default 24h).
+    //      Kind=Browser, pinned entries, and pattern-matched commands
+    //      are exempt. The activity log captures the killed command
+    //      for post-mortem before the entry is moved.
+    //   3. prune_finished — TTL+LRU eviction of completed entries.
+    //
+    // No-op when the caller didn't pass a registry (CLI standalone /
+    // tests). Each sub-action charges the heal_action_budget.
+    let mut subprocess_repeat_offender = false;
+    if let Some(reg) = registry {
+        if !budget.is_blown() {
+            let reaped = reg.reap_dead(now);
+            report.subprocess_dead_reaped = reaped;
+            budget.try_spend(reaped);
+        }
+        if !budget.is_blown() && config.process_registry.auto_reap_secs > 0 {
+            let policy = AutoReapPolicy {
+                max_age_secs: config.process_registry.auto_reap_secs as i64,
+                never_kill_patterns: compile_never_kill_patterns(
+                    &config.process_registry.never_kill_patterns,
+                ),
+                sigterm_grace_secs: config.process_registry.sigterm_grace_secs,
+            };
+            // Previous-sweep snapshot must be read before auto_reap
+            // overwrites it.
+            let previous = reg.previous_auto_reaped_commands();
+            let auto_report = reg.auto_reap(now, &policy);
+            report.subprocess_auto_killed = auto_report.killed_count();
+            report.subprocess_auto_exempted = auto_report.exempted_count();
+            budget.try_spend(auto_report.killed_count());
+
+            // Audit-log each kill with the full command so the operator
+            // can post-mortem. Loud-on-the-error-path: never silently
+            // discard the activity-log write.
+            for entry in auto_report
+                .terminated
+                .iter()
+                .chain(auto_report.killed.iter())
+            {
+                let line = format!(
+                    "auto-reaped subprocess id={} pid={} kind={} age={}s cmd={:?}",
+                    entry.id,
+                    entry.pid,
+                    entry.kind.tag(),
+                    now.saturating_sub(entry.started_at),
+                    entry.command
+                );
+                crate::activity_log::log_activity(db, "warn", "process_registry", &line);
+            }
+
+            // Repeat-offender: same normalized command auto-reaped two
+            // sweeps in a row → surface a persistent warning hinting
+            // the operator to add it to `never_kill_patterns`.
+            let current = reg.previous_auto_reaped_commands();
+            if !current.is_empty() && current.iter().any(|c| previous.contains(c)) {
+                subprocess_repeat_offender = true;
+            }
+        }
+        if !budget.is_blown() {
+            let pruned = reg.prune_finished(
+                now,
+                config.process_registry.finished_ttl_secs as i64,
+                config.process_registry.max_finished_entries,
+            );
+            report.subprocess_finished_pruned = pruned;
+            budget.try_spend(pruned);
+        }
+        // Classify still-running entries for the doctor surface. Counted
+        // even when auto-reap is disabled — visibility is the primary
+        // signal; auto-kill is the long-tail backstop.
+        let class = reg.classify(
+            now,
+            config.process_registry.orphan_warn_secs as i64,
+            config.process_registry.orphan_fail_secs as i64,
+        );
+        report.subprocess_long_running = class.warning.len() + class.failing.len();
     }
 
     // 5a. WAL checkpoint + conditional full VACUUM. Always runs the
@@ -444,7 +565,25 @@ pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<Maintenan
     }
 
     // 7. Re-run diagnostics so the recorded report reflects post-repair state.
-    let diag = run_diagnostics(config);
+    let mut diag = run_diagnostics_with_registry(config, registry);
+    if subprocess_repeat_offender {
+        // Two consecutive sweeps auto-reaped the same workload. Surface
+        // as a persistent warning so the operator either pins it or adds
+        // a `never_kill_patterns` entry instead of silently re-killing
+        // every 24h.
+        diag.checks.push(
+            DiagnosticCheck::warn(
+                "Subprocesses",
+                "repeated auto-reap",
+                "the same workload was auto-reaped on two consecutive sweeps",
+            )
+            .with_remediation(
+                RemediationKind::Manual,
+                "subprocesses.repeated_auto_reap",
+                "add the command to `process_registry.never_kill_patterns` or pin it",
+            ),
+        );
+    }
     let (pass, warn, fail) = diag.counts();
     report.pass_count = pass;
     report.warn_count = warn;
@@ -1047,4 +1186,101 @@ mod tests {
             report.heal_actions_spent
         );
     }
+
+    // ── Subprocess registry sweep ──
+
+    #[test]
+    fn sweep_reports_zero_subprocess_counts_when_registry_empty() {
+        // Empty registry → all subprocess counters are 0. No accidental
+        // false-positive warnings on a clean install.
+        let db = crate::db::Database::test_db();
+        let registry = crate::process_registry::ProcessRegistry::new();
+        let report = run_daily_maintenance_with_registry(&db, &Config::default(), Some(&registry))
+            .expect("sweep");
+        assert_eq!(report.subprocess_dead_reaped, 0);
+        assert_eq!(report.subprocess_finished_pruned, 0);
+        assert_eq!(report.subprocess_long_running, 0);
+        assert_eq!(report.subprocess_auto_killed, 0);
+    }
+
+    #[test]
+    fn sweep_reaps_dead_pid() {
+        // Register a PID that's reliably never alive; the sweep must
+        // detect it and move it to finished.
+        let db = crate::db::Database::test_db();
+        let registry = crate::process_registry::ProcessRegistry::new();
+        let _g = registry.register(
+            0xFFFF_FFFE,
+            crate::process_registry::ProcessKind::Hook,
+            "ghost",
+            None,
+        );
+        let report = run_daily_maintenance_with_registry(&db, &Config::default(), Some(&registry))
+            .expect("sweep");
+        assert_eq!(report.subprocess_dead_reaped, 1);
+        std::mem::forget(_g);
+    }
+
+    #[test]
+    fn sweep_skips_auto_reap_when_setting_zero() {
+        // Visibility-only mode: ancient entries report as long-running
+        // but are not killed. Uses PID 1 (init / launchd — always
+        // alive) so the dead-reap step doesn't evict the entry before
+        // classify runs.
+        let db = crate::db::Database::test_db();
+        let registry = crate::process_registry::ProcessRegistry::new();
+        let _g = registry.register(
+            1,
+            crate::process_registry::ProcessKind::RunShell,
+            "ancient",
+            None,
+        );
+        let mut config = Config::default();
+        config.process_registry.auto_reap_secs = 0;
+        config.process_registry.orphan_warn_secs = 0;
+        config.process_registry.orphan_fail_secs = 1_000_000;
+        let report =
+            run_daily_maintenance_with_registry(&db, &config, Some(&registry)).expect("sweep");
+        assert_eq!(report.subprocess_auto_killed, 0, "auto-reap disabled");
+        assert!(
+            report.subprocess_long_running >= 1,
+            "still surfaces as long-running (got {})",
+            report.subprocess_long_running,
+        );
+        std::mem::forget(_g);
+    }
+
+    #[test]
+    fn sweep_classify_excludes_pinned_from_long_running() {
+        // The sweep's long-running counter must mirror the doctor
+        // check's exclusion logic: pinned entries don't count. Uses
+        // PID 1 to survive the dead-reap probe.
+        let db = crate::db::Database::test_db();
+        let registry = crate::process_registry::ProcessRegistry::new();
+        let g = registry.register(
+            1,
+            crate::process_registry::ProcessKind::RunShell,
+            "pinned-build",
+            None,
+        );
+        registry.pin(g.id()).expect("pin");
+        let mut config = Config::default();
+        config.process_registry.orphan_warn_secs = 0;
+        config.process_registry.orphan_fail_secs = 1_000_000;
+        let report =
+            run_daily_maintenance_with_registry(&db, &config, Some(&registry)).expect("sweep");
+        assert_eq!(report.subprocess_long_running, 0, "pinned excluded");
+        std::mem::forget(g);
+    }
+
+    #[test]
+    fn sweep_with_no_registry_is_a_noop_for_subprocess_fields() {
+        // The CLI-standalone path passes None; the legacy callsites
+        // (heal RPC pre-wire, tests) must still produce a valid report.
+        let db = crate::db::Database::test_db();
+        let report = run_daily_maintenance(&db, &Config::default()).expect("sweep");
+        assert_eq!(report.subprocess_dead_reaped, 0);
+        assert_eq!(report.subprocess_auto_killed, 0);
+    }
+
 }

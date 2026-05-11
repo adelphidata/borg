@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod llm;
 pub mod maintenance;
 pub mod media;
+pub mod process_registry;
 pub mod security;
 #[macro_use]
 mod settings_macro;
@@ -19,6 +20,7 @@ pub use gateway::*;
 pub use llm::*;
 pub use maintenance::*;
 pub use media::*;
+pub use process_registry::*;
 pub use security::*;
 pub use update::*;
 
@@ -126,6 +128,10 @@ pub struct Config {
     /// Daily self-healing maintenance task retention settings.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Subprocess process registry — orphan thresholds and auto-reap
+    /// whitelist. Consumed by the maintenance sweep.
+    #[serde(default)]
+    pub process_registry: ProcessRegistryConfig,
     /// Daemon-wide data retention + backup policy.
     #[serde(default)]
     pub data: DataConfig,

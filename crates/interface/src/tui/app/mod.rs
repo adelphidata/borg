@@ -34,6 +34,7 @@ use super::schedule_popup::{ScheduleAction, SchedulePopup};
 use super::sessions_popup::SessionsPopup;
 use super::settings_popup::SettingsPopup;
 use super::status_popup::StatusPopup;
+use super::subprocesses_popup::SubprocessesPopup;
 use super::transcript_pager::TranscriptPager;
 use super::usage_popup::UsagePopup;
 
@@ -54,6 +55,7 @@ macro_rules! for_each_routed_popup {
         $body!($self, migrate_popup);
         $body!($self, status_popup);
         $body!($self, usage_popup);
+        $body!($self, subprocesses_popup);
         $body!($self, btw_popup);
     };
 }
@@ -513,6 +515,7 @@ pub struct App<'a> {
     pub pending_update_version: Option<String>,
     pub status_popup: StatusPopup,
     pub usage_popup: UsagePopup,
+    pub subprocesses_popup: SubprocessesPopup,
     pub btw_popup: BtwPopup,
     /// Cancel token for the currently-in-flight `/btw` background task, if
     /// any. A new `/btw` invocation cancels the previous one.
@@ -595,6 +598,7 @@ impl<'a> App<'a> {
             pending_update_version: None,
             status_popup: StatusPopup::new(),
             usage_popup: UsagePopup::new(),
+            subprocesses_popup: SubprocessesPopup::new(),
             btw_popup: BtwPopup::new(),
             btw_cancel: None,
             btw_result_rx: None,
@@ -743,6 +747,7 @@ impl<'a> App<'a> {
             || self.migrate_popup.is_visible()
             || self.status_popup.is_visible()
             || self.usage_popup.is_visible()
+            || self.subprocesses_popup.is_visible()
             || self.btw_popup.is_visible()
             || self.plugins_popup.is_visible()
     }

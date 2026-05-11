@@ -106,6 +106,11 @@ impl App<'_> {
                 self.sessions_popup.show(&client);
                 return Some(Ok(AppAction::EnterAltScreen));
             }
+            "/subprocesses" | "/procs" => {
+                let client = self.client.clone();
+                self.subprocesses_popup.show(&client);
+                return Some(Ok(AppAction::EnterAltScreen));
+            }
             "/save" => return Some(Ok(AppAction::SaveSession)),
             "/export" => {
                 return Some(Ok(AppAction::ExportCurrentSession {
@@ -323,6 +328,7 @@ impl App<'_> {
              /update    - Update borg to latest version\n\
              \n  \
              /sessions  - Browse and load saved sessions (press 'e' to export)\n  \
+             /subprocesses - View tracked subprocesses (p: toggle pin, r: reload)\n  \
              /save      - Save current session\n  \
              /new       - Start new session\n  \
              /fork      - Branch the current session into a new one (preserves history up to now)\n  \

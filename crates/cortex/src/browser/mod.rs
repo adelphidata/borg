@@ -29,12 +29,33 @@ pub struct BrowserSession {
     event_listener_handles: Vec<tokio::task::JoinHandle<()>>,
     event_buffers: console::EventBuffers,
     config: BorgBrowserConfig,
+    /// Registry guard for the Chrome process. Held for the lifetime of
+    /// the session; dropped (and finalized as Killed) when the session
+    /// is closed. `chromiumoxide` does not expose the child PID through
+    /// its public API, so the registered entry carries `pid = 0` and
+    /// orphan detection works on `kind = Browser` + start time instead
+    /// of liveness probing — adequate because the Browser kind is
+    /// auto-reap-exempt by design.
+    _registry_guard: Option<crate::process_registry::ProcessGuard>,
 }
 
 impl BrowserSession {
     /// Launch Chrome and open a default page.
     #[instrument(skip_all, fields(browser.action = "launch"))]
     pub async fn launch(config: &BorgBrowserConfig) -> Result<Self> {
+        Self::launch_with_registry(config, None, None).await
+    }
+
+    /// Same as [`Self::launch`] but registers the Chrome process with
+    /// the daemon-side subprocess registry, so `borg status` /
+    /// `/doctor` can see the browser is running and the operator can
+    /// pin it (Browser is auto-reap-exempt by default).
+    #[instrument(skip_all, fields(browser.action = "launch"))]
+    pub async fn launch_with_registry(
+        config: &BorgBrowserConfig,
+        registry: Option<&crate::process_registry::ProcessRegistry>,
+        session_id: Option<String>,
+    ) -> Result<Self> {
         let detection = detection::find_chrome(config.executable.as_deref());
         let chrome_path = detection.executable.context(
             "No Chrome/Chromium found. Install Chrome or set browser.executable in config.",
@@ -86,6 +107,15 @@ impl BrowserSession {
 
         let event_listener_handles = console::spawn_event_listeners(&page, &event_buffers).await;
 
+        let registry_guard = registry.map(|reg| {
+            reg.register(
+                0, // chromiumoxide does not expose the child PID; see field doc.
+                crate::process_registry::ProcessKind::Browser,
+                "chromium (headless)",
+                session_id,
+            )
+        });
+
         Ok(Self {
             browser,
             tab_manager: tabs::TabManager::new(page),
@@ -93,6 +123,7 @@ impl BrowserSession {
             event_listener_handles,
             event_buffers,
             config: config.clone(),
+            _registry_guard: registry_guard,
         })
     }
 

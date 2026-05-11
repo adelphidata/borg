@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::constants::{IDENTITY_FILE, SECS_PER_DAY};
 use crate::db::Database;
+use crate::process_registry::ProcessRegistry;
 use crate::provider::Provider;
 use crate::skills::load_all_skills;
 
@@ -316,14 +317,101 @@ impl DiagnosticRunner {
     }
 }
 
-/// Run all diagnostic checks and return a report.
+/// Run all diagnostic checks and return a report. Equivalent to
+/// [`run_diagnostics_with_registry`] with `None` — preserved for call
+/// sites (`borg doctor` CLI, tests) that don't have a process registry
+/// handle.
 pub fn run_diagnostics(config: &Config) -> DiagnosticReport {
+    run_diagnostics_with_registry(config, None)
+}
+
+/// Run all diagnostic checks plus the `Subprocesses` check when the
+/// caller has a live registry. The daemon's maintenance sweep and
+/// `Admin.Heal` RPC use this variant.
+pub fn run_diagnostics_with_registry(
+    config: &Config,
+    registry: Option<&ProcessRegistry>,
+) -> DiagnosticReport {
     let mut runner = DiagnosticRunner::new();
     let mut checks = Vec::new();
     while let Some((_label, step_checks)) = runner.next_step(config) {
         checks.extend(step_checks);
     }
+    if let Some(reg) = registry {
+        check_subprocesses(config, reg, &mut checks);
+    }
     DiagnosticReport { checks }
+}
+
+/// Subprocess registry health: surfaces `Warn`/`Fail` when one or more
+/// non-pinned children have been running past the configured age
+/// thresholds. Squelchable via
+/// `/doctor squelch Subprocesses:Long-running children`.
+fn check_subprocesses(
+    config: &Config,
+    registry: &ProcessRegistry,
+    checks: &mut Vec<DiagnosticCheck>,
+) {
+    let now = chrono::Utc::now().timestamp();
+    let class = registry.classify(
+        now,
+        config.process_registry.orphan_warn_secs as i64,
+        config.process_registry.orphan_fail_secs as i64,
+    );
+    let hint =
+        "Inspect: `borg status`. Pin the row in `/status` (press `p`) or kill: `kill <pid>`.";
+    if !class.failing.is_empty() {
+        let msg = format_subprocess_offenders(&class.failing, now);
+        let mut check = DiagnosticCheck::fail("Subprocesses", "Long-running children", msg);
+        check.remediation_kind = RemediationKind::Manual;
+        check.remediation_key = Some("subprocesses.long_running");
+        check.user_hint = Some(hint.to_string());
+        checks.push(check);
+    } else if !class.warning.is_empty() {
+        let msg = format_subprocess_offenders(&class.warning, now);
+        let mut check = DiagnosticCheck::warn("Subprocesses", "Long-running children", msg);
+        check.remediation_kind = RemediationKind::Manual;
+        check.remediation_key = Some("subprocesses.long_running");
+        check.user_hint = Some(hint.to_string());
+        checks.push(check);
+    } else {
+        checks.push(DiagnosticCheck::pass(
+            "Subprocesses",
+            "Long-running children",
+        ));
+    }
+}
+
+/// Render up to 3 offenders by descending age; collapse the rest into
+/// "… and N more" so a runaway registry doesn't produce a wall-of-text
+/// warning in `borg doctor` or persistent warnings.
+fn format_subprocess_offenders(
+    entries: &[crate::process_registry::ProcessEntry],
+    now: i64,
+) -> String {
+    const MAX_NAMED: usize = 3;
+    let mut parts: Vec<String> = entries
+        .iter()
+        .take(MAX_NAMED)
+        .map(|e| {
+            let age = now.saturating_sub(e.started_at).max(0);
+            format!(
+                "{} pid={} age={}s ({})",
+                e.kind.tag(),
+                e.pid,
+                age,
+                e.command
+            )
+        })
+        .collect();
+    if entries.len() > MAX_NAMED {
+        parts.push(format!("… and {} more", entries.len() - MAX_NAMED));
+    }
+    format!(
+        "{} long-running child(ren): {}",
+        entries.len(),
+        parts.join("; ")
+    )
 }
 
 fn check_provider(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
@@ -1787,6 +1875,149 @@ mod tests {
                 *want_pending,
                 "({global}/{entries}) pending-suffix mismatch"
             );
+        }
+    }
+
+    // ── Subprocesses check ──
+
+    fn find_subprocess_check(report: &DiagnosticReport) -> Option<&DiagnosticCheck> {
+        report
+            .checks
+            .iter()
+            .find(|c| c.category == "Subprocesses" && c.name == "Long-running children")
+    }
+
+    #[test]
+    fn subprocesses_check_absent_without_registry() {
+        // The CLI `borg doctor` path (`run_diagnostics`) has no registry
+        // handle and MUST NOT produce a misleading "Pass" for a system
+        // it couldn't actually inspect.
+        let cfg = Config::default();
+        let report = run_diagnostics(&cfg);
+        assert!(
+            find_subprocess_check(&report).is_none(),
+            "registry-less doctor must omit the Subprocesses check"
+        );
+    }
+
+    #[test]
+    fn subprocesses_check_passes_when_registry_empty() {
+        let cfg = Config::default();
+        let reg = ProcessRegistry::new();
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn subprocesses_check_passes_when_all_young() {
+        let cfg = Config::default();
+        let reg = ProcessRegistry::new();
+        let _g = reg.register(
+            111,
+            crate::process_registry::ProcessKind::RunShell,
+            "fresh",
+            None,
+        );
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn subprocesses_check_warns_at_warn_threshold() {
+        // Threshold = 0s means every running entry is "older than the
+        // threshold" — that's the easiest way to drive Warn from a test
+        // without a fake clock.
+        let mut cfg = Config::default();
+        cfg.process_registry.orphan_warn_secs = 0;
+        cfg.process_registry.orphan_fail_secs = 1_000_000;
+        let reg = ProcessRegistry::new();
+        let _g = reg.register(
+            222,
+            crate::process_registry::ProcessKind::RunShell,
+            "long-build",
+            None,
+        );
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        assert!(
+            matches!(check.status, CheckStatus::Warn(_)),
+            "expected Warn, got {:?}",
+            check.status
+        );
+        assert_eq!(check.remediation_kind, RemediationKind::Manual);
+        assert_eq!(check.remediation_key, Some("subprocesses.long_running"));
+    }
+
+    #[test]
+    fn subprocesses_check_fails_at_fail_threshold() {
+        let mut cfg = Config::default();
+        cfg.process_registry.orphan_warn_secs = 0;
+        cfg.process_registry.orphan_fail_secs = 0;
+        let reg = ProcessRegistry::new();
+        let _g = reg.register(
+            333,
+            crate::process_registry::ProcessKind::RunShell,
+            "really-old",
+            None,
+        );
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        assert!(
+            matches!(check.status, CheckStatus::Fail(_)),
+            "expected Fail, got {:?}",
+            check.status
+        );
+    }
+
+    #[test]
+    fn subprocesses_check_omits_pinned_from_warn_count() {
+        // A pinned entry past the warn threshold MUST NOT push the
+        // check into Warn — otherwise pinning would be useless.
+        let mut cfg = Config::default();
+        cfg.process_registry.orphan_warn_secs = 0;
+        cfg.process_registry.orphan_fail_secs = 1_000_000;
+        let reg = ProcessRegistry::new();
+        let g = reg.register(
+            444,
+            crate::process_registry::ProcessKind::RunShell,
+            "pinned-build",
+            None,
+        );
+        reg.pin(g.id()).expect("pin");
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        assert_eq!(
+            check.status,
+            CheckStatus::Pass,
+            "pinned entries must not trigger Warn"
+        );
+    }
+
+    #[test]
+    fn subprocesses_check_message_caps_offender_list() {
+        // 5 offenders → first 3 named, then "… and 2 more". This keeps
+        // the persistent-warning surface scannable.
+        let mut cfg = Config::default();
+        cfg.process_registry.orphan_warn_secs = 0;
+        cfg.process_registry.orphan_fail_secs = 1_000_000;
+        let reg = ProcessRegistry::new();
+        let mut guards = Vec::new();
+        for i in 0..5 {
+            guards.push(reg.register(
+                1000 + i,
+                crate::process_registry::ProcessKind::RunShell,
+                format!("c{i}"),
+                None,
+            ));
+        }
+        let report = run_diagnostics_with_registry(&cfg, Some(&reg));
+        let check = find_subprocess_check(&report).expect("present");
+        if let CheckStatus::Warn(msg) = &check.status {
+            assert!(msg.contains("… and 2 more"), "message: {msg}");
+        } else {
+            panic!("expected Warn, got {:?}", check.status);
         }
     }
 }

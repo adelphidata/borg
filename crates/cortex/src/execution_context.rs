@@ -10,6 +10,18 @@ pub struct ExecutionContext {
     workspace_root: PathBuf,
     enforce_workspace_root: bool,
     text_file_bridge: Option<Arc<dyn TextFileBridge>>,
+    /// Optional handle to the daemon-side subprocess registry. When
+    /// present, tool handlers that spawn child processes (`run_shell`,
+    /// browser launch, hooks) register their PID for visibility in
+    /// `borg status` / `/doctor` and inclusion in the self-healing
+    /// sweep. `None` for CLI/test paths that don't have a running
+    /// daemon — the spawn proceeds as before, just without tracking.
+    process_registry: Option<crate::process_registry::ProcessRegistry>,
+    /// Optional session id used when registering spawned processes;
+    /// drives the "kill all my children" UX when implemented and is
+    /// surfaced in `borg status` so the operator can attribute an
+    /// orphan to its conversation.
+    session_id: Option<String>,
 }
 
 /// Optional ACP-backed text file access for IDE buffer reads/writes.
@@ -43,6 +55,8 @@ impl ExecutionContext {
             workspace_cwd,
             enforce_workspace_root: false,
             text_file_bridge: None,
+            process_registry: None,
+            session_id: None,
         }
     }
 
@@ -80,6 +94,8 @@ impl ExecutionContext {
             workspace_root,
             enforce_workspace_root: true,
             text_file_bridge: None,
+            process_registry: None,
+            session_id: None,
         })
     }
 
@@ -104,6 +120,33 @@ impl ExecutionContext {
     /// Access the optional IDE-backed text-file bridge.
     pub fn text_file_bridge(&self) -> Option<&Arc<dyn TextFileBridge>> {
         self.text_file_bridge.as_ref()
+    }
+
+    /// Attach a process registry handle. Tool handlers that spawn
+    /// children will register their PID against this registry.
+    pub fn with_process_registry(
+        mut self,
+        registry: Option<crate::process_registry::ProcessRegistry>,
+    ) -> Self {
+        self.process_registry = registry;
+        self
+    }
+
+    /// Access the optional process registry.
+    pub fn process_registry(&self) -> Option<&crate::process_registry::ProcessRegistry> {
+        self.process_registry.as_ref()
+    }
+
+    /// Attach an owning session id. Used as the `session_id` field on
+    /// registered subprocess entries.
+    pub fn with_session_id(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
+    /// Access the owning session id, if any.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Resolve a user-provided path that must already exist.

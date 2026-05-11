@@ -331,7 +331,8 @@ async fn execute_maintenance_task(ctx: &TaskExecContext) {
     let config_clone = config.clone();
     let result = tokio::task::spawn_blocking(move || {
         let db = cortex::db::Database::open()?;
-        cortex::maintenance::run_daily_maintenance(&db, &config_clone)
+        let reg = cortex::process_registry::global();
+        cortex::maintenance::run_daily_maintenance_with_registry(&db, &config_clone, reg.as_ref())
     })
     .await;
 

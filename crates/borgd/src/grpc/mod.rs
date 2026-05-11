@@ -61,6 +61,9 @@ pub struct AdminExtras {
     pub shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     /// Config watcher notifier for immediate post-setting reloads.
     pub config_notify_tx: Option<tokio::sync::mpsc::Sender<cortex::config::Config>>,
+    /// Daemon-wide subprocess registry — Admin RPCs (`GetSubprocesses`,
+    /// `SetSubprocessPinned`) and `Admin.Heal` use this when set.
+    pub process_registry: Option<cortex::process_registry::ProcessRegistry>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -87,6 +90,9 @@ pub fn build_services_with_extras(
     }
     if let Some(tx) = extras.config_notify_tx {
         admin_svc = admin_svc.with_config_notify_sender(tx);
+    }
+    if let Some(reg) = extras.process_registry {
+        admin_svc = admin_svc.with_process_registry(reg);
     }
     Services {
         status: StatusServer::new(status::StatusSvc::new()),

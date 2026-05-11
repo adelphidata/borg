@@ -36,6 +36,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 struct DaemonSessionFactory {
     config_rx: tokio::sync::watch::Receiver<CoreConfig>,
     cost_event_sink: Arc<dyn CostEventSink>,
+    process_registry: cortex::process_registry::ProcessRegistry,
 }
 
 impl SessionFactory for DaemonSessionFactory {
@@ -45,6 +46,12 @@ impl SessionFactory for DaemonSessionFactory {
         execution_context: Option<cortex::execution_context::ExecutionContext>,
     ) -> Result<SessionHost> {
         let config = self.config_rx.borrow().clone();
+        // Inject the daemon-wide subprocess registry into the session's
+        // ExecutionContext so every tool handler that spawns a child can
+        // register it. Falls through to a registry-less context when the
+        // request didn't carry workspace coordinates.
+        let execution_context = execution_context
+            .map(|ctx| ctx.with_process_registry(Some(self.process_registry.clone())));
         let backend = AgentBackend::new(
             config,
             BorgMetrics::noop(),
@@ -131,9 +138,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     }
 
     let registry = SessionRegistry::new();
+    // Daemon-wide subprocess registry — one handle, cloned everywhere
+    // (`Arc` inside). Threaded into the session factory so tool handlers
+    // see it via `ExecutionContext`, and wired into AdminSvc for RPC
+    // inspection / pin toggling. Also installed as the process-global
+    // handle so the scheduled-task runner's maintenance executor can
+    // find it without threading parameters through the dispatcher.
+    let process_registry = cortex::process_registry::ProcessRegistry::new();
+    cortex::process_registry::install_global(process_registry.clone());
     let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory {
         config_rx: config_watcher.subscribe(),
         cost_event_sink: cost_event_sink.clone(),
+        process_registry: process_registry.clone(),
     });
     let capability_router = Arc::new(CapabilityRouter::new());
 
@@ -196,6 +212,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 heartbeat_trigger_tx: Some(handles.heartbeat_trigger_tx),
                 shutdown_tx: Some(shutdown_tx.clone()),
                 config_notify_tx: Some(config_watcher.notify_sender()),
+                process_registry: Some(process_registry.clone()),
             }
         }
         Err(e) => {
@@ -208,6 +225,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 heartbeat_trigger_tx: None,
                 shutdown_tx: Some(shutdown_tx.clone()),
                 config_notify_tx: Some(config_watcher.notify_sender()),
+                process_registry: Some(process_registry.clone()),
             }
         }
     };

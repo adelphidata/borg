@@ -140,6 +140,9 @@ pub mod panic_utils;
 pub mod policy;
 /// Token pricing per provider and model.
 pub mod pricing;
+/// Central registry of agent-initiated subprocesses (PID, kind, age,
+/// pin state) surfaced via `borg status` and folded into self-healing.
+pub mod process_registry;
 /// Project doc discovery (AGENTS.md / CLAUDE.md) for system prompt.
 pub mod project_doc;
 /// LLM provider enum, auto-detection, and API headers.

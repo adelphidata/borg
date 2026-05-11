@@ -11,6 +11,7 @@
 use crate::heartbeat::{HeartbeatBus, HeartbeatSource, HeartbeatTrigger};
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
+use cortex::process_registry::{ProcessEntry, ProcessRegistry};
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
     admin_server::Admin, ActivityLogQuery, ActivityLogText, AddCredentialRequest,
@@ -27,8 +28,9 @@ use protocols::admin::{
     ResetCredentialsRequest, ResetCredentialsResponse, RevokedClientToken, ScheduledTask,
     ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef,
     ScheduledTaskRun, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SessionSummary, SetCredentialStrategyRequest, SettingEntry, SettingKey,
-    SettingMutation, SettingsSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
+    SessionRef, SessionSummary, SetCredentialStrategyRequest, SetSubprocessPinnedRequest,
+    SettingEntry, SettingKey, SettingMutation, SettingsSnapshot, Subprocess as PbSubprocess,
+    SubprocessSnapshot, TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -45,6 +47,7 @@ pub struct AdminSvc {
     heartbeat_bus: Mutex<Option<HeartbeatBus>>,
     executor: Mutex<Option<Arc<DaemonSessionExecutor>>>,
     config_notify_tx: Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
+    process_registry: Mutex<Option<ProcessRegistry>>,
 }
 
 impl AdminSvc {
@@ -57,7 +60,26 @@ impl AdminSvc {
             heartbeat_bus: Mutex::new(None),
             executor: Mutex::new(None),
             config_notify_tx: Mutex::new(None),
+            process_registry: Mutex::new(None),
         }
+    }
+
+    /// Wire the daemon-side subprocess registry. `Admin.GetSubprocesses`
+    /// and `Admin.SetSubprocessPinned` rely on this; Admin.Heal also
+    /// folds the registry into the maintenance sweep when present.
+    pub fn with_process_registry(self, reg: ProcessRegistry) -> Self {
+        *self
+            .process_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reg);
+        self
+    }
+
+    fn process_registry_handle(&self) -> Option<ProcessRegistry> {
+        self.process_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Wire a heartbeat trigger channel. `Admin.Poke` and
@@ -171,10 +193,11 @@ impl Admin for AdminSvc {
     }
 
     async fn heal(&self, _req: Request<Empty>) -> Result<Response<HealReport>, TStatus> {
-        let report = tokio::task::spawn_blocking(|| -> anyhow::Result<_> {
+        let reg = self.process_registry_handle();
+        let report = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let db = Database::open()?;
             let config = cortex::config::Config::load_from_db()?;
-            cortex::maintenance::run_daily_maintenance(&db, &config)
+            cortex::maintenance::run_daily_maintenance_with_registry(&db, &config, reg.as_ref())
         })
         .await
         .map_err(|e| TStatus::internal(format!("heal task panicked: {e}")))?
@@ -1616,6 +1639,63 @@ impl Admin for AdminSvc {
         .map_err(|e| TStatus::invalid_argument(format!("set_credential_strategy: {e}")))?;
         notify_runtime_config_reload(&self.config_notify_tx);
         Ok(Response::new(Empty {}))
+    }
+
+    async fn get_subprocesses(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<SubprocessSnapshot>, TStatus> {
+        let reg = self.process_registry_handle();
+        let Some(reg) = reg else {
+            return Ok(Response::new(SubprocessSnapshot::default()));
+        };
+        let snap = reg.snapshot();
+        Ok(Response::new(SubprocessSnapshot {
+            running: snap
+                .running
+                .into_iter()
+                .map(process_entry_to_proto)
+                .collect(),
+            finished: snap
+                .finished
+                .into_iter()
+                .map(process_entry_to_proto)
+                .collect(),
+        }))
+    }
+
+    async fn set_subprocess_pinned(
+        &self,
+        req: Request<SetSubprocessPinnedRequest>,
+    ) -> Result<Response<Empty>, TStatus> {
+        let req = req.into_inner();
+        let reg = self
+            .process_registry_handle()
+            .ok_or_else(|| TStatus::failed_precondition("process registry not wired"))?;
+        let result = if req.pinned {
+            reg.pin(req.id)
+        } else {
+            reg.unpin(req.id)
+        };
+        result.map_err(|e| TStatus::not_found(e.to_string()))?;
+        Ok(Response::new(Empty {}))
+    }
+}
+
+fn process_entry_to_proto(entry: ProcessEntry) -> PbSubprocess {
+    PbSubprocess {
+        id: entry.id,
+        pid: entry.pid,
+        kind: format!("{:?}", entry.kind),
+        command: entry.command,
+        session_id: entry.session_id.unwrap_or_default(),
+        started_at_unix: entry.started_at,
+        finished_at_unix: entry.finished_at.unwrap_or(0),
+        finished: entry.finished_at.is_some(),
+        exit_code: entry.exit_code.unwrap_or(0),
+        exit_code_present: entry.exit_code.is_some(),
+        status: format!("{:?}", entry.status),
+        pinned: entry.pinned,
     }
 }
 

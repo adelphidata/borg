@@ -34,8 +34,9 @@ use protocols::admin::{
     PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
     RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
     ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SetCredentialStrategyRequest, SettingKey, SettingMutation, SettingsSnapshot,
-    TriggerHeartbeatRequest, WarningList, WebhookRef,
+    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
+    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, WarningList,
+    WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -955,6 +956,30 @@ impl DaemonClient {
             .await
             .context("Admin.GetAmbientStatus failed")?
             .into_inner())
+    }
+
+    /// Snapshot of running + recently-finished subprocesses tracked by the
+    /// daemon's `ProcessRegistry`. Empty when the daemon has no registry
+    /// wired (older daemon builds, test harnesses without the registry).
+    pub async fn get_subprocesses(&mut self) -> Result<SubprocessSnapshot> {
+        Ok(self
+            .admin
+            .get_subprocesses(AdminEmpty {})
+            .await
+            .context("Admin.GetSubprocesses failed")?
+            .into_inner())
+    }
+
+    /// Toggle the auto-reap pin on a specific subprocess entry. Pinning a
+    /// running workload exempts it from the daily maintenance sweep's
+    /// 24h auto-kill and downgrades its doctor surface.
+    pub async fn set_subprocess_pinned(&mut self, id: u64, pinned: bool) -> Result<()> {
+        let _ = self
+            .admin
+            .set_subprocess_pinned(SetSubprocessPinnedRequest { id, pinned })
+            .await
+            .context("Admin.SetSubprocessPinned failed")?;
+        Ok(())
     }
 
     /// Latest doctor-run persistent warnings.

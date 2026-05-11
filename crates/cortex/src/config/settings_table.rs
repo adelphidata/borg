@@ -235,6 +235,15 @@ define_settings! {
         "maintenance.security_squelch_ttl_days" => maintenance.security_squelch_ttl_days, parsed(u32);
         "maintenance.vacuum_interval_days" => maintenance.vacuum_interval_days, parsed(u32);
         "maintenance.heal_action_budget" => maintenance.heal_action_budget, parsed(u32);
+
+        // ── Subprocess process registry ──
+        "process_registry.orphan_warn_secs" => process_registry.orphan_warn_secs, parsed(u64);
+        "process_registry.orphan_fail_secs" => process_registry.orphan_fail_secs, parsed(u64);
+        "process_registry.auto_reap_secs" => process_registry.auto_reap_secs, parsed(u64);
+        "process_registry.sigterm_grace_secs" => process_registry.sigterm_grace_secs, parsed(u64);
+        "process_registry.never_kill_patterns" => process_registry.never_kill_patterns, json;
+        "process_registry.finished_ttl_secs" => process_registry.finished_ttl_secs, parsed(u64);
+        "process_registry.max_finished_entries" => process_registry.max_finished_entries, parsed(usize);
     }
 
     registry_only {
@@ -585,6 +594,13 @@ define_settings! {
         "maintenance.security_squelch_ttl_days" => "Doctor squelch TTL (days)", Uint, "Maintenance";
         "maintenance.vacuum_interval_days" => "VACUUM interval (days)", Uint, "Maintenance";
         "maintenance.heal_action_budget" => "Heal action budget", Uint, "Maintenance";
+
+        "process_registry.orphan_warn_secs" => "Subprocess warn age (s)", Uint, "Subprocesses";
+        "process_registry.orphan_fail_secs" => "Subprocess fail age (s)", Uint, "Subprocesses";
+        "process_registry.auto_reap_secs" => "Subprocess auto-reap age (s, 0=off)", Uint, "Subprocesses";
+        "process_registry.sigterm_grace_secs" => "SIGTERM grace (s)", Uint, "Subprocesses";
+        "process_registry.finished_ttl_secs" => "Finished entry TTL (s)", Uint, "Subprocesses";
+        "process_registry.max_finished_entries" => "Max finished entries", Uint, "Subprocesses";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";
