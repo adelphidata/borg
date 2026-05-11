@@ -257,6 +257,44 @@ pub async fn run(cfg: Config) -> Result<()> {
     // happen before DAEMON_START so the install order is observable in
     // tests if it ever regresses.
     cortex::db::install_global_audit(audit.clone());
+
+    // Install the process-global output-redaction policy. This is what
+    // strips detected secrets from agent output before it reaches a
+    // channel, the TUI transcript, or `~/.borg/logs/`. Gated by the
+    // `security.output_redaction` setting (default true, security-first).
+    // A spawned watcher reinstalls the policy whenever the setting flips
+    // so /settings → toggle takes effect on the next message without a
+    // daemon restart.
+    {
+        let core_cfg = CoreConfig::load_from_db().unwrap_or_default();
+        cortex::output_redaction::install_global(
+            cortex::output_redaction::RedactionPolicy::from_db(
+                core_cfg.security.output_redaction,
+                pki_db.clone(),
+            ),
+        );
+        let mut rx = config_watcher.subscribe();
+        let db_for_policy = pki_db.clone();
+        tokio::spawn(async move {
+            let mut current = core_cfg.security.output_redaction;
+            loop {
+                if rx.changed().await.is_err() {
+                    return;
+                }
+                let next = rx.borrow().security.output_redaction;
+                if next != current {
+                    cortex::output_redaction::install_global(
+                        cortex::output_redaction::RedactionPolicy::from_db(
+                            next,
+                            db_for_policy.clone(),
+                        ),
+                    );
+                    current = next;
+                }
+            }
+        });
+    }
+
     audit.emit(
         audit_events::DAEMON_START,
         "system",

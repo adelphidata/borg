@@ -1081,8 +1081,22 @@ async fn invoke_agent_inner(
         response_text = "(no response)".to_string();
     }
 
-    // Log outbound message (redact secrets before DB persistence)
-    let redacted_response = cortex::secrets::redact_secrets(&response_text);
+    // Log outbound message — route through the same output-redaction policy
+    // as live channel delivery so the toggle and audit trail apply uniformly.
+    // `channel_messages` is a persisted DB surface; an operator inspecting it
+    // must see the same redacted text the recipient saw.
+    let redaction_context = format!(
+        "{}:{}",
+        inbound.sender_id,
+        inbound.channel_id.as_deref().unwrap_or("-")
+    );
+    let redacted_response = cortex::output_redaction::current_policy()
+        .apply(
+            cortex::output_redaction::OutputSink::Channel(channel_name),
+            Some(&redaction_context),
+            &response_text,
+        )
+        .into_owned();
     if let Err(e) = db.log_channel_message(
         channel_name,
         &inbound.sender_id,

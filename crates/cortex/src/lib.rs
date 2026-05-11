@@ -128,6 +128,10 @@ pub mod mmr;
 pub mod model_registry;
 /// Multi-agent orchestration.
 pub mod multi_agent;
+/// Output-side redaction policy applied to channel deliveries, TUI
+/// transcript, and log writes. Pairs with the input-side detector in
+/// [`secrets`].
+pub mod output_redaction;
 /// Sender pairing and access control for gateway channels.
 pub mod pairing;
 /// Shared helpers for panic-isolated supervised loops.

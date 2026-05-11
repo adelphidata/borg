@@ -51,6 +51,7 @@ Borg includes multiple layers of security by design:
 - **Sandboxed tool execution** — macOS Seatbelt and Linux Bubblewrap isolate user tools
 - **Blocked path enforcement** — sensitive directories (`.ssh`, `.aws`, `.gnupg`, etc.) are filtered from tool access
 - **Secret redaction** — API keys and tokens are automatically redacted from tool outputs
+- **Output redaction** — agent output is stripped of detected secrets on the way out (channel deliveries, TUI transcript, logs), gated by `security.output_redaction` (default on) with an audit trail in `redaction_audit`
 - **Prompt injection detection** — scoring-based input sanitization flags suspicious content
 - **Rate limiting** — per-session caps on tool calls, shell commands, file writes, and web requests
 - **Sender pairing** — gateway messages from unknown senders require approval before processing

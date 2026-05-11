@@ -6,7 +6,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::secrets::redact_secrets;
+use crate::output_redaction::{current_policy, OutputSink, RedactionPolicy};
 use crate::types::{Message, MessageContent};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +60,22 @@ fn append_entry(entry: &LogEntry) -> Result<()> {
 }
 
 pub fn log_message(message: &Message) {
+    log_message_with_policy(message, &current_policy())
+}
+
+/// Same as [`log_message`] but uses the caller-supplied policy. Test seam:
+/// production code always goes through [`log_message`], which consults the
+/// global policy installed during daemon startup.
+pub fn log_message_with_policy(message: &Message, policy: &RedactionPolicy) {
     let timestamp = Local::now().to_rfc3339();
+
+    // Logs are a persisted, shareable surface — unlike TUI cells where the
+    // user's own typed input is rendered verbatim, the log file scrubs every
+    // role including User. A user who pastes a credential into the prompt
+    // still benefits from output-side redaction once their message lands in
+    // `~/.borg/logs/*.jsonl`. There is no per-sender thread context for log
+    // lines (they're session-scoped at the JSONL row level elsewhere).
+    let redact = |s: &str| policy.apply(OutputSink::Log, None, s).into_owned();
 
     let kind = match message.role {
         crate::types::Role::User => {
@@ -68,24 +83,25 @@ pub fn log_message(message: &Message) {
                 .content
                 .as_ref()
                 .map_or_else(String::new, MessageContent::full_text);
-            let content = redact_secrets(&full);
-            LogEntryKind::UserMessage { content }
+            LogEntryKind::UserMessage {
+                content: redact(&full),
+            }
         }
         crate::types::Role::Assistant => LogEntryKind::AssistantMessage {
-            content: message.text_content().map(redact_secrets),
+            content: message.text_content().map(redact),
             tool_calls: message.tool_calls.as_ref().map(|tcs| {
                 tcs.iter()
                     .map(|tc| LogToolCall {
                         id: tc.id.clone(),
                         name: tc.function.name.clone(),
-                        arguments: redact_secrets(&tc.function.arguments),
+                        arguments: redact(&tc.function.arguments),
                     })
                     .collect()
             }),
         },
         crate::types::Role::Tool => LogEntryKind::ToolResult {
             tool_call_id: message.tool_call_id.clone().unwrap_or_default(),
-            content: redact_secrets(message.text_content().unwrap_or("")),
+            content: redact(message.text_content().unwrap_or("")),
         },
         crate::types::Role::System => return,
     };

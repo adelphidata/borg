@@ -378,6 +378,34 @@ async fn async_main() -> Result<()> {
 
     {
         let config = cortex::config::Config::load_from_db().unwrap_or_default();
+
+        // Install the process-global output-redaction policy for standalone
+        // `borg` (TUI / REPL without `borgd`). When `borgd` is the host the
+        // daemon installs its own policy with a shared DB handle; here the
+        // TUI opens its own connection just for audit writes. Gated by
+        // `security.output_redaction` (default true). The policy will still
+        // strip secrets even if the audit-DB open fails — failing closed
+        // (i.e. skipping redaction) would be the wrong choice security-wise.
+        match cortex::db::Database::open() {
+            Ok(db) => {
+                use std::sync::{Arc, Mutex};
+                cortex::output_redaction::install_global(
+                    cortex::output_redaction::RedactionPolicy::from_db(
+                        config.security.output_redaction,
+                        Arc::new(Mutex::new(db)),
+                    ),
+                );
+            }
+            Err(e) => {
+                eprintln!("Warning: audit-DB open failed ({e}); output redaction will run without audit logging");
+                cortex::output_redaction::install_global(if config.security.output_redaction {
+                    cortex::output_redaction::RedactionPolicy::enabled_no_audit()
+                } else {
+                    cortex::output_redaction::RedactionPolicy::disabled()
+                });
+            }
+        }
+
         let (otel_layer, tg) =
             cortex::telemetry::init_telemetry(&config.telemetry).unwrap_or_else(|e| {
                 eprintln!("Warning: OpenTelemetry init failed: {e}");

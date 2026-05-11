@@ -82,11 +82,41 @@ static SECRET_PATTERNS: LazyLock<Vec<SecretPattern>> = LazyLock::new(|| {
         .collect()
 });
 
+/// A single per-pattern audit record produced by [`redact_with_audit`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionHit {
+    pub label: &'static str,
+    pub count: usize,
+}
+
+/// Result of an audited redaction pass: the rewritten text plus a per-pattern
+/// hit summary. `hits` is empty when nothing matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionOutcome {
+    pub text: String,
+    pub hits: Vec<RedactionHit>,
+}
+
+impl RedactionOutcome {
+    pub fn is_empty(&self) -> bool {
+        self.hits.is_empty()
+    }
+}
+
 /// Redact detected secrets in text, replacing matches with `[REDACTED <label>]`.
 pub fn redact_secrets(text: &str) -> String {
+    redact_with_audit(text).text
+}
+
+/// Redact detected secrets and report per-pattern match counts. The hit list
+/// preserves pattern evaluation order so callers writing audit rows get a
+/// deterministic ordering.
+pub fn redact_with_audit(text: &str) -> RedactionOutcome {
     let mut result = text.to_string();
+    let mut hits: Vec<RedactionHit> = Vec::new();
     for pattern in SECRET_PATTERNS.iter() {
         let label = pattern.label;
+        let mut count: usize = 0;
         if pattern.capture_only {
             // Replace only the first capture group (the secret value), preserving the prefix.
             // Skip values that already start with "[REDACTED" to avoid corrupting output
@@ -99,6 +129,7 @@ pub fn redact_secrets(text: &str) -> String {
                     if value.starts_with("[REDACTED") {
                         return full.to_string();
                     }
+                    count += 1;
                     let prefix_len = full.len() - value.len();
                     format!("{}[REDACTED {label}]", &full[..prefix_len])
                 })
@@ -106,17 +137,43 @@ pub fn redact_secrets(text: &str) -> String {
         } else {
             result = pattern
                 .regex
-                .replace_all(&result, format!("[REDACTED {}]", pattern.label))
+                .replace_all(&result, |_caps: &regex::Captures| {
+                    count += 1;
+                    format!("[REDACTED {label}]")
+                })
                 .into_owned();
         }
+        if count > 0 {
+            hits.push(RedactionHit { label, count });
+        }
     }
-    result
+    RedactionOutcome { text: result, hits }
 }
 
 /// Check whether text contains any detectable secrets.
 pub fn contains_secrets(text: &str) -> bool {
     SECRET_PATTERNS.iter().any(|p| p.regex.is_match(text))
 }
+
+/// One representative sample per secret pattern. Used by cross-module tests
+/// (notably the output-redaction policy) to assert every pattern the
+/// detector knows about also gets stripped on the output side, without
+/// duplicating the pattern list. The order matches `SECRET_PATTERNS`.
+#[cfg(test)]
+pub const SECRET_PATTERNS_FOR_TEST: &[&str] = &[
+    "AKIAIOSFODNN7EXAMPLE",
+    "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk",
+    "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
+    "sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678",
+    "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678aBcDeFgHiJkLm",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "xoxb-1234567890-abcdefghijklmnopqrstuvwx",
+    r#"password="super-secret-shh""#,
+    "password=hunter2trustno1",
+    "postgresql://user:hunter2pw@localhost:5432/mydb",
+    "API_KEY=AbCdEf0123456789TokenValue",
+];
 
 #[cfg(test)]
 mod tests {

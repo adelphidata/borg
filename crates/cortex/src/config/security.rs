@@ -138,6 +138,13 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_paths: Vec<String>,
     pub host_audit: bool,
+    /// Strip detected secrets from agent-generated output before it reaches
+    /// channels, the TUI transcript, or logs. Pairs with input-side detection
+    /// (`secret_detection`); this is the output-side counterpart. Default true
+    /// (security-first). Operators can disable per-deploy via
+    /// `security.output_redaction`.
+    #[serde(default = "default_output_redaction")]
+    pub output_redaction: bool,
     #[serde(default)]
     pub action_limits: crate::rate_guard::ActionLimits,
     #[serde(default = "default_gateway_action_limits")]
@@ -157,6 +164,10 @@ fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
     crate::rate_guard::ActionLimits::gateway_defaults()
 }
 
+fn default_output_redaction() -> bool {
+    true
+}
+
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
@@ -172,6 +183,7 @@ impl Default for SecurityConfig {
             ],
             allowed_paths: Vec::new(),
             host_audit: true,
+            output_redaction: true,
             action_limits: crate::rate_guard::ActionLimits::default(),
             gateway_action_limits: crate::rate_guard::ActionLimits::gateway_defaults(),
             verifier: VerifierKind::Tofu,
@@ -253,6 +265,13 @@ mod tests {
         let cfg = SecurityConfig::default();
         assert!(cfg.secret_detection);
         assert!(cfg.host_audit);
+        // Security-first default invariant. If a future change silently flips
+        // this to false, fresh deploys would stop stripping secrets from
+        // outgoing channel messages / TUI / logs without operator action.
+        assert!(
+            cfg.output_redaction,
+            "output_redaction must default to true (security-first)"
+        );
         assert_eq!(cfg.verifier, VerifierKind::Tofu);
         assert_eq!(cfg.kek_backend, KekBackend::Auto);
         assert_eq!(cfg.blocked_paths.len(), 7);
@@ -288,6 +307,16 @@ mod tests {
         assert!(cfg.blocked_paths.is_empty());
         // other defaults still apply
         assert!(cfg.secret_detection);
+    }
+
+    #[test]
+    fn security_config_output_redaction_toml_round_trip() {
+        let toml_str = r#"output_redaction = false"#;
+        let cfg: SecurityConfig = toml::from_str(toml_str).expect("parse");
+        assert!(!cfg.output_redaction);
+        // Unset field should still respect security-first default.
+        let cfg_default: SecurityConfig = toml::from_str("").expect("parse");
+        assert!(cfg_default.output_redaction);
     }
 
     #[test]

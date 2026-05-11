@@ -835,6 +835,21 @@ CREATE TABLE IF NOT EXISTS web_search_cache (
 CREATE INDEX IF NOT EXISTS idx_web_search_cache_fetched_at
     ON web_search_cache(fetched_at);
 
+-- Output redaction audit ---------------------------------------------------
+-- Records *that* a secret was redacted from agent output (channels / TUI /
+-- logs), not the secret itself. The audit log is safe to share because it
+-- carries only the pattern label and per-pattern hit count. Adding the secret
+-- value or any preview here would defeat the feature.
+CREATE TABLE IF NOT EXISTS redaction_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    sink        TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    hit_count   INTEGER NOT NULL,
+    context_key TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_redaction_audit_ts ON redaction_audit(ts DESC);
+
 -- Skill audit / doctor / maintenance --------------------------------------
 CREATE TABLE IF NOT EXISTS skill_audit (
     name           TEXT PRIMARY KEY,

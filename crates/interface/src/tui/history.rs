@@ -1,4 +1,5 @@
 use ansi_to_tui::IntoText;
+use cortex::output_redaction::{current_policy, OutputSink};
 use cortex::types::{PlanStep, PlanStepStatus};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -887,6 +888,21 @@ impl HistoryCell {
                 streaming,
                 cache,
             } => {
+                // Output-redaction chokepoint for the TUI transcript.
+                // Assistant text is stripped of detected secrets before it
+                // enters markdown rendering, so a shared-screen viewer
+                // never sees a raw API key the agent legitimately read
+                // from disk. Clean text takes a zero-allocation fast path
+                // (Cow::Borrowed). User-input cells are intentionally not
+                // redacted — the user sees their own input verbatim.
+                let redacted;
+                let text: &str = match current_policy().apply(OutputSink::Tui, None, text) {
+                    std::borrow::Cow::Borrowed(b) => b,
+                    std::borrow::Cow::Owned(o) => {
+                        redacted = o;
+                        &redacted
+                    }
+                };
                 let visible_text = strip_reply_directive_prefix(text);
                 let inner_width = width.saturating_sub(LIVE_PREFIX_COLS as u16);
                 let commit_end = visible_text
@@ -969,6 +985,20 @@ impl HistoryCell {
                 args_json,
                 collapsed,
             } => {
+                // Output-redaction chokepoint for tool result text. A
+                // `run_shell` that cats `~/.aws/credentials` or
+                // `read_file` on `.env` would otherwise echo the raw
+                // value into the transcript. Apply once at the top so
+                // every downstream render path (shell formatter, diff
+                // formatter, generic body) sees the redacted form.
+                let redacted_output;
+                let output: &str = match current_policy().apply(OutputSink::Tui, None, output) {
+                    std::borrow::Cow::Borrowed(b) => b,
+                    std::borrow::Cow::Owned(o) => {
+                        redacted_output = o;
+                        &redacted_output
+                    }
+                };
                 let mut lines: Vec<Line<'static>> = Vec::new();
 
                 // Contextual: apply_patch renders the raw patch as a colored diff
@@ -2683,5 +2713,122 @@ mod tests {
                 .any(|s| s.style.add_modifier.contains(Modifier::BOLD)),
             "tail line lost BOLD: {tail_last:?}"
         );
+    }
+
+    // ── Output-redaction chokepoint (assistant + tool result) ──────────────
+    //
+    // These tests rely on the process-wide global redaction policy. They run
+    // in the same test binary as other tests that may touch the global, so
+    // each test installs a known state before asserting and restores the
+    // default afterwards. The lock prevents interleaving with other
+    // policy-sensitive tests in this module.
+    use std::sync::Mutex as StdMutex;
+    static REDACTION_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct PolicyGuard {
+        prev: cortex::output_redaction::RedactionPolicy,
+        _g: std::sync::MutexGuard<'static, ()>,
+    }
+    impl PolicyGuard {
+        fn install(policy: cortex::output_redaction::RedactionPolicy) -> Self {
+            let g = REDACTION_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev = cortex::output_redaction::install_global(policy);
+            Self { prev, _g: g }
+        }
+    }
+    impl Drop for PolicyGuard {
+        fn drop(&mut self) {
+            cortex::output_redaction::install_global(self.prev.clone());
+        }
+    }
+
+    #[test]
+    fn assistant_cell_redacts_secrets_in_transcript() {
+        // Positive: an assistant message that echoes a real-looking AWS key
+        // must be stripped before reaching the rendered Lines. Catches the
+        // shared-screen leak vector this whole feature exists for.
+        let _guard =
+            PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());
+        let cell = HistoryCell::assistant(
+            "here is the key: AKIAIOSFODNN7EXAMPLE end.".to_string(),
+            false,
+        );
+        let lines = cell.render(80, None);
+        let rendered = flatten_plain(&lines);
+        assert!(
+            !rendered.contains("AKIAIOSFODNN7EXAMPLE"),
+            "raw secret leaked into transcript: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[REDACTED AWS Access Key]"),
+            "expected redaction marker, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_cell_passes_through_when_policy_disabled() {
+        // Negative / operator-toggle contract: when the policy is off,
+        // assistant content reaches the transcript verbatim. This is what
+        // an operator opts in to when they flip `security.output_redaction`
+        // — confirms the toggle actually disables redaction in the TUI sink.
+        let _guard = PolicyGuard::install(cortex::output_redaction::RedactionPolicy::disabled());
+        let cell = HistoryCell::assistant(
+            "here is the key: AKIAIOSFODNN7EXAMPLE end.".to_string(),
+            false,
+        );
+        let lines = cell.render(80, None);
+        let rendered = flatten_plain(&lines);
+        assert!(
+            rendered.contains("AKIAIOSFODNN7EXAMPLE"),
+            "policy-disabled must let the original text through, got: {rendered:?}"
+        );
+        assert!(!rendered.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn tool_result_cell_redacts_secrets() {
+        let _guard =
+            PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());
+        let cell = HistoryCell::ToolResult {
+            output: "GITHUB_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk done".to_string(),
+            is_error: false,
+            duration_ms: Some(10),
+            display_label: "cat .env".to_string(),
+            tool_name: "read_file".to_string(),
+            args_json: None,
+            collapsed: false,
+        };
+        let lines = cell.render(80, None);
+        let rendered = flatten_plain(&lines);
+        assert!(
+            !rendered.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"),
+            "raw GitHub token leaked into tool result render: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[REDACTED GitHub Token]"),
+            "expected redaction marker on tool result, got: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn user_cell_is_never_redacted() {
+        // Critical contract: the user sees their own input verbatim. If a
+        // user pastes an AKIA-shaped fixture (e.g. asking the agent to
+        // search for a leaked key), redacting their own message would be
+        // confusing and lose information they explicitly typed.
+        let _guard =
+            PolicyGuard::install(cortex::output_redaction::RedactionPolicy::enabled_no_audit());
+        let cell = HistoryCell::User {
+            text: "AKIAIOSFODNN7EXAMPLE".to_string(),
+        };
+        let lines = cell.render(80, None);
+        let rendered = flatten_plain(&lines);
+        assert!(
+            rendered.contains("AKIAIOSFODNN7EXAMPLE"),
+            "user input must NOT be redacted; got: {rendered:?}"
+        );
+        assert!(!rendered.contains("[REDACTED"));
     }
 }
