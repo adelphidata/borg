@@ -629,7 +629,7 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     // subsequent content changes are flagged as potential tampering.
     match (crate::skills::skills_dir(), Database::open()) {
         (Ok(dir), Ok(db)) => {
-            let findings = crate::skill_security::audit_user_skills(&db, &dir);
+            let findings = crate::security::skill::audit_user_skills(&db, &dir);
             let modified: Vec<String> = findings
                 .iter()
                 .filter(|f| f.is_modified())

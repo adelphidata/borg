@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::tool_handlers;
-use crate::tts::TtsSynthesizer;
+use crate::media::tts::TtsSynthesizer;
 use crate::types::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

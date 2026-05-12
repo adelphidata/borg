@@ -6,7 +6,7 @@ use crate::constants::{
     DEFAULT_LLM_MAX_TOKENS, DEFAULT_LLM_REQUEST_TIMEOUT_MS, DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
     DEFAULT_LLM_TEMPERATURE,
 };
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 
 /// Extended thinking level for supported LLM providers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

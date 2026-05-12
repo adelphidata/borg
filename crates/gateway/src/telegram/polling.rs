@@ -146,7 +146,7 @@ fn extract_chat_id(update: &Update) -> Option<i64> {
 }
 
 fn calculate_backoff(consecutive_errors: u32) -> Duration {
-    crate::backoff::calculate_backoff(
+    crate::resilience::backoff::calculate_backoff(
         consecutive_errors,
         MIN_BACKOFF,
         MAX_BACKOFF,

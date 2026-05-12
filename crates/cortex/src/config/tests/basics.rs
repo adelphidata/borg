@@ -1,6 +1,6 @@
 use super::*;
 #[allow(unused_imports)]
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 use std::io::Write;
 
 #[test]

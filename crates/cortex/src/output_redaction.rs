@@ -9,7 +9,7 @@
 //! 4. Log files at `~/.borg/logs/`.
 //!
 //! Input-side defense already strips secrets from prompts (see
-//! [`crate::secrets::redact_secrets`] in the prompt-injection layer). Output
+//! [`crate::security::secrets::redact_secrets`] in the prompt-injection layer). Output
 //! redaction is the symmetric guard: if an agent legitimately reads
 //! `~/.aws/credentials` and echoes the result, none of the sinks above
 //! should ever forward the raw key. Critical for shared-screen and
@@ -23,7 +23,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::db::Database;
-use crate::secrets::{redact_with_audit, RedactionHit};
+use crate::security::secrets::{redact_with_audit, RedactionHit};
 
 /// Where the redacted text is about to be delivered. Round-tripped into the
 /// audit log via [`OutputSink::as_audit_label`] so an operator inspecting
@@ -214,7 +214,7 @@ pub fn current_policy() -> RedactionPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::secrets::SECRET_PATTERNS_FOR_TEST;
+    use crate::security::secrets::SECRET_PATTERNS_FOR_TEST;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// In-memory audit sink — captures every recorded hit for assertions.

@@ -25,7 +25,7 @@
     clippy::useless_vec
 )]
 
-use cortex::sanitize::{
+use cortex::security::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };
 

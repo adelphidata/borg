@@ -397,6 +397,7 @@ mod tests {
 
     #[test]
     fn env_credentials_win_when_present() {
+        let _lock = super::env_test_lock();
         let _access = EnvGuard::set("AWS_ACCESS_KEY_ID", "AKIA_TEST");
         let _secret = EnvGuard::set("AWS_SECRET_ACCESS_KEY", "secret");
         let _token = EnvGuard::set("AWS_SESSION_TOKEN", "token");
@@ -491,16 +492,22 @@ mod tests {
             .rsplit_once(", Signature=")
             .map(|(_, sig)| sig)
             .expect("Signature= component present");
-        assert_eq!(signature.len(), 64, "signature must be 64 hex chars: {auth}");
+        assert_eq!(
+            signature.len(),
+            64,
+            "signature must be 64 hex chars: {auth}"
+        );
         assert!(
-            signature.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            signature
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "signature must be lowercase hex: {signature}"
         );
     }
 
     #[test]
     fn resolve_region_reads_shared_aws_profile_config() {
-        let _guard = env_test_lock();
+        let _guard = super::env_test_lock();
         let temp = tempfile::tempdir().expect("tempdir");
         let aws_dir = temp.path().join(".aws");
         fs::create_dir_all(&aws_dir).expect("create .aws");

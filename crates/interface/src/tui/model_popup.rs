@@ -574,7 +574,7 @@ mod tests {
         let mut popup = make_popup();
         let mut cfg = Config::default();
         // Pre-set a resolvable key so we skip the EnterApiKey step deterministically.
-        cfg.llm.api_keys = vec![cortex::secrets_resolve::SecretRef::Env {
+        cfg.llm.api_keys = vec![cortex::security::secrets_resolve::SecretRef::Env {
             var: "BORG_TEST_FAKE_KEY".to_string(),
         }];
         // Safety: only the current test process reads this env var.

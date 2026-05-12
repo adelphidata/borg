@@ -1061,7 +1061,7 @@ async fn run_event_loop(
                                                 cfg.credentials.insert(
                                                         entry.key.clone(),
                                                         cortex::config::CredentialValue::Ref(
-                                                            cortex::secrets_resolve::SecretRef::Keychain {
+                                                            cortex::security::secrets_resolve::SecretRef::Keychain {
                                                                 service: entry.service.clone(),
                                                                 account: entry.account.clone(),
                                                             },

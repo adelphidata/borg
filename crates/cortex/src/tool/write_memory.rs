@@ -83,7 +83,7 @@ fn spawn_embedding_task(args: &WriteMemoryArgs, config_arc: &Arc<Config>) {
         .unwrap_or(&raw_filename)
         .to_string();
     let full_content = match crate::memory::read_memory_db(&entry_name, &scope) {
-        Ok(Some(content)) => crate::secrets::redact_secrets(&content),
+        Ok(Some(content)) => crate::security::secrets::redact_secrets(&content),
         Ok(None) => {
             tracing::debug!(
                 "spawn_embedding_task: entry {entry_name} (scope {scope}) missing, skipping embed"

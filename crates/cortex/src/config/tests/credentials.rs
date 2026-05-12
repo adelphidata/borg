@@ -1,5 +1,5 @@
 use super::*;
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 
 #[test]
 fn parse_credentials_legacy_string() {

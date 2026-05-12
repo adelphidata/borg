@@ -21,7 +21,7 @@ impl TwilioClient {
         );
 
         Ok(Self {
-            client: crate::http_retry::build_channel_client(
+            client: crate::resilience::http_retry::build_channel_client(
                 "Twilio",
                 GATEWAY_HTTP_TIMEOUT,
                 Some(Duration::from_secs(10)),

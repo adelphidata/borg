@@ -70,7 +70,7 @@ pub async fn enrich_parsed_message(
 
     if let Some(ref audio) = parsed.audio {
         if let Some(transcriber) =
-            cortex::media_understanding::AudioTranscriber::from_config(config)
+            cortex::media::understanding::AudioTranscriber::from_config(config)
         {
             match async {
                 let file_info = client.get_file(&audio.file_id).await?;

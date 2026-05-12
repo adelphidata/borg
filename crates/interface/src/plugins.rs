@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use cortex::config::{Config, CredentialValue};
-use cortex::secrets_resolve::SecretRef;
+use cortex::security::secrets_resolve::SecretRef;
 
 pub struct PluginDef {
     pub name: &'static str,

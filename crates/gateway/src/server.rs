@@ -25,9 +25,9 @@ use crate::handler;
 use crate::handler::InboundMessage;
 use crate::health::ChannelHealthRegistry;
 use crate::manifest::ChannelMode;
-use crate::rate_limit::SlidingWindowLimiter;
+use crate::resilience::rate_limit::SlidingWindowLimiter;
 use crate::registry::ChannelRegistry;
-use crate::retry::RetryPolicy;
+use crate::resilience::retry::RetryPolicy;
 use crate::session_queue::SessionQueue;
 use crate::slack::api::SlackClient;
 use crate::slack::channel::SlackChannel;
@@ -144,7 +144,7 @@ impl GatewayServer {
         let signal_client = crate::channel_init::init_signal(&self.config).await;
 
         // TTS synthesizer (shared between webhook and polling paths)
-        let tts_synth: Option<Arc<cortex::tts::TtsSynthesizer>> =
+        let tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>> =
             crate::voice::configured_tts_synthesizer(&self.config).map(Arc::new);
 
         // Build native channel registry for unified webhook dispatch
@@ -1555,7 +1555,7 @@ async fn drain_pending_deliveries(
         // For drain loop, use fewer retries to avoid blocking
         policy.max_retries = policy.max_retries.min(2);
 
-        match crate::retry::send_with_retry(
+        match crate::resilience::retry::send_with_retry(
             &executor,
             &delivery.payload_json,
             blocked_paths,
@@ -1563,13 +1563,13 @@ async fn drain_pending_deliveries(
         )
         .await
         {
-            crate::retry::RetryOutcome::Success(_) => {
+            crate::resilience::retry::RetryOutcome::Success(_) => {
                 if let Err(e) = db.mark_delivered(&delivery.id) {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery success status: {e}");
                 }
                 health.write().await.record_outbound(&delivery.channel_name);
             }
-            crate::retry::RetryOutcome::PermanentFailure(e) => {
+            crate::resilience::retry::RetryOutcome::PermanentFailure(e) => {
                 if let Err(db_err) = db.mark_failed(&delivery.id, &e, None) {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");
                 }
@@ -1578,7 +1578,7 @@ async fn drain_pending_deliveries(
                     .await
                     .record_error(&delivery.channel_name, &e);
             }
-            crate::retry::RetryOutcome::Exhausted(e) => {
+            crate::resilience::retry::RetryOutcome::Exhausted(e) => {
                 let next_retry = chrono::Utc::now().timestamp() + 60;
                 if let Err(db_err) = db.mark_failed(&delivery.id, &e, Some(next_retry)) {
                     warn!(delivery_id = %delivery.id, "Failed to persist delivery failure status: {db_err}");

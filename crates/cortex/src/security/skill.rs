@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::config::SkillEntryConfig;
 use crate::db::{Database, SkillAuditOutcome};
 use crate::integrity::compute_sha256;
-use crate::sanitize::{self, ThreatLevel};
+use crate::security::sanitize::{self, ThreatLevel};
 use crate::skills::{self, SkillManifest};
 
 /// Environment variables that are always safe for any skill to request.

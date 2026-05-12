@@ -104,7 +104,7 @@ pub fn build_ack(
 ///
 /// Sequence: 0.5s, 1s, 2s, 4s, 8s, 16s, 20s (cap), 20s, …
 ///
-/// Intentionally bypasses `crate::backoff::calculate_backoff` (which delegates
+/// Intentionally bypasses `crate::resilience::backoff::calculate_backoff` (which delegates
 /// to `cortex::retry`) — Slack Socket Mode requires a deterministic, jitter-free
 /// reconnect cadence, distinct from the randomized poll backoff used by other
 /// channels.

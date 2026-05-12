@@ -24,7 +24,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use cortex::config::Config;
 use cortex::llm::{LlmClient, StreamEvent};
-use cortex::secrets_resolve::SecretRef;
+use cortex::security::secrets_resolve::SecretRef;
 use cortex::types::{Message, MessageContent, Role};
 
 /// Process-global serialization for tests that mutate `BORG_DATA_DIR`.

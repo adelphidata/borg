@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::format::{chunk_with_styles, FormattedText, TextStyle};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
 use crate::chunker;
-use crate::circuit_breaker::CircuitBreaker;
+use crate::resilience::circuit_breaker::CircuitBreaker;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
@@ -33,7 +33,7 @@ pub struct SignalClient {
 impl SignalClient {
     pub fn new(base_url: &str, account: &str) -> Result<Self> {
         Ok(Self {
-            client: crate::http_retry::build_channel_client(
+            client: crate::resilience::http_retry::build_channel_client(
                 "Signal",
                 RPC_TIMEOUT,
                 Some(SIGNAL_HTTP_CONNECT_TIMEOUT),

@@ -5,7 +5,7 @@ use std::str::FromStr;
 use cortex::config::Config;
 use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
 use cortex::provider::Provider;
-use cortex::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
+use cortex::security::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
 
 use crate::daemon_client;
@@ -679,7 +679,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                         cfg.credentials.insert(
                             key.clone(),
                             cortex::config::CredentialValue::Ref(
-                                cortex::secrets_resolve::SecretRef::Keychain {
+                                cortex::security::secrets_resolve::SecretRef::Keychain {
                                     service: service.clone(),
                                     account,
                                 },
@@ -702,7 +702,7 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                         cfg.credentials.insert(
                             key.clone(),
                             cortex::config::CredentialValue::Ref(
-                                cortex::secrets_resolve::SecretRef::Env { var: key.clone() },
+                                cortex::security::secrets_resolve::SecretRef::Env { var: key.clone() },
                             ),
                         );
                     }

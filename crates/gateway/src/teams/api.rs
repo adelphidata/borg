@@ -8,7 +8,7 @@ use tracing::warn;
 use super::types::{Mention, ReplyActivity, TokenResponse};
 use crate::chunker;
 use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
-use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
+use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token";
 /// Buffer in seconds before token expiry to trigger refresh.
@@ -34,7 +34,7 @@ pub struct TeamsClient {
 impl TeamsClient {
     pub fn new(app_id: &str, app_secret: &str) -> Result<Self> {
         Ok(Self {
-            client: crate::http_retry::build_channel_client("Teams", GATEWAY_HTTP_TIMEOUT, None)?,
+            client: crate::resilience::http_retry::build_channel_client("Teams", GATEWAY_HTTP_TIMEOUT, None)?,
             app_id: app_id.to_string(),
             app_secret: app_secret.to_string(),
             token_cache: RwLock::new(None),

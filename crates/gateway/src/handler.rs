@@ -10,20 +10,20 @@ use cortex::agent::AgentEvent;
 use cortex::config::Config;
 use cortex::constants;
 use cortex::db::{Database, NewDelivery};
-use cortex::sanitize::{
+use cortex::security::sanitize::{
     scan_for_injection, wrap_untrusted, wrap_with_injection_warning, ThreatLevel,
 };
-use cortex::validation::{sanitize_filename, sanitize_thread_id};
+use cortex::security::validation::{sanitize_filename, sanitize_thread_id};
 
 use crate::constants::MAX_THREAD_ID_LEN;
 
-use crate::challenge_throttle::ChallengeThrottle;
+use crate::resilience::challenge_throttle::ChallengeThrottle;
 use crate::chunker;
 use crate::constants::{DEFAULT_BINDING_ID, PEER_KIND_GROUP};
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
 use crate::registry::RegisteredChannel;
-use crate::retry::{self, RetryOutcome, RetryPolicy};
+use crate::resilience::retry::{self, RetryOutcome, RetryPolicy};
 
 /// Global throttle for pairing challenge messages — suppresses repeated
 /// challenges for the same sender within a 5-minute cooldown.

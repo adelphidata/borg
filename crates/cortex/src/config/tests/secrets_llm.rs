@@ -1,5 +1,5 @@
 use super::*;
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 use std::io::Write;
 
 #[test]
@@ -104,6 +104,7 @@ fn resolve_provider_prefers_secret_ref() {
 
 #[test]
 fn resolve_provider_bedrock_uses_region_without_api_key() {
+    let _lock = crate::llm::bedrock::env_test_lock();
     std::env::set_var("AWS_REGION", "us-west-2");
     let mut cfg = Config::default();
     cfg.llm.provider = Some("bedrock".to_string());
@@ -115,8 +116,20 @@ fn resolve_provider_bedrock_uses_region_without_api_key() {
 
 #[test]
 fn resolve_provider_bedrock_errors_when_region_missing() {
+    let _lock = crate::llm::bedrock::env_test_lock();
+    // Point HOME at an empty tempdir so the ~/.aws/config profile fallback
+    // can't find a region either — otherwise the developer's real AWS
+    // config shadows the failure case under test.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let old_home = std::env::var("HOME").ok();
+    let old_profile = std::env::var("AWS_PROFILE").ok();
+    let old_default_profile = std::env::var("AWS_DEFAULT_PROFILE").ok();
+    std::env::set_var("HOME", temp.path());
+    std::env::remove_var("AWS_PROFILE");
+    std::env::remove_var("AWS_DEFAULT_PROFILE");
     std::env::remove_var("AWS_REGION");
     std::env::remove_var("AWS_DEFAULT_REGION");
+
     let mut cfg = Config::default();
     cfg.llm.provider = Some("bedrock".to_string());
     let err = cfg
@@ -126,10 +139,23 @@ fn resolve_provider_bedrock_errors_when_region_missing() {
         err.to_string().contains("AWS region"),
         "unexpected error: {err}"
     );
+
+    if let Some(h) = old_home {
+        std::env::set_var("HOME", h);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(p) = old_profile {
+        std::env::set_var("AWS_PROFILE", p);
+    }
+    if let Some(p) = old_default_profile {
+        std::env::set_var("AWS_DEFAULT_PROFILE", p);
+    }
 }
 
 #[test]
 fn resolve_bedrock_region_prefers_setting_over_env() {
+    let _lock = crate::llm::bedrock::env_test_lock();
     std::env::set_var("AWS_REGION", "us-east-1");
     let mut cfg = Config::default();
     cfg.llm.bedrock_region = Some("eu-west-1".to_string());
@@ -140,6 +166,7 @@ fn resolve_bedrock_region_prefers_setting_over_env() {
 
 #[test]
 fn resolve_bedrock_region_reads_shared_aws_profile_config() {
+    let _lock = crate::llm::bedrock::env_test_lock();
     let temp = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(temp.path().join(".aws")).expect("create .aws");
     std::fs::write(

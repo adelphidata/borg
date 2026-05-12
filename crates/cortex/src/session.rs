@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::db::Database;
 use crate::types::{Message, MessageContent, Role, ToolCall};
-use crate::validation::validate_session_id;
+use crate::security::validation::validate_session_id;
 
 /// Lightweight metadata for a conversation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -30,7 +30,7 @@ pub async fn handle_generate_image(args: &serde_json::Value, config: &Config) ->
         .map(|n| n as u32);
     let size = args.get("size").and_then(serde_json::Value::as_str);
 
-    let provider = match crate::image_gen::ImageGenProvider::from_config(&config.image_gen) {
+    let provider = match crate::media::image_gen::ImageGenProvider::from_config(&config.image_gen) {
         Some(p) => p,
         None => {
             return Ok(
@@ -40,7 +40,7 @@ pub async fn handle_generate_image(args: &serde_json::Value, config: &Config) ->
         }
     };
 
-    match crate::image_gen::generate_image(&provider, prompt, size, count).await {
+    match crate::media::image_gen::generate_image(&provider, prompt, size, count).await {
         Ok(results) if results.is_empty() => Ok("Image generation returned no results".to_string()),
         Ok(results) => {
             let count = results.len();
@@ -66,7 +66,7 @@ pub async fn handle_generate_image(args: &serde_json::Value, config: &Config) ->
 #[instrument(skip_all, fields(tool.name = "text_to_speech"))]
 pub async fn handle_text_to_speech(
     args: &serde_json::Value,
-    synthesizer: &crate::tts::TtsSynthesizer,
+    synthesizer: &crate::media::tts::TtsSynthesizer,
 ) -> ToolOutput {
     let text = match require_str_param(args, "text") {
         Ok(t) => t,
@@ -76,7 +76,7 @@ pub async fn handle_text_to_speech(
     let format = args
         .get("format")
         .and_then(|v| v.as_str())
-        .and_then(crate::tts::AudioFormat::from_str_lossy);
+        .and_then(crate::media::tts::AudioFormat::from_str_lossy);
 
     match synthesizer.synthesize(text, voice, format).await {
         Ok((audio_bytes, fmt, _attempts)) => {
@@ -384,7 +384,7 @@ mod tests {
         // Either a provider was found in the env (rare in test) or we get the
         // "No image generation provider available" message. Only assert the
         // disabled-provider branch when no provider is configured.
-        if crate::image_gen::ImageGenProvider::from_config(&config.image_gen).is_none() {
+        if crate::media::image_gen::ImageGenProvider::from_config(&config.image_gen).is_none() {
             assert!(
                 result.contains("No image generation provider"),
                 "got: {result}"

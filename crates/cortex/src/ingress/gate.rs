@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::message::{session_key, IngressMessage, IngressSource, PrincipalId};
-use crate::sanitize::{scan_for_injection, wrap_with_injection_warning, ThreatLevel};
+use crate::security::sanitize::{scan_for_injection, wrap_with_injection_warning, ThreatLevel};
 
 /// Maximum unique rate-limit keys retained before the gate refuses new
 /// principals. Same bound as the gateway's

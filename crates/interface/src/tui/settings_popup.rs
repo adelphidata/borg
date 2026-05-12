@@ -1702,7 +1702,7 @@ mod tests {
         assert_eq!(value, "(not set)");
 
         // With an api_key SecretRef configured → (set), still never leaks raw value
-        cfg.llm.api_key = Some(cortex::secrets_resolve::SecretRef::Env {
+        cfg.llm.api_key = Some(cortex::security::secrets_resolve::SecretRef::Env {
             var: "FAKE_KEY_VAR".to_string(),
         });
         let value = popup.current_value(&cfg, "llm.api_key");
@@ -1714,7 +1714,7 @@ mod tests {
     fn secret_enter_starts_with_empty_buffer() {
         let mut popup = SettingsPopup::new();
         let mut cfg = Config::default();
-        cfg.llm.api_key = Some(cortex::secrets_resolve::SecretRef::Env {
+        cfg.llm.api_key = Some(cortex::security::secrets_resolve::SecretRef::Env {
             var: "FAKE_KEY_VAR".to_string(),
         });
         open(&mut popup, &cfg);

@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::provider::Provider;
-use crate::secrets::redact_secrets;
+use crate::security::secrets::redact_secrets;
 
 /// Maximum bytes of provider response body retained in error messages.
 /// Bodies are redacted first, then truncated — keeps logs bounded and avoids

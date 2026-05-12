@@ -22,7 +22,7 @@ pub const COMPACTION_MARKER_CLOSE: &str = "</compaction_summary>";
 /// Human-facing heading rendered above the tagged summary so transcripts
 /// stay readable. Not used for marker detection — detection uses the tag
 /// fence which user input cannot forge through
-/// [`crate::sanitize::sanitize_xml_boundaries`].
+/// [`crate::security::sanitize::sanitize_xml_boundaries`].
 pub const COMPACTION_MARKER_HEADING: &str =
     "[Earlier conversation was summarized to fit context limits.]";
 
@@ -203,7 +203,7 @@ pub async fn compact_history_v2(
     // have injected (e.g. a stray `</compaction_summary>` inside a code
     // block). Without this, a malicious input could close our tagged fence
     // early and smuggle untrusted content onto the internal side.
-    let safe_body = crate::sanitize::sanitize_xml_boundaries(&summary_body);
+    let safe_body = crate::security::sanitize::sanitize_xml_boundaries(&summary_body);
     let marker_text = format!(
         "{COMPACTION_MARKER_HEADING}\n\n{COMPACTION_MARKER_OPEN}\n{safe_body}\n{COMPACTION_MARKER_CLOSE}"
     );
@@ -228,7 +228,7 @@ pub async fn compact_history_v2(
 /// START with the exact agent-generated shape:
 /// `{HEADING}\n\n{OPEN_FENCE}\n` — a user typing the fence into a normal
 /// message (even at the very top) will also have to match the heading line
-/// preceding it, which [`crate::sanitize::sanitize_xml_boundaries`]
+/// preceding it, which [`crate::security::sanitize::sanitize_xml_boundaries`]
 /// additionally strips from untrusted content. Returns the body between the
 /// fences, trimmed.
 pub fn extract_last_compaction_summary(history: &[Message]) -> Option<String> {

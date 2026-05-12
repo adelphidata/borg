@@ -12,7 +12,7 @@ use super::types::{
 use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::{DISCORD_API_BASE, DISCORD_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
-use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
+use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 /// Validate that a Discord snowflake ID is numeric (prevents path traversal in URL interpolation).
 fn validate_snowflake(id: &str, label: &str) -> Result<()> {
@@ -83,7 +83,7 @@ pub struct DiscordClient {
 impl DiscordClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: crate::http_retry::build_channel_client("Discord", GATEWAY_HTTP_TIMEOUT, None)?,
+            client: crate::resilience::http_retry::build_channel_client("Discord", GATEWAY_HTTP_TIMEOUT, None)?,
             token: token.to_string(),
             application_id: None,
         })

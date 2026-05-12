@@ -19,7 +19,7 @@ pub async fn send_response(
     input_was_voice: bool,
     voice_reply_mode: Option<VoiceReplyMode>,
     health: &Arc<RwLock<ChannelHealthRegistry>>,
-    tts_synthesizer: Option<&cortex::tts::TtsSynthesizer>,
+    tts_synthesizer: Option<&cortex::media::tts::TtsSynthesizer>,
 ) -> Result<()> {
     if response_text.trim().is_empty() {
         tracing::debug!("Telegram response empty after trim, skipping send for chat {chat_id}");
@@ -49,9 +49,9 @@ pub async fn send_response(
     if let Some(synth) = tts_synthesizer {
         if let Some(mode) = voice_reply_mode {
             if should_send_voice_reply(mode, response_text, input_was_voice) {
-                let tts_text = cortex::tts::truncate_for_tts(response_text, 4096);
+                let tts_text = cortex::media::tts::truncate_for_tts(response_text, 4096);
                 match synth
-                    .synthesize(&tts_text, None, Some(cortex::tts::AudioFormat::Opus))
+                    .synthesize(&tts_text, None, Some(cortex::media::tts::AudioFormat::Opus))
                     .await
                 {
                     Ok((audio_bytes, _, _)) => {

@@ -10,7 +10,7 @@ use anyhow::Result;
 use rusqlite::params;
 
 use super::Database;
-use crate::secrets::RedactionHit;
+use crate::security::secrets::RedactionHit;
 
 /// One row from the `redaction_audit` table.
 #[derive(Debug, Clone, PartialEq, Eq)]

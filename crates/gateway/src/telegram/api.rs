@@ -37,7 +37,7 @@ pub struct TelegramClient {
 impl TelegramClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: crate::http_retry::build_channel_client(
+            client: crate::resilience::http_retry::build_channel_client(
                 "Telegram",
                 GATEWAY_HTTP_TIMEOUT,
                 Some(HTTP_CONNECT_TIMEOUT),

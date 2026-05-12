@@ -17,13 +17,13 @@ use anyhow::{Context, Result};
 
 use cortex::config::Config;
 use cortex::provider::Provider;
-use cortex::secrets_resolve::provider_api_key_secret_ref;
+use cortex::security::secrets_resolve::provider_api_key_secret_ref;
 use protocols::admin::{api_key_value::Body as ApiKeyBody, ApiKeyValue, KeychainRef};
 
 use crate::daemon_client;
 
 #[cfg(test)]
-use cortex::secrets_resolve::SecretRef;
+use cortex::security::secrets_resolve::SecretRef;
 
 /// Outcome of attempting to save an API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

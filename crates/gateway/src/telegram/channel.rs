@@ -39,7 +39,7 @@ pub struct TelegramChannel {
     /// Application configuration.
     pub config: Config,
     /// Optional TTS synthesizer for auto-voice responses.
-    pub tts_synthesizer: Option<Arc<cortex::tts::TtsSynthesizer>>,
+    pub tts_synthesizer: Option<Arc<cortex::media::tts::TtsSynthesizer>>,
 }
 
 #[async_trait]

@@ -633,7 +633,7 @@ impl Config {
         let service = format!("borg-{}", plugin_id.replace('/', "-"));
         let account = format!("borg-{key}");
 
-        let sr = crate::secrets_resolve::SecretRef::Keychain {
+        let sr = crate::security::secrets_resolve::SecretRef::Keychain {
             service: service.clone(),
             account: account.clone(),
         };

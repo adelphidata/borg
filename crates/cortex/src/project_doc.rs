@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::sanitize;
+use crate::security::sanitize;
 
 /// Filenames to search for, checked in order per directory.
 const DOC_FILENAMES: &[&str] = &["AGENTS.md", "CLAUDE.md"];

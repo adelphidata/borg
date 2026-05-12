@@ -2073,7 +2073,7 @@ fn truncate_error_msg(s: &str) -> String {
     // Redact first — upstream error bodies occasionally echo the bearer
     // token tail back, and `last_error_message` ends up on operator
     // terminals via `borg auth list` (and into shell history).
-    let redacted = crate::secrets::redact_secrets(s);
+    let redacted = crate::security::secrets::redact_secrets(s);
     if redacted.len() <= ERROR_MESSAGE_MAX_LEN {
         return redacted;
     }

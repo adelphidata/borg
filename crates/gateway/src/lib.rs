@@ -26,14 +26,11 @@
 )]
 
 pub mod auto_reply;
-pub mod backoff;
 /// Ephemeral `/btw` side-question dispatcher shared across native channels.
 pub mod btw_dispatch;
-pub mod challenge_throttle;
 mod channel_init;
 pub mod channel_trait;
 pub mod chunker;
-pub mod circuit_breaker;
 pub mod commands;
 pub mod constants;
 pub mod crypto;
@@ -48,7 +45,6 @@ pub mod generic_webhook;
 pub mod google_chat;
 pub mod handler;
 pub mod health;
-pub mod http_retry;
 #[cfg(target_os = "macos")]
 pub mod imessage;
 pub mod link_understanding;
@@ -63,9 +59,10 @@ pub mod mcp;
 pub mod openai_compat;
 /// Helpers for plain-text channels that cannot render Markdown code fences.
 pub mod plain_text;
-pub mod rate_limit;
 pub mod registry;
-pub mod retry;
+/// Fault-tolerance primitives: backoff, retry, circuit breaker, rate
+/// limit, HTTP retry, challenge throttling.
+pub mod resilience;
 pub mod routing;
 pub mod server;
 pub mod session_executor;

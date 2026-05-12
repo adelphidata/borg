@@ -93,8 +93,6 @@ pub mod hooks;
 pub mod host_audit;
 /// IDENTITY.md load/save for agent personality.
 pub mod identity;
-/// AI image generation (OpenAI DALL-E, Fal).
-pub mod image_gen;
 /// Normalized ingress message schema and pre-dispatch gate (rate-limit,
 /// sanitize, audit). Shared by every ingress surface — native channels,
 /// OpenAI-compat HTTP, generic webhook, MCP server.
@@ -112,10 +110,8 @@ pub mod logging;
 /// Daily self-healing maintenance runner (doctor sweep, log/activity
 /// pruning, persistent-warning surfacing). Seeded as a scheduled task.
 pub mod maintenance;
-/// Media file handling and type detection.
+/// Multimodal I/O: parsing/compression (core), image gen, TTS, understanding.
 pub mod media;
-/// Media understanding (image/audio analysis via LLM).
-pub mod media_understanding;
 /// Memory loading with token budget and semantic search.
 pub mod memory;
 /// Client-side `@path` mention expansion for the TUI composer.
@@ -130,7 +126,7 @@ pub mod model_registry;
 pub mod multi_agent;
 /// Output-side redaction policy applied to channel deliveries, TUI
 /// transcript, and log writes. Pairs with the input-side detector in
-/// [`secrets`].
+/// [`security::secrets`].
 pub mod output_redaction;
 /// Sender pairing and access control for gateway channels.
 pub mod pairing;
@@ -153,14 +149,11 @@ pub mod providers;
 pub mod rate_guard;
 /// Retry utilities with exponential backoff.
 pub mod retry;
-/// Prompt injection detection and content sanitization.
-pub mod sanitize;
 /// Script management for user-created tools.
 pub mod scripts;
-/// Secret detection and redaction in tool outputs.
-pub mod secrets;
-/// Credential resolution from env, file, exec, or keychain.
-pub mod secrets_resolve;
+/// Trust-boundary cluster: sanitize, secrets (detection + resolution),
+/// skill audit, input validation.
+pub mod security;
 /// Session management and persistence.
 pub mod session;
 /// Session transcript indexing for searchable conversations.
@@ -171,8 +164,6 @@ pub mod session_types;
 pub mod settings;
 /// Short-term (working) memory for the current session.
 pub mod short_term_memory;
-/// Security validation for user-defined skills.
-pub mod skill_security;
 /// Skills loading, parsing, and progressive token budgeting.
 pub mod skills;
 /// Shared SSE stream processing for LLM providers.
@@ -194,8 +185,6 @@ pub mod tool;
 pub mod tool_handlers;
 /// Text truncation with head+tail preservation.
 pub mod truncate;
-/// Text-to-speech integration.
-pub mod tts;
 /// Core types: Message, ToolCall, ToolDefinition, Role.
 pub mod types;
 /// Tiny Unix filesystem helpers (chmod) shared across crates.
@@ -209,8 +198,6 @@ pub mod url_policy;
 /// spend, cost, model usage, tool calls, channel activity) over a rolling
 /// time window. The TUI popup renders the returned string verbatim.
 pub mod usage;
-/// Shared input validators and sanitizers.
-pub mod validation;
 /// Vitals system: passive agent health tracking via hooks.
 pub mod vitals;
 /// Web fetching and search capabilities.

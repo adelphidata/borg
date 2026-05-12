@@ -3,7 +3,7 @@
 
 use cortex::constants;
 
-pub use crate::circuit_breaker::CircuitBreaker as SharedCircuitBreaker;
+pub use crate::resilience::circuit_breaker::CircuitBreaker as SharedCircuitBreaker;
 
 const FAILURE_THRESHOLD: u32 = constants::TELEGRAM_CIRCUIT_FAILURE_THRESHOLD;
 const SUSPENSION_SECS: u64 = constants::TELEGRAM_CIRCUIT_SUSPENSION_SECS;

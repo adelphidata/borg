@@ -24,7 +24,7 @@ use crate::llm_error::{classify_error_text, FailoverReason};
 use crate::logging::log_message;
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{RateDecision, SessionRateGuard};
-use crate::secrets::redact_secrets;
+use crate::security::secrets::redact_secrets;
 use crate::session::Session;
 use crate::skills::load_skills_context;
 use crate::telemetry::BorgMetrics;
@@ -263,7 +263,7 @@ pub struct Agent {
     pub(super) skill_env_allowlist: std::collections::HashSet<String>,
     pub(super) metrics: BorgMetrics,
     pub(super) browser_session: Option<crate::browser::BrowserSession>,
-    pub(super) tts_synthesizer: Option<crate::tts::TtsSynthesizer>,
+    pub(super) tts_synthesizer: Option<crate::media::tts::TtsSynthesizer>,
     pub(super) config_rx: Option<tokio::sync::watch::Receiver<Config>>,
     pub(super) db: Mutex<Option<Database>>,
     /// System-prompt input caches (identity, credentials, project docs, skills).
@@ -315,7 +315,7 @@ struct AgentCommon {
     session: Session,
     db: Option<Database>,
     skill_env_allowlist: std::collections::HashSet<String>,
-    tts_synthesizer: Option<crate::tts::TtsSynthesizer>,
+    tts_synthesizer: Option<crate::media::tts::TtsSynthesizer>,
 }
 
 /// Build the shared initialization state used by both `Agent::new` and `Agent::new_sub_agent`.
@@ -348,7 +348,7 @@ fn build_common(config: &Config) -> Result<AgentCommon> {
     let resolved_creds = config.resolve_credentials();
     let skill_env_allowlist =
         crate::skills::collect_required_env_vars(&resolved_creds, &config.skills);
-    let tts_synthesizer = crate::tts::TtsSynthesizer::from_config(config);
+    let tts_synthesizer = crate::media::tts::TtsSynthesizer::from_config(config);
     Ok(AgentCommon {
         policy,
         rate_guard,
@@ -2062,14 +2062,14 @@ impl Agent {
             self.metrics.tool_duration.record(tool_elapsed, &[]);
 
             // Sanitize tool name for XML embedding to prevent injection
-            let safe_name = crate::sanitize::escape_xml_attr(name);
+            let safe_name = crate::security::sanitize::escape_xml_attr(name);
 
             let (raw_text, extra_parts) = match tool_output {
                 ToolOutput::Text(t) => (t, None),
                 ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
             };
             let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::sanitize::sanitize_xml_boundaries(&redacted);
+            let sanitized = crate::security::sanitize::sanitize_xml_boundaries(&redacted);
             let xml = format!(
                 "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
             );
@@ -2270,13 +2270,13 @@ impl Agent {
             self.metrics.tool_executions.add(1, &[]);
             self.metrics.tool_duration.record(elapsed, &[]);
 
-            let safe_name = crate::sanitize::escape_xml_attr(&name);
+            let safe_name = crate::security::sanitize::escape_xml_attr(&name);
             let (raw_text, extra_parts) = match tool_output {
                 ToolOutput::Text(t) => (t, None),
                 ToolOutput::Multimodal { text, parts } => (text, Some(parts)),
             };
             let redacted = self.truncate_and_redact(&raw_text);
-            let sanitized = crate::sanitize::sanitize_xml_boundaries(&redacted);
+            let sanitized = crate::security::sanitize::sanitize_xml_boundaries(&redacted);
             let xml = format!(
                 "<tool_output name=\"{safe_name}\" trust=\"external\">\n{sanitized}\n</tool_output>"
             );

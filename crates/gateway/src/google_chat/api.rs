@@ -6,7 +6,7 @@ use crate::chunker;
 use crate::constants::{
     GATEWAY_HTTP_TIMEOUT, GOOGLE_CHAT_API_BASE, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE,
 };
-use crate::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
+use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 /// A client for the Google Chat API.
 #[derive(Clone)]

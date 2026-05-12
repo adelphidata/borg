@@ -60,8 +60,8 @@ pub fn default_voice_reply_mode(config: &Config) -> VoiceReplyMode {
     }
 }
 
-pub fn configured_tts_synthesizer(config: &Config) -> Option<cortex::tts::TtsSynthesizer> {
-    cortex::tts::TtsSynthesizer::from_config(config)
+pub fn configured_tts_synthesizer(config: &Config) -> Option<cortex::media::tts::TtsSynthesizer> {
+    cortex::media::tts::TtsSynthesizer::from_config(config)
 }
 
 pub fn voice_reply_unavailable_reason(config: &Config) -> Option<&'static str> {

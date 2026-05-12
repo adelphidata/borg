@@ -4,7 +4,7 @@ use tracing::{debug, instrument};
 use crate::config::Config;
 use crate::constants::{HEARTBEAT_FILE, MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
 use crate::db::MemoryEntryRow;
-use crate::sanitize::escape_xml_attr;
+use crate::security::sanitize::escape_xml_attr;
 use crate::tokenizer::estimate_tokens;
 
 mod injection;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 
 /// Ensure that serializing a Config and parsing it back produces valid TOML.
 /// This catches issues like duplicate table headers.

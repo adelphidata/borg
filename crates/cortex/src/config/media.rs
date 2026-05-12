@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::constants;
-use crate::secrets_resolve::SecretRef;
+use crate::security::secrets_resolve::SecretRef;
 
 /// Collaboration mode that controls how the agent interacts during a session.
 ///
