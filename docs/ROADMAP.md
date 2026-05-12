@@ -244,11 +244,6 @@ top-down by priority, not by section order.
   re-reads on demand via `read_file`. Prevents context bloat from a
   single chatty tool call. Pairs with the deferred mid-turn context
   compression.
-- **Thinking-block scrubber.** `[H]` Deferred. Strip `<thinking>` content
-  from persisted messages before they're re-fed in subsequent turns.
-  Borg strips `<internal>` in real-time today, but the saved bytes in
-  the `messages` table may still re-enter context on replay. Real token
-  savings on reasoning-heavy models once confirmed not already covered.
 
 ### Agent loop ergonomics
 
