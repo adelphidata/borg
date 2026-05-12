@@ -2360,3 +2360,153 @@ fn anthropic_sse_invalid_request_generic_is_fatal_format() {
         _ => panic!("expected Error variant"),
     }
 }
+
+// ── Azure OpenAI URL composition ──
+
+fn azure_test_cfg(
+    resource: Option<&str>,
+    deployment: Option<&str>,
+    api_version: Option<&str>,
+) -> crate::config::LlmConfig {
+    let mut cfg = crate::config::LlmConfig::default();
+    cfg.azure_resource = resource.map(str::to_string);
+    cfg.azure_deployment = deployment.map(str::to_string);
+    cfg.azure_api_version = api_version.map(str::to_string);
+    cfg
+}
+
+#[test]
+fn compose_azure_openai_url_happy_path() {
+    // Spec-literal URL — the operator-derived shape Azure expects. If
+    // any of the three path segments drift, every Azure request 404s.
+    let cfg = azure_test_cfg(Some("my-resource"), Some("my-gpt4o"), Some("2024-10-21"));
+    let url = compose_azure_openai_url(&cfg).unwrap();
+    assert_eq!(
+        url,
+        "https://my-resource.openai.azure.com/openai/deployments/my-gpt4o/chat/completions?api-version=2024-10-21"
+    );
+}
+
+#[test]
+fn compose_azure_openai_url_missing_resource_errors() {
+    let cfg = azure_test_cfg(None, Some("d"), Some("v"));
+    let err = compose_azure_openai_url(&cfg).unwrap_err().to_string();
+    assert!(
+        err.contains("llm.azure_resource"),
+        "error must name the missing setting; got: {err}"
+    );
+}
+
+#[test]
+fn compose_azure_openai_url_missing_deployment_errors() {
+    let cfg = azure_test_cfg(Some("r"), None, Some("v"));
+    let err = compose_azure_openai_url(&cfg).unwrap_err().to_string();
+    assert!(err.contains("llm.azure_deployment"), "got: {err}");
+}
+
+#[test]
+fn compose_azure_openai_url_missing_api_version_errors() {
+    // No silent default — operators must opt into a specific API
+    // version so upstream shape drift surfaces as an explicit upgrade.
+    let cfg = azure_test_cfg(Some("r"), Some("d"), None);
+    let err = compose_azure_openai_url(&cfg).unwrap_err().to_string();
+    assert!(err.contains("llm.azure_api_version"), "got: {err}");
+}
+
+#[test]
+fn compose_azure_openai_url_empty_string_treated_as_missing() {
+    // Setting to "" via `borg settings set llm.azure_resource ''` must
+    // not produce a URL with an empty host segment that quietly resolves
+    // to a wildcard match against `.openai.azure.com`.
+    let cfg = azure_test_cfg(Some(""), Some("d"), Some("v"));
+    assert!(compose_azure_openai_url(&cfg).is_err());
+}
+
+#[test]
+fn compose_azure_openai_url_rejects_path_unsafe_chars() {
+    // Reject characters that would either change the URL semantics
+    // (`/`, `?`, `#`) or require percent-encoding. Surfacing as a
+    // config error beats a runtime 404 with a baffling URL.
+    let cfg = azure_test_cfg(Some("r"), Some("bad/name"), Some("2024-10-21"));
+    let err = compose_azure_openai_url(&cfg).unwrap_err().to_string();
+    assert!(err.contains("llm.azure_deployment"), "got: {err}");
+
+    let cfg = azure_test_cfg(Some("r"), Some("d"), Some("v?injected=1"));
+    assert!(compose_azure_openai_url(&cfg).is_err());
+}
+
+#[test]
+fn compose_azure_openai_url_rejects_dot_in_resource() {
+    // Subdomain-injection guard: a `.` in `azure_resource` would let an
+    // operator typo (or a hostile setting) point requests at an arbitrary
+    // host — `evil.attacker` →
+    // `https://evil.attacker.openai.azure.com`. Resource names are DNS
+    // labels (alphanumeric + `-` only), so `.` must be a hard error.
+    let cfg = azure_test_cfg(Some("evil.attacker"), Some("d"), Some("2024-10-21"));
+    let err = compose_azure_openai_url(&cfg).unwrap_err().to_string();
+    assert!(err.contains("llm.azure_resource"), "got: {err}");
+    assert!(err.contains("DNS label"), "got: {err}");
+
+    // Underscore is also forbidden in DNS labels.
+    let cfg = azure_test_cfg(Some("bad_resource"), Some("d"), Some("2024-10-21"));
+    assert!(compose_azure_openai_url(&cfg).is_err());
+}
+
+fn azure_test_config(env_var: &str) -> Config {
+    std::env::set_var(env_var, "test-key");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("azure-openai".to_string());
+    cfg.llm.model = "gpt-4o".to_string();
+    cfg.llm.api_key_env = env_var.to_string();
+    cfg
+}
+
+#[test]
+fn azure_openai_construction_fails_without_settings() {
+    // LlmClient::new must reject an Azure config that's missing the
+    // required Azure settings — fail-fast at start rather than 400 on
+    // first prompt. This pins the construction-time guard.
+    let cfg = azure_test_config("BORG_TEST_AZURE_MISSING");
+    let err = match LlmClient::new(&cfg) {
+        Ok(_) => panic!("expected Azure config-missing error"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("Azure OpenAI"),
+        "construction error must name Azure; got: {err}"
+    );
+}
+
+#[test]
+fn azure_openai_construction_succeeds_with_settings() {
+    // Mirror of the failure case: with all three fields set, construction
+    // succeeds and the composed URL is stored as the effective base URL.
+    let mut cfg = azure_test_config("BORG_TEST_AZURE_OK");
+    cfg.llm.azure_resource = Some("acme".to_string());
+    cfg.llm.azure_deployment = Some("gpt-4o-prod".to_string());
+    cfg.llm.azure_api_version = Some("2024-10-21".to_string());
+
+    let client = LlmClient::new(&cfg).expect("Azure client should construct");
+    let url = client.effective_base_url().to_string();
+    assert_eq!(
+        url,
+        "https://acme.openai.azure.com/openai/deployments/gpt-4o-prod/chat/completions?api-version=2024-10-21"
+    );
+}
+
+#[test]
+fn azure_openai_construction_respects_base_url_override() {
+    // Operators sometimes proxy Azure through a private gateway. When
+    // `llm.base_url` is set, the Azure URL composer must defer to it.
+    let mut cfg = azure_test_config("BORG_TEST_AZURE_PROXY");
+    cfg.llm.base_url = Some(
+        "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21".to_string(),
+    );
+
+    let client = LlmClient::new(&cfg).expect("base_url override should bypass composer");
+    let url = client.effective_base_url().to_string();
+    assert_eq!(
+        url,
+        "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21"
+    );
+}

@@ -37,6 +37,14 @@ pub enum Provider {
     /// User-defined OpenAI-compatible endpoint. `base_url()` returns "" — the
     /// concrete URL is read from `PooledCredential.base_url` at request time.
     Custom,
+    /// Azure OpenAI Service — deployment-name-scoped OpenAI on Microsoft
+    /// tenancy. Wire body is OpenAI ChatCompletions; the URL is composed
+    /// from `llm.azure_resource` / `llm.azure_deployment` /
+    /// `llm.azure_api_version` at request time, and the auth header is
+    /// `api-key: <key>` for API-key auth or `Authorization: Bearer <token>`
+    /// for AAD (Entra ID) tokens. The auth mode is signaled by the
+    /// `PooledCredential.auth_type` field (`ApiKey` vs `OAuth`).
+    AzureOpenAi,
 }
 
 impl Provider {
@@ -55,7 +63,8 @@ impl Provider {
             | Provider::ClaudeCodeOAuth
             | Provider::CodexOAuth
             | Provider::CopilotOAuth
-            | Provider::Custom => ProviderAuthKind::ApiKeyLike,
+            | Provider::Custom
+            | Provider::AzureOpenAi => ProviderAuthKind::ApiKeyLike,
         }
     }
 
@@ -81,6 +90,11 @@ impl Provider {
             Provider::CopilotOAuth => "https://api.githubcopilot.com/chat/completions",
             // Custom resolves base_url from the lease at request time.
             Provider::Custom => "",
+            // Azure composes its URL from llm.azure_* settings; see
+            // `LlmClient::effective_base_url`. Empty here means a caller that
+            // forgets to compose will fail loudly on URL parse instead of
+            // silently using a wrong host.
+            Provider::AzureOpenAi => "",
         }
     }
 
@@ -103,6 +117,7 @@ impl Provider {
             | Provider::CodexOAuth
             | Provider::CopilotOAuth
             | Provider::Custom => "",
+            Provider::AzureOpenAi => "AZURE_OPENAI_API_KEY",
         }
     }
 
@@ -207,6 +222,15 @@ impl Provider {
                 );
                 headers.insert("Editor-Version", HeaderValue::from_static("Borg/1.0"));
             }
+            Provider::AzureOpenAi => {
+                // Azure OpenAI uses the `api-key` header for static-key auth;
+                // `Authorization: Bearer` is reserved for AAD (Entra ID)
+                // tokens, which v2 will wire through the credential-pool
+                // auth_type seam landing with Bedrock on main.
+                let val = HeaderValue::from_str(api_key)
+                    .context("API key contains invalid characters for HTTP headers")?;
+                headers.insert("api-key", val);
+            }
         }
 
         Ok(headers)
@@ -246,6 +270,11 @@ impl Provider {
             Provider::CodexOAuth => model.strip_prefix("openai/").unwrap_or(model).to_string(),
             Provider::CopilotOAuth => model.strip_prefix("copilot/").unwrap_or(model).to_string(),
             Provider::Custom => model.to_string(),
+            // Azure routes by deployment name in the URL, not by model id in
+            // the body — but the body's `model` field is required and should
+            // be passthrough so the operator can put the deployment name (or
+            // a label) there. No vendor prefix to strip.
+            Provider::AzureOpenAi => model.to_string(),
         }
     }
 
@@ -323,6 +352,19 @@ impl Provider {
             }
             Provider::CopilotOAuth => true,
             Provider::Custom => true, // operator-driven; let the endpoint reject if unsupported
+            // Azure deployments are vendor-named (e.g. `gpt-4o`, `gpt-5`).
+            // Mirror the OpenAI blocklist so embedding/whisper deployments
+            // don't silently accept image inputs.
+            Provider::AzureOpenAi => {
+                !m.contains("gpt-3.5")
+                    && !m.contains("davinci")
+                    && !m.contains("babbage")
+                    && !m.contains("ada")
+                    && !m.contains("whisper")
+                    && !m.contains("tts")
+                    && !m.contains("dall-e")
+                    && !m.contains("embedding")
+            }
         }
     }
 
@@ -343,6 +385,7 @@ impl Provider {
             Provider::CodexOAuth => "codex-oauth",
             Provider::CopilotOAuth => "copilot-oauth",
             Provider::Custom => "custom",
+            Provider::AzureOpenAi => "azure-openai",
         }
     }
 
@@ -412,8 +455,9 @@ impl FromStr for Provider {
             "codex-oauth" | "codex_oauth" | "codexoauth" => Ok(Provider::CodexOAuth),
             "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
             "custom" => Ok(Provider::Custom),
+            "azure-openai" | "azure_openai" | "azureopenai" => Ok(Provider::AzureOpenAi),
             _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
+                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom, azure-openai")
             }
         }
     }
@@ -447,6 +491,7 @@ mod tests {
             Provider::CodexOAuth,
             Provider::CopilotOAuth,
             Provider::Custom,
+            Provider::AzureOpenAi,
         ];
         for provider in &all {
             let s = provider.as_str();
@@ -957,5 +1002,89 @@ mod tests {
             Provider::from_api_key_prefix("  xai-key  "),
             Some(Provider::XAi)
         );
+    }
+    // ── AzureOpenAi tests ──
+
+    #[test]
+    fn azure_openai_from_str_aliases() {
+        // All accepted alias spellings must resolve to the same variant.
+        for alias in [
+            "azure-openai",
+            "azure_openai",
+            "azureopenai",
+            "Azure-OpenAI",
+        ] {
+            assert_eq!(
+                Provider::from_str(alias).unwrap(),
+                Provider::AzureOpenAi,
+                "alias {alias} did not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_openai_api_key_header_uses_api_key_not_bearer() {
+        // Spec invariant: Azure rejects `Authorization: Bearer <api_key>`
+        // for static-key auth. The `api-key` header is the documented
+        // shape; misclassifying this regresses every Azure request to a
+        // 401.
+        let headers = Provider::AzureOpenAi.build_headers("test-key").unwrap();
+        assert_eq!(
+            headers.get("api-key").unwrap().to_str().unwrap(),
+            "test-key"
+        );
+        assert!(
+            headers.get("Authorization").is_none(),
+            "Azure api-key path must not send Authorization: Bearer"
+        );
+    }
+
+    #[test]
+    fn azure_openai_is_openai_compatible_true() {
+        // Azure speaks OpenAI ChatCompletions on the wire. Routing it
+        // through the Anthropic transport would produce malformed bodies.
+        assert!(Provider::AzureOpenAi.is_openai_compatible());
+    }
+
+    #[test]
+    fn azure_openai_static_base_url_is_empty() {
+        // URL is composed from llm.azure_* settings at request time. A
+        // non-empty static URL here would let callers that forget to
+        // compose silently hit the wrong host.
+        assert_eq!(Provider::AzureOpenAi.base_url(), "");
+    }
+
+    #[test]
+    fn azure_openai_default_env_var() {
+        assert_eq!(
+            Provider::AzureOpenAi.default_env_var(),
+            "AZURE_OPENAI_API_KEY"
+        );
+    }
+
+    #[test]
+    fn azure_openai_normalize_model_passthrough() {
+        // Azure deployment names are operator-chosen — must not be
+        // prefix-stripped or mutated.
+        assert_eq!(
+            Provider::AzureOpenAi.normalize_model("my-gpt-4o"),
+            "my-gpt-4o"
+        );
+        assert_eq!(
+            Provider::AzureOpenAi.normalize_model("openai/gpt-4o"),
+            "openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn azure_openai_supports_vision_blocklist() {
+        // Vision-capable deployments must pass; embedding/whisper/etc.
+        // must be flagged so multimodal messages don't get silently
+        // downgraded to a 400.
+        assert!(Provider::AzureOpenAi.supports_vision("gpt-4o"));
+        assert!(Provider::AzureOpenAi.supports_vision("gpt-5"));
+        assert!(!Provider::AzureOpenAi.supports_vision("text-embedding-3-large"));
+        assert!(!Provider::AzureOpenAi.supports_vision("whisper-1"));
+        assert!(!Provider::AzureOpenAi.supports_vision("dall-e-3"));
     }
 }

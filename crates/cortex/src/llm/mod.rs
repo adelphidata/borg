@@ -434,6 +434,86 @@ fn normalize_gemini_base(url: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{stripped}{CANONICAL_SUFFIX}"))
 }
 
+/// Compose the Azure OpenAI chat-completions URL from
+/// `llm.azure_resource` / `llm.azure_deployment` / `llm.azure_api_version`.
+///
+/// Azure's URL is operator-derived (one resource hosts many deployments
+/// at distinct paths), so it cannot be encoded as a static `base_url()`.
+/// Missing fields surface as a clear config error rather than a runtime
+/// 400 from Azure — `LlmClient::new` invokes this at construction time
+/// for `Provider::AzureOpenAi`.
+pub(crate) fn compose_azure_openai_url(cfg: &crate::config::LlmConfig) -> anyhow::Result<String> {
+    let resource = cfg
+        .azure_resource
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Azure OpenAI: missing required setting `llm.azure_resource` \
+             (e.g. `borg settings set llm.azure_resource my-resource`)"
+            )
+        })?;
+    let deployment = cfg
+        .azure_deployment
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Azure OpenAI: missing required setting `llm.azure_deployment` \
+                 (e.g. `gpt-4o-prod`)"
+            )
+        })?;
+    let api_version = cfg
+        .azure_api_version
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Azure OpenAI: missing required setting `llm.azure_api_version` \
+                 (e.g. `2024-10-21`)"
+            )
+        })?;
+
+    // Validate per Azure's per-field rules so a typo surfaces as a config
+    // error instead of a runtime 404 — and so a `.` in `azure_resource`
+    // can't inject a subdomain (e.g. `evil.attacker` →
+    // `https://evil.attacker.openai.azure.com`).
+    //
+    // - resource: RFC 1123 DNS label — lowercase alphanumeric + `-`.
+    // - deployment: operator-chosen, Azure portal allows alphanumeric +
+    //   `-` + `_`.
+    // - api_version: `YYYY-MM-DD[-preview]` — alphanumeric + `-`.
+    fn is_dns_label(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    }
+    fn is_deployment_safe(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+    if !is_dns_label(resource) {
+        anyhow::bail!(
+            "Azure OpenAI: setting `llm.azure_resource` must be a DNS label \
+             (alphanumeric and `-` only — no `.`, `_`, or other characters)"
+        );
+    }
+    if !is_deployment_safe(deployment) {
+        anyhow::bail!(
+            "Azure OpenAI: setting `llm.azure_deployment` contains invalid \
+             characters (allowed: alphanumeric, `-`, `_`)"
+        );
+    }
+    if !is_dns_label(api_version) {
+        anyhow::bail!(
+            "Azure OpenAI: setting `llm.azure_api_version` contains invalid \
+             characters (expected `YYYY-MM-DD[-preview]`)"
+        );
+    }
+    Ok(format!(
+        "https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={api_version}"
+    ))
+}
+
 impl LlmClient {
     /// Effective API URL: config override → provider default, with provider-
     /// specific normalization (e.g. Gemini base-URL suffix correction).
@@ -465,6 +545,23 @@ impl LlmClient {
             config.providers.outbound_allowed,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Compose the Azure OpenAI URL from settings at construction time so
+        // misconfiguration surfaces as "borg refuses to start" rather than a
+        // runtime 400 on first request. The composed URL is stashed in
+        // `llm_config.base_url` so the existing override path picks it up.
+        // Skip when `llm.base_url` is already set — operators occasionally
+        // need to point Azure at a proxy.
+        let mut llm_config = config.llm.clone();
+        if provider == Provider::AzureOpenAi
+            && llm_config
+                .base_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
+            llm_config.base_url = Some(compose_azure_openai_url(&llm_config)?);
+        }
 
         let debug_logging = config.debug.llm_logging;
         let client = Client::new();
@@ -512,7 +609,7 @@ impl LlmClient {
 
         Ok(Self {
             client,
-            llm_config: config.llm.clone(),
+            llm_config,
             provider,
             api_key,
             fallback_keys: keys_remaining,

@@ -59,7 +59,8 @@ impl From<Provider> for ProviderCategory {
             // OAuth flavors hit the same public clouds; same air-gap rules apply.
             | Provider::ClaudeCodeOAuth
             | Provider::CodexOAuth
-            | Provider::CopilotOAuth => ProviderCategory::PublicCloud,
+            | Provider::CopilotOAuth
+            | Provider::AzureOpenAi => ProviderCategory::PublicCloud,
             Provider::Ollama | Provider::ClaudeCli => ProviderCategory::Local,
             // Custom is the BYO escape hatch — air-gap policy is enforced on
             // the resolved address (loopback/RFC1918 OK), not compile-time.

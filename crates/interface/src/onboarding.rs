@@ -52,6 +52,11 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
     ("groq", "Groq", "Ultra-fast inference"),
     ("xai", "xAI", "Grok models directly from xAI"),
+    (
+        "azure-openai",
+        "Azure OpenAI",
+        "OpenAI models on Microsoft tenancy (set resource/deployment in /settings)",
+    ),
     ("ollama", "Ollama", "Run models locally"),
     (
         "claude-cli",
@@ -189,6 +194,19 @@ pub(crate) const XAI_MODELS: &[(&str, &str)] = &[
     ),
 ];
 
+// Azure OpenAI deployment names are operator-chosen — these are suggested
+// labels for the most common base-model deployments. The actual deployment
+// name lives in `llm.azure_deployment` (set via /settings after onboarding);
+// the `model` field in the body is informational on Azure (routing is by
+// deployment, not model id).
+pub(crate) const AZURE_OPENAI_MODELS: &[(&str, &str)] = &[
+    ("gpt-4o", "GPT-4o (suggest as deployment name)"),
+    ("gpt-4o-mini", "GPT-4o Mini"),
+    ("gpt-5", "GPT-5"),
+    ("gpt-5-mini", "GPT-5 Mini"),
+    ("o3", "o3 (reasoning)"),
+];
+
 pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
@@ -230,6 +248,7 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
         "xai" => XAI_MODELS,
+        "azure-openai" => AZURE_OPENAI_MODELS,
         "ollama" => OLLAMA_MODELS,
         "claude-cli" => CLAUDE_CLI_MODELS,
         "openrouter" => {

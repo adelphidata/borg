@@ -103,11 +103,16 @@ fn visible_entries(config: &Config) -> Vec<&'static SettingEntry> {
         .map(|provider| provider.requires_api_key())
         .unwrap_or(true);
     let provider_is_bedrock = matches!(provider, Some(cortex::provider::Provider::Bedrock));
+    let provider_is_azure_openai =
+        matches!(provider, Some(cortex::provider::Provider::AzureOpenAi));
     TUI_SETTINGS
         .iter()
         .filter(|e| match e.key {
             "llm.api_key" | "llm.api_key_env" => provider_uses_api_key,
             "llm.bedrock_region" => provider_is_bedrock,
+            "llm.azure_resource" | "llm.azure_deployment" | "llm.azure_api_version" => {
+                provider_is_azure_openai
+            }
             "gateway.signal_cli_host" | "gateway.signal_cli_port" => signal_on,
             "gateway.discord_guild_allowlist" => discord_on,
             "gateway.slack_channel_allowlist" => slack_on,
@@ -1165,6 +1170,34 @@ mod tests {
         assert!(!entries.iter().any(|e| e.key == "llm.bedrock_region"));
         assert!(entries.iter().any(|e| e.key == "llm.api_key"));
         assert!(entries.iter().any(|e| e.key == "llm.api_key_env"));
+    }
+
+    #[test]
+    fn azure_openai_visibility_shows_azure_rows_and_hides_bedrock_region() {
+        // Provider-gated visibility for the three Azure-only settings.
+        // Showing them under non-Azure providers would clutter the popup
+        // with always-blank rows; hiding them under Azure would force
+        // operators to drop to the CLI to configure the provider.
+        let mut cfg = Config::default();
+        cfg.llm.provider = Some("azure-openai".to_string());
+        let entries = visible_entries(&cfg);
+        assert!(entries.iter().any(|e| e.key == "llm.azure_resource"));
+        assert!(entries.iter().any(|e| e.key == "llm.azure_deployment"));
+        assert!(entries.iter().any(|e| e.key == "llm.azure_api_version"));
+        assert!(!entries.iter().any(|e| e.key == "llm.bedrock_region"));
+        // Azure uses an API key (in v1 — AAD lands later), so the standard
+        // key rows must still show.
+        assert!(entries.iter().any(|e| e.key == "llm.api_key"));
+    }
+
+    #[test]
+    fn non_azure_providers_hide_azure_rows() {
+        let mut cfg = Config::default();
+        cfg.llm.provider = Some("openai".to_string());
+        let entries = visible_entries(&cfg);
+        assert!(!entries.iter().any(|e| e.key == "llm.azure_resource"));
+        assert!(!entries.iter().any(|e| e.key == "llm.azure_deployment"));
+        assert!(!entries.iter().any(|e| e.key == "llm.azure_api_version"));
     }
 
     #[test]

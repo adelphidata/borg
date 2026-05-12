@@ -117,6 +117,23 @@ fn check_builtin_air_gap_refuses_public_cloud() {
 }
 
 #[test]
+fn check_builtin_air_gap_refuses_azure_openai() {
+    // Azure must be classified PublicCloud — same enterprise rationale as
+    // Bedrock and OpenAI. A regression that flipped this to BYOEndpoint or
+    // Local would let an air-gapped deployment silently dial out to
+    // `*.openai.azure.com`.
+    use crate::provider::Provider;
+    let err = ProviderRegistry::check_builtin_air_gap(Provider::AzureOpenAi, false).unwrap_err();
+    match err {
+        ResolveError::AirGapPolicyViolation { id, category } => {
+            assert_eq!(id, "azure-openai");
+            assert_eq!(category, ProviderCategory::PublicCloud);
+        }
+        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
+    }
+}
+
+#[test]
 fn check_builtin_air_gap_allows_local() {
     use crate::provider::Provider;
     ProviderRegistry::check_builtin_air_gap(Provider::Ollama, false).unwrap();

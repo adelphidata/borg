@@ -87,6 +87,23 @@ pub struct LlmConfig {
     /// standard AWS region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, profile).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bedrock_region: Option<String>,
+    /// Azure OpenAI resource name — e.g. `"my-resource"` →
+    /// `https://my-resource.openai.azure.com`. Required when `provider =
+    /// azure-openai` unless `llm.base_url` is set directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_resource: Option<String>,
+    /// Azure OpenAI deployment name (operator-chosen label from the Azure
+    /// portal). Becomes the `/deployments/{name}/` URL path segment.
+    /// Required when `provider = azure-openai` unless `llm.base_url` is
+    /// set directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_deployment: Option<String>,
+    /// Azure OpenAI API version — e.g. `"2024-10-21"`. Required by Azure on
+    /// every request. No default: API-version drift between Azure releases
+    /// changes the response shape, so an explicit version surface forces
+    /// the operator to upgrade deliberately rather than silently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure_api_version: Option<String>,
     /// Provider-level failover chain (tried in order when primary provider fails).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<LlmFallback>,
@@ -289,6 +306,9 @@ impl Default for LlmConfig {
             stream_chunk_timeout_secs: DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
             base_url: None,
             bedrock_region: None,
+            azure_resource: None,
+            azure_deployment: None,
+            azure_api_version: None,
             fallback: Vec::new(),
             aux: None,
             thinking: ThinkingLevel::Off,

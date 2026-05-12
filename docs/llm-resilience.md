@@ -165,6 +165,26 @@ add --base-url <url> --name <name> <provider>`; the suppression model
 keys on `name`, not `base_url`, so port flips on a self-hosted endpoint
 survive operator removal/re-add.
 
+### Azure OpenAI
+
+`Provider::AzureOpenAi` rides the standard credential pool with one key
+difference: the wire URL is *not* static. It is composed at `LlmClient::new`
+time from three settings — `llm.azure_resource`, `llm.azure_deployment`,
+`llm.azure_api_version` — and stashed into `llm_config.base_url` so the
+rest of the request path treats Azure identically to any other
+OpenAI-compatible host. Missing or malformed settings surface as a clear
+config error at construction (named-setting message from
+`compose_azure_openai_url`), not as a runtime 4xx — the rule is "borg
+refuses to start" over "first request 400s." A `.` in `azure_resource`
+would otherwise produce a subdomain-injection vector
+(`https://evil.attacker.openai.azure.com`); the composer enforces DNS-label
+character classes on all three fields to close that gap.
+
+The auth header is `api-key: <key>`, not `Authorization: Bearer` — Azure
+reserves Bearer for AAD/Entra ID tokens. AAD support is a follow-up
+(requires a new `ProviderAuthKind::AadCredentialChain` and bypassing the
+credential pool the way Bedrock does for the AWS chain).
+
 ### Fallback deferral
 
 Before walking the `llm.fallback` chain on a 429/402, the pool is asked
