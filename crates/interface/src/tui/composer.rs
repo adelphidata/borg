@@ -26,7 +26,9 @@ struct InputHistory {
 const HISTORY_MAX: usize = 1000;
 
 fn history_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".borg").join("history.jsonl"))
+    cortex::config::Config::data_dir()
+        .ok()
+        .map(|d| d.join("history.jsonl"))
 }
 
 fn load_history() -> Vec<String> {

@@ -5,13 +5,14 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
 use crate::config::Config;
+use crate::constants::{KEYCHAIN_ACCOUNT_SCRIPTS_HMAC, KEYCHAIN_SERVICE_SCRIPTS};
 use crate::db::{Database, NewScript, ScriptRow};
 use crate::hex::{hex_decode, hex_encode};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const KEYCHAIN_SERVICE: &str = "borg-scripts";
-const KEYCHAIN_ACCOUNT: &str = "hmac-key";
+const KEYCHAIN_SERVICE: &str = KEYCHAIN_SERVICE_SCRIPTS;
+const KEYCHAIN_ACCOUNT: &str = KEYCHAIN_ACCOUNT_SCRIPTS_HMAC;
 const KEY_FILE_NAME: &str = ".scripts_key";
 const KEY_LEN: usize = 32;
 

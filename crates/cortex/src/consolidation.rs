@@ -11,11 +11,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-/// Fixed UUID for the nightly memory consolidation task (seeded in the schema).
-pub const NIGHTLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0001";
-
-/// Fixed UUID for the weekly memory maintenance task (seeded in the schema).
-pub const WEEKLY_CONSOLIDATION_TASK_ID: &str = "00000000-0000-4000-8000-c005011d0002";
+pub use crate::task_ids::{NIGHTLY_CONSOLIDATION_TASK_ID, WEEKLY_CONSOLIDATION_TASK_ID};
 
 /// Settings key for tracking the last successful nightly consolidation run.
 pub const SETTING_LAST_NIGHTLY: &str = "consolidation.last_nightly";
@@ -23,7 +19,11 @@ pub const SETTING_LAST_NIGHTLY: &str = "consolidation.last_nightly";
 /// Settings key for tracking the last successful weekly consolidation run.
 pub const SETTING_LAST_WEEKLY: &str = "consolidation.last_weekly";
 
-const CONSOLIDATION_TOOLS: &[&str] = &["memory_search", "read_memory", "write_memory"];
+pub(crate) const CONSOLIDATION_TOOLS: &[&str] = &[
+    crate::tool_names::WRITE_MEMORY,
+    crate::tool_names::READ_MEMORY,
+    crate::tool_names::MEMORY_SEARCH,
+];
 const NIGHTLY_PROMPT: &str = "Review today's sessions and extract durable information into long-term memory. \
 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \
 Never duplicate information already in existing memory entries. When in doubt, keep the information.";

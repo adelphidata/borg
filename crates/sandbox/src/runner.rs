@@ -290,11 +290,7 @@ pub fn validate_script_path(base_dir: &Path, script_name: &str) -> Result<std::p
 /// Forward only the parent environment variables that runtimes genuinely
 /// need (PATH, HOME, locale, temp dir). Everything else is stripped.
 fn apply_minimal_safe_env(cmd: &mut Command) {
-    const SAFE_VARS: &[&str] = &[
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR",
-        "TEMP", "TMP", "TERM",
-    ];
-    for key in SAFE_VARS {
+    for key in crate::constants::SAFE_ENV_VARS {
         if let Ok(val) = std::env::var(key) {
             cmd.env(key, val);
         }

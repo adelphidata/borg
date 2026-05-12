@@ -38,6 +38,18 @@ impl Default for RateLimitPolicy {
     }
 }
 
+impl RateLimitPolicy {
+    /// Default policy named after a specific service. Replaces the
+    /// `RateLimitPolicy { service_name: "Foo", ..Default::default() }`
+    /// struct-update boilerplate that channel API clients otherwise repeat.
+    pub fn for_service(service_name: &'static str) -> Self {
+        Self {
+            service_name,
+            ..Self::default()
+        }
+    }
+}
+
 /// Send an HTTP request with automatic 429 rate-limit retry.
 ///
 /// `make_request` is called on each attempt and must return a fresh `reqwest::Response`.

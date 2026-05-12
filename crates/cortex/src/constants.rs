@@ -111,6 +111,10 @@ pub const SCHEDULED_TASK_DEFAULT_TIMEOUT_MS: u64 = 300_000;
 /// Default timeout for seeded nightly/weekly workflows (10m).
 pub const SEEDED_WORKFLOW_TIMEOUT_MS: u64 = 600_000;
 
+/// Default `pre_run_command` timeout for scheduled tasks (1m). Seeded as the
+/// SQL column default and used when callers omit `pre_run_timeout_ms`.
+pub const PRE_RUN_DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
 /// SQLite `busy_timeout` for gateway DB opens (30s).
 pub const GATEWAY_BUSY_TIMEOUT_MS: u64 = 30_000;
 
@@ -299,6 +303,24 @@ pub const MAX_EMBEDDING_INPUT_CHARS: usize = 32_000;
 
 /// Max characters per message when building session transcripts.
 pub const MAX_SESSION_MESSAGE_CHARS: usize = 2000;
+
+// ── Keychain service / account names ──────────────────────────────
+//
+// Cortex stores two distinct secrets in the OS keychain. The wire-format
+// names below are also used as libsecret schema attributes and must match
+// exactly what was persisted in prior installs — never change a value here.
+
+/// Keychain service name for the script HMAC key (signs SKILL.md authors).
+pub const KEYCHAIN_SERVICE_SCRIPTS: &str = "borg-scripts";
+
+/// Keychain account name for the script HMAC key under [`KEYCHAIN_SERVICE_SCRIPTS`].
+pub const KEYCHAIN_ACCOUNT_SCRIPTS_HMAC: &str = "hmac-key";
+
+/// Keychain service name for the evolution Ed25519 signing key.
+pub const KEYCHAIN_SERVICE_EVOLUTION: &str = "com.borg.evolution.signing";
+
+/// Keychain account name for the evolution signing key under [`KEYCHAIN_SERVICE_EVOLUTION`].
+pub const KEYCHAIN_ACCOUNT_EVOLUTION_SIGNING: &str = "ed25519-secret";
 
 // ── Filenames in ~/.borg/ ─────────────────────────────────────────
 

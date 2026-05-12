@@ -137,6 +137,7 @@ pub async fn run_complete(code: &str, device_label: &str, socket: Option<PathBuf
 }
 
 fn default_pairing_socket_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".borg").join("borgd-pair.sock")
+    cortex::config::Config::data_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("borgd-pair.sock")
 }

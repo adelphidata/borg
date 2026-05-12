@@ -30,6 +30,8 @@
 
 /// Linux Bubblewrap (`bwrap`) sandboxing with namespace isolation.
 pub mod bubblewrap;
+/// Shared security-critical constants (env allowlist, exec paths, sensitive paths).
+pub mod constants;
 /// Path utilities shared across sandbox and channel code.
 pub mod paths;
 /// Sandbox policy definition and command wrapping.

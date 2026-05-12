@@ -101,7 +101,9 @@ pub struct ScriptHook {
 impl ScriptHook {
     /// Path to the default hooks config file: `~/.borg/hooks.json`.
     pub fn default_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".borg").join("hooks.json"))
+        crate::config::Config::data_dir()
+            .ok()
+            .map(|d| d.join("hooks.json"))
     }
 
     /// Load hooks from the default path, gated by `enabled`.

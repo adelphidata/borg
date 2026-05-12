@@ -8,8 +8,7 @@ use anyhow::Result;
 use crate::constants::SECS_PER_DAY;
 use crate::db::{Database, MessageRow};
 
-/// Fixed UUID for the built-in Daily Summary task.
-pub const DAILY_SUMMARY_TASK_ID: &str = "00000000-0000-4000-8000-da1175000002";
+pub use crate::task_ids::DAILY_SUMMARY_TASK_ID;
 
 /// LLM instructions prepended to the gathered context.
 const SUMMARY_PROMPT: &str = include_str!("../templates/tasks/DAILY_SUMMARY.md");

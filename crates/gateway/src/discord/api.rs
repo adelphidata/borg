@@ -825,10 +825,7 @@ impl DiscordClient {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<reqwest::Response>>,
     {
-        let policy = RateLimitPolicy {
-            service_name: "Discord",
-            ..RateLimitPolicy::default()
-        };
+        let policy = RateLimitPolicy::for_service("Discord");
 
         let resp = send_with_rate_limit_retry(&policy, make_request).await?;
 

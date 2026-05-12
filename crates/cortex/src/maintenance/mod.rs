@@ -39,9 +39,7 @@ use log_prune::{
     LOG_FILE_SIZE_CAP_BYTES,
 };
 
-/// Single source of truth for the seeded maintenance task's UUID. The schema
-/// inserts this id and the dispatcher matches against it.
-pub const MAINTENANCE_TASK_ID: &str = "00000000-0000-4000-8000-ada1ca1e0001";
+pub use crate::task_ids::MAINTENANCE_TASK_ID;
 
 /// Summary of one maintenance run, persisted to `doctor_runs` and
 /// returned to the task dispatcher for activity-log accounting.

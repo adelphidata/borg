@@ -5,9 +5,7 @@
 //! in `scheduled_tasks`; this module owns the row's fixed identifier and
 //! whatever cortex-side helpers the consolidation needs.
 
-/// Stable UUID for the seeded heartbeat row. Same fixed-UUID seeding
-/// pattern as `MAINTENANCE_TASK_ID` so re-running the seed is a no-op.
-pub const HEARTBEAT_TASK_ID: &str = "00000000-0000-4000-8000-5ec041700002";
+pub use crate::task_ids::HEARTBEAT_TASK_ID;
 
 /// Sentinel `delivery_channel` value that means "fan out to all
 /// gateway-bound channels" — preserves the legacy multi-channel

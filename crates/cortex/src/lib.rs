@@ -177,6 +177,8 @@ pub mod skill_security;
 pub mod skills;
 /// Shared SSE stream processing for LLM providers.
 pub mod sse;
+/// Fixed UUIDs for built-in seeded `scheduled_tasks` rows.
+pub mod task_ids;
 /// Scheduled task management (prompt and command jobs).
 pub mod tasks;
 /// Anonymous telemetry collection.

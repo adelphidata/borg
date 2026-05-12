@@ -161,10 +161,7 @@ impl SlackClient {
             blocks: None,
         };
 
-        let policy = RateLimitPolicy {
-            service_name: "Slack chat.postMessage",
-            ..RateLimitPolicy::default()
-        };
+        let policy = RateLimitPolicy::for_service("Slack chat.postMessage");
 
         let resp = send_with_rate_limit_retry(&policy, || async {
             self.client
@@ -847,10 +844,7 @@ impl SlackClient {
         body: &serde_json::Value,
     ) -> Result<reqwest::Response> {
         let url = format!("{SLACK_API_BASE}/{method}");
-        let policy = RateLimitPolicy {
-            service_name: "Slack",
-            ..RateLimitPolicy::default()
-        };
+        let policy = RateLimitPolicy::for_service("Slack");
         let client = &self.client;
         let token = &self.token;
         let body = body.clone();

@@ -1,13 +1,18 @@
+use std::sync::LazyLock;
+
 use anyhow::Result;
 use rusqlite::params;
 
 use super::Database;
+use crate::constants::{
+    PRE_RUN_DEFAULT_TIMEOUT_MS, SCHEDULED_TASK_DEFAULT_TIMEOUT_MS, SEEDED_WORKFLOW_TIMEOUT_MS,
+};
 
 impl Database {
     /// Full schema. Borg has no released DBs, so all prior incremental
     /// migrations were squashed into this single emit-the-final-shape step.
     pub(super) fn migrate_v1(&self) -> Result<()> {
-        self.conn.execute_batch(SCHEMA_SQL)?;
+        self.conn.execute_batch(&SCHEMA_SQL)?;
         self.seed_default_tasks()?;
         self.seed_consolidation_tasks()?;
         self.seed_maintenance_task()?;
@@ -39,14 +44,14 @@ impl Database {
 
     /// Built-in default tasks (monthly security audit + daily summary).
     pub(super) fn seed_default_tasks(&self) -> Result<()> {
-        const SECURITY_AUDIT_TASK_ID: &str = "00000000-0000-4000-8000-5ec041700001";
+        use crate::task_ids::{DAILY_SUMMARY_TASK_ID, SECURITY_AUDIT_TASK_ID};
         const SECURITY_AUDIT_CRON: &str = "0 0 9 1 * *";
         let next_run = crate::tasks::calculate_next_run("cron", SECURITY_AUDIT_CRON, "local")?;
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 300000)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9)",
             params![
                 SECURITY_AUDIT_TASK_ID,
                 "Monthly Security Audit",
@@ -56,6 +61,7 @@ impl Database {
                 "local",
                 next_run,
                 now,
+                SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
             ],
         )?;
 
@@ -64,9 +70,9 @@ impl Database {
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 300000)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9)",
             params![
-                crate::daily_summary::DAILY_SUMMARY_TASK_ID,
+                DAILY_SUMMARY_TASK_ID,
                 "Daily Summary",
                 "Produce a daily standup summary of recent activity. Review sessions, tasks, and memory for what was done, what's planned, and any blockers.",
                 "cron",
@@ -74,6 +80,7 @@ impl Database {
                 "local",
                 next_run_daily,
                 now,
+                SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
             ],
         )?;
         Ok(())
@@ -83,13 +90,14 @@ impl Database {
         let nightly_task_id = crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
         let weekly_task_id = crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
         let now = chrono::Utc::now().timestamp();
+        let allowed_tools = crate::consolidation::CONSOLIDATION_TOOLS.join(",");
 
         const NIGHTLY_CRON: &str = "0 0 3 * * *";
         let next_nightly = crate::tasks::calculate_next_run("cron", NIGHTLY_CRON, "local")?;
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9, ?10, 'prompt')",
             params![
                 nightly_task_id,
                 "Nightly Memory Consolidation",
@@ -101,7 +109,8 @@ impl Database {
                 "local",
                 next_nightly,
                 now,
-                "write_memory,read_memory,memory_search",
+                SEEDED_WORKFLOW_TIMEOUT_MS,
+                allowed_tools,
             ],
         )?;
 
@@ -110,7 +119,7 @@ impl Database {
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, 600000, ?9, 'prompt')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9, ?10, 'prompt')",
             params![
                 weekly_task_id,
                 "Weekly Memory Maintenance",
@@ -123,7 +132,8 @@ impl Database {
                 "local",
                 next_weekly,
                 now,
-                "write_memory,read_memory,memory_search",
+                SEEDED_WORKFLOW_TIMEOUT_MS,
+                allowed_tools,
             ],
         )?;
         Ok(())
@@ -137,7 +147,7 @@ impl Database {
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, 300000, NULL, 'maintenance')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, ?9, NULL, 'maintenance')",
             params![
                 task_id,
                 "Daily Self-Healing Maintenance",
@@ -147,6 +157,7 @@ impl Database {
                 "local",
                 next_run,
                 now,
+                SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
             ],
         )?;
         Ok(())
@@ -159,7 +170,7 @@ impl Database {
         self.conn.execute(
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, 300000, ?9, NULL, NULL, 'heartbeat', NULL, NULL, 60000, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10, NULL, NULL, 'heartbeat', NULL, NULL, ?11, ?12)",
             rusqlite::params![
                 task_id,
                 "Heartbeat",
@@ -169,7 +180,9 @@ impl Database {
                 "local",
                 next_run,
                 now,
+                SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
                 crate::heartbeat_task::BROADCAST_DELIVERY,
+                PRE_RUN_DEFAULT_TIMEOUT_MS,
                 crate::constants::MIN_HEARTBEAT_INTERVAL_SECS as i64,
             ],
         )?;
@@ -189,7 +202,9 @@ impl Database {
     }
 }
 
-const SCHEMA_SQL: &str = r#"
+static SCHEMA_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"
 -- Core sessions / messages -------------------------------------------------
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -269,14 +284,14 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     max_retries INTEGER NOT NULL DEFAULT 3,
     retry_after INTEGER,
     last_error TEXT,
-    timeout_ms INTEGER NOT NULL DEFAULT 300000,
+    timeout_ms INTEGER NOT NULL DEFAULT {SCHEDULED_TASK_DEFAULT_TIMEOUT_MS},
     delivery_channel TEXT,
     delivery_target TEXT,
     allowed_tools TEXT,
     task_type TEXT NOT NULL DEFAULT 'prompt',
     pre_run_command TEXT,
     pre_run_cwd TEXT,
-    pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000,
+    pre_run_timeout_ms INTEGER NOT NULL DEFAULT {PRE_RUN_DEFAULT_TIMEOUT_MS},
     bypass_quiet_hours_once INTEGER NOT NULL DEFAULT 0,
     min_interval_secs INTEGER,
     last_response_hash TEXT
@@ -939,4 +954,28 @@ CREATE TABLE IF NOT EXISTS credential_suppressions (
     suppressed_at_ms INTEGER NOT NULL,
     PRIMARY KEY (provider, source_kind, source_value)
 );
-"#;
+"#
+    )
+});
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_sql_pins_default_timeouts() {
+        // The compiled SCHEMA_SQL must interpolate the constants into exactly
+        // the byte sequence the SQLite parser expects. If the constants change,
+        // this test fails and forces a deliberate decision about migrating
+        // existing rows — the seeded literals on production DBs won't update
+        // just because the constant did.
+        assert!(
+            SCHEMA_SQL.contains("timeout_ms INTEGER NOT NULL DEFAULT 300000,"),
+            "scheduled_tasks.timeout_ms default drifted from 300000"
+        );
+        assert!(
+            SCHEMA_SQL.contains("pre_run_timeout_ms INTEGER NOT NULL DEFAULT 60000,"),
+            "scheduled_tasks.pre_run_timeout_ms default drifted from 60000"
+        );
+    }
+}

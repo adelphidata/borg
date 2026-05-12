@@ -298,10 +298,7 @@ impl TeamsClient {
 
     /// Send a single request with 429 retry logic and error classification.
     async fn send_with_retry(&self, url: &str, body: &ReplyActivity) -> Result<()> {
-        let policy = RateLimitPolicy {
-            service_name: "Teams",
-            ..RateLimitPolicy::default()
-        };
+        let policy = RateLimitPolicy::for_service("Teams");
 
         let resp = send_with_rate_limit_retry(&policy, || async {
             let token = self.get_token().await?;

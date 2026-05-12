@@ -12,12 +12,11 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, SECRET_KEY_LENGTH};
 
+use crate::constants::{
+    KEYCHAIN_ACCOUNT_EVOLUTION_SIGNING as KEYCHAIN_ACCOUNT,
+    KEYCHAIN_SERVICE_EVOLUTION as KEYCHAIN_SERVICE,
+};
 use crate::hex::{hex_decode, hex_encode};
-
-/// Service name used for both macOS Keychain and libsecret.
-pub const KEYCHAIN_SERVICE: &str = "com.borg.evolution.signing";
-/// Account/key name within the service.
-pub const KEYCHAIN_ACCOUNT: &str = "ed25519-secret";
 
 /// Generate a fresh Ed25519 signing key. Uses `rand::rng().fill()` (rand 0.9
 /// CSPRNG) and feeds the bytes to `SigningKey::from_bytes` rather than

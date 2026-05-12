@@ -1,8 +1,6 @@
+use crate::constants::{SENSITIVE_HOME_PATHS, STANDARD_EXEC_PATHS};
 use crate::policy::SandboxPolicy;
 use std::path::Path;
-
-/// Standard system paths containing binaries that sandboxed scripts may invoke.
-const STANDARD_EXEC_PATHS: &[&str] = &["/bin", "/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"];
 
 /// Validate that a path is safe for interpolation into a Seatbelt profile.
 /// Rejects paths containing characters that could inject arbitrary Seatbelt rules.
@@ -102,7 +100,7 @@ pub fn generate_profile(
     // though file-read* is broadly allowed. If the manifest-level
     // blocked_paths filter has a bug, these rules are the backstop.
     if let Ok(home_str) = std::env::var("HOME") {
-        for sensitive in &[".ssh", ".aws", ".gnupg", ".config/gh"] {
+        for sensitive in SENSITIVE_HOME_PATHS {
             let path = format!("{home_str}/{sensitive}");
             if validate_seatbelt_path(&path).is_ok() {
                 profile.push_str(&format!("(deny file-read* (subpath \"{path}\"))\n"));

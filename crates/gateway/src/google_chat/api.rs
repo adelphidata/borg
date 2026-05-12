@@ -68,10 +68,7 @@ impl GoogleChatClient {
             url.push_str("?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD");
         }
 
-        let policy = RateLimitPolicy {
-            service_name: "Google Chat",
-            ..RateLimitPolicy::default()
-        };
+        let policy = RateLimitPolicy::for_service("Google Chat");
 
         let resp = send_with_rate_limit_retry(&policy, || async {
             self.client
