@@ -894,20 +894,34 @@ mod tests {
         .is_err());
     }
 
+    /// Table-driven check that model-id validation accepts the slug shapes
+    /// real providers emit and rejects inputs that could inject into config
+    /// TOML (quotes, newlines, internal whitespace). Both directions live in
+    /// one test so a regression that flips a rule into being a no-op fails
+    /// loudly here.
     #[test]
-    fn validate_model_id_accepts_valid() {
-        assert!(validate_model_id("anthropic/claude-sonnet-4").is_ok());
-        assert!(validate_model_id("openai/gpt-4.1-mini").is_ok());
-        assert!(validate_model_id("meta-llama/llama-4-scout").is_ok());
-        assert!(validate_model_id("llama3.3").is_ok());
-    }
-
-    #[test]
-    fn validate_model_id_rejects_invalid() {
-        assert!(validate_model_id("").is_err());
-        assert!(validate_model_id("model\"").is_err());
-        assert!(validate_model_id("model\nkey=val").is_err());
-        assert!(validate_model_id("model with spaces").is_err());
+    fn validate_model_id_accepts_safe_and_rejects_unsafe() {
+        let valid = [
+            "anthropic/claude-sonnet-4",
+            "openai/gpt-4.1-mini",
+            "meta-llama/llama-4-scout",
+            "llama3.3",
+        ];
+        let invalid = [
+            ("", "empty string must not pass"),
+            ("model\"", "embedded quote could inject into TOML"),
+            ("model\nkey=val", "newline could inject a fake key"),
+            ("model with spaces", "whitespace not allowed in model slug"),
+        ];
+        for id in valid {
+            validate_model_id(id).unwrap_or_else(|e| panic!("expected {id:?} to be accepted: {e}"));
+        }
+        for (id, why) in invalid {
+            assert!(
+                validate_model_id(id).is_err(),
+                "expected {id:?} to be rejected ({why})"
+            );
+        }
     }
 
     #[test]

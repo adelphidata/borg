@@ -357,158 +357,90 @@ fn extract_transport_detail(raw: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    // ── classify_error tests ──
-
+    /// Table-driven classifier check. Each row pins a real provider/transport
+    /// message against the category the user-facing layer relies on for
+    /// branching (retry vs. surface vs. abort). Collapsed from 18 near-
+    /// duplicate per-pattern tests.
     #[test]
-    fn classify_rate_limit_429() {
-        assert_eq!(
-            classify_error("OpenRouter returned 429 (rate limited): too many requests"),
-            ErrorCategory::RateLimit
-        );
-    }
-
-    #[test]
-    fn classify_rate_limit_text() {
-        assert_eq!(
-            classify_error("Rate limit exceeded for this model"),
-            ErrorCategory::RateLimit
-        );
-    }
-
-    #[test]
-    fn classify_billing_402() {
-        assert_eq!(
-            classify_error("OpenAI returned 402 (billing error): payment required"),
-            ErrorCategory::Billing
-        );
-    }
-
-    #[test]
-    fn classify_billing_quota() {
-        assert_eq!(
-            classify_error("You exceeded your current quota, please check your plan"),
-            ErrorCategory::Billing
-        );
-    }
-
-    #[test]
-    fn classify_billing_insufficient_quota() {
-        assert_eq!(
-            classify_error("Error: insufficient_quota"),
-            ErrorCategory::Billing
-        );
-    }
-
-    #[test]
-    fn classify_auth_401() {
-        assert_eq!(
-            classify_error("Anthropic returned 401 (auth error): bad key"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_auth_403() {
-        assert_eq!(
-            classify_error("returned 403 (auth error): forbidden"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_auth_invalid_key() {
-        assert_eq!(
-            classify_error("Invalid API key provided"),
-            ErrorCategory::Auth
-        );
-    }
-
-    #[test]
-    fn classify_overloaded_503() {
-        assert_eq!(
-            classify_error("Anthropic returned 503 (overloaded)"),
-            ErrorCategory::Overloaded
-        );
-    }
-
-    #[test]
-    fn classify_overloaded_502() {
-        assert_eq!(
-            classify_error("returned 502: bad gateway"),
-            ErrorCategory::Overloaded
-        );
-    }
-
-    #[test]
-    fn classify_overloaded_500() {
-        assert_eq!(
-            classify_error("returned 500: internal server error"),
-            ErrorCategory::Overloaded
-        );
-    }
-
-    #[test]
-    fn classify_transport_connection_refused() {
-        assert_eq!(
-            classify_error("error sending request: connection refused"),
-            ErrorCategory::Transport
-        );
-    }
-
-    #[test]
-    fn classify_transport_dns() {
-        assert_eq!(
-            classify_error("DNS lookup failed for api.openai.com"),
-            ErrorCategory::Transport
-        );
-    }
-
-    #[test]
-    fn classify_transport_tls() {
-        assert_eq!(
-            classify_error("TLS handshake failed: certificate verify failed"),
-            ErrorCategory::Transport
-        );
-    }
-
-    #[test]
-    fn classify_context_overflow() {
-        assert_eq!(
-            classify_error("This request exceeds the model's maximum context length"),
-            ErrorCategory::ContextOverflow
-        );
-    }
-
-    #[test]
-    fn classify_context_overflow_prompt_too_long() {
-        assert_eq!(
-            classify_error("prompt is too long: 150000 tokens > 128000 maximum"),
-            ErrorCategory::ContextOverflow
-        );
-    }
-
-    #[test]
-    fn classify_timeout() {
-        assert_eq!(
-            classify_error("request timed out after 30s"),
-            ErrorCategory::Timeout
-        );
-    }
-
-    #[test]
-    fn classify_timeout_deadline() {
-        assert_eq!(
-            classify_error("deadline exceeded waiting for response"),
-            ErrorCategory::Timeout
-        );
-    }
-
-    #[test]
-    fn classify_unknown() {
-        assert_eq!(
-            classify_error("something completely unexpected happened"),
-            ErrorCategory::Unknown
-        );
+    fn classify_error_dispatches_to_correct_category() {
+        let cases: &[(&str, ErrorCategory)] = &[
+            // RateLimit
+            (
+                "OpenRouter returned 429 (rate limited): too many requests",
+                ErrorCategory::RateLimit,
+            ),
+            (
+                "Rate limit exceeded for this model",
+                ErrorCategory::RateLimit,
+            ),
+            // Billing
+            (
+                "OpenAI returned 402 (billing error): payment required",
+                ErrorCategory::Billing,
+            ),
+            (
+                "You exceeded your current quota, please check your plan",
+                ErrorCategory::Billing,
+            ),
+            ("Error: insufficient_quota", ErrorCategory::Billing),
+            // Auth
+            (
+                "Anthropic returned 401 (auth error): bad key",
+                ErrorCategory::Auth,
+            ),
+            ("returned 403 (auth error): forbidden", ErrorCategory::Auth),
+            ("Invalid API key provided", ErrorCategory::Auth),
+            // Overloaded (5xx)
+            (
+                "Anthropic returned 503 (overloaded)",
+                ErrorCategory::Overloaded,
+            ),
+            ("returned 502: bad gateway", ErrorCategory::Overloaded),
+            (
+                "returned 500: internal server error",
+                ErrorCategory::Overloaded,
+            ),
+            // Transport
+            (
+                "error sending request: connection refused",
+                ErrorCategory::Transport,
+            ),
+            (
+                "DNS lookup failed for api.openai.com",
+                ErrorCategory::Transport,
+            ),
+            (
+                "TLS handshake failed: certificate verify failed",
+                ErrorCategory::Transport,
+            ),
+            // ContextOverflow
+            (
+                "This request exceeds the model's maximum context length",
+                ErrorCategory::ContextOverflow,
+            ),
+            (
+                "prompt is too long: 150000 tokens > 128000 maximum",
+                ErrorCategory::ContextOverflow,
+            ),
+            // Timeout
+            ("request timed out after 30s", ErrorCategory::Timeout),
+            (
+                "deadline exceeded waiting for response",
+                ErrorCategory::Timeout,
+            ),
+            // Unknown (fallthrough)
+            (
+                "something completely unexpected happened",
+                ErrorCategory::Unknown,
+            ),
+        ];
+        for (input, expected) in cases {
+            let actual = classify_error(input);
+            assert_eq!(
+                actual, *expected,
+                "classify_error({input:?}) = {actual:?}, expected {expected:?}"
+            );
+        }
     }
 
     // ── format_friendly_error tests ──

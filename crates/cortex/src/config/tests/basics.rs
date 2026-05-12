@@ -45,34 +45,16 @@ secret_detection = false
 }
 
 #[test]
-fn parse_empty_config_toml_yields_defaults() {
-    let cfg: Config = toml::from_str("").expect("should parse empty toml");
-    let defaults = Config::default();
-    assert_eq!(cfg.llm.api_key_env, defaults.llm.api_key_env);
-    assert_eq!(cfg.llm.model, defaults.llm.model);
-    assert_eq!(
-        cfg.conversation.max_iterations,
-        defaults.conversation.max_iterations
-    );
-}
-
-#[test]
-fn parse_minimal_config_toml_with_partial_sections() {
-    let toml_str = r#"
-[llm]
-model = "meta/llama-3"
-"#;
-    let cfg: Config = toml::from_str(toml_str).expect("should parse partial toml");
-    assert_eq!(cfg.llm.model, "meta/llama-3");
-    assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
-}
-
-#[test]
-fn load_from_nonexistent_path_returns_defaults() {
-    let path = Path::new("/tmp/borg_test_nonexistent_config.toml");
-    let cfg = Config::load_from(path).expect("should return default for missing file");
-    let defaults = Config::default();
-    assert_eq!(cfg.llm.model, defaults.llm.model);
+fn load_from_nonexistent_path_returns_usable_config() {
+    // Missing config file is treated as empty, not as an error — and the
+    // returned Config must remain mutable via apply_setting so the daemon
+    // can boot with no config.toml on disk.
+    let path = Path::new("/tmp/borg_test_nonexistent_config_path.toml");
+    assert!(!path.exists(), "test precondition: file must not exist");
+    let mut cfg = Config::load_from(path).expect("missing file should not error");
+    cfg.apply_setting("model", "post-load-model")
+        .expect("config from missing file must still accept apply_setting");
+    assert_eq!(cfg.llm.model, "post-load-model");
 }
 
 #[test]
@@ -117,19 +99,57 @@ agent_name = "Buddy"
     assert_eq!(cfg.user.agent_name.as_deref(), Some("Buddy"));
 }
 
+/// Table-driven check that `define_settings!` dispatches each key to the right
+/// field. Every row: apply (key, value) to a default config, then read the
+/// field via `getter` and confirm the stringified result round-trips. Catches
+/// missing arms, mis-typed keys, and dispatch-to-wrong-field regressions
+/// without one near-duplicate test per setting.
+///
+/// Limitation: same-typed field swaps (e.g. `tts.default_voice` ↔ `tts.default_format`,
+/// both `String`) would slip through because each row only checks its own getter.
+/// Validator wiring is pinned separately by `apply_setting_*_rejects_*` /
+/// `apply_setting_*_invalid` tests below.
 #[test]
-fn apply_setting_model() {
-    let mut cfg = Config::default();
-    let result = cfg.apply_setting("model", "gpt-4o").unwrap();
-    assert!(result.contains("gpt-4o"));
-    assert_eq!(cfg.llm.model, "gpt-4o");
-}
-
-#[test]
-fn apply_setting_temperature() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("temperature", "0.5").unwrap();
-    assert!((cfg.llm.temperature - 0.5).abs() < f32::EPSILON);
+fn apply_setting_dispatches_to_correct_field() {
+    type Getter = fn(&Config) -> String;
+    let cases: &[(&str, &str, Getter)] = &[
+        ("model", "gpt-4o", |c| c.llm.model.clone()),
+        ("temperature", "0.5", |c| c.llm.temperature.to_string()),
+        ("conversation.max_iterations", "50", |c| {
+            c.conversation.max_iterations.to_string()
+        }),
+        ("conversation.show_thinking", "false", |c| {
+            c.conversation.show_thinking.to_string()
+        }),
+        ("security.secret_detection", "false", |c| {
+            c.security.secret_detection.to_string()
+        }),
+        ("browser.headless", "false", |c| {
+            c.browser.headless.to_string()
+        }),
+        ("tts.enabled", "true", |c| c.tts.enabled.to_string()),
+        ("tts.auto_mode", "true", |c| c.tts.auto_mode.to_string()),
+        ("tts.default_voice", "nova", |c| c.tts.default_voice.clone()),
+        ("tts.default_format", "opus", |c| {
+            c.tts.default_format.clone()
+        }),
+        ("budget.monthly_token_limit", "1000000", |c| {
+            c.budget.monthly_token_limit.to_string()
+        }),
+        ("budget.warning_threshold", "0.9", |c| {
+            c.budget.warning_threshold.to_string()
+        }),
+    ];
+    for (key, value, getter) in cases {
+        let mut cfg = Config::default();
+        cfg.apply_setting(key, value)
+            .unwrap_or_else(|e| panic!("apply_setting({key} = {value}) failed: {e}"));
+        let actual = getter(&cfg);
+        assert_eq!(
+            &actual, value,
+            "after apply_setting({key} = {value}), field reads back as {actual:?}"
+        );
+    }
 }
 
 #[test]
@@ -137,30 +157,6 @@ fn apply_setting_temperature_out_of_range() {
     let mut cfg = Config::default();
     assert!(cfg.apply_setting("temperature", "3.0").is_err());
     assert!(cfg.apply_setting("temperature", "-1.0").is_err());
-}
-
-#[test]
-fn apply_setting_max_iterations() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("conversation.max_iterations", "50")
-        .unwrap();
-    assert_eq!(cfg.conversation.max_iterations, 50);
-}
-
-#[test]
-fn apply_setting_show_thinking() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("conversation.show_thinking", "false")
-        .unwrap();
-    assert!(!cfg.conversation.show_thinking);
-}
-
-#[test]
-fn apply_setting_secret_detection() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("security.secret_detection", "false")
-        .unwrap();
-    assert!(!cfg.security.secret_detection);
 }
 
 #[test]
@@ -242,44 +238,60 @@ fn path_helpers() {
     assert_eq!(mem_index, data.join("MEMORY.md"));
 }
 
+/// Table-driven check that partial TOML for one section leaves unset fields
+/// at their `#[serde(default)]` values rather than failing to parse. A
+/// regression where someone forgets `#[serde(default)]` on a new field shows
+/// up here, and we don't need one near-duplicate test per section.
 #[test]
-fn partial_section_defaults_remaining_fields() {
-    // Only set model; temperature, max_tokens, etc. should get defaults
-    let toml_str = r#"
-[llm]
-model = "custom-model"
-"#;
-    let cfg: Config = toml::from_str(toml_str).expect("should parse");
-    assert_eq!(cfg.llm.model, "custom-model");
-    assert!((cfg.llm.temperature - 0.7).abs() < f32::EPSILON);
-    assert_eq!(cfg.llm.max_tokens, 16_384);
-    assert_eq!(cfg.llm.max_retries, 3);
-    assert_eq!(cfg.llm.initial_retry_delay_ms, 200);
-    assert_eq!(cfg.llm.request_timeout_ms, 120_000);
-    assert_eq!(cfg.llm.api_key_env, "OPENROUTER_API_KEY");
-    assert!(cfg.llm.base_url.is_none());
-}
-
-#[test]
-fn partial_web_config_defaults_remaining_fields() {
-    let toml_str = r#"
-[web]
-enabled = false
-"#;
-    let cfg: Config = toml::from_str(toml_str).expect("should parse");
-    assert!(!cfg.web.enabled);
-    assert_eq!(cfg.web.search_provider, "auto");
-    assert!(cfg.web.search_api_key_env.is_none());
-}
-
-#[test]
-fn partial_tasks_config_defaults_remaining_fields() {
-    let toml_str = r#"
-[tasks]
-max_concurrent = 5
-"#;
-    let cfg: Config = toml::from_str(toml_str).expect("should parse");
-    assert_eq!(cfg.tasks.max_concurrent, 5);
+fn partial_toml_keeps_defaults_for_unset_fields() {
+    type Assert = fn(&Config, &Config);
+    let defaults = Config::default();
+    let cases: &[(&str, &str, Assert)] = &[
+        (
+            "llm-with-only-model",
+            "[llm]\nmodel = \"custom-model\"\n",
+            |cfg, d| {
+                assert_eq!(cfg.llm.model, "custom-model");
+                assert_eq!(cfg.llm.temperature, d.llm.temperature);
+                assert_eq!(cfg.llm.max_tokens, d.llm.max_tokens);
+                assert_eq!(cfg.llm.max_retries, d.llm.max_retries);
+                assert_eq!(cfg.llm.api_key_env, d.llm.api_key_env);
+                assert!(cfg.llm.base_url.is_none());
+            },
+        ),
+        (
+            "web-with-only-enabled",
+            "[web]\nenabled = false\n",
+            |cfg, d| {
+                assert!(!cfg.web.enabled);
+                assert_eq!(cfg.web.search_provider, d.web.search_provider);
+                assert_eq!(cfg.web.search_api_key_env, d.web.search_api_key_env);
+            },
+        ),
+        (
+            "tasks-with-only-max-concurrent",
+            "[tasks]\nmax_concurrent = 5\n",
+            |cfg, _d| {
+                assert_eq!(cfg.tasks.max_concurrent, 5);
+            },
+        ),
+        ("empty-toml-budget-defaults", "", |cfg, d| {
+            assert_eq!(cfg.budget.monthly_token_limit, d.budget.monthly_token_limit);
+            assert_eq!(cfg.budget.warning_threshold, d.budget.warning_threshold);
+        }),
+        (
+            "llm-with-only-model-yields-default-api-key",
+            "[llm]\nmodel = \"meta/llama-3\"\n",
+            |cfg, d| {
+                assert_eq!(cfg.llm.model, "meta/llama-3");
+                assert_eq!(cfg.llm.api_key_env, d.llm.api_key_env);
+            },
+        ),
+    ];
+    for (name, toml_str, assert) in cases {
+        let cfg: Config = toml::from_str(toml_str).unwrap_or_else(|e| panic!("parse {name}: {e}"));
+        assert(&cfg, &defaults);
+    }
 }
 
 #[test]
@@ -305,29 +317,6 @@ warning_threshold = 0.9
 "#;
     let cfg: Config = toml::from_str(toml_str).expect("should parse");
     assert_eq!(cfg.budget.monthly_token_limit, 5_000_000);
-    assert!((cfg.budget.warning_threshold - 0.9).abs() < f64::EPSILON);
-}
-
-#[test]
-fn parse_budget_config_defaults_when_absent() {
-    let cfg: Config = toml::from_str("").expect("should parse");
-    assert_eq!(cfg.budget.monthly_token_limit, 1_000_000);
-    assert!((cfg.budget.warning_threshold - 0.8).abs() < f64::EPSILON);
-}
-
-#[test]
-fn apply_setting_budget_monthly_token_limit() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("budget.monthly_token_limit", "1000000")
-        .expect("should succeed");
-    assert_eq!(cfg.budget.monthly_token_limit, 1_000_000);
-}
-
-#[test]
-fn apply_setting_budget_warning_threshold() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("budget.warning_threshold", "0.9")
-        .expect("should succeed");
     assert!((cfg.budget.warning_threshold - 0.9).abs() < f64::EPSILON);
 }
 

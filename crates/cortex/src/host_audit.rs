@@ -928,13 +928,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_apt_upgradable_some() {
-        assert!(matches!(
-            parse_apt_upgradable(
-                "Listing...\nlibssl/stable 3.0.1 amd64 [upgradable from: 3.0.0]\n"
-            ),
-            CheckStatus::Warn(_),
-        ));
+    fn parse_apt_upgradable_reports_accurate_count() {
+        // The warning text feeds straight into the heartbeat surface, so the
+        // package count has to be right — not just "some warning fired".
+        let output = "Listing...\n\
+libssl/stable 3.0.1 amd64 [upgradable from: 3.0.0]\n\
+curl/stable 8.5.0 amd64 [upgradable from: 8.4.0]\n\
+openssh-server/stable 9.6 amd64 [upgradable from: 9.5]\n";
+        let CheckStatus::Warn(msg) = parse_apt_upgradable(output) else {
+            panic!("upgradable packages must surface as Warn");
+        };
+        assert!(
+            msg.starts_with("3 "),
+            "count must reflect the 3 upgradable lines, got: {msg}"
+        );
+        assert!(
+            msg.contains("upgradable"),
+            "message must name the condition, got: {msg}"
+        );
     }
 
     #[test]

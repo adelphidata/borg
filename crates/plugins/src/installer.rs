@@ -499,13 +499,22 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_native_succeeds_without_files() {
+    fn uninstall_native_is_idempotent_with_no_credentials() {
+        // Native uninstall must be a graceful no-op when nothing is on disk
+        // or in the keychain. Idempotency is the contract: re-running
+        // uninstall after a successful uninstall must not error.
         let tmp = tempfile::tempdir().expect("create temp dir");
         let def = CATALOG
             .iter()
             .find(|c| c.id == "messaging/telegram")
             .expect("telegram in catalog");
-        let result = uninstall(def, tmp.path());
-        assert!(result.is_ok());
+        uninstall(def, tmp.path()).expect("first uninstall must succeed with no state");
+        uninstall(def, tmp.path()).expect("uninstall must be idempotent");
+        // Native uninstall must not create any files under the data dir —
+        // the only side effects are keychain removals.
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().next().is_none(),
+            "uninstall must not write to data_dir for native integrations"
+        );
     }
 }

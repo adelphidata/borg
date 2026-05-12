@@ -280,15 +280,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Table-driven check that seatbelt path validation accepts the path
+    /// shapes Seatbelt's S-expression syntax can quote safely and rejects
+    /// the ones that would inject. The validator must:
+    /// - allow ASCII paths with `-`, `_`, `/`, `.`, digits
+    /// - reject non-ASCII (Seatbelt's parser can mishandle multibyte chars)
     #[test]
-    fn validate_seatbelt_path_accepts_valid() {
-        assert!(validate_seatbelt_path("/usr/local/bin").is_ok());
-        assert!(validate_seatbelt_path("/tmp/my-tool_dir/v2").is_ok());
-    }
-
-    #[test]
-    fn validate_seatbelt_path_rejects_non_ascii() {
-        assert!(validate_seatbelt_path("/tmp/tëst").is_err());
+    fn validate_seatbelt_path_accepts_safe_and_rejects_unsafe() {
+        let valid = ["/usr/local/bin", "/tmp/my-tool_dir/v2"];
+        let invalid = ["/tmp/tëst"];
+        for path in valid {
+            validate_seatbelt_path(path)
+                .unwrap_or_else(|e| panic!("expected {path:?} to be accepted: {e}"));
+        }
+        for path in invalid {
+            assert!(
+                validate_seatbelt_path(path).is_err(),
+                "expected {path:?} to be rejected"
+            );
+        }
     }
 
     #[test]

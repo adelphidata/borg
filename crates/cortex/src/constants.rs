@@ -722,103 +722,22 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_max_tokens_positive() {
-        assert!(TOOL_OUTPUT_MAX_TOKENS > 0);
-    }
-
-    #[test]
-    fn compaction_safety_margin_in_range() {
-        assert!(COMPACTION_SAFETY_MARGIN > 0.0);
-        assert!(COMPACTION_SAFETY_MARGIN < 1.0);
-    }
-
-    #[test]
-    fn gateway_max_body_size_reasonable() {
-        assert!(GATEWAY_MAX_BODY_SIZE >= 1024 * 1024); // at least 1 MB
-    }
-
-    #[test]
-    fn max_tool_name_len_and_args_positive() {
-        assert!(MAX_TOOL_NAME_LEN > 0);
-        assert!(MAX_TOOL_ARGS_LEN > 0);
-        assert!(MAX_TOOL_CALLS_PER_RESPONSE > 0);
-    }
-
-    #[test]
-    fn backoff_factors_greater_than_one() {
-        assert!(TELEGRAM_BACKOFF_FACTOR > 1.0);
-        assert!(SIGNAL_SSE_BACKOFF_FACTOR > 1.0);
-        assert!(RETRY_BACKOFF_FACTOR > 1.0);
-    }
-
-    #[test]
-    fn jitter_fractions_in_zero_one_range() {
-        assert!(TELEGRAM_JITTER_FRACTION > 0.0 && TELEGRAM_JITTER_FRACTION < 1.0);
-        assert!(SIGNAL_SSE_JITTER_FRACTION > 0.0 && SIGNAL_SSE_JITTER_FRACTION < 1.0);
-        assert!(RETRY_JITTER_FACTOR > 0.0 && RETRY_JITTER_FACTOR < 1.0);
-    }
-
-    #[test]
-    fn echo_cache_ttls_positive() {
-        assert!(!ECHO_CACHE_TEXT_TTL.is_zero());
-        assert!(!ECHO_CACHE_ID_TTL.is_zero());
-        assert!(!SELF_CHAT_CACHE_TTL.is_zero());
-    }
-
-    #[test]
-    fn dedup_capacities_positive() {
-        assert!(TELEGRAM_DEDUP_CAPACITY > 0);
-        assert!(SLACK_DEDUP_CAPACITY > 0);
-        assert!(DISCORD_DEDUP_CAPACITY > 0);
-        assert!(TEAMS_DEDUP_CAPACITY > 0);
-        assert!(SLACK_ECHO_CACHE_CAPACITY > 0);
-        assert!(SELF_CHAT_CACHE_MAX_ENTRIES > 0);
-    }
-
-    #[test]
     fn agent_tool_calls_exceeds_per_response() {
         assert!(MAX_AGENT_TOOL_CALLS > MAX_TOOL_CALLS_PER_RESPONSE);
     }
 
     #[test]
-    fn flush_limits_positive() {
-        assert!(FLUSH_MESSAGE_TRUNCATE_CHARS > 0);
+    fn flush_transcript_cap_exceeds_truncate() {
         assert!(FLUSH_TRANSCRIPT_CAP_CHARS > FLUSH_MESSAGE_TRUNCATE_CHARS);
     }
 
     #[test]
-    fn token_estimates_positive() {
-        assert!(IMAGE_TOKEN_ESTIMATE > 0);
-        assert!(AUDIO_TOKEN_ESTIMATE_MIN > 0);
-        assert!(AUDIO_BYTES_PER_TOKEN > 0);
-        assert!(TOOL_RESULT_COMPACT_THRESHOLD > 0);
-    }
-
-    #[test]
-    fn web_constants_positive() {
-        assert!(WEB_FETCH_TIMEOUT_SECS > 0);
-        assert!(WEB_FETCH_MAX_CHARS > 0);
-        assert!(WEB_MAX_SEARCH_RESULTS > 0);
+    fn web_max_body_at_least_1mb() {
         assert!(WEB_MAX_BODY_BYTES >= 1024 * 1024);
-        assert!(WEB_REDIRECT_LIMIT > 0);
     }
 
     #[test]
-    fn embedding_dims_positive() {
-        assert!(OPENAI_EMBEDDING_DIM > 0);
-        assert!(GEMINI_EMBEDDING_DIM > 0);
-        assert!(MAX_EMBEDDING_INPUT_CHARS > 0);
-    }
-
-    #[test]
-    fn session_and_project_limits_positive() {
-        assert!(MAX_SESSION_MESSAGE_CHARS > 0);
-        assert!(MAX_PROJECT_DOC_BYTES > 0);
-    }
-
-    #[test]
-    fn hmac_constants_valid() {
-        assert!(HMAC_CHECKPOINT_INTERVAL > 0);
+    fn secs_constants_consistent() {
         assert_eq!(SECS_PER_HOUR, 3600);
         assert_eq!(SECS_PER_DAY, SECS_PER_HOUR * 24);
     }

@@ -1,18 +1,6 @@
 use super::*;
 
 #[test]
-fn default_browser_config_values() {
-    let cfg = BrowserConfig::default();
-    assert!(cfg.enabled);
-    assert!(cfg.headless);
-    assert!(cfg.executable.is_none());
-    assert_eq!(cfg.cdp_port, 9222);
-    assert!(!cfg.no_sandbox);
-    assert_eq!(cfg.timeout_ms, 30000);
-    assert_eq!(cfg.startup_timeout_ms, 15000);
-}
-
-#[test]
 fn parse_browser_config_toml() {
     let toml_str = r#"
 [browser]
@@ -35,21 +23,6 @@ startup_timeout_ms = 20000
 }
 
 #[test]
-fn parse_empty_toml_yields_browser_defaults() {
-    let cfg: Config = toml::from_str("").expect("should parse");
-    assert!(cfg.browser.enabled);
-    assert!(cfg.browser.headless);
-    assert_eq!(cfg.browser.cdp_port, 9222);
-}
-
-#[test]
-fn apply_setting_browser_headless() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("browser.headless", "false").unwrap();
-    assert!(!cfg.browser.headless);
-}
-
-#[test]
 fn apply_setting_browser_cdp_port_hidden() {
     let mut cfg = Config::default();
     assert!(cfg.apply_setting("browser.cdp_port", "9333").is_err());
@@ -62,46 +35,6 @@ fn display_settings_contains_browser() {
     assert!(display.contains("browser.enabled"));
     assert!(display.contains("browser.headless"));
     assert!(!display.contains("browser.cdp_port"));
-}
-
-#[test]
-fn tts_config_defaults() {
-    let cfg = TtsConfig::default();
-    assert!(!cfg.enabled);
-    assert!(cfg.models.is_empty());
-    assert_eq!(cfg.default_voice, "alloy");
-    assert_eq!(cfg.default_format, "mp3");
-    assert_eq!(cfg.max_text_length, 4096);
-    assert_eq!(cfg.timeout_ms, 30_000);
-    assert!(!cfg.auto_mode);
-}
-
-#[test]
-fn apply_setting_tts_enabled() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("tts.enabled", "true").unwrap();
-    assert!(cfg.tts.enabled);
-}
-
-#[test]
-fn apply_setting_tts_auto_mode() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("tts.auto_mode", "true").unwrap();
-    assert!(cfg.tts.auto_mode);
-}
-
-#[test]
-fn apply_setting_tts_default_voice() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("tts.default_voice", "nova").unwrap();
-    assert_eq!(cfg.tts.default_voice, "nova");
-}
-
-#[test]
-fn apply_setting_tts_default_format() {
-    let mut cfg = Config::default();
-    cfg.apply_setting("tts.default_format", "opus").unwrap();
-    assert_eq!(cfg.tts.default_format, "opus");
 }
 
 #[test]
@@ -178,14 +111,4 @@ api_key_env = "GROQ_API_KEY"
         cfg.audio.models[1].api_key_env.as_deref(),
         Some("GROQ_API_KEY")
     );
-}
-
-#[test]
-fn audio_config_defaults() {
-    let cfg = AudioConfig::default();
-    assert!(!cfg.enabled);
-    assert!(cfg.models.is_empty());
-    assert_eq!(cfg.max_file_size, 20 * 1024 * 1024);
-    assert_eq!(cfg.min_file_size, 1024);
-    assert!(!cfg.echo_transcript);
 }

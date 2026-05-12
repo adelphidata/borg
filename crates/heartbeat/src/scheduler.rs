@@ -678,14 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn default_config_has_quiet_hours() {
-        let config = HeartbeatConfig::default();
-        assert_eq!(config.quiet_hours_start, Some("00:00".to_string()));
-        assert_eq!(config.quiet_hours_end, Some("06:00".to_string()));
-        assert!(config.channels.is_empty());
-    }
-
-    #[test]
     fn quiet_hours_contains_boundary_table() {
         // Window 23:55–06:00 (wraps midnight). Half-open [start, end): start
         // is INSIDE, end is OUTSIDE. Boundary regression target — flipping

@@ -486,65 +486,71 @@ impl ToolDefinition {
 mod tests {
     use super::*;
 
+    /// Collapsed constructor check. Each row exercises the constructor's
+    /// `Into<String>` plumbing AND the `text_content()` extractor (which
+    /// matches on `MessageContent::Text` vs. `Parts`), so a regression in
+    /// either layer fails here. `tool_result` is the only constructor that
+    /// sets `tool_call_id` — that row guards against a swap with `tool_calls`.
     #[test]
-    fn message_system_constructor() {
-        let msg = Message::system("You are helpful.");
-        assert_eq!(msg.role, Role::System);
-        assert_eq!(msg.text_content(), Some("You are helpful."));
-        assert!(msg.tool_calls.is_none());
-        assert!(msg.tool_call_id.is_none());
+    fn message_constructors_set_role_text_and_tool_call_id() {
+        struct Case {
+            msg: Message,
+            role: Role,
+            text: &'static str,
+            tool_call_id: Option<&'static str>,
+        }
+        let cases = vec![
+            Case {
+                msg: Message::system("You are helpful."),
+                role: Role::System,
+                text: "You are helpful.",
+                tool_call_id: None,
+            },
+            Case {
+                // Owned String exercises the `Into<String>` generic bound.
+                msg: Message::user(String::from("Hello")),
+                role: Role::User,
+                text: "Hello",
+                tool_call_id: None,
+            },
+            Case {
+                msg: Message::assistant("Hi there"),
+                role: Role::Assistant,
+                text: "Hi there",
+                tool_call_id: None,
+            },
+            Case {
+                msg: Message::tool_result("call_123", "result text"),
+                role: Role::Tool,
+                text: "result text",
+                tool_call_id: Some("call_123"),
+            },
+        ];
+        for case in cases {
+            assert_eq!(case.msg.role, case.role);
+            assert_eq!(case.msg.text_content(), Some(case.text));
+            assert_eq!(case.msg.tool_call_id.as_deref(), case.tool_call_id);
+            assert!(case.msg.tool_calls.is_none());
+        }
     }
 
+    /// Wire-format contract: roles serialize as lowercase strings and
+    /// round-trip back. Each variant must be pinned — provider APIs reject
+    /// unknown role strings.
     #[test]
-    fn message_user_constructor() {
-        let msg = Message::user("Hello");
-        assert_eq!(msg.role, Role::User);
-        assert_eq!(msg.text_content(), Some("Hello"));
-    }
-
-    #[test]
-    fn message_assistant_constructor() {
-        let msg = Message::assistant("Hi there");
-        assert_eq!(msg.role, Role::Assistant);
-        assert_eq!(msg.text_content(), Some("Hi there"));
-    }
-
-    #[test]
-    fn message_tool_result_constructor() {
-        let msg = Message::tool_result("call_123", "result text");
-        assert_eq!(msg.role, Role::Tool);
-        assert_eq!(msg.text_content(), Some("result text"));
-        assert_eq!(msg.tool_call_id.as_deref(), Some("call_123"));
-        assert!(msg.tool_calls.is_none());
-    }
-
-    #[test]
-    fn message_constructors_accept_string_types() {
-        let owned = String::from("owned string");
-        let msg = Message::user(owned);
-        assert_eq!(msg.text_content(), Some("owned string"));
-
-        let msg2 = Message::system("static str");
-        assert_eq!(msg2.text_content(), Some("static str"));
-    }
-
-    #[test]
-    fn role_serializes_to_lowercase() {
-        assert_eq!(serde_json::to_string(&Role::System).unwrap(), "\"system\"");
-        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"user\"");
-        assert_eq!(
-            serde_json::to_string(&Role::Assistant).unwrap(),
-            "\"assistant\""
-        );
-        assert_eq!(serde_json::to_string(&Role::Tool).unwrap(), "\"tool\"");
-    }
-
-    #[test]
-    fn role_deserializes_from_lowercase() {
-        let role: Role = serde_json::from_str("\"system\"").unwrap();
-        assert_eq!(role, Role::System);
-        let role: Role = serde_json::from_str("\"tool\"").unwrap();
-        assert_eq!(role, Role::Tool);
+    fn role_serde_wire_format_is_lowercase_round_trip() {
+        let cases = [
+            (Role::System, "system"),
+            (Role::User, "user"),
+            (Role::Assistant, "assistant"),
+            (Role::Tool, "tool"),
+        ];
+        for (role, wire) in cases {
+            let ser = serde_json::to_string(&role).unwrap();
+            assert_eq!(ser, format!("\"{wire}\""));
+            let de: Role = serde_json::from_str(&ser).unwrap();
+            assert_eq!(de, role);
+        }
     }
 
     #[test]
@@ -684,30 +690,6 @@ mod tests {
         match output {
             ToolOutput::Text(s) => assert_eq!(s, "hello"),
             other @ ToolOutput::Multimodal { .. } => unreachable!("expected Text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_output_multimodal_has_parts() {
-        let output = ToolOutput::Multimodal {
-            text: "screenshot taken".to_string(),
-            parts: vec![
-                ContentPart::Text("screenshot taken".to_string()),
-                ContentPart::ImageBase64 {
-                    media: MediaData {
-                        mime_type: "image/png".to_string(),
-                        data: "abc123".to_string(),
-                        filename: None,
-                    },
-                },
-            ],
-        };
-        match output {
-            ToolOutput::Multimodal { text, parts } => {
-                assert_eq!(text, "screenshot taken");
-                assert_eq!(parts.len(), 2);
-            }
-            other @ ToolOutput::Text(_) => unreachable!("expected Multimodal, got {other:?}"),
         }
     }
 

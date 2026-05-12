@@ -592,15 +592,24 @@ mod tests {
 
     #[test]
     fn optional_db_empty_facts_are_noop_with_or_without_db() {
+        // No daily entry should be written for empty or whitespace-only input,
+        // regardless of whether a DB handle is provided. Catches a regression
+        // where blank-flush would clobber the existing daily/{date} entry with
+        // an empty body.
         let db = crate::db::Database::test_db();
-        assert!(flush_short_term_to_daily_with_optional_db(Some(&db), "").is_ok());
-        assert!(flush_short_term_to_daily_with_optional_db(Some(&db), "   \n").is_ok());
-        assert!(flush_short_term_to_daily_with_optional_db(None, "").is_ok());
+        flush_short_term_to_daily_with_optional_db(Some(&db), "")
+            .expect("empty input must be a no-op, not an error");
+        flush_short_term_to_daily_with_optional_db(Some(&db), "   \n")
+            .expect("whitespace-only input must be a no-op, not an error");
+        flush_short_term_to_daily_with_optional_db(None, "")
+            .expect("None db + empty input must be a no-op, not an error");
         let date = chrono::Local::now().format("%Y-%m-%d").to_string();
-        assert!(db
-            .get_memory_entry("global", &format!("daily/{date}"))
-            .unwrap()
-            .is_none());
+        assert!(
+            db.get_memory_entry("global", &format!("daily/{date}"))
+                .unwrap()
+                .is_none(),
+            "no-op flush must not create a daily entry"
+        );
     }
 
     #[test]

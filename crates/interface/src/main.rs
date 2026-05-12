@@ -1327,10 +1327,38 @@ mod tests {
         assert!(cli.command.is_none());
     }
 
+    /// Table-driven check that argv-less subcommands wired through clap derive
+    /// resolve to the right `Commands::*` variant. Pins the user-facing CLI
+    /// surface — renaming a `#[command(name = ...)]` would silently break
+    /// any external scripts. `test_parse_heal` and `test_parse_acp` below
+    /// fold into this once we touch them again.
     #[test]
-    fn test_parse_dream_subcommand() {
-        let cli = Cli::try_parse_from(["borg", "dream"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Dream)));
+    fn parses_no_arg_subcommands_to_correct_variant() {
+        type Check = fn(&Cli);
+        let cases: &[(&[&str], Check)] = &[
+            (&["borg", "dream"], |cli| {
+                assert!(
+                    matches!(cli.command, Some(Commands::Dream)),
+                    "dream did not parse to Commands::Dream"
+                )
+            }),
+            (&["borg", "heal"], |cli| {
+                assert!(
+                    matches!(cli.command, Some(Commands::Heal)),
+                    "heal did not parse to Commands::Heal"
+                )
+            }),
+            (&["borg", "acp"], |cli| {
+                assert!(
+                    matches!(cli.command, Some(Commands::Acp)),
+                    "acp did not parse to Commands::Acp"
+                )
+            }),
+        ];
+        for (args, check) in cases {
+            let cli = Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("parse {args:?}: {e}"));
+            check(&cli);
+        }
     }
 
     #[test]
@@ -1542,19 +1570,8 @@ mod tests {
         assert!(err.is_err(), "--content + --file must conflict");
     }
 
-    // ── Heal / Sessions parse tests ──
-
-    #[test]
-    fn test_parse_heal() {
-        let cli = Cli::try_parse_from(["borg", "heal"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Heal)));
-    }
-
-    #[test]
-    fn test_parse_acp() {
-        let cli = Cli::try_parse_from(["borg", "acp"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Acp)));
-    }
+    // ── Sessions parse tests ──
+    // heal / acp parsing is covered by `parses_no_arg_subcommands_to_correct_variant` above.
 
     #[test]
     fn test_parse_sessions_list_with_limit() {

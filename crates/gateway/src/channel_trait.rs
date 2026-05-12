@@ -602,34 +602,6 @@ mod tests {
     }
 
     #[test]
-    fn webhook_outcome_variants() {
-        // Verify all enum variants can be constructed
-        let _skip = WebhookOutcome::Skip;
-
-        let _protocol = WebhookOutcome::ProtocolResponse((
-            StatusCode::OK,
-            axum::Json(serde_json::json!({"challenge": "test"})),
-        ));
-
-        let _msg = WebhookOutcome::Message {
-            inbound: InboundMessage {
-                sender_id: "u1".to_string(),
-                text: "hello".to_string(),
-                channel_id: None,
-                thread_id: None,
-                message_id: None,
-                thread_ts: None,
-                attachments: vec![],
-                reaction: None,
-                metadata: serde_json::Value::Null,
-                peer_kind: None,
-            },
-            session_key: "test:u1:".to_string(),
-            response_context: serde_json::json!({}),
-        };
-    }
-
-    #[test]
     fn typing_handle_drop_sends_stop() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

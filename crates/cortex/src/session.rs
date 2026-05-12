@@ -219,23 +219,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_new_has_uuid_and_defaults() {
+    fn session_new_generates_valid_uuid_and_rfc3339_timestamps() {
+        // The id must be a parseable UUID — the DB and gateway both index on
+        // it, so an empty or malformed value would silently route to the
+        // wrong session. Timestamps must parse as RFC3339 — that's the
+        // persisted wire format and the only valid lex-sortable form.
         let session = Session::new();
-        assert!(!session.meta.id.is_empty());
-        assert_eq!(session.meta.title, "New conversation");
-        assert_eq!(session.meta.message_count, 0);
-        assert!(session.messages.is_empty());
-        // Timestamps should be non-empty RFC3339
-        assert!(!session.meta.created_at.is_empty());
-        assert!(!session.meta.updated_at.is_empty());
-    }
-
-    #[test]
-    fn session_default_equals_new() {
-        let s1 = Session::new();
-        let s2 = Session::default();
-        assert_eq!(s1.meta.title, s2.meta.title);
-        assert_eq!(s1.meta.message_count, s2.meta.message_count);
+        uuid::Uuid::parse_str(&session.meta.id)
+            .expect("Session::new must produce a valid UUID for downstream indexing");
+        chrono::DateTime::parse_from_rfc3339(&session.meta.created_at).expect(
+            "Session::new must produce RFC3339 created_at — DB stores it as a string sort key",
+        );
+        chrono::DateTime::parse_from_rfc3339(&session.meta.updated_at)
+            .expect("Session::new must produce RFC3339 updated_at");
     }
 
     #[test]

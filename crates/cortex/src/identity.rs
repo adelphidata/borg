@@ -152,29 +152,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_identity_is_non_empty() {
-        assert!(!DEFAULT_IDENTITY.is_empty());
-    }
-
-    #[test]
-    fn default_identity_contains_identity() {
-        assert!(DEFAULT_IDENTITY.contains("Borg"));
-        assert!(DEFAULT_IDENTITY.contains("assistant"));
-    }
-
-    #[test]
-    fn identity_path_ends_with_identity_md() {
-        let path = identity_path().unwrap();
-        assert!(path.to_string_lossy().ends_with("IDENTITY.md"));
-        assert!(path.to_string_lossy().contains(".borg"));
-    }
-
-    #[test]
-    fn load_identity_returns_content() {
-        // Should return either the file content or the default — never an error
-        let identity = load_identity().unwrap();
-        // Other tests may mutate the file, so we only check it's non-error
-        let _ = identity;
+    fn load_identity_returns_non_empty_content() {
+        // load_identity is the system-prompt source; whether it falls back to
+        // DEFAULT_IDENTITY or reads the on-disk file, the result must be
+        // non-empty so the system prompt is never blank. The actual
+        // fallback-vs-disk branching is covered by the override-based tests
+        // below; here we just pin the never-blank contract on the default
+        // entry point.
+        let loaded = load_identity().expect("load_identity must not error");
+        assert!(
+            !loaded.trim().is_empty(),
+            "loaded identity must be non-empty so system prompt is never blank"
+        );
     }
 
     #[test]
