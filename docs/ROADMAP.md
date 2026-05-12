@@ -395,17 +395,6 @@ top-down by priority, not by section order.
   everything else stripped. Prevents accidental leak of
   `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` etc. into shell tool
   output that gets logged or echoed back.
-- **Output redaction toggle.** `[H]` Programmatic redaction of
-  secrets and PII in agent output (channel deliveries, logs, transcript)
-  with an operator toggle and an audit log of what was redacted. Borg
-  has input-side secret-redaction in the prompt-injection layer;
-  output-side is separate. Critical for shared-screen / posted-log
-  scenarios.
-- **Subprocess process registry.** `[H]` Track every
-  subprocess Borg spawns (PID, command, start time, owning session) and
-  surface it in `borg status` / `borg doctor`. An orphaned `browser`
-  child or stuck shell is invisible today until the user notices CPU.
-  Folds into self-healing.
 - **Browser anti-detection + supervisor.** `[H]` Drop-in
   browser provider with anti-bot stealth headers, dialog auto-handling,
   and a supervisor that restarts crashed sessions. Borg's `browser`

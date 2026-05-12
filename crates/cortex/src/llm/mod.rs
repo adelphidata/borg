@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -101,6 +101,7 @@ pub mod credential_pool;
 pub mod credential_sources;
 pub mod oauth_refresh;
 mod pricing;
+mod transport;
 
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
@@ -112,6 +113,7 @@ pub use credential_pool::{
     CredentialPool, CredentialSource, CredentialStatus, CredentialStrategy, LeaseHandle,
     PooledCredential, ResolveError,
 };
+use transport::{Transport, TransportRequest};
 
 pub use crate::llm_error::*;
 
@@ -794,27 +796,10 @@ impl LlmClient {
         }
     }
 
-    fn parse_usage_cost(value: &serde_json::Value) -> Option<String> {
-        match value {
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
-            _ => None,
-        }
-    }
-
+    #[cfg(test)]
     /// Resolve provider-reported cost; prefer top-level `cost`/`total_cost`, fall back to `cost_details`.
     fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
-        if let Some(c) = usage.cost.as_ref().and_then(Self::parse_usage_cost) {
-            return Some(c);
-        }
-        let details = usage.cost_details.as_ref()?;
-        if let Some(c) = details.total_cost.as_ref().and_then(Self::parse_usage_cost) {
-            return Some(c);
-        }
-        details
-            .upstream_inference_cost
-            .as_ref()
-            .and_then(Self::parse_usage_cost)
+        transport::extract_provider_cost_usd(usage)
     }
 
     fn maybe_capture_usage_from_action(
@@ -1285,6 +1270,205 @@ impl LlmClient {
         Ok(response)
     }
 
+    fn transport_request<'a>(
+        &'a self,
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+        model: &'a str,
+    ) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: self.provider,
+            model,
+            messages,
+            tools,
+            llm_config: &self.llm_config,
+            prompt_cache_key: self.prompt_cache_key.as_deref(),
+            cost_events_enabled: self.cost_events_enabled(),
+        }
+    }
+
+    async fn stream_http_transport_inner(
+        &self,
+        transport: &'static dyn Transport,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), LlmError> {
+        let model = self.provider.normalize_model(&self.llm_config.model);
+        let request = self.transport_request(messages, tools, &model);
+        let body = transport.build_streaming_request(&request)?;
+
+        debug!(
+            "Sending streaming request to {} (model: {})",
+            transport.protocol_name(),
+            model
+        );
+
+        if self.debug_logging {
+            if let Ok(json) = serde_json::to_string_pretty(&body) {
+                self.debug_log(transport.debug_request_label(), &json);
+            }
+        }
+
+        let req_id = short_request_id();
+        let verbose = self.debug_logging;
+        let lc_start = Instant::now();
+        lc_log!(
+            verbose,
+            req_id = %req_id,
+            provider = %self.provider,
+            model = %model,
+            base_url = %self.effective_base_url(),
+            msg_count = messages.len(),
+            tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
+            "{}: request start",
+            transport.protocol_name()
+        );
+
+        let response = match self.send_request(&body, cancel).await {
+            Ok(r) => {
+                lc_log!(
+                    verbose,
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "{}: response headers received",
+                    transport.protocol_name()
+                );
+                r
+            }
+            Err(e) => {
+                warn!(
+                    target: "cortex::llm::lifecycle",
+                    req_id = %req_id,
+                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                    "{}: request failed before stream: {e}",
+                    transport.protocol_name()
+                );
+                return Err(e);
+            }
+        };
+
+        let stream = response.bytes_stream();
+        let provider_str = self.provider.as_str().to_string();
+        let model_str = self.llm_config.model.clone();
+        let mut state = transport.new_stream_state();
+        let mut first_byte_ms: Option<u64> = None;
+        let mut line_count: u64 = 0;
+        let mut last_usage: Option<UsageData> = None;
+
+        let result = crate::sse::process_sse_stream(
+            stream,
+            tx,
+            cancel,
+            self.llm_config.stream_chunk_timeout_secs,
+            MAX_SSE_BUFFER,
+            |line| {
+                if first_byte_ms.is_none() {
+                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                }
+                line_count += 1;
+                let action =
+                    transport.parse_stream_line(line, &provider_str, &model_str, &mut state);
+                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
+                action
+            },
+        )
+        .await;
+
+        match &result {
+            Ok(()) => lc_log!(
+                verbose,
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "{}: stream end ok",
+                transport.protocol_name()
+            ),
+            Err(e) => warn!(
+                target: "cortex::llm::lifecycle",
+                req_id = %req_id,
+                elapsed_ms = lc_start.elapsed().as_millis() as u64,
+                first_byte_ms = ?first_byte_ms,
+                line_count = line_count,
+                "{}: stream end err: {e}",
+                transport.protocol_name()
+            ),
+        }
+        if result.is_ok() {
+            self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
+        }
+        result
+    }
+
+    async fn chat_http_transport_inner(
+        &self,
+        transport: &'static dyn Transport,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        let model = self.provider.normalize_model(&self.llm_config.model);
+        let request = self.transport_request(messages, tools, &model);
+        let body = transport.build_chat_request(&request)?;
+        let max_retries = self.llm_config.max_retries;
+        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
+        let cancel = CancellationToken::new();
+        let req_id = short_request_id();
+        let request_model = self.llm_config.model.clone();
+
+        for attempt in 0..=max_retries {
+            match self.send_request(&body, &cancel).await {
+                Ok(response) => {
+                    let response_json: serde_json::Value = response.json().await?;
+                    let parsed = transport.parse_chat_response(
+                        response_json,
+                        self.provider.as_str(),
+                        &request_model,
+                    )?;
+                    self.emit_cost_event_best_effort(
+                        &req_id,
+                        parsed.usage.as_ref(),
+                        &request_model,
+                    );
+                    return Ok(parsed.message);
+                }
+                Err(e) => {
+                    if !e.is_retryable() || attempt == max_retries {
+                        bail!("{e}");
+                    }
+                    let delay = if let LlmError::Retryable {
+                        retry_after: Some(ra),
+                        ..
+                    } = &e
+                    {
+                        *ra
+                    } else {
+                        backoff_with_config(
+                            attempt,
+                            &BackoffConfig {
+                                initial: initial_delay,
+                                ..Default::default()
+                            },
+                        )
+                    };
+                    info!(
+                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
+                        attempt + 1,
+                        max_retries,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        bail!(
+            "All retries exhausted for non-streaming {} request",
+            transport.protocol_name()
+        )
+    }
+
     #[instrument(skip_all, fields(llm.provider = "claude-cli"))]
     async fn stream_chat_claude_cli_inner(
         &self,
@@ -1330,261 +1514,20 @@ impl LlmClient {
         tx: &mpsc::Sender<StreamEvent>,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), LlmError> {
-        let model = self.provider.normalize_model(&self.llm_config.model);
-        let reasoning_effort = self
-            .llm_config
-            .thinking
-            .openai_reasoning_effort()
-            .map(String::from);
-        let sanitized_messages = sanitize_openai_messages(messages);
-
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: sanitized_messages,
-            tools: tools.map(<[ToolDefinition]>::to_vec),
-            temperature: self.llm_config.temperature,
-            max_tokens: self.llm_config.max_tokens,
-            stream: true,
-            reasoning_effort,
-            prompt_cache_key: self.prompt_cache_key.clone(),
-            user: self.prompt_cache_key.clone(),
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled())
-                .then_some(UsageOptions { include: true }),
-        };
-
-        debug!(
-            "Sending streaming request to {} (model: {})",
-            self.provider, model
-        );
-
-        // When proxying Claude through OpenRouter, inject Anthropic-style
-        // `cache_control` markers onto the system + rolling-tail messages.
-        // For every other (provider, model) combination this is a no-op and
-        // we send the typed `ChatRequest` directly.
-        let cache_cfg = &self.llm_config.cache;
-        let cached_body: Option<serde_json::Value> = if cache_cfg.enabled
-            && supports_anthropic_cache_control(self.provider, &model)
-            && self.provider != Provider::Anthropic
-        {
-            // ChatRequest's Serialize impl is the standard derive — this only
-            // fails if serde itself is broken, so propagate as Fatal rather
-            // than silently degrading caching with no user-visible signal.
-            let mut body = serde_json::to_value(&request).map_err(|e| LlmError::Fatal {
-                source: anyhow::anyhow!("serialize OpenAI ChatRequest for cache injection: {e}"),
-                reason: FailoverReason::Unknown,
-            })?;
-            apply_openai_cache_markers(&mut body, cache_cfg);
-            Some(body)
-        } else {
-            None
-        };
-
-        if self.debug_logging {
-            let dump = if let Some(body) = &cached_body {
-                serde_json::to_string_pretty(body).ok()
-            } else {
-                serde_json::to_string_pretty(&request).ok()
-            };
-            if let Some(json) = dump {
-                self.debug_log("request_openai", &json);
-            }
-        }
-
-        let req_id = short_request_id();
-        let verbose = self.debug_logging;
-        let lc_start = Instant::now();
-        lc_log!(
-            verbose,
-            req_id = %req_id,
-            provider = %self.provider,
-            model = %model,
-            base_url = %self.effective_base_url(),
-            msg_count = messages.len(),
-            tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
-            "openai-compat: request start"
-        );
-
-        let send_result = if let Some(body) = &cached_body {
-            self.send_request(body, cancel).await
-        } else {
-            self.send_request(&request, cancel).await
-        };
-
-        let response = match send_result {
-            Ok(r) => {
-                lc_log!(
-                    verbose,
-                    req_id = %req_id,
-                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                    "openai-compat: response headers received"
-                );
-                r
-            }
-            Err(e) => {
-                warn!(
-                    target: "cortex::llm::lifecycle",
-                    req_id = %req_id,
-                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                    "openai-compat: request failed before stream: {e}"
-                );
-                return Err(e);
-            }
-        };
-
-        let stream = response.bytes_stream();
-        let provider_str = self.provider.as_str().to_string();
-        let model_str = self.llm_config.model.clone();
-
-        let mut first_byte_ms: Option<u64> = None;
-        let mut line_count: u64 = 0;
-        let mut last_usage: Option<UsageData> = None;
-        let result = crate::sse::process_sse_stream(
-            stream,
+        self.stream_http_transport_inner(
+            transport::openai_compat_transport(),
+            messages,
+            tools,
             tx,
             cancel,
-            self.llm_config.stream_chunk_timeout_secs,
-            MAX_SSE_BUFFER,
-            |line| {
-                if first_byte_ms.is_none() {
-                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
-                }
-                line_count += 1;
-                let action = Self::parse_openai_sse_line(line, &provider_str, &model_str);
-                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
-                action
-            },
         )
-        .await;
-
-        match &result {
-            Ok(()) => lc_log!(
-                verbose,
-                req_id = %req_id,
-                elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                first_byte_ms = ?first_byte_ms,
-                line_count = line_count,
-                "openai-compat: stream end ok"
-            ),
-            Err(e) => warn!(
-                target: "cortex::llm::lifecycle",
-                req_id = %req_id,
-                elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                first_byte_ms = ?first_byte_ms,
-                line_count = line_count,
-                "openai-compat: stream end err: {e}"
-            ),
-        }
-        if result.is_ok() {
-            self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
-        }
-        result
+        .await
     }
 
+    #[cfg(test)]
     /// Parse a single SSE line from an OpenAI-compatible provider.
     fn parse_openai_sse_line(line: &str, provider: &str, model: &str) -> crate::sse::SseAction {
-        use crate::sse::SseAction;
-
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
-            None => return SseAction::Continue,
-        };
-
-        if data.trim() == "[DONE]" {
-            return SseAction::Done(vec![StreamEvent::Done]);
-        }
-
-        match serde_json::from_str::<StreamChunk>(data) {
-            Ok(chunk) => {
-                let mut events = Vec::new();
-
-                if let Some(usage) = chunk.usage {
-                    let cached_input_tokens = usage
-                        .prompt_tokens_details
-                        .as_ref()
-                        .and_then(|d| d.cached_tokens)
-                        .or(usage.cached_tokens)
-                        .unwrap_or(0);
-                    let provider_cost_usd = Self::extract_provider_cost_usd(&usage);
-                    if provider == "openrouter" && provider_cost_usd.is_none() {
-                        // Diagnostic: capture the raw `usage` JSON when an
-                        // OpenRouter chunk lacks a recognizable cost field, so
-                        // the actual response shape is observable in
-                        // production logs without enabling full debug logging.
-                        let raw_usage = serde_json::from_str::<serde_json::Value>(data)
-                            .ok()
-                            .and_then(|v| v.get("usage").cloned())
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "<unparseable>".to_string());
-                        warn!(
-                            target: "cortex::llm::cost",
-                            usage = %raw_usage,
-                            "OpenRouter usage chunk has no recognizable cost field — \
-                             cost-event attribution will be 'unknown'"
-                        );
-                    }
-                    events.push(StreamEvent::Usage(UsageData {
-                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
-                        completion_tokens: usage.completion_tokens.unwrap_or(0),
-                        total_tokens: usage.total_tokens.unwrap_or(0),
-                        cached_input_tokens,
-                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                        provider: provider.to_string(),
-                        model: model.to_string(),
-                        provider_cost_usd,
-                    }));
-                }
-
-                if let Some(choices) = chunk.choices {
-                    for choice in choices {
-                        if let Some(delta) = choice.delta {
-                            if let Some(content) = delta.content {
-                                events.push(StreamEvent::TextDelta(content));
-                            }
-                            if let Some(tool_calls) = delta.tool_calls {
-                                for tc in tool_calls {
-                                    events.push(StreamEvent::ToolCallDelta {
-                                        index: tc.index.unwrap_or(0),
-                                        id: tc.id,
-                                        name: tc.function.as_ref().and_then(|f| f.name.clone()),
-                                        arguments_delta: tc
-                                            .function
-                                            .as_ref()
-                                            .and_then(|f| f.arguments.clone())
-                                            .unwrap_or_default(),
-                                    });
-                                }
-                            }
-                        }
-                        // OpenRouter (and others) split termination across
-                        // two chunks: the first carries `finish_reason`, the
-                        // second carries `finish_reason` + `usage`. Returning
-                        // `Done` here would race past the usage chunk and
-                        // permanently strand cost attribution at "unknown".
-                        // Rely solely on the `[DONE]` sentinel to terminate.
-                        // We DO inspect `finish_reason == "length"` so the
-                        // agent loop can convert the inevitable truncated
-                        // tool-call JSON into a clear "split your work" hint
-                        // for the model.
-                        if choice.finish_reason.as_deref() == Some("length") {
-                            events.push(StreamEvent::Truncated);
-                        }
-                    }
-                }
-
-                if events.is_empty() {
-                    SseAction::Continue
-                } else {
-                    SseAction::Emit(events)
-                }
-            }
-            Err(e) => {
-                warn!("Failed to parse SSE chunk: {e}");
-                SseAction::Continue
-            }
-        }
+        transport::parse_openai_sse_line(line, provider, model)
     }
 
     #[instrument(skip_all, fields(llm.provider = "openai"))]
@@ -1593,128 +1536,13 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        let model = self.provider.normalize_model(&self.llm_config.model);
-        let reasoning_effort = self
-            .llm_config
-            .thinking
-            .openai_reasoning_effort()
-            .map(String::from);
-        let request = ChatRequest {
-            model: model.clone(),
-            messages: messages.to_vec(),
-            tools: tools.map(<[ToolDefinition]>::to_vec),
-            temperature: self.llm_config.temperature,
-            max_tokens: self.llm_config.max_tokens,
-            stream: false,
-            reasoning_effort,
-            prompt_cache_key: self.prompt_cache_key.clone(),
-            user: self.prompt_cache_key.clone(),
-            stream_options: None,
-            usage: (self.provider == Provider::OpenRouter && self.cost_events_enabled())
-                .then_some(UsageOptions { include: true }),
-        };
-
-        // Mirror the streaming path: inject Anthropic-style cache markers
-        // when we're proxying Claude through OpenRouter.
-        let cache_cfg = &self.llm_config.cache;
-        let cached_body: Option<serde_json::Value> = if cache_cfg.enabled
-            && supports_anthropic_cache_control(self.provider, &model)
-            && self.provider != Provider::Anthropic
-        {
-            // Propagate any serialize failure rather than silently shipping an
-            // un-cached request — see the streaming path for the rationale.
-            let mut body = serde_json::to_value(&request)
-                .context("serialize OpenAI ChatRequest for cache injection")?;
-            apply_openai_cache_markers(&mut body, cache_cfg);
-            Some(body)
-        } else {
-            None
-        };
-
-        #[derive(Deserialize)]
-        struct ChatResponse {
-            choices: Vec<ChatChoice>,
-            #[serde(default)]
-            usage: Option<StreamUsage>,
-        }
-        #[derive(Deserialize)]
-        struct ChatChoice {
-            message: Message,
-        }
-
-        let max_retries = self.llm_config.max_retries;
-        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
-        let cancel = CancellationToken::new();
-        let req_id = short_request_id();
-        let request_model = self.llm_config.model.clone();
-
-        for attempt in 0..=max_retries {
-            let result = if let Some(body) = &cached_body {
-                self.send_request(body, &cancel).await
-            } else {
-                self.send_request(&request, &cancel).await
-            };
-            match result {
-                Ok(response) => {
-                    let resp: ChatResponse = response.json().await?;
-                    let message = resp
-                        .choices
-                        .into_iter()
-                        .next()
-                        .map(|c| c.message)
-                        .context("No response from LLM")?;
-                    let usage = resp.usage.map(|usage| UsageData {
-                        prompt_tokens: usage.prompt_tokens.unwrap_or(0),
-                        completion_tokens: usage.completion_tokens.unwrap_or(0),
-                        total_tokens: usage.total_tokens.unwrap_or(0),
-                        cached_input_tokens: usage
-                            .prompt_tokens_details
-                            .as_ref()
-                            .and_then(|d| d.cached_tokens)
-                            .or(usage.cached_tokens)
-                            .unwrap_or(0),
-                        cache_creation_tokens: usage.cache_creation_input_tokens.unwrap_or(0),
-                        provider: self.provider.as_str().to_string(),
-                        model: request_model.clone(),
-                        provider_cost_usd: Self::extract_provider_cost_usd(&usage),
-                    });
-                    self.emit_cost_event_best_effort(&req_id, usage.as_ref(), &request_model);
-                    return Ok(message);
-                }
-                Err(e) => {
-                    if !e.is_retryable() || attempt == max_retries {
-                        bail!("{e}");
-                    }
-                    let delay = if let LlmError::Retryable {
-                        retry_after: Some(ra),
-                        ..
-                    } = &e
-                    {
-                        *ra
-                    } else {
-                        backoff_with_config(
-                            attempt,
-                            &BackoffConfig {
-                                initial: initial_delay,
-                                ..Default::default()
-                            },
-                        )
-                    };
-                    info!(
-                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
-                        attempt + 1,
-                        max_retries,
-                        delay.as_millis()
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-        bail!("All retries exhausted for non-streaming OpenAI request")
+        self.chat_http_transport_inner(transport::openai_compat_transport(), messages, tools)
+            .await
     }
 
     // ── Anthropic path ──
 
+    #[cfg(test)]
     fn build_anthropic_request(
         &self,
         messages: &[Message],
@@ -1722,91 +1550,8 @@ impl LlmClient {
         stream: bool,
     ) -> serde_json::Value {
         let model = self.provider.normalize_model(&self.llm_config.model);
-
-        // Extract system message
-        let system_text: Option<String> = messages
-            .iter()
-            .find(|m| m.role == Role::System)
-            .and_then(|m| m.text_content().map(String::from));
-
-        // Convert messages (skip system)
-        let anthropic_messages = build_anthropic_messages(messages);
-
-        // Convert tools to Anthropic format
-        let anthropic_tools: Option<Vec<serde_json::Value>> = tools.map(|ts| {
-            ts.iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.function.name,
-                        "description": t.function.description,
-                        "input_schema": t.function.parameters,
-                    })
-                })
-                .collect()
-        });
-
-        let cache_cfg = &self.llm_config.cache;
-        let cache_enabled = cache_cfg.enabled;
-        let cache_marker = build_cache_control_marker(cache_cfg.ttl);
-        let (cache_system_eff, cache_tools_eff, rolling_eff) = cache_cfg.effective_layout();
-
-        let mut body = if let Some(budget) = self.llm_config.thinking.budget_tokens() {
-            // When thinking is enabled: omit temperature (Anthropic requirement),
-            // ensure max_tokens accommodates both thinking budget and response.
-            let max_tokens = self.llm_config.max_tokens.max(budget + 1024);
-            serde_json::json!({
-                "model": model,
-                "max_tokens": max_tokens,
-                "stream": stream,
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": budget
-                }
-            })
-        } else {
-            serde_json::json!({
-                "model": model,
-                "max_tokens": self.llm_config.max_tokens,
-                "temperature": self.llm_config.temperature,
-                "stream": stream,
-            })
-        };
-
-        if let Some(sys) = system_text {
-            if cache_enabled && cache_system_eff {
-                // Structured system block with cache_control so the provider can
-                // reuse the (stable) system prompt across turns.
-                body["system"] = serde_json::json!([
-                    {
-                        "type": "text",
-                        "text": sys,
-                        "cache_control": &cache_marker,
-                    }
-                ]);
-            } else {
-                body["system"] = serde_json::json!(sys);
-            }
-        }
-
-        let mut anthropic_messages = anthropic_messages;
-        if cache_enabled {
-            apply_message_cache_control(&mut anthropic_messages, rolling_eff, &cache_marker, false);
-        }
-        body["messages"] = serde_json::json!(anthropic_messages);
-        if let Some(mut tools_json) = anthropic_tools {
-            // Attach a cache_control marker to the last tool definition so the
-            // entire (stable) tools array becomes a single cache breakpoint.
-            if cache_enabled && cache_tools_eff {
-                if let Some(last) = tools_json.last_mut() {
-                    if let Some(obj) = last.as_object_mut() {
-                        obj.insert("cache_control".to_string(), cache_marker);
-                    }
-                }
-            }
-            body["tools"] = serde_json::json!(tools_json);
-        }
-
-        body
+        let request = self.transport_request(messages, tools, &model);
+        transport::build_anthropic_request(&request, stream)
     }
 
     #[instrument(skip_all, fields(llm.provider = "anthropic"))]
@@ -1817,122 +1562,17 @@ impl LlmClient {
         tx: &mpsc::Sender<StreamEvent>,
         cancel: &CancellationToken,
     ) -> std::result::Result<(), LlmError> {
-        let body = self.build_anthropic_request(messages, tools, true);
-        let model = self.provider.normalize_model(&self.llm_config.model);
-
-        debug!("Sending streaming request to Anthropic (model: {})", model);
-
-        if self.debug_logging {
-            if let Ok(json) = serde_json::to_string_pretty(&body) {
-                self.debug_log("request_anthropic", &json);
-            }
-        }
-
-        let req_id = short_request_id();
-        let verbose = self.debug_logging;
-        let lc_start = Instant::now();
-        lc_log!(
-            verbose,
-            req_id = %req_id,
-            provider = %self.provider,
-            model = %model,
-            base_url = %self.effective_base_url(),
-            msg_count = messages.len(),
-            tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
-            "anthropic: request start"
-        );
-
-        let response = match self.send_request(&body, cancel).await {
-            Ok(r) => {
-                lc_log!(
-                    verbose,
-                    req_id = %req_id,
-                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                    "anthropic: response headers received"
-                );
-                r
-            }
-            Err(e) => {
-                warn!(
-                    target: "cortex::llm::lifecycle",
-                    req_id = %req_id,
-                    elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                    "anthropic: request failed before stream: {e}"
-                );
-                return Err(e);
-            }
-        };
-
-        let stream = response.bytes_stream();
-        let provider_str = self.provider.as_str().to_string();
-        let model_str = self.llm_config.model.clone();
-
-        // Mutable state for Anthropic's stateful event stream
-        let mut current_tool_index: usize = 0;
-        let mut current_block_is_tool = false;
-        let mut current_block_is_thinking = false;
-        // `input_tokens` and cache counts arrive on `message_start`; only
-        // `output_tokens` lands on `message_delta`. Stash here to merge —
-        // without this the emitted Usage has `prompt_tokens = 0`.
-        let mut pending_input_tokens: u64 = 0;
-        let mut pending_cached_input_tokens: u64 = 0;
-        let mut pending_cache_creation_tokens: u64 = 0;
-        let mut first_byte_ms: Option<u64> = None;
-        let mut line_count: u64 = 0;
-        let mut last_usage: Option<UsageData> = None;
-
-        let result = crate::sse::process_sse_stream(
-            stream,
+        self.stream_http_transport_inner(
+            transport::anthropic_transport(),
+            messages,
+            tools,
             tx,
             cancel,
-            self.llm_config.stream_chunk_timeout_secs,
-            MAX_SSE_BUFFER,
-            |line| {
-                if first_byte_ms.is_none() {
-                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
-                }
-                line_count += 1;
-                let action = Self::parse_anthropic_sse_line(
-                    line,
-                    &provider_str,
-                    &model_str,
-                    &mut current_tool_index,
-                    &mut current_block_is_tool,
-                    &mut current_block_is_thinking,
-                    &mut pending_input_tokens,
-                    &mut pending_cached_input_tokens,
-                    &mut pending_cache_creation_tokens,
-                );
-                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
-                action
-            },
         )
-        .await;
-
-        match &result {
-            Ok(()) => lc_log!(
-                verbose,
-                req_id = %req_id,
-                elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                first_byte_ms = ?first_byte_ms,
-                line_count = line_count,
-                "anthropic: stream end ok"
-            ),
-            Err(e) => warn!(
-                target: "cortex::llm::lifecycle",
-                req_id = %req_id,
-                elapsed_ms = lc_start.elapsed().as_millis() as u64,
-                first_byte_ms = ?first_byte_ms,
-                line_count = line_count,
-                "anthropic: stream end err: {e}"
-            ),
-        }
-        if result.is_ok() {
-            self.emit_cost_event_best_effort(&req_id, last_usage.as_ref(), &model_str);
-        }
-        result
+        .await
     }
 
+    #[cfg(test)]
     /// Parse a single SSE line from Anthropic's streaming API.
     #[allow(clippy::too_many_arguments)]
     fn parse_anthropic_sse_line(
@@ -1946,179 +1586,17 @@ impl LlmClient {
         pending_cached_input_tokens: &mut u64,
         pending_cache_creation_tokens: &mut u64,
     ) -> crate::sse::SseAction {
-        use crate::sse::SseAction;
-
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
-            None => return SseAction::Continue,
-        };
-
-        let event = match serde_json::from_str::<serde_json::Value>(data) {
-            Ok(e) => e,
-            Err(_) => return SseAction::Continue,
-        };
-
-        let event_type = event["type"].as_str().unwrap_or("");
-
-        match event_type {
-            "message_start" => {
-                if let Some(usage) = event["message"]["usage"].as_object() {
-                    let (cached, created) =
-                        normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
-                    *pending_cached_input_tokens = cached;
-                    *pending_cache_creation_tokens = created;
-                    *pending_input_tokens = usage
-                        .get("input_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                }
-                SseAction::Continue
-            }
-            "content_block_start" => {
-                let block = &event["content_block"];
-                let block_type = block["type"].as_str().unwrap_or("");
-                *current_block_is_tool = false;
-                *current_block_is_thinking = false;
-                match block_type {
-                    "tool_use" => {
-                        *current_block_is_tool = true;
-                        let id = block["id"].as_str().map(String::from);
-                        let name = block["name"].as_str().map(String::from);
-                        SseAction::Emit(vec![StreamEvent::ToolCallDelta {
-                            index: *current_tool_index,
-                            id,
-                            name,
-                            arguments_delta: String::new(),
-                        }])
-                    }
-                    "thinking" => {
-                        *current_block_is_thinking = true;
-                        SseAction::Continue
-                    }
-                    _ => SseAction::Continue,
-                }
-            }
-            "content_block_delta" => {
-                let delta = &event["delta"];
-                match delta["type"].as_str() {
-                    Some("text_delta") => {
-                        if let Some(text) = delta["text"].as_str() {
-                            SseAction::Emit(vec![StreamEvent::TextDelta(text.to_string())])
-                        } else {
-                            SseAction::Continue
-                        }
-                    }
-                    Some("thinking_delta") => {
-                        if let Some(text) = delta["thinking"].as_str() {
-                            SseAction::Emit(vec![StreamEvent::ThinkingDelta(text.to_string())])
-                        } else {
-                            SseAction::Continue
-                        }
-                    }
-                    Some("input_json_delta") => {
-                        if let Some(json_delta) = delta["partial_json"].as_str() {
-                            SseAction::Emit(vec![StreamEvent::ToolCallDelta {
-                                index: *current_tool_index,
-                                id: None,
-                                name: None,
-                                arguments_delta: json_delta.to_string(),
-                            }])
-                        } else {
-                            SseAction::Continue
-                        }
-                    }
-                    _ => {
-                        // For thinking blocks, text comes as text_delta
-                        if *current_block_is_thinking {
-                            if let Some(text) = delta["text"].as_str() {
-                                return SseAction::Emit(vec![StreamEvent::ThinkingDelta(
-                                    text.to_string(),
-                                )]);
-                            }
-                        }
-                        SseAction::Continue
-                    }
-                }
-            }
-            "content_block_stop" => {
-                if *current_block_is_tool {
-                    *current_tool_index += 1;
-                }
-                SseAction::Continue
-            }
-            "message_stop" => SseAction::Done(vec![StreamEvent::Done]),
-            "message_delta" => {
-                let mut events = Vec::new();
-                if let Some(usage) = event["usage"].as_object() {
-                    let delta_input = usage
-                        .get("input_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    // Anthropic reports `input_tokens` on `message_start` and
-                    // omits it from `message_delta`. Prefer whichever is larger
-                    // so cache-refresh paths that re-emit input still win.
-                    let input = delta_input.max(*pending_input_tokens);
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(0);
-                    let (delta_cached, delta_created) =
-                        normalize_cache_tokens(&serde_json::Value::Object(usage.clone()));
-                    let cached_input_tokens = delta_cached.max(*pending_cached_input_tokens);
-                    let cache_creation_tokens = delta_created.max(*pending_cache_creation_tokens);
-                    events.push(StreamEvent::Usage(UsageData {
-                        prompt_tokens: input,
-                        completion_tokens: output,
-                        total_tokens: input + output,
-                        cached_input_tokens,
-                        cache_creation_tokens,
-                        provider: provider.to_string(),
-                        model: model.to_string(),
-                        provider_cost_usd: None,
-                    }));
-                }
-                if let Some(stop_reason) = event["delta"]["stop_reason"].as_str() {
-                    if stop_reason == "max_tokens" {
-                        events.push(StreamEvent::Truncated);
-                    }
-                    events.push(StreamEvent::Done);
-                    return SseAction::Done(events);
-                }
-                if events.is_empty() {
-                    SseAction::Continue
-                } else {
-                    SseAction::Emit(events)
-                }
-            }
-            "error" => {
-                // Anthropic stream errors carry a structured `error.type`.
-                // Before this branch routed through `classify_anthropic_stream_error`,
-                // every variant landed as `Overloaded` — an in-stream 401
-                // then burned the retry budget instead of fast-failing
-                // the provider.
-                let err_type = event["error"]["type"].as_str().unwrap_or("");
-                let err_msg = event["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown error");
-                let reason = classify_anthropic_stream_error(err_type, err_msg);
-                let source = anyhow::anyhow!("Anthropic stream error ({err_type}): {err_msg}");
-                let llm_err = match reason {
-                    FailoverReason::Auth
-                    | FailoverReason::AuthPermanent
-                    | FailoverReason::Billing
-                    | FailoverReason::ModelNotFound
-                    | FailoverReason::PayloadTooLarge
-                    | FailoverReason::Format => LlmError::Fatal { source, reason },
-                    _ => LlmError::Retryable {
-                        source,
-                        retry_after: None,
-                        reason,
-                    },
-                };
-                SseAction::Error(llm_err)
-            }
-            _ => SseAction::Continue,
-        }
+        transport::parse_anthropic_sse_line(
+            line,
+            provider,
+            model,
+            current_tool_index,
+            current_block_is_tool,
+            current_block_is_thinking,
+            pending_input_tokens,
+            pending_cached_input_tokens,
+            pending_cache_creation_tokens,
+        )
     }
 
     #[instrument(skip_all, fields(llm.provider = "anthropic"))]
@@ -2127,80 +1605,8 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        let body = self.build_anthropic_request(messages, tools, false);
-        let max_retries = self.llm_config.max_retries;
-        let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
-        let cancel = CancellationToken::new();
-        let req_id = short_request_id();
-        let request_model = self.llm_config.model.clone();
-
-        for attempt in 0..=max_retries {
-            let result = self.send_request(&body, &cancel).await;
-            match result {
-                Ok(response) => {
-                    let resp: serde_json::Value = response.json().await?;
-                    let message = parse_anthropic_response(&resp)?;
-                    let usage = resp["usage"].as_object().map(|usage| {
-                        let usage_value = serde_json::Value::Object(usage.clone());
-                        let (cached_input_tokens, cache_creation_tokens) =
-                            normalize_cache_tokens(&usage_value);
-                        UsageData {
-                            prompt_tokens: usage
-                                .get("input_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0),
-                            completion_tokens: usage
-                                .get("output_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0),
-                            total_tokens: usage
-                                .get("input_tokens")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0)
-                                + usage
-                                    .get("output_tokens")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0),
-                            cached_input_tokens,
-                            cache_creation_tokens,
-                            provider: self.provider.as_str().to_string(),
-                            model: request_model.clone(),
-                            provider_cost_usd: None,
-                        }
-                    });
-                    self.emit_cost_event_best_effort(&req_id, usage.as_ref(), &request_model);
-                    return Ok(message);
-                }
-                Err(e) => {
-                    if !e.is_retryable() || attempt == max_retries {
-                        bail!("{e}");
-                    }
-                    let delay = if let LlmError::Retryable {
-                        retry_after: Some(ra),
-                        ..
-                    } = &e
-                    {
-                        *ra
-                    } else {
-                        backoff_with_config(
-                            attempt,
-                            &BackoffConfig {
-                                initial: initial_delay,
-                                ..Default::default()
-                            },
-                        )
-                    };
-                    info!(
-                        "Non-streaming retryable error (attempt {}/{}): {e}. Retrying in {}ms...",
-                        attempt + 1,
-                        max_retries,
-                        delay.as_millis()
-                    );
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
-        bail!("All retries exhausted for non-streaming Anthropic request")
+        self.chat_http_transport_inner(transport::anthropic_transport(), messages, tools)
+            .await
     }
 }
 
