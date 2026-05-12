@@ -295,11 +295,6 @@ top-down by priority, not by section order.
 - **Server-initiated MCP sampling.** `[H]` If/when we add MCP client
   support, allow MCP servers to request completions back through Borg
   (full MCP spec, not just tool-calling).
-- **Expanded dangerous-command regex set.** `[H]` 50+ patterns:
-  `chmod 777`, fork bombs, `curl|sh`, `tee` overwrite of credential
-  files, `bash -c` payload introspection, recursive deletes outside
-  cwd. Today the sandbox blocks a small handful of catastrophic
-  commands; this is the next layer.
 - **Code-execution sandbox tool.** `[H]` Run user-provided Python (or
   Rust via `cargo script`) in a subprocess with a restricted stub
   library exposing only safe tools (web_search, read/write_file,
