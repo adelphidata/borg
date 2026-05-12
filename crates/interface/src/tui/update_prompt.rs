@@ -20,9 +20,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect};
@@ -37,6 +35,7 @@ use cortex::update::{
 };
 
 use crate::daemon_client;
+use crate::terminal_guard::TerminalGuard;
 use crate::tui::theme;
 
 /// Outcome handed back to the TUI launcher.
@@ -308,15 +307,6 @@ fn option_row(num: u8, label: String, highlighted: bool) -> Line<'static> {
         Span::styled(format!("{pointer} "), Style::default().fg(theme::CYAN)),
         Span::styled(format!("{num}. {label}"), style),
     ])
-}
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
-    }
 }
 
 #[cfg(test)]

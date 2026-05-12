@@ -590,8 +590,7 @@ impl Transport for AnthropicTransport {
         let message = parse_anthropic_response(&response)?;
         let usage = response["usage"].as_object().map(|usage| {
             let usage_value = serde_json::Value::Object(usage.clone());
-            let (cached_input_tokens, cache_creation_tokens) =
-                normalize_cache_tokens(&usage_value);
+            let (cached_input_tokens, cache_creation_tokens) = normalize_cache_tokens(&usage_value);
             UsageData {
                 prompt_tokens: usage
                     .get("input_tokens")

@@ -49,14 +49,10 @@ fn extract_patch_filenames(patch: &str) -> Vec<String> {
     files
 }
 
-/// Truncate a string to at most `max` characters, appending "..." if truncated.
+/// Truncate to at most `max` characters total, with "..." suffix when
+/// truncation occurs. UTF-8 safe.
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
-        format!("{truncated}...")
-    }
+    cortex::truncate::truncate_to_width_with(s, max, "...")
 }
 
 /// Truncate a `/`-separated path so the trailing segment (filename) stays

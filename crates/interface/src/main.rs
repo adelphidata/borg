@@ -58,6 +58,7 @@ mod onboarding_tui;
 mod openrouter_catalog;
 mod plugins;
 mod repl;
+mod terminal_guard;
 mod tui;
 
 #[derive(Parser)]

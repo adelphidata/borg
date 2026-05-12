@@ -32,7 +32,7 @@ static SERIAL: Mutex<()> = Mutex::new(());
 
 async fn make_channel(socket: &Path) -> Channel {
     let p = socket.to_path_buf();
-    Endpoint::try_from("http://[::]:50051")
+    Endpoint::try_from(protocols::TONIC_UDS_PLACEHOLDER_URL)
         .unwrap()
         .connect_with_connector(service_fn(move |_: Uri| {
             let p = p.clone();
