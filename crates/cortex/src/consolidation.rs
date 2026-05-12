@@ -20,9 +20,9 @@ pub const SETTING_LAST_NIGHTLY: &str = "consolidation.last_nightly";
 pub const SETTING_LAST_WEEKLY: &str = "consolidation.last_weekly";
 
 pub(crate) const CONSOLIDATION_TOOLS: &[&str] = &[
-    crate::tool_names::WRITE_MEMORY,
-    crate::tool_names::READ_MEMORY,
-    crate::tool_names::MEMORY_SEARCH,
+    crate::tool::names::WRITE_MEMORY,
+    crate::tool::names::READ_MEMORY,
+    crate::tool::names::MEMORY_SEARCH,
 ];
 const NIGHTLY_PROMPT: &str = "Review today's sessions and extract durable information into long-term memory. \
 For each piece of information: APPEND to an existing topic if relevant, CREATE a new topic, or SKIP if already captured. \

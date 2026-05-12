@@ -659,6 +659,7 @@ mod tests {
     fn provider_needs_key_helper() {
         assert!(provider_needs_key("openrouter"));
         assert!(provider_needs_key("anthropic"));
+        assert!(!provider_needs_key("bedrock"));
         assert!(!provider_needs_key("ollama"));
         assert!(!provider_needs_key("claude-cli"));
     }

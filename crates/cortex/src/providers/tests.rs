@@ -131,6 +131,7 @@ fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
     for p in [
         Provider::OpenAi,
         Provider::Anthropic,
+        Provider::Bedrock,
         Provider::Gemini,
         Provider::Groq,
         Provider::DeepSeek,

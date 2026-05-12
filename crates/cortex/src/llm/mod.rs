@@ -3,7 +3,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use futures_util::{FutureExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -96,6 +97,7 @@ const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 
 mod anthropic;
 pub mod aux_model_picker;
+pub(crate) mod bedrock;
 mod cost;
 pub mod credential_pool;
 pub mod credential_sources;
@@ -472,13 +474,18 @@ impl LlmClient {
         // Try to build the primary credential pool. Best-effort: falls back
         // to legacy rotation when the DB is unreachable (tests, headless
         // embedded usage, first-boot before borgd has stamped a DB file).
-        let primary_pool = credential_pool::try_build_from_keys(
-            provider,
-            keys,
-            config.llm.credential_strategy,
-            config.llm.credential_cooldown_secs,
-            config.llm.max_concurrent_per_credential,
-        );
+        let primary_pool = provider
+            .supports_credential_pool()
+            .then(|| {
+                credential_pool::try_build_from_keys(
+                    provider,
+                    keys.clone(),
+                    config.llm.credential_strategy,
+                    config.llm.credential_cooldown_secs,
+                    config.llm.max_concurrent_per_credential,
+                )
+            })
+            .flatten();
 
         // Build provider-level failover slots
         let mut provider_slots = Vec::new();
@@ -704,13 +711,18 @@ impl LlmClient {
             bail!("No API keys found for fallback provider {provider}");
         }
 
-        let pool = credential_pool::try_build_from_keys(
-            provider,
-            slot_keys.clone(),
-            config.llm.credential_strategy,
-            config.llm.credential_cooldown_secs,
-            config.llm.max_concurrent_per_credential,
-        );
+        let pool = provider
+            .supports_credential_pool()
+            .then(|| {
+                credential_pool::try_build_from_keys(
+                    provider,
+                    slot_keys.clone(),
+                    config.llm.credential_strategy,
+                    config.llm.credential_cooldown_secs,
+                    config.llm.max_concurrent_per_credential,
+                )
+            })
+            .flatten();
 
         Ok(ProviderSlot {
             provider,
@@ -815,6 +827,97 @@ impl LlmClient {
                 }
             }
             crate::sse::SseAction::Continue | crate::sse::SseAction::Error(_) => {}
+        }
+    }
+
+    async fn process_bedrock_stream<S, B, E, F>(
+        mut stream: S,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+        chunk_timeout_secs: u64,
+        max_buffer: usize,
+        mut parse_payload: F,
+    ) -> std::result::Result<(), LlmError>
+    where
+        S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+        B: AsRef<[u8]>,
+        E: std::fmt::Display,
+        F: FnMut(&[u8]) -> crate::sse::SseAction,
+    {
+        let mut buffer = Vec::new();
+
+        loop {
+            let chunk = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(StreamEvent::Done).await;
+                    return Ok(());
+                }
+                maybe_chunk = async {
+                    if chunk_timeout_secs > 0 {
+                        tokio::time::timeout(
+                            Duration::from_secs(chunk_timeout_secs),
+                            stream.next(),
+                        ).await
+                    } else {
+                        Ok(stream.next().await)
+                    }
+                } => {
+                    match maybe_chunk {
+                        Ok(Some(Ok(c))) => c,
+                        Ok(Some(Err(e))) => {
+                            return Err(LlmError::Retryable {
+                                source: anyhow::anyhow!("Bedrock stream read error: {e}"),
+                                retry_after: None,
+                                reason: FailoverReason::Timeout,
+                            });
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(StreamEvent::Done).await;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            return Err(LlmError::Retryable {
+                                source: anyhow::anyhow!("No Bedrock stream data received for {chunk_timeout_secs}s"),
+                                retry_after: None,
+                                reason: FailoverReason::Timeout,
+                            });
+                        }
+                    }
+                }
+            };
+
+            buffer.extend_from_slice(chunk.as_ref());
+            if buffer.len() > max_buffer {
+                return Err(LlmError::Retryable {
+                    source: anyhow::anyhow!("Bedrock stream buffer exceeded {max_buffer} bytes"),
+                    retry_after: None,
+                    reason: FailoverReason::Overloaded,
+                });
+            }
+
+            while let Some(payload) =
+                crate::llm::bedrock::try_take_eventstream_payload(&mut buffer)?
+            {
+                match parse_payload(&payload) {
+                    crate::sse::SseAction::Continue => {}
+                    crate::sse::SseAction::Emit(events) => {
+                        for event in events {
+                            if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    crate::sse::SseAction::Done(events) => {
+                        for event in events {
+                            if tx.send(event).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                        return Ok(());
+                    }
+                    crate::sse::SseAction::Error(e) => return Err(e),
+                }
+            }
         }
     }
 
@@ -1037,6 +1140,9 @@ impl LlmClient {
                 let result = if matches!(self.provider, Provider::ClaudeCli) {
                     self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
                         .await
+                } else if matches!(self.provider, Provider::Bedrock) {
+                    self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
+                        .await
                 } else if self.provider.is_openai_compatible() {
                     self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
                         .await
@@ -1189,7 +1295,9 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
-        if self.provider.is_openai_compatible() {
+        if self.provider == Provider::Bedrock {
+            self.chat_bedrock(messages, tools).await
+        } else if self.provider.is_openai_compatible() {
             self.chat_openai(messages, tools).await
         } else {
             self.chat_anthropic(messages, tools).await
@@ -1201,22 +1309,73 @@ impl LlmClient {
     #[instrument(skip_all, fields(llm.provider = %self.provider))]
     async fn send_request(
         &self,
+        url: &str,
         body: &impl Serialize,
         cancel: &CancellationToken,
     ) -> std::result::Result<reqwest::Response, LlmError> {
         let timeout = Duration::from_millis(self.llm_config.request_timeout_ms);
 
-        let fut =
-            self.client
-                .post(self.effective_base_url().as_ref())
+        let request_url = url.to_string();
+        let body_bytes = serde_json::to_vec(body).map_err(|e| LlmError::Fatal {
+            source: anyhow::anyhow!("serialize request body: {e}"),
+            reason: FailoverReason::Format,
+        })?;
+        let fut = if self.provider == Provider::Bedrock {
+            let client = self.client.clone();
+            let region_hint = self.llm_config.bedrock_region.clone();
+            async move {
+                let (region, credentials) =
+                    crate::llm::bedrock::load_region_and_credentials(region_hint.as_deref())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("resolve AWS credentials for Bedrock: {e}"))?;
+                let parsed_url = url::Url::parse(&request_url).context("parse Bedrock URL hint")?;
+                let path = parsed_url.path().to_string();
+                let final_url = format!("https://bedrock-runtime.{region}.amazonaws.com{path}");
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::CONTENT_TYPE,
+                    reqwest::header::HeaderValue::from_static("application/json"),
+                );
+                headers.insert(
+                    reqwest::header::ACCEPT,
+                    reqwest::header::HeaderValue::from_static(
+                        if path.ends_with("/converse-stream") {
+                            "application/vnd.amazon.eventstream"
+                        } else {
+                            "application/json"
+                        },
+                    ),
+                );
+                if path.ends_with("/converse-stream") {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_static("x-amzn-bedrock-accept"),
+                        reqwest::header::HeaderValue::from_static("application/json"),
+                    );
+                }
+                let request = crate::llm::bedrock::signed_request(
+                    &client,
+                    &final_url,
+                    &body_bytes,
+                    &region,
+                    &credentials,
+                    headers,
+                )?;
+                client.execute(request).await.map_err(anyhow::Error::from)
+            }
+            .boxed()
+        } else {
+            let builder = self
+                .client
+                .post(request_url)
                 .headers(self.provider.build_headers(&self.api_key).map_err(|e| {
                     LlmError::Fatal {
                         source: e,
                         reason: FailoverReason::Unknown,
                     }
                 })?)
-                .json(body)
-                .send();
+                .body(body_bytes);
+            async move { builder.send().await.map_err(anyhow::Error::from) }.boxed()
+        };
 
         let response = tokio::select! {
             _ = cancel.cancelled() => {
@@ -1297,6 +1456,16 @@ impl LlmClient {
     ) -> std::result::Result<(), LlmError> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
+        let request_url = if self.provider == Provider::Bedrock {
+            transport
+                .endpoint(&request, true)
+                .map_err(|e| LlmError::Fatal {
+                    source: anyhow::anyhow!("build {} endpoint: {e}", transport.protocol_name()),
+                    reason: FailoverReason::Format,
+                })?
+        } else {
+            self.effective_base_url().into_owned()
+        };
         let body = transport.build_streaming_request(&request)?;
 
         debug!(
@@ -1319,14 +1488,14 @@ impl LlmClient {
             req_id = %req_id,
             provider = %self.provider,
             model = %model,
-            base_url = %self.effective_base_url(),
+            base_url = %request_url,
             msg_count = messages.len(),
             tool_count = tools.map(<[ToolDefinition]>::len).unwrap_or(0),
             "{}: request start",
             transport.protocol_name()
         );
 
-        let response = match self.send_request(&body, cancel).await {
+        let response = match self.send_request(&request_url, &body, cancel).await {
             Ok(r) => {
                 lc_log!(
                     verbose,
@@ -1357,24 +1526,56 @@ impl LlmClient {
         let mut line_count: u64 = 0;
         let mut last_usage: Option<UsageData> = None;
 
-        let result = crate::sse::process_sse_stream(
-            stream,
-            tx,
-            cancel,
-            self.llm_config.stream_chunk_timeout_secs,
-            MAX_SSE_BUFFER,
-            |line| {
-                if first_byte_ms.is_none() {
-                    first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
-                }
-                line_count += 1;
-                let action =
-                    transport.parse_stream_line(line, &provider_str, &model_str, &mut state);
-                Self::maybe_capture_usage_from_action(&action, &mut last_usage);
-                action
-            },
-        )
-        .await;
+        let result = match transport.stream_protocol() {
+            transport::StreamProtocol::Sse => {
+                crate::sse::process_sse_stream(
+                    stream,
+                    tx,
+                    cancel,
+                    self.llm_config.stream_chunk_timeout_secs,
+                    MAX_SSE_BUFFER,
+                    |line| {
+                        if first_byte_ms.is_none() {
+                            first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                        }
+                        line_count += 1;
+                        let action = transport.parse_stream_line(
+                            line,
+                            &provider_str,
+                            &model_str,
+                            &mut state,
+                        );
+                        Self::maybe_capture_usage_from_action(&action, &mut last_usage);
+                        action
+                    },
+                )
+                .await
+            }
+            transport::StreamProtocol::AwsEventStream => {
+                Self::process_bedrock_stream(
+                    stream,
+                    tx,
+                    cancel,
+                    self.llm_config.stream_chunk_timeout_secs,
+                    MAX_SSE_BUFFER,
+                    |payload| {
+                        if first_byte_ms.is_none() {
+                            first_byte_ms = Some(lc_start.elapsed().as_millis() as u64);
+                        }
+                        line_count += 1;
+                        let action = transport.parse_stream_payload(
+                            payload,
+                            &provider_str,
+                            &model_str,
+                            &mut state,
+                        );
+                        Self::maybe_capture_usage_from_action(&action, &mut last_usage);
+                        action
+                    },
+                )
+                .await
+            }
+        };
 
         match &result {
             Ok(()) => lc_log!(
@@ -1410,6 +1611,11 @@ impl LlmClient {
     ) -> Result<Message> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
+        let request_url = if self.provider == Provider::Bedrock {
+            transport.endpoint(&request, false)?
+        } else {
+            self.effective_base_url().into_owned()
+        };
         let body = transport.build_chat_request(&request)?;
         let max_retries = self.llm_config.max_retries;
         let initial_delay = Duration::from_millis(self.llm_config.initial_retry_delay_ms);
@@ -1418,7 +1624,7 @@ impl LlmClient {
         let request_model = self.llm_config.model.clone();
 
         for attempt in 0..=max_retries {
-            match self.send_request(&body, &cancel).await {
+            match self.send_request(&request_url, &body, &cancel).await {
                 Ok(response) => {
                     let response_json: serde_json::Value = response.json().await?;
                     let parsed = transport.parse_chat_response(
@@ -1606,6 +1812,34 @@ impl LlmClient {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
         self.chat_http_transport_inner(transport::anthropic_transport(), messages, tools)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "bedrock"))]
+    async fn stream_chat_bedrock_inner(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), LlmError> {
+        self.stream_http_transport_inner(
+            transport::bedrock_transport(),
+            messages,
+            tools,
+            tx,
+            cancel,
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "bedrock"))]
+    async fn chat_bedrock(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        self.chat_http_transport_inner(transport::bedrock_transport(), messages, tools)
             .await
     }
 }

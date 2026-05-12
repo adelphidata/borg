@@ -338,7 +338,10 @@ impl OnboardingState {
         let Ok(provider) = Provider::from_str(provider_id) else {
             return false;
         };
-        // Keyless providers: check if server is reachable instead of API key
+        if provider.uses_aws_credential_chain() {
+            return true;
+        }
+        // Keyless local providers: check if server is reachable instead of API key
         if !provider.requires_api_key() {
             return Provider::ollama_available();
         }
@@ -393,7 +396,9 @@ impl OnboardingState {
     /// Whether the selected provider needs an API key.
     fn selected_provider_needs_key(&self) -> bool {
         let (id, _, _) = PROVIDERS[self.provider_index];
-        id != "ollama"
+        Provider::from_str(id)
+            .map(|provider| provider.requires_api_key())
+            .unwrap_or(true)
     }
 
     fn build_result(&self) -> OnboardingResult {
@@ -1866,6 +1871,16 @@ mod tests {
             .unwrap();
         state.provider_index = ollama_idx;
         assert!(!state.selected_provider_needs_key());
+
+        let bedrock_idx = PROVIDERS
+            .iter()
+            .position(|(id, _, _)| *id == "bedrock")
+            .unwrap();
+        state.provider_index = bedrock_idx;
+        assert!(
+            !state.selected_provider_needs_key(),
+            "bedrock uses the AWS chain, not an API key prompt"
+        );
     }
 
     #[test]

@@ -115,6 +115,7 @@ fn builtin_from_id(id: &str) -> Option<Provider> {
     match id.to_ascii_lowercase().as_str() {
         "openai" => Some(Provider::OpenAi),
         "anthropic" => Some(Provider::Anthropic),
+        "bedrock" => Some(Provider::Bedrock),
         "gemini" => Some(Provider::Gemini),
         "deepseek" => Some(Provider::DeepSeek),
         "groq" => Some(Provider::Groq),

@@ -16,6 +16,7 @@ pub enum Provider {
     OpenRouter,
     OpenAi,
     Anthropic,
+    Bedrock,
     Gemini,
     DeepSeek,
     Groq,
@@ -37,12 +38,31 @@ pub enum Provider {
 }
 
 impl Provider {
+    /// How this provider obtains request credentials.
+    pub fn auth_kind(&self) -> ProviderAuthKind {
+        match self {
+            Provider::Ollama | Provider::ClaudeCli => ProviderAuthKind::None,
+            Provider::Bedrock => ProviderAuthKind::AwsCredentialChain,
+            Provider::OpenRouter
+            | Provider::OpenAi
+            | Provider::Anthropic
+            | Provider::Gemini
+            | Provider::DeepSeek
+            | Provider::Groq
+            | Provider::ClaudeCodeOAuth
+            | Provider::CodexOAuth
+            | Provider::CopilotOAuth
+            | Provider::Custom => ProviderAuthKind::ApiKeyLike,
+        }
+    }
+
     /// API base URL for this provider.
     pub fn base_url(&self) -> &'static str {
         match self {
             Provider::OpenRouter => "https://openrouter.ai/api/v1/chat/completions",
             Provider::OpenAi => "https://api.openai.com/v1/chat/completions",
             Provider::Anthropic => "https://api.anthropic.com/v1/messages",
+            Provider::Bedrock => "",
             Provider::Gemini => {
                 "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
             }
@@ -66,6 +86,7 @@ impl Provider {
             Provider::OpenRouter => "OPENROUTER_API_KEY",
             Provider::OpenAi => "OPENAI_API_KEY",
             Provider::Anthropic => "ANTHROPIC_API_KEY",
+            Provider::Bedrock => "",
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Groq => "GROQ_API_KEY",
@@ -82,14 +103,27 @@ impl Provider {
 
     /// Whether this provider requires an API key.
     pub fn requires_api_key(&self) -> bool {
-        !matches!(self, Provider::Ollama | Provider::ClaudeCli)
+        self.auth_kind() == ProviderAuthKind::ApiKeyLike
+    }
+
+    /// Whether this provider uses the AWS default credential chain.
+    pub fn uses_aws_credential_chain(&self) -> bool {
+        self.auth_kind() == ProviderAuthKind::AwsCredentialChain
+    }
+
+    /// Whether this provider participates in the API-key credential pool.
+    pub fn supports_credential_pool(&self) -> bool {
+        self.auth_kind() == ProviderAuthKind::ApiKeyLike
     }
 
     /// Whether this provider uses the OpenAI-compatible chat completions format.
     pub fn is_openai_compatible(&self) -> bool {
         !matches!(
             self,
-            Provider::Anthropic | Provider::ClaudeCli | Provider::ClaudeCodeOAuth
+            Provider::Anthropic
+                | Provider::Bedrock
+                | Provider::ClaudeCli
+                | Provider::ClaudeCodeOAuth
         )
     }
 
@@ -104,7 +138,7 @@ impl Provider {
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
         match self {
-            Provider::Ollama | Provider::ClaudeCli => {
+            Provider::Ollama | Provider::ClaudeCli | Provider::Bedrock => {
                 // No authentication needed for local providers
             }
             Provider::OpenRouter => {
@@ -178,6 +212,7 @@ impl Provider {
                 .strip_prefix("anthropic/")
                 .unwrap_or(model)
                 .to_string(),
+            Provider::Bedrock => model.to_string(),
             Provider::Gemini => model.strip_prefix("google/").unwrap_or(model).to_string(),
             Provider::DeepSeek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
             Provider::Groq => model.strip_prefix("groq/").unwrap_or(model).to_string(),
@@ -228,6 +263,7 @@ impl Provider {
         match self {
             // All Claude 3+ models support vision; only older/embedding models don't
             Provider::Anthropic => !m.contains("claude-2") && !m.contains("claude-instant"),
+            Provider::Bedrock => !m.contains("claude-2") && !m.contains("claude-instant"),
             // Most modern OpenAI models support vision
             Provider::OpenAi => {
                 !m.contains("gpt-3.5")
@@ -275,6 +311,7 @@ impl Provider {
             Provider::OpenRouter => "openrouter",
             Provider::OpenAi => "openai",
             Provider::Anthropic => "anthropic",
+            Provider::Bedrock => "bedrock",
             Provider::Gemini => "gemini",
             Provider::DeepSeek => "deepseek",
             Provider::Groq => "groq",
@@ -338,6 +375,7 @@ impl FromStr for Provider {
             "openrouter" => Ok(Provider::OpenRouter),
             "openai" => Ok(Provider::OpenAi),
             "anthropic" => Ok(Provider::Anthropic),
+            "bedrock" => Ok(Provider::Bedrock),
             "gemini" => Ok(Provider::Gemini),
             "deepseek" => Ok(Provider::DeepSeek),
             "groq" => Ok(Provider::Groq),
@@ -350,10 +388,17 @@ impl FromStr for Provider {
             "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
             "custom" => Ok(Provider::Custom),
             _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, gemini, deepseek, groq, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
+                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthKind {
+    ApiKeyLike,
+    AwsCredentialChain,
+    None,
 }
 
 #[cfg(test)]
@@ -366,6 +411,7 @@ mod tests {
             Provider::OpenRouter,
             Provider::OpenAi,
             Provider::Anthropic,
+            Provider::Bedrock,
             Provider::Gemini,
             Provider::DeepSeek,
             Provider::Groq,
@@ -438,6 +484,7 @@ mod tests {
         assert!(Provider::CodexOAuth.is_openai_compatible());
         assert!(Provider::CopilotOAuth.is_openai_compatible());
         assert!(Provider::Custom.is_openai_compatible());
+        assert!(!Provider::Bedrock.is_openai_compatible());
     }
 
     #[test]
@@ -464,6 +511,13 @@ mod tests {
         assert!(Provider::from_str("unknown").is_err());
     }
 
+    #[test]
+    fn bedrock_uses_aws_chain_not_api_key_pool() {
+        assert!(Provider::Bedrock.uses_aws_credential_chain());
+        assert!(!Provider::Bedrock.requires_api_key());
+        assert!(!Provider::Bedrock.supports_credential_pool());
+    }
+
     // detect_from_env / from_env_var_name were removed along with provider auto-detection.
     // Provider is now strictly sourced from `Config.llm.provider` (set via onboarding,
     // `/settings`, or `borg settings set llm.provider <name>`). See config::resolve_provider.
@@ -477,6 +531,10 @@ mod tests {
         assert_eq!(
             Provider::Anthropic.normalize_model("anthropic/claude-sonnet-4"),
             "claude-sonnet-4"
+        );
+        assert_eq!(
+            Provider::Bedrock.normalize_model("anthropic.claude-3-7-sonnet-20250219-v1:0"),
+            "anthropic.claude-3-7-sonnet-20250219-v1:0"
         );
         assert_eq!(
             Provider::Gemini.normalize_model("google/gemini-2.5-pro"),
@@ -505,6 +563,10 @@ mod tests {
         assert_eq!(
             Provider::Anthropic.normalize_model("claude-sonnet-4"),
             "claude-sonnet-4"
+        );
+        assert_eq!(
+            Provider::Bedrock.normalize_model("anthropic.claude-3-7-sonnet-20250219-v1:0"),
+            "anthropic.claude-3-7-sonnet-20250219-v1:0"
         );
         assert_eq!(
             Provider::DeepSeek.normalize_model("deepseek-chat"),

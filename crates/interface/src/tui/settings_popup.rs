@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use super::custom_terminal::Frame;
@@ -93,9 +94,20 @@ fn visible_entries(config: &Config) -> Vec<&'static SettingEntry> {
     let slack_on = config
         .resolve_credential_or_env("SLACK_BOT_TOKEN")
         .is_some();
+    let provider = config
+        .llm
+        .provider
+        .as_deref()
+        .and_then(|id| cortex::provider::Provider::from_str(id).ok());
+    let provider_uses_api_key = provider
+        .map(|provider| provider.requires_api_key())
+        .unwrap_or(true);
+    let provider_is_bedrock = matches!(provider, Some(cortex::provider::Provider::Bedrock));
     TUI_SETTINGS
         .iter()
         .filter(|e| match e.key {
+            "llm.api_key" | "llm.api_key_env" => provider_uses_api_key,
+            "llm.bedrock_region" => provider_is_bedrock,
             "gateway.signal_cli_host" | "gateway.signal_cli_port" => signal_on,
             "gateway.discord_guild_allowlist" => discord_on,
             "gateway.slack_channel_allowlist" => slack_on,
@@ -986,6 +998,7 @@ mod tests {
     /// Mirrors `SettingsPopup::show` minus the `refresh_customized_keys` RPC.
     fn open(popup: &mut SettingsPopup, cfg: &Config) {
         popup.visible = true;
+        popup.entries = visible_entries(cfg);
         popup.selected = 0;
         popup.mode = EditMode::Browsing;
         popup.status_message = None;
@@ -1132,6 +1145,26 @@ mod tests {
             let val = popup.current_value(&cfg, entry.key);
             assert_ne!(val, "?", "missing current_value for {}", entry.key);
         }
+    }
+
+    #[test]
+    fn bedrock_visibility_hides_api_key_rows_and_shows_region() {
+        let mut cfg = Config::default();
+        cfg.llm.provider = Some("bedrock".to_string());
+        let entries = visible_entries(&cfg);
+        assert!(entries.iter().any(|e| e.key == "llm.bedrock_region"));
+        assert!(!entries.iter().any(|e| e.key == "llm.api_key"));
+        assert!(!entries.iter().any(|e| e.key == "llm.api_key_env"));
+    }
+
+    #[test]
+    fn api_key_providers_hide_bedrock_region_row() {
+        let mut cfg = Config::default();
+        cfg.llm.provider = Some("openrouter".to_string());
+        let entries = visible_entries(&cfg);
+        assert!(!entries.iter().any(|e| e.key == "llm.bedrock_region"));
+        assert!(entries.iter().any(|e| e.key == "llm.api_key"));
+        assert!(entries.iter().any(|e| e.key == "llm.api_key_env"));
     }
 
     #[test]

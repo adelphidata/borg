@@ -51,6 +51,7 @@ impl From<Provider> for ProviderCategory {
             Provider::OpenRouter
             | Provider::OpenAi
             | Provider::Anthropic
+            | Provider::Bedrock
             | Provider::Gemini
             | Provider::DeepSeek
             | Provider::Groq

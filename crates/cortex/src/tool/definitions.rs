@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::tool_names;
+use crate::tool::names as tool_names;
 use crate::types::ToolDefinition;
 
 /// Build the core tool definitions sent to the LLM.

@@ -105,7 +105,7 @@ impl Agent {
         ];
 
         // Build the full tool list including multi-agent tools when available
-        let mut defs = crate::tool_definitions::core_tool_definitions(&self.config);
+        let mut defs = crate::tool::definitions::core_tool_definitions(&self.config);
         if self.agent_control.is_some() {
             defs.extend(crate::multi_agent::tools::tool_definitions(
                 self.spawn_depth,

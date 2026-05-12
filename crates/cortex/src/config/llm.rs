@@ -83,6 +83,10 @@ pub struct LlmConfig {
     /// Override the provider's default API URL (e.g., for Ollama on a remote host, Azure OpenAI, or proxies).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// AWS Bedrock region override. When unset, Borg falls back to the
+    /// standard AWS region chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, profile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bedrock_region: Option<String>,
     /// Provider-level failover chain (tried in order when primary provider fails).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<LlmFallback>,
@@ -284,6 +288,7 @@ impl Default for LlmConfig {
             request_timeout_ms: DEFAULT_LLM_REQUEST_TIMEOUT_MS,
             stream_chunk_timeout_secs: DEFAULT_LLM_STREAM_CHUNK_TIMEOUT_SECS,
             base_url: None,
+            bedrock_region: None,
             fallback: Vec::new(),
             aux: None,
             thinking: ThinkingLevel::Off,

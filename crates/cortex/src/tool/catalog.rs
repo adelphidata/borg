@@ -41,39 +41,39 @@ pub enum ToolGroup {
 /// are dispatched through their own typed [`crate::tool::Tool`] variants.
 const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     // Memory
-    (crate::tool_names::WRITE_MEMORY, ToolGroup::Memory),
-    (crate::tool_names::READ_MEMORY, ToolGroup::Memory),
-    (crate::tool_names::MEMORY_SEARCH, ToolGroup::Memory),
+    (crate::tool::names::WRITE_MEMORY, ToolGroup::Memory),
+    (crate::tool::names::READ_MEMORY, ToolGroup::Memory),
+    (crate::tool::names::MEMORY_SEARCH, ToolGroup::Memory),
     // Filesystem
-    (crate::tool_names::APPLY_PATCH, ToolGroup::Fs),
-    (crate::tool_names::READ_FILE, ToolGroup::Fs),
-    (crate::tool_names::LIST_DIR, ToolGroup::Fs),
+    (crate::tool::names::APPLY_PATCH, ToolGroup::Fs),
+    (crate::tool::names::READ_FILE, ToolGroup::Fs),
+    (crate::tool::names::LIST_DIR, ToolGroup::Fs),
     // Runtime
-    (crate::tool_names::RUN_SHELL, ToolGroup::Runtime),
+    (crate::tool::names::RUN_SHELL, ToolGroup::Runtime),
     // Discovery
-    (crate::tool_names::LIST, ToolGroup::Discovery),
-    (crate::tool_names::REQUEST_USER_INPUT, ToolGroup::Discovery),
+    (crate::tool::names::LIST, ToolGroup::Discovery),
+    (crate::tool::names::REQUEST_USER_INPUT, ToolGroup::Discovery),
     // Web
-    (crate::tool_names::WEB_FETCH, ToolGroup::Web),
-    (crate::tool_names::WEB_SEARCH, ToolGroup::Web),
+    (crate::tool::names::WEB_FETCH, ToolGroup::Web),
+    (crate::tool::names::WEB_SEARCH, ToolGroup::Web),
     // UI
-    (crate::tool_names::BROWSER, ToolGroup::Ui),
+    (crate::tool::names::BROWSER, ToolGroup::Ui),
     // Scheduling
-    (crate::tool_names::SCHEDULE, ToolGroup::Scheduling),
+    (crate::tool::names::SCHEDULE, ToolGroup::Scheduling),
     // Media
-    (crate::tool_names::GENERATE_IMAGE, ToolGroup::Media),
-    (crate::tool_names::TEXT_TO_SPEECH, ToolGroup::Media),
+    (crate::tool::names::GENERATE_IMAGE, ToolGroup::Media),
+    (crate::tool::names::TEXT_TO_SPEECH, ToolGroup::Media),
     // Integration (skill-driven; not dispatched by the agent loop directly)
-    (crate::tool_names::GMAIL, ToolGroup::Integration),
-    (crate::tool_names::GOOGLE_CALENDAR, ToolGroup::Integration),
-    (crate::tool_names::NOTION, ToolGroup::Integration),
-    (crate::tool_names::LINEAR, ToolGroup::Integration),
+    (crate::tool::names::GMAIL, ToolGroup::Integration),
+    (crate::tool::names::GOOGLE_CALENDAR, ToolGroup::Integration),
+    (crate::tool::names::NOTION, ToolGroup::Integration),
+    (crate::tool::names::LINEAR, ToolGroup::Integration),
     // Agents
-    (crate::tool_names::SPAWN_AGENT, ToolGroup::Agents),
-    (crate::tool_names::SEND_TO_AGENT, ToolGroup::Agents),
-    (crate::tool_names::WAIT_FOR_AGENT, ToolGroup::Agents),
-    (crate::tool_names::CLOSE_AGENT, ToolGroup::Agents),
-    (crate::tool_names::MANAGE_ROLES, ToolGroup::Agents),
+    (crate::tool::names::SPAWN_AGENT, ToolGroup::Agents),
+    (crate::tool::names::SEND_TO_AGENT, ToolGroup::Agents),
+    (crate::tool::names::WAIT_FOR_AGENT, ToolGroup::Agents),
+    (crate::tool::names::CLOSE_AGENT, ToolGroup::Agents),
+    (crate::tool::names::MANAGE_ROLES, ToolGroup::Agents),
 ];
 
 impl ToolGroup {
@@ -330,13 +330,13 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
 /// as primary themselves. Aliases are dispatched through their own typed
 /// [`crate::tool::Tool`] variants but participate in catalog filtering.
 const ALIAS_TOOLS: &[(&str, ToolGroup)] = &[
-    (crate::tool_names::APPLY_SKILL_PATCH, ToolGroup::Fs),
-    (crate::tool_names::CREATE_CHANNEL, ToolGroup::Fs),
-    (crate::tool_names::LIST_SKILLS, ToolGroup::Discovery),
-    (crate::tool_names::LIST_CHANNELS, ToolGroup::Discovery),
-    (crate::tool_names::LIST_AGENTS, ToolGroup::Discovery),
-    (crate::tool_names::MANAGE_TASKS, ToolGroup::Scheduling),
-    (crate::tool_names::MANAGE_CRON, ToolGroup::Scheduling),
+    (crate::tool::names::APPLY_SKILL_PATCH, ToolGroup::Fs),
+    (crate::tool::names::CREATE_CHANNEL, ToolGroup::Fs),
+    (crate::tool::names::LIST_SKILLS, ToolGroup::Discovery),
+    (crate::tool::names::LIST_CHANNELS, ToolGroup::Discovery),
+    (crate::tool::names::LIST_AGENTS, ToolGroup::Discovery),
+    (crate::tool::names::MANAGE_TASKS, ToolGroup::Scheduling),
+    (crate::tool::names::MANAGE_CRON, ToolGroup::Scheduling),
 ];
 
 /// Map a tool name to its group. Returns `None` for user-created tools.
@@ -740,7 +740,7 @@ mod tests {
     /// classify — and vice versa.
     #[test]
     fn tool_name_constants_match_catalog() {
-        use crate::tool_names;
+        use crate::tool::names as tool_names;
 
         let catalog_names: std::collections::HashSet<&str> = PRIMARY_TOOLS
             .iter()

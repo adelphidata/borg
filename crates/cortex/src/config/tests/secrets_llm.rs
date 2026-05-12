@@ -103,6 +103,90 @@ fn resolve_provider_prefers_secret_ref() {
 }
 
 #[test]
+fn resolve_provider_bedrock_uses_region_without_api_key() {
+    std::env::set_var("AWS_REGION", "us-west-2");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("bedrock".to_string());
+    let (provider, key) = cfg.resolve_provider().expect("bedrock should resolve");
+    assert_eq!(provider, Provider::Bedrock);
+    assert!(key.is_empty(), "bedrock must not require an API key");
+    std::env::remove_var("AWS_REGION");
+}
+
+#[test]
+fn resolve_provider_bedrock_errors_when_region_missing() {
+    std::env::remove_var("AWS_REGION");
+    std::env::remove_var("AWS_DEFAULT_REGION");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("bedrock".to_string());
+    let err = cfg
+        .resolve_provider()
+        .expect_err("missing region must error");
+    assert!(
+        err.to_string().contains("AWS region"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn resolve_bedrock_region_prefers_setting_over_env() {
+    std::env::set_var("AWS_REGION", "us-east-1");
+    let mut cfg = Config::default();
+    cfg.llm.bedrock_region = Some("eu-west-1".to_string());
+    let region = cfg.resolve_bedrock_region().expect("region resolves");
+    assert_eq!(region, "eu-west-1");
+    std::env::remove_var("AWS_REGION");
+}
+
+#[test]
+fn resolve_bedrock_region_reads_shared_aws_profile_config() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(temp.path().join(".aws")).expect("create .aws");
+    std::fs::write(
+        temp.path().join(".aws/config"),
+        "[profile bedrock]\nregion = ap-south-1\n",
+    )
+    .expect("write config");
+
+    let old_home = std::env::var("HOME").ok();
+    let old_profile = std::env::var("AWS_PROFILE").ok();
+    let old_region = std::env::var("AWS_REGION").ok();
+    let old_default_region = std::env::var("AWS_DEFAULT_REGION").ok();
+
+    std::env::set_var("HOME", temp.path());
+    std::env::set_var("AWS_PROFILE", "bedrock");
+    std::env::remove_var("AWS_REGION");
+    std::env::remove_var("AWS_DEFAULT_REGION");
+
+    let cfg = Config::default();
+    let region = cfg
+        .resolve_bedrock_region()
+        .expect("region should come from ~/.aws/config");
+    assert_eq!(region, "ap-south-1");
+
+    if let Some(home) = old_home {
+        std::env::set_var("HOME", home);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    if let Some(profile) = old_profile {
+        std::env::set_var("AWS_PROFILE", profile);
+    } else {
+        std::env::remove_var("AWS_PROFILE");
+    }
+    if let Some(region) = old_region {
+        std::env::set_var("AWS_REGION", region);
+    } else {
+        std::env::remove_var("AWS_REGION");
+    }
+    if let Some(region) = old_default_region {
+        std::env::set_var("AWS_DEFAULT_REGION", region);
+    } else {
+        std::env::remove_var("AWS_DEFAULT_REGION");
+    }
+}
+
+#[test]
 fn resolve_api_keys_overrides_openai_to_openrouter_when_key_is_openrouter() {
     let env = "BORG_TEST_MISMATCHED_KEY";
     std::env::set_var(env, "sk-or-v1-mismatched-key");

@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use crate::config::ToolPolicyConfig;
-use crate::tool_catalog::{tool_group, ToolGroup, ToolProfile};
+use crate::tool::catalog::{tool_group, ToolGroup, ToolProfile};
 use crate::types::ToolDefinition;
 
 /// Expand a policy entry like `"group:fs"` into individual tool names,

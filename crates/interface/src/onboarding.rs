@@ -43,6 +43,11 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ),
     ("openai", "OpenAI", "GPT models directly"),
     ("anthropic", "Anthropic", "Claude models via API key"),
+    (
+        "bedrock",
+        "AWS Bedrock",
+        "Claude models via the AWS credential chain",
+    ),
     ("gemini", "Gemini", "Google Gemini models directly"),
     ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
     ("groq", "Groq", "Ultra-fast inference"),
@@ -125,6 +130,21 @@ pub(crate) const GEMINI_MODELS: &[(&str, &str)] = &[
     ("gemini-2.5-flash", "Gemini 2.5 Flash (legacy)"),
 ];
 
+pub(crate) const BEDROCK_MODELS: &[(&str, &str)] = &[
+    (
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "Claude 3.7 Sonnet (recommended)",
+    ),
+    (
+        "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "Claude 3.5 Sonnet",
+    ),
+    (
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "Claude 3.5 Haiku (fast, cheap)",
+    ),
+];
+
 pub(crate) const DEEPSEEK_MODELS: &[(&str, &str)] = &[
     ("deepseek-chat", "DeepSeek Chat — V3.2 (recommended)"),
     ("deepseek-reasoner", "DeepSeek Reasoner — R1 (reasoning)"),
@@ -192,6 +212,7 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
     let hardcoded: &'static [(&'static str, &'static str)] = match provider_id {
         "openai" => OPENAI_MODELS,
         "anthropic" => ANTHROPIC_MODELS,
+        "bedrock" => BEDROCK_MODELS,
         "gemini" => GEMINI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
@@ -289,7 +310,7 @@ fn validate_model_id(model_id: &str) -> Result<()> {
     }
     if model_id
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | ':'))
     {
         Ok(())
     } else {
@@ -319,7 +340,9 @@ pub fn generate_config(
 
     let provider = Provider::from_str(provider_id)?;
 
-    let api_key_line = if !provider.requires_api_key() {
+    let api_key_line = if provider.uses_aws_credential_chain() {
+        "# Uses the AWS credential chain (env/profile/role)\n# bedrock_region = \"us-east-1\"  # uncomment to override AWS_REGION / AWS_DEFAULT_REGION".to_string()
+    } else if !provider.requires_api_key() {
         // Keyless providers (e.g., Ollama) — no API key config needed
         "# No API key required for local provider\n# base_url = \"http://localhost:11434/v1/chat/completions\"  # uncomment to override".to_string()
     } else if use_keychain {
@@ -1027,6 +1050,28 @@ mod tests {
     }
 
     #[test]
+    fn generate_config_bedrock_uses_region_comment_not_api_key() {
+        let model = "anthropic.claude-3-7-sonnet-20250219-v1:0";
+        let config = generate_config(model, "bedrock", "Mike", "Buddy", false).expect("valid");
+        assert!(config.contains("provider = \"bedrock\""));
+        assert!(config.contains(&format!("model = \"{model}\"")));
+        assert!(config.contains("bedrock_region = \"us-east-1\""));
+        assert!(!config.contains("api_key_env"));
+        assert!(!config.contains("api_key = {"));
+    }
+
+    #[test]
+    fn bedrock_models_non_empty_and_parseable() {
+        assert!(!BEDROCK_MODELS.is_empty());
+        for (id, _) in BEDROCK_MODELS {
+            assert!(
+                validate_model_id(id).is_ok(),
+                "invalid bedrock model id: {id}"
+            );
+        }
+    }
+
+    #[test]
     fn generate_config_ollama_keychain_still_no_api_key() {
         // Even with keychain flag, Ollama should skip API key config
         let config =
@@ -1059,6 +1104,12 @@ mod tests {
             assert!(
                 validate_model_id(id).is_ok(),
                 "deepseek model id invalid: {id}"
+            );
+        }
+        for (id, _) in BEDROCK_MODELS {
+            assert!(
+                validate_model_id(id).is_ok(),
+                "bedrock model id invalid: {id}"
             );
         }
         for (id, _) in GROQ_MODELS {

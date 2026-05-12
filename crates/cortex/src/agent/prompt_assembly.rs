@@ -283,7 +283,7 @@ Rules:
     }
 
     pub(super) fn build_tool_definitions(&self, user_message: &str) -> Vec<ToolDefinition> {
-        let mut tools = crate::tool_definitions::core_tool_definitions(&self.config);
+        let mut tools = crate::tool::definitions::core_tool_definitions(&self.config);
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(
                 self.spawn_depth,
@@ -301,19 +301,19 @@ Rules:
         // Apply tool policy filtering (profile + allow/deny)
         let policy = &self.config.tools.policy;
         if self.spawn_depth > 0 {
-            tools = crate::tool_policy::filter_subagent_tools(tools, policy);
+            tools = crate::tool::policy::filter_subagent_tools(tools, policy);
         } else {
-            tools = crate::tool_policy::filter_tools(tools, policy);
+            tools = crate::tool::policy::filter_tools(tools, policy);
         }
 
         // Conditional tool loading: exclude tool groups not relevant to the
         // current user message or recent tool usage. Saves 500-1500 tokens/turn.
         if self.config.tools.conditional_loading {
             let profile =
-                crate::tool_catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
+                crate::tool::catalog::ToolProfile::from_str_opt(&self.config.tools.policy.profile)
                     .unwrap_or_default();
             let profile_groups = profile.groups();
-            tools = crate::tool_catalog::filter_tools_by_relevance(
+            tools = crate::tool::catalog::filter_tools_by_relevance(
                 tools,
                 user_message,
                 &self.recent_tool_names,
@@ -324,7 +324,7 @@ Rules:
         // Compact tool schemas: strip redundant metadata to reduce token overhead.
         if self.config.tools.compact_schemas {
             for tool in &mut tools {
-                crate::tool_definitions::compact_tool_schema(&mut tool.function.parameters);
+                crate::tool::definitions::compact_tool_schema(&mut tool.function.parameters);
             }
         }
 

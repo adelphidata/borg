@@ -755,7 +755,7 @@ fn compute_tools_filter(
             // Without unioning multi-agent here, children would silently lose
             // access to e.g. `wait_for_agent` even if a caller deliberately
             // removed it from the blocklist — a confusing invariant to debug.
-            let mut parent_tools = crate::tool_definitions::core_tool_definitions(parent_config);
+            let mut parent_tools = crate::tool::definitions::core_tool_definitions(parent_config);
             parent_tools.extend(tools::tool_definitions(0, u32::MAX));
             let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
             let filtered: Vec<String> = parent_tools
@@ -1328,7 +1328,7 @@ mod tests {
         // `mutating_tool_names()`. If this test fails, a newly-added tool
         // is silently escaping Plan-mode's child blocklist.
         let parent = Config::default();
-        let mut all: Vec<String> = crate::tool_definitions::core_tool_definitions(&parent)
+        let mut all: Vec<String> = crate::tool::definitions::core_tool_definitions(&parent)
             .into_iter()
             .map(|t| t.function.name)
             .collect();

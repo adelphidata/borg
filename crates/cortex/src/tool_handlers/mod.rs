@@ -115,7 +115,7 @@ pub use user_input::{handle_request_user_input, handle_update_plan};
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::tool_definitions::core_tool_definitions;
+    use crate::tool::definitions::core_tool_definitions;
     use serde_json::json;
 
     // -- require_str_param --

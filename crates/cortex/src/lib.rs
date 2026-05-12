@@ -187,20 +187,11 @@ pub mod telemetry;
 pub mod template;
 /// Token estimation via tiktoken (cl100k_base BPE).
 pub mod tokenizer;
-/// Typed tool dispatch: closed `enum Tool` + per-variant `Args`.
-pub(crate) mod tool;
-/// Tool catalog for dynamic tool registration.
-pub mod tool_catalog;
-/// Core tool definitions sent to the LLM.
-pub mod tool_definitions;
-/// Tool-call effect classification and concurrent-grouping planner.
-pub mod tool_effects;
+/// Typed tool dispatch: closed `enum Tool` + per-variant `Args`. Also hosts
+/// catalog/definitions/effects/names/policy submodules (metadata siblings).
+pub mod tool;
 /// Tool execution dispatch and result handling.
 pub mod tool_handlers;
-/// Centralized tool name constants and dispatch macro.
-pub mod tool_names;
-/// Tool access policy (allow/deny lists, profiles).
-pub mod tool_policy;
 /// Text truncation with head+tail preservation.
 pub mod truncate;
 /// Text-to-speech integration.

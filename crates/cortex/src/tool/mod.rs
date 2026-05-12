@@ -22,8 +22,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::tool_catalog::ToolGroup;
-use crate::tool_names as tn;
+use catalog::ToolGroup;
+use names as tn;
+
+pub mod catalog;
+pub mod definitions;
+pub mod effects;
+pub mod names;
+pub mod policy;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;
@@ -310,7 +316,7 @@ impl Tool {
 
     /// The catalog group this tool belongs to.
     ///
-    /// The catalog uses raw-name lookup ([`crate::tool_catalog::tool_group`])
+    /// The catalog uses raw-name lookup ([`crate::tool::catalog::tool_group`])
     /// because alias names also need a group; this typed variant exists so a
     /// post-parse caller can reach the same answer without a string compare.
     #[allow(dead_code)]

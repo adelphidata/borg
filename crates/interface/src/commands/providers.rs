@@ -91,7 +91,7 @@ fn list() -> Result<()> {
     let rows = ProviderRow::list(db.conn())?;
     if rows.is_empty() {
         println!("No BYO providers configured.");
-        println!("(Built-ins openai, anthropic, gemini, deepseek, groq, openrouter, ollama, claude_cli are always available.)");
+        println!("(Built-ins openai, anthropic, bedrock, gemini, deepseek, groq, openrouter, ollama, claude_cli are always available.)");
         return Ok(());
     }
     println!(

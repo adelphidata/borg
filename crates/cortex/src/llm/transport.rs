@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
 
 use super::{
-    apply_message_cache_control, apply_openai_cache_markers, build_anthropic_messages,
-    build_cache_control_marker, classify_anthropic_stream_error, normalize_cache_tokens,
-    parse_anthropic_response, sanitize_openai_messages, supports_anthropic_cache_control,
-    ChatRequest, LlmConfig, LlmError, Message, Provider, Role, StreamChunk, StreamEvent,
-    StreamOptions, StreamUsage, ToolDefinition, UsageData, UsageOptions,
+    apply_message_cache_control, apply_openai_cache_markers, bedrock::url_for_model,
+    build_anthropic_messages, build_cache_control_marker, classify_anthropic_stream_error,
+    normalize_cache_tokens, parse_anthropic_response, sanitize_openai_messages,
+    supports_anthropic_cache_control, ChatRequest, LlmConfig, LlmError, Message, Provider, Role,
+    StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition, UsageData, UsageOptions,
 };
 use crate::llm_error::FailoverReason;
 
@@ -27,12 +27,25 @@ pub(crate) struct TransportResponse {
 pub(crate) enum StreamState {
     OpenAiCompat,
     Anthropic(AnthropicStreamState),
+    Bedrock(BedrockStreamState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamProtocol {
+    Sse,
+    AwsEventStream,
 }
 
 pub(crate) trait Transport: Sync {
     fn protocol_name(&self) -> &'static str;
 
     fn debug_request_label(&self) -> &'static str;
+
+    fn stream_protocol(&self) -> StreamProtocol {
+        StreamProtocol::Sse
+    }
+
+    fn endpoint(&self, request: &TransportRequest<'_>, stream: bool) -> Result<String>;
 
     fn build_streaming_request(
         &self,
@@ -51,6 +64,16 @@ pub(crate) trait Transport: Sync {
         state: &mut StreamState,
     ) -> crate::sse::SseAction;
 
+    fn parse_stream_payload(
+        &self,
+        _payload: &[u8],
+        _provider: &str,
+        _model: &str,
+        _state: &mut StreamState,
+    ) -> crate::sse::SseAction {
+        crate::sse::SseAction::Continue
+    }
+
     fn parse_chat_response(
         &self,
         response: serde_json::Value,
@@ -61,6 +84,7 @@ pub(crate) trait Transport: Sync {
 
 static OPENAI_COMPAT_TRANSPORT: OpenAiCompatTransport = OpenAiCompatTransport;
 static ANTHROPIC_TRANSPORT: AnthropicTransport = AnthropicTransport;
+static BEDROCK_TRANSPORT: BedrockTransport = BedrockTransport;
 
 pub(crate) fn openai_compat_transport() -> &'static dyn Transport {
     &OPENAI_COMPAT_TRANSPORT
@@ -68,6 +92,10 @@ pub(crate) fn openai_compat_transport() -> &'static dyn Transport {
 
 pub(crate) fn anthropic_transport() -> &'static dyn Transport {
     &ANTHROPIC_TRANSPORT
+}
+
+pub(crate) fn bedrock_transport() -> &'static dyn Transport {
+    &BEDROCK_TRANSPORT
 }
 
 pub(crate) fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
@@ -446,6 +474,12 @@ pub(crate) struct AnthropicStreamState {
     pending_cache_creation_tokens: u64,
 }
 
+#[derive(Default)]
+pub(crate) struct BedrockStreamState {
+    current_tool_index: usize,
+    current_block_is_tool: bool,
+}
+
 struct OpenAiCompatTransport;
 
 impl Transport for OpenAiCompatTransport {
@@ -455,6 +489,24 @@ impl Transport for OpenAiCompatTransport {
 
     fn debug_request_label(&self) -> &'static str {
         "request_openai"
+    }
+
+    fn endpoint(&self, request: &TransportRequest<'_>, _stream: bool) -> Result<String> {
+        Ok(match request.provider {
+            Provider::Gemini => super::normalize_gemini_base(
+                request
+                    .llm_config
+                    .base_url
+                    .as_deref()
+                    .unwrap_or(request.provider.base_url()),
+            )
+            .into_owned(),
+            _ => request
+                .llm_config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| request.provider.base_url().to_string()),
+        })
     }
 
     fn build_streaming_request(
@@ -542,6 +594,14 @@ impl Transport for AnthropicTransport {
         "request_anthropic"
     }
 
+    fn endpoint(&self, request: &TransportRequest<'_>, _stream: bool) -> Result<String> {
+        Ok(request
+            .llm_config
+            .base_url
+            .clone()
+            .unwrap_or_else(|| request.provider.base_url().to_string()))
+    }
+
     fn build_streaming_request(
         &self,
         request: &TransportRequest<'_>,
@@ -590,8 +650,7 @@ impl Transport for AnthropicTransport {
         let message = parse_anthropic_response(&response)?;
         let usage = response["usage"].as_object().map(|usage| {
             let usage_value = serde_json::Value::Object(usage.clone());
-            let (cached_input_tokens, cache_creation_tokens) =
-                normalize_cache_tokens(&usage_value);
+            let (cached_input_tokens, cache_creation_tokens) = normalize_cache_tokens(&usage_value);
             UsageData {
                 prompt_tokens: usage
                     .get("input_tokens")
@@ -618,6 +677,76 @@ impl Transport for AnthropicTransport {
         });
 
         Ok(TransportResponse { message, usage })
+    }
+}
+
+struct BedrockTransport;
+
+impl Transport for BedrockTransport {
+    fn protocol_name(&self) -> &'static str {
+        "bedrock"
+    }
+
+    fn debug_request_label(&self) -> &'static str {
+        "request_bedrock"
+    }
+
+    fn stream_protocol(&self) -> StreamProtocol {
+        StreamProtocol::AwsEventStream
+    }
+
+    fn endpoint(&self, request: &TransportRequest<'_>, stream: bool) -> Result<String> {
+        let region =
+            crate::llm::bedrock::resolve_region(request.llm_config.bedrock_region.as_deref())
+                .unwrap_or_else(|| "region-unresolved".to_string());
+        Ok(url_for_model(&region, request.model, stream))
+    }
+
+    fn build_streaming_request(
+        &self,
+        request: &TransportRequest<'_>,
+    ) -> std::result::Result<serde_json::Value, LlmError> {
+        Ok(build_bedrock_request(request))
+    }
+
+    fn build_chat_request(&self, request: &TransportRequest<'_>) -> Result<serde_json::Value> {
+        Ok(build_bedrock_request(request))
+    }
+
+    fn new_stream_state(&self) -> StreamState {
+        StreamState::Bedrock(BedrockStreamState::default())
+    }
+
+    fn parse_stream_line(
+        &self,
+        _line: &str,
+        _provider: &str,
+        _model: &str,
+        _state: &mut StreamState,
+    ) -> crate::sse::SseAction {
+        crate::sse::SseAction::Continue
+    }
+
+    fn parse_stream_payload(
+        &self,
+        payload: &[u8],
+        provider: &str,
+        model: &str,
+        state: &mut StreamState,
+    ) -> crate::sse::SseAction {
+        let StreamState::Bedrock(state) = state else {
+            return crate::sse::SseAction::Continue;
+        };
+        parse_bedrock_event_payload(payload, provider, model, state)
+    }
+
+    fn parse_chat_response(
+        &self,
+        response: serde_json::Value,
+        provider: &str,
+        model: &str,
+    ) -> Result<TransportResponse> {
+        parse_bedrock_chat_response(response, provider, model)
     }
 }
 
@@ -666,5 +795,585 @@ fn parse_usage_cost(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
         _ => None,
+    }
+}
+
+fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
+    let mut bedrock_messages = Vec::new();
+    let mut system_blocks = Vec::new();
+
+    for message in request.messages {
+        match message.role {
+            Role::System => {
+                if let Some(text) = message.text_content() {
+                    system_blocks.push(serde_json::json!({ "text": text }));
+                }
+            }
+            Role::User => {
+                let mut content = Vec::new();
+                append_bedrock_content(&mut content, message);
+                bedrock_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+            Role::Assistant => {
+                let mut content = Vec::new();
+                append_bedrock_content(&mut content, message);
+                if content.is_empty() {
+                    content.push(serde_json::json!({ "text": "" }));
+                }
+                bedrock_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content,
+                }));
+            }
+            Role::Tool => {
+                bedrock_messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "toolResult": {
+                            "toolUseId": message.tool_call_id.as_deref().unwrap_or(""),
+                            "content": [{ "text": message.text_content().unwrap_or("") }],
+                        }
+                    }],
+                }));
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "messages": bedrock_messages,
+        "inferenceConfig": {
+            "temperature": request.llm_config.temperature,
+            "maxTokens": request.llm_config.max_tokens,
+        },
+    });
+    if !system_blocks.is_empty() {
+        body["system"] = serde_json::json!(system_blocks);
+    }
+    if let Some(tools) = request.tools {
+        let tool_specs: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "toolSpec": {
+                        "name": tool.function.name,
+                        "description": tool.function.description,
+                        "inputSchema": {
+                            "json": tool.function.parameters,
+                        },
+                    }
+                })
+            })
+            .collect();
+        if !tool_specs.is_empty() {
+            body["toolConfig"] = serde_json::json!({ "tools": tool_specs });
+        }
+    }
+    body
+}
+
+fn append_bedrock_content(content: &mut Vec<serde_json::Value>, message: &Message) {
+    match &message.content {
+        Some(crate::types::MessageContent::Text(text)) => {
+            if !text.is_empty() {
+                content.push(serde_json::json!({ "text": text }));
+            }
+        }
+        Some(crate::types::MessageContent::Parts(parts)) => {
+            for part in parts {
+                match part {
+                    crate::types::ContentPart::Text(text) => {
+                        if !text.is_empty() {
+                            content.push(serde_json::json!({ "text": text }));
+                        }
+                    }
+                    crate::types::ContentPart::ImageBase64 { media } => {
+                        content.push(serde_json::json!({
+                            "image": {
+                                "format": media.mime_type.split('/').next_back().unwrap_or("png"),
+                                "source": { "bytes": media.data },
+                            }
+                        }));
+                    }
+                    crate::types::ContentPart::ImageUrl { url } => {
+                        content.push(serde_json::json!({ "text": format!("[image: {url}]") }));
+                    }
+                    crate::types::ContentPart::AudioBase64 { media } => {
+                        content.push(serde_json::json!({
+                            "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
+                        }));
+                    }
+                }
+            }
+        }
+        None => {}
+    }
+    if let Some(tool_calls) = &message.tool_calls {
+        for tool_call in tool_calls {
+            let input = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            content.push(serde_json::json!({
+                "toolUse": {
+                    "toolUseId": tool_call.id,
+                    "name": tool_call.function.name,
+                    "input": input,
+                }
+            }));
+        }
+    }
+}
+
+fn parse_bedrock_event_payload(
+    payload: &[u8],
+    provider: &str,
+    model: &str,
+    state: &mut BedrockStreamState,
+) -> crate::sse::SseAction {
+    use crate::sse::SseAction;
+
+    let event = match serde_json::from_slice::<serde_json::Value>(payload) {
+        Ok(event) => event,
+        Err(_) => return SseAction::Continue,
+    };
+
+    if let Some(start) = event.get("contentBlockStart").and_then(|v| v.get("start")) {
+        if let Some(tool_use) = start.get("toolUse") {
+            state.current_block_is_tool = true;
+            return SseAction::Emit(vec![StreamEvent::ToolCallDelta {
+                index: state.current_tool_index,
+                id: tool_use
+                    .get("toolUseId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                name: tool_use
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                arguments_delta: String::new(),
+            }]);
+        }
+        state.current_block_is_tool = false;
+    }
+
+    if let Some(delta) = event.get("contentBlockDelta").and_then(|v| v.get("delta")) {
+        if let Some(text) = delta.get("text").and_then(serde_json::Value::as_str) {
+            return SseAction::Emit(vec![StreamEvent::TextDelta(text.to_string())]);
+        }
+        if let Some(tool_use) = delta.get("toolUse") {
+            let arguments_delta = match tool_use.get("input") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(other) => other.to_string(),
+                None => String::new(),
+            };
+            if !arguments_delta.is_empty() {
+                return SseAction::Emit(vec![StreamEvent::ToolCallDelta {
+                    index: state.current_tool_index,
+                    id: None,
+                    name: None,
+                    arguments_delta,
+                }]);
+            }
+        }
+    }
+
+    if event.get("contentBlockStop").is_some() && state.current_block_is_tool {
+        state.current_tool_index += 1;
+        state.current_block_is_tool = false;
+    }
+
+    if let Some(metadata) = event.get("metadata") {
+        let usage = metadata.get("usage").cloned().unwrap_or_default();
+        let input = usage
+            .get("inputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("outputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if input > 0 || output > 0 {
+            let (cached_input_tokens, cache_creation_tokens) = normalize_cache_tokens(&usage);
+            return SseAction::Emit(vec![StreamEvent::Usage(UsageData {
+                prompt_tokens: input,
+                completion_tokens: output,
+                total_tokens: usage
+                    .get("totalTokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(input + output),
+                cached_input_tokens,
+                cache_creation_tokens,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                provider_cost_usd: None,
+            })]);
+        }
+    }
+
+    if let Some(stop) = event.get("messageStop") {
+        let mut events = Vec::new();
+        if stop.get("stopReason").and_then(serde_json::Value::as_str) == Some("max_tokens") {
+            events.push(StreamEvent::Truncated);
+        }
+        events.push(StreamEvent::Done);
+        return SseAction::Done(events);
+    }
+
+    if let Some(error) = parse_bedrock_event_error(&event) {
+        return SseAction::Error(error);
+    }
+
+    SseAction::Continue
+}
+
+fn parse_bedrock_event_error(event: &serde_json::Value) -> Option<LlmError> {
+    let object = event.as_object()?;
+    let (error_type, payload) = object.iter().find(|(key, _)| key.ends_with("Exception"))?;
+    let message = payload
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown Bedrock stream error");
+    let reason = match error_type.as_str() {
+        "accessDeniedException" => FailoverReason::AuthPermanent,
+        "resourceNotFoundException" => FailoverReason::ModelNotFound,
+        "validationException" => FailoverReason::Format,
+        "throttlingException" => FailoverReason::RateLimit,
+        "serviceUnavailableException" | "internalServerException" => FailoverReason::Overloaded,
+        "modelTimeoutException" => FailoverReason::Timeout,
+        _ => FailoverReason::Unknown,
+    };
+    let source = anyhow::anyhow!("Bedrock stream error ({error_type}): {message}");
+    Some(match reason {
+        FailoverReason::Auth
+        | FailoverReason::AuthPermanent
+        | FailoverReason::Billing
+        | FailoverReason::ModelNotFound
+        | FailoverReason::PayloadTooLarge
+        | FailoverReason::Format => LlmError::Fatal { source, reason },
+        _ => LlmError::Retryable {
+            source,
+            retry_after: None,
+            reason,
+        },
+    })
+}
+
+fn parse_bedrock_chat_response(
+    response: serde_json::Value,
+    provider: &str,
+    model: &str,
+) -> Result<TransportResponse> {
+    let message_json = response
+        .get("output")
+        .and_then(|v| v.get("message"))
+        .cloned()
+        .context("Bedrock response missing output.message")?;
+    let message = parse_bedrock_message(&message_json)?;
+    let usage_json = response.get("usage").cloned().unwrap_or_default();
+    let input = usage_json
+        .get("inputTokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let output = usage_json
+        .get("outputTokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let (cached_input_tokens, cache_creation_tokens) = normalize_cache_tokens(&usage_json);
+    let usage = (input > 0 || output > 0).then_some(UsageData {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: usage_json
+            .get("totalTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(input + output),
+        cached_input_tokens,
+        cache_creation_tokens,
+        provider: provider.to_string(),
+        model: model.to_string(),
+        provider_cost_usd: None,
+    });
+
+    Ok(TransportResponse { message, usage })
+}
+
+fn parse_bedrock_message(message_json: &serde_json::Value) -> Result<Message> {
+    let role = match message_json
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("assistant")
+    {
+        "user" => Role::User,
+        "tool" => Role::Tool,
+        "system" => Role::System,
+        _ => Role::Assistant,
+    };
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in message_json
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(text) = block.get("text").and_then(serde_json::Value::as_str) {
+            text_parts.push(text.to_string());
+        }
+        if let Some(tool_use) = block.get("toolUse") {
+            let id = tool_use
+                .get("toolUseId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let name = tool_use
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let input = tool_use
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            tool_calls.push(crate::types::ToolCall {
+                id,
+                call_type: "function".to_string(),
+                function: crate::types::FunctionCall {
+                    name,
+                    arguments: input.to_string(),
+                },
+            });
+        }
+    }
+
+    Ok(Message {
+        role,
+        content: Some(crate::types::MessageContent::Text(text_parts.join(""))),
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        tool_call_id: None,
+        timestamp: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_llm_config() -> &'static LlmConfig {
+        static CFG: std::sync::LazyLock<LlmConfig> = std::sync::LazyLock::new(LlmConfig::default);
+        &CFG
+    }
+
+    fn bedrock_request<'a>(messages: &'a [Message]) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::Bedrock,
+            model: "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            messages,
+            tools: None,
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        }
+    }
+
+    #[test]
+    fn build_bedrock_request_maps_system_and_messages() {
+        let messages = vec![
+            Message::system("system prompt"),
+            Message::user("hello"),
+            Message::assistant("world"),
+        ];
+        let body = build_bedrock_request(&bedrock_request(&messages));
+        assert_eq!(body["system"][0]["text"], "system prompt");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["messages"][1]["role"], "assistant");
+    }
+
+    #[test]
+    fn build_bedrock_request_includes_tool_config_and_tool_result() {
+        let messages = vec![
+            Message::user("run pwd"),
+            Message::tool_result("call_42", "/tmp"),
+        ];
+        let tools = vec![crate::types::ToolDefinition::new(
+            "run_shell",
+            "Execute a shell command",
+            serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            }),
+        )];
+        let mut req = bedrock_request(&messages);
+        req.tools = Some(&tools);
+
+        let body = build_bedrock_request(&req);
+
+        // Tool definitions map onto `toolConfig.tools[].toolSpec.inputSchema.json`.
+        let spec = &body["toolConfig"]["tools"][0]["toolSpec"];
+        assert_eq!(spec["name"], "run_shell");
+        assert_eq!(spec["description"], "Execute a shell command");
+        assert_eq!(spec["inputSchema"]["json"]["type"], "object");
+
+        // Tool results travel under the `user` role with a `toolResult` block
+        // referencing the originating tool-use id — Converse's contract.
+        let tool_result_msg = &body["messages"][1];
+        assert_eq!(tool_result_msg["role"], "user");
+        let tool_result = &tool_result_msg["content"][0]["toolResult"];
+        assert_eq!(tool_result["toolUseId"], "call_42");
+        assert_eq!(tool_result["content"][0]["text"], "/tmp");
+    }
+
+    #[test]
+    fn bedrock_transport_endpoint_uses_setting_then_env_then_stream_suffix() {
+        use crate::config::LlmConfig;
+        // Setting wins; toggling `stream` flips the suffix.
+        let mut cfg = LlmConfig::default();
+        cfg.bedrock_region = Some("ap-southeast-2".to_string());
+        let cfg_box: &'static LlmConfig = Box::leak(Box::new(cfg));
+        let req = TransportRequest {
+            provider: Provider::Bedrock,
+            model: "anthropic.claude-3-5-haiku-20241022-v1:0",
+            messages: &[],
+            tools: None,
+            llm_config: cfg_box,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let transport = BedrockTransport;
+        let stream_url = transport.endpoint(&req, true).expect("endpoint");
+        assert!(
+            stream_url.contains("bedrock-runtime.ap-southeast-2.amazonaws.com"),
+            "setting region must win: {stream_url}"
+        );
+        assert!(
+            stream_url.ends_with("/converse-stream"),
+            "stream=true must select converse-stream: {stream_url}"
+        );
+        let unary_url = transport.endpoint(&req, false).expect("endpoint");
+        assert!(
+            unary_url.ends_with("/converse"),
+            "stream=false must select converse: {unary_url}"
+        );
+    }
+
+    #[test]
+    fn parse_bedrock_chat_response_normalizes_usage() {
+        let response = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "text": "done" }]
+                }
+            },
+            "usage": {
+                "inputTokens": 12,
+                "outputTokens": 3,
+                "totalTokens": 15,
+                "cache_write_input_tokens": 2
+            }
+        });
+        let parsed =
+            parse_bedrock_chat_response(response, "bedrock", "anthropic.claude").expect("parse");
+        assert_eq!(parsed.message.text_content(), Some("done"));
+        let usage = parsed.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.cache_creation_tokens, 2);
+    }
+
+    #[test]
+    fn parse_bedrock_event_payload_emits_tool_and_usage() {
+        let mut state = BedrockStreamState::default();
+        let start = serde_json::json!({
+            "contentBlockStart": {
+                "start": {
+                    "toolUse": {
+                        "toolUseId": "tool_1",
+                        "name": "run_shell"
+                    }
+                }
+            }
+        });
+        let action = parse_bedrock_event_payload(
+            start.to_string().as_bytes(),
+            "bedrock",
+            "anthropic.claude",
+            &mut state,
+        );
+        match action {
+            crate::sse::SseAction::Emit(events) => {
+                assert!(matches!(
+                    &events[0],
+                    StreamEvent::ToolCallDelta { name: Some(name), .. } if name == "run_shell"
+                ));
+            }
+            _ => panic!("expected tool event"),
+        }
+
+        let metadata = serde_json::json!({
+            "metadata": {
+                "usage": {
+                    "inputTokens": 10,
+                    "outputTokens": 4,
+                    "totalTokens": 14
+                }
+            }
+        });
+        let action = parse_bedrock_event_payload(
+            metadata.to_string().as_bytes(),
+            "bedrock",
+            "anthropic.claude",
+            &mut state,
+        );
+        match action {
+            crate::sse::SseAction::Emit(events) => {
+                assert!(matches!(
+                    &events[0],
+                    StreamEvent::Usage(usage) if usage.total_tokens == 14
+                ));
+            }
+            _ => panic!("expected usage event"),
+        }
+    }
+
+    #[test]
+    fn parse_bedrock_event_payload_classifies_stream_exceptions() {
+        let mut state = BedrockStreamState::default();
+        let throttled = serde_json::json!({
+            "throttlingException": {
+                "message": "rate limited"
+            }
+        });
+        let action = parse_bedrock_event_payload(
+            throttled.to_string().as_bytes(),
+            "bedrock",
+            "anthropic.claude",
+            &mut state,
+        );
+        match action {
+            crate::sse::SseAction::Error(LlmError::Retryable { reason, .. }) => {
+                assert_eq!(reason, FailoverReason::RateLimit);
+            }
+            _ => panic!("expected retryable rate-limit error"),
+        }
+
+        let denied = serde_json::json!({
+            "accessDeniedException": {
+                "message": "not allowed"
+            }
+        });
+        let action = parse_bedrock_event_payload(
+            denied.to_string().as_bytes(),
+            "bedrock",
+            "anthropic.claude",
+            &mut state,
+        );
+        match action {
+            crate::sse::SseAction::Error(LlmError::Fatal { reason, .. }) => {
+                assert_eq!(reason, FailoverReason::AuthPermanent);
+            }
+            _ => panic!("expected fatal auth-permanent error"),
+        }
     }
 }

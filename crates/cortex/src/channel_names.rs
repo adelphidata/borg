@@ -2,7 +2,7 @@
 //!
 //! Single source of truth for channel name strings used across gateway
 //! registries, DB rows, routing rules, and pairing flows. Mirrors the
-//! [`crate::tool_names`] pattern.
+//! [`crate::tool::names`] pattern.
 
 use std::fmt;
 use std::str::FromStr;

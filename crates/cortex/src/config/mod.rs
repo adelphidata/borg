@@ -457,10 +457,15 @@ impl Config {
     pub fn resolve_provider(&self) -> Result<(Provider, String)> {
         let Some(provider_str) = self.llm.provider.as_deref() else {
             anyhow::bail!(
-                "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one (OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, Groq, Ollama, or Claude CLI). Borg won't guess."
+                "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one (OpenRouter, OpenAI, Anthropic, Bedrock, Gemini, DeepSeek, Groq, Ollama, or Claude CLI). Borg won't guess."
             );
         };
         let provider = Provider::from_str(provider_str)?;
+
+        if provider.uses_aws_credential_chain() {
+            self.resolve_bedrock_region()?;
+            return Ok((provider, String::new()));
+        }
 
         // Keyless providers (e.g., Ollama, Claude CLI) don't need API key resolution.
         if !provider.requires_api_key() {
@@ -479,6 +484,17 @@ impl Config {
             "No API key found for {provider}. Open `/settings` in the TUI and paste your key under \"API key\", or export {} in your shell and restart borg.",
             provider.default_env_var()
         );
+    }
+
+    /// Resolve the Bedrock region from config, env, or the AWS shared config
+    /// chain. Kept in sync with the Bedrock transport so early validation
+    /// accepts the same setups that runtime requests do.
+    pub fn resolve_bedrock_region(&self) -> Result<String> {
+        crate::llm::bedrock::resolve_region(self.llm.bedrock_region.as_deref()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No AWS region found for Bedrock. Set llm.bedrock_region in `/settings`, or export AWS_REGION / AWS_DEFAULT_REGION."
+                )
+            })
     }
 
     /// Try to resolve `self.llm.api_key` via its `SecretRef`. Logs a warning
@@ -523,6 +539,10 @@ impl Config {
                     );
                 };
                 let provider = Provider::from_str(provider_str)?;
+                if provider.uses_aws_credential_chain() {
+                    self.resolve_bedrock_region()?;
+                    return Ok((provider, vec![String::new()]));
+                }
                 let provider = correct_provider_from_key(provider, &keys[0]);
                 return Ok((provider, keys));
             }

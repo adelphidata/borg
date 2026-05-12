@@ -29,9 +29,9 @@ use crate::session::Session;
 use crate::skills::load_skills_context;
 use crate::telemetry::BorgMetrics;
 use crate::template::Template;
+use crate::tool::names as tn;
 #[cfg(test)]
 use crate::tool_handlers;
-use crate::tool_names as tn;
 use crate::truncate::truncate_output;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition, ToolOutput};
 
@@ -1928,7 +1928,7 @@ impl Agent {
         let max_workers = concurrent_cfg.max_workers.max(1);
         let parallel_enabled = concurrent_cfg.enabled && max_workers > 1;
 
-        let groups = crate::tool_effects::plan_groups(tc);
+        let groups = crate::tool::effects::plan_groups(tc);
         for group in groups {
             if cancel.is_cancelled() {
                 // Emit cancellation markers for the remaining calls so the LLM

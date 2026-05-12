@@ -16,6 +16,7 @@ define_settings! {
         "llm.request_timeout_ms" => llm.request_timeout_ms, parsed(u64);
         "llm.stream_chunk_timeout_secs" => llm.stream_chunk_timeout_secs, parsed(u64);
         "llm.base_url" => llm.base_url, opt_string;
+        "llm.bedrock_region" => llm.bedrock_region, opt_string;
         "llm.thinking" => llm.thinking, json_quoted("Invalid thinking level");
         "llm.fallback" => llm.fallback, json_count("providers");
         "llm.api_keys" => llm.api_keys, json_count("keys");
@@ -528,6 +529,7 @@ define_settings! {
         "model" => "Model", Select, "Essentials";
         "llm.api_key" => "API key", Secret, "Essentials";
         "llm.api_key_env" => "API key env var", Text, "Essentials";
+        "llm.bedrock_region" => "Bedrock region", Text, "Essentials";
         "temperature" => "Temperature", Float, "Essentials";
         "conversation.collaboration_mode" => "Mode", Select, "Essentials";
         "budget.monthly_token_limit" => "Monthly token limit", Uint, "Essentials";
