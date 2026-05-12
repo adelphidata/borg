@@ -18,7 +18,7 @@ use cortex::config::Config;
 use cortex::db::{Database, MessageRow};
 use cortex::types::{Message, MessageContent};
 
-use crate::channel_trait::NativeChannel;
+use crate::channel::channel_trait::NativeChannel;
 use crate::handler::InboundMessage;
 use crate::health::ChannelHealthRegistry;
 
@@ -207,7 +207,7 @@ mod tests {
     use axum::http::HeaderMap;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::channel_trait::{WebhookContext, WebhookOutcome};
+    use crate::channel::channel_trait::{WebhookContext, WebhookOutcome};
 
     struct RecordingChannel {
         send_count: AtomicU32,

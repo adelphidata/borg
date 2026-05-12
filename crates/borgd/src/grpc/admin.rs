@@ -221,7 +221,7 @@ impl Admin for AdminSvc {
     async fn dream(&self, _req: Request<Empty>) -> Result<Response<DreamReport>, TStatus> {
         let config = cortex::config::Config::load_from_db()
             .map_err(|e| TStatus::internal(format!("dream config load failed: {e}")))?;
-        let report = cortex::consolidation::run_dream(&config)
+        let report = cortex::memory::consolidation::run_dream(&config)
             .await
             .map_err(|e| TStatus::internal(format!("dream failed: {e}")))?;
         Ok(Response::new(DreamReport {
@@ -1515,7 +1515,7 @@ impl Admin for AdminSvc {
                     PoolLoadConfig,
                 };
                 use cortex::llm::credential_sources::discoverer_by_name;
-                use cortex::provider::Provider;
+                use cortex::llm::provider::Provider;
 
                 let discoverer = discoverer_by_name(&kind).ok_or_else(|| {
                     anyhow::anyhow!(

@@ -19,8 +19,8 @@ use super::send::send_imessage;
 use super::types::{
     normalize_handle, AttachmentMeta, IMessagePayload, InboundDecision, ReplyContext,
 };
+use crate::channel::registry::RegisteredChannel;
 use crate::handler::{self, InboundAttachment, InboundMessage};
-use crate::registry::RegisteredChannel;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 const STATE_FILE: &str = "state.json";

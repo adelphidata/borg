@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, RwLock};
 use cortex::config::Config;
 use cortex::db::Database;
 
-use crate::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
+use crate::channel::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
 
 use super::api::TelegramClient;

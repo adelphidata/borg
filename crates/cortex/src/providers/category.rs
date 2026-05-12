@@ -1,6 +1,6 @@
 //! Provider category — the air-gap and audit-tier discriminator.
 
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 /// Provider categories. Air-gap mode refuses anything that isn't `Local`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -10,7 +10,7 @@ use rusqlite::params;
 use sha2::{Digest, Sha256};
 
 use super::Database;
-use crate::hex::hex_encode;
+use crate::util::hex::hex_encode;
 
 /// Normalize then hash a query string. Lowercases, trims, and collapses
 /// internal whitespace before hashing so cosmetic differences share an entry.

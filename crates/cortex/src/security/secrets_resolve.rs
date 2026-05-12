@@ -172,7 +172,7 @@ impl SecretRef {
             }
 
             SecretRef::File { path, key } => {
-                let expanded = crate::unix_ext::expand_tilde(path);
+                let expanded = crate::util::unix_ext::expand_tilde(path);
                 let canonical = validate_file_path(&expanded)?;
                 let content = std::fs::read_to_string(&canonical)
                     .with_context(|| format!("Failed to read secret file: {path}"))?;

@@ -98,13 +98,18 @@ fn spawn_embedding_task(args: &WriteMemoryArgs, config_arc: &Arc<Config>) {
     let filename = entry_name;
     crate::agent::spawn_logged("embed_memory_write", async move {
         if let Err(e) =
-            crate::embeddings::embed_memory_file(&config, &filename, &full_content, &scope).await
+            crate::memory::embeddings::embed_memory_file(&config, &filename, &full_content, &scope)
+                .await
         {
             tracing::warn!("Failed to embed memory {filename}: {e}");
         }
-        if let Err(e) =
-            crate::embeddings::embed_memory_file_chunked(&config, &filename, &full_content, &scope)
-                .await
+        if let Err(e) = crate::memory::embeddings::embed_memory_file_chunked(
+            &config,
+            &filename,
+            &full_content,
+            &scope,
+        )
+        .await
         {
             tracing::warn!("Failed to chunk-embed memory {filename}: {e}");
         }

@@ -70,7 +70,7 @@ impl fmt::Display for ErrorCategory {
 /// - `PayloadTooLarge` rolls into `ContextOverflow` for messaging — both
 ///   mean "the request was too big," and the recovery advice is identical.
 pub fn classify_error(raw: &str) -> ErrorCategory {
-    use crate::llm_error::{classify_error_text, FailoverReason};
+    use crate::llm::llm_error::{classify_error_text, FailoverReason};
 
     match classify_error_text(raw) {
         Some(FailoverReason::RateLimit) => ErrorCategory::RateLimit,

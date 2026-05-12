@@ -11,10 +11,10 @@ use axum::{
     Json, Router,
 };
 use cortex::db::Database;
-use cortex::hex::hex_encode;
 use cortex::ingress::{
     AdmittedIngress, IngressGate, IngressMessage, IngressSource, MessageBody, PrincipalId,
 };
+use cortex::util::hex::hex_encode;
 
 use super::definitions;
 use super::extract::{extract_string, extract_string_opt, verify_signature, HmacError};

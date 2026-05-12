@@ -2,10 +2,10 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 
 use super::types::CreateMessageRequest;
-use crate::chunker;
 use crate::constants::{
     GATEWAY_HTTP_TIMEOUT, GOOGLE_CHAT_API_BASE, GOOGLE_CHAT_MESSAGE_CHUNK_SIZE,
 };
+use crate::message_processing::chunker;
 use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 /// A client for the Google Chat API.

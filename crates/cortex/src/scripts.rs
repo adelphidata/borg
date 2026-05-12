@@ -7,7 +7,7 @@ use sha2::Sha256;
 use crate::config::Config;
 use crate::constants::{KEYCHAIN_ACCOUNT_SCRIPTS_HMAC, KEYCHAIN_SERVICE_SCRIPTS};
 use crate::db::{Database, NewScript, ScriptRow};
-use crate::hex::{hex_decode, hex_encode};
+use crate::util::hex::{hex_decode, hex_encode};
 
 type HmacSha256 = Hmac<Sha256>;
 

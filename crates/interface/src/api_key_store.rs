@@ -16,7 +16,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 
 use cortex::config::Config;
-use cortex::provider::Provider;
+use cortex::llm::provider::Provider;
 use cortex::security::secrets_resolve::provider_api_key_secret_ref;
 use protocols::admin::{api_key_value::Body as ApiKeyBody, ApiKeyValue, KeychainRef};
 

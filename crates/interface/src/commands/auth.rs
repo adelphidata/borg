@@ -268,5 +268,5 @@ fn detail_line(e: &CredentialEntry) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    cortex::truncate::pad_or_truncate(s, max)
+    cortex::util::truncate::pad_or_truncate(s, max)
 }

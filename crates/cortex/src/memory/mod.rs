@@ -4,11 +4,24 @@ use tracing::{debug, instrument};
 use crate::config::Config;
 use crate::constants::{HEARTBEAT_FILE, MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
 use crate::db::MemoryEntryRow;
+use crate::memory::tokenizer::estimate_tokens;
 use crate::security::sanitize::escape_xml_attr;
-use crate::tokenizer::estimate_tokens;
 
 mod injection;
 pub use injection::{scan_for_injection, InjectionCategory};
+
+/// Markdown-aware content chunking with code fence preservation.
+pub mod chunker;
+/// Memory consolidation pipeline (nightly/weekly scheduled tasks).
+pub mod consolidation;
+/// Embedding API client, cosine similarity, and hybrid search.
+pub mod embeddings;
+/// MMR diversity re-ranking (Jaccard similarity, greedy selection).
+pub mod mmr;
+/// Short-term (working) memory for the current session.
+pub mod short_term_memory;
+/// Token estimation via tiktoken (cl100k_base BPE).
+pub mod tokenizer;
 
 /// How to write to a memory file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -725,7 +738,7 @@ fn search_knowledge_files_in(
     query: &str,
     max_results: usize,
     min_score: f32,
-) -> Result<Vec<crate::embeddings::SearchResult>> {
+) -> Result<Vec<crate::memory::embeddings::SearchResult>> {
     let files = scan_knowledge_files_in(memory_dir, scopes)?;
     let mut results = Vec::new();
     for file in files {
@@ -740,7 +753,7 @@ fn search_knowledge_files_in(
         if score < min_score {
             continue;
         }
-        results.push(crate::embeddings::SearchResult {
+        results.push(crate::memory::embeddings::SearchResult {
             filename: format!("knowledge:{}", file.name),
             chunk_index: 0,
             start_line: None,
@@ -765,7 +778,7 @@ pub fn search_knowledge_files(
     query: &str,
     max_results: usize,
     min_score: f32,
-) -> Result<Vec<crate::embeddings::SearchResult>> {
+) -> Result<Vec<crate::memory::embeddings::SearchResult>> {
     search_knowledge_files_in(
         &Config::memory_dir()?,
         &resolved_memory_scopes(config),
@@ -908,7 +921,7 @@ pub fn scan_extra_paths(
 ) -> Vec<(String, std::path::PathBuf)> {
     let mut files = Vec::new();
     for raw_path in extra_paths {
-        let expanded = crate::unix_ext::expand_tilde(raw_path);
+        let expanded = crate::util::unix_ext::expand_tilde(raw_path);
 
         // Canonicalize after tilde expansion; reject traversal and inaccessible paths
         let canonical = match std::fs::canonicalize(&expanded) {

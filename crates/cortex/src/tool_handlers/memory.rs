@@ -3,12 +3,12 @@ use tracing::instrument;
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::embeddings;
+use crate::memory::embeddings;
+use crate::memory::mmr;
 use crate::memory::{
     read_memory_db_or_not_found, resolved_memory_scopes, search_knowledge_files, write_memory_db,
     WriteMode,
 };
-use crate::mmr;
 
 use super::{
     optional_bool_param, optional_f64_param, optional_str_param, optional_u64_param,
@@ -187,7 +187,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
         .ok();
 
     if query_embedding.is_none() {
-        // Logged once at provider-resolution startup (see crates/cortex/src/embeddings.rs).
+        // Logged once at provider-resolution startup (see crates/cortex/src/memory/embeddings.rs).
         // Repeating it per memory_search just spams daemon.log without new info.
         static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {

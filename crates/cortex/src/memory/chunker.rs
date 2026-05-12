@@ -1,4 +1,4 @@
-use crate::tokenizer::estimate_tokens;
+use crate::memory::tokenizer::estimate_tokens;
 
 /// A chunk of content with line position metadata.
 #[derive(Debug, Clone)]

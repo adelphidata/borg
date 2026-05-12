@@ -29,8 +29,8 @@
 )]
 
 use cortex::config::{ActivationMode, Config};
+use gateway::channel::routing::ResolvedRoute;
 use gateway::handler::check_activation;
-use gateway::routing::ResolvedRoute;
 
 fn route_with_activation(activation: Option<ActivationMode>) -> ResolvedRoute {
     ResolvedRoute {

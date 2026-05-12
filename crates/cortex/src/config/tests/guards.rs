@@ -4,7 +4,7 @@
 //! with behaviour assertions:
 //!
 //! * gateway↔config key-map alignment is asserted in
-//!   `crates/gateway/src/channel_init.rs` (test `every_gateway_key_maps_to_a_plugin`),
+//!   `crates/gateway/src/channel/channel_init.rs` (test `every_gateway_key_maps_to_a_plugin`),
 //!   which iterates the typed `GATEWAY_CREDENTIAL_KEYS` const against
 //!   `Config::keychain_plugin_for_key`.
 //! * the TUI plugin-install reload path is exercised end-to-end by the TUI

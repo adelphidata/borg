@@ -165,7 +165,7 @@ fn find_mentions(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
 /// Resolve `raw` to an absolute path. Supports `~`, absolute paths, and
 /// paths relative to `cwd`.
 fn resolve_path(raw: &str, cwd: &Path) -> PathBuf {
-    let expanded = crate::unix_ext::expand_tilde(raw);
+    let expanded = crate::util::unix_ext::expand_tilde(raw);
     let p = PathBuf::from(&expanded);
     if p.is_absolute() {
         p

@@ -47,16 +47,12 @@ pub mod browser;
 pub mod budgets;
 /// Centralized channel name constants and `ChannelName` enum.
 pub mod channel_names;
-/// Markdown-aware content chunking with code fence preservation.
-pub mod chunker;
 /// Claude Code CLI subprocess backend for subscription-based access.
 pub mod claude_cli;
 /// Configuration parsing, defaults, and runtime overrides.
 pub mod config;
 /// File watcher for live config reloading.
 pub mod config_watcher;
-/// Memory consolidation pipeline (nightly/weekly scheduled tasks).
-pub mod consolidation;
 /// Global constants (token limits, timeouts, etc.).
 pub mod constants;
 /// Conversation context management and compaction.
@@ -67,8 +63,6 @@ pub mod daily_summary;
 pub mod db;
 /// Diagnostic checks for `borg doctor`.
 pub mod doctor;
-/// Embedding API client, cosine similarity, and hybrid search.
-pub mod embeddings;
 /// Structured error formatting for user-facing messages.
 pub mod error_format;
 /// Conversation evolution and personality drift.
@@ -83,8 +77,6 @@ pub mod gateway_context;
 pub mod git;
 /// Heartbeat task constants and helpers (seeded heartbeat row).
 pub mod heartbeat_task;
-/// Lowercase hex encode/decode helpers.
-pub mod hex;
 /// HMAC-SHA256 chain for tamper-proof event logs.
 pub mod hmac_chain;
 /// Lifecycle hook system for intercepting agent loop events.
@@ -103,8 +95,6 @@ pub mod integrity;
 pub mod internal_tag_filter;
 /// Multi-provider streaming SSE client.
 pub mod llm;
-/// LLM error classification and retry logic.
-pub mod llm_error;
 /// Structured logging setup.
 pub mod logging;
 /// Daily self-healing maintenance runner (doctor sweep, log/activity
@@ -118,10 +108,6 @@ pub mod memory;
 pub mod mentions;
 /// Migration utilities for importing from other assistants.
 pub mod migrate;
-/// MMR diversity re-ranking (Jaccard similarity, greedy selection).
-pub mod mmr;
-/// Static metadata for known LLM models — context windows and capability flags.
-pub mod model_registry;
 /// Multi-agent orchestration.
 pub mod multi_agent;
 /// Output-side redaction policy applied to channel deliveries, TUI
@@ -130,8 +116,6 @@ pub mod multi_agent;
 pub mod output_redaction;
 /// Sender pairing and access control for gateway channels.
 pub mod pairing;
-/// Shared helpers for panic-isolated supervised loops.
-pub mod panic_utils;
 /// Execution policy for collaboration modes.
 pub mod policy;
 /// Token pricing per provider and model.
@@ -141,14 +125,10 @@ pub mod pricing;
 pub mod process_registry;
 /// Project doc discovery (AGENTS.md / CLAUDE.md) for system prompt.
 pub mod project_doc;
-/// LLM provider enum, auto-detection, and API headers.
-pub mod provider;
 /// Provider trait + registry — uniform interface over all LLM transports.
 pub mod providers;
 /// Per-session rate limiting for tool calls and actions.
 pub mod rate_guard;
-/// Retry utilities with exponential backoff.
-pub mod retry;
 /// Script management for user-created tools.
 pub mod scripts;
 /// Trust-boundary cluster: sanitize, secrets (detection + resolution),
@@ -162,8 +142,6 @@ pub mod session_indexer;
 pub mod session_types;
 /// Settings resolver: DB → TOML → compiled defaults.
 pub mod settings;
-/// Short-term (working) memory for the current session.
-pub mod short_term_memory;
 /// Skills loading, parsing, and progressive token budgeting.
 pub mod skills;
 /// Shared SSE stream processing for LLM providers.
@@ -176,19 +154,13 @@ pub mod tasks;
 pub mod telemetry;
 /// System prompt template assembly.
 pub mod template;
-/// Token estimation via tiktoken (cl100k_base BPE).
-pub mod tokenizer;
 /// Typed tool dispatch: closed `enum Tool` + per-variant `Args`. Also hosts
 /// catalog/definitions/effects/names/policy submodules (metadata siblings).
 pub mod tool;
 /// Tool execution dispatch and result handling.
 pub mod tool_handlers;
-/// Text truncation with head+tail preservation.
-pub mod truncate;
 /// Core types: Message, ToolCall, ToolDefinition, Role.
 pub mod types;
-/// Tiny Unix filesystem helpers (chmod) shared across crates.
-pub mod unix_ext;
 /// Self-update mechanism for the borg binary.
 pub mod update;
 /// Pre-flight URL classifier and per-site policy (allow/deny, transform,
@@ -198,6 +170,8 @@ pub mod url_policy;
 /// spend, cost, model usage, tool calls, channel activity) over a rolling
 /// time window. The TUI popup renders the returned string verbatim.
 pub mod usage;
+/// Shared low-level primitives: hex, retry, panic-utils, truncate, unix-ext.
+pub mod util;
 /// Vitals system: passive agent health tracking via hooks.
 pub mod vitals;
 /// Web fetching and search capabilities.

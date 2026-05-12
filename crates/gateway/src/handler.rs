@@ -17,12 +17,12 @@ use cortex::security::validation::{sanitize_filename, sanitize_thread_id};
 
 use crate::constants::MAX_THREAD_ID_LEN;
 
-use crate::resilience::challenge_throttle::ChallengeThrottle;
-use crate::chunker;
+use crate::channel::registry::RegisteredChannel;
 use crate::constants::{DEFAULT_BINDING_ID, PEER_KIND_GROUP};
 use crate::executor::ChannelExecutor;
 use crate::health::ChannelHealthRegistry;
-use crate::registry::RegisteredChannel;
+use crate::message_processing::chunker;
+use crate::resilience::challenge_throttle::ChallengeThrottle;
 use crate::resilience::retry::{self, RetryOutcome, RetryPolicy};
 
 /// Global throttle for pairing challenge messages — suppresses repeated
@@ -185,7 +185,7 @@ fn build_retry_policy(channel: &RegisteredChannel) -> RetryPolicy {
 pub fn check_activation(
     text: &str,
     peer_kind: Option<&str>,
-    route: &crate::routing::ResolvedRoute,
+    route: &crate::channel::routing::ResolvedRoute,
     config: &Config,
     bot_identifier: Option<&str>,
 ) -> (bool, String) {
@@ -331,7 +331,7 @@ async fn resolve_session_and_commands(
     channel_name: &str,
     inbound: &InboundMessage,
     config: &Config,
-    route: &crate::routing::ResolvedRoute,
+    route: &crate::channel::routing::ResolvedRoute,
 ) -> Result<SessionResolution> {
     // Resolve session — include thread_id and binding_id in the key for isolation
     let base_key = match &inbound.thread_id {
@@ -441,15 +441,16 @@ async fn resolve_session_and_commands(
 
     if crate::commands::is_dream_command(&inbound.text) {
         let config = config.clone();
-        let response = match tokio::spawn(
-            async move { cortex::consolidation::run_dream(&config).await },
-        )
-        .await
-        {
-            Ok(Ok(report)) => format_dream_report(&report),
-            Ok(Err(e)) => format!("Dream failed: {e}"),
-            Err(e) => format!("Dream failed: {e}"),
-        };
+        let response =
+            match tokio::spawn(
+                async move { cortex::memory::consolidation::run_dream(&config).await },
+            )
+            .await
+            {
+                Ok(Ok(report)) => format_dream_report(&report),
+                Ok(Err(e)) => format!("Dream failed: {e}"),
+                Err(e) => format!("Dream failed: {e}"),
+            };
         if let Err(e) = db.log_channel_message(
             channel_name,
             &inbound.sender_id,
@@ -502,7 +503,7 @@ async fn resolve_session_and_commands(
     })
 }
 
-fn format_dream_report(report: &cortex::consolidation::DreamReport) -> String {
+fn format_dream_report(report: &cortex::memory::consolidation::DreamReport) -> String {
     let mut text = format!(
         "Dream complete.\nEntries extracted: {}\nDupes merged: {}\nTokens used: {}",
         report.entries_extracted, report.dupes_merged, report.tokens_used
@@ -537,11 +538,12 @@ async fn prepare_message_text(
 ) -> (String, bool) {
     // Link understanding: augment message with fetched URL content
     let cleaned_text = if config.gateway.link_understanding.enabled {
-        let (augmented, fetched) = crate::link_understanding::augment_with_links(
-            &cleaned_text,
-            &config.gateway.link_understanding,
-        )
-        .await;
+        let (augmented, fetched) =
+            crate::message_processing::link_understanding::augment_with_links(
+                &cleaned_text,
+                &config.gateway.link_understanding,
+            )
+            .await;
         if !fetched.is_empty() {
             info!(
                 "Link understanding: fetched {} URL(s) for channel '{}'",
@@ -932,7 +934,7 @@ async fn invoke_agent_inner(
     }
 
     // Phase 2: Route resolution + activation check
-    let route = crate::routing::resolve_route(
+    let route = crate::channel::routing::resolve_route(
         config,
         channel_name,
         &inbound.sender_id,
@@ -1308,7 +1310,7 @@ mod tests {
 
     #[test]
     fn format_dream_report_minimal() {
-        let report = cortex::consolidation::DreamReport::default();
+        let report = cortex::memory::consolidation::DreamReport::default();
         let out = format_dream_report(&report);
         assert!(out.starts_with("Dream complete."));
         assert!(out.contains("Entries extracted: 0"));
@@ -1322,7 +1324,7 @@ mod tests {
 
     #[test]
     fn format_dream_report_with_summaries_and_warnings() {
-        let report = cortex::consolidation::DreamReport {
+        let report = cortex::memory::consolidation::DreamReport {
             entries_extracted: 7,
             dupes_merged: 2,
             tokens_used: 1234,
@@ -1349,7 +1351,7 @@ mod tests {
     #[test]
     fn format_dream_report_warnings_without_summaries() {
         // Real production case: consolidation aborts before summaries land.
-        let report = cortex::consolidation::DreamReport {
+        let report = cortex::memory::consolidation::DreamReport {
             entries_extracted: 0,
             dupes_merged: 0,
             tokens_used: 0,
@@ -1474,9 +1476,9 @@ mod tests {
             .unwrap_or(false));
     }
 
-    fn default_route() -> crate::routing::ResolvedRoute {
+    fn default_route() -> crate::channel::routing::ResolvedRoute {
         let config = Config::default();
-        crate::routing::ResolvedRoute {
+        crate::channel::routing::ResolvedRoute {
             config,
             binding_id: DEFAULT_BINDING_ID.to_string(),
             memory_scope: None,
@@ -1845,7 +1847,7 @@ mod tests {
     /// Verify webhook dispatch path formats errors instead of silently returning.
     #[test]
     fn webhook_dispatch_formats_errors() {
-        let source = include_str!("channel_trait.rs");
+        let source = include_str!("channel/channel_trait.rs");
         // The webhook dispatch must call format_gateway_error on agent errors.
         assert!(
             source.contains("format_gateway_error"),

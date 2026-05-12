@@ -19,8 +19,8 @@ use crate::db::Database;
 use crate::hooks::{HookAction, HookData, HookPoint, HookRegistry};
 use crate::identity::load_identity;
 use crate::internal_tag_filter::InternalTagFilter;
+use crate::llm::llm_error::{classify_error_text, FailoverReason};
 use crate::llm::{LlmClient, StreamEvent, UsageData};
-use crate::llm_error::{classify_error_text, FailoverReason};
 use crate::logging::log_message;
 use crate::policy::ExecutionPolicy;
 use crate::rate_guard::{RateDecision, SessionRateGuard};
@@ -32,8 +32,8 @@ use crate::template::Template;
 use crate::tool::names as tn;
 #[cfg(test)]
 use crate::tool_handlers;
-use crate::truncate::truncate_output;
 use crate::types::{ContentPart, FunctionCall, Message, ToolCall, ToolDefinition, ToolOutput};
+use crate::util::truncate::truncate_output;
 
 use std::sync::LazyLock;
 
@@ -285,7 +285,7 @@ pub struct Agent {
     /// Optional best-effort sink for borgd cost events.
     pub(super) cost_event_sink: Option<Arc<dyn crate::llm::CostEventSink>>,
     /// Short-term working memory for the current session.
-    pub(super) short_term_memory: crate::short_term_memory::ShortTermMemory,
+    pub(super) short_term_memory: crate::memory::short_term_memory::ShortTermMemory,
     /// Most recent compaction summary text (no marker prefix). Used by
     /// `compact_history_v2` to issue iterative-update prompts rather than
     /// re-summarizing from scratch. Populated either by the current
@@ -468,7 +468,9 @@ impl Agent {
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
             cost_event_sink: None,
-            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
+                session_id, 2000,
+            ),
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
@@ -733,8 +735,10 @@ impl Agent {
 
         self.history.clear();
         self.session = Session::new();
-        self.short_term_memory =
-            crate::short_term_memory::ShortTermMemory::new(self.session.meta.id.clone(), 2000);
+        self.short_term_memory = crate::memory::short_term_memory::ShortTermMemory::new(
+            self.session.meta.id.clone(),
+            2000,
+        );
 
         // Fire SessionStart for the new session
         let hook_ctx = self.hook_ctx(
@@ -764,9 +768,10 @@ impl Agent {
             return;
         }
         let guard = self.db_guard();
-        if let Err(e) =
-            crate::consolidation::flush_short_term_to_daily_with_optional_db(guard.as_ref(), &facts)
-        {
+        if let Err(e) = crate::memory::consolidation::flush_short_term_to_daily_with_optional_db(
+            guard.as_ref(),
+            &facts,
+        ) {
             warn!("flush_short_term_memory failed: {e}");
         }
     }
@@ -1220,7 +1225,7 @@ impl Agent {
                     );
                     for (filename, path) in files {
                         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                            let _ = crate::embeddings::embed_memory_file_chunked(
+                            let _ = crate::memory::embeddings::embed_memory_file_chunked(
                                 &config, &filename, &content, "extra",
                             )
                             .await;
@@ -2949,7 +2954,9 @@ mod tests {
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
             cost_event_sink: None,
-            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
+                session_id, 2000,
+            ),
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),
@@ -3013,7 +3020,9 @@ mod tests {
             steer_rx: None,
             recent_tool_names: std::collections::HashSet::new(),
             cost_event_sink: None,
-            short_term_memory: crate::short_term_memory::ShortTermMemory::new(session_id, 2000),
+            short_term_memory: crate::memory::short_term_memory::ShortTermMemory::new(
+                session_id, 2000,
+            ),
             previous_summary: None,
             setup_just_consumed: false,
             tool_call_repeat: ToolCallRepeatTracker::default(),

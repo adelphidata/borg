@@ -37,8 +37,8 @@ use std::sync::Mutex;
 
 use cortex::constants::{MEMORY_ENTRY_REJECT_TOKENS, MEMORY_ENTRY_WARN_TOKENS};
 use cortex::db::Database;
+use cortex::memory::tokenizer::estimate_tokens;
 use cortex::memory::{read_memory_db, write_memory_db, WriteMode};
-use cortex::tokenizer::estimate_tokens;
 
 /// Tests in this binary share `BORG_DATA_DIR` and the on-disk DB it points
 /// at — serialize so they don't read each other's writes.

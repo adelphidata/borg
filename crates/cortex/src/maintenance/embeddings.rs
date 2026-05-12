@@ -34,7 +34,7 @@ pub(super) fn embedding_scopes(db: &Database, config: &Config) -> Vec<String> {
 }
 
 pub(super) fn count_stale_chunks(
-    expected_chunks: &[crate::chunker::Chunk],
+    expected_chunks: &[crate::memory::chunker::Chunk],
     existing_chunks: &[crate::db::ChunkRow],
 ) -> usize {
     if expected_chunks.is_empty() {
@@ -45,7 +45,7 @@ pub(super) fn count_stale_chunks(
         .enumerate()
         .filter(|(idx, expected)| {
             existing_chunks.get(*idx).is_none_or(|existing| {
-                existing.content_hash != crate::embeddings::content_hash(&expected.content)
+                existing.content_hash != crate::memory::embeddings::content_hash(&expected.content)
                     || existing.embedding.is_none()
             })
         })
@@ -60,7 +60,7 @@ pub(super) fn repair_embedding_backlog(
     if !config.maintenance.embedding_repair_enabled || !config.memory.embeddings.enabled {
         return Ok(report);
     }
-    if crate::embeddings::get_or_init_provider(&config.memory.embeddings).is_none() {
+    if crate::memory::embeddings::get_or_init_provider(&config.memory.embeddings).is_none() {
         report.failed = true;
         return Ok(report);
     }
@@ -81,7 +81,7 @@ pub(super) fn repair_embedding_backlog(
             let whole_missing = db
                 .get_embedding(&scope, &entry.name)?
                 .is_none_or(|row| row.content_hash != entry.content_hash);
-            let expected_chunks = crate::chunker::chunk_content(
+            let expected_chunks = crate::memory::chunker::chunk_content(
                 &entry.content,
                 config.memory.embeddings.chunk_size_tokens,
                 config.memory.embeddings.chunk_overlap_tokens,
@@ -107,7 +107,7 @@ pub(super) fn repair_embedding_backlog(
             let config_clone = config.clone();
             runtime.block_on(async {
                 if whole_missing {
-                    crate::embeddings::embed_memory_file(
+                    crate::memory::embeddings::embed_memory_file(
                         &config_clone,
                         &name_clone,
                         &content_clone,
@@ -116,7 +116,7 @@ pub(super) fn repair_embedding_backlog(
                     .await?;
                 }
                 if chunk_missing {
-                    crate::embeddings::embed_memory_file_chunked(
+                    crate::memory::embeddings::embed_memory_file_chunked(
                         &config_clone,
                         &name_clone,
                         &content_clone,
@@ -166,17 +166,17 @@ mod tests {
     #[test]
     fn count_stale_chunks_only_counts_missing_or_stale_entries() {
         let expected_chunks = vec![
-            crate::chunker::Chunk {
+            crate::memory::chunker::Chunk {
                 content: "alpha".into(),
                 start_line: 1,
                 end_line: 1,
             },
-            crate::chunker::Chunk {
+            crate::memory::chunker::Chunk {
                 content: "beta".into(),
                 start_line: 2,
                 end_line: 2,
             },
-            crate::chunker::Chunk {
+            crate::memory::chunker::Chunk {
                 content: "gamma".into(),
                 start_line: 3,
                 end_line: 3,
@@ -191,7 +191,7 @@ mod tests {
                 start_line: Some(1),
                 end_line: Some(1),
                 content: "alpha".into(),
-                content_hash: crate::embeddings::content_hash("alpha"),
+                content_hash: crate::memory::embeddings::content_hash("alpha"),
                 embedding: Some(vec![1, 2, 3]),
                 created_at: 0,
             },
@@ -203,7 +203,7 @@ mod tests {
                 start_line: Some(2),
                 end_line: Some(2),
                 content: "beta".into(),
-                content_hash: crate::embeddings::content_hash("beta"),
+                content_hash: crate::memory::embeddings::content_hash("beta"),
                 embedding: None,
                 created_at: 0,
             },

@@ -54,17 +54,17 @@ macro_rules! dedup_wrapper {
         is_duplicate($arg:ident : $ArgType:ty) => $convert:expr;
     ) => {
         $(#[$meta])*
-        $vis struct $Name($crate::dedup::BoundedDedup<$KeyType>);
+        $vis struct $Name($crate::message_processing::dedup::BoundedDedup<$KeyType>);
 
         impl $Name {
             pub fn new() -> Self {
-                Self($crate::dedup::BoundedDedup::new($capacity))
+                Self($crate::message_processing::dedup::BoundedDedup::new($capacity))
             }
 
             #[cfg(test)]
             #[allow(dead_code)]
             pub(crate) fn with_capacity(capacity: usize) -> Self {
-                Self($crate::dedup::BoundedDedup::new(capacity))
+                Self($crate::message_processing::dedup::BoundedDedup::new(capacity))
             }
 
             pub fn is_duplicate(&mut self, $arg: $ArgType) -> bool {

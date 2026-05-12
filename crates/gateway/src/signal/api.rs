@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::format::{chunk_with_styles, FormattedText, TextStyle};
 use super::types::{JsonRpcRequest, JsonRpcResponse};
-use crate::chunker;
+use crate::message_processing::chunker;
 use crate::resilience::circuit_breaker::CircuitBreaker;
 use anyhow::{bail, Context, Result};
 use reqwest::Client;

@@ -37,7 +37,7 @@ impl TwilioClient {
         // preformatted command output (e.g. /xp, /card, /evolution) doesn't
         // arrive with literal backticks. WhatsApp supports ```monospace```
         // so `send_whatsapp` does NOT strip.
-        let stripped = crate::plain_text::strip_outer_code_fence(body);
+        let stripped = crate::message_processing::plain_text::strip_outer_code_fence(body);
         self.send_message(from, to, &stripped).await
     }
 

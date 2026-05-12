@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use cortex::config::{Config, HeartbeatConfig};
-use cortex::panic_utils::panic_msg;
 use cortex::tasks::parse_interval;
+use cortex::util::panic_utils::panic_msg;
 
 /// Hard floor enforced regardless of `heartbeat.min_interval_secs`. A
 /// configured value of 0 is bumped to 1 second so a misconfiguration

@@ -105,7 +105,7 @@ fn air_gap_refuses_byo_unless_marked_local() {
 
 #[test]
 fn check_builtin_air_gap_refuses_public_cloud() {
-    use crate::provider::Provider;
+    use crate::llm::provider::Provider;
     let err = ProviderRegistry::check_builtin_air_gap(Provider::OpenAi, false).unwrap_err();
     match err {
         ResolveError::AirGapPolicyViolation { id, category } => {
@@ -122,7 +122,7 @@ fn check_builtin_air_gap_refuses_azure_openai() {
     // Bedrock and OpenAI. A regression that flipped this to BYOEndpoint or
     // Local would let an air-gapped deployment silently dial out to
     // `*.openai.azure.com`.
-    use crate::provider::Provider;
+    use crate::llm::provider::Provider;
     let err = ProviderRegistry::check_builtin_air_gap(Provider::AzureOpenAi, false).unwrap_err();
     match err {
         ResolveError::AirGapPolicyViolation { id, category } => {
@@ -135,14 +135,14 @@ fn check_builtin_air_gap_refuses_azure_openai() {
 
 #[test]
 fn check_builtin_air_gap_allows_local() {
-    use crate::provider::Provider;
+    use crate::llm::provider::Provider;
     ProviderRegistry::check_builtin_air_gap(Provider::Ollama, false).unwrap();
     ProviderRegistry::check_builtin_air_gap(Provider::ClaudeCli, false).unwrap();
 }
 
 #[test]
 fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
-    use crate::provider::Provider;
+    use crate::llm::provider::Provider;
     // outbound_allowed = true must be a no-op — a regression here would
     // break every existing user's primary call path.
     for p in [

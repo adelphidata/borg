@@ -247,4 +247,4 @@ Strongly prefer extending an existing tool. If you must add:
 
 ### New Native Channel
 
-`crates/gateway/src/<name>/` with types/parse/api/verify modules. Register in `crates/gateway/src/server.rs` and `channel_init.rs`.
+`crates/gateway/src/<name>/` with types/parse/api/verify modules. Register in `crates/gateway/src/server.rs` and `crates/gateway/src/channel/channel_init.rs`.

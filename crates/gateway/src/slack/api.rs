@@ -9,9 +9,9 @@ use super::echo::EchoCache;
 use super::types::{
     AuthTestResponse, PinnedItem, PostMessageRequest, ReactionInfo, SlackChannelInfo, UserInfo,
 };
-use crate::chunker;
-use crate::resilience::circuit_breaker::CircuitBreaker;
 use crate::constants::{DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT};
+use crate::message_processing::chunker;
+use crate::resilience::circuit_breaker::CircuitBreaker;
 use crate::resilience::http_retry::{send_with_rate_limit_retry, RateLimitPolicy};
 
 const SLACK_API_BASE: &str = crate::constants::SLACK_API_BASE;
@@ -77,7 +77,11 @@ pub struct SlackClient {
 impl SlackClient {
     pub fn new(token: &str) -> Result<Self> {
         Ok(Self {
-            client: crate::resilience::http_retry::build_channel_client("Slack", GATEWAY_HTTP_TIMEOUT, None)?,
+            client: crate::resilience::http_retry::build_channel_client(
+                "Slack",
+                GATEWAY_HTTP_TIMEOUT,
+                None,
+            )?,
             token: token.to_string(),
             circuit_breaker: Arc::new(CircuitBreaker::new(
                 TYPING_CB_FAILURE_THRESHOLD,

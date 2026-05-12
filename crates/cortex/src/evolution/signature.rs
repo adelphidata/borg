@@ -12,7 +12,7 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey, SIGNATURE_LENGTH};
 
-use crate::hex::{hex_decode, hex_encode};
+use crate::util::hex::{hex_decode, hex_encode};
 
 /// Build the canonical payload bytes hashed for signing/verification.
 /// Field order and separators MUST stay stable — changing this breaks every

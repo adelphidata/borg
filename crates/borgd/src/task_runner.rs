@@ -126,7 +126,7 @@ pub async fn spawn_task_execution(
                 execute_maintenance_task(&exec_ctx).await;
             } else if task_type == "heartbeat" {
                 execute_heartbeat_task(&exec_ctx, &task).await;
-            } else if cortex::consolidation::is_consolidation_task_id(&task.id) {
+            } else if cortex::memory::consolidation::is_consolidation_task_id(&task.id) {
                 execute_consolidation_task(&exec_ctx).await;
             } else {
                 execute_prompt_task(&exec_ctx).await;
@@ -513,15 +513,15 @@ async fn execute_consolidation_task(ctx: &TaskExecContext) {
         config,
         ..
     } = ctx;
-    let pass = if task_id == cortex::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID {
-        cortex::consolidation::ConsolidationPass::Nightly
+    let pass = if task_id == cortex::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID {
+        cortex::memory::consolidation::ConsolidationPass::Nightly
     } else {
-        cortex::consolidation::ConsolidationPass::Weekly
+        cortex::memory::consolidation::ConsolidationPass::Weekly
     };
 
     let result = tokio::time::timeout(
         *timeout,
-        cortex::consolidation::run_single_pass(config, pass),
+        cortex::memory::consolidation::run_single_pass(config, pass),
     )
     .await;
 
@@ -1078,7 +1078,7 @@ async fn deliver_task_result(
     }
 }
 
-fn format_consolidation_report(report: &cortex::consolidation::DreamReport) -> String {
+fn format_consolidation_report(report: &cortex::memory::consolidation::DreamReport) -> String {
     let mut text = format!(
         "Dream complete: {} entries extracted, {} dupes merged, {} tokens used",
         report.entries_extracted, report.dupes_merged, report.tokens_used

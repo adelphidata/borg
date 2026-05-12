@@ -1,6 +1,6 @@
 use cortex::constants;
 
-use crate::dedup::BoundedDedup;
+use crate::message_processing::dedup::BoundedDedup;
 
 /// Bounded deduplicator for Slack events.
 ///

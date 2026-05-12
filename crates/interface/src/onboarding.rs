@@ -4,7 +4,7 @@ use std::str::FromStr;
 
 use cortex::config::Config;
 use cortex::constants::{IDENTITY_FILE, MEMORY_INDEX_FILE};
-use cortex::provider::Provider;
+use cortex::llm::provider::Provider;
 use cortex::security::secrets_resolve::{provider_api_key_secret_ref, SecretRef};
 use protocols::admin::{PluginInstallRequest, PluginInstalledChannel};
 

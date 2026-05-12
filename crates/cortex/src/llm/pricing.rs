@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use crate::budgets::Usd;
 use crate::config::CacheTtl;
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 struct ModelRate {
     input_per_mtok: &'static str,

@@ -13,11 +13,11 @@ use super::types::{
     MediaSource, ReactionType, SendMessageRequest, SendPollRequest, SetMessageReactionRequest,
     Update, User,
 };
-use crate::chunker;
 use crate::commands::{CommandDef, NativeCommandRegistration};
 use crate::constants::{
     DEFAULT_MESSAGE_CHUNK_SIZE, GATEWAY_HTTP_TIMEOUT, TELEGRAM_MAX_FILE_SIZE_BYTES,
 };
+use crate::message_processing::chunker;
 
 const TELEGRAM_API_BASE: &str = crate::constants::TELEGRAM_API_BASE;
 const HTTP_CONNECT_TIMEOUT: Duration = crate::constants::TELEGRAM_HTTP_CONNECT_TIMEOUT;

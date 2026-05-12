@@ -23,7 +23,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use cortex::config::Config;
 #[cfg(unix)]
-use cortex::unix_ext::set_unix_mode;
+use cortex::util::unix_ext::set_unix_mode;
 
 use crate::daemon_client;
 

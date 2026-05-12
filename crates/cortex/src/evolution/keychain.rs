@@ -16,7 +16,7 @@ use crate::constants::{
     KEYCHAIN_ACCOUNT_EVOLUTION_SIGNING as KEYCHAIN_ACCOUNT,
     KEYCHAIN_SERVICE_EVOLUTION as KEYCHAIN_SERVICE,
 };
-use crate::hex::{hex_decode, hex_encode};
+use crate::util::hex::{hex_decode, hex_encode};
 
 /// Generate a fresh Ed25519 signing key. Uses `rand::rng().fill()` (rand 0.9
 /// CSPRNG) and feeds the bytes to `SigningKey::from_bytes` rather than

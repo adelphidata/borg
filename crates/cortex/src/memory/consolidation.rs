@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn flush_short_term_memory_integration_with_facts_as_text() {
-        use crate::short_term_memory::{FactCategory, ShortTermMemory};
+        use crate::memory::short_term_memory::{FactCategory, ShortTermMemory};
 
         let db = crate::db::Database::test_db();
         let mut stm = ShortTermMemory::new("sess-test".into(), 2000);

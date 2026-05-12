@@ -10,7 +10,7 @@
 //! sites:
 //!
 //!   1. `crates/cortex/src/logging.rs`         — log-file writer.
-//!   2. `crates/gateway/src/channel_trait.rs`  — channel delivery dispatch.
+//!   2. `crates/gateway/src/channel/channel_trait.rs`  — channel delivery dispatch.
 //!   3. `crates/gateway/src/handler.rs`        — `channel_messages` DB log.
 //!   4. `crates/interface/src/tui/history.rs`  — TUI assistant + tool result.
 //!
@@ -37,7 +37,7 @@ const CHOKEPOINTS: &[Chokepoint] = &[
         description: "log-file writer must route through current_policy().apply(Log, …)",
     },
     Chokepoint {
-        file: "crates/gateway/src/channel_trait.rs",
+        file: "crates/gateway/src/channel/channel_trait.rs",
         must_contain: "output_redaction::current_policy()",
         description: "gateway dispatch must redact response_text before enqueue/send",
     },

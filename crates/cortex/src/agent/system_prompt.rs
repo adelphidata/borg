@@ -369,7 +369,7 @@ impl Agent {
         {
             return String::new();
         }
-        let truncated = if crate::tokenizer::estimate_tokens(trimmed) > cfg.max_tokens {
+        let truncated = if crate::memory::tokenizer::estimate_tokens(trimmed) > cfg.max_tokens {
             // Cheap char-based clamp: 4 chars/token rule of thumb. Safe upper
             // bound — actual tokens will be ≤ cfg.max_tokens.
             let cap = cfg.max_tokens.saturating_mul(4);

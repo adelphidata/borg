@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use tokio::sync::RwLock;
 
-use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
 
 use super::api::TeamsClient;

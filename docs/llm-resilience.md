@@ -85,7 +85,7 @@ All durations are clamped to `[1s, 24h]`.
 A 402 with usage/quota markers AND a transient signal (try-again, reset,
 window) is classified as `RateLimit` (cools, retryable). A 402 with only
 hard exhaustion language is classified as `Billing` (fatal at this slot,
-fallback engages). Source: `classify_402` in `crates/cortex/src/llm_error.rs`.
+fallback engages). Source: `classify_402` in `crates/cortex/src/llm/llm_error.rs`.
 
 ### Persistence
 

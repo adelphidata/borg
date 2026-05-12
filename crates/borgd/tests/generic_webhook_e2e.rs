@@ -42,11 +42,11 @@ fn create_webhook(name: &str, sender_path: &str) -> String {
 fn sign(secret_plaintext: &str, ts: i64, body: &[u8]) -> String {
     use sha2::Digest;
     let digest = Sha256::digest(secret_plaintext.as_bytes());
-    let key_hex = cortex::hex::hex_encode(&digest);
+    let key_hex = cortex::util::hex::hex_encode(&digest);
     let mut mac = Hmac::<Sha256>::new_from_slice(key_hex.as_bytes()).expect("hmac");
     mac.update(format!("{ts}.").as_bytes());
     mac.update(body);
-    let sig = cortex::hex::hex_encode(&mac.finalize().into_bytes());
+    let sig = cortex::util::hex::hex_encode(&mac.finalize().into_bytes());
     format!("v1={sig}")
 }
 

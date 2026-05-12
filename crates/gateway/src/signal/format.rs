@@ -5,7 +5,7 @@
 /// into Signal's native text style format.
 use serde::Serialize;
 
-use crate::chunker;
+use crate::message_processing::chunker;
 
 /// Supported Signal text style types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

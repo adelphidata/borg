@@ -7,7 +7,7 @@ use super::{
     supports_anthropic_cache_control, ChatRequest, LlmConfig, LlmError, Message, Provider, Role,
     StreamChunk, StreamEvent, StreamOptions, StreamUsage, ToolDefinition, UsageData, UsageOptions,
 };
-use crate::llm_error::FailoverReason;
+use crate::llm::llm_error::FailoverReason;
 
 pub(crate) struct TransportRequest<'a> {
     pub(crate) provider: Provider,

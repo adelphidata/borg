@@ -52,7 +52,7 @@ fn extract_patch_filenames(patch: &str) -> Vec<String> {
 /// Truncate to at most `max` characters total, with "..." suffix when
 /// truncation occurs. UTF-8 safe.
 fn truncate(s: &str, max: usize) -> String {
-    cortex::truncate::truncate_to_width_with(s, max, "...")
+    cortex::util::truncate::truncate_to_width_with(s, max, "...")
 }
 
 /// Truncate a `/`-separated path so the trailing segment (filename) stays

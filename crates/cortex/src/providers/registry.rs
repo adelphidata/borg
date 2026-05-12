@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use super::category::ProviderCategory;
 use super::row::ProviderRow;
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 /// Reason a `provider_id` couldn't be resolved.
 #[derive(Debug, Error)]

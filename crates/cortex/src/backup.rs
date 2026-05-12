@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::{AuditChainOutcome, Database};
-use crate::hex::hex_encode;
+use crate::util::hex::hex_encode;
 
 /// Read the live `BORG_HOME/borg.db`'s schema version through a read-only
 /// connection. Used by `borg backup create` to tag the new tarball without

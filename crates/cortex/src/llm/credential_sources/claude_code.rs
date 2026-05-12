@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 use super::{CredentialSource, DiscoveredCredential};
 

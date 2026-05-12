@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 use crate::security::secrets::redact_secrets;
 
 /// Maximum bytes of provider response body retained in error messages.

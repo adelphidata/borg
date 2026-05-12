@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
+use crate::channel::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
 
 use super::api::DiscordClient;

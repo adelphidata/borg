@@ -226,7 +226,7 @@ async fn reset_clears_cooled_entries_only() {
         let _db = Database::open().expect("db");
         let config = cortex::config::Config::load_from_db().expect("config");
         let pool = cortex::llm::credential_pool::try_build_from_keys(
-            cortex::provider::Provider::OpenRouter,
+            cortex::llm::provider::Provider::OpenRouter,
             config.resolve_api_keys().expect("keys").1,
             config.llm.credential_strategy,
             config.llm.credential_cooldown_secs,
@@ -236,7 +236,7 @@ async fn reset_clears_cooled_entries_only() {
         let id = pool.entries()[0].id.clone();
         pool.report_failure(
             &id,
-            cortex::llm_error::FailoverReason::RateLimit,
+            cortex::llm::llm_error::FailoverReason::RateLimit,
             Some(429),
             None,
             Some("throttled"),

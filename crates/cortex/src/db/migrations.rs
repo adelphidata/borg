@@ -87,10 +87,10 @@ impl Database {
     }
 
     fn seed_consolidation_tasks(&self) -> Result<()> {
-        let nightly_task_id = crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
-        let weekly_task_id = crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
+        let nightly_task_id = crate::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
+        let weekly_task_id = crate::memory::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
         let now = chrono::Utc::now().timestamp();
-        let allowed_tools = crate::consolidation::CONSOLIDATION_TOOLS.join(",");
+        let allowed_tools = crate::memory::consolidation::CONSOLIDATION_TOOLS.join(",");
 
         const NIGHTLY_CRON: &str = "0 0 3 * * *";
         let next_nightly = crate::tasks::calculate_next_run("cron", NIGHTLY_CRON, "local")?;

@@ -89,9 +89,9 @@ fn apply_openai_cache_markers(
 }
 
 use crate::config::{Config, LlmConfig};
-use crate::provider::Provider;
-use crate::retry::{backoff_with_config, BackoffConfig};
+use crate::llm::provider::Provider;
 use crate::types::{Message, Role, ToolDefinition};
+use crate::util::retry::{backoff_with_config, BackoffConfig};
 
 const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 
@@ -101,8 +101,11 @@ pub(crate) mod bedrock;
 mod cost;
 pub mod credential_pool;
 pub mod credential_sources;
+pub mod llm_error;
+pub mod model_registry;
 pub mod oauth_refresh;
 mod pricing;
+pub mod provider;
 mod transport;
 
 pub(crate) use anthropic::normalize_cache_tokens;
@@ -117,7 +120,7 @@ pub use credential_pool::{
 };
 use transport::{Transport, TransportRequest};
 
-pub use crate::llm_error::*;
+pub use crate::llm::llm_error::*;
 
 // ── Data types ──
 
@@ -743,13 +746,13 @@ impl LlmClient {
     /// the model registry; falls back to a conservative default for unknown
     /// models so downstream budget calculations always have a non-zero value.
     pub fn context_window(&self) -> u32 {
-        crate::model_registry::context_window_for(&self.llm_config.model)
+        crate::llm::model_registry::context_window_for(&self.llm_config.model)
     }
 
     /// Hard-cap context window of the active model (≥ `context_window` for
     /// tiered models like GPT-5).
     pub fn max_context_window(&self) -> u32 {
-        crate::model_registry::max_context_window_for(&self.llm_config.model)
+        crate::llm::model_registry::max_context_window_for(&self.llm_config.model)
     }
 
     /// Resolve a fallback config into a ProviderSlot.
@@ -1511,13 +1514,13 @@ impl LlmClient {
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(crate::llm_error::parse_retry_after_header);
+                .and_then(crate::llm::llm_error::parse_retry_after_header);
             let body = response.text().await.unwrap_or_else(|e| {
                 tracing::warn!("Failed to read error response body: {e}");
                 String::new()
             });
             let err = classify_status(status, &body, self.provider);
-            return Err(crate::llm_error::override_retry_after(
+            return Err(crate::llm::llm_error::override_retry_after(
                 err,
                 header_retry_after,
             ));

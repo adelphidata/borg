@@ -83,7 +83,7 @@ impl Agent {
 
         // Generate query embedding once for ranking
         let (_provider, query_embedding) =
-            match crate::embeddings::generate_query_embedding(&self.config, &query).await {
+            match crate::memory::embeddings::generate_query_embedding(&self.config, &query).await {
                 Ok(result) => result,
                 Err(e) => {
                     // The "no embedding provider" case is logged once at
@@ -100,7 +100,7 @@ impl Agent {
         let scopes = resolved_memory_scopes(&self.config);
 
         let ranking_result = tokio::task::spawn_blocking(move || {
-            crate::embeddings::rank_embeddings_by_similarity_scoped(&qe_global, &scopes, rw)
+            crate::memory::embeddings::rank_embeddings_by_similarity_scoped(&qe_global, &scopes, rw)
         })
         .await;
 
@@ -250,13 +250,14 @@ Rules:
                         match crate::memory::read_memory_db(&fname, "global") {
                             Ok(Some(full_content)) => {
                                 spawn_logged("embed_daily_log", async move {
-                                    if let Err(e) = crate::embeddings::embed_memory_file_chunked(
-                                        &config,
-                                        &fname,
-                                        &full_content,
-                                        "global",
-                                    )
-                                    .await
+                                    if let Err(e) =
+                                        crate::memory::embeddings::embed_memory_file_chunked(
+                                            &config,
+                                            &fname,
+                                            &full_content,
+                                            "global",
+                                        )
+                                        .await
                                     {
                                         tracing::warn!("Failed to embed daily log {fname}: {e}");
                                     }
@@ -368,7 +369,7 @@ Rules:
                     let dropped_tokens: usize = dropped
                         .iter()
                         .map(|m| match m.text_content() {
-                            Some(s) => crate::tokenizer::estimate_tokens(s),
+                            Some(s) => crate::memory::tokenizer::estimate_tokens(s),
                             None => 0,
                         })
                         .sum();
@@ -478,7 +479,7 @@ Rules:
     /// Active model's practical context window in tokens. Resolves through the
     /// model registry; falls back to `DEFAULT_CONTEXT_WINDOW` for unknown models.
     pub(super) fn active_context_window(&self) -> u32 {
-        crate::model_registry::context_window_for(&self.config.llm.model)
+        crate::llm::model_registry::context_window_for(&self.config.llm.model)
     }
 
     /// Emit a per-session toast/log warning when the skill budget had to drop

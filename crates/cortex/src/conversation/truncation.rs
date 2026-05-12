@@ -2,7 +2,7 @@
 //! newest-first compaction. These run before any LLM-summary call in the
 //! autocompaction pipeline.
 
-use crate::tokenizer::estimate_tokens;
+use crate::memory::tokenizer::estimate_tokens;
 use crate::types::{Message, MessageContent, Role};
 
 use super::tokens::history_tokens;
@@ -63,7 +63,7 @@ pub fn enforce_tool_result_share_limit(history: &mut [Message], max_tokens: usiz
         if let Some(MessageContent::Text(ref s)) = msg.content {
             let toks = estimate_tokens(s);
             if toks > max_per_result {
-                let truncated = crate::truncate::truncate_output(s, max_per_result);
+                let truncated = crate::util::truncate::truncate_output(s, max_per_result);
                 msg.content = Some(MessageContent::Text(truncated));
             }
         }

@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::db::Database;
-use crate::llm_error::FailoverReason;
-use crate::provider::Provider;
+use crate::llm::llm_error::FailoverReason;
+use crate::llm::provider::Provider;
 
 /// Hard ceiling for any cooldown duration — defends against absurd provider
 /// hints like `retry_after: 999999999` (yes, it happens).

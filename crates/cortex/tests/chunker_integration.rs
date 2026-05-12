@@ -25,7 +25,7 @@
     clippy::useless_vec
 )]
 
-use cortex::chunker::chunk_content;
+use cortex::memory::chunker::chunk_content;
 
 // ── Test: empty content returns no chunks ──
 

@@ -1,7 +1,7 @@
 //! Deduplicator for Signal inbound messages, keyed on (sender_id, timestamp).
 //!
 //! Prevents duplicate processing when the SSE stream reconnects and replays
-//! recent events. Wraps the shared [`crate::dedup::BoundedDedup`] so the LRU
+//! recent events. Wraps the shared [`crate::message_processing::dedup::BoundedDedup`] so the LRU
 //! eviction policy matches the other channels.
 
 crate::dedup_wrapper!(

@@ -21,7 +21,7 @@ pub struct ProviderRow {
     pub display_name: String,
     /// Base URL. For OpenAI-compatible BYO this is the full chat-completions
     /// endpoint; for non-BYO it's informational only (the canonical URL is
-    /// hardcoded in [`crate::provider::Provider::base_url`]).
+    /// hardcoded in [`crate::llm::provider::Provider::base_url`]).
     pub endpoint_url: String,
     /// Environment variable holding the API key (e.g. `MY_BYO_KEY`).
     /// `None` for keyless local endpoints.

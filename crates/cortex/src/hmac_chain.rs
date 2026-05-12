@@ -11,7 +11,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 use crate::constants;
-use crate::hex::hex_encode;
+use crate::util::hex::hex_encode;
 
 type HmacSha256 = Hmac<Sha256>;
 

@@ -32,8 +32,8 @@ use std::str::FromStr;
 use tracing::warn;
 
 use crate::constants::{DB_FILE, IDENTITY_FILE, MEMORY_INDEX_FILE};
+use crate::llm::provider::Provider;
 use crate::policy::ExecutionPolicy;
-use crate::provider::Provider;
 
 /// Top-level configuration, loaded from SQLite settings DB.
 ///
@@ -598,7 +598,7 @@ impl Config {
 
     /// Maps credential key → plugin ID for keychain service-name derivation.
     /// Plugin IDs must match those in the plugin catalog (`crates/plugins/src/catalog.rs`)
-    /// and the gateway's `resolve_credential` call sites (`crates/gateway/src/channel_init.rs`).
+    /// and the gateway's `resolve_credential` call sites (`crates/gateway/src/channel/channel_init.rs`).
     pub const KEY_PLUGIN_MAP: &'static [(&'static str, &'static str)] = &[
         ("TELEGRAM_BOT_TOKEN", "messaging/telegram"),
         ("TELEGRAM_WEBHOOK_SECRET", "messaging/telegram"),

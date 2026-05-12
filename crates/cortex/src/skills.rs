@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::config::{Config, SkillsConfig};
+use crate::memory::tokenizer::estimate_tokens;
 use crate::security::sanitize::{self, ThreatLevel};
 use crate::security::skill as skill_security;
-use crate::tokenizer::estimate_tokens;
 
 /// How much of a skill's content to include in prompt context.
 #[derive(Debug, Clone, Copy, PartialEq)]

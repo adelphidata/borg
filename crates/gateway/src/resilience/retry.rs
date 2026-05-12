@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use cortex::constants;
-use cortex::retry::{backoff_with_config, BackoffConfig};
+use cortex::util::retry::{backoff_with_config, BackoffConfig};
 use tracing::{info, warn};
 
 use crate::executor::ChannelExecutor;
@@ -12,7 +12,7 @@ pub struct RetryPolicy {
     /// Maximum number of retry attempts after the initial send.
     pub max_retries: u32,
     /// Backoff timing parameters (shared with the rest of the workspace via
-    /// `cortex::retry::BackoffConfig`).
+    /// `cortex::util::retry::BackoffConfig`).
     pub backoff: BackoffConfig,
 }
 
@@ -33,7 +33,7 @@ impl Default for RetryPolicy {
 impl RetryPolicy {
     /// Compute the delay before the given retry attempt (0-indexed), with jitter.
     ///
-    /// Delegates to `cortex::retry::backoff_with_config` so the entire workspace
+    /// Delegates to `cortex::util::retry::backoff_with_config` so the entire workspace
     /// shares one backoff implementation. Jitter is additive
     /// (`base + up to jitter_fraction * base`).
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {

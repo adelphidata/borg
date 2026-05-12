@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use cortex::db::Database;
-use cortex::hex::hex_encode;
+use cortex::util::hex::hex_encode;
 use gateway::generic_webhook::definitions;
 
 use super::format_ts;
@@ -119,5 +119,5 @@ fn run_revoke(name: &str) -> Result<()> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    cortex::truncate::pad_or_truncate(s, max)
+    cortex::util::truncate::pad_or_truncate(s, max)
 }

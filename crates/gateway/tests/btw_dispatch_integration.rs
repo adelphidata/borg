@@ -31,7 +31,9 @@ use tokio::sync::RwLock;
 
 use cortex::config::Config;
 use gateway::btw_dispatch::{is_threaded, BTW_THREAD_ANCHOR_KEY};
-use gateway::channel_trait::{dispatch_webhook, NativeChannel, WebhookContext, WebhookOutcome};
+use gateway::channel::channel_trait::{
+    dispatch_webhook, NativeChannel, WebhookContext, WebhookOutcome,
+};
 use gateway::handler::InboundMessage;
 use gateway::health::ChannelHealthRegistry;
 use gateway::session_queue::SessionQueue;

@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 pub mod claude_code;
 pub mod codex;

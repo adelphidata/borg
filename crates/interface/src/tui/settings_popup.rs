@@ -98,13 +98,13 @@ fn visible_entries(config: &Config) -> Vec<&'static SettingEntry> {
         .llm
         .provider
         .as_deref()
-        .and_then(|id| cortex::provider::Provider::from_str(id).ok());
+        .and_then(|id| cortex::llm::provider::Provider::from_str(id).ok());
     let provider_uses_api_key = provider
         .map(|provider| provider.requires_api_key())
         .unwrap_or(true);
-    let provider_is_bedrock = matches!(provider, Some(cortex::provider::Provider::Bedrock));
+    let provider_is_bedrock = matches!(provider, Some(cortex::llm::provider::Provider::Bedrock));
     let provider_is_azure_openai =
-        matches!(provider, Some(cortex::provider::Provider::AzureOpenAi));
+        matches!(provider, Some(cortex::llm::provider::Provider::AzureOpenAi));
     TUI_SETTINGS
         .iter()
         .filter(|e| match e.key {

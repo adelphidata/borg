@@ -114,8 +114,8 @@ pub fn handle_manage_tasks(args: &serde_json::Value, _config: &Config) -> Result
 fn reject_system_task(task_id: &str, action: &str) -> Option<String> {
     let is_system = task_id == crate::heartbeat_task::HEARTBEAT_TASK_ID
         || task_id == crate::maintenance::MAINTENANCE_TASK_ID
-        || task_id == crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID
-        || task_id == crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID
+        || task_id == crate::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID
+        || task_id == crate::memory::consolidation::WEEKLY_CONSOLIDATION_TASK_ID
         || task_id == crate::daily_summary::DAILY_SUMMARY_TASK_ID;
     if is_system {
         Some(format!(

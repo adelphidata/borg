@@ -20,7 +20,7 @@ use cortex::config::security::KekBackend;
 use cortex::config::Config as CoreConfig;
 use cortex::db::Database;
 #[cfg(unix)]
-use cortex::unix_ext::set_unix_mode;
+use cortex::util::unix_ext::set_unix_mode;
 use identity::{FileKekStore, KekStore, KeychainStore};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

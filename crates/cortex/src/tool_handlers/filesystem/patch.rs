@@ -563,7 +563,7 @@ fn normalize_patch_paths(patch_text: &str, cwd: &std::path::Path) -> String {
         if let Some(normalized_move) = normalize_move_file_line(line, cwd) {
             output.push_str(&normalized_move);
         } else if let Some((prefix, path)) = split_marker_line(line) {
-            let expanded = crate::unix_ext::expand_tilde(path);
+            let expanded = crate::util::unix_ext::expand_tilde(path);
             let absolute = if std::path::Path::new(&expanded).is_absolute() {
                 expanded
             } else {
@@ -661,7 +661,7 @@ fn normalize_move_file_line(line: &str, cwd: &std::path::Path) -> Option<String>
 }
 
 fn normalize_patch_path_fragment(path: &str, cwd: &std::path::Path) -> String {
-    let expanded = crate::unix_ext::expand_tilde(path);
+    let expanded = crate::util::unix_ext::expand_tilde(path);
     if std::path::Path::new(&expanded).is_absolute() {
         expanded
     } else {

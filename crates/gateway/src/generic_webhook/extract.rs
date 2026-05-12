@@ -211,7 +211,7 @@ mod tests {
         mac.update(format!("{ts}.").as_bytes());
         mac.update(body);
         let bytes = mac.finalize().into_bytes();
-        let hex = cortex::hex::hex_encode(&bytes);
+        let hex = cortex::util::hex::hex_encode(&bytes);
         format!("v1={hex}")
     }
 

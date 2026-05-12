@@ -35,8 +35,13 @@ pub async fn index_session(config: &Config, session_id: &str) -> Result<usize> {
     }
 
     let filename = format!("session_{session_id}");
-    crate::embeddings::embed_memory_file_chunked(config, &filename, &transcript, "sessions")
-        .await?;
+    crate::memory::embeddings::embed_memory_file_chunked(
+        config,
+        &filename,
+        &transcript,
+        "sessions",
+    )
+    .await?;
 
     let count = messages.len();
     db.mark_session_indexed(session_id, count)?;

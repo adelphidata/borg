@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tracing::debug;
 
-use crate::plain_text::strip_outer_code_fence;
+use crate::message_processing::plain_text::strip_outer_code_fence;
 
 /// Send a message via iMessage using osascript (AppleScript).
 ///

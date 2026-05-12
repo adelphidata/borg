@@ -963,8 +963,8 @@ fn schema_seeds_memory_consolidation_tasks() {
     // expressions. Without this regression guard, a migration reorder could
     // silently disable nightly consolidation.
     let db = test_db();
-    let nightly_id = crate::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
-    let weekly_id = crate::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
+    let nightly_id = crate::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
+    let weekly_id = crate::memory::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
 
     let (name, schedule_type, schedule_expr, allowed_tools): (String, String, String, String) = db
         .conn()

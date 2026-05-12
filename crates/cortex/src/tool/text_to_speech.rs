@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool_handlers;
 use crate::media::tts::TtsSynthesizer;
+use crate::tool_handlers;
 use crate::types::ToolOutput;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

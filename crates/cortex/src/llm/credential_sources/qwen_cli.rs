@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::provider::Provider;
+use crate::llm::provider::Provider;
 
 use super::{CredentialSource, DiscoveredCredential};
 

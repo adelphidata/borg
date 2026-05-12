@@ -516,7 +516,7 @@ pub async fn embed_memory_file_chunked(
 
     let chunk_size = config.memory.embeddings.chunk_size_tokens;
     let overlap = config.memory.embeddings.chunk_overlap_tokens;
-    let chunks = crate::chunker::chunk_content(content, chunk_size, overlap);
+    let chunks = crate::memory::chunker::chunk_content(content, chunk_size, overlap);
 
     if chunks.is_empty() {
         return Ok(());

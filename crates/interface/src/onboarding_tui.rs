@@ -17,7 +17,7 @@ use crate::onboarding::{models_for_provider, OnboardingResult, PROVIDERS};
 use crate::terminal_guard::TerminalGuard;
 use crate::tui::theme;
 use cortex::config::Config;
-use cortex::provider::Provider;
+use cortex::llm::provider::Provider;
 use rand::Rng;
 use std::str::FromStr;
 

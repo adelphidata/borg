@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use cortex::config::Config;
 
-use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 use crate::health::ChannelHealthRegistry;
 
 use super::api::TwilioClient;

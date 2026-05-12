@@ -17,7 +17,8 @@ use cortex::config::Config;
 use cortex::db::Database;
 use cortex::telemetry::BorgMetrics;
 
-use crate::channel_trait::{self, NativeChannelRegistry, WebhookContext};
+use crate::channel::channel_trait::{self, NativeChannelRegistry, WebhookContext};
+use crate::channel::registry::ChannelRegistry;
 use crate::constants::{POLL_INITIAL_BACKOFF, POLL_MAX_BACKOFF, POLL_MAX_CONSECUTIVE_ERRORS};
 use crate::discord::channel::DiscordChannel;
 use crate::google_chat::channel::GoogleChatChannel;
@@ -26,7 +27,6 @@ use crate::handler::InboundMessage;
 use crate::health::ChannelHealthRegistry;
 use crate::manifest::ChannelMode;
 use crate::resilience::rate_limit::SlidingWindowLimiter;
-use crate::registry::ChannelRegistry;
 use crate::resilience::retry::RetryPolicy;
 use crate::session_queue::SessionQueue;
 use crate::slack::api::SlackClient;
@@ -124,24 +124,25 @@ impl GatewayServer {
 
         // Initialize channel clients
         let (telegram_client, telegram_bot_username, telegram_secret) =
-            crate::channel_init::init_telegram(&self.config).await;
+            crate::channel::channel_init::init_telegram(&self.config).await;
         let telegram_dedup = Arc::new(Mutex::new(UpdateDeduplicator::new()));
 
         let (slack_client, slack_signing_secret, slack_bot_user_id) =
-            crate::channel_init::init_slack(&self.config).await;
+            crate::channel::channel_init::init_slack(&self.config).await;
 
         let (twilio_client, twilio_auth_token, twilio_phone_number, twilio_whatsapp_number) =
-            crate::channel_init::init_twilio(&self.config);
+            crate::channel::channel_init::init_twilio(&self.config);
 
         let (discord_client, discord_public_key) =
-            crate::channel_init::init_discord(&self.config).await;
+            crate::channel::channel_init::init_discord(&self.config).await;
 
-        let (teams_client, teams_app_secret) = crate::channel_init::init_teams(&self.config)?;
+        let (teams_client, teams_app_secret) =
+            crate::channel::channel_init::init_teams(&self.config)?;
 
         let (google_chat_client, google_chat_token) =
-            crate::channel_init::init_google_chat(&self.config)?;
+            crate::channel::channel_init::init_google_chat(&self.config)?;
 
-        let signal_client = crate::channel_init::init_signal(&self.config).await;
+        let signal_client = crate::channel::channel_init::init_signal(&self.config).await;
 
         // TTS synthesizer (shared between webhook and polling paths)
         let tts_synth: Option<Arc<cortex::media::tts::TtsSynthesizer>> =
@@ -677,7 +678,7 @@ impl GatewayServer {
                                 messages.len()
                             );
 
-                            let reg_channel = crate::registry::RegisteredChannel {
+                            let reg_channel = crate::channel::registry::RegisteredChannel {
                                 manifest: manifest.clone(),
                                 dir: channel_dir.clone(),
                             };
@@ -1399,7 +1400,7 @@ mod tests {
 
     #[test]
     fn combined_channel_count_includes_native() {
-        use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+        use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 
         struct TestChannel(&'static str);
 
@@ -1438,7 +1439,7 @@ mod tests {
 
     #[test]
     fn list_channels_includes_native_names() {
-        use crate::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
+        use crate::channel::channel_trait::{NativeChannel, WebhookContext, WebhookOutcome};
 
         struct TestChannel(&'static str);
 

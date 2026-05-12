@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::constants::{IDENTITY_FILE, SECS_PER_DAY};
 use crate::db::Database;
+use crate::llm::provider::Provider;
 use crate::process_registry::ProcessRegistry;
-use crate::provider::Provider;
 use crate::skills::load_all_skills;
 
 /// How a detected issue can be remediated.
@@ -1348,7 +1348,7 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         return;
     }
 
-    match crate::embeddings::EmbeddingProvider::from_config(&config.memory.embeddings) {
+    match crate::memory::embeddings::EmbeddingProvider::from_config(&config.memory.embeddings) {
         Some(provider) => {
             checks.push(DiagnosticCheck::pass(
                 "Embeddings",

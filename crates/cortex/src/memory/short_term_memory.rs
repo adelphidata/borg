@@ -5,8 +5,8 @@
 //! Never persisted directly — flushed to daily log entries on session end,
 //! then consolidated into long-term memory by the nightly job.
 
+use crate::memory::tokenizer::estimate_tokens;
 use crate::security::sanitize::escape_xml_attr;
-use crate::tokenizer::estimate_tokens;
 
 /// Category of a short-term memory fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

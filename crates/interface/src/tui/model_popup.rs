@@ -435,7 +435,7 @@ impl ModelPopup {
 
 fn provider_needs_key(provider_id: &str) -> bool {
     use std::str::FromStr;
-    cortex::provider::Provider::from_str(provider_id)
+    cortex::llm::provider::Provider::from_str(provider_id)
         .map(|p| p.requires_api_key())
         .unwrap_or(true)
 }

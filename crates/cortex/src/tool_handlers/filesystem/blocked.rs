@@ -31,7 +31,7 @@ pub fn is_blocked_path(path: &std::path::Path, blocked: &[String], allowed: &[St
     // 1. Allow list: if the canonical path is under any allowed prefix,
     //    short-circuit to allow. Entries support tilde expansion.
     for raw_entry in allowed {
-        let expanded = crate::unix_ext::expand_tilde(raw_entry);
+        let expanded = crate::util::unix_ext::expand_tilde(raw_entry);
         let entry_path = std::path::PathBuf::from(&expanded);
         // Canonicalize the allow entry too, so `~/work/.aws` and
         // `/Users/me/work/.aws` compare equal.

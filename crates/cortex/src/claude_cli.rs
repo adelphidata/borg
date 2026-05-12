@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::llm::llm_error::{FailoverReason, LlmError};
 use crate::llm::StreamEvent;
-use crate::llm_error::{FailoverReason, LlmError};
 use crate::types::{Message, MessageContent, Role, ToolDefinition};
 
 // ── CLI Detection ──

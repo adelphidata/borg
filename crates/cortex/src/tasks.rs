@@ -328,7 +328,7 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         task.schedule_expr,
         next,
         payload_label,
-        crate::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
+        crate::util::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
     )
 }
 
@@ -416,7 +416,7 @@ pub fn parse_cron_line(line: &str) -> Result<(String, String)> {
 /// `RateLimit`, `Overloaded`, and `Timeout`; everything else (auth, billing,
 /// context overflow, format) would just burn retries.
 pub fn is_transient_error(error: &str) -> bool {
-    use crate::llm_error::{classify_error_text, FailoverReason};
+    use crate::llm::llm_error::{classify_error_text, FailoverReason};
     matches!(
         classify_error_text(error),
         Some(FailoverReason::RateLimit)

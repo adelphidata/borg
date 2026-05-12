@@ -117,7 +117,7 @@ impl Hook for BudgetHook {
             } => (*message_count as u64).saturating_mul(50),
             HookData::AgentStart { user_message } => {
                 // First-call fallback: rough byte → token estimate.
-                use crate::tokenizer::estimate_tokens;
+                use crate::memory::tokenizer::estimate_tokens;
                 estimate_tokens(user_message) as u64
             }
             _ => return HookAction::Continue,
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn hook_agent_start_uses_estimate_tokens_path() {
         // AgentStart routes through the byte→token estimator in
-        // crate::tokenizer::estimate_tokens. With no rate cards seeded the
+        // crate::memory::tokenizer::estimate_tokens. With no rate cards seeded the
         // estimate is still Usd::ZERO so the engine returns Allow → Continue.
         // The point of this test is to exercise the AgentStart match arm
         // without panicking on an unexpectedly large user_message.

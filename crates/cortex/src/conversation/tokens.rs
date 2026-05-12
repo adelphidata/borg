@@ -3,7 +3,7 @@
 use crate::constants::{
     self, AUDIO_TOKEN_ESTIMATE_MIN, IMAGE_TOKEN_ESTIMATE, MESSAGE_ROLE_TOKEN_OVERHEAD,
 };
-use crate::tokenizer::estimate_tokens;
+use crate::memory::tokenizer::estimate_tokens;
 use crate::types::{ContentPart, Message, MessageContent};
 
 /// Estimate the token count of a single message, including role overhead.

@@ -8,7 +8,7 @@
 //!
 //! Same approach as Hermes (`auxiliary_client.py::_API_KEY_PROVIDER_AUX_MODELS_FALLBACK`):
 //! a hardcoded provider → model map, refreshed via PR when a provider deprecates
-//! a model. Same release cadence as the slugs in [`crate::model_registry`].
+//! a model. Same release cadence as the slugs in [`crate::llm::model_registry`].
 //!
 //! Local providers (`ollama`, `claude-cli`) and unknown provider strings return
 //! `None` — the caller falls through to the primary chain rather than surface

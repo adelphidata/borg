@@ -26,7 +26,7 @@
 //! shared `CancellationToken` returns cleanly without burning a restart.
 
 use cortex::db::Database;
-use cortex::panic_utils::panic_msg;
+use cortex::util::panic_utils::panic_msg;
 use futures::FutureExt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
