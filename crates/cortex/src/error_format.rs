@@ -290,6 +290,7 @@ fn extract_provider_name(raw: &str) -> Option<&'static str> {
         ("gemini", "Gemini"),
         ("deepseek", "DeepSeek"),
         ("groq", "Groq"),
+        ("xai", "xAI"),
         ("ollama", "Ollama"),
         ("claude-cli", "Claude CLI"),
     ];

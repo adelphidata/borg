@@ -239,6 +239,37 @@ const REGISTRY: &[ModelMetadata] = &[
         max_context_window: 1_000_000,
         supports_thinking: false,
     },
+    // ── xAI Grok 4 family ──
+    // Declared longest-slug-first for human readability; `lookup` does
+    // longest-prefix matching independent of declaration order.
+    // Context windows mirror xAI's public docs (Grok 4 = 256k, Grok 4 Fast = 2M)
+    // — update when xAI revises them.
+    ModelMetadata {
+        slug: "grok-4-fast-reasoning",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: true,
+    },
+    ModelMetadata {
+        slug: "grok-4-fast-non-reasoning",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: false,
+    },
+    // Bare `grok-4-fast` family entry catches versioned slugs (`grok-4-fast-0925`)
+    // so they get the 2M window instead of falling through to the 256k `grok-4`.
+    ModelMetadata {
+        slug: "grok-4-fast",
+        context_window: 2_000_000,
+        max_context_window: 2_000_000,
+        supports_thinking: false,
+    },
+    ModelMetadata {
+        slug: "grok-4",
+        context_window: 256_000,
+        max_context_window: 256_000,
+        supports_thinking: true,
+    },
     // ── DeepSeek ──
     // `deepseek-chat` is the stable alias — the underlying weights are V3.2 today.
     ModelMetadata {
@@ -388,6 +419,7 @@ fn strip_vendor_prefix(model: &str) -> &str {
         "groq/",
         "claude-cli/",
         "ollama/",
+        "xai/",
         "x-ai/",
         "meta-llama/",
         "mistralai/",
@@ -446,6 +478,38 @@ mod tests {
         assert_eq!(lookup("llama-3.3-70b").unwrap().slug, "llama-3.3-70b");
         assert_eq!(lookup("mixtral-8x7b").unwrap().slug, "mixtral-8x7b");
         assert_eq!(lookup("o1").unwrap().slug, "o1");
+        assert_eq!(lookup("grok-4").unwrap().slug, "grok-4");
+        assert_eq!(
+            lookup("grok-4-fast-reasoning").unwrap().slug,
+            "grok-4-fast-reasoning"
+        );
+        assert_eq!(
+            lookup("grok-4-fast-non-reasoning").unwrap().slug,
+            "grok-4-fast-non-reasoning"
+        );
+    }
+
+    #[test]
+    fn grok_vendor_prefixes_strip_to_canonical_slug() {
+        // The xAI direct-provider canonical (`xai/`) and the OpenRouter-style
+        // (`x-ai/`) must both resolve to the same registry entry — otherwise
+        // a user copy-pasting from either docs page sees a different context
+        // window than what the model actually accepts.
+        assert_eq!(lookup("xai/grok-4").unwrap().slug, "grok-4");
+        assert_eq!(lookup("x-ai/grok-4").unwrap().slug, "grok-4");
+        assert_eq!(
+            lookup("xai/grok-4-fast-reasoning").unwrap().slug,
+            "grok-4-fast-reasoning"
+        );
+    }
+
+    #[test]
+    fn grok_dated_slug_matches_family_entry() {
+        // Versioned slugs like `grok-4-0709` must fall through to the
+        // `grok-4` family entry via longest-prefix match, not return None
+        // (which would silently drop them to DEFAULT_CONTEXT_WINDOW).
+        assert_eq!(lookup("grok-4-0709").unwrap().slug, "grok-4");
+        assert_eq!(context_window_for("grok-4-0709"), 256_000);
     }
 
     #[test]

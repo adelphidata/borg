@@ -135,6 +135,7 @@ fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
         Provider::Gemini,
         Provider::Groq,
         Provider::DeepSeek,
+        Provider::XAi,
         Provider::OpenRouter,
         Provider::Ollama,
         Provider::ClaudeCli,

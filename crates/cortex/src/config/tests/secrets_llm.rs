@@ -619,6 +619,7 @@ fn provider_setting_key_roundtrips_through_apply_setting() {
         "gemini",
         "deepseek",
         "groq",
+        "xai",
         "ollama",
         "claude-cli",
     ] {

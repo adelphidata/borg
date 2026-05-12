@@ -55,6 +55,7 @@ impl From<Provider> for ProviderCategory {
             | Provider::Gemini
             | Provider::DeepSeek
             | Provider::Groq
+            | Provider::XAi
             // OAuth flavors hit the same public clouds; same air-gap rules apply.
             | Provider::ClaudeCodeOAuth
             | Provider::CodexOAuth

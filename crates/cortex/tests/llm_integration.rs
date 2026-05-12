@@ -29,7 +29,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::mpsc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use cortex::config::Config;
@@ -458,4 +458,98 @@ async fn eof_without_trailing_newline_flushes_last_delta() {
         vec!["text:first", "text: last", "done"],
         "EOF-flush path must surface the final delta and terminate cleanly"
     );
+}
+
+// ── Test: xAI (Grok) routes through OpenAI-compat transport ──
+
+/// Verify that `Provider::XAi` is wired through `OpenAiCompatTransport` end to
+/// end: the request hits `/v1/chat/completions`, carries `Authorization: Bearer
+/// xai-…`, advertises the configured Grok model, and the streaming SSE response
+/// parses through the same path as OpenAI/Groq/DeepSeek. If this test fails,
+/// either the provider was mis-classified as Anthropic-shaped or the auth
+/// header path skipped the new Bearer arm.
+#[tokio::test]
+async fn xai_streams_via_openai_compat_transport() {
+    let server = MockServer::start().await;
+
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"content":"hi from Grok"},"finish_reason":null}]}"#,
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#,
+        "[DONE]",
+    ]);
+
+    // Header matchers fail-closed: if the auth header is missing or x-api-key
+    // is sent instead, the mock won't match and the streaming call errors out.
+    // That covers the "did xAI route through the OpenAI-compat Bearer arm"
+    // invariant without needing post-hoc HeaderName/HeaderValues plumbing.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", "Bearer xai-test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let env_key = format!("BORG_TEST_XAI_KEY_{n}");
+    std::env::set_var(&env_key, "xai-test-key");
+
+    let mut config = Config::default();
+    config.llm.provider = Some("xai".into());
+    config.llm.api_key_env = env_key.clone();
+    config.llm.base_url = Some(format!("{}/v1/chat/completions", server.uri()));
+    config.llm.model = "grok-4-fast-non-reasoning".into();
+    config.llm.max_retries = 0;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+
+    client
+        .stream_chat(&user_message("ping"), None, tx)
+        .await
+        .expect("stream_chat");
+
+    let events = collect_events(rx).await;
+    assert!(
+        events.iter().any(|e| e == "text:hi from Grok"),
+        "expected the Grok delta to surface as a TextDelta event, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e == "usage:7:3:10"),
+        "expected usage extraction, got {events:?}"
+    );
+    assert_eq!(
+        events.last().map(|s| s.as_str()),
+        Some("done"),
+        "stream must terminate with Done, got {events:?}"
+    );
+
+    // The header matcher above already proved the request carried
+    // `Authorization: Bearer xai-test-key`. Inspect the body to verify the
+    // configured Grok slug + streaming flag actually made it onto the wire.
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    assert_eq!(received.len(), 1, "expected exactly one POST");
+    let req = &received[0];
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&req.body).expect("request body is JSON");
+    assert_eq!(
+        body_json.get("model").and_then(|v| v.as_str()),
+        Some("grok-4-fast-non-reasoning"),
+        "request model field must match the configured Grok slug"
+    );
+    assert!(
+        body_json
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "request must opt into streaming"
+    );
+    assert!(
+        body_json.get("messages").is_some(),
+        "request must carry OpenAI-style messages array"
+    );
+
+    std::env::remove_var(&env_key);
 }

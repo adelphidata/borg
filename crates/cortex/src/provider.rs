@@ -20,6 +20,8 @@ pub enum Provider {
     Gemini,
     DeepSeek,
     Groq,
+    /// xAI (Grok) — OpenAI-compatible chat-completions API.
+    XAi,
     Ollama,
     /// Claude Code CLI — uses the user's Claude subscription via subprocess.
     ClaudeCli,
@@ -49,6 +51,7 @@ impl Provider {
             | Provider::Gemini
             | Provider::DeepSeek
             | Provider::Groq
+            | Provider::XAi
             | Provider::ClaudeCodeOAuth
             | Provider::CodexOAuth
             | Provider::CopilotOAuth
@@ -68,6 +71,7 @@ impl Provider {
             }
             Provider::DeepSeek => "https://api.deepseek.com/v1/chat/completions",
             Provider::Groq => "https://api.groq.com/openai/v1/chat/completions",
+            Provider::XAi => "https://api.x.ai/v1/chat/completions",
             Provider::Ollama => "http://localhost:11434/v1/chat/completions",
             Provider::ClaudeCli => "", // Not used — communicates via subprocess
             // OAuth flavors hit the same wire endpoints as their API-key
@@ -90,6 +94,7 @@ impl Provider {
             Provider::Gemini => "GEMINI_API_KEY",
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::Groq => "GROQ_API_KEY",
+            Provider::XAi => "XAI_API_KEY",
             Provider::Ollama => "OLLAMA_HOST",
             Provider::ClaudeCli => "CLAUDE_CLI_PATH", // Optional override for claude binary path
             // OAuth + Custom credentials seed via on-disk discoverers, not
@@ -158,7 +163,11 @@ impl Provider {
                 headers.insert("x-api-key", val);
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             }
-            Provider::OpenAi | Provider::Gemini | Provider::DeepSeek | Provider::Groq => {
+            Provider::OpenAi
+            | Provider::Gemini
+            | Provider::DeepSeek
+            | Provider::Groq
+            | Provider::XAi => {
                 let bearer = format!("Bearer {api_key}");
                 let val = HeaderValue::from_str(&bearer)
                     .context("API key contains invalid characters for HTTP headers")?;
@@ -216,6 +225,14 @@ impl Provider {
             Provider::Gemini => model.strip_prefix("google/").unwrap_or(model).to_string(),
             Provider::DeepSeek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
             Provider::Groq => model.strip_prefix("groq/").unwrap_or(model).to_string(),
+            // xAI publishes Grok slugs without a vendor prefix. Tolerate both
+            // `xai/grok-4` and the OpenRouter-style `x-ai/grok-4` so users
+            // copying slugs from either docs page hit the same endpoint.
+            Provider::XAi => model
+                .strip_prefix("xai/")
+                .or_else(|| model.strip_prefix("x-ai/"))
+                .unwrap_or(model)
+                .to_string(),
             Provider::Ollama => model.to_string(),
             Provider::ClaudeCli => model
                 .strip_prefix("claude-cli/")
@@ -282,6 +299,10 @@ impl Provider {
             Provider::DeepSeek => m.contains("vl"),
             // Groq: only known vision models
             Provider::Groq => m.contains("vision") || m.contains("llava"),
+            // xAI Grok 4 family is multimodal end-to-end; default true so
+            // multimodal payloads aren't silently downgraded. If xAI ships a
+            // text-only Grok variant later, blocklist it here.
+            Provider::XAi => true,
             // Ollama: only known vision models
             Provider::Ollama => {
                 m.contains("llava") || m.contains("vision") || m.contains("moondream")
@@ -315,6 +336,7 @@ impl Provider {
             Provider::Gemini => "gemini",
             Provider::DeepSeek => "deepseek",
             Provider::Groq => "groq",
+            Provider::XAi => "xai",
             Provider::Ollama => "ollama",
             Provider::ClaudeCli => "claude-cli",
             Provider::ClaudeCodeOAuth => "claude-code-oauth",
@@ -335,6 +357,8 @@ impl Provider {
             Some(Provider::OpenRouter)
         } else if trimmed.starts_with("sk-ant-") {
             Some(Provider::Anthropic)
+        } else if trimmed.starts_with("xai-") {
+            Some(Provider::XAi)
         } else {
             None
         }
@@ -379,6 +403,7 @@ impl FromStr for Provider {
             "gemini" => Ok(Provider::Gemini),
             "deepseek" => Ok(Provider::DeepSeek),
             "groq" => Ok(Provider::Groq),
+            "xai" | "x-ai" | "x_ai" => Ok(Provider::XAi),
             "ollama" => Ok(Provider::Ollama),
             "claude-cli" | "claudecli" | "claude_cli" => Ok(Provider::ClaudeCli),
             "claude-code-oauth" | "claude_code_oauth" | "claudecodeoauth" => {
@@ -388,7 +413,7 @@ impl FromStr for Provider {
             "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
             "custom" => Ok(Provider::Custom),
             _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
+                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom")
             }
         }
     }
@@ -415,6 +440,7 @@ mod tests {
             Provider::Gemini,
             Provider::DeepSeek,
             Provider::Groq,
+            Provider::XAi,
             Provider::Ollama,
             Provider::ClaudeCli,
             Provider::ClaudeCodeOAuth,
@@ -838,5 +864,98 @@ mod tests {
         assert_eq!(Provider::from_api_key_prefix(""), None);
         assert_eq!(Provider::from_api_key_prefix("AIzaFakeGemini"), None);
         assert_eq!(Provider::from_api_key_prefix("random-key"), None);
+    }
+
+    // ── xAI (Grok) tests ──
+
+    #[test]
+    fn xai_round_trip() {
+        assert_eq!(Provider::XAi.as_str(), "xai");
+        assert_eq!(Provider::from_str("xai").unwrap(), Provider::XAi);
+        // Case-insensitive + alternate spellings users might paste from docs.
+        assert_eq!(Provider::from_str("XAI").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("x-ai").unwrap(), Provider::XAi);
+        assert_eq!(Provider::from_str("X-AI").unwrap(), Provider::XAi);
+    }
+
+    #[test]
+    fn xai_base_url_and_env() {
+        // Pin the production endpoint. An accidental edit that points Grok
+        // traffic at a different host would silently break every xAI user
+        // — this is cheap insurance against that.
+        assert_eq!(
+            Provider::XAi.base_url(),
+            "https://api.x.ai/v1/chat/completions"
+        );
+        assert_eq!(Provider::XAi.default_env_var(), "XAI_API_KEY");
+        assert!(Provider::XAi.requires_api_key());
+    }
+
+    #[test]
+    fn xai_is_openai_compatible() {
+        // Guards against a future enum reshuffle that accidentally lands xAI
+        // in the Anthropic match arm — that would route Grok requests through
+        // /v1/messages and produce a 4xx on every turn.
+        assert!(Provider::XAi.is_openai_compatible());
+    }
+
+    #[test]
+    fn xai_build_headers_bearer() {
+        let headers = Provider::XAi.build_headers("xai-test123").unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap().to_str().unwrap(),
+            "Bearer xai-test123"
+        );
+        // xAI doesn't use any of the provider-specific headers other paths set.
+        assert!(headers.get("x-api-key").is_none());
+        assert!(headers.get("anthropic-version").is_none());
+        assert!(headers.get("Copilot-Integration-Id").is_none());
+        assert!(headers.get("HTTP-Referer").is_none());
+    }
+
+    #[test]
+    fn xai_normalize_model_strips_vendor_prefix() {
+        assert_eq!(Provider::XAi.normalize_model("xai/grok-4"), "grok-4");
+        // Tolerate the OpenRouter-style x-ai/ prefix too — users routinely
+        // copy slugs across the two docs sites.
+        assert_eq!(
+            Provider::XAi.normalize_model("x-ai/grok-4-fast-reasoning"),
+            "grok-4-fast-reasoning"
+        );
+        // Bare slugs pass through unchanged.
+        assert_eq!(Provider::XAi.normalize_model("grok-4"), "grok-4");
+    }
+
+    #[test]
+    fn xai_supports_vision_true_for_grok_family() {
+        // Grok 4 frontier is multimodal — default true mirrors Gemini/OpenAI.
+        // If a future Grok variant is text-only it gets blocklisted here, but
+        // today every published Grok 4 model accepts image inputs.
+        assert!(Provider::XAi.supports_vision("grok-4"));
+        assert!(Provider::XAi.supports_vision("grok-4-fast-reasoning"));
+        assert!(Provider::XAi.supports_vision("grok-4-fast-non-reasoning"));
+    }
+
+    #[test]
+    fn xai_supports_tools_for_grok_4_family() {
+        // The reasoning-only blocklist (deepseek-r1, qwq, o1-mini/preview)
+        // must not match any Grok slug. Lock that explicitly so a future
+        // edit to `supports_tools` (e.g. adding `r1` keyword) can't quietly
+        // disable tool calling for `grok-4-fast-reasoning`.
+        assert!(Provider::XAi.supports_tools("grok-4"));
+        assert!(Provider::XAi.supports_tools("grok-4-fast-reasoning"));
+        assert!(Provider::XAi.supports_tools("grok-4-fast-non-reasoning"));
+    }
+
+    #[test]
+    fn from_api_key_prefix_xai() {
+        assert_eq!(
+            Provider::from_api_key_prefix("xai-abc123"),
+            Some(Provider::XAi)
+        );
+        assert_eq!(
+            Provider::from_api_key_prefix("  xai-key  "),
+            Some(Provider::XAi)
+        );
     }
 }

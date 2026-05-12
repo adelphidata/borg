@@ -14,6 +14,7 @@ const API_KEY_VARS: &[&str] = &[
     "GEMINI_API_KEY",
     "DEEPSEEK_API_KEY",
     "GROQ_API_KEY",
+    "XAI_API_KEY",
 ];
 
 const CHANNEL_TOKEN_VARS: &[&str] = &[

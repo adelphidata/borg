@@ -332,6 +332,7 @@ fn provider_to_env_var(provider: &str) -> Option<&'static str> {
         "google" | "gemini" => Some("GEMINI_API_KEY"),
         "deepseek" => Some("DEEPSEEK_API_KEY"),
         "groq" => Some("GROQ_API_KEY"),
+        "xai" | "x-ai" | "grok" => Some("XAI_API_KEY"),
         _ => None,
     }
 }

@@ -23,6 +23,7 @@ const AUX_DEFAULTS: &[(&str, &str)] = &[
     ("gemini", "gemini-2.5-flash"),
     ("deepseek", "deepseek-chat"),
     ("groq", "llama-3.3-70b-versatile"),
+    ("xai", "grok-4-fast-non-reasoning"),
 ];
 
 /// Resolve the auxiliary model id for a given provider, or `None` when the
@@ -53,6 +54,7 @@ mod tests {
             "gemini",
             "deepseek",
             "groq",
+            "xai",
         ] {
             let resolved = pick_aux_model(provider);
             assert!(

@@ -607,6 +607,7 @@ mod tests {
             std::env::remove_var("GEMINI_API_KEY");
             std::env::remove_var("DEEPSEEK_API_KEY");
             std::env::remove_var("GROQ_API_KEY");
+            std::env::remove_var("XAI_API_KEY");
         }
 
         open(&mut popup, &cfg);

@@ -279,6 +279,7 @@ pub fn map_provider_name(name: &str) -> &'static str {
         "google" | "gemini" => "gemini",
         "deepseek" => "deepseek",
         "groq" => "groq",
+        "xai" | "x-ai" | "grok" => "xai",
         "ollama" => "ollama",
         _ => "openrouter",
     }

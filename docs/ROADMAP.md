@@ -178,14 +178,19 @@ top-down by priority, not by section order.
   3. **Google Vertex AI.** Gemini + Anthropic via GCP service-account
      auth. Rounds out the big-three cloud gateways and unlocks Gemini
      for orgs that ban consumer Google AI Studio keys.
-  4. **xAI (Grok).** Frontier model with a long context window and an
-     OpenAI-compatible surface; cheap to add and currently a real
-     capability gap vs. Anthropic/OpenAI/Gemini.
-  5. **Cerebras.** Wafer-scale inference, fastest tokens/sec for
+  4. **Cerebras.** Wafer-scale inference, fastest tokens/sec for
      Llama/Qwen; ideal `llm.aux` target where latency dominates quality.
-  6. **Together AI / Fireworks.** Broad OSS-model hosting
+  5. **Together AI / Fireworks.** Broad OSS-model hosting
      (Llama/Qwen/DeepSeek). Either covers the "I want OSS without
      self-hosting" lane; pick one.
+
+  Shipped (no further work):
+  - **xAI (Grok)** — `Provider::XAi` direct integration with the OpenAI-
+    compatible chat-completions surface, Bearer auth via `XAI_API_KEY`,
+    Grok 4 / Grok 4 Fast (reasoning + non-reasoning) in the model
+    picker, aux default `grok-4-fast-non-reasoning`, registry entries
+    and onboarding wiring. Pricing intentionally deferred — see "Cost
+    emission" below.
 
 ### Streaming & channel delivery
 
@@ -283,6 +288,7 @@ top-down by priority, not by section order.
 - **Fireworks.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
 - **Bedrock.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
 - **Vertex.** Emit `cost_usd_present = false` until provider pricing is wired into the static table path.
+- **xAI.** Emit `cost_usd_present = false` until Grok pricing is wired into the static table path.
 - **Local models.** Emit `cost_usd_present = false` until a local-pricing policy exists.
 
 ### Tools & sub-agents

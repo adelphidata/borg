@@ -51,6 +51,7 @@ pub(crate) const PROVIDERS: &[(&str, &str, &str)] = &[
     ("gemini", "Gemini", "Google Gemini models directly"),
     ("deepseek", "DeepSeek", "Cost-effective, strong at coding"),
     ("groq", "Groq", "Ultra-fast inference"),
+    ("xai", "xAI", "Grok models directly from xAI"),
     ("ollama", "Ollama", "Run models locally"),
     (
         "claude-cli",
@@ -176,6 +177,18 @@ pub(crate) const GROQ_MODELS: &[(&str, &str)] = &[
     ("llama-3.1-8b-instant", "Llama 3.1 8B Instant (fastest)"),
 ];
 
+pub(crate) const XAI_MODELS: &[(&str, &str)] = &[
+    ("grok-4", "Grok 4 (recommended)"),
+    (
+        "grok-4-fast-reasoning",
+        "Grok 4 Fast — reasoning (long context)",
+    ),
+    (
+        "grok-4-fast-non-reasoning",
+        "Grok 4 Fast — non-reasoning (fastest)",
+    ),
+];
+
 pub(crate) const CLAUDE_CLI_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-7", "Claude Opus 4.7 (recommended)"),
     ("claude-sonnet-4-6", "Claude Sonnet 4.6 (balanced)"),
@@ -216,6 +229,7 @@ pub(crate) fn models_for_provider(provider_id: &str) -> Vec<(String, String)> {
         "gemini" => GEMINI_MODELS,
         "deepseek" => DEEPSEEK_MODELS,
         "groq" => GROQ_MODELS,
+        "xai" => XAI_MODELS,
         "ollama" => OLLAMA_MODELS,
         "claude-cli" => CLAUDE_CLI_MODELS,
         "openrouter" => {
@@ -702,7 +716,9 @@ pub fn apply_onboarding(result: &OnboardingResult) -> Result<()> {
                         cfg.credentials.insert(
                             key.clone(),
                             cortex::config::CredentialValue::Ref(
-                                cortex::security::secrets_resolve::SecretRef::Env { var: key.clone() },
+                                cortex::security::secrets_resolve::SecretRef::Env {
+                                    var: key.clone(),
+                                },
                             ),
                         );
                     }
@@ -881,6 +897,7 @@ mod tests {
             ("gemini-2.5-pro", "gemini", "GEMINI_API_KEY"),
             ("deepseek-chat", "deepseek", "DEEPSEEK_API_KEY"),
             ("llama-3.3-70b-versatile", "groq", "GROQ_API_KEY"),
+            ("grok-4-fast-non-reasoning", "xai", "XAI_API_KEY"),
         ];
         for (model, provider, env) in cases {
             let config = generate_config(model, provider, "User", "Agent", false)
@@ -1114,6 +1131,9 @@ mod tests {
         }
         for (id, _) in GROQ_MODELS {
             assert!(validate_model_id(id).is_ok(), "groq model id invalid: {id}");
+        }
+        for (id, _) in XAI_MODELS {
+            assert!(validate_model_id(id).is_ok(), "xai model id invalid: {id}");
         }
         for (id, _) in CLAUDE_CLI_MODELS {
             assert!(
