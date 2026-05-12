@@ -34,34 +34,24 @@ fn lock_agent(agent: &Mutex<Agent>) -> tokio::sync::MutexGuard<'_, Agent> {
 
 /// RAII guard that detaches an attached IDE-backed text-file bridge when it
 /// drops — including the panic-unwind path — so the next turn never inherits
-/// a stale bridge. Constructed from a `&mut Agent` whose owning `MutexGuard`
-/// strictly outlives this guard. The pointer indirection is what lets us
-/// call `set_text_file_bridge(None)` from `Drop` without a second &mut borrow
-/// fight with the `agent` ref the surrounding code is using.
-struct TextFileBridgeAutoDetach {
-    agent: *mut Agent,
+/// a stale bridge. Owns the sole live `&mut Agent` for the turn; agent calls
+/// go through `guard.agent`, and `Drop` reuses the same reference to detach.
+struct TextFileBridgeAutoDetach<'a> {
+    agent: &'a mut Agent,
+    attached: bool,
 }
 
-// Safety: the pointer is exclusively owned for the guard's lifetime — the
-// async Mutex enforces single-writer access, and we only construct this
-// guard while holding the MutexGuard. No aliasing access happens until the
-// guard drops.
-unsafe impl Send for TextFileBridgeAutoDetach {}
-
-impl TextFileBridgeAutoDetach {
-    fn new(agent: &mut Agent) -> Self {
-        Self {
-            agent: agent as *mut Agent,
-        }
+impl<'a> TextFileBridgeAutoDetach<'a> {
+    fn new(agent: &'a mut Agent, attached: bool) -> Self {
+        Self { agent, attached }
     }
 }
 
-impl Drop for TextFileBridgeAutoDetach {
+impl Drop for TextFileBridgeAutoDetach<'_> {
     fn drop(&mut self) {
-        // Safety: caller invariant — the &mut Agent we were built from is
-        // still alive (held by the surrounding MutexGuard) and exclusively
-        // owned. set_text_file_bridge(None) is a pure mutation of one field.
-        unsafe { (*self.agent).set_text_file_bridge(None) };
+        if self.attached {
+            self.agent.set_text_file_bridge(None);
+        }
     }
 }
 
@@ -311,10 +301,11 @@ impl SessionBackend for AgentBackend {
         if bridge_attached {
             agent.set_text_file_bridge(text_file_bridge);
         }
-        let _bridge_guard = bridge_attached.then(|| TextFileBridgeAutoDetach::new(&mut agent));
+        let bridge_guard = TextFileBridgeAutoDetach::new(&mut *agent, bridge_attached);
 
         let result = if images.is_empty() {
-            agent
+            bridge_guard
+                .agent
                 .send_message_with_cancel(&text, event_tx.clone(), cancel)
                 .await
         } else {
@@ -332,10 +323,13 @@ impl SessionBackend for AgentBackend {
                 });
             }
             let msg = Message::user_multimodal(parts);
-            agent.send_message_raw(msg, event_tx.clone(), cancel).await
+            bridge_guard
+                .agent
+                .send_message_raw(msg, event_tx.clone(), cancel)
+                .await
         };
-        // _bridge_guard's Drop runs here (or earlier on unwind) and detaches.
-        drop(_bridge_guard);
+        // bridge_guard's Drop runs here (or earlier on unwind) and detaches.
+        drop(bridge_guard);
 
         if let Err(e) = result {
             // anyhow's `Display` only renders the topmost message; `{:#}` walks

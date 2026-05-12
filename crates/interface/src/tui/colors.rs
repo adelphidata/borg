@@ -103,6 +103,8 @@ fn query_osc_color(query: &[u8]) -> Option<(u8, u8, u8)> {
         if remaining <= 0 || total >= buf.len() {
             break;
         }
+        // SAFETY: `poll_fd` is a valid stack-allocated `pollfd` with fd=stdin;
+        // we pass a count of 1 matching the single-entry array.
         let ret = unsafe { libc::poll(&mut poll_fd, 1, remaining) };
         if ret <= 0 {
             break;

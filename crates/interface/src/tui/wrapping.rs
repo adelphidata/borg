@@ -50,7 +50,7 @@ where
     for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
         match line {
             std::borrow::Cow::Borrowed(slice) => {
-                let start = unsafe { slice.as_ptr().offset_from(text.as_ptr()) as usize };
+                let start = slice.as_ptr() as usize - text.as_ptr() as usize;
                 let end = start + slice.len();
                 let trailing_spaces = text[end..].chars().take_while(|c| *c == ' ').count();
                 lines.push(start..end + trailing_spaces + 1);
@@ -85,7 +85,7 @@ where
     for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
         match line {
             std::borrow::Cow::Borrowed(slice) => {
-                let start = unsafe { slice.as_ptr().offset_from(text.as_ptr()) as usize };
+                let start = slice.as_ptr() as usize - text.as_ptr() as usize;
                 let end = start + slice.len();
                 lines.push(start..end);
                 cursor = end;

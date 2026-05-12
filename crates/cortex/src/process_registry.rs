@@ -657,6 +657,7 @@ enum KillOutcome {
 fn pid_alive(pid: u32) -> bool {
     // `kill(pid, 0)` checks signal-delivery permission without actually
     // signalling. `ESRCH` (3) is the canonical "no such process".
+    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     if rc == 0 {
         return true;
@@ -679,6 +680,7 @@ fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
     if pid == 0 {
         return KillOutcome::SignalFailed;
     }
+    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
     let term = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     if term != 0 {
         return KillOutcome::SignalFailed;
@@ -695,6 +697,7 @@ fn send_term_then_kill(pid: u32, grace_secs: u64) -> KillOutcome {
     if !pid_alive(pid) {
         return KillOutcome::TermSufficed;
     }
+    // SAFETY: pure FFI; pid + signal arguments have no memory preconditions.
     let kill = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     if kill != 0 && pid_alive(pid) {
         return KillOutcome::SignalFailed;

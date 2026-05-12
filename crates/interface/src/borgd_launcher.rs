@@ -500,6 +500,8 @@ pub fn kill_other_borg_processes() {
                 if let Ok(pid) = line.trim().parse::<u32>() {
                     if pid != my_pid {
                         tracing::info!("Killing {name} process {pid}");
+                        // SAFETY: `libc::kill` is a pure FFI call; passing a
+                        // numeric pid + signal has no memory preconditions.
                         unsafe {
                             libc::kill(pid as libc::pid_t, libc::SIGKILL);
                         }
