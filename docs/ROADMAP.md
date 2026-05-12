@@ -164,6 +164,28 @@ top-down by priority, not by section order.
   returns 429 instead of reacting to it. Extends the credential pool
   (currently reactive — waits for the 429) with proactive avoidance.
   Reduces mean latency under sustained load.
+- **Additional providers (prioritized).** `[O+H]` Deferred. Enterprise +
+  frontier gaps surfaced by the 2026-05 reference survey. Self-hosted
+  endpoints (LM Studio, vLLM, llama.cpp) already work via the custom
+  OpenAI-compatible credential type — no dedicated provider needed.
+  Order is priority, not alphabetical:
+  1. **AWS Bedrock.** SigV4-signed Anthropic/Llama access; the
+     enterprise gateway for shops that can't ship API keys to vendors.
+     Needed for any serious AWS-shop adoption.
+  2. **Azure OpenAI.** Deployment-name-scoped OpenAI on Microsoft
+     tenancy with AAD auth. Same enterprise rationale as Bedrock;
+     covers the Microsoft half of the market.
+  3. **Google Vertex AI.** Gemini + Anthropic via GCP service-account
+     auth. Rounds out the big-three cloud gateways and unlocks Gemini
+     for orgs that ban consumer Google AI Studio keys.
+  4. **xAI (Grok).** Frontier model with a long context window and an
+     OpenAI-compatible surface; cheap to add and currently a real
+     capability gap vs. Anthropic/OpenAI/Gemini.
+  5. **Cerebras.** Wafer-scale inference, fastest tokens/sec for
+     Llama/Qwen; ideal `llm.aux` target where latency dominates quality.
+  6. **Together AI / Fireworks.** Broad OSS-model hosting
+     (Llama/Qwen/DeepSeek). Either covers the "I want OSS without
+     self-hosting" lane; pick one.
 
 ### Streaming & channel delivery
 
