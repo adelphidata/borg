@@ -328,17 +328,8 @@ pub fn format_task(task: &ScheduledTaskRow) -> String {
         task.schedule_expr,
         next,
         payload_label,
-        truncate_str(&task.prompt, 80),
+        crate::truncate::truncate_with_ellipsis(&task.prompt, 80, "..."),
     )
-}
-
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-        format!("{}...", &s[..end])
-    } else {
-        s.to_string()
-    }
 }
 
 /// Validate a schedule expression without computing the next run time.
@@ -601,27 +592,6 @@ mod tests {
     fn parse_interval_is_pub() {
         // Verifies parse_interval is now pub by calling it from tests
         assert!(parse_interval("30m").is_some());
-    }
-
-    #[test]
-    fn truncate_str_short() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_str_long() {
-        let long = "a".repeat(100);
-        let result = truncate_str(&long, 10);
-        assert!(result.ends_with("..."));
-        assert_eq!(result.chars().count(), 13); // 10 + "..."
-    }
-
-    #[test]
-    fn truncate_str_multibyte() {
-        let s = "hello\u{1F600}world"; // emoji in the middle
-        let result = truncate_str(s, 6);
-        assert!(result.ends_with("..."));
-        assert_eq!(result.chars().count(), 9); // 6 + "..."
     }
 
     // ── Cron line parser tests ──

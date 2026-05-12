@@ -32,15 +32,5 @@ pub(crate) fn short_id(id: &str) -> &str {
 }
 
 pub(crate) fn truncate_str(s: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max - 1;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    cortex::truncate::truncate_to_width(s, max)
 }

@@ -301,7 +301,7 @@ async fn start_harness() -> Harness {
 }
 
 async fn uds_channel(socket: PathBuf) -> Channel {
-    Endpoint::try_from("http://[::]:50051")
+    Endpoint::try_from(protocols::TONIC_UDS_PLACEHOLDER_URL)
         .expect("endpoint")
         .connect_with_connector(service_fn(move |_: Uri| {
             let socket = socket.clone();

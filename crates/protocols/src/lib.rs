@@ -46,3 +46,9 @@ pub mod pki {
 
 /// Re-export tonic for downstream crates so they don't have to pin a version.
 pub use tonic;
+
+/// Placeholder URI used when constructing a tonic `Endpoint` that will be
+/// driven by a custom connector (UDS or pre-paired TCP). The string itself
+/// is never dialed — tonic requires *some* URI to satisfy its `try_from`,
+/// and `.connect_with_connector(...)` supplies the actual transport.
+pub const TONIC_UDS_PLACEHOLDER_URL: &str = "http://[::]:50051";

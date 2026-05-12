@@ -131,11 +131,7 @@ fn format_time(timestamp: &str) -> String {
 
 fn truncate(s: &str, max: usize) -> String {
     let first_line = s.lines().next().unwrap_or(s);
-    if first_line.len() > max {
-        format!("{}…", &first_line[..max])
-    } else {
-        first_line.to_string()
-    }
+    crate::truncate::truncate_with_ellipsis(first_line, max, "…")
 }
 
 fn strip_tool_output_wrapper(s: &str) -> &str {

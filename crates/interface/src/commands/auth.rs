@@ -268,12 +268,5 @@ fn detail_line(e: &CredentialEntry) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return format!("{s:<max$}");
-    }
-    let mut end = max - 1;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    cortex::truncate::pad_or_truncate(s, max)
 }

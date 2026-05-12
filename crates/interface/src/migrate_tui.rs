@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -15,6 +13,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
 use crate::logo::LOGO;
+use crate::terminal_guard::TerminalGuard;
 use crate::tui::theme;
 use cortex::config::Config;
 use cortex::migrate::{
@@ -589,17 +588,6 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, state: &MigrateState) {
         Paragraph::new(Line::from(Span::styled(hint, theme::dim()))),
         area,
     );
-}
-
-// ── Terminal guard ──
-
-struct TerminalGuard;
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = stdout().execute(LeaveAlternateScreen);
-    }
 }
 
 // ── Public entry point ──

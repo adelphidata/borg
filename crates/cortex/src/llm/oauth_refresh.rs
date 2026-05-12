@@ -154,11 +154,7 @@ fn now_ms() -> i64 {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    crate::truncate::truncate_with_ellipsis(s, max, "…")
 }
 
 #[cfg(test)]

@@ -106,7 +106,7 @@ pub async fn connect(socket_path: Option<&Path>) -> Result<DaemonClient> {
         ));
     }
     let path_owned = path.to_path_buf();
-    let channel = Endpoint::try_from("http://[::]:50051")
+    let channel = Endpoint::try_from(protocols::TONIC_UDS_PLACEHOLDER_URL)
         .context("constructing endpoint")?
         .connect_with_connector(service_fn(move |_: Uri| {
             let p = path_owned.clone();
