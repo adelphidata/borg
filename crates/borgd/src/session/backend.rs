@@ -301,7 +301,7 @@ impl SessionBackend for AgentBackend {
         if bridge_attached {
             agent.set_text_file_bridge(text_file_bridge);
         }
-        let bridge_guard = TextFileBridgeAutoDetach::new(&mut *agent, bridge_attached);
+        let bridge_guard = TextFileBridgeAutoDetach::new(&mut agent, bridge_attached);
 
         let result = if images.is_empty() {
             bridge_guard

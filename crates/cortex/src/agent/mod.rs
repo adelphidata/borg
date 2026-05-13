@@ -2337,6 +2337,9 @@ impl Agent {
         let tool = match crate::tool::Tool::parse(name, raw_args.clone()) {
             Ok(t) => t,
             Err(crate::tool::ToolParseError::UnknownTool(n)) => {
+                if let Some(output) = crate::wasm_plugins::try_execute_tool(&n, &raw_args)? {
+                    return Ok(ToolOutput::Text(output));
+                }
                 return Err(anyhow::anyhow!("Unknown tool: {n}"));
             }
             Err(crate::tool::ToolParseError::InvalidArgs { tool, source }) => {

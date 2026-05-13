@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 coding = { path = "../coding" }
 sandbox = { path = "../sandbox" }
+plugins = { path = "../plugins" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }

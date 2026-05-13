@@ -1,7 +1,9 @@
 use anyhow::Result;
 use rusqlite::params;
 
-use super::models::PluginRow;
+use super::models::{
+    NewWasmPlugin, PluginRow, WasmPluginRow, WasmToolDefinitionRow, WasmToolRuntimeRow,
+};
 use super::Database;
 
 impl Database {
@@ -203,5 +205,137 @@ impl Database {
             params![name, description, runtime, plugin_id, webhook_path, now],
         )?;
         Ok(())
+    }
+
+    // ── WASM plugins ──
+
+    /// Persist verified WASM plugin metadata and its tool definitions.
+    pub fn insert_wasm_plugin(
+        &self,
+        plugin: &NewWasmPlugin<'_>,
+        tools: &[(&str, &str, &str)],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO wasm_plugins
+             (plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key, signature,
+              local_hmac, manifest_path, wasm_path, status, quarantine_reason, installed_at, verified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'verified', NULL, ?10, ?10)",
+            params![
+                plugin.plugin_id,
+                plugin.manifest_json,
+                plugin.manifest_sha256,
+                plugin.wasm_sha256,
+                plugin.publisher_key,
+                plugin.signature,
+                plugin.local_hmac,
+                plugin.manifest_path,
+                plugin.wasm_path,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM wasm_plugin_tools WHERE plugin_id = ?1",
+            params![plugin.plugin_id],
+        )?;
+        for (name, description, schema) in tools {
+            tx.execute(
+                "INSERT INTO wasm_plugin_tools
+                 (plugin_id, name, description, input_schema_json, installed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![plugin.plugin_id, name, description, schema, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Return a WASM plugin row by id.
+    pub fn get_wasm_plugin(&self, plugin_id: &str) -> Result<Option<WasmPluginRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key,
+                    signature, local_hmac, manifest_path, wasm_path, status, quarantine_reason,
+                    installed_at, verified_at
+             FROM wasm_plugins WHERE plugin_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![plugin_id], |row| {
+            Ok(WasmPluginRow {
+                plugin_id: row.get(0)?,
+                manifest_json: row.get(1)?,
+                manifest_sha256: row.get(2)?,
+                wasm_sha256: row.get(3)?,
+                publisher_key: row.get(4)?,
+                signature: row.get(5)?,
+                local_hmac: row.get(6)?,
+                manifest_path: row.get(7)?,
+                wasm_path: row.get(8)?,
+                status: row.get(9)?,
+                quarantine_reason: row.get(10)?,
+                installed_at: row.get(11)?,
+                verified_at: row.get(12)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark a WASM plugin quarantined so its tools are no longer advertised or executable.
+    pub fn quarantine_wasm_plugin(&self, plugin_id: &str, reason: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE wasm_plugins
+             SET status = 'quarantined', quarantine_reason = ?1
+             WHERE plugin_id = ?2",
+            params![reason, plugin_id],
+        )?;
+        Ok(())
+    }
+
+    /// List verified WASM tool definitions to advertise to the LLM.
+    pub fn list_verified_wasm_tool_definitions(&self) -> Result<Vec<WasmToolDefinitionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.name, t.description, t.input_schema_json
+             FROM wasm_plugin_tools t
+             JOIN wasm_plugins p ON p.plugin_id = t.plugin_id
+             WHERE p.status = 'verified'
+             ORDER BY t.name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WasmToolDefinitionRow {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    input_schema_json: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Look up runtime metadata for a verified WASM tool.
+    pub fn get_verified_wasm_tool_runtime(&self, name: &str) -> Result<Option<WasmToolRuntimeRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.plugin_id, t.name, p.manifest_json, p.manifest_path, p.wasm_path, p.local_hmac
+             FROM wasm_plugin_tools t
+             JOIN wasm_plugins p ON p.plugin_id = t.plugin_id
+             WHERE t.name = ?1 AND p.status = 'verified'
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            Ok(WasmToolRuntimeRow {
+                plugin_id: row.get(0)?,
+                tool_name: row.get(1)?,
+                manifest_json: row.get(2)?,
+                manifest_path: row.get(3)?,
+                wasm_path: row.get(4)?,
+                local_hmac: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 }

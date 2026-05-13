@@ -38,6 +38,8 @@ pub mod installer;
 pub mod keychain;
 /// Installation integrity verification via file hashes.
 pub mod verifier;
+/// Capability-sandboxed WebAssembly plugin packages.
+pub mod wasm;
 
 use serde::{Deserialize, Serialize};
 

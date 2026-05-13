@@ -174,5 +174,6 @@ pub mod usage;
 pub mod util;
 /// Vitals system: passive agent health tracking via hooks.
 pub mod vitals;
+pub mod wasm_plugins;
 /// Web fetching and search capabilities.
 pub mod web;

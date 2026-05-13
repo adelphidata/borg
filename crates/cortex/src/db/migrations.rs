@@ -421,6 +421,33 @@ CREATE TABLE IF NOT EXISTS file_hashes (
     UNIQUE(customization_id, file_path)
 );
 
+CREATE TABLE IF NOT EXISTS wasm_plugins (
+    plugin_id         TEXT PRIMARY KEY,
+    manifest_json     TEXT NOT NULL,
+    manifest_sha256   TEXT NOT NULL,
+    wasm_sha256       TEXT NOT NULL,
+    publisher_key     TEXT NOT NULL,
+    signature         TEXT NOT NULL,
+    local_hmac        TEXT NOT NULL,
+    manifest_path     TEXT NOT NULL,
+    wasm_path         TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'verified',
+    quarantine_reason TEXT,
+    installed_at      INTEGER NOT NULL,
+    verified_at       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_wasm_plugins_status ON wasm_plugins(status);
+
+CREATE TABLE IF NOT EXISTS wasm_plugin_tools (
+    plugin_id         TEXT NOT NULL,
+    name              TEXT PRIMARY KEY,
+    description       TEXT NOT NULL,
+    input_schema_json TEXT NOT NULL,
+    installed_at      INTEGER NOT NULL,
+    FOREIGN KEY(plugin_id) REFERENCES wasm_plugins(plugin_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_wasm_plugin_tools_plugin ON wasm_plugin_tools(plugin_id);
+
 -- Delivery queue -----------------------------------------------------------
 CREATE TABLE IF NOT EXISTS delivery_queue (
     id TEXT PRIMARY KEY,

@@ -16,10 +16,17 @@ dirs = { workspace = true }
 rusqlite = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
 keyring = { workspace = true }
+ed25519-dalek = { workspace = true }
+wasmparser = { workspace = true }
+wasmtime = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wasm-encoder = "0.244"
 
 [lints]
 workspace = true

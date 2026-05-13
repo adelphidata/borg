@@ -222,6 +222,87 @@ pub struct PluginRow {
     pub verified_at: Option<i64>,
 }
 
+/// WASM plugin row from SQLite.
+#[derive(Debug, Clone)]
+pub struct WasmPluginRow {
+    /// Plugin identifier.
+    pub plugin_id: String,
+    /// Canonical manifest JSON.
+    pub manifest_json: String,
+    /// Manifest SHA-256 hex digest.
+    pub manifest_sha256: String,
+    /// WASM SHA-256 hex digest.
+    pub wasm_sha256: String,
+    /// Base64 Ed25519 publisher verifying key.
+    pub publisher_key: String,
+    /// Detached signature over the canonical manifest.
+    pub signature: String,
+    /// Local HMAC seal over manifest and WASM bytes.
+    pub local_hmac: String,
+    /// Installed manifest path.
+    pub manifest_path: String,
+    /// Installed WASM path.
+    pub wasm_path: String,
+    /// Trust state (`verified` or `quarantined`).
+    pub status: String,
+    /// Quarantine reason, if any.
+    pub quarantine_reason: Option<String>,
+    /// Unix timestamp when the plugin was installed.
+    pub installed_at: i64,
+    /// Unix timestamp when the plugin was last verified.
+    pub verified_at: Option<i64>,
+}
+
+/// New WASM plugin metadata to persist.
+pub struct NewWasmPlugin<'a> {
+    /// Plugin identifier.
+    pub plugin_id: &'a str,
+    /// Canonical manifest JSON.
+    pub manifest_json: &'a str,
+    /// Manifest SHA-256 hex digest.
+    pub manifest_sha256: &'a str,
+    /// WASM SHA-256 hex digest.
+    pub wasm_sha256: &'a str,
+    /// Base64 Ed25519 publisher verifying key.
+    pub publisher_key: &'a str,
+    /// Detached signature over the canonical manifest.
+    pub signature: &'a str,
+    /// Local HMAC seal.
+    pub local_hmac: &'a str,
+    /// Installed manifest path.
+    pub manifest_path: &'a str,
+    /// Installed WASM path.
+    pub wasm_path: &'a str,
+}
+
+/// WASM plugin tool definition row.
+#[derive(Debug, Clone)]
+pub struct WasmToolDefinitionRow {
+    /// Tool name.
+    pub name: String,
+    /// Tool description.
+    pub description: String,
+    /// JSON schema string.
+    pub input_schema_json: String,
+}
+
+/// WASM plugin runtime lookup row.
+#[derive(Debug, Clone)]
+pub struct WasmToolRuntimeRow {
+    /// Owning plugin id.
+    pub plugin_id: String,
+    /// Tool name.
+    pub tool_name: String,
+    /// Canonical manifest JSON.
+    pub manifest_json: String,
+    /// Installed manifest path.
+    pub manifest_path: String,
+    /// Installed WASM path.
+    pub wasm_path: String,
+    /// Local HMAC seal.
+    pub local_hmac: String,
+}
+
 /// Memory embedding row from SQLite.
 #[derive(Debug, Clone)]
 pub struct EmbeddingRow {

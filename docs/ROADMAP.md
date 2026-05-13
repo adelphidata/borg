@@ -328,6 +328,19 @@ top-down by priority, not by section order.
 
 ### Plugins & extensibility
 
+- **WASM plugin system v1.** Third-party tool plugins run as signed,
+  capability-sandboxed WASM modules rather than native code. V1 is
+  tool-only: manifests use `borg.plugin.v1`, require trusted Ed25519
+  publisher signatures, pin the WASM SHA-256, and get sealed with a
+  local HMAC after install so post-install tampering quarantines the
+  plugin before execution. Static validation rejects WASI, undeclared
+  host imports, start functions, memory64/shared memory, missing ABI
+  exports, oversized memories, invalid endpoint allowlists, and unknown
+  capabilities. Runtime uses `wasmtime` with fuel/memory/output limits
+  and only narrow Borg host functions; plugin-originated HTTP is gated
+  by endpoint allowlist plus secret leak scanning at the host boundary.
+  Channels, hooks, onboard scripts, and background tasks stay out of
+  scope until the host boundary has more mileage.
 - **Plugin manifest + onboard hooks.** `[O]` `plugin.json` declaring
   deps, capabilities, and an onboard script that runs at install time
   to configure auth/defaults. Load-time validation rejects invalid
@@ -446,14 +459,6 @@ demand materializes.
   current Borg users but would open homelab/SBC deployments. Cost:
   cross-compilation matrix, hardware test rigs, embedded-Rust
   expertise.
-- **WASM plugin system.** Capability-sandboxed third-party extensions
-  (compile to WASM in any language, host grants narrow capabilities,
-  endpoint allowlist + leak scanner at the host boundary). Today Borg
-  is compiled-in only; this is the path to a real plugin ecosystem
-  without the security cost of native loading. Cost: WASM runtime in
-  the binary (`wasmtime` ≈ several MB), capability-grant API design,
-  manifest signing/verification, confused-deputy hardening on every
-  host function.
 - **Web dashboard.** `[H]` Optional remote-monitoring web UI for
   headless/VPS deployments — React SPA served by `borgd` over the
   existing mTLS-authed TCP listener. Conflicts with the TUI-first

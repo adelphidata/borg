@@ -307,3 +307,120 @@ fn insert_credential_round_trip() {
     let deleted = db.delete_credentials_for("email/gmail").expect("delete");
     assert_eq!(deleted, 2);
 }
+
+#[test]
+fn wasm_plugin_tools_visible_only_while_verified() {
+    let db = test_db();
+    let manifest_sha = "a".repeat(64);
+    let wasm_sha = "b".repeat(64);
+    let local_hmac = "c".repeat(64);
+    let plugin = crate::db::models::NewWasmPlugin {
+        plugin_id: "dev/echo",
+        manifest_json: r#"{"schema_version":"borg.plugin.v1"}"#,
+        manifest_sha256: &manifest_sha,
+        wasm_sha256: &wasm_sha,
+        publisher_key: "publisher",
+        signature: "signature",
+        local_hmac: &local_hmac,
+        manifest_path: "/tmp/manifest.json",
+        wasm_path: "/tmp/plugin.wasm",
+    };
+    db.insert_wasm_plugin(
+        &plugin,
+        &[(
+            "echo_wasm",
+            "Echo through wasm",
+            r#"{"type":"object","properties":{}}"#,
+        )],
+    )
+    .expect("insert wasm plugin");
+
+    let defs = db
+        .list_verified_wasm_tool_definitions()
+        .expect("list verified tools");
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].name, "echo_wasm");
+    assert!(db
+        .get_verified_wasm_tool_runtime("echo_wasm")
+        .expect("runtime")
+        .is_some());
+
+    db.quarantine_wasm_plugin("dev/echo", "integrity check failed")
+        .expect("quarantine");
+    assert!(db
+        .list_verified_wasm_tool_definitions()
+        .expect("list after quarantine")
+        .is_empty());
+    assert!(db
+        .get_verified_wasm_tool_runtime("echo_wasm")
+        .expect("runtime after quarantine")
+        .is_none());
+    let row = db.get_wasm_plugin("dev/echo").expect("get").unwrap();
+    assert_eq!(row.status, "quarantined");
+    assert_eq!(
+        row.quarantine_reason.as_deref(),
+        Some("integrity check failed")
+    );
+}
+
+#[test]
+fn wasm_plugin_insert_rolls_back_on_tool_name_collision() {
+    let db = test_db();
+    let manifest_sha = "a".repeat(64);
+    let wasm_sha = "b".repeat(64);
+    let local_hmac = "c".repeat(64);
+    let first = crate::db::models::NewWasmPlugin {
+        plugin_id: "dev/first",
+        manifest_json: r#"{"schema_version":"borg.plugin.v1","id":"dev/first"}"#,
+        manifest_sha256: &manifest_sha,
+        wasm_sha256: &wasm_sha,
+        publisher_key: "publisher",
+        signature: "signature",
+        local_hmac: &local_hmac,
+        manifest_path: "/tmp/first-manifest.json",
+        wasm_path: "/tmp/first.wasm",
+    };
+    db.insert_wasm_plugin(
+        &first,
+        &[(
+            "shared_wasm",
+            "Shared tool",
+            r#"{"type":"object","properties":{}}"#,
+        )],
+    )
+    .expect("insert first wasm plugin");
+
+    let second = crate::db::models::NewWasmPlugin {
+        plugin_id: "dev/second",
+        manifest_json: r#"{"schema_version":"borg.plugin.v1","id":"dev/second"}"#,
+        manifest_sha256: &manifest_sha,
+        wasm_sha256: &wasm_sha,
+        publisher_key: "publisher",
+        signature: "signature",
+        local_hmac: &local_hmac,
+        manifest_path: "/tmp/second-manifest.json",
+        wasm_path: "/tmp/second.wasm",
+    };
+    let err = db
+        .insert_wasm_plugin(
+            &second,
+            &[(
+                "shared_wasm",
+                "Conflicting tool",
+                r#"{"type":"object","properties":{}}"#,
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("UNIQUE constraint failed"));
+
+    assert!(db
+        .get_wasm_plugin("dev/second")
+        .expect("lookup second")
+        .is_none());
+    let defs = db
+        .list_verified_wasm_tool_definitions()
+        .expect("list verified tools");
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].description, "Shared tool");
+}
