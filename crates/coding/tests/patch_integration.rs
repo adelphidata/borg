@@ -742,3 +742,193 @@ fn empty_chunk_body_surfaces_actionable_error() {
         "file must be untouched on parser rejection"
     );
 }
+
+// ── Test: `*** Add File:` overwrites an existing destination ──
+//
+// Regression guard: `*** Add File:` against a path that already exists is
+// permissive — it replaces the file's contents rather than erroring. Locked
+// down because the inverse policy (reject-on-exists) would be an equally
+// defensible choice; a silent change in either direction would burn LLM turns
+// and confuse callers who rely on the current semantics.
+
+#[test]
+fn add_file_overwrites_existing_destination() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("greeting.txt"), "stale content\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Add File: greeting.txt
++fresh content line 1
++fresh content line 2
+*** End Patch";
+
+    let affected = apply_patch_to_dir(patch, dir).expect("add over existing must succeed");
+    assert!(affected.added.contains(&"greeting.txt".to_string()));
+
+    let content = fs::read_to_string(dir.join("greeting.txt")).expect("read");
+    assert!(
+        content.contains("fresh content line 1"),
+        "destination must hold the new content, got: {content:?}"
+    );
+    assert!(
+        !content.contains("stale content"),
+        "previous contents must be gone, got: {content:?}"
+    );
+}
+
+// ── Test: `*** Delete File:` targeting a directory errors cleanly ──
+//
+// Regression guard: `*** Delete File:` is intended for regular files only.
+// Pointing it at a directory path must surface a clean error during the
+// preflight pass (transactional design: no partial filesystem mutation) rather
+// than panicking or silently no-op'ing. Without this guard, a typo in the
+// patch could escalate to deleting a directory's contents via a later
+// alternate implementation.
+
+#[test]
+fn delete_directory_path_errors_cleanly() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::create_dir_all(dir.join("subdir")).expect("create subdir");
+    fs::write(dir.join("subdir/keep.txt"), "preserved\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Delete File: subdir
+*** End Patch";
+
+    let err = apply_patch_to_dir(patch, dir).expect_err("delete on directory must error");
+    let msg = err.to_string();
+    // Today the io error ("Is a directory") is wrapped by `with_context` and
+    // only the wrapper survives the top-level anyhow `to_string()`. The
+    // load-bearing guard here is the filesystem-state assertion below: under
+    // Borg's transactional preflight, no part of the directory may be touched.
+    // The message-shape check is a soft signal that the failure routed through
+    // the patch-validation path rather than panicking or partially succeeding.
+    assert!(
+        msg.contains("Patch validation failed") && msg.contains("subdir"),
+        "expected preflight rejection naming the directory, got: {msg}"
+    );
+
+    // Transactional invariant: directory and its contents must be untouched.
+    assert!(dir.join("subdir").is_dir(), "directory must still exist");
+    let kept = fs::read_to_string(dir.join("subdir/keep.txt")).expect("read kept");
+    assert_eq!(kept, "preserved\n", "nested file must be untouched");
+}
+
+// ── Test: update hunk consisting entirely of `+` lines (pure addition) ──
+//
+// Regression guard: a chunk with no context and no removals — only `+` lines —
+// is a valid shape the parser must accept and the applicator must append to
+// end-of-file. Without this guard, a future "require at least one context or
+// removal line" tightening would silently break this shape, which LLMs do
+// emit for append-style edits. Placement at EOF (rather than start-of-file)
+// is the current contract — see `apply_hunks` in `crates/coding/src/apply.rs`.
+
+#[test]
+fn update_hunk_with_only_additions_applies() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("lines.txt"), "first\nsecond\nthird\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: lines.txt
+@@
++inserted alpha
++inserted beta
+*** End Patch";
+
+    let affected = apply_patch_to_dir(patch, dir).expect("pure-addition hunk must apply");
+    assert!(affected.modified.contains(&"lines.txt".to_string()));
+
+    // Pin placement at end-of-file as an exact post-condition. A regression
+    // that reordered or duplicated lines (or that moved the insertion point
+    // to start-of-file) would fail this assertion.
+    let content = fs::read_to_string(dir.join("lines.txt")).expect("read");
+    assert_eq!(
+        content, "first\nsecond\nthird\ninserted alpha\ninserted beta\n",
+        "pure-addition chunk must append to end-of-file preserving original content"
+    );
+}
+
+// ── Test: leading whitespace on `*** Update File:` header is tolerated ──
+//
+// Regression guard: LLM patch outputs occasionally indent the operation
+// headers (`*** Add File:` / `*** Update File:` / etc.) by accident. The
+// parser strips leading whitespace per line before matching the marker
+// prefix; this test pins that tolerance so a stricter rewrite cannot silently
+// reject patches the agent currently accepts.
+
+#[test]
+fn whitespace_padded_update_file_header_accepted() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("foo.txt"), "old line\n").expect("seed");
+
+    // Two leading spaces before `*** Update File:` — the only deviation from
+    // the canonical patch shape.
+    let patch = "\
+*** Begin Patch
+  *** Update File: foo.txt
+@@
+-old line
++new line
+*** End Patch";
+
+    let affected = apply_patch_to_dir(patch, dir).expect("indented header must be accepted");
+    assert!(affected.modified.contains(&"foo.txt".to_string()));
+
+    let content = fs::read_to_string(dir.join("foo.txt")).expect("read");
+    assert!(
+        content.contains("new line"),
+        "replacement must land, got: {content:?}"
+    );
+    assert!(
+        !content.contains("old line"),
+        "old content must be gone, got: {content:?}"
+    );
+}
+
+// ── Test: update hunk consisting only of `-` removals (deletion-only) ──
+//
+// Regression guard: a chunk that removes one or more context-anchored lines
+// without adding any must apply cleanly. Without this guard, an applicator
+// tightening that required `replace_lines` to be non-empty (or that elided
+// "empty replace" as a no-op) would silently break the LLM's common
+// delete-this-line edits.
+
+#[test]
+fn update_hunk_with_only_deletions_applies() {
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let dir = tmp.path();
+
+    fs::write(dir.join("lines.txt"), "line1\nline2\nline3\n").expect("seed");
+
+    let patch = "\
+*** Begin Patch
+*** Update File: lines.txt
+@@
+ line1
+-line2
+ line3
+*** End Patch";
+
+    let affected = apply_patch_to_dir(patch, dir).expect("deletion-only hunk must apply");
+    assert!(affected.modified.contains(&"lines.txt".to_string()));
+
+    // Exact post-condition: pins both content and ordering. A regression that
+    // reordered surviving context lines or that elided the removal as a no-op
+    // would not be caught by a presence-only assertion.
+    let content = fs::read_to_string(dir.join("lines.txt")).expect("read");
+    assert_eq!(
+        content, "line1\nline3\n",
+        "expected line2 removed, surrounding context preserved in original order"
+    );
+}
