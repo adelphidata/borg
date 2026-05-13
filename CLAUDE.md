@@ -188,6 +188,14 @@ SQLite at `~/.borg/borg.db`. Migrations run on `Database::open()`. Tables: sessi
 
 macOS: `sandbox-exec` Seatbelt (deny-all default). Linux: `bwrap` namespace isolation. Policy from `[sandbox]` per script/channel. Blocked paths filtered before profile generation.
 
+### WASM Plugin Sandbox
+
+Third-party tool plugins ship as signed, capability-sandboxed WebAssembly modules — v1 is tool-only (channels, hooks, onboard scripts, background tasks stay out of scope). Code in `crates/plugins/src/wasm.rs`. Schema tag `borg.plugin.v1`.
+
+Install gauntlet: manifest validation → WASM SHA-256 pin → Ed25519 publisher signature (operator-trusted publisher list) → static WASM walk (rejects WASI, undeclared host imports, `start` functions, `memory64`/shared memory, oversized memories, missing ABI exports `memory`/`alloc`/`borg_tool_call`, non-HTTPS endpoints, unknown capabilities) → local HMAC seal over canonical manifest + WASM. Every execution re-checks the seal; tampering quarantines the plugin instead of running it.
+
+Runtime is `wasmtime` with fuel + memory pages + output bytes + wall-clock caps from the manifest (host ceilings: `fuel ≤ 50M`, `max_memory_pages ≤ 256`, `max_output_bytes ≤ 1 MiB`, `timeout_ms ≤ 60_000`). No WASI, sockets, subprocesses, or filesystem. Host imports are gated by capability: `borg:log` (log), `borg:http` (http — endpoint allowlist + secret-leak scan at host boundary), `borg:state` (state), `borg:credentials` (credentials). Capability/endpoint/credential coherence is enforced both ways — declaring `http` requires at least one `https://` endpoint, and vice versa. See `docs/plugins.md`.
+
 ### Vitals & Posture
 
 5 stats (stability, focus, sync, growth, happiness) computed by replaying HMAC-verified events. `VitalsHook` on SessionStart/BeforeAgentStart/AfterToolCall. `borg status` / `/status`.
