@@ -1,6 +1,5 @@
 //! Runtime bridge for verified WASM plugin tools.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,46 +23,52 @@ const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
 /// whose name collides with a built-in is filtered out at definition time and
 /// rejected at dispatch time, so the LLM never sees two competing schemas for
 /// the same name.
-fn builtin_tool_names() -> &'static HashSet<&'static str> {
-    use std::sync::OnceLock;
-    static NAMES: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    NAMES.get_or_init(|| {
-        [
-            names::WRITE_MEMORY,
-            names::READ_MEMORY,
-            names::MEMORY_SEARCH,
-            names::LIST,
-            names::APPLY_PATCH,
-            names::RUN_SHELL,
-            names::READ_FILE,
-            names::LIST_DIR,
-            names::WEB_FETCH,
-            names::WEB_SEARCH,
-            names::SCHEDULE,
-            names::MANAGE_TASKS,
-            names::MANAGE_CRON,
-            names::BROWSER,
-            names::GENERATE_IMAGE,
-            names::TEXT_TO_SPEECH,
-            names::REQUEST_USER_INPUT,
-            names::APPLY_SKILL_PATCH,
-            names::CREATE_CHANNEL,
-            names::LIST_SKILLS,
-            names::LIST_CHANNELS,
-            names::LIST_AGENTS,
-            names::SPAWN_AGENT,
-            names::SEND_TO_AGENT,
-            names::WAIT_FOR_AGENT,
-            names::CLOSE_AGENT,
-            names::MANAGE_ROLES,
-            names::GMAIL,
-            names::GOOGLE_CALENDAR,
-            names::NOTION,
-            names::LINEAR,
-        ]
-        .into_iter()
-        .collect()
-    })
+fn builtin_tool_names() -> &'static [&'static str] {
+    &[
+        names::WRITE_MEMORY,
+        names::READ_MEMORY,
+        names::MEMORY_SEARCH,
+        names::LIST,
+        names::APPLY_PATCH,
+        names::RUN_SHELL,
+        names::READ_FILE,
+        names::LIST_DIR,
+        names::WEB_FETCH,
+        names::WEB_SEARCH,
+        names::SCHEDULE,
+        names::MANAGE_TASKS,
+        names::MANAGE_CRON,
+        names::BROWSER,
+        names::GENERATE_IMAGE,
+        names::TEXT_TO_SPEECH,
+        names::REQUEST_USER_INPUT,
+        names::APPLY_SKILL_PATCH,
+        names::CREATE_CHANNEL,
+        names::LIST_SKILLS,
+        names::LIST_CHANNELS,
+        names::LIST_AGENTS,
+        names::SPAWN_AGENT,
+        names::SEND_TO_AGENT,
+        names::WAIT_FOR_AGENT,
+        names::CLOSE_AGENT,
+        names::MANAGE_ROLES,
+        names::GMAIL,
+        names::GOOGLE_CALENDAR,
+        names::NOTION,
+        names::LINEAR,
+    ]
+}
+
+/// True if `name` collides with a built-in, ASCII-case-insensitively.
+///
+/// `validate_tool_name` (plugins crate) accepts uppercase ASCII, so an exact
+/// match would let `Run_Shell` slip past while still shadowing the built-in
+/// anywhere downstream that normalizes case. Case-insensitive comparison
+/// closes the gap without restricting plugin tool naming.
+fn is_builtin_tool_name(name: &str) -> bool {
+    builtin_tool_names()
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
 }
 
 /// Cheap check for whether the WASM plugin subsystem is allowed to advertise
@@ -91,12 +96,11 @@ pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
             return Vec::new();
         }
     };
-    let builtins = builtin_tool_names();
     match db.list_verified_wasm_tool_definitions() {
         Ok(rows) => rows
             .into_iter()
             .filter_map(|row| {
-                if builtins.contains(row.name.as_str()) {
+                if is_builtin_tool_name(&row.name) {
                     tracing::warn!(
                         tool = %row.name,
                         "Hiding WASM tool: name collides with built-in"
@@ -132,7 +136,7 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
     if !wasm_enabled() {
         return Ok(None);
     }
-    if builtin_tool_names().contains(name) {
+    if is_builtin_tool_name(name) {
         // A built-in never reaches the unknown-tool fallthrough; if it ever did,
         // we must not let a plugin shadow it.
         return Ok(None);
@@ -314,5 +318,32 @@ impl HostServices for BorgHostServices {
             Some(cfg) => Ok(cfg.resolve_credential_or_env(key)),
             None => Ok(std::env::var(key).ok().filter(|v| !v.is_empty())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_tool_name_match_is_case_insensitive() {
+        // `plugins::wasm::validate_tool_name` accepts uppercase ASCII, so a
+        // plugin advertising `Run_Shell` would otherwise slip past the
+        // built-in collision check (HashSet exact match) and reach the LLM
+        // prompt as a second tool definition. Sanity-check both anchors:
+        //
+        // - canonical lowercase still matches (would fail if the list went
+        //   stale or `is_builtin_tool_name` started normalizing the wrong
+        //   direction)
+        // - upper/mixed case match (the regression guard)
+        // - non-builtin still rejects (would fail if `eq_ignore_ascii_case`
+        //   was applied to the wrong argument and accidentally matched
+        //   everything)
+        assert!(is_builtin_tool_name("run_shell"));
+        assert!(is_builtin_tool_name("RUN_SHELL"));
+        assert!(is_builtin_tool_name("Run_Shell"));
+        assert!(is_builtin_tool_name("rUn_ShElL"));
+        assert!(!is_builtin_tool_name("plugin_specific_tool"));
+        assert!(!is_builtin_tool_name(""));
     }
 }

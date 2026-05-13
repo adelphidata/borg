@@ -247,6 +247,7 @@ pub fn install_verified_package(
     let safe_id = safe_plugin_dir_name(&package.manifest.id)?;
     let dir = data_dir.join("wasm_plugins").join(safe_id);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    restrict_install_dir_permissions(&dir)?;
     let manifest_path = dir.join("manifest.json");
     let wasm_path = dir.join("plugin.wasm");
     std::fs::write(&manifest_path, &package.canonical_manifest)
@@ -278,6 +279,13 @@ pub fn verify_installed_hmac(
     wasm: &[u8],
     expected_hmac: &str,
 ) -> Result<()> {
+    // Mirror the bail in `verify_package` — without a key, both sides would
+    // hash to the same constant and any tampering would still "verify". A
+    // misconfigured boot (e.g. broken `derive_hmac_key`) must fail loudly here
+    // rather than silently degrade to no integrity check.
+    if local_hmac_key.is_empty() {
+        bail!("local HMAC key is required");
+    }
     let expected = hex_decode(expected_hmac)?;
     let actual_hex = compute_local_hmac(local_hmac_key, manifest_bytes, wasm)?;
     let actual = hex_decode(&actual_hex)?;
@@ -517,6 +525,34 @@ pub fn execute_tool(
     )
 }
 
+/// Build a `wasmtime::Engine` configured with Borg's fuel + epoch policy.
+///
+/// Engines are safe to share across plugins because the `Config` is fixed —
+/// per-call variation (fuel budget, epoch deadline) lives in the `Store`.
+/// Callers that execute the same plugin repeatedly (e.g. the daemon) should
+/// cache a single engine plus per-plugin compiled `Module`s and feed them to
+/// [`execute_tool_prepared`].
+pub fn build_engine() -> Result<wasmtime::Engine> {
+    let mut config = wasmtime::Config::new();
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+    // Threads would let a guest spawn host OS threads outside our budgets; the
+    // static gauntlet already rejects shared memory but `wasm_threads(false)`
+    // makes the runtime refuse to instantiate any threaded module too.
+    config.wasm_threads(false);
+    // Disable DWARF — smaller modules, no source-path/symbol leakage from a
+    // signed package back into host logs.
+    config.debug_info(false);
+    wasmtime::Engine::new(&config).context("build wasmtime engine")
+}
+
+/// JIT-compile `wasm` against `engine`. The caller MUST have already cleared
+/// the install gauntlet (`verify_package` / `verify_installed_hmac`) — this
+/// function only compiles, it does NOT re-check signatures or HMAC seals.
+pub fn compile_module(engine: &wasmtime::Engine, wasm: &[u8]) -> Result<wasmtime::Module> {
+    wasmtime::Module::new(engine, wasm).context("compile wasm module")
+}
+
 /// Execute one verified WASM tool, routing capability imports through the
 /// supplied [`HostServices`]. Returns the UTF-8 string the guest stages at
 /// its packed-pointer return value.
@@ -527,16 +563,31 @@ pub fn execute_tool_with_services(
     args_json: &serde_json::Value,
     services: Arc<dyn HostServices>,
 ) -> Result<String> {
+    let engine = build_engine()?;
+    let module = compile_module(&engine, wasm)?;
+    execute_tool_prepared(
+        manifest, &engine, &module, wasm, tool_name, args_json, services,
+    )
+}
+
+/// Same contract as [`execute_tool_with_services`] minus the per-call Engine
+/// and Module construction. Use this when you maintain a process-lifetime
+/// cache of compiled modules. `validate_wasm_module` still runs on every call
+/// — the cache amortizes JIT compile, never integrity checks.
+pub fn execute_tool_prepared(
+    manifest: &WasmPluginManifest,
+    engine: &wasmtime::Engine,
+    module: &wasmtime::Module,
+    wasm: &[u8],
+    tool_name: &str,
+    args_json: &serde_json::Value,
+    services: Arc<dyn HostServices>,
+) -> Result<String> {
     if !manifest.tools.iter().any(|t| t.name == tool_name) {
         bail!("tool {tool_name} is not declared by this plugin");
     }
     validate_wasm_module(manifest, wasm)?;
 
-    let mut config = wasmtime::Config::new();
-    config.consume_fuel(true);
-    config.epoch_interruption(true);
-    let engine = wasmtime::Engine::new(&config)?;
-    let module = wasmtime::Module::new(&engine, wasm)?;
     let max_memory_bytes = (manifest.limits.max_memory_pages as usize)
         .checked_mul(WASM_PAGE_BYTES)
         .context("max_memory_pages overflow")?;
@@ -834,6 +885,24 @@ fn path_prefix_allowed(allowed_path: &str, request_path: &str) -> bool {
 fn safe_plugin_dir_name(id: &str) -> Result<String> {
     validate_plugin_id(id)?;
     Ok(sha256_hex(id.as_bytes()))
+}
+
+/// Restrict the per-plugin install directory to owner-only on Unix.
+///
+/// Matches the `~/.borg/secrets/` posture so an attacker with read access to
+/// `~/.borg/` (e.g. via a misconfigured backup or a sibling tool running as a
+/// less-privileged user) cannot enumerate installed plugin source bytes —
+/// which is the moral equivalent of cleartext capability tokens once paired
+/// with a quarantine bypass.
+fn restrict_install_dir_permissions(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to chmod {} to 0700", dir.display()))?;
+    }
+    let _ = dir;
+    Ok(())
 }
 
 fn is_hex_64(s: &str) -> bool {
@@ -1513,6 +1582,21 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("local HMAC key is required"));
+    }
+
+    #[test]
+    fn verify_installed_hmac_rejects_empty_key() {
+        // Mirrors `package_verification_requires_local_hmac_key`. Without a key
+        // the HMAC degenerates to a publicly recomputable value, so both sides
+        // would "verify" after tampering. The empty-key path must bail before
+        // we ever reach the constant-time compare.
+        let err = verify_installed_hmac(b"", b"manifest", b"wasm", "0".repeat(64).as_str())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local HMAC key is required"),
+            "expected empty-key bail, got: {err}"
+        );
     }
 
     #[test]
@@ -2902,5 +2986,80 @@ mod tests {
             err.contains("unknown field") && err.contains("evil_field"),
             "[tools[0]] expected nested unknown-field rejection, got: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_verified_package_sets_0700_on_unix() {
+        // The install directory holds verified plugin source bytes that are
+        // moral siblings to credentials once paired with a quarantine bypass —
+        // we want the same 0700 posture as `~/.borg/secrets/`. Asserting on
+        // the post-condition (`mode() & 0o777 == 0o700`) means a future change
+        // that drops the chmod call fails this test for a real reason.
+        use std::os::unix::fs::PermissionsExt;
+
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let trusted = vec![manifest.publisher.public_key.clone()];
+        let package =
+            verify_package(&canonical, &sig, &wasm, &trusted, b"local-key").expect("verify");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let installed = install_verified_package(tmp.path(), &package).expect("install");
+
+        let dir = installed.manifest_path.parent().expect("manifest parent");
+        let mode = std::fs::metadata(dir)
+            .expect("stat install dir")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "install dir {} has mode {:o}, expected 0o700",
+            dir.display(),
+            mode & 0o777
+        );
+    }
+
+    #[test]
+    fn wasmtime_config_has_required_setters() {
+        // Source-grep guard. `wasmtime::Config` has no getters, so this
+        // invariant can't be expressed in the type system. The setters below
+        // are the minimum sandbox posture we ship — losing any one of them is
+        // a real-world regression:
+        //
+        //   * `consume_fuel(true)` — without it, no instruction budget.
+        //   * `epoch_interruption(true)` — without it, the per-call watchdog
+        //     thread that arms `Engine::increment_epoch` has nothing to
+        //     interrupt, and the documented wall-clock cap is unenforced.
+        //   * `wasm_threads(false)` — keeps a guest from spawning host OS
+        //     threads outside our budgets; complements the static gauntlet's
+        //     shared-memory rejection.
+        //   * `debug_info(false)` — smaller modules; no source-path leakage
+        //     from a signed package back into host log lines.
+        //
+        // The check runs against the production region only (sliced before
+        // `#[cfg(test)]`) so a setter mentioned in this test body itself
+        // cannot satisfy the assertion.
+        let src = include_str!("wasm.rs");
+        let test_boundary = src
+            .find("#[cfg(test)]")
+            .expect("test module marker must exist");
+        let production = &src[..test_boundary];
+        for setter in [
+            "consume_fuel(true)",
+            "epoch_interruption(true)",
+            "wasm_threads(false)",
+            "debug_info(false)",
+        ] {
+            assert!(
+                production.contains(setter),
+                "wasmtime Config production code must call `{setter}` to preserve the v1 sandbox posture"
+            );
+        }
     }
 }
