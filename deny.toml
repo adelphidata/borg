@@ -6,10 +6,6 @@ all-features = true
 unmaintained = "workspace"
 yanked = "warn"
 ignore = [
-    # rand 0.9.2 unsoundness with custom logger in rand::rng() — pulled in
-    # via tungstenite -> async-tungstenite -> chromiumoxide. Does not apply
-    # to our usage; revisit when upstream chain updates.
-    "RUSTSEC-2026-0097",
     # rustls-pemfile is unmaintained — functionality moved into rustls-pki-types.
     # Pulled transitively (reqwest/rustls-native-certs); revisit when upstream
     # deps drop it.

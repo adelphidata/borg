@@ -94,7 +94,7 @@ async-trait = "0.1"
 rand = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 wasmparser = "0.244"
-wasmtime = "30"
+wasmtime = "36"
 tonic = { version = "0.12", features = ["tls"] }
 tonic-build = "0.12"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
