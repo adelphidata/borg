@@ -757,8 +757,9 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use ed25519_dalek::{Signer, SigningKey};
     use wasm_encoder::{
-        CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
-        Instruction, MemorySection, MemoryType, Module, TypeSection, ValType,
+        BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function,
+        FunctionSection, Instruction, MemorySection, MemoryType, Module, StartSection, TypeSection,
+        ValType,
     };
 
     fn minimal_wasm() -> Vec<u8> {
@@ -997,5 +998,601 @@ mod tests {
         let literal = safe_plugin_dir_name("dev__echo").unwrap();
         assert_ne!(nested, literal);
         assert!(nested.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Build a WASM module matching the Borg plugin ABI but with a customisable
+    /// `borg_tool_call` body. Used by adversarial-execution tests so each one
+    /// changes exactly the bytes under test.
+    fn abi_wasm_with_call_body(build_call_body: impl FnOnce(&mut Function)) -> Vec<u8> {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
+        module.section(&types);
+
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(1);
+        module.section(&funcs);
+
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: Some(1),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("borg_tool_call", ExportKind::Func, 1);
+        module.section(&exports);
+
+        let mut code = CodeSection::new();
+        let mut alloc = Function::new([]);
+        alloc.instruction(&Instruction::I32Const(1024));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+        let mut call = Function::new([]);
+        build_call_body(&mut call);
+        code.function(&call);
+        module.section(&code);
+
+        module.finish()
+    }
+
+    /// Positive end-to-end ABI: alloc + borg_tool_call + memory read flow
+    /// returns the bytes the guest staged at the packed pointer.
+    #[test]
+    fn execute_tool_runs_minimal_abi_end_to_end() {
+        let wasm = minimal_wasm();
+        let manifest = manifest_for(&wasm);
+        let output = execute_tool(&manifest, &wasm, &serde_json::json!({}))
+            .expect("minimal ABI module executes");
+        assert_eq!(
+            output, "OK",
+            "execute_tool must decode packed (ptr,len) and read the guest's staged bytes"
+        );
+    }
+
+    #[test]
+    fn verify_package_rejects_wasm_hash_mismatch() {
+        let wasm = minimal_wasm();
+        let other_wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::I64Const(0));
+            call.instruction(&Instruction::End);
+        });
+        assert_ne!(sha256_hex(&wasm), sha256_hex(&other_wasm));
+
+        let signing = SigningKey::from_bytes(&[3u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let canonical = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+
+        let err = verify_package(
+            &canonical,
+            &sig,
+            &other_wasm,
+            &[manifest.publisher.public_key.clone()],
+            b"local-key",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("WASM hash mismatch"),
+            "expected hash-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_package_rejects_post_signing_manifest_tamper() {
+        let wasm = minimal_wasm();
+        let signing = SigningKey::from_bytes(&[11u8; 32]);
+        let mut manifest = manifest_for(&wasm);
+        manifest.publisher.public_key = STANDARD.encode(signing.verifying_key().to_bytes());
+        let trusted = vec![manifest.publisher.public_key.clone()];
+
+        let canonical_original = canonical_manifest_bytes(&manifest).unwrap();
+        let sig = STANDARD.encode(signing.sign(&canonical_original).to_bytes());
+
+        // Untampered: baseline must verify so the negative below can only fail
+        // on the signature path.
+        verify_package(&canonical_original, &sig, &wasm, &trusted, b"local-key")
+            .expect("baseline signed package verifies");
+
+        let mut tampered = manifest.clone();
+        tampered.version = "9.9.9".to_string();
+        let canonical_tampered = canonical_manifest_bytes(&tampered).unwrap();
+
+        let err = verify_package(&canonical_tampered, &sig, &wasm, &trusted, b"local-key")
+            .unwrap_err()
+            .to_string();
+        // Must be the signature-verification failure specifically — not an
+        // earlier gate firing for an unrelated reason.
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("signature") || lower.contains("verif"),
+            "expected signature verification failure, got: {err}"
+        );
+        assert!(
+            !err.contains("WASM hash mismatch")
+                && !err.contains("invalid plugin manifest JSON")
+                && !err.contains("not trusted"),
+            "signature path not exercised, got an earlier-gate error: {err}"
+        );
+    }
+
+    #[test]
+    fn installed_hmac_detects_single_byte_tamper() {
+        let wasm = minimal_wasm();
+        let manifest_bytes = canonical_manifest_bytes(&manifest_for(&wasm)).unwrap();
+        let key = b"hmac-key-v1";
+        let hmac = compute_local_hmac(key, &manifest_bytes, &wasm).unwrap();
+
+        verify_installed_hmac(key, &manifest_bytes, &wasm, &hmac)
+            .expect("untampered round-trip verifies");
+
+        let mut wasm_tamper = wasm.clone();
+        let last = wasm_tamper.len() - 1;
+        wasm_tamper[last] ^= 0x01;
+        let err = verify_installed_hmac(key, &manifest_bytes, &wasm_tamper, &hmac)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("integrity check failed"),
+            "wasm byte flip must trip integrity check, got: {err}"
+        );
+
+        let mut manifest_tamper = manifest_bytes.clone();
+        manifest_tamper[0] ^= 0x01;
+        let err = verify_installed_hmac(key, &manifest_tamper, &wasm, &hmac)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("integrity check failed"),
+            "manifest byte flip must trip integrity check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn static_validation_rejects_start_section() {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        module.section(&funcs);
+        module.section(&StartSection { function_index: 0 });
+        let mut code = CodeSection::new();
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::End);
+        code.function(&body);
+        module.section(&code);
+        let wasm = module.finish();
+
+        let mut manifest = manifest_for(&minimal_wasm());
+        manifest.wasm_sha256 = sha256_hex(&wasm);
+        let err = validate_wasm_module(&manifest, &wasm)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("start functions are not allowed"),
+            "expected start-section bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn static_validation_rejects_disallowed_memory_shapes() {
+        // Baseline: confirm a normal memory shape passes so the table below
+        // proves each case fails for the field it mutates, not collateral.
+        let baseline_wasm = minimal_wasm();
+        validate_wasm_module(&manifest_for(&baseline_wasm), &baseline_wasm)
+            .expect("baseline memory shape passes static validation");
+
+        let cases: &[(&str, MemoryType, &str)] = &[
+            (
+                "memory64",
+                MemoryType {
+                    minimum: 1,
+                    maximum: Some(1),
+                    memory64: true,
+                    shared: false,
+                    page_size_log2: None,
+                },
+                "memory64 is not allowed",
+            ),
+            (
+                "shared",
+                MemoryType {
+                    minimum: 1,
+                    maximum: Some(1),
+                    memory64: false,
+                    shared: true,
+                    page_size_log2: None,
+                },
+                "shared memory is not allowed",
+            ),
+            (
+                "initial_over_limit",
+                MemoryType {
+                    minimum: MAX_MEMORY_PAGES_DEFAULT + 1,
+                    maximum: Some(MAX_MEMORY_PAGES_DEFAULT + 1),
+                    memory64: false,
+                    shared: false,
+                    page_size_log2: None,
+                },
+                "initial memory pages",
+            ),
+            (
+                "maximum_over_limit",
+                MemoryType {
+                    minimum: 1,
+                    maximum: Some(MAX_MEMORY_PAGES_DEFAULT + 1),
+                    memory64: false,
+                    shared: false,
+                    page_size_log2: None,
+                },
+                "declared maximum memory exceeds plugin limit",
+            ),
+        ];
+
+        for (label, memory_type, expected_fragment) in cases {
+            let mut module = Module::new();
+            let mut types = TypeSection::new();
+            types.ty().function([ValType::I32], [ValType::I32]);
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32], [ValType::I64]);
+            module.section(&types);
+            let mut funcs = FunctionSection::new();
+            funcs.function(0);
+            funcs.function(1);
+            module.section(&funcs);
+            let mut memories = MemorySection::new();
+            memories.memory(*memory_type);
+            module.section(&memories);
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("alloc", ExportKind::Func, 0);
+            exports.export("borg_tool_call", ExportKind::Func, 1);
+            module.section(&exports);
+            let mut code = CodeSection::new();
+            let mut alloc = Function::new([]);
+            alloc.instruction(&Instruction::I32Const(1024));
+            alloc.instruction(&Instruction::End);
+            code.function(&alloc);
+            let mut call = Function::new([]);
+            call.instruction(&Instruction::I64Const(0));
+            call.instruction(&Instruction::End);
+            code.function(&call);
+            module.section(&code);
+            let wasm = module.finish();
+
+            let mut manifest = manifest_for(&baseline_wasm);
+            manifest.wasm_sha256 = sha256_hex(&wasm);
+            let err = validate_wasm_module(&manifest, &wasm)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(expected_fragment),
+                "[{label}] expected {expected_fragment:?} in error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_tool_traps_on_fuel_exhaustion() {
+        let wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::Loop(BlockType::Empty));
+            call.instruction(&Instruction::Br(0));
+            call.instruction(&Instruction::End);
+            call.instruction(&Instruction::Unreachable);
+            call.instruction(&Instruction::End);
+        });
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.fuel = 1_000;
+
+        // Run under a hard wall-clock timeout so a regression that removes
+        // the fuel limit produces a clear test failure rather than a hung CI.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manifest_thread = manifest.clone();
+        let wasm_thread = wasm.clone();
+        std::thread::spawn(move || {
+            let r = execute_tool(&manifest_thread, &wasm_thread, &serde_json::json!({}));
+            let _ = tx.send(r);
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("fuel-bounded execution must terminate within 15s");
+
+        let err = result.expect_err("infinite loop must be terminated by fuel exhaustion");
+        // anyhow's Display only shows the topmost context; walk the chain so a
+        // wasmtime `Trap::OutOfFuel` deep in the cause chain is visible.
+        let chain: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chain.to_lowercase().contains("fuel"),
+            "expected wasmtime fuel-exhaustion trap, got chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_output_exceeding_max_output_bytes() {
+        let max_out: u64 = 1_048_576; // upper bound permitted by validate_manifest
+        let packed: i64 = (max_out + 1) as i64; // ptr=0, len = max_out + 1
+        let wasm = abi_wasm_with_call_body(|call| {
+            call.instruction(&Instruction::I64Const(packed));
+            call.instruction(&Instruction::End);
+        });
+        let mut manifest = manifest_for(&wasm);
+        manifest.limits.max_output_bytes = max_out;
+
+        let err = execute_tool(&manifest, &wasm, &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("output exceeded"),
+            "expected output-cap bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_manifest_rejects_unsafe_plugin_ids() {
+        let wasm = minimal_wasm();
+        // Positive anchor: the default id must still be accepted, otherwise the
+        // table below would pass even if validate_plugin_id became vacuous.
+        validate_manifest(&manifest_for(&wasm)).expect("dev/echo is a valid id");
+
+        for bad_id in [
+            "../etc", "/abs", "a//b", "a b", "a\\b", "", "a..b",
+            "a@b",     // exercises the alphanumeric/punct allowlist branch
+            "plugin!", // trailing disallowed char
+        ] {
+            let mut manifest = manifest_for(&wasm);
+            manifest.id = bad_id.to_string();
+            let err = validate_manifest(&manifest).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid WASM plugin id"),
+                "[{bad_id:?}] expected id rejection, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_manifest_rejects_duplicate_tool_names() {
+        let wasm = minimal_wasm();
+        let mut manifest = manifest_for(&wasm);
+        manifest.tools.push(WasmToolManifest {
+            name: "echo_wasm".to_string(),
+            description: "Second copy".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        });
+        let err = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate tool name"),
+            "expected duplicate-tool-name bail, got: {err}"
+        );
+    }
+
+    #[test]
+    fn host_http_rejects_request_without_http_capability() {
+        let wasm = minimal_wasm();
+        let manifest = manifest_for(&wasm);
+        validate_manifest(&manifest).expect("baseline manifest has no http cap and passes");
+
+        let req = HostHttpRequest {
+            url: "https://api.example.com/v1/items",
+            headers: &[],
+            body: b"",
+        };
+        let err = validate_host_http_request(&manifest, &req, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not have http capability"),
+            "expected capability gate, got: {err}"
+        );
+    }
+
+    #[test]
+    fn host_http_rejects_non_https_requests_and_allowlist_entries() {
+        // Request-time gate: even with http cap + valid https allowlist, an
+        // http:// URL must be rejected by the scheme check.
+        let wasm = minimal_wasm();
+        let mut manifest = manifest_for(&wasm);
+        manifest.capabilities = vec!["http".to_string()];
+        manifest.endpoints = vec!["https://api.example.com/v1/".to_string()];
+        validate_manifest(&manifest).expect("https allowlist validates");
+
+        let req = HostHttpRequest {
+            url: "http://api.example.com/v1/items",
+            headers: &[],
+            body: b"",
+        };
+        let err = validate_host_http_request(&manifest, &req, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("must use https"),
+            "expected https-only bail, got: {err}"
+        );
+
+        // Manifest-time gate: an http:// allowlist entry must itself be
+        // rejected so a misconfigured manifest can't smuggle in an open
+        // egress for plaintext HTTP.
+        let mut bad_manifest = manifest_for(&wasm);
+        bad_manifest.capabilities = vec!["http".to_string()];
+        bad_manifest.endpoints = vec!["http://api.example.com/v1/".to_string()];
+        let err = validate_manifest(&bad_manifest).unwrap_err().to_string();
+        assert!(
+            err.contains("https"),
+            "expected allowlist scheme rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn host_http_wildcard_allows_subdomains_but_not_apex() {
+        let wasm = minimal_wasm();
+        let mut manifest = manifest_for(&wasm);
+        manifest.capabilities = vec!["http".to_string()];
+        manifest.endpoints = vec!["*.example.com".to_string()];
+        validate_manifest(&manifest).expect("wildcard endpoint manifest validates");
+
+        let subdomain = HostHttpRequest {
+            url: "https://api.example.com/v1/items",
+            headers: &[],
+            body: b"",
+        };
+        validate_host_http_request(&manifest, &subdomain, &[])
+            .expect("wildcard must match a strict subdomain");
+
+        let apex = HostHttpRequest {
+            url: "https://example.com/v1/items",
+            headers: &[],
+            body: b"",
+        };
+        let err = validate_host_http_request(&manifest, &apex, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not allowlisted"),
+            "wildcard *.example.com must NOT match bare apex example.com, got: {err}"
+        );
+
+        // The classic suffix-smuggle: `barexample.com` ends with `example.com`
+        // but is not a subdomain. A naive `ends_with` would let it through —
+        // the production code requires the `.` boundary.
+        let smuggle = HostHttpRequest {
+            url: "https://barexample.com/v1/items",
+            headers: &[],
+            body: b"",
+        };
+        let err = validate_host_http_request(&manifest, &smuggle, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not allowlisted"),
+            "wildcard match must enforce a dot boundary, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_alloc_returning_oob_pointer() {
+        // alloc returns i32::MAX (positive, so it bypasses the `< 0` host
+        // guard) but lies far outside the single memory page. The host's
+        // `memory.write` must trap, not silently succeed or wrap.
+        let wasm = {
+            let mut module = Module::new();
+            let mut types = TypeSection::new();
+            types.ty().function([ValType::I32], [ValType::I32]);
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32], [ValType::I64]);
+            module.section(&types);
+            let mut funcs = FunctionSection::new();
+            funcs.function(0);
+            funcs.function(1);
+            module.section(&funcs);
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            module.section(&memories);
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("alloc", ExportKind::Func, 0);
+            exports.export("borg_tool_call", ExportKind::Func, 1);
+            module.section(&exports);
+            let mut code = CodeSection::new();
+            let mut alloc = Function::new([]);
+            alloc.instruction(&Instruction::I32Const(i32::MAX));
+            alloc.instruction(&Instruction::End);
+            code.function(&alloc);
+            let mut call = Function::new([]);
+            call.instruction(&Instruction::I64Const(0));
+            call.instruction(&Instruction::End);
+            code.function(&call);
+            module.section(&code);
+            module.finish()
+        };
+        let manifest = manifest_for(&wasm);
+        let err = execute_tool(&manifest, &wasm, &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("out of bounds") || lower.contains("memory"),
+            "expected memory access trap on OOB alloc pointer, got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_tool_rejects_non_utf8_output() {
+        // Guest stages 0xff 0xfe at offset 2048 (a known-invalid UTF-8 prefix)
+        // and points the packed result there. The host must refuse to surface
+        // arbitrary bytes as a String — only UTF-8 may cross the boundary.
+        let wasm = {
+            let mut module = Module::new();
+            let mut types = TypeSection::new();
+            types.ty().function([ValType::I32], [ValType::I32]);
+            types
+                .ty()
+                .function([ValType::I32, ValType::I32], [ValType::I64]);
+            module.section(&types);
+            let mut funcs = FunctionSection::new();
+            funcs.function(0);
+            funcs.function(1);
+            module.section(&funcs);
+            let mut memories = MemorySection::new();
+            memories.memory(MemoryType {
+                minimum: 1,
+                maximum: Some(1),
+                memory64: false,
+                shared: false,
+                page_size_log2: None,
+            });
+            module.section(&memories);
+            let mut exports = ExportSection::new();
+            exports.export("memory", ExportKind::Memory, 0);
+            exports.export("alloc", ExportKind::Func, 0);
+            exports.export("borg_tool_call", ExportKind::Func, 1);
+            module.section(&exports);
+            let mut code = CodeSection::new();
+            let mut alloc = Function::new([]);
+            alloc.instruction(&Instruction::I32Const(1024));
+            alloc.instruction(&Instruction::End);
+            code.function(&alloc);
+            let mut call = Function::new([]);
+            call.instruction(&Instruction::I64Const(((2048u64) << 32 | 2u64) as i64));
+            call.instruction(&Instruction::End);
+            code.function(&call);
+            module.section(&code);
+            let mut data = DataSection::new();
+            data.active(0, &ConstExpr::i32_const(2048), [0xffu8, 0xfeu8]);
+            module.section(&data);
+            module.finish()
+        };
+        let manifest = manifest_for(&wasm);
+        let err = execute_tool(&manifest, &wasm, &serde_json::json!({}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-UTF-8"),
+            "expected non-UTF-8 rejection at host boundary, got: {err}"
+        );
     }
 }
