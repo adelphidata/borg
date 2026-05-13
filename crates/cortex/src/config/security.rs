@@ -229,6 +229,11 @@ pub struct SecurityConfig {
     /// Pre-flight gate for outbound URLs (`web_fetch`, `browser.navigate`).
     #[serde(default)]
     pub url_policy: UrlPolicyConfig,
+    /// Base64-encoded Ed25519 public keys trusted to sign WASM plugin
+    /// manifests. `borg plugin install` rejects any package whose publisher
+    /// key is not in this list. Empty by default — operators must opt in.
+    #[serde(default)]
+    pub trusted_publisher_keys: Vec<String>,
 }
 
 fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
@@ -260,6 +265,7 @@ impl Default for SecurityConfig {
             verifier: VerifierKind::Tofu,
             kek_backend: KekBackend::Auto,
             url_policy: UrlPolicyConfig::default(),
+            trusted_publisher_keys: Vec::new(),
         }
     }
 }

@@ -126,6 +126,11 @@ enum Commands {
     },
     /// List all available integrations and their status
     Plugins,
+    /// Manage WASM plugin packages (install/list/show/remove/verify)
+    Plugin {
+        #[command(subcommand)]
+        action: commands::wasm_plugin::WasmPluginAction,
+    },
     /// Show or update configuration settings
     Settings {
         #[command(subcommand)]
@@ -528,6 +533,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Add { name }) => plugins::add_plugin(&name)?,
         Some(Commands::Remove { name }) => plugins::remove_plugin(&name)?,
         Some(Commands::Plugins) => plugins::list_plugins()?,
+        Some(Commands::Plugin { action }) => commands::wasm_plugin::dispatch(action)?,
         Some(Commands::Settings { action }) => commands::settings::dispatch_settings(action)?,
         Some(Commands::Logs {
             count,

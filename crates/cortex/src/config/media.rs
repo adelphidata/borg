@@ -688,6 +688,8 @@ pub struct PluginsConfig {
     pub enabled: bool,
     /// Automatically verify plugin integrity on install.
     pub auto_verify: bool,
+    /// WASM-plugin subsystem settings.
+    pub wasm: WasmPluginsConfig,
 }
 
 impl Default for PluginsConfig {
@@ -695,7 +697,23 @@ impl Default for PluginsConfig {
         Self {
             enabled: true,
             auto_verify: true,
+            wasm: WasmPluginsConfig::default(),
         }
+    }
+}
+
+/// WASM-plugin runtime kill switches.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WasmPluginsConfig {
+    /// When false, WASM tool definitions are hidden from the LLM and dispatch
+    /// returns "tool not found" — useful for incident response.
+    pub enabled: bool,
+}
+
+impl Default for WasmPluginsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 

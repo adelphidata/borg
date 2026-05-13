@@ -282,6 +282,46 @@ impl Database {
         }
     }
 
+    /// List all WASM plugin rows ordered by id, regardless of status.
+    pub fn list_wasm_plugins(&self) -> Result<Vec<WasmPluginRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT plugin_id, manifest_json, manifest_sha256, wasm_sha256, publisher_key,
+                    signature, local_hmac, manifest_path, wasm_path, status, quarantine_reason,
+                    installed_at, verified_at
+             FROM wasm_plugins ORDER BY plugin_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(WasmPluginRow {
+                    plugin_id: row.get(0)?,
+                    manifest_json: row.get(1)?,
+                    manifest_sha256: row.get(2)?,
+                    wasm_sha256: row.get(3)?,
+                    publisher_key: row.get(4)?,
+                    signature: row.get(5)?,
+                    local_hmac: row.get(6)?,
+                    manifest_path: row.get(7)?,
+                    wasm_path: row.get(8)?,
+                    status: row.get(9)?,
+                    quarantine_reason: row.get(10)?,
+                    installed_at: row.get(11)?,
+                    verified_at: row.get(12)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Count tools registered for a plugin.
+    pub fn count_wasm_plugin_tools(&self, plugin_id: &str) -> Result<u32> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM wasm_plugin_tools WHERE plugin_id = ?1",
+            params![plugin_id],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u32)
+    }
+
     /// Mark a WASM plugin quarantined so its tools are no longer advertised or executable.
     pub fn quarantine_wasm_plugin(&self, plugin_id: &str, reason: &str) -> Result<()> {
         self.conn.execute(
