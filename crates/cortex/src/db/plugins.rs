@@ -293,6 +293,33 @@ impl Database {
         Ok(())
     }
 
+    /// Clear a quarantine so a previously-failed plugin can be re-verified
+    /// from a fresh on-disk copy. Idempotent: calling on a non-quarantined
+    /// row updates nothing.
+    pub fn restore_wasm_plugin(&self, plugin_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "UPDATE wasm_plugins
+             SET status = 'verified', quarantine_reason = NULL, verified_at = ?1
+             WHERE plugin_id = ?2 AND status = 'quarantined'",
+            params![now, plugin_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all DB state for a WASM plugin. Returns true if a row existed.
+    /// The on-disk install directory is NOT touched — the caller (CLI / TUI)
+    /// owns filesystem cleanup so this method stays usable from contexts that
+    /// don't know the `data_dir`.
+    pub fn delete_wasm_plugin(&self, plugin_id: &str) -> Result<bool> {
+        let affected = self.conn.execute(
+            "DELETE FROM wasm_plugins WHERE plugin_id = ?1",
+            params![plugin_id],
+        )?;
+        // `wasm_plugin_tools` is cleaned by the FK ON DELETE CASCADE.
+        Ok(affected > 0)
+    }
+
     /// List verified WASM tool definitions to advertise to the LLM.
     pub fn list_verified_wasm_tool_definitions(&self) -> Result<Vec<WasmToolDefinitionRow>> {
         let mut stmt = self.conn.prepare(

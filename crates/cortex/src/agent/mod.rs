@@ -2337,7 +2337,17 @@ impl Agent {
         let tool = match crate::tool::Tool::parse(name, raw_args.clone()) {
             Ok(t) => t,
             Err(crate::tool::ToolParseError::UnknownTool(n)) => {
-                if let Some(output) = crate::wasm_plugins::try_execute_tool(&n, &raw_args)? {
+                // WASM plugin execution does sync DB + FS + wasmtime compile + run; offload
+                // to a blocking thread so the agent loop's reactor isn't starved for up to
+                // the manifest's timeout_ms budget.
+                let args_owned = raw_args.clone();
+                let n_owned = n.clone();
+                let plugin_result = tokio::task::spawn_blocking(move || {
+                    crate::wasm_plugins::try_execute_tool(&n_owned, &args_owned)
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("WASM plugin task join failed: {e}"))??;
+                if let Some(output) = plugin_result {
                     return Ok(ToolOutput::Text(output));
                 }
                 return Err(anyhow::anyhow!("Unknown tool: {n}"));
