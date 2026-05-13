@@ -178,10 +178,15 @@ async fn bad_cron_at_startup_falls_back_without_panic() {
 /// watchdog falsely flag the loop as stalled after 5min.
 #[tokio::test(start_paused = true)]
 async fn cron_long_wait_is_capped_for_liveness() {
-    // Cron firing every 10 minutes — long enough that without the cap,
-    // a 60s liveness check window would fail.
+    // Cron firing once on 2099-01-01 — `chrono::Local::now()` ignores
+    // `tokio::time::pause`, so any periodic expression (e.g. `0 0/10 *
+    // * * *`) makes the test flaky when wall time happens to sit
+    // within LIVENESS_TICK_MAX of a fire boundary: `did_clip` would
+    // be false, virtual sleep would complete, and a real Fire would
+    // be emitted. A single fire decades away guarantees the cap
+    // clips every iteration regardless of when the test runs.
     let mut config = hb_config("30m");
-    config.cron = Some("0 0/10 * * * *".to_string());
+    config.cron = Some("0 0 0 1 1 * 2099".to_string());
     config.min_interval_secs = 1;
 
     let (_poke_tx, poke_rx) = mpsc::channel(1);
