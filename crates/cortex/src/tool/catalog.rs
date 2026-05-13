@@ -30,6 +30,8 @@ pub enum ToolGroup {
     Integration,
     /// Multi-agent orchestration tools.
     Agents,
+    /// Per-session goal management tools.
+    Goals,
 }
 
 /// Primary tools per group — derived from the typed [`crate::tool::Tool`]
@@ -74,6 +76,10 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     (crate::tool::names::WAIT_FOR_AGENT, ToolGroup::Agents),
     (crate::tool::names::CLOSE_AGENT, ToolGroup::Agents),
     (crate::tool::names::MANAGE_ROLES, ToolGroup::Agents),
+    // Goals
+    (crate::tool::names::GET_GOAL, ToolGroup::Goals),
+    (crate::tool::names::CREATE_GOAL, ToolGroup::Goals),
+    (crate::tool::names::UPDATE_GOAL, ToolGroup::Goals),
 ];
 
 impl ToolGroup {
@@ -90,6 +96,7 @@ impl ToolGroup {
             "media" => Some(Self::Media),
             "integration" => Some(Self::Integration),
             "agents" => Some(Self::Agents),
+            "goals" => Some(Self::Goals),
             _ => None,
         }
     }
@@ -107,6 +114,7 @@ impl ToolGroup {
             Self::Media => "Media",
             Self::Integration => "Integration",
             Self::Agents => "Agents",
+            Self::Goals => "Goals",
         }
     }
 
@@ -123,7 +131,7 @@ impl ToolGroup {
     pub fn is_core(&self) -> bool {
         matches!(
             self,
-            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery
+            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery | Self::Goals
         )
     }
 
@@ -131,7 +139,7 @@ impl ToolGroup {
     /// user message. Core groups return an empty slice (always included).
     pub fn keyword_hints(&self) -> &'static [&'static str] {
         match self {
-            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery => &[],
+            Self::Memory | Self::Fs | Self::Runtime | Self::Discovery | Self::Goals => &[],
             Self::Web => &[
                 "search", "fetch", "url", "website", "http", "link", "web", "scrape",
             ],
@@ -324,6 +332,7 @@ pub const ALL_GROUPS: &[ToolGroup] = &[
     ToolGroup::Media,
     ToolGroup::Integration,
     ToolGroup::Agents,
+    ToolGroup::Goals,
 ];
 
 /// Aliases — tools that share a group with a primary tool but are not listed
@@ -561,7 +570,7 @@ mod tests {
 
     #[test]
     fn all_groups_constant_has_all_variants() {
-        assert_eq!(ALL_GROUPS.len(), 10);
+        assert_eq!(ALL_GROUPS.len(), 11);
         assert!(ALL_GROUPS.contains(&ToolGroup::Memory));
         assert!(ALL_GROUPS.contains(&ToolGroup::Fs));
         assert!(ALL_GROUPS.contains(&ToolGroup::Runtime));
@@ -572,6 +581,7 @@ mod tests {
         assert!(ALL_GROUPS.contains(&ToolGroup::Media));
         assert!(ALL_GROUPS.contains(&ToolGroup::Integration));
         assert!(ALL_GROUPS.contains(&ToolGroup::Agents));
+        assert!(ALL_GROUPS.contains(&ToolGroup::Goals));
     }
 
     #[test]
@@ -617,6 +627,7 @@ mod tests {
         assert!(!ToolGroup::Media.is_core());
         assert!(!ToolGroup::Integration.is_core());
         assert!(!ToolGroup::Agents.is_core());
+        assert!(ToolGroup::Goals.is_core());
     }
 
     #[test]
@@ -780,6 +791,9 @@ mod tests {
             tool_names::GOOGLE_CALENDAR,
             tool_names::NOTION,
             tool_names::LINEAR,
+            tool_names::GET_GOAL,
+            tool_names::CREATE_GOAL,
+            tool_names::UPDATE_GOAL,
         ];
 
         for name in &constants {

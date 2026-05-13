@@ -1,0 +1,190 @@
+//! Per-session goals: typed objective + status + token budget, accounting,
+//! steering prompts, and runtime state.
+//!
+//! A session has at most one goal at a time. The model can read it via
+//! `get_goal`, create one via `create_goal` (only when none exists), and mark
+//! the active goal complete via `update_goal`. Pause/resume/budget changes are
+//! user-driven (via `/goal …` in the TUI or the daemon RPC).
+
+use serde::Deserialize;
+use serde::Serialize;
+
+pub mod prompts;
+pub mod runtime;
+
+/// Hard cap on objective length, mirrors codex's protocol cap and prevents the
+/// objective from blowing out the system-prompt suffix.
+pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
+
+/// Goal lifecycle status. Stored in SQLite as snake_case strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalStatus {
+    /// Agent is actively pursuing the goal.
+    Active,
+    /// User paused the goal; no auto-continuation.
+    Paused,
+    /// Token budget reached; agent should wrap up.
+    BudgetLimited,
+    /// Objective achieved.
+    Complete,
+}
+
+impl GoalStatus {
+    /// SQL/wire string form.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::BudgetLimited => "budget_limited",
+            GoalStatus::Complete => "complete",
+        }
+    }
+
+    /// Parse from SQL/wire string. Returns `None` for unknown variants.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "active" => GoalStatus::Active,
+            "paused" => GoalStatus::Paused,
+            "budget_limited" => GoalStatus::BudgetLimited,
+            "complete" => GoalStatus::Complete,
+            _ => return None,
+        })
+    }
+
+    /// Human-readable label for TUI summary cards.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            GoalStatus::Active => "active",
+            GoalStatus::Paused => "paused",
+            GoalStatus::BudgetLimited => "limited by budget",
+            GoalStatus::Complete => "complete",
+        }
+    }
+}
+
+/// A persisted per-session goal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Goal {
+    /// Session this goal belongs to (also the primary key).
+    pub session_id: String,
+    /// UUID v4 regenerated whenever the objective is replaced; lets accounting
+    /// detect mid-flight objective swaps.
+    pub goal_id: String,
+    /// User-provided objective string (untrusted).
+    pub objective: String,
+    /// Current lifecycle status.
+    pub status: GoalStatus,
+    /// Optional positive token budget. `None` = unbounded.
+    pub token_budget: Option<i64>,
+    /// Tokens consumed pursuing the goal.
+    pub tokens_used: i64,
+    /// Wall-clock seconds spent with this goal Active.
+    pub time_used_seconds: i64,
+    /// Unix seconds.
+    pub created_at: i64,
+    /// Unix seconds.
+    pub updated_at: i64,
+}
+
+/// Validate a user-provided objective. Returns the trimmed objective on
+/// success.
+///
+/// Rejects: empty / whitespace-only / longer than [`MAX_OBJECTIVE_CHARS`]
+/// characters (Unicode scalar values, matching codex).
+pub fn validate_objective(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("objective must not be empty".to_string());
+    }
+    let char_count = trimmed.chars().count();
+    if char_count > MAX_OBJECTIVE_CHARS {
+        return Err(format!(
+            "objective is {char_count} characters; limit is {MAX_OBJECTIVE_CHARS}"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a token budget. `None` is unbounded and always valid; `Some(n)`
+/// must be strictly positive.
+pub fn validate_budget(budget: Option<i64>) -> Result<Option<i64>, String> {
+    match budget {
+        None => Ok(None),
+        Some(n) if n > 0 => Ok(Some(n)),
+        Some(n) => Err(format!("token_budget must be positive (got {n})")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_as_str_and_back_roundtrip() {
+        for status in [
+            GoalStatus::Active,
+            GoalStatus::Paused,
+            GoalStatus::BudgetLimited,
+            GoalStatus::Complete,
+        ] {
+            assert_eq!(GoalStatus::from_str(status.as_str()), Some(status));
+        }
+        assert_eq!(GoalStatus::from_str("nonsense"), None);
+    }
+
+    #[test]
+    fn status_serde_is_snake_case() {
+        let json = serde_json::to_string(&GoalStatus::BudgetLimited).unwrap();
+        assert_eq!(json, "\"budget_limited\"");
+        let back: GoalStatus = serde_json::from_str("\"budget_limited\"").unwrap();
+        assert_eq!(back, GoalStatus::BudgetLimited);
+    }
+
+    #[test]
+    fn validate_objective_rejects_empty_and_whitespace() {
+        assert!(validate_objective("").is_err());
+        assert!(validate_objective("   \n\t").is_err());
+    }
+
+    #[test]
+    fn validate_objective_trims() {
+        assert_eq!(
+            validate_objective("  ship it  ").unwrap(),
+            "ship it".to_string()
+        );
+    }
+
+    #[test]
+    fn validate_objective_enforces_char_cap() {
+        let ok = "x".repeat(MAX_OBJECTIVE_CHARS);
+        assert_eq!(
+            validate_objective(&ok).unwrap().chars().count(),
+            MAX_OBJECTIVE_CHARS
+        );
+        let too_big = "x".repeat(MAX_OBJECTIVE_CHARS + 1);
+        let err = validate_objective(&too_big).unwrap_err();
+        assert!(err.contains("limit is"));
+    }
+
+    #[test]
+    fn validate_objective_counts_unicode_scalars_not_bytes() {
+        // Each `é` is 2 bytes but 1 scalar value; MAX_OBJECTIVE_CHARS scalars must pass
+        // even though byte length is 2x.
+        let s = "é".repeat(MAX_OBJECTIVE_CHARS);
+        assert!(validate_objective(&s).is_ok());
+    }
+
+    #[test]
+    fn validate_budget_rejects_zero_and_negative() {
+        assert!(validate_budget(Some(0)).is_err());
+        assert!(validate_budget(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn validate_budget_accepts_none_and_positive() {
+        assert_eq!(validate_budget(None).unwrap(), None);
+        assert_eq!(validate_budget(Some(100)).unwrap(), Some(100));
+    }
+}

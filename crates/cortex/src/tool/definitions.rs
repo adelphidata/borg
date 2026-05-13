@@ -156,6 +156,45 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
         }),
     ));
 
+    // Per-session goals. The three tools form the agent-visible surface for
+    // the persisted goal: read state, create when none exists, and mark
+    // complete. Pause/resume/budget changes and objective edits are
+    // user-controlled and are *not* exposed here.
+    defs.push(ToolDefinition::new(
+        tool_names::GET_GOAL,
+        "Get the current goal for this session, including status, objective, token budget and tokens used, elapsed time, and remaining token budget. Returns null when no goal is set.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    ));
+    defs.push(ToolDefinition::new(
+        tool_names::CREATE_GOAL,
+        "Create a goal only when explicitly requested by the user or developer instructions; do not infer goals from ordinary tasks. Set token_budget only when an explicit token budget is requested. Fails if a goal already exists; the user must edit or clear the existing goal first.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string", "description": "Required. The concrete objective to start pursuing. This starts a new active goal only when no goal is currently defined."},
+                "token_budget": {"type": "integer", "description": "Optional positive token budget for the new active goal."}
+            },
+            "required": ["objective"],
+            "additionalProperties": false
+        }),
+    ));
+    defs.push(ToolDefinition::new(
+        tool_names::UPDATE_GOAL,
+        "Mark the existing goal as achieved. The only accepted value for `status` is \"complete\". Pause, resume, budget edits, and objective replacement are user-controlled and not reachable through this tool. Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work. When marking a budgeted goal complete, report the final token usage from the tool result to the user.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["complete"], "description": "Required. Set to complete only when the objective is achieved and no required work remains."}
+            },
+            "required": ["status"],
+            "additionalProperties": false
+        }),
+    ));
+
     defs
 }
 

@@ -1093,6 +1093,11 @@ impl Agent {
         // or when the search returns no hits.
         system.push_str(&self.build_active_memory_section().await);
 
+        // Active goal context — the agent must see the current objective so
+        // every turn pulls toward it. Untrusted: the objective is user-data,
+        // not a higher-priority instruction set.
+        system.push_str(&self.build_goal_context_section());
+
         // Short-term working memory (session facts, active project)
         let working_memory = self.short_term_memory.render();
         if !working_memory.is_empty() {
@@ -2480,6 +2485,27 @@ impl Agent {
             }
             crate::tool::Tool::ManageRoles(args) => {
                 crate::tool::multi_agent::handle_manage_roles(args)
+            }
+            crate::tool::Tool::GetGoal(args) => {
+                let guard = self.db_guard();
+                match guard.as_ref() {
+                    Some(db) => crate::tool::get_goal::handle(args, db, &self.session.meta.id),
+                    None => Ok("null".to_string()),
+                }
+            }
+            crate::tool::Tool::CreateGoal(args) => {
+                let guard = self.db_guard();
+                match guard.as_ref() {
+                    Some(db) => crate::tool::create_goal::handle(args, db, &self.session.meta.id),
+                    None => Ok(serde_json::json!({"error":"database unavailable"}).to_string()),
+                }
+            }
+            crate::tool::Tool::UpdateGoal(args) => {
+                let guard = self.db_guard();
+                match guard.as_ref() {
+                    Some(db) => crate::tool::update_goal::handle(args, db, &self.session.meta.id),
+                    None => Ok(serde_json::json!({"error":"database unavailable"}).to_string()),
+                }
             }
             // Variants handled in the early-return block above.
             crate::tool::Tool::ReadFile(_)

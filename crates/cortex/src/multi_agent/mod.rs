@@ -1351,6 +1351,7 @@ mod tests {
             "web_fetch",
             "web_search",
             "request_user_input",
+            "get_goal",
         ]
         .into_iter()
         .collect();

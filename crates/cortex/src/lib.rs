@@ -75,6 +75,8 @@ pub mod export;
 pub mod gateway_context;
 /// Git utilities: ghost commits, context enrichment, turn diff tracking.
 pub mod git;
+/// Per-session goals: types, validators, prompt builders, runtime accounting.
+pub mod goals;
 /// Heartbeat task constants and helpers (seeded heartbeat row).
 pub mod heartbeat_task;
 /// HMAC-SHA256 chain for tamper-proof event logs.

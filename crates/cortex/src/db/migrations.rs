@@ -254,6 +254,20 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     VALUES (new.id, new.session_id, new.role, COALESCE(new.content, ''));
 END;
 
+-- Per-session goals --------------------------------------------------------
+CREATE TABLE IF NOT EXISTS goals (
+    session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    goal_id           TEXT NOT NULL,
+    objective         TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    token_budget      INTEGER,
+    tokens_used       INTEGER NOT NULL DEFAULT 0,
+    time_used_seconds INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
+
 CREATE TABLE IF NOT EXISTS token_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp INTEGER NOT NULL,

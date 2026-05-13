@@ -315,6 +315,48 @@ pub(super) fn render_scheduled_tasks_snapshot(db: &crate::db::Database, now: i64
 }
 
 impl Agent {
+    /// Build the `<goal_context trust="untrusted">` section if an Active /
+    /// Paused / BudgetLimited goal exists for this session. The objective is
+    /// XML-escaped so a malicious objective cannot inject tags. Complete goals
+    /// are dropped (no steering value).
+    ///
+    /// Empty string when no goal is set, the DB is unavailable, or the goal
+    /// is Complete. Lookups are best-effort and `tracing::warn!` on error —
+    /// per CLAUDE.md, prompt assembly must never break the agent.
+    pub(super) fn build_goal_context_section(&self) -> String {
+        let session_id = &self.session.meta.id;
+        let guard = match self.db.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let db = match guard.as_ref() {
+            Some(db) => db,
+            None => return String::new(),
+        };
+        let goal = match db.get_goal(session_id) {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!("build_goal_context_section: get_goal failed: {e}");
+                return String::new();
+            }
+        };
+        let Some(goal) = goal else {
+            return String::new();
+        };
+        if matches!(goal.status, crate::goals::GoalStatus::Complete) {
+            return String::new();
+        }
+        let escaped = crate::goals::prompts::escape_xml_text(&goal.objective);
+        let status_label = goal.status.as_str();
+        let budget_line = match goal.token_budget {
+            Some(b) => format!("\nbudget: {b} tokens (used: {})", goal.tokens_used),
+            None => String::new(),
+        };
+        format!(
+            "\n<goal_context trust=\"untrusted\" status=\"{status_label}\">\n{escaped}{budget_line}\n</goal_context>\n"
+        )
+    }
+
     /// Build the `<collaboration_mode>` section from the current config.
     pub(super) fn build_collaboration_section(&self) -> String {
         let mode_template = match self.config.conversation.collaboration_mode {

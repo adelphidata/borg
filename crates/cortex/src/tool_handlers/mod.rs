@@ -271,8 +271,8 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            13,
-            "expected 13 core tools (all enabled), got: {names:?}"
+            16,
+            "expected 16 core tools (all enabled, incl. 3 goal tools), got: {names:?}"
         );
 
         let mut minimal_config = Config::default();
@@ -280,7 +280,11 @@ mod tests {
         minimal_config.browser.enabled = false;
         let defs = core_tool_definitions(&minimal_config);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
-        assert_eq!(names.len(), 10, "expected 10 base tools, got: {names:?}");
+        assert_eq!(
+            names.len(),
+            13,
+            "expected 13 base tools (incl. goals), got: {names:?}"
+        );
     }
 
     #[test]

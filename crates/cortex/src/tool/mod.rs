@@ -33,7 +33,9 @@ pub mod policy;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;
+pub(crate) mod create_goal;
 pub(crate) mod generate_image;
+pub(crate) mod get_goal;
 pub(crate) mod list;
 pub(crate) mod list_dir;
 pub(crate) mod memory_search;
@@ -44,13 +46,16 @@ pub(crate) mod request_user_input;
 pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod text_to_speech;
+pub(crate) mod update_goal;
 pub(crate) mod web_fetch;
 pub(crate) mod web_search;
 pub(crate) mod write_memory;
 
 pub(crate) use apply_patch::ApplyPatchArgs;
 pub(crate) use browser::BrowserArgs;
+pub(crate) use create_goal::CreateGoalArgs;
 pub(crate) use generate_image::GenerateImageArgs;
+pub(crate) use get_goal::GetGoalArgs;
 pub(crate) use list::ListArgs;
 pub(crate) use list_dir::ListDirArgs;
 pub(crate) use memory_search::MemorySearchArgs;
@@ -61,6 +66,7 @@ pub(crate) use request_user_input::RequestUserInputArgs;
 pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
+pub(crate) use update_goal::UpdateGoalArgs;
 pub(crate) use web_fetch::WebFetchArgs;
 pub(crate) use web_search::WebSearchArgs;
 pub(crate) use write_memory::WriteMemoryArgs;
@@ -109,6 +115,11 @@ pub(crate) enum Tool {
 
     // User interaction
     RequestUserInput(RequestUserInputArgs),
+
+    // Goals
+    GetGoal(GetGoalArgs),
+    CreateGoal(CreateGoalArgs),
+    UpdateGoal(UpdateGoalArgs),
 
     // Multi-agent
     SpawnAgent(MultiAgentArgs),
@@ -190,6 +201,11 @@ impl Tool {
             // User input
             tn::REQUEST_USER_INPUT => Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?),
 
+            // Goals
+            tn::GET_GOAL => Tool::GetGoal(from(tn::GET_GOAL, args)?),
+            tn::CREATE_GOAL => Tool::CreateGoal(from(tn::CREATE_GOAL, args)?),
+            tn::UPDATE_GOAL => Tool::UpdateGoal(from(tn::UPDATE_GOAL, args)?),
+
             // Multi-agent
             tn::SPAWN_AGENT => Tool::SpawnAgent(from(tn::SPAWN_AGENT, args)?),
             tn::SEND_TO_AGENT => Tool::SendToAgent(from(tn::SEND_TO_AGENT, args)?),
@@ -226,6 +242,9 @@ impl Tool {
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
             Tool::RequestUserInput(_) => tn::REQUEST_USER_INPUT,
+            Tool::GetGoal(_) => tn::GET_GOAL,
+            Tool::CreateGoal(_) => tn::CREATE_GOAL,
+            Tool::UpdateGoal(_) => tn::UPDATE_GOAL,
             Tool::SpawnAgent(_) => tn::SPAWN_AGENT,
             Tool::SendToAgent(_) => tn::SEND_TO_AGENT,
             Tool::WaitForAgent(_) => tn::WAIT_FOR_AGENT,
@@ -264,6 +283,9 @@ impl Tool {
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::RequestUserInput(_)
+            | Tool::GetGoal(_)
+            | Tool::CreateGoal(_)
+            | Tool::UpdateGoal(_)
             | Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
             | Tool::WaitForAgent(_)
@@ -293,7 +315,8 @@ impl Tool {
             | Tool::MemorySearch(_)
             | Tool::WebFetch(_)
             | Tool::WebSearch(_)
-            | Tool::RequestUserInput(_) => true,
+            | Tool::RequestUserInput(_)
+            | Tool::GetGoal(_) => true,
 
             Tool::WriteMemory(_)
             | Tool::ApplyPatch(_)
@@ -306,6 +329,8 @@ impl Tool {
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::CreateGoal(_)
+            | Tool::UpdateGoal(_)
             | Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
             | Tool::WaitForAgent(_)
@@ -343,6 +368,7 @@ impl Tool {
             | Tool::WaitForAgent(_)
             | Tool::CloseAgent(_)
             | Tool::ManageRoles(_) => ToolGroup::Agents,
+            Tool::GetGoal(_) | Tool::CreateGoal(_) | Tool::UpdateGoal(_) => ToolGroup::Goals,
         }
     }
 }
@@ -366,6 +392,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::WEB_FETCH,
             tn::WEB_SEARCH,
             tn::REQUEST_USER_INPUT,
+            tn::GET_GOAL,
         ],
     )
 }
@@ -468,6 +495,9 @@ mod tests {
             (tn::LIST_AGENTS, json!({})),
             (tn::CLOSE_AGENT, json!({})),
             (tn::MANAGE_ROLES, json!({})),
+            (tn::GET_GOAL, json!({})),
+            (tn::CREATE_GOAL, json!({"objective":"o"})),
+            (tn::UPDATE_GOAL, json!({"status":"complete"})),
         ];
         for (name, args) in cases {
             let parsed = Tool::parse(name, args.clone())
@@ -560,6 +590,9 @@ mod tests {
             (tn::LIST_AGENTS, json!({})),
             (tn::CLOSE_AGENT, json!({})),
             (tn::MANAGE_ROLES, json!({})),
+            (tn::GET_GOAL, json!({})),
+            (tn::CREATE_GOAL, json!({"objective":"o"})),
+            (tn::UPDATE_GOAL, json!({"status":"complete"})),
         ]
     }
 

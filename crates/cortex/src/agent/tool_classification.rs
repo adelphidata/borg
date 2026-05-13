@@ -29,6 +29,7 @@ pub fn mutating_tool_names() -> &'static [&'static str] {
         "browser",
         "close_agent",
         "create_channel",
+        "create_goal",
         "generate_image",
         "manage_cron",
         "manage_roles",
@@ -39,6 +40,7 @@ pub fn mutating_tool_names() -> &'static [&'static str] {
         "send_to_agent",
         "spawn_agent",
         "text_to_speech",
+        "update_goal",
         "wait_for_agent",
         "write_memory",
     ]

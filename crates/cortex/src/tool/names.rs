@@ -30,6 +30,11 @@ pub const TEXT_TO_SPEECH: &str = "text_to_speech";
 // ── User interaction ──
 pub const REQUEST_USER_INPUT: &str = "request_user_input";
 
+// ── Goals ──
+pub const GET_GOAL: &str = "get_goal";
+pub const CREATE_GOAL: &str = "create_goal";
+pub const UPDATE_GOAL: &str = "update_goal";
+
 // ── Filesystem aliases ──
 pub const APPLY_SKILL_PATCH: &str = "apply_skill_patch";
 pub const CREATE_CHANNEL: &str = "create_channel";

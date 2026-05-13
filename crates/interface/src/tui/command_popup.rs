@@ -26,6 +26,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "Token spend, model + tool usage over a window (default 30 days)",
     ),
     ("/plan", "Toggle plan mode"),
+    (
+        "/goal",
+        "Set, view, pause, resume, edit, or clear the session goal",
+    ),
     ("/mode", "Switch collaboration mode"),
     ("/model", "Switch LLM provider/model"),
     // Conversation
@@ -460,6 +464,7 @@ mod tests {
             "/settings",
             "/usage",
             "/plan",
+            "/goal",
             "/mode",
             "/model",
             "/compact",
