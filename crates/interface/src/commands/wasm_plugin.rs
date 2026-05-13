@@ -15,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 
 use cortex::config::Config;
-use cortex::db::{Database, NewWasmPlugin};
+use cortex::db::{audit_events, try_emit_global, Database, NewWasmPlugin};
 
 #[derive(Subcommand)]
 pub enum WasmPluginAction {
@@ -133,6 +133,17 @@ fn install(dir: &Path) -> Result<()> {
     )
     .context("persist plugin metadata")?;
 
+    try_emit_global(
+        audit_events::WASM_PLUGIN_INSTALLED,
+        "system",
+        &serde_json::json!({
+            "plugin_id": &package.manifest.id,
+            "version": &package.manifest.version,
+            "tool_count": package.manifest.tools.len(),
+            "manifest_sha": manifest_sha,
+        }),
+    );
+
     println!(
         "installed {} ({}) — {} tool(s)",
         package.manifest.id,
@@ -149,10 +160,7 @@ fn list() -> Result<()> {
         println!("(no WASM plugins installed)");
         return Ok(());
     }
-    println!(
-        "{:<32}  {:<10}  {:<5}  {}",
-        "ID", "STATUS", "TOOLS", "INSTALLED"
-    );
+    println!("{:<32}  {:<10}  {:<5}  INSTALLED", "ID", "STATUS", "TOOLS");
     for row in rows {
         let tools = db.count_wasm_plugin_tools(&row.plugin_id).unwrap_or(0);
         let installed = chrono::DateTime::from_timestamp(row.installed_at, 0)

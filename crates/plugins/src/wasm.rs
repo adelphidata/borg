@@ -525,6 +525,12 @@ pub fn execute_tool(
     )
 }
 
+/// Re-exports so callers can hold a cached engine + module without taking a
+/// direct dependency on the `wasmtime` crate (whose semver bumps must stay
+/// confined to the plugins crate). Named `Wasm*` to avoid colliding with the
+/// `base64::Engine` trait already in scope here.
+pub use wasmtime::{Engine as WasmEngine, Module as WasmModule};
+
 /// Build a `wasmtime::Engine` configured with Borg's fuel + epoch policy.
 ///
 /// Engines are safe to share across plugins because the `Config` is fixed —
@@ -592,7 +598,7 @@ pub fn execute_tool_prepared(
         .checked_mul(WASM_PAGE_BYTES)
         .context("max_memory_pages overflow")?;
     let mut store = wasmtime::Store::new(
-        &engine,
+        engine,
         HostState {
             limits: PluginLimits { max_memory_bytes },
             capabilities: manifest.capabilities.clone(),
@@ -614,17 +620,17 @@ pub fn execute_tool_prepared(
     // exceed wall-clock budget indefinitely.
     store.set_epoch_deadline(1);
     let _epoch_timer = EpochTimer::new(
-        &engine,
+        engine,
         std::time::Duration::from_millis(manifest.limits.timeout_ms),
     );
-    let mut linker = wasmtime::Linker::new(&engine);
+    let mut linker = wasmtime::Linker::new(engine);
     linker.func_wrap("borg:log", "log", host_log)?;
     linker.func_wrap("borg:http", "fetch", host_http_fetch)?;
     linker.func_wrap("borg:state", "read", host_state_read)?;
     linker.func_wrap("borg:state", "write", host_state_write)?;
     linker.func_wrap("borg:credentials", "get", host_credentials_get)?;
 
-    let instance = linker.instantiate(&mut store, &module)?;
+    let instance = linker.instantiate(&mut store, module)?;
     let memory = instance
         .get_memory(&mut store, ABI_EXPORT_MEMORY)
         .context("WASM plugin missing exported memory")?;

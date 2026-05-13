@@ -346,14 +346,43 @@ pub fn keychain_available() -> bool {
 mod tests {
     use super::*;
     use crate::catalog::CATALOG;
+    use crate::{Category, Platform, PluginKind};
 
     #[test]
-    fn prerequisites_check_bins() {
-        // python3 should be available on most dev machines
-        let telegram = CATALOG.iter().find(|c| c.id == "messaging/telegram");
-        if let Some(def) = telegram {
-            // Don't assert — just verify it doesn't panic
-            let _ = check_prerequisites(def);
+    fn check_prerequisites_blocks_platform_mismatched_plugin() {
+        // Real-world failure: a macOS-only channel installed on Linux must
+        // refuse with a label the operator can read, not a generic "not
+        // found". Exercises Platform::is_available() AND Platform::label()
+        // through the actual production composition site — a refactor that
+        // breaks either accessor surfaces here.
+        let def = crate::catalog::PluginDef {
+            id: "test/macos-only",
+            name: "MacOnly",
+            category: Category::Channels,
+            kind: PluginKind::Channel,
+            description: "test fixture",
+            required_credentials: &[],
+            required_bins: &[],
+            templates: &[],
+            platform: Platform::MacOS,
+            is_native: true,
+            post_install: None,
+        };
+
+        let outcome = check_prerequisites(&def);
+
+        #[cfg(target_os = "macos")]
+        assert!(outcome.is_ok(), "macOS plugin must install on macOS");
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let err = outcome.expect_err("must refuse off-platform install");
+            let msg = err.to_string();
+            assert!(msg.contains("MacOnly"), "error must name the plugin: {msg}");
+            assert!(
+                msg.contains("macOS only"),
+                "operator must see the platform label, not a generic error: {msg}"
+            );
         }
     }
 

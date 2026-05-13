@@ -1211,6 +1211,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "wasm-encoder 0.244.0",
  "which 7.0.3",
  "wiremock",
  "zstd",

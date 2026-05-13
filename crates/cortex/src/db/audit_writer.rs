@@ -50,6 +50,9 @@ pub mod audit_events {
     pub const BUDGET_HIT: &str = "budget_hit";
     pub const POSTURE_CHANGED: &str = "posture_changed";
     pub const SETTINGS_CHANGED: &str = "settings_changed";
+    pub const WASM_PLUGIN_INSTALLED: &str = "wasm_plugin_installed";
+    pub const WASM_PLUGIN_EXECUTED: &str = "wasm_plugin_executed";
+    pub const WASM_PLUGIN_QUARANTINED: &str = "wasm_plugin_quarantined";
 }
 
 #[derive(Clone)]

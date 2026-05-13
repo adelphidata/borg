@@ -11,6 +11,67 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::tool::names;
 
+/// Process-lifetime cache of compiled WASM modules, keyed by the row's
+/// `local_hmac`. The HMAC binds (KEK-derived key, canonical manifest, wasm
+/// bytes) — `try_execute_tool` re-verifies the on-disk seal before every
+/// lookup, so a tampered file never reaches the cache.
+pub(crate) mod compiled_cache {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    use anyhow::{anyhow, Result};
+    use plugins::wasm::{WasmEngine as Engine, WasmModule as Module};
+
+    /// Cap matches the gauntlet's installable-plugin envelope. A bulk-clear on
+    /// overflow is fine: recompiling 64 modules is cheap and a >64-plugin
+    /// install is exceptional.
+    const MAX_ENTRIES: usize = 64;
+
+    static ENGINE: OnceLock<Engine> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<String, Module>>> = OnceLock::new();
+
+    pub(crate) fn engine() -> Result<&'static Engine> {
+        if let Some(e) = ENGINE.get() {
+            return Ok(e);
+        }
+        let built = plugins::wasm::build_engine()?;
+        Ok(ENGINE.get_or_init(|| built))
+    }
+
+    pub(crate) fn module_for(local_hmac: &str, wasm: &[u8]) -> Result<Module> {
+        let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map
+            .lock()
+            .map_err(|e| anyhow!("wasm module cache mutex poisoned: {e}"))?;
+        if let Some(m) = guard.get(local_hmac) {
+            return Ok(m.clone());
+        }
+        if guard.len() >= MAX_ENTRIES {
+            guard.clear();
+        }
+        let module = plugins::wasm::compile_module(engine()?, wasm)?;
+        guard.insert(local_hmac.to_string(), module.clone());
+        Ok(module)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_len() -> usize {
+        CACHE
+            .get()
+            .and_then(|m| m.lock().ok().map(|g| g.len()))
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear() {
+        if let Some(m) = CACHE.get() {
+            if let Ok(mut g) = m.lock() {
+                g.clear();
+            }
+        }
+    }
+}
+
 // v2 bumps the derived-key domain alongside the framing change in
 // compute_local_hmac (length-prefixed over NUL-separated). Pre-v2 installs
 // re-verify under a different MAC, fail integrity, and quarantine themselves —
@@ -157,6 +218,16 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
     if let Err(e) =
         plugins::wasm::verify_installed_hmac(&key, &manifest_bytes, &wasm, &row.local_hmac)
     {
+        // Emit before the DB UPDATE so the audit trail records the quarantine
+        // intent even if the UPDATE itself fails.
+        crate::db::try_emit_global(
+            crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
+            &row.plugin_id,
+            &serde_json::json!({
+                "plugin_id": &row.plugin_id,
+                "reason": e.to_string(),
+            }),
+        );
         db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())?;
         return Err(e).context("WASM plugin quarantined");
     }
@@ -174,9 +245,37 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
         config,
     )?);
 
-    let output =
-        plugins::wasm::execute_tool_with_services(&manifest, &wasm, &row.tool_name, args, services)
-            .with_context(|| format!("WASM plugin tool '{}' failed", row.tool_name))?;
+    let engine = compiled_cache::engine()?;
+    let module = compiled_cache::module_for(&row.local_hmac, &wasm)?;
+
+    let start = std::time::Instant::now();
+    let result = plugins::wasm::execute_tool_prepared(
+        &manifest,
+        engine,
+        &module,
+        &wasm,
+        &row.tool_name,
+        args,
+        services,
+    );
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let error_message = result
+        .as_ref()
+        .err()
+        .map(std::string::ToString::to_string);
+    crate::db::try_emit_global(
+        crate::db::audit_events::WASM_PLUGIN_EXECUTED,
+        &row.plugin_id,
+        &serde_json::json!({
+            "plugin_id": &row.plugin_id,
+            "tool_name": &row.tool_name,
+            "success": result.is_ok(),
+            "error_message": error_message,
+            "duration_ms": duration_ms,
+        }),
+    );
+
+    let output = result.with_context(|| format!("WASM plugin tool '{}' failed", row.tool_name))?;
     Ok(Some(output))
 }
 
@@ -345,5 +444,294 @@ mod tests {
         assert!(is_builtin_tool_name("rUn_ShElL"));
         assert!(!is_builtin_tool_name("plugin_specific_tool"));
         assert!(!is_builtin_tool_name(""));
+    }
+}
+
+/// End-to-end coverage of `try_execute_tool`: the compiled-module cache, the
+/// audit-event emissions for install/execute/quarantine, and the on-disk
+/// tamper → quarantine path. These have to be exercised through the public
+/// entry point because the cache and audit code only meet at that seam.
+///
+/// All assertions live in one test function so the `OnceLock`-installed audit
+/// writer is set up exactly once and `BORG_DATA_DIR` stays pinned to a single
+/// tempdir for the whole sequence. Splitting these would race on global state.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod e2e_tests {
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use wasm_encoder::{
+        CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, Function, FunctionSection,
+        Instruction, MemorySection, MemoryType, Module, TypeSection, ValType,
+    };
+
+    use crate::db::{audit_events, install_global_audit, AuditWriter, Database, NewWasmPlugin};
+
+    use super::{compiled_cache, try_execute_tool, HMAC_DOMAIN};
+
+    /// Serializes E2E setup against any other test that mutates
+    /// `$BORG_DATA_DIR` in the same test binary (see
+    /// `config/tests/credentials.rs` for the canonical pattern).
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    struct DataDirGuard {
+        prev: Option<String>,
+        _tmp: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    impl DataDirGuard {
+        fn new() -> Self {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            let path = tmp.path().to_path_buf();
+            let prev = std::env::var("BORG_DATA_DIR").ok();
+            // SAFETY: env mutation guarded by env_lock; restore on Drop.
+            unsafe { std::env::set_var("BORG_DATA_DIR", &path) };
+            Self {
+                prev,
+                _tmp: tmp,
+                path,
+            }
+        }
+    }
+
+    impl Drop for DataDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation guarded by env_lock.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("BORG_DATA_DIR", v),
+                    None => std::env::remove_var("BORG_DATA_DIR"),
+                }
+            }
+        }
+    }
+
+    /// Mirrors `plugins::wasm::tests::minimal_wasm` — the guest stages
+    /// "OK" at offset 2048 and `borg_tool_call` returns `(2048<<32) | 2`.
+    fn minimal_wasm() -> Vec<u8> {
+        let mut module = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [ValType::I64]);
+        module.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        funcs.function(1);
+        module.section(&funcs);
+        let mut memories = MemorySection::new();
+        memories.memory(MemoryType {
+            minimum: 1,
+            maximum: Some(1),
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        });
+        module.section(&memories);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("alloc", ExportKind::Func, 0);
+        exports.export("borg_tool_call", ExportKind::Func, 1);
+        module.section(&exports);
+        let mut code = CodeSection::new();
+        let mut alloc = Function::new([]);
+        alloc.instruction(&Instruction::I32Const(1024));
+        alloc.instruction(&Instruction::End);
+        code.function(&alloc);
+        let mut call = Function::new([]);
+        call.instruction(&Instruction::I64Const(((2048u64) << 32 | 2u64) as i64));
+        call.instruction(&Instruction::End);
+        code.function(&call);
+        module.section(&code);
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(2048), b"OK".iter().copied());
+        module.section(&data);
+        module.finish()
+    }
+
+    #[test]
+    fn cache_audit_and_quarantine_e2e() {
+        let _lock = env_lock();
+        let dir = DataDirGuard::new();
+
+        // Open the DB once for our test driver. Migrations run on open.
+        let db = Database::open().expect("open db");
+
+        // Install a process-global audit writer pointing at the same DB so
+        // the production `try_emit_global` calls land in the chain we can
+        // inspect. `install_global_audit` is `OnceLock::set` — if some other
+        // test in this binary beat us to it, we cannot run the audit
+        // assertions reliably.
+        let writer = AuditWriter::new(Arc::new(Mutex::new(
+            Database::open().expect("audit writer db handle"),
+        )));
+        assert!(
+            install_global_audit(writer),
+            "audit writer was already installed by another test — \
+             run `cargo test -p cortex --lib cache_audit_and_quarantine_e2e`",
+        );
+
+        // Sign a manifest with an ephemeral keypair the operator trusts.
+        let signing = SigningKey::from_bytes(&[23u8; 32]);
+        let trusted = vec![STANDARD.encode(signing.verifying_key().to_bytes())];
+        let wasm = minimal_wasm();
+        let manifest = plugins::wasm::WasmPluginManifest {
+            schema_version: "borg.plugin.v1".to_string(),
+            id: "dev/e2e-echo".to_string(),
+            name: "E2E Echo".to_string(),
+            version: "1.0.0".to_string(),
+            publisher: plugins::wasm::PublisherManifest {
+                name: "E2E".to_string(),
+                public_key: trusted[0].clone(),
+            },
+            wasm_sha256: plugins::wasm::sha256_hex(&wasm),
+            tools: vec![plugins::wasm::WasmToolManifest {
+                name: "e2e_echo".to_string(),
+                description: "Echo E2E test".to_string(),
+                input_schema: serde_json::json!({"type":"object","properties":{}}),
+            }],
+            capabilities: vec![],
+            endpoints: vec![],
+            credentials: vec![],
+            limits: plugins::wasm::ResourceLimits::default(),
+        };
+        let canonical = plugins::wasm::canonical_manifest_bytes(&manifest).expect("canonical");
+        let sig = STANDARD.encode(signing.sign(&canonical).to_bytes());
+        let hmac_key = db.derive_hmac_key(HMAC_DOMAIN);
+
+        // Verify + install + persist DB row (production-equivalent pipeline,
+        // minus the CLI wrapper).
+        let pkg = plugins::wasm::verify_package(&canonical, &sig, &wasm, &trusted, &hmac_key)
+            .expect("verify");
+        let installed = plugins::wasm::install_verified_package(&dir.path, &pkg).expect("install");
+        let manifest_path_str = installed.manifest_path.to_string_lossy().into_owned();
+        let wasm_path_str = installed.wasm_path.to_string_lossy().into_owned();
+        let canonical_str =
+            String::from_utf8(pkg.canonical_manifest.clone()).expect("canonical manifest is utf-8");
+        let manifest_sha = plugins::wasm::sha256_hex(&pkg.canonical_manifest);
+        db.insert_wasm_plugin(
+            &NewWasmPlugin {
+                plugin_id: &manifest.id,
+                manifest_json: &canonical_str,
+                manifest_sha256: &manifest_sha,
+                wasm_sha256: &manifest.wasm_sha256,
+                publisher_key: &manifest.publisher.public_key,
+                signature: &sig,
+                local_hmac: &installed.local_hmac,
+                manifest_path: &manifest_path_str,
+                wasm_path: &wasm_path_str,
+            },
+            &[(
+                &manifest.tools[0].name,
+                &manifest.tools[0].description,
+                &serde_json::to_string(&manifest.tools[0].input_schema).unwrap(),
+            )],
+        )
+        .expect("persist plugin");
+
+        // ── Positive: cache miss → hit ──
+        compiled_cache::clear();
+        assert_eq!(
+            compiled_cache::cache_len(),
+            0,
+            "cache must start empty after clear()"
+        );
+
+        let out1 = try_execute_tool("e2e_echo", &serde_json::json!({}))
+            .expect("first execute Ok")
+            .expect("first execute returned Some");
+        assert_eq!(out1, "OK", "guest must surface staged bytes on first call");
+        assert_eq!(
+            compiled_cache::cache_len(),
+            1,
+            "first call must populate the cache"
+        );
+
+        let out2 = try_execute_tool("e2e_echo", &serde_json::json!({}))
+            .expect("second execute Ok")
+            .expect("second execute returned Some");
+        assert_eq!(out2, "OK", "second call must hit the cache and still work");
+        assert_eq!(
+            compiled_cache::cache_len(),
+            1,
+            "second call must reuse the cached Module, not insert a duplicate",
+        );
+
+        // ── Positive: audit chain records both executes ──
+        let after_exec = db.list_audit_events().expect("list audit events");
+        let exec_rows: Vec<_> = after_exec
+            .iter()
+            .filter(|e| e.event_type == audit_events::WASM_PLUGIN_EXECUTED)
+            .collect();
+        assert_eq!(
+            exec_rows.len(),
+            2,
+            "two executes must produce two audit rows: {:#?}",
+            after_exec
+        );
+        for row in &exec_rows {
+            assert_eq!(row.principal_id, "dev/e2e-echo");
+            let payload: serde_json::Value =
+                serde_json::from_str(&row.event_json).expect("payload json");
+            assert_eq!(payload["success"], serde_json::Value::Bool(true));
+            assert_eq!(payload["tool_name"], "e2e_echo");
+        }
+
+        // ── Negative: tamper → quarantine + audit ──
+        let mut bytes = std::fs::read(&installed.wasm_path).expect("read wasm");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&installed.wasm_path, &bytes).expect("write tampered wasm");
+
+        let err = try_execute_tool("e2e_echo", &serde_json::json!({}))
+            .expect_err("tampered plugin must fail execution");
+        assert!(
+            err.to_string().contains("quarantined"),
+            "operator must see the quarantine signal: {err}",
+        );
+
+        let after_tamper = db.list_audit_events().expect("list after tamper");
+        let quarantine_rows: Vec<_> = after_tamper
+            .iter()
+            .filter(|e| e.event_type == audit_events::WASM_PLUGIN_QUARANTINED)
+            .collect();
+        assert_eq!(
+            quarantine_rows.len(),
+            1,
+            "exactly one quarantine row expected: {:#?}",
+            after_tamper
+        );
+        assert_eq!(quarantine_rows[0].principal_id, "dev/e2e-echo");
+
+        // Plugin row should be marked quarantined and hidden from the runtime.
+        let row = db
+            .get_wasm_plugin("dev/e2e-echo")
+            .expect("get plugin")
+            .expect("plugin row exists");
+        assert_eq!(row.status, "quarantined");
+        assert!(
+            db.get_verified_wasm_tool_runtime("e2e_echo")
+                .expect("runtime")
+                .is_none(),
+            "quarantined plugin must not surface to dispatch",
+        );
+
+        // Audit chain must still verify end-to-end.
+        assert_eq!(
+            db.verify_audit_chain().expect("verify chain"),
+            crate::db::AuditChainOutcome::Ok,
+        );
+
+        compiled_cache::clear();
     }
 }

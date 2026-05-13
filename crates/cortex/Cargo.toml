@@ -79,3 +79,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 libc = { workspace = true }
 wiremock = "0.5"
 rusqlite = { workspace = true }
+wasm-encoder = "0.244"
