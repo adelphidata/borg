@@ -50,15 +50,18 @@ pub(crate) fn handle(args: &UpdateGoalArgs, db: &Database, session_id: &str) -> 
         },
     )?;
     match updated {
-        Some(g) => Ok(json!({
-            "ok": true,
-            "goal_id": g.goal_id,
-            "status": g.status.as_str(),
-            "tokens_used": g.tokens_used,
-            "token_budget": g.token_budget,
-            "time_used_seconds": g.time_used_seconds,
-        })
-        .to_string()),
+        Some(g) => {
+            crate::goals::metrics::record_completed(&g);
+            Ok(json!({
+                "ok": true,
+                "goal_id": g.goal_id,
+                "status": g.status.as_str(),
+                "tokens_used": g.tokens_used,
+                "token_budget": g.token_budget,
+                "time_used_seconds": g.time_used_seconds,
+            })
+            .to_string())
+        }
         None => Ok(json!({
             "error": "goal changed concurrently; refusing to mark complete"
         })

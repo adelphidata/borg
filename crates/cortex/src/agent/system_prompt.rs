@@ -324,6 +324,9 @@ impl Agent {
     /// is Complete. Lookups are best-effort and `tracing::warn!` on error —
     /// per CLAUDE.md, prompt assembly must never break the agent.
     pub(super) fn build_goal_context_section(&self) -> String {
+        if !self.config.goals.enabled {
+            return String::new();
+        }
         let session_id = &self.session.meta.id;
         let guard = match self.db.lock() {
             Ok(g) => g,

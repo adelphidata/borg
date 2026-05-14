@@ -2487,6 +2487,11 @@ impl Agent {
                 crate::tool::multi_agent::handle_manage_roles(args)
             }
             crate::tool::Tool::GetGoal(args) => {
+                if !self.config.goals.enabled {
+                    return Ok(ToolOutput::Text(
+                        serde_json::json!({"error": "goals are disabled"}).to_string(),
+                    ));
+                }
                 let guard = self.db_guard();
                 match guard.as_ref() {
                     Some(db) => crate::tool::get_goal::handle(args, db, &self.session.meta.id),
@@ -2494,13 +2499,28 @@ impl Agent {
                 }
             }
             crate::tool::Tool::CreateGoal(args) => {
+                if !self.config.goals.enabled {
+                    return Ok(ToolOutput::Text(
+                        serde_json::json!({"error": "goals are disabled"}).to_string(),
+                    ));
+                }
                 let guard = self.db_guard();
                 match guard.as_ref() {
-                    Some(db) => crate::tool::create_goal::handle(args, db, &self.session.meta.id),
+                    Some(db) => crate::tool::create_goal::handle(
+                        args,
+                        db,
+                        &self.session.meta.id,
+                        self.config.goals.default_token_budget,
+                    ),
                     None => Ok(serde_json::json!({"error":"database unavailable"}).to_string()),
                 }
             }
             crate::tool::Tool::UpdateGoal(args) => {
+                if !self.config.goals.enabled {
+                    return Ok(ToolOutput::Text(
+                        serde_json::json!({"error": "goals are disabled"}).to_string(),
+                    ));
+                }
                 let guard = self.db_guard();
                 match guard.as_ref() {
                     Some(db) => crate::tool::update_goal::handle(args, db, &self.session.meta.id),

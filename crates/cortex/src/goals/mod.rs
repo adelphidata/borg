@@ -9,6 +9,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
+pub mod metrics;
 pub mod prompts;
 pub mod runtime;
 

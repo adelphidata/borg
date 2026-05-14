@@ -11,6 +11,7 @@ mod channels;
 mod consolidation_settings;
 mod credentials;
 mod gateway;
+mod goals_settings;
 mod guards;
 mod media;
 mod memory_skills;

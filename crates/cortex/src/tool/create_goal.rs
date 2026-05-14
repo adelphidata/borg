@@ -18,24 +18,36 @@ pub(crate) struct CreateGoalArgs {
     pub token_budget: Option<i64>,
 }
 
-pub(crate) fn handle(args: &CreateGoalArgs, db: &Database, session_id: &str) -> Result<String> {
+pub(crate) fn handle(
+    args: &CreateGoalArgs,
+    db: &Database,
+    session_id: &str,
+    default_budget: Option<i64>,
+) -> Result<String> {
     let objective = match validate_objective(&args.objective) {
         Ok(o) => o,
         Err(e) => return Ok(json!({"error": e}).to_string()),
     };
-    let budget = match validate_budget(args.token_budget) {
+    // Fall back to the config default when the model didn't specify a
+    // budget — `validate_budget` still gets to reject zero/negative defaults
+    // before they hit the DB.
+    let requested = args.token_budget.or(default_budget);
+    let budget = match validate_budget(requested) {
         Ok(b) => b,
         Err(e) => return Ok(json!({"error": e}).to_string()),
     };
     match db.insert_goal(session_id, &objective, GoalStatus::Active, budget)? {
-        Some(g) => Ok(json!({
-            "ok": true,
-            "goal_id": g.goal_id,
-            "objective": g.objective,
-            "status": g.status.as_str(),
-            "token_budget": g.token_budget,
-        })
-        .to_string()),
+        Some(g) => {
+            crate::goals::metrics::record_created(&g);
+            Ok(json!({
+                "ok": true,
+                "goal_id": g.goal_id,
+                "objective": g.objective,
+                "status": g.status.as_str(),
+                "token_budget": g.token_budget,
+            })
+            .to_string())
+        }
         None => Ok(json!({
             "error": "a goal already exists for this session; use the user-facing /goal command to edit or clear it"
         })
@@ -63,6 +75,7 @@ mod tests {
             },
             &db,
             "s",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -84,6 +97,7 @@ mod tests {
             },
             &db,
             "s",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -102,11 +116,47 @@ mod tests {
             },
             &db,
             "s",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert!(v["error"].as_str().unwrap().contains("empty"));
         assert!(db.get_goal("s").unwrap().is_none());
+    }
+
+    #[test]
+    fn default_budget_applies_when_args_omit_one() {
+        let db = db_with_session("s");
+        let out = handle(
+            &CreateGoalArgs {
+                objective: "x".into(),
+                token_budget: None,
+            },
+            &db,
+            "s",
+            Some(7777),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["token_budget"], 7777);
+    }
+
+    #[test]
+    fn args_budget_overrides_default() {
+        let db = db_with_session("s");
+        let out = handle(
+            &CreateGoalArgs {
+                objective: "x".into(),
+                token_budget: Some(500),
+            },
+            &db,
+            "s",
+            Some(7777),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["token_budget"], 500);
     }
 
     #[test]
@@ -119,6 +169,7 @@ mod tests {
             },
             &db,
             "s",
+            None,
         )
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();

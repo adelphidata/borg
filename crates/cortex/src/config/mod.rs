@@ -1,6 +1,7 @@
 pub mod consolidation;
 pub mod data;
 pub mod gateway;
+pub mod goals;
 pub mod llm;
 pub mod maintenance;
 pub mod media;
@@ -17,6 +18,7 @@ mod tests;
 pub use consolidation::*;
 pub use data::*;
 pub use gateway::*;
+pub use goals::*;
 pub use llm::*;
 pub use maintenance::*;
 pub use media::*;
@@ -128,6 +130,9 @@ pub struct Config {
     /// Daily self-healing maintenance task retention settings.
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    /// Per-session goal subsystem tunables.
+    #[serde(default)]
+    pub goals: GoalsConfig,
     /// Subprocess process registry — orphan thresholds and auto-reap
     /// whitelist. Consumed by the maintenance sweep.
     #[serde(default)]

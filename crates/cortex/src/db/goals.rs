@@ -252,9 +252,18 @@ impl Database {
             Ok(GoalAccountingOutcome::Unchanged(current))
         } else {
             // The UPDATE matched, so the row must exist.
-            Ok(GoalAccountingOutcome::Updated(current.ok_or_else(
-                || anyhow::anyhow!("goal disappeared after accounting update"),
-            )?))
+            let goal = current
+                .ok_or_else(|| anyhow::anyhow!("goal disappeared after accounting update"))?;
+            // Emit the budget-limited metric exactly when this UPDATE
+            // performed the transition. The CASE expression above is the
+            // sole path to BudgetLimited via accounting, and the row was
+            // Active before this call (WHERE status='active'), so seeing
+            // BudgetLimited now means the transition happened on this
+            // call.
+            if goal.status == crate::goals::GoalStatus::BudgetLimited {
+                crate::goals::metrics::record_budget_limited(&goal);
+            }
+            Ok(GoalAccountingOutcome::Updated(goal))
         }
     }
 

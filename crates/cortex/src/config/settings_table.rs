@@ -259,6 +259,10 @@ define_settings! {
         "process_registry.never_kill_patterns" => process_registry.never_kill_patterns, json;
         "process_registry.finished_ttl_secs" => process_registry.finished_ttl_secs, parsed(u64);
         "process_registry.max_finished_entries" => process_registry.max_finished_entries, parsed(usize);
+
+        // ── Per-session goals (/goal) ──
+        "goals.enabled" => goals.enabled, parsed(bool);
+        "goals.default_token_budget" => goals.default_token_budget, opt_parsed(i64);
     }
 
     registry_only {
@@ -624,6 +628,9 @@ define_settings! {
         "process_registry.sigterm_grace_secs" => "SIGTERM grace (s)", Uint, "Subprocesses";
         "process_registry.finished_ttl_secs" => "Finished entry TTL (s)", Uint, "Subprocesses";
         "process_registry.max_finished_entries" => "Max finished entries", Uint, "Subprocesses";
+
+        // — Per-session goals (/goal) —
+        "goals.enabled" => "Enable /goal", Bool, "Goals";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";
