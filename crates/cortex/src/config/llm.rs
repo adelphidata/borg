@@ -104,6 +104,12 @@ pub struct LlmConfig {
     /// the operator to upgrade deliberately rather than silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub azure_api_version: Option<String>,
+    /// Google Cloud project id for Vertex AI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_project: Option<String>,
+    /// Google Cloud location for Vertex AI. Defaults to `global` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertex_location: Option<String>,
     /// Provider-level failover chain (tried in order when primary provider fails).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<LlmFallback>,
@@ -309,6 +315,8 @@ impl Default for LlmConfig {
             azure_resource: None,
             azure_deployment: None,
             azure_api_version: None,
+            vertex_project: None,
+            vertex_location: None,
             fallback: Vec::new(),
             aux: None,
             thinking: ThinkingLevel::Off,

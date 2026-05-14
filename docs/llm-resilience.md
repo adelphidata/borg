@@ -180,10 +180,20 @@ would otherwise produce a subdomain-injection vector
 (`https://evil.attacker.openai.azure.com`); the composer enforces DNS-label
 character classes on all three fields to close that gap.
 
-The auth header is `api-key: <key>`, not `Authorization: Bearer` — Azure
-reserves Bearer for AAD/Entra ID tokens. AAD support is a follow-up
-(requires a new `ProviderAuthKind::AadCredentialChain` and bypassing the
-credential pool the way Bedrock does for the AWS chain).
+The static-key auth header is `api-key: <key>`, not `Authorization:
+Bearer`. When no Azure API key is configured, Borg uses Entra ID instead:
+client credentials from `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` /
+`AZURE_CLIENT_SECRET`, or managed identity through Azure IMDS. Entra tokens
+send `Authorization: Bearer <token>` and bypass the API-key credential pool.
+
+### Google Vertex AI
+
+`Provider::VertexAi` uses GCP OAuth access tokens from
+`GOOGLE_APPLICATION_CREDENTIALS` service-account JSON or the metadata server.
+Configure `llm.vertex_project` and optionally `llm.vertex_location`
+(`global` default). Gemini models use Vertex's OpenAI-compatible chat
+endpoint; Claude/Anthropic model names use the Vertex Anthropic raw-predict
+endpoint with `anthropic_version = "vertex-2023-10-16"` in the request body.
 
 ### Fallback deferral
 

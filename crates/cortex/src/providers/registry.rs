@@ -120,6 +120,8 @@ fn builtin_from_id(id: &str) -> Option<Provider> {
         "deepseek" => Some(Provider::DeepSeek),
         "groq" => Some(Provider::Groq),
         "xai" | "x-ai" => Some(Provider::XAi),
+        "azure-openai" | "azure_openai" | "azureopenai" => Some(Provider::AzureOpenAi),
+        "vertex-ai" | "vertex_ai" | "vertexai" | "vertex" => Some(Provider::VertexAi),
         "openrouter" => Some(Provider::OpenRouter),
         "ollama" => Some(Provider::Ollama),
         "claude_cli" | "claude-cli" => Some(Provider::ClaudeCli),

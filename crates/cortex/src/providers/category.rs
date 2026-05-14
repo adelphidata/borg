@@ -60,7 +60,8 @@ impl From<Provider> for ProviderCategory {
             | Provider::ClaudeCodeOAuth
             | Provider::CodexOAuth
             | Provider::CopilotOAuth
-            | Provider::AzureOpenAi => ProviderCategory::PublicCloud,
+            | Provider::AzureOpenAi
+            | Provider::VertexAi => ProviderCategory::PublicCloud,
             Provider::Ollama | Provider::ClaudeCli => ProviderCategory::Local,
             // Custom is the BYO escape hatch — air-gap policy is enforced on
             // the resolved address (loopback/RFC1918 OK), not compile-time.

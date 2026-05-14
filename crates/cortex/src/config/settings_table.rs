@@ -20,6 +20,8 @@ define_settings! {
         "llm.azure_resource" => llm.azure_resource, opt_string;
         "llm.azure_deployment" => llm.azure_deployment, opt_string;
         "llm.azure_api_version" => llm.azure_api_version, opt_string;
+        "llm.vertex_project" => llm.vertex_project, opt_string;
+        "llm.vertex_location" => llm.vertex_location, opt_string;
         "llm.thinking" => llm.thinking, json_quoted("Invalid thinking level");
         "llm.fallback" => llm.fallback, json_count("providers");
         "llm.api_keys" => llm.api_keys, json_count("keys");
@@ -543,6 +545,8 @@ define_settings! {
         "llm.azure_resource" => "Azure resource", Text, "Essentials";
         "llm.azure_deployment" => "Azure deployment", Text, "Essentials";
         "llm.azure_api_version" => "Azure API version", Text, "Essentials";
+        "llm.vertex_project" => "Vertex project", Text, "Essentials";
+        "llm.vertex_location" => "Vertex location", Text, "Essentials";
         "temperature" => "Temperature", Float, "Essentials";
         "conversation.collaboration_mode" => "Mode", Select, "Essentials";
         "budget.monthly_token_limit" => "Monthly token limit", Uint, "Essentials";

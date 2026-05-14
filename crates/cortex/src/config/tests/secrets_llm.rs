@@ -115,6 +115,34 @@ fn resolve_provider_bedrock_uses_region_without_api_key() {
 }
 
 #[test]
+fn resolve_provider_vertex_uses_cloud_auth_without_api_key() {
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("vertex-ai".to_string());
+    let (provider, key) = cfg.resolve_provider().expect("vertex should resolve");
+    assert_eq!(provider, Provider::VertexAi);
+    assert!(key.is_empty(), "vertex uses GCP auth, not static API keys");
+}
+
+#[test]
+fn resolve_provider_azure_openai_allows_entra_without_api_key() {
+    let env_name = "BORG_TEST_EMPTY_AZURE_KEY";
+    let old_azure_key = std::env::var("AZURE_OPENAI_API_KEY").ok();
+    std::env::remove_var(env_name);
+    std::env::remove_var("AZURE_OPENAI_API_KEY");
+    let mut cfg = Config::default();
+    cfg.llm.provider = Some("azure-openai".to_string());
+    cfg.llm.api_key_env = env_name.to_string();
+    let (provider, key) = cfg
+        .resolve_provider()
+        .expect("azure-openai should allow Entra auth without API key");
+    assert_eq!(provider, Provider::AzureOpenAi);
+    assert!(key.is_empty(), "empty key selects Entra token path");
+    if let Some(old) = old_azure_key {
+        std::env::set_var("AZURE_OPENAI_API_KEY", old);
+    }
+}
+
+#[test]
 fn resolve_provider_bedrock_errors_when_region_missing() {
     let _lock = crate::llm::bedrock::env_test_lock();
     // Point HOME at an empty tempdir so the ~/.aws/config profile fallback
@@ -620,6 +648,8 @@ fn provider_setting_key_roundtrips_through_apply_setting() {
         "deepseek",
         "groq",
         "xai",
+        "azure-openai",
+        "vertex-ai",
         "ollama",
         "claude-cli",
     ] {

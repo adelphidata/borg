@@ -457,7 +457,7 @@ impl Config {
     pub fn resolve_provider(&self) -> Result<(Provider, String)> {
         let Some(provider_str) = self.llm.provider.as_deref() else {
             anyhow::bail!(
-                "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one (OpenRouter, OpenAI, Anthropic, Bedrock, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude CLI). Borg won't guess."
+                "No LLM provider selected. Open `/settings` or `/model` in the TUI to pick one (OpenRouter, OpenAI, Anthropic, Bedrock, Azure OpenAI, Vertex AI, Gemini, DeepSeek, Groq, xAI, Ollama, or Claude CLI). Borg won't guess."
             );
         };
         let provider = Provider::from_str(provider_str)?;
@@ -478,6 +478,10 @@ impl Config {
             .or_else(|| try_resolve_env(provider.default_env_var()))
         {
             return Ok((provider, key));
+        }
+
+        if provider.supports_cloud_auth() {
+            return Ok((provider, String::new()));
         }
 
         anyhow::bail!(

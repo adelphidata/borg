@@ -98,6 +98,7 @@ const MAX_SSE_BUFFER: usize = crate::constants::MAX_SSE_BUFFER;
 mod anthropic;
 pub mod aux_model_picker;
 pub(crate) mod bedrock;
+pub(crate) mod cloud_auth;
 mod cost;
 pub mod credential_pool;
 pub mod credential_sources;
@@ -107,6 +108,7 @@ pub mod oauth_refresh;
 mod pricing;
 pub mod provider;
 mod transport;
+pub(crate) mod vertex;
 
 pub(crate) use anthropic::normalize_cache_tokens;
 use anthropic::{
@@ -437,6 +439,21 @@ fn normalize_gemini_base(url: &str) -> Cow<'_, str> {
     Cow::Owned(format!("{stripped}{CANONICAL_SUFFIX}"))
 }
 
+fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap, LlmError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+    let bearer = format!("Bearer {token}");
+    let value = reqwest::header::HeaderValue::from_str(&bearer).map_err(|e| LlmError::Fatal {
+        source: anyhow::anyhow!("cloud access token contains invalid header characters: {e}"),
+        reason: FailoverReason::Auth,
+    })?;
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+    Ok(headers)
+}
+
 /// Compose the Azure OpenAI chat-completions URL from
 /// `llm.azure_resource` / `llm.azure_deployment` / `llm.azure_api_version`.
 ///
@@ -533,6 +550,22 @@ impl LlmClient {
             .unwrap_or_else(|| self.provider.base_url());
         match self.provider {
             Provider::Gemini => normalize_gemini_base(raw),
+            Provider::VertexAi if !vertex::is_anthropic_model(&self.llm_config.model) => {
+                if self
+                    .llm_config
+                    .base_url
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .is_some()
+                {
+                    Cow::Borrowed(raw)
+                } else {
+                    Cow::Owned(
+                        vertex::compose_gemini_url(&self.llm_config)
+                            .unwrap_or_else(|_| raw.to_string()),
+                    )
+                }
+            }
             _ => Cow::Borrowed(raw),
         }
     }
@@ -565,6 +598,20 @@ impl LlmClient {
         {
             llm_config.base_url = Some(compose_azure_openai_url(&llm_config)?);
         }
+        if provider == Provider::VertexAi
+            && llm_config
+                .base_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .is_none()
+        {
+            if vertex::is_anthropic_model(&llm_config.model) {
+                let model = provider.normalize_model(&llm_config.model);
+                vertex::compose_anthropic_url(&llm_config, &model, true)?;
+            } else {
+                llm_config.base_url = Some(vertex::compose_gemini_url(&llm_config)?);
+            }
+        }
 
         let debug_logging = config.debug.llm_logging;
         let client = Client::new();
@@ -574,18 +621,18 @@ impl LlmClient {
         // Try to build the primary credential pool. Best-effort: falls back
         // to legacy rotation when the DB is unreachable (tests, headless
         // embedded usage, first-boot before borgd has stamped a DB file).
-        let primary_pool = provider
-            .supports_credential_pool()
-            .then(|| {
-                credential_pool::try_build_from_keys(
-                    provider,
-                    keys.clone(),
-                    config.llm.credential_strategy,
-                    config.llm.credential_cooldown_secs,
-                    config.llm.max_concurrent_per_credential,
-                )
-            })
-            .flatten();
+        let primary_pool = (provider.supports_credential_pool()
+            && keys.iter().any(|k| !k.is_empty()))
+        .then(|| {
+            credential_pool::try_build_from_keys(
+                provider,
+                keys.clone(),
+                config.llm.credential_strategy,
+                config.llm.credential_cooldown_secs,
+                config.llm.max_concurrent_per_credential,
+            )
+        })
+        .flatten();
 
         // Build provider-level failover slots
         let mut provider_slots = Vec::new();
@@ -802,8 +849,10 @@ impl LlmClient {
             }
         }
 
-        // Keyless providers (e.g., Ollama) don't need API keys
-        if slot_keys.is_empty() && !provider.requires_api_key() {
+        // Keyless/cloud-chain providers (Ollama, Bedrock, Vertex, Azure AAD)
+        // don't need static API keys in the fallback slot.
+        if slot_keys.is_empty() && (!provider.requires_api_key() || provider.supports_cloud_auth())
+        {
             slot_keys.push(String::new());
         }
 
@@ -811,8 +860,7 @@ impl LlmClient {
             bail!("No API keys found for fallback provider {provider}");
         }
 
-        let pool = provider
-            .supports_credential_pool()
+        let pool = (provider.supports_credential_pool() && slot_keys.iter().any(|k| !k.is_empty()))
             .then(|| {
                 credential_pool::try_build_from_keys(
                     provider,
@@ -1243,6 +1291,11 @@ impl LlmClient {
                 } else if matches!(self.provider, Provider::Bedrock) {
                     self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
                         .await
+                } else if self.provider == Provider::VertexAi
+                    && vertex::is_anthropic_model(&self.llm_config.model)
+                {
+                    self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
+                        .await
                 } else if self.provider.is_openai_compatible() {
                     self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
                         .await
@@ -1397,6 +1450,10 @@ impl LlmClient {
     ) -> Result<Message> {
         if self.provider == Provider::Bedrock {
             self.chat_bedrock(messages, tools).await
+        } else if self.provider == Provider::VertexAi
+            && vertex::is_anthropic_model(&self.llm_config.model)
+        {
+            self.chat_vertex_anthropic(messages, tools).await
         } else if self.provider.is_openai_compatible() {
             self.chat_openai(messages, tools).await
         } else {
@@ -1464,15 +1521,11 @@ impl LlmClient {
             }
             .boxed()
         } else {
+            let headers = self.request_headers().await?;
             let builder = self
                 .client
                 .post(request_url)
-                .headers(self.provider.build_headers(&self.api_key).map_err(|e| {
-                    LlmError::Fatal {
-                        source: e,
-                        reason: FailoverReason::Unknown,
-                    }
-                })?)
+                .headers(headers)
                 .body(body_bytes);
             async move { builder.send().await.map_err(anyhow::Error::from) }.boxed()
         };
@@ -1546,6 +1599,33 @@ impl LlmClient {
         }
     }
 
+    async fn request_headers(&self) -> std::result::Result<reqwest::header::HeaderMap, LlmError> {
+        if self.provider == Provider::AzureOpenAi && self.api_key.is_empty() {
+            let token = cloud_auth::azure_openai_token(&self.client)
+                .await
+                .map_err(|e| LlmError::Fatal {
+                    source: e,
+                    reason: FailoverReason::Auth,
+                })?;
+            return bearer_headers(&token.access_token);
+        }
+        if self.provider == Provider::VertexAi {
+            let token = cloud_auth::gcp_access_token(&self.client)
+                .await
+                .map_err(|e| LlmError::Fatal {
+                    source: e,
+                    reason: FailoverReason::Auth,
+                })?;
+            return bearer_headers(&token.access_token);
+        }
+        self.provider
+            .build_headers(&self.api_key)
+            .map_err(|e| LlmError::Fatal {
+                source: e,
+                reason: FailoverReason::Unknown,
+            })
+    }
+
     async fn stream_http_transport_inner(
         &self,
         transport: &'static dyn Transport,
@@ -1556,7 +1636,10 @@ impl LlmClient {
     ) -> std::result::Result<(), LlmError> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
-        let request_url = if self.provider == Provider::Bedrock {
+        let request_url = if self.provider == Provider::Bedrock
+            || (self.provider == Provider::VertexAi
+                && vertex::is_anthropic_model(&self.llm_config.model))
+        {
             transport
                 .endpoint(&request, true)
                 .map_err(|e| LlmError::Fatal {
@@ -1711,7 +1794,10 @@ impl LlmClient {
     ) -> Result<Message> {
         let model = self.provider.normalize_model(&self.llm_config.model);
         let request = self.transport_request(messages, tools, &model);
-        let request_url = if self.provider == Provider::Bedrock {
+        let request_url = if self.provider == Provider::Bedrock
+            || (self.provider == Provider::VertexAi
+                && vertex::is_anthropic_model(&self.llm_config.model))
+        {
             transport.endpoint(&request, false)?
         } else {
             self.effective_base_url().into_owned()
@@ -1940,6 +2026,34 @@ impl LlmClient {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
         self.chat_http_transport_inner(transport::bedrock_transport(), messages, tools)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "vertex-ai"))]
+    async fn stream_chat_vertex_anthropic_inner(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), LlmError> {
+        self.stream_http_transport_inner(
+            transport::vertex_anthropic_transport(),
+            messages,
+            tools,
+            tx,
+            cancel,
+        )
+        .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "vertex-ai"))]
+    async fn chat_vertex_anthropic(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        self.chat_http_transport_inner(transport::vertex_anthropic_transport(), messages, tools)
             .await
     }
 }

@@ -134,6 +134,19 @@ fn check_builtin_air_gap_refuses_azure_openai() {
 }
 
 #[test]
+fn check_builtin_air_gap_refuses_vertex_ai() {
+    use crate::llm::provider::Provider;
+    let err = ProviderRegistry::check_builtin_air_gap(Provider::VertexAi, false).unwrap_err();
+    match err {
+        ResolveError::AirGapPolicyViolation { id, category } => {
+            assert_eq!(id, "vertex-ai");
+            assert_eq!(category, ProviderCategory::PublicCloud);
+        }
+        other => panic!("expected AirGapPolicyViolation, got {other:?}"),
+    }
+}
+
+#[test]
 fn check_builtin_air_gap_allows_local() {
     use crate::llm::provider::Provider;
     ProviderRegistry::check_builtin_air_gap(Provider::Ollama, false).unwrap();
@@ -154,6 +167,8 @@ fn check_builtin_air_gap_allows_anything_when_outbound_allowed() {
         Provider::DeepSeek,
         Provider::XAi,
         Provider::OpenRouter,
+        Provider::AzureOpenAi,
+        Provider::VertexAi,
         Provider::Ollama,
         Provider::ClaudeCli,
     ] {

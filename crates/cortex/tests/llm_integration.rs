@@ -27,8 +27,10 @@
 )]
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::LazyLock;
 
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -38,13 +40,14 @@ use cortex::types::{Message, MessageContent, Role};
 
 /// Monotonic counter to generate unique env var names per test, avoiding races.
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+static CLOUD_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Build a `Config` that routes LLM requests to the given wiremock server.
 fn test_config(server_uri: &str) -> Config {
     let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let env_key = format!("BORG_TEST_LLM_KEY_{n}");
     // Each test uses a unique env var name to avoid conflicts in parallel execution.
-    std::env::set_var(&env_key, "test-key-value");
+    std::env::set_var(&env_key, format!("test-key-value-{n}"));
 
     let mut config = Config::default();
     config.llm.provider = Some("openai".into());
@@ -645,8 +648,8 @@ async fn gemini_streams_via_openai_compat_transport() {
 // Azure's static-key auth is the **most common operator misconfiguration**
 // for this provider: every other OpenAI-compatible host accepts
 // `Authorization: Bearer …`, but Azure rejects that header for static keys
-// and requires the `api-key` header instead. AAD/Entra ID tokens use Bearer
-// (deferred to a follow-up). This test pins the header path so the
+// and requires the `api-key` header instead. Entra ID tokens use Bearer.
+// This test pins the header path so the
 // `Provider::AzureOpenAi` match arm in `build_headers` can't silently
 // regress to the OpenAI Bearer path.
 //
@@ -726,4 +729,212 @@ async fn azure_openai_uses_api_key_header_not_bearer() {
     assert_eq!(received.len(), 1, "expected exactly one POST");
 
     std::env::remove_var(&env_key);
+}
+
+#[tokio::test]
+async fn azure_openai_uses_entra_bearer_when_no_api_key_is_configured() {
+    let _guard = CLOUD_ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/tenant/oauth2/v2.0/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "entra-access-token",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"content":"hi from Entra"},"finish_reason":null}]}"#,
+        "[DONE]",
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/openai/deployments/gpt-4o-prod/chat/completions"))
+        .and(header("Authorization", "Bearer entra-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let missing_env = format!("BORG_TEST_AZURE_MISSING_KEY_{n}");
+    std::env::remove_var(&missing_env);
+    std::env::set_var("AZURE_TENANT_ID", "tenant");
+    std::env::set_var("AZURE_CLIENT_ID", "client");
+    std::env::set_var("AZURE_CLIENT_SECRET", "secret");
+    std::env::set_var(
+        "BORG_AZURE_TOKEN_URL",
+        format!("{}/tenant/oauth2/v2.0/token", server.uri()),
+    );
+
+    let mut config = Config::default();
+    config.llm.provider = Some("azure-openai".into());
+    config.llm.api_key_env = missing_env;
+    config.llm.base_url = Some(format!(
+        "{}/openai/deployments/gpt-4o-prod/chat/completions?api-version=2024-10-21",
+        server.uri()
+    ));
+    config.llm.model = "gpt-4o-prod".into();
+    config.llm.max_retries = 0;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("ping"), None, tx)
+        .await
+        .expect("stream_chat");
+
+    let events = collect_events(rx).await;
+    assert!(events.iter().any(|e| e == "text:hi from Entra"));
+
+    std::env::remove_var("AZURE_TENANT_ID");
+    std::env::remove_var("AZURE_CLIENT_ID");
+    std::env::remove_var("AZURE_CLIENT_SECRET");
+    std::env::remove_var("BORG_AZURE_TOKEN_URL");
+}
+
+#[tokio::test]
+async fn vertex_gemini_uses_gcp_bearer_and_openai_compat_body() {
+    let _guard = CLOUD_ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path(
+            "/computeMetadata/v1/instance/service-accounts/default/token",
+        ))
+        .and(header("Metadata-Flavor", "Google"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "gcp-access-token",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    let body = sse_body(&[
+        r#"{"choices":[{"delta":{"content":"hi from Vertex Gemini"},"finish_reason":null}]}"#,
+        "[DONE]",
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/vertex/openai/chat/completions"))
+        .and(header("Authorization", "Bearer gcp-access-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let old_creds = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+    std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+    std::env::set_var(
+        "BORG_GCP_METADATA_TOKEN_URL",
+        format!(
+            "{}/computeMetadata/v1/instance/service-accounts/default/token",
+            server.uri()
+        ),
+    );
+
+    let mut config = Config::default();
+    config.llm.provider = Some("vertex-ai".into());
+    config.llm.model = "google/gemini-2.5-flash".into();
+    config.llm.vertex_project = Some("acme-prod".into());
+    config.llm.vertex_location = Some("us-central1".into());
+    config.llm.base_url = Some(format!("{}/vertex/openai/chat/completions", server.uri()));
+    config.llm.max_retries = 0;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("ping"), None, tx)
+        .await
+        .expect("stream_chat");
+
+    let events = collect_events(rx).await;
+    assert!(events.iter().any(|e| e == "text:hi from Vertex Gemini"));
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    let llm_req = received
+        .iter()
+        .find(|r| r.url.path() == "/vertex/openai/chat/completions")
+        .expect("LLM request recorded");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&llm_req.body).expect("request body is JSON");
+    assert_eq!(body_json["model"], "gemini-2.5-flash");
+
+    if let Some(old) = old_creds {
+        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", old);
+    }
+    std::env::remove_var("BORG_GCP_METADATA_TOKEN_URL");
+}
+
+#[tokio::test]
+async fn vertex_claude_uses_gcp_bearer_and_vertex_anthropic_body() {
+    let _guard = CLOUD_ENV_LOCK.lock().await;
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/metadata/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "gcp-claude-token",
+            "expires_in": 3600
+        })))
+        .mount(&server)
+        .await;
+
+    let body = sse_body(&[
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi from Vertex Claude"}}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/vertex/claude:streamRawPredict"))
+        .and(header("Authorization", "Bearer gcp-claude-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let old_creds = std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+    std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
+    std::env::set_var(
+        "BORG_GCP_METADATA_TOKEN_URL",
+        format!("{}/metadata/token", server.uri()),
+    );
+
+    let mut config = Config::default();
+    config.llm.provider = Some("vertex-ai".into());
+    config.llm.model = "anthropic/claude-sonnet-4".into();
+    config.llm.vertex_project = Some("acme-prod".into());
+    config.llm.vertex_location = Some("us-central1".into());
+    config.llm.base_url = Some(format!("{}/vertex/claude:streamRawPredict", server.uri()));
+    config.llm.max_retries = 0;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("ping"), None, tx)
+        .await
+        .expect("stream_chat");
+
+    let events = collect_events(rx).await;
+    assert!(events.iter().any(|e| e == "text:hi from Vertex Claude"));
+
+    let received = server
+        .received_requests()
+        .await
+        .expect("mock recorded requests");
+    let llm_req = received
+        .iter()
+        .find(|r| r.url.path() == "/vertex/claude:streamRawPredict")
+        .expect("LLM request recorded");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&llm_req.body).expect("request body is JSON");
+    assert!(
+        body_json.get("model").is_none(),
+        "Vertex Claude request must not include model in body"
+    );
+    assert_eq!(body_json["anthropic_version"], "vertex-2023-10-16");
+
+    if let Some(old) = old_creds {
+        std::env::set_var("GOOGLE_APPLICATION_CREDENTIALS", old);
+    }
+    std::env::remove_var("BORG_GCP_METADATA_TOKEN_URL");
 }

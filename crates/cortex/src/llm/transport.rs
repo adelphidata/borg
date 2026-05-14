@@ -85,6 +85,7 @@ pub(crate) trait Transport: Sync {
 static OPENAI_COMPAT_TRANSPORT: OpenAiCompatTransport = OpenAiCompatTransport;
 static ANTHROPIC_TRANSPORT: AnthropicTransport = AnthropicTransport;
 static BEDROCK_TRANSPORT: BedrockTransport = BedrockTransport;
+static VERTEX_ANTHROPIC_TRANSPORT: VertexAnthropicTransport = VertexAnthropicTransport;
 
 pub(crate) fn openai_compat_transport() -> &'static dyn Transport {
     &OPENAI_COMPAT_TRANSPORT
@@ -96,6 +97,10 @@ pub(crate) fn anthropic_transport() -> &'static dyn Transport {
 
 pub(crate) fn bedrock_transport() -> &'static dyn Transport {
     &BEDROCK_TRANSPORT
+}
+
+pub(crate) fn vertex_anthropic_transport() -> &'static dyn Transport {
+    &VERTEX_ANTHROPIC_TRANSPORT
 }
 
 pub(crate) fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
@@ -750,6 +755,78 @@ impl Transport for BedrockTransport {
     }
 }
 
+struct VertexAnthropicTransport;
+
+impl Transport for VertexAnthropicTransport {
+    fn protocol_name(&self) -> &'static str {
+        "vertex-anthropic"
+    }
+
+    fn debug_request_label(&self) -> &'static str {
+        "request_vertex_anthropic"
+    }
+
+    fn endpoint(&self, request: &TransportRequest<'_>, stream: bool) -> Result<String> {
+        if let Some(base_url) = request
+            .llm_config
+            .base_url
+            .as_ref()
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(base_url.clone());
+        }
+        crate::llm::vertex::compose_anthropic_url(request.llm_config, request.model, stream)
+    }
+
+    fn build_streaming_request(
+        &self,
+        request: &TransportRequest<'_>,
+    ) -> std::result::Result<serde_json::Value, LlmError> {
+        Ok(build_vertex_anthropic_request(request, true))
+    }
+
+    fn build_chat_request(&self, request: &TransportRequest<'_>) -> Result<serde_json::Value> {
+        Ok(build_vertex_anthropic_request(request, false))
+    }
+
+    fn new_stream_state(&self) -> StreamState {
+        StreamState::Anthropic(AnthropicStreamState::default())
+    }
+
+    fn parse_stream_line(
+        &self,
+        line: &str,
+        provider: &str,
+        model: &str,
+        state: &mut StreamState,
+    ) -> crate::sse::SseAction {
+        let StreamState::Anthropic(state) = state else {
+            return crate::sse::SseAction::Continue;
+        };
+
+        parse_anthropic_sse_line(
+            line,
+            provider,
+            model,
+            &mut state.current_tool_index,
+            &mut state.current_block_is_tool,
+            &mut state.current_block_is_thinking,
+            &mut state.pending_input_tokens,
+            &mut state.pending_cached_input_tokens,
+            &mut state.pending_cache_creation_tokens,
+        )
+    }
+
+    fn parse_chat_response(
+        &self,
+        response: serde_json::Value,
+        provider: &str,
+        model: &str,
+    ) -> Result<TransportResponse> {
+        ANTHROPIC_TRANSPORT.parse_chat_response(response, provider, model)
+    }
+}
+
 fn build_openai_request(
     request: &TransportRequest<'_>,
     stream: bool,
@@ -870,6 +947,21 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
         if !tool_specs.is_empty() {
             body["toolConfig"] = serde_json::json!({ "tools": tool_specs });
         }
+    }
+    body
+}
+
+fn build_vertex_anthropic_request(
+    request: &TransportRequest<'_>,
+    stream: bool,
+) -> serde_json::Value {
+    let mut body = build_anthropic_request(request, stream);
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("model");
+        obj.insert(
+            "anthropic_version".to_string(),
+            serde_json::json!("vertex-2023-10-16"),
+        );
     }
     body
 }
@@ -1375,5 +1467,23 @@ mod tests {
             }
             _ => panic!("expected fatal auth-permanent error"),
         }
+    }
+
+    #[test]
+    fn build_vertex_anthropic_request_moves_model_to_url_contract() {
+        let messages = vec![Message::system("sys"), Message::user("hello")];
+        let mut req = bedrock_request(&messages);
+        req.provider = Provider::VertexAi;
+        req.model = "claude-sonnet-4";
+
+        let body = build_vertex_anthropic_request(&req, true);
+
+        assert!(
+            body.get("model").is_none(),
+            "Vertex Anthropic model lives in the URL path, not the JSON body"
+        );
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 }

@@ -45,6 +45,9 @@ pub enum Provider {
     /// for AAD (Entra ID) tokens. The auth mode is signaled by the
     /// `PooledCredential.auth_type` field (`ApiKey` vs `OAuth`).
     AzureOpenAi,
+    /// Google Vertex AI — service-account / workload identity access to
+    /// Gemini and partner Anthropic models.
+    VertexAi,
 }
 
 impl Provider {
@@ -53,6 +56,7 @@ impl Provider {
         match self {
             Provider::Ollama | Provider::ClaudeCli => ProviderAuthKind::None,
             Provider::Bedrock => ProviderAuthKind::AwsCredentialChain,
+            Provider::VertexAi => ProviderAuthKind::CloudOAuth,
             Provider::OpenRouter
             | Provider::OpenAi
             | Provider::Anthropic
@@ -95,6 +99,7 @@ impl Provider {
             // forgets to compose will fail loudly on URL parse instead of
             // silently using a wrong host.
             Provider::AzureOpenAi => "",
+            Provider::VertexAi => "",
         }
     }
 
@@ -118,6 +123,7 @@ impl Provider {
             | Provider::CopilotOAuth
             | Provider::Custom => "",
             Provider::AzureOpenAi => "AZURE_OPENAI_API_KEY",
+            Provider::VertexAi => "",
         }
     }
 
@@ -129,6 +135,12 @@ impl Provider {
     /// Whether this provider uses the AWS default credential chain.
     pub fn uses_aws_credential_chain(&self) -> bool {
         self.auth_kind() == ProviderAuthKind::AwsCredentialChain
+    }
+
+    /// Whether this provider can obtain short-lived cloud OAuth tokens without
+    /// a static API key.
+    pub fn supports_cloud_auth(&self) -> bool {
+        matches!(self, Provider::AzureOpenAi | Provider::VertexAi)
     }
 
     /// Whether this provider participates in the API-key credential pool.
@@ -231,6 +243,12 @@ impl Provider {
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("api-key", val);
             }
+            Provider::VertexAi => {
+                let bearer = format!("Bearer {api_key}");
+                let val = HeaderValue::from_str(&bearer)
+                    .context("Access token contains invalid characters for HTTP headers")?;
+                headers.insert("Authorization", val);
+            }
         }
 
         Ok(headers)
@@ -275,6 +293,11 @@ impl Provider {
             // be passthrough so the operator can put the deployment name (or
             // a label) there. No vendor prefix to strip.
             Provider::AzureOpenAi => model.to_string(),
+            Provider::VertexAi => model
+                .strip_prefix("google/")
+                .or_else(|| model.strip_prefix("anthropic/"))
+                .unwrap_or(model)
+                .to_string(),
         }
     }
 
@@ -365,6 +388,17 @@ impl Provider {
                     && !m.contains("dall-e")
                     && !m.contains("embedding")
             }
+            Provider::VertexAi => {
+                if m.starts_with("claude-")
+                    || m.starts_with("anthropic/")
+                    || m.contains("claude-2")
+                    || m.contains("claude-instant")
+                {
+                    !m.contains("claude-2") && !m.contains("claude-instant")
+                } else {
+                    true
+                }
+            }
         }
     }
 
@@ -386,6 +420,7 @@ impl Provider {
             Provider::CopilotOAuth => "copilot-oauth",
             Provider::Custom => "custom",
             Provider::AzureOpenAi => "azure-openai",
+            Provider::VertexAi => "vertex-ai",
         }
     }
 
@@ -456,8 +491,9 @@ impl FromStr for Provider {
             "copilot-oauth" | "copilot_oauth" | "copilotoauth" => Ok(Provider::CopilotOAuth),
             "custom" => Ok(Provider::Custom),
             "azure-openai" | "azure_openai" | "azureopenai" => Ok(Provider::AzureOpenAi),
+            "vertex-ai" | "vertex_ai" | "vertexai" | "vertex" => Ok(Provider::VertexAi),
             _ => {
-                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom, azure-openai")
+                bail!("Unknown provider: {s}. Valid options: openrouter, openai, anthropic, bedrock, gemini, deepseek, groq, xai, ollama, claude-cli, claude-code-oauth, codex-oauth, copilot-oauth, custom, azure-openai, vertex-ai")
             }
         }
     }
@@ -467,6 +503,7 @@ impl FromStr for Provider {
 pub enum ProviderAuthKind {
     ApiKeyLike,
     AwsCredentialChain,
+    CloudOAuth,
     None,
 }
 
@@ -492,6 +529,7 @@ mod tests {
             Provider::CopilotOAuth,
             Provider::Custom,
             Provider::AzureOpenAi,
+            Provider::VertexAi,
         ];
         for provider in &all {
             let s = provider.as_str();
@@ -1086,5 +1124,27 @@ mod tests {
         assert!(!Provider::AzureOpenAi.supports_vision("text-embedding-3-large"));
         assert!(!Provider::AzureOpenAi.supports_vision("whisper-1"));
         assert!(!Provider::AzureOpenAi.supports_vision("dall-e-3"));
+    }
+
+    #[test]
+    fn vertex_ai_from_str_aliases_and_cloud_auth() {
+        for alias in ["vertex-ai", "vertex_ai", "vertexai", "vertex", "Vertex-AI"] {
+            assert_eq!(Provider::from_str(alias).unwrap(), Provider::VertexAi);
+        }
+        assert!(Provider::VertexAi.supports_cloud_auth());
+        assert!(!Provider::VertexAi.requires_api_key());
+        assert_eq!(Provider::VertexAi.default_env_var(), "");
+    }
+
+    #[test]
+    fn vertex_ai_normalizes_google_and_anthropic_prefixes() {
+        assert_eq!(
+            Provider::VertexAi.normalize_model("google/gemini-2.5-pro"),
+            "gemini-2.5-pro"
+        );
+        assert_eq!(
+            Provider::VertexAi.normalize_model("anthropic/claude-sonnet-4"),
+            "claude-sonnet-4"
+        );
     }
 }
