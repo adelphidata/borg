@@ -2828,11 +2828,9 @@ mod tests {
         let write_req = b"{\"key\":\"mykey\",\"value_b64\":\"aGk=\"}";
         // Embed the key string "mykey" at offset 3072 for the read.
         let key_bytes = b"mykey";
-        let mut data = DataSection::new();
-        data.active(0, &ConstExpr::i32_const(2048), write_req.iter().copied());
-        data.active(0, &ConstExpr::i32_const(3072), key_bytes.iter().copied());
-        module.section(&data);
 
+        // WASM spec requires Code before Data; emitting Data first triggers
+        // wasmtime's "section out of order" parse error.
         let mut code = CodeSection::new();
         // alloc: return 1024
         let mut alloc = Function::new([]);
@@ -2851,6 +2849,11 @@ mod tests {
         call.instruction(&Instruction::End);
         code.function(&call);
         module.section(&code);
+
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(2048), write_req.iter().copied());
+        data.active(0, &ConstExpr::i32_const(3072), key_bytes.iter().copied());
+        module.section(&data);
 
         let wasm = module.finish();
         let mut manifest = manifest_for(&wasm);
@@ -2941,9 +2944,8 @@ mod tests {
         exports.export("alloc", ExportKind::Func, 1);
         exports.export("borg_tool_call", ExportKind::Func, 2);
         module.section(&exports);
-        let mut data = DataSection::new();
-        data.active(0, &ConstExpr::i32_const(2048), b"SECRET".iter().copied());
-        module.section(&data);
+        // WASM spec requires Code before Data; emitting Data first triggers
+        // wasmtime's "section out of order" parse error.
         let mut code = CodeSection::new();
         let mut alloc = Function::new([]);
         alloc.instruction(&Instruction::I32Const(1024));
@@ -2956,6 +2958,9 @@ mod tests {
         call.instruction(&Instruction::End);
         code.function(&call);
         module.section(&code);
+        let mut data = DataSection::new();
+        data.active(0, &ConstExpr::i32_const(2048), b"SECRET".iter().copied());
+        module.section(&data);
         let wasm = module.finish();
         let mut manifest = manifest_for(&wasm);
         manifest.wasm_sha256 = sha256_hex(&wasm);
