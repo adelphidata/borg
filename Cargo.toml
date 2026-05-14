@@ -23,6 +23,7 @@ members = [
     "crates/protocols",
     "crates/borgd",
     "crates/identity",
+    "crates/mcp",
 ]
 
 [workspace.dependencies]
