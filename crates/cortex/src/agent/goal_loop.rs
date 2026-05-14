@@ -222,10 +222,18 @@ impl Agent {
         };
         let session_id = self.session.meta.id.as_str();
         // Trait method is sync and infallible; wrap in catch_unwind so a
-        // misbehaving downstream sink can't take the agent down.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // misbehaving downstream sink can't take the agent down. Surface the
+        // panic via tracing so a broken sink is diagnosable.
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             sink.emit(kind, session_id, goal);
-        }));
+        })) {
+            let detail = panic
+                .downcast_ref::<&'static str>()
+                .copied()
+                .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("<non-string panic>");
+            tracing::warn!("emit_goal_lifecycle({kind}) sink panicked: {detail}");
+        }
     }
 
     /// Record a goal lifecycle event into the HMAC-verified vitals chain.
@@ -286,7 +294,10 @@ impl Agent {
         if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return;
         }
-        if v.get("already_complete").and_then(serde_json::Value::as_bool) == Some(true) {
+        if v.get("already_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
             return;
         }
         let Some(goal) = self.fetch_current_goal() else {

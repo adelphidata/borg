@@ -25,6 +25,8 @@ pub mod event_kind {
     pub const REPLACED: &str = "replaced";
     /// Status changed (paused, resumed, etc.).
     pub const STATUS_CHANGED: &str = "status_changed";
+    /// Token budget was edited without a status change.
+    pub const BUDGET_CHANGED: &str = "budget_changed";
     /// Accounting flipped status to `budget_limited`.
     pub const BUDGET_LIMITED: &str = "budget_limited";
     /// Goal completed via `update_goal`.

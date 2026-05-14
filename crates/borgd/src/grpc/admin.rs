@@ -8,7 +8,7 @@
 //!   (set via `with_heartbeat_trigger_sender`).
 //! - The daemon's `shutdown_tx` for Shutdown (set via `with_shutdown_sender`).
 
-use crate::goal_bus::GoalEventBus;
+use crate::goal_bus::{now_unix, GoalEventBus};
 use crate::heartbeat::{HeartbeatBus, HeartbeatSource, HeartbeatTrigger};
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
@@ -1742,128 +1742,167 @@ impl Admin for AdminSvc {
             None
         };
         let bus = self.goal_bus_handle();
-        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<SetGoalOutcome> {
-            let db = Database::open()?;
-            let session_id = resolve_goal_session_id(&db, &session_id_req)?
-                .ok_or_else(|| anyhow::anyhow!("no active session — start a turn first"))?;
-            match op {
-                GoalMutationOp::Unspecified => unreachable!(),
-                GoalMutationOp::Create => {
-                    let obj = cortex::goals::validate_objective(&objective)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let inserted = db.insert_goal(
-                        &session_id,
-                        &obj,
-                        cortex::goals::GoalStatus::Active,
-                        budget,
-                    )?;
-                    let goal = inserted
-                        .ok_or_else(|| anyhow::anyhow!("goal already exists for this session"))?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind: cortex::goals::event_kind::CREATED,
-                    })
-                }
-                GoalMutationOp::Replace => {
-                    let obj = cortex::goals::validate_objective(&objective)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let existed = db.get_goal(&session_id)?.is_some();
-                    let g = db.replace_goal(
-                        &session_id,
-                        &obj,
-                        cortex::goals::GoalStatus::Active,
-                        budget,
-                    )?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(g),
-                        kind: if existed {
-                            cortex::goals::event_kind::REPLACED
-                        } else {
-                            cortex::goals::event_kind::CREATED
-                        },
-                    })
-                }
-                GoalMutationOp::SetStatus => {
-                    let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "status must be one of active|paused|complete (got {status_raw:?})"
+        let outcome =
+            tokio::task::spawn_blocking(move || -> Result<SetGoalOutcome, SetGoalError> {
+                let db = Database::open().map_err(SetGoalError::Internal)?;
+                let session_id = resolve_goal_session_id(&db, &session_id_req)
+                    .map_err(SetGoalError::Internal)?
+                    .ok_or_else(|| {
+                        SetGoalError::Precondition("no active session — start a turn first".into())
+                    })?;
+                match op {
+                    GoalMutationOp::Unspecified => unreachable!(),
+                    GoalMutationOp::Create => {
+                        let obj = cortex::goals::validate_objective(&objective)
+                            .map_err(SetGoalError::Invalid)?;
+                        let budget = cortex::goals::validate_budget(token_budget)
+                            .map_err(SetGoalError::Invalid)?;
+                        let inserted = db
+                            .insert_goal(
+                                &session_id,
+                                &obj,
+                                cortex::goals::GoalStatus::Active,
+                                budget,
+                            )
+                            .map_err(SetGoalError::Internal)?;
+                        let goal = inserted.ok_or_else(|| {
+                            SetGoalError::AlreadyExists(
+                                "goal already exists for this session".into(),
                             )
                         })?;
-                    if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
-                        return Err(anyhow::anyhow!(
-                            "budget_limited is system-only; cannot be set via RPC"
-                        ));
+                        Ok(SetGoalOutcome {
+                            goal: Some(goal),
+                            kind: cortex::goals::event_kind::CREATED,
+                        })
                     }
-                    let current = db
-                        .get_goal(&session_id)?
-                        .ok_or_else(|| anyhow::anyhow!("no goal set for this session"))?;
-                    use cortex::goals::GoalStatus as S;
-                    let allowed = matches!(
-                        (current.status, new_status),
-                        (S::Active, S::Paused)
-                            | (S::Paused, S::Active)
-                            | (S::Active, S::Complete)
-                            | (S::Paused, S::Complete)
-                            | (S::BudgetLimited, S::Complete)
-                    );
-                    if !allowed {
-                        return Err(anyhow::anyhow!(
-                            "illegal transition {} -> {}",
-                            current.status.as_str(),
-                            new_status.as_str()
-                        ));
+                    GoalMutationOp::Replace => {
+                        let obj = cortex::goals::validate_objective(&objective)
+                            .map_err(SetGoalError::Invalid)?;
+                        let budget = cortex::goals::validate_budget(token_budget)
+                            .map_err(SetGoalError::Invalid)?;
+                        let existed = db
+                            .get_goal(&session_id)
+                            .map_err(SetGoalError::Internal)?
+                            .is_some();
+                        let g = db
+                            .replace_goal(
+                                &session_id,
+                                &obj,
+                                cortex::goals::GoalStatus::Active,
+                                budget,
+                            )
+                            .map_err(SetGoalError::Internal)?;
+                        Ok(SetGoalOutcome {
+                            goal: Some(g),
+                            kind: if existed {
+                                cortex::goals::event_kind::REPLACED
+                            } else {
+                                cortex::goals::event_kind::CREATED
+                            },
+                        })
                     }
-                    let updated = db.update_goal(
-                        &session_id,
-                        cortex::db::GoalUpdate {
-                            status: Some(new_status),
-                            expected_goal_id: Some(current.goal_id),
-                            ..Default::default()
-                        },
-                    )?;
-                    let goal = updated
-                        .ok_or_else(|| anyhow::anyhow!("goal disappeared during status update"))?;
-                    let kind = if goal.status == cortex::goals::GoalStatus::Complete {
-                        cortex::goals::event_kind::COMPLETED
-                    } else {
-                        cortex::goals::event_kind::STATUS_CHANGED
-                    };
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind,
-                    })
+                    GoalMutationOp::SetStatus => {
+                        let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
+                            .ok_or_else(|| {
+                                SetGoalError::Invalid(format!(
+                                "status must be one of active|paused|complete (got {status_raw:?})"
+                            ))
+                            })?;
+                        if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
+                            return Err(SetGoalError::Invalid(
+                                "budget_limited is system-only; cannot be set via RPC".into(),
+                            ));
+                        }
+                        let current = db
+                            .get_goal(&session_id)
+                            .map_err(SetGoalError::Internal)?
+                            .ok_or_else(|| {
+                                SetGoalError::Precondition("no goal set for this session".into())
+                            })?;
+                        use cortex::goals::GoalStatus as S;
+                        let allowed = matches!(
+                            (current.status, new_status),
+                            (S::Active, S::Paused)
+                                | (S::Paused, S::Active)
+                                | (S::Active, S::Complete)
+                                | (S::Paused, S::Complete)
+                                | (S::BudgetLimited, S::Complete)
+                        );
+                        if !allowed {
+                            return Err(SetGoalError::Invalid(format!(
+                                "illegal transition {} -> {}",
+                                current.status.as_str(),
+                                new_status.as_str()
+                            )));
+                        }
+                        let updated = db
+                            .update_goal(
+                                &session_id,
+                                cortex::db::GoalUpdate {
+                                    status: Some(new_status),
+                                    expected_goal_id: Some(current.goal_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(SetGoalError::Internal)?;
+                        let goal = updated.ok_or_else(|| {
+                            SetGoalError::Precondition(
+                                "goal changed concurrently during status update".into(),
+                            )
+                        })?;
+                        let kind = if goal.status == cortex::goals::GoalStatus::Complete {
+                            cortex::goals::event_kind::COMPLETED
+                        } else {
+                            cortex::goals::event_kind::STATUS_CHANGED
+                        };
+                        Ok(SetGoalOutcome {
+                            goal: Some(goal),
+                            kind,
+                        })
+                    }
+                    GoalMutationOp::SetBudget => {
+                        let budget = cortex::goals::validate_budget(token_budget)
+                            .map_err(SetGoalError::Invalid)?;
+                        let current = db
+                            .get_goal(&session_id)
+                            .map_err(SetGoalError::Internal)?
+                            .ok_or_else(|| {
+                                SetGoalError::Precondition("no goal set for this session".into())
+                            })?;
+                        let updated = db
+                            .update_goal(
+                                &session_id,
+                                cortex::db::GoalUpdate {
+                                    token_budget: Some(budget),
+                                    expected_goal_id: Some(current.goal_id),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(SetGoalError::Internal)?;
+                        let goal = updated.ok_or_else(|| {
+                            SetGoalError::Precondition(
+                                "goal changed concurrently during budget update".into(),
+                            )
+                        })?;
+                        Ok(SetGoalOutcome {
+                            goal: Some(goal),
+                            kind: cortex::goals::event_kind::BUDGET_CHANGED,
+                        })
+                    }
                 }
-                GoalMutationOp::SetBudget => {
-                    let budget = cortex::goals::validate_budget(token_budget)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    let current = db
-                        .get_goal(&session_id)?
-                        .ok_or_else(|| anyhow::anyhow!("no goal set for this session"))?;
-                    let updated = db.update_goal(
-                        &session_id,
-                        cortex::db::GoalUpdate {
-                            token_budget: Some(budget),
-                            expected_goal_id: Some(current.goal_id),
-                            ..Default::default()
-                        },
-                    )?;
-                    let goal = updated
-                        .ok_or_else(|| anyhow::anyhow!("goal disappeared during budget update"))?;
-                    Ok(SetGoalOutcome {
-                        goal: Some(goal),
-                        kind: cortex::goals::event_kind::STATUS_CHANGED,
-                    })
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("set_goal task panicked: {e}")))?
+            .map_err(|e| match e {
+                SetGoalError::Invalid(msg) => TStatus::invalid_argument(format!("set_goal: {msg}")),
+                SetGoalError::Precondition(msg) => {
+                    TStatus::failed_precondition(format!("set_goal: {msg}"))
                 }
-            }
-        })
-        .await
-        .map_err(|e| TStatus::internal(format!("set_goal task panicked: {e}")))?
-        .map_err(|e| TStatus::invalid_argument(format!("set_goal: {e}")))?;
+                SetGoalError::AlreadyExists(msg) => {
+                    TStatus::already_exists(format!("set_goal: {msg}"))
+                }
+                SetGoalError::Internal(err) => TStatus::internal(format!("set_goal: {err}")),
+            })?;
 
         let detail = outcome
             .goal
@@ -1977,11 +2016,26 @@ struct SetGoalOutcome {
     kind: &'static str,
 }
 
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+/// Classified failures from `set_goal` so the boundary picks the right
+/// `tonic::Status` code. Without this every error collapses to
+/// `InvalidArgument`, hiding real DB / infra problems behind a client-error
+/// shaped response and breaking retry/alerting heuristics.
+enum SetGoalError {
+    /// Caller-supplied input or domain rule violated (validation, illegal
+    /// transition, system-only status). Surfaces as
+    /// `tonic::Code::InvalidArgument`.
+    Invalid(String),
+    /// Server state precludes the request: no session yet, no goal row,
+    /// or a concurrent writer changed the goal mid-CAS. Surfaces as
+    /// `tonic::Code::FailedPrecondition` so clients can retry safely.
+    Precondition(String),
+    /// `Create` requested when a row already exists. Surfaces as
+    /// `tonic::Code::AlreadyExists` so the client can branch into a
+    /// `Replace` flow without parsing message text.
+    AlreadyExists(String),
+    /// Storage or unexpected runtime failure. Surfaces as
+    /// `tonic::Code::Internal` to trigger backoff / paging.
+    Internal(anyhow::Error),
 }
 
 /// Resolve the session id the goal RPC operates on. Empty session_id means

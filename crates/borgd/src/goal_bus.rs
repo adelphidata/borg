@@ -88,7 +88,9 @@ impl GoalEventSink for BusSink {
     }
 }
 
-fn now_unix() -> i64 {
+/// Wall-clock seconds since the UNIX epoch. Saturates to 0 on a backward
+/// system clock — `GoalEvent.emitted_at_unix` is informational, not a key.
+pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

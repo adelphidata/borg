@@ -374,7 +374,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
                     let status = cortex::goals::GoalStatus::from_str(&detail.status);
                     let _ = seed_tx
                         .send(crate::tui::app::GoalUiEvent {
-                            kind: "status_changed".to_string(),
+                            kind: cortex::goals::event_kind::STATUS_CHANGED.to_string(),
                             status,
                         })
                         .await;

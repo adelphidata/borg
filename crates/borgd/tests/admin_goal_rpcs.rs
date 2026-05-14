@@ -169,8 +169,9 @@ async fn get_goal_resolves_latest_and_reports_absence() {
 }
 
 /// Positive: SetGoal{Create} inserts a new row.
-/// Negative: a second SetGoal{Create} on the same session is rejected
-/// (`insert_goal` returns Ok(None) → handler converts to InvalidArgument).
+/// Negative: a second SetGoal{Create} on the same session is rejected as
+/// AlreadyExists so the client can branch into a Replace flow without
+/// parsing the error message.
 #[tokio::test]
 async fn set_goal_create_rejects_duplicate() {
     let _g = SERIAL
@@ -210,8 +211,8 @@ async fn set_goal_create_rejects_duplicate() {
         .expect_err("duplicate create must fail");
     assert_eq!(
         err.code(),
-        tonic::Code::InvalidArgument,
-        "duplicate create must surface as InvalidArgument, got code={:?}, msg={}",
+        tonic::Code::AlreadyExists,
+        "duplicate create must surface as AlreadyExists, got code={:?}, msg={}",
         err.code(),
         err.message()
     );
@@ -320,6 +321,12 @@ async fn set_goal_status_rejects_illegal_transitions() {
         })
         .await
         .expect_err("complete->active must fail");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "illegal transition must be InvalidArgument, got code={:?}",
+        err.code()
+    );
     assert!(
         err.message().contains("illegal transition"),
         "expected illegal-transition error, got: {}",
@@ -338,6 +345,12 @@ async fn set_goal_status_rejects_illegal_transitions() {
         })
         .await
         .expect_err("budget_limited via RPC must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "system-only status must be InvalidArgument, got code={:?}",
+        err.code()
+    );
     assert!(
         err.message().to_lowercase().contains("system-only"),
         "expected system-only rejection, got: {}",

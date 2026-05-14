@@ -365,41 +365,22 @@ impl App<'_> {
             self.event_rx = None;
             self.steer_tx = None;
             self.pending_steers.clear();
-            // Pause any Active goal so the Ralph loop doesn't immediately
-            // self-continue past the operator's Esc/`/cancel`. The RPC is a
-            // no-op when no Active goal exists (returns present=false), so
-            // we never push a noisy "no goal" message in the normal case.
-            // Transport failures are logged + swallowed: cancel itself must
-            // succeed even if the daemon is briefly unreachable, because
-            // dropping the cancel would orphan the in-flight turn.
-            // Only attempt the pause RPC when a Tokio runtime is available.
-            // Unit tests for `cmd_cancel` run outside an async context (the
-            // app surface is sync); cancel must still succeed there. In real
-            // operation the TUI always runs on a Tokio runtime.
-            let paused = if tokio::runtime::Handle::try_current().is_ok() {
+            // Pause any Active goal so the Ralph loop doesn't self-continue
+            // past the operator's Esc/`/cancel`. Fire-and-forget: cancel must
+            // feel instant, so we never block the TUI on the daemon round
+            // trip. The footer is driven by `SubscribeGoalEvents`, so the
+            // status flip lands in the UI on its own once the RPC completes.
+            // The no-runtime branch (unit tests for `cmd_cancel`) is a no-op.
+            if tokio::runtime::Handle::try_current().is_ok() {
                 let client = self.client.clone();
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async move {
-                        let mut c = client.lock().await;
-                        c.pause_goal_on_interrupt("").await
-                    })
-                })
-            } else {
-                Ok(protocols::admin::GoalDetail::default())
-            };
-            match paused {
-                Ok(detail) if detail.present => {
-                    self.push_system_message(format!(
-                        "[cancelled] /goal: paused — \"{}\"",
-                        detail.objective
-                    ));
-                }
-                Ok(_) => self.push_system_message("[cancelled]".to_string()),
-                Err(e) => {
-                    tracing::warn!("cmd_cancel: pause_goal_on_interrupt failed: {e}");
-                    self.push_system_message("[cancelled]".to_string());
-                }
+                tokio::spawn(async move {
+                    let mut c = client.lock().await;
+                    if let Err(e) = c.pause_goal_on_interrupt("").await {
+                        tracing::warn!("cmd_cancel: pause_goal_on_interrupt failed: {e}");
+                    }
+                });
             }
+            self.push_system_message("[cancelled]".to_string());
             Ok(AppAction::Continue)
         } else {
             self.push_system_message("Nothing to cancel.".to_string());
@@ -1053,7 +1034,7 @@ fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
     let status_label = cortex::goals::GoalStatus::from_str(&detail.status)
         .map(|s| s.label().to_string())
         .unwrap_or_else(|| detail.status.clone());
-    out.push_str(&format!("Status:    {}\n", status_label));
+    out.push_str(&format!("Status:    {status_label}\n"));
     out.push_str(&format!("Objective: {}\n", detail.objective));
     out.push_str(&format!(
         "Time used: {}\n",
