@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 
-use cortex::config::Config;
-use cortex::db::{audit_events, try_emit_global, Database, NewWasmPlugin};
+use cortex::db::Database;
+use cortex::wasm_plugins;
 
 #[derive(Subcommand)]
 pub enum WasmPluginAction {
@@ -55,100 +55,11 @@ pub fn dispatch(action: WasmPluginAction) -> Result<()> {
     }
 }
 
-const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
-
 fn install(dir: &Path) -> Result<()> {
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
-    }
-    let manifest_path = dir.join("manifest.json");
-    let sig_path = dir.join("manifest.sig");
-    let wasm_path = dir.join("plugin.wasm");
-
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
-    let signature_b64 = std::fs::read_to_string(&sig_path)
-        .with_context(|| format!("read {}", sig_path.display()))?;
-    let wasm =
-        std::fs::read(&wasm_path).with_context(|| format!("read {}", wasm_path.display()))?;
-
-    let config = Config::load_from_db().context("load config")?;
-    if config.security.trusted_publisher_keys.is_empty() {
-        bail!(
-            "security.trusted_publisher_keys is empty; add at least one key with `borg settings set security.trusted_publisher_keys '[\"<base64-ed25519>\"]'`"
-        );
-    }
-
-    let db = Database::open().context("open db")?;
-    let local_hmac_key = db.derive_hmac_key(HMAC_DOMAIN);
-
-    let package = plugins::wasm::verify_package(
-        &manifest_bytes,
-        signature_b64.trim(),
-        &wasm,
-        &config.security.trusted_publisher_keys,
-        &local_hmac_key,
-    )
-    .context("verify plugin package")?;
-
-    let data_dir = Config::data_dir()?;
-    let installed = plugins::wasm::install_verified_package(&data_dir, &package)
-        .context("write installed package files")?;
-
-    let manifest_sha = plugins::wasm::sha256_hex(&package.canonical_manifest);
-    let tool_rows: Vec<(&str, &str, String)> = package
-        .manifest
-        .tools
-        .iter()
-        .map(|t| {
-            (
-                t.name.as_str(),
-                t.description.as_str(),
-                serde_json::to_string(&t.input_schema).unwrap_or_else(|_| "{}".to_string()),
-            )
-        })
-        .collect();
-    let tool_refs: Vec<(&str, &str, &str)> = tool_rows
-        .iter()
-        .map(|(n, d, s)| (*n, *d, s.as_str()))
-        .collect();
-
-    let manifest_path_str = installed.manifest_path.to_string_lossy().into_owned();
-    let wasm_path_str = installed.wasm_path.to_string_lossy().into_owned();
-    let canonical_manifest_str = String::from_utf8(package.canonical_manifest.clone())
-        .context("canonical manifest is not utf-8")?;
-    db.insert_wasm_plugin(
-        &NewWasmPlugin {
-            plugin_id: &package.manifest.id,
-            manifest_json: &canonical_manifest_str,
-            manifest_sha256: &manifest_sha,
-            wasm_sha256: &package.manifest.wasm_sha256,
-            publisher_key: &package.manifest.publisher.public_key,
-            signature: signature_b64.trim(),
-            local_hmac: &installed.local_hmac,
-            manifest_path: &manifest_path_str,
-            wasm_path: &wasm_path_str,
-        },
-        &tool_refs,
-    )
-    .context("persist plugin metadata")?;
-
-    try_emit_global(
-        audit_events::WASM_PLUGIN_INSTALLED,
-        "system",
-        &serde_json::json!({
-            "plugin_id": &package.manifest.id,
-            "version": &package.manifest.version,
-            "tool_count": package.manifest.tools.len(),
-            "manifest_sha": manifest_sha,
-        }),
-    );
-
+    let summary = wasm_plugins::install_from_dir(dir)?;
     println!(
         "installed {} ({}) — {} tool(s)",
-        package.manifest.id,
-        package.manifest.version,
-        package.manifest.tools.len()
+        summary.plugin_id, summary.version, summary.tool_count
     );
     Ok(())
 }
@@ -224,7 +135,7 @@ fn verify(plugin_id: &str) -> Result<()> {
     let manifest_bytes =
         std::fs::read(&row.manifest_path).with_context(|| format!("read {}", row.manifest_path))?;
     let wasm = std::fs::read(&row.wasm_path).with_context(|| format!("read {}", row.wasm_path))?;
-    let key = db.derive_hmac_key(HMAC_DOMAIN);
+    let key = db.derive_hmac_key(wasm_plugins::HMAC_DOMAIN);
     plugins::wasm::verify_installed_hmac(&key, &manifest_bytes, &wasm, &row.local_hmac)
         .context("local HMAC verification failed")?;
     db.restore_wasm_plugin(plugin_id)
@@ -234,32 +145,18 @@ fn verify(plugin_id: &str) -> Result<()> {
 }
 
 fn remove(plugin_id: &str) -> Result<()> {
-    let db = Database::open().context("open db")?;
-    let row = db.get_wasm_plugin(plugin_id)?;
-    let existed = db
-        .delete_wasm_plugin(plugin_id)
-        .context("delete plugin rows")?;
-    if !existed {
+    let outcome = wasm_plugins::remove(plugin_id)?;
+    if !outcome.existed {
         bail!("plugin '{plugin_id}' not found");
     }
-    if let Some(row) = row {
-        // Delete the install dir if it sits under data_dir/wasm_plugins.
-        let data_dir = Config::data_dir().ok();
-        let wasm_path = PathBuf::from(&row.wasm_path);
-        if let (Some(data_dir), Some(parent)) = (data_dir, wasm_path.parent()) {
-            let expected_root = data_dir.join("wasm_plugins");
-            if parent.starts_with(&expected_root) {
-                if let Err(e) = std::fs::remove_dir_all(parent) {
-                    tracing::warn!("Failed to remove {}: {e}", parent.display());
-                    eprintln!("warning: could not remove {}: {e}", parent.display());
-                }
-            } else {
-                tracing::warn!(
-                    "Refusing to delete plugin dir {} outside data dir",
-                    parent.display()
-                );
-            }
-        }
+    if let Some(dir) = outcome.orphaned_dir {
+        // DB rows are gone but the on-disk install dir was left behind. The
+        // user needs to see this on stderr — they typed `borg plugin remove`
+        // expecting a clean state, and tracing logs aren't always tailed.
+        eprintln!(
+            "warning: removed DB rows but could not delete {} — see logs",
+            dir.display()
+        );
     }
     println!("removed {plugin_id}");
     Ok(())

@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use plugins::wasm::{HostHttpFetch, HostHttpResponse, HostServices};
 
 use crate::config::Config;
-use crate::db::Database;
+use crate::db::{Database, NewWasmPlugin};
 use crate::tool::names;
 
 /// Process-lifetime cache of compiled WASM modules, keyed by the row's
@@ -76,7 +76,7 @@ pub(crate) mod compiled_cache {
 // compute_local_hmac (length-prefixed over NUL-separated). Pre-v2 installs
 // re-verify under a different MAC, fail integrity, and quarantine themselves —
 // the migration is `borg plugin remove && borg plugin install`.
-const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
+pub const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
 
 /// Names of built-in tools — WASM plugins may not shadow them.
 ///
@@ -734,4 +734,192 @@ mod e2e_tests {
 
         compiled_cache::clear();
     }
+}
+
+/// Summary of a successful install — returned to the CLI for its print line
+/// and to tests for assertions.
+#[derive(Debug, Clone)]
+pub struct InstalledSummary {
+    /// Manifest's declared plugin id (e.g. `dev/echo`).
+    pub plugin_id: String,
+    /// Manifest version string.
+    pub version: String,
+    /// Number of tools registered for this plugin.
+    pub tool_count: usize,
+}
+
+/// Verify and install a signed WASM plugin package directory.
+///
+/// `dir` must contain `manifest.json`, `manifest.sig`, and `plugin.wasm`. The
+/// publisher key in the manifest must appear in `security.trusted_publisher_keys`.
+/// On success: the canonical manifest + wasm bytes are written under
+/// `data_dir/wasm_plugins/<sha-id>/`, sealed with the per-DB HMAC key, and the
+/// metadata + tool rows are persisted so `tool_definitions()` will surface them.
+///
+/// Shared by the `borg plugin install` CLI command and the integration test
+/// suite so both walk the same code path.
+pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
+    if !dir.is_dir() {
+        bail!("{} is not a directory", dir.display());
+    }
+    let manifest_path = dir.join("manifest.json");
+    let sig_path = dir.join("manifest.sig");
+    let wasm_path = dir.join("plugin.wasm");
+
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let signature_b64 = std::fs::read_to_string(&sig_path)
+        .with_context(|| format!("read {}", sig_path.display()))?;
+    let wasm =
+        std::fs::read(&wasm_path).with_context(|| format!("read {}", wasm_path.display()))?;
+
+    let config = Config::load_from_db().context("load config")?;
+    if config.security.trusted_publisher_keys.is_empty() {
+        bail!(
+            "security.trusted_publisher_keys is empty; add at least one key with `borg settings set security.trusted_publisher_keys '[\"<base64-ed25519>\"]'`"
+        );
+    }
+
+    let db = Database::open().context("open db")?;
+    let local_hmac_key = db.derive_hmac_key(HMAC_DOMAIN);
+
+    let package = plugins::wasm::verify_package(
+        &manifest_bytes,
+        signature_b64.trim(),
+        &wasm,
+        &config.security.trusted_publisher_keys,
+        &local_hmac_key,
+    )
+    .context("verify plugin package")?;
+
+    let data_dir = Config::data_dir()?;
+    let installed = plugins::wasm::install_verified_package(&data_dir, &package)
+        .context("write installed package files")?;
+
+    let manifest_sha = plugins::wasm::sha256_hex(&package.canonical_manifest);
+    let tool_rows: Vec<(&str, &str, String)> = package
+        .manifest
+        .tools
+        .iter()
+        .map(|t| {
+            (
+                t.name.as_str(),
+                t.description.as_str(),
+                serde_json::to_string(&t.input_schema).unwrap_or_else(|_| "{}".to_string()),
+            )
+        })
+        .collect();
+    let tool_refs: Vec<(&str, &str, &str)> = tool_rows
+        .iter()
+        .map(|(n, d, s)| (*n, *d, s.as_str()))
+        .collect();
+
+    let manifest_path_str = installed.manifest_path.to_string_lossy().into_owned();
+    let wasm_path_str = installed.wasm_path.to_string_lossy().into_owned();
+    let canonical_manifest_str = String::from_utf8(package.canonical_manifest.clone())
+        .context("canonical manifest is not utf-8")?;
+    db.insert_wasm_plugin(
+        &NewWasmPlugin {
+            plugin_id: &package.manifest.id,
+            manifest_json: &canonical_manifest_str,
+            manifest_sha256: &manifest_sha,
+            wasm_sha256: &package.manifest.wasm_sha256,
+            publisher_key: &package.manifest.publisher.public_key,
+            signature: signature_b64.trim(),
+            local_hmac: &installed.local_hmac,
+            manifest_path: &manifest_path_str,
+            wasm_path: &wasm_path_str,
+        },
+        &tool_refs,
+    )
+    .context("persist plugin metadata")?;
+
+    // Match the audit pattern established for WASM_PLUGIN_EXECUTED /
+    // _QUARANTINED: principal "system" because the install was operator-driven,
+    // not plugin-driven. Lives in cortex (not the CLI) so daemon-side install
+    // paths get the same audit trail without re-implementing the emit.
+    crate::db::try_emit_global(
+        crate::db::audit_events::WASM_PLUGIN_INSTALLED,
+        "system",
+        &serde_json::json!({
+            "plugin_id": &package.manifest.id,
+            "version": &package.manifest.version,
+            "tool_count": package.manifest.tools.len(),
+            "manifest_sha": manifest_sha,
+        }),
+    );
+
+    Ok(InstalledSummary {
+        plugin_id: package.manifest.id,
+        version: package.manifest.version,
+        tool_count: package.manifest.tools.len(),
+    })
+}
+
+/// Outcome of a `remove` call, surfaced to the CLI so it can warn the user
+/// when DB cleanup succeeded but the on-disk install directory was left
+/// behind. The CLAUDE.md invariant — "If we report success to the user, it
+/// MUST actually succeed" — means the CLI must not print a plain "removed"
+/// when `orphaned_dir` is `Some`.
+#[derive(Debug, Clone)]
+pub struct RemoveOutcome {
+    /// True when a DB row existed for `plugin_id` (and was deleted).
+    pub existed: bool,
+    /// Set when the DB row pointed at a wasm path under `data_dir/wasm_plugins/`
+    /// but `remove_dir_all` failed; the directory still lives on disk.
+    pub orphaned_dir: Option<PathBuf>,
+}
+
+/// Remove a WASM plugin's DB rows and its on-disk install directory.
+///
+/// The on-disk directory is only removed when it sits under
+/// `data_dir/wasm_plugins/` — a paranoia guard against a tampered DB row
+/// pointing at a path outside the borg data dir.
+pub fn remove(plugin_id: &str) -> Result<RemoveOutcome> {
+    let db = Database::open().context("open db")?;
+    let row = db.get_wasm_plugin(plugin_id)?;
+    let existed = db
+        .delete_wasm_plugin(plugin_id)
+        .context("delete plugin rows")?;
+    if !existed {
+        return Ok(RemoveOutcome {
+            existed: false,
+            orphaned_dir: None,
+        });
+    }
+    let mut orphaned_dir = None;
+    let Some(row) = row else {
+        // Race: DELETE succeeded but the prior SELECT didn't see the row.
+        // We can't clean the directory without its path, so flag the
+        // inconsistency rather than silently claiming a clean removal.
+        tracing::warn!(
+            plugin_id,
+            "DB row deleted but lookup returned None; on-disk dir (if any) not cleaned"
+        );
+        return Ok(RemoveOutcome {
+            existed: true,
+            orphaned_dir: None,
+        });
+    };
+    let data_dir = Config::data_dir().ok();
+    let wasm_path = PathBuf::from(&row.wasm_path);
+    if let (Some(data_dir), Some(parent)) = (data_dir, wasm_path.parent()) {
+        let expected_root = data_dir.join("wasm_plugins");
+        if parent.starts_with(&expected_root) {
+            if let Err(e) = std::fs::remove_dir_all(parent) {
+                tracing::warn!("Failed to remove {}: {e}", parent.display());
+                orphaned_dir = Some(parent.to_path_buf());
+            }
+        } else {
+            tracing::warn!(
+                "Refusing to delete plugin dir {} outside data dir",
+                parent.display()
+            );
+            orphaned_dir = Some(parent.to_path_buf());
+        }
+    }
+    Ok(RemoveOutcome {
+        existed: true,
+        orphaned_dir,
+    })
 }
