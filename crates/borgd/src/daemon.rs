@@ -2,8 +2,8 @@
 
 use crate::auth::kek_factory::build_kek_store;
 use crate::auth::{
-    auth_interceptor, build_server_tls_config, build_verifier, ensure_root_ca, ensure_server_cert,
-    ServerCertMaterial,
+    auth_interceptor, build_server_tls_config, build_verifier, derive_server_san, ensure_root_ca,
+    ensure_server_cert, ServerCertMaterial,
 };
 use crate::cost_events::CostEventBus;
 use crate::grpc;
@@ -255,7 +255,12 @@ pub async fn run(cfg: Config) -> Result<()> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ensure_root_ca(&g, kek.as_ref()).context("ensure root CA")?
     };
-    let san_dns = vec!["localhost".to_string()];
+    // Derive the server-cert SAN from the bind address. Loopback (or no
+    // `--listen`) gives `["localhost"]`; non-loopback requires the operator
+    // to set `BORG_DAEMON_TLS_SAN`. This replaces the historical hard-coded
+    // `["localhost"]` so binding to `--listen 0.0.0.0:PORT` fails loudly at
+    // startup instead of silently minting an unusable cert.
+    let san_dns = derive_server_san(cfg.listen_tcp.as_deref()).context("derive server cert SAN")?;
     let (server_cert_pem, server_key_pem, _server_serial) = {
         let g = pki_db
             .lock()

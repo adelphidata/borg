@@ -58,8 +58,25 @@ pub enum VerifierError {
     Tailscale(String),
 }
 
+/// Sealed marker — see [`Verifier`]. Lives in a module that is reachable to
+/// sibling `auth/` submodules but unreachable from outside the crate, so
+/// only in-crate types can impl [`Verifier`].
+pub(super) mod sealed {
+    /// Implemented for every in-crate `Verifier`. The trait itself is
+    /// unreachable from outside `borgd::auth`, which seals the [`Verifier`]
+    /// trait at the type level.
+    pub trait Sealed {}
+}
+
 /// Authenticates a peer by certificate fingerprint and returns the principal.
-pub trait Verifier: Send + Sync {
+///
+/// **Sealed.** Implementations live exclusively inside `borgd::auth` so the
+/// auth interceptor's contract (revocation check + paired-device lookup +
+/// optional transport pinning) cannot be silently bypassed by an out-of-crate
+/// impl. Construction goes through [`super::build_verifier`]; never call
+/// [`TofuVerifier::new`] from outside this crate. The sealed constructor
+/// enforces this at compile time.
+pub trait Verifier: sealed::Sealed + Send + Sync {
     /// Verify `fingerprint` (optionally with a SAN URI hint) and return the principal id.
     fn verify(&self, fingerprint: &str, san_uri: Option<&str>) -> Result<String, VerifierError>;
 
@@ -85,10 +102,17 @@ pub struct TofuVerifier {
 
 impl TofuVerifier {
     /// Build a TOFU verifier backed by the shared database handle.
-    pub fn new(db: Arc<Mutex<Database>>) -> Self {
+    ///
+    /// Crate-private on purpose: external callers MUST go through
+    /// [`super::build_verifier`] so the operator's `security.verifier`
+    /// choice is honored and the optional Tailscale wrapper is composed in.
+    /// A direct construction would silently downgrade the security posture.
+    pub(crate) fn new(db: Arc<Mutex<Database>>) -> Self {
         Self { db }
     }
 }
+
+impl sealed::Sealed for TofuVerifier {}
 
 impl Verifier for TofuVerifier {
     fn verify(&self, fingerprint: &str, _san_uri: Option<&str>) -> Result<String, VerifierError> {

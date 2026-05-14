@@ -223,6 +223,8 @@ impl TailscaleVerifier {
     }
 }
 
+impl super::verifier::sealed::Sealed for TailscaleVerifier {}
+
 impl Verifier for TailscaleVerifier {
     fn verify(&self, fingerprint: &str, san_uri: Option<&str>) -> Result<String, VerifierError> {
         // Without a peer IP we cannot enforce Tailscale pinning. Refuse

@@ -8,6 +8,7 @@
 pub mod ca_bootstrap;
 pub mod interceptor;
 pub mod kek_factory;
+pub mod san;
 pub mod tailscale_verifier;
 pub mod tls;
 pub mod verifier;
@@ -19,11 +20,16 @@ use cortex::db::Database;
 
 pub use ca_bootstrap::{ensure_root_ca, ensure_server_cert, CaMaterial};
 pub use interceptor::{auth_interceptor, Principal};
+pub use san::derive_server_san;
 pub use tailscale_verifier::{
     TailscaleCliSource, TailscaleStatusSource, TailscaleVerifier, STATUS_CACHE_TTL,
 };
 pub use tls::{build_server_tls_config, ServerCertMaterial};
-pub use verifier::{PeerCtx, TofuVerifier, Verifier, VerifierError};
+// `TofuVerifier` intentionally NOT re-exported — its `new()` is `pub(crate)`
+// so the type is unconstructable from outside `borgd::auth`. External callers
+// always go through `build_verifier`.
+use verifier::TofuVerifier;
+pub use verifier::{PeerCtx, Verifier, VerifierError};
 
 /// Construct the configured `Verifier` for the daemon. Fails-closed when
 /// the user selected `Tailscale` but the binary is absent — never silently

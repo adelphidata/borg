@@ -244,7 +244,8 @@ async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
     // Forgetting that ordering — or short-circuiting on `find_active_paired_device`
     // first — would let revoked-but-still-active rows authenticate. Codifies
     // the spec's "revoked cert handshake refusal" done-when bullet.
-    use borgd::auth::verifier::{TofuVerifier, Verifier, VerifierError};
+    use borgd::auth::{build_verifier, VerifierError};
+    use cortex::config::VerifierKind;
 
     let state = make_state();
     let code = mint_pairing_code();
@@ -277,7 +278,7 @@ async fn revoked_fingerprint_blocks_verifier_after_successful_pair() {
         .clone();
 
     // Pre-revocation: verifier accepts.
-    let v = TofuVerifier::new(state.db.clone());
+    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None).expect("build verifier");
     assert!(v.verify(&fp, None).is_ok(), "fresh paired device verifies");
 
     // Revoke and confirm verifier now blocks.
@@ -301,7 +302,8 @@ async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
     // (even under Alice's principal label) must be rejected. The verifier's
     // sole identity key is the cert fingerprint — exercising it locks that
     // invariant in.
-    use borgd::auth::verifier::{TofuVerifier, Verifier, VerifierError};
+    use borgd::auth::{build_verifier, VerifierError};
+    use cortex::config::VerifierKind;
 
     let state = make_state();
     let code = mint_pairing_code();
@@ -325,7 +327,7 @@ async fn second_unrelated_cert_after_pair_is_rejected_as_unknown_device() {
         .await
         .expect("pair");
 
-    let v = TofuVerifier::new(state.db.clone());
+    let v = build_verifier(VerifierKind::Tofu, state.db.clone(), None).expect("build verifier");
     match v.verify("fp-attacker-not-paired", None) {
         Err(VerifierError::UnknownDevice(fp)) => {
             assert_eq!(fp, "fp-attacker-not-paired")
