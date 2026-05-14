@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 use crate::db::Database;
 use crate::llm::llm_error::FailoverReason;
 use crate::llm::provider::Provider;
+use crate::llm::rate_limit_headers::RateLimitSnapshot;
 
 /// Hard ceiling for any cooldown duration — defends against absurd provider
 /// hints like `retry_after: 999999999` (yes, it happens).
@@ -220,6 +221,11 @@ pub struct PooledCredential {
     /// Per-provider opaque JSON blob (PKCE verifier, OAuth client_id, etc.).
     /// Used by the OAuth-refresh flow.
     pub extra_json: Option<String>,
+    /// Latest provider rate-limit headers observed for this credential.
+    /// In-memory only — snapshots expire well within the bucket reset window
+    /// (seconds-to-minutes), so persisting across restart would just mean
+    /// acting on stale data. Populated by `report_rate_limit_headers`.
+    pub rate_limit: Option<RateLimitSnapshot>,
 }
 
 impl PooledCredential {
@@ -240,6 +246,57 @@ impl PooledCredential {
     /// True when this credential is available for `pick()` right now.
     pub fn is_available(&self, now_ms: i64) -> bool {
         !self.is_removed() && !self.is_cooling(now_ms)
+    }
+
+    /// True when the latest provider rate-limit headers say this credential
+    /// is near-empty *and* far enough from reset that rotating to a sibling
+    /// is cheaper than waiting.
+    ///
+    /// Returns false when:
+    /// - no snapshot has been captured (yet);
+    /// - `threshold_pct == 0` (operator disabled the feature);
+    /// - the bucket's reset window is within `min_window_secs` (waiting is cheaper);
+    /// - every reported bucket has more than `threshold_pct` headroom;
+    /// - the snapshot is older than its own reset (provider has already replenished).
+    ///
+    /// This is a hint, not a hard block — `pick_force` ignores it when
+    /// nothing else is available so we never *fail* on proactive avoidance.
+    pub fn is_proactively_throttled(
+        &self,
+        now_ms: i64,
+        threshold_pct: u8,
+        min_window_secs: u64,
+    ) -> bool {
+        // Defense in depth: tombstoned credentials are already excluded by
+        // `is_available`, but a future caller asking the predicate directly
+        // must not see a stale-snapshot tombstone reported as "throttled" —
+        // that would imply it's a candidate for use.
+        if self.is_removed() {
+            return false;
+        }
+        if threshold_pct == 0 {
+            return false;
+        }
+        let Some(snap) = self.rate_limit.as_ref() else {
+            return false;
+        };
+        if snap.is_stale(now_ms) {
+            return false;
+        }
+        let min_window_ms = (min_window_secs as i64).saturating_mul(1000);
+        let buckets = [snap.requests, snap.tokens];
+        buckets.into_iter().flatten().any(|b| {
+            // Stale or already-replenished bucket: don't act on it.
+            if b.reset_at_ms <= now_ms {
+                return false;
+            }
+            // Within the "just wait it out" window: rotating costs more than
+            // it saves (warmup on the sibling, lost in-flight context).
+            if b.reset_at_ms - now_ms <= min_window_ms {
+                return false;
+            }
+            b.remaining_pct() < threshold_pct
+        })
     }
 }
 
@@ -278,6 +335,7 @@ impl std::fmt::Debug for PooledCredential {
             .field("expires_at_ms", &self.expires_at_ms)
             .field("base_url", &self.base_url)
             .field("extra_json", &self.extra_json)
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -335,6 +393,11 @@ struct PoolInner {
     /// spam logs on every subsequent failed `pick()`. Cleared on any
     /// recovery (cooldown expiry or operator reset).
     emitted_exhausted_warn: bool,
+    /// Proactive rate-limit avoidance threshold (% remaining). `0` disables
+    /// the feature — pick() behaves identically to the reactive-only path.
+    proactive_threshold_pct: u8,
+    /// Minimum seconds-until-reset for proactive avoidance to kick in.
+    proactive_min_window_secs: u64,
 }
 
 // ── CredentialPool ────────────────────────────────────────────────────────
@@ -385,6 +448,13 @@ pub struct PoolLoadConfig {
     pub strategy: CredentialStrategy,
     pub cooldown_secs: u64,
     pub max_concurrent_per_credential: u32,
+    /// Proactive rate-limit avoidance: skip a credential during `pick()`
+    /// when its observed rate-limit headroom drops below this percentage.
+    /// `0` disables (the pool stays purely reactive to 429s).
+    pub proactive_rate_limit_threshold_pct: u8,
+    /// Minimum seconds-until-reset for proactive avoidance to kick in.
+    /// Below this, waiting out the bucket is cheaper than rotating.
+    pub proactive_rate_limit_min_window_secs: u64,
     /// Resolved (label, key) pairs from `api_keys` config blocks. The loader
     /// computes fingerprints and de-dupes. Labels are operator-friendly tags
     /// for `borg auth list`.
@@ -657,6 +727,7 @@ impl CredentialPool {
                         expires_at_ms: row.expires_at_ms,
                         base_url: row.base_url.clone(),
                         extra_json: row.extra_json.clone(),
+                        rate_limit: None,
                     });
                 }
             }
@@ -704,6 +775,8 @@ impl CredentialPool {
             max_concurrent_per_credential: cfg.max_concurrent_per_credential.max(1),
             suppressed,
             emitted_exhausted_warn: false,
+            proactive_threshold_pct: cfg.proactive_rate_limit_threshold_pct,
+            proactive_min_window_secs: cfg.proactive_rate_limit_min_window_secs,
         };
 
         Ok(Arc::new(Self {
@@ -955,14 +1028,33 @@ impl CredentialPool {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Snapshot available indices to make the strategy match deterministic.
-        let avail: Vec<usize> = g
+        let threshold_pct = g.proactive_threshold_pct;
+        let min_window_secs = g.proactive_min_window_secs;
+        // Two-pass filter: first exclude reactively-cooling AND proactively-
+        // throttled credentials. If every credential is proactively throttled
+        // but otherwise available, fall back to the original filter — the
+        // pool should still pick *something*, since rotating to nothing
+        // strictly worsens latency vs. the would-be 429.
+        let avail_strict: Vec<usize> = g
             .creds
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.is_available(now))
+            .filter(|(_, c)| {
+                c.is_available(now)
+                    && !c.is_proactively_throttled(now, threshold_pct, min_window_secs)
+            })
             .map(|(i, _)| i)
             .collect();
+        let avail: Vec<usize> = if avail_strict.is_empty() {
+            g.creds
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.is_available(now))
+                .map(|(i, _)| i)
+                .collect()
+        } else {
+            avail_strict
+        };
 
         if avail.is_empty() {
             if !g.emitted_exhausted_warn {
@@ -1076,6 +1168,34 @@ impl CredentialPool {
         drop(g);
         self.persist_credential(&cred);
         Some(cred)
+    }
+
+    /// Record observed rate-limit headers for `credential_id`. Overwrites
+    /// any prior snapshot — provider headers are the freshest source of
+    /// truth about the bucket. Held in memory only; not persisted.
+    ///
+    /// Called from both the success and failure paths so the pool always
+    /// acts on the most recent observation, including the snapshot that
+    /// accompanied the 429 that just cooled the key.
+    pub fn report_rate_limit_headers(&self, credential_id: &str, snapshot: RateLimitSnapshot) {
+        let mut g = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(c) = g.creds.iter_mut().find(|c| c.id == credential_id) else {
+            return;
+        };
+        if c.is_removed() {
+            return;
+        }
+        debug!(
+            target: "cortex::llm::credential_pool",
+            id = %c.id,
+            requests = ?snapshot.requests,
+            tokens = ?snapshot.tokens,
+            "rate-limit snapshot captured"
+        );
+        c.rate_limit = Some(snapshot);
     }
 
     /// Record a successful request against `credential_id`. Bumps `use_count`,
@@ -1301,6 +1421,10 @@ impl CredentialPool {
                 entry.last_error_reason = None;
                 entry.last_error_message = None;
                 entry.last_error_reset_at_ms = None;
+                // The previous rate-limit snapshot is from before the
+                // credential was tombstoned — almost certainly stale, and
+                // we want a fresh observation before acting on it.
+                entry.rate_limit = None;
                 let resurrected = entry.clone();
                 let had_suppression = g.suppressed.remove(&suppression_key);
                 g.emitted_exhausted_warn = false;
@@ -1343,6 +1467,7 @@ impl CredentialPool {
             expires_at_ms,
             base_url,
             extra_json,
+            rate_limit: None,
         };
         g.creds.push(cred.clone());
         g.emitted_exhausted_warn = false;
@@ -1478,16 +1603,32 @@ impl CredentialPool {
         }
 
         let cap = g.max_concurrent_per_credential;
-        let available: Vec<usize> = g
+        let threshold_pct = g.proactive_threshold_pct;
+        let min_window_secs = g.proactive_min_window_secs;
+        let available_all: Vec<usize> = g
             .creds
             .iter()
             .enumerate()
             .filter(|(_, c)| c.is_available(now))
             .map(|(i, _)| i)
             .collect();
-        if available.is_empty() {
+        if available_all.is_empty() {
             return None;
         }
+        // Two-pass: prefer credentials that aren't proactively throttled.
+        // If every available credential is throttled (every bucket near
+        // empty), fall through to the full set — picking *something* still
+        // beats failing entirely.
+        let available_strict: Vec<usize> = available_all
+            .iter()
+            .copied()
+            .filter(|&i| !g.creds[i].is_proactively_throttled(now, threshold_pct, min_window_secs))
+            .collect();
+        let available: Vec<usize> = if available_strict.is_empty() {
+            available_all
+        } else {
+            available_strict
+        };
         // Prefer below-cap by (leases, priority).
         let below_cap: Vec<usize> = available
             .iter()
@@ -1818,6 +1959,7 @@ fn reconcile_or_new(
             expires_at_ms: row.expires_at_ms,
             base_url: row.base_url.clone(),
             extra_json: row.extra_json.clone(),
+            rate_limit: None,
         }
     } else {
         PooledCredential {
@@ -1840,6 +1982,7 @@ fn reconcile_or_new(
             expires_at_ms: None,
             base_url: None,
             extra_json: None,
+            rate_limit: None,
         }
     }
 }
@@ -1886,6 +2029,7 @@ fn reconcile_or_new_oauth(
             expires_at_ms: disc.expires_at_ms.or(row.expires_at_ms),
             base_url: disc.base_url.or_else(|| row.base_url.clone()),
             extra_json: disc.extra_json.or_else(|| row.extra_json.clone()),
+            rate_limit: None,
         }
     } else {
         PooledCredential {
@@ -1908,6 +2052,7 @@ fn reconcile_or_new_oauth(
             expires_at_ms: disc.expires_at_ms,
             base_url: disc.base_url,
             extra_json: disc.extra_json,
+            rate_limit: None,
         }
     }
 }
@@ -2108,10 +2253,36 @@ pub fn pool_load_config_for_provider(
         strategy,
         cooldown_secs,
         max_concurrent_per_credential,
+        proactive_rate_limit_threshold_pct: 0,
+        proactive_rate_limit_min_window_secs: 0,
         config_entries,
         env_vars,
         oauth_home: None,
     }
+}
+
+/// Same as [`pool_load_config_for_provider`], but also threads the proactive
+/// rate-limit knobs. New callers should use this; the no-suffix variant
+/// remains for backward compatibility (it disables proactive avoidance).
+pub fn pool_load_config_for_provider_with_proactive(
+    provider: Provider,
+    strategy: CredentialStrategy,
+    cooldown_secs: u64,
+    max_concurrent_per_credential: u32,
+    proactive_rate_limit_threshold_pct: u8,
+    proactive_rate_limit_min_window_secs: u64,
+    config_entries: Vec<ConfigEntry>,
+) -> PoolLoadConfig {
+    let mut cfg = pool_load_config_for_provider(
+        provider,
+        strategy,
+        cooldown_secs,
+        max_concurrent_per_credential,
+        config_entries,
+    );
+    cfg.proactive_rate_limit_threshold_pct = proactive_rate_limit_threshold_pct;
+    cfg.proactive_rate_limit_min_window_secs = proactive_rate_limit_min_window_secs;
+    cfg
 }
 
 /// Convenience: build a pool from already-resolved plaintext keys. Skips the
@@ -2125,6 +2296,8 @@ pub fn try_build_from_keys(
     strategy: CredentialStrategy,
     cooldown_secs: u64,
     max_concurrent_per_credential: u32,
+    proactive_rate_limit_threshold_pct: u8,
+    proactive_rate_limit_min_window_secs: u64,
 ) -> Option<Arc<CredentialPool>> {
     let db_path = match crate::config::Config::db_path() {
         Ok(p) => p,
@@ -2157,11 +2330,13 @@ pub fn try_build_from_keys(
             config_name: format!("llm.api_keys[{i}]"),
         })
         .collect();
-    let cfg = pool_load_config_for_provider(
+    let cfg = pool_load_config_for_provider_with_proactive(
         provider,
         strategy,
         cooldown_secs,
         max_concurrent_per_credential,
+        proactive_rate_limit_threshold_pct,
+        proactive_rate_limit_min_window_secs,
         config_entries,
     );
     match CredentialPool::load(&db, &db_path, provider, cfg) {
@@ -2225,6 +2400,8 @@ mod tests {
             strategy: CredentialStrategy::FillFirst,
             cooldown_secs: 60,
             max_concurrent_per_credential: 1,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
             config_entries: entries,
             env_vars: vec![],
             oauth_home: None,
@@ -2244,6 +2421,8 @@ mod tests {
                 strategy: CredentialStrategy::FillFirst,
                 cooldown_secs: 60,
                 max_concurrent_per_credential: 1,
+                proactive_rate_limit_threshold_pct: 0,
+                proactive_rate_limit_min_window_secs: 0,
                 config_entries: vec![],
                 env_vars: vec!["BORG_TEST_NEVER_SET_XYZ".into()],
                 oauth_home: None,
@@ -3393,6 +3572,8 @@ mod tests {
             strategy: CredentialStrategy::FillFirst,
             cooldown_secs: 60,
             max_concurrent_per_credential: 1,
+            proactive_rate_limit_threshold_pct: 0,
+            proactive_rate_limit_min_window_secs: 0,
             config_entries: vec![],
             env_vars: vec![],
             oauth_home: Some(home.to_path_buf()),
@@ -3792,5 +3973,161 @@ mod tests {
             c.last_error_reset_at_ms.is_some(),
             "cooldown state survived reload"
         );
+    }
+
+    // ── Proactive rate-limit avoidance ──
+
+    use crate::llm::rate_limit_headers::{Bucket, RateLimitSnapshot};
+
+    fn snap_with_pct(now_ms: i64, remaining_pct: u8, reset_offset_ms: i64) -> RateLimitSnapshot {
+        let limit = 1000u64;
+        let remaining = (limit * remaining_pct as u64) / 100;
+        RateLimitSnapshot {
+            captured_at_ms: now_ms,
+            requests: Some(Bucket {
+                limit,
+                remaining,
+                reset_at_ms: now_ms + reset_offset_ms,
+            }),
+            tokens: None,
+        }
+    }
+
+    fn proactive_cfg(threshold_pct: u8, min_window_secs: u64) -> PoolLoadConfig {
+        let entries = vec![
+            ConfigEntry {
+                key: "key-a".into(),
+                label: Some("A".into()),
+                config_name: "llm.api_keys[0]".into(),
+            },
+            ConfigEntry {
+                key: "key-b".into(),
+                label: Some("B".into()),
+                config_name: "llm.api_keys[1]".into(),
+            },
+        ];
+        PoolLoadConfig {
+            strategy: CredentialStrategy::FillFirst,
+            cooldown_secs: 60,
+            max_concurrent_per_credential: 1,
+            proactive_rate_limit_threshold_pct: threshold_pct,
+            proactive_rate_limit_min_window_secs: min_window_secs,
+            config_entries: entries,
+            env_vars: vec![],
+            oauth_home: None,
+        }
+    }
+
+    #[test]
+    fn proactive_throttle_triggers_below_threshold() {
+        let now = 1_000_000;
+        let mut c = PooledCredential {
+            id: "x".into(),
+            label: "x".into(),
+            priority: 0,
+            source: CredentialSource::Manual,
+            key: "k".into(),
+            fingerprint: "fp".into(),
+            use_count: 0,
+            last_status: CredentialStatus::Ok,
+            last_status_at_ms: Some(now),
+            last_error_code: None,
+            last_error_reason: None,
+            last_error_message: None,
+            last_error_reset_at_ms: None,
+            removed_at_ms: None,
+            auth_type: AuthType::ApiKey,
+            refresh_token: None,
+            expires_at_ms: None,
+            base_url: None,
+            extra_json: None,
+            rate_limit: Some(snap_with_pct(now, 2, 60_000)),
+        };
+        // 2% remaining < 5% threshold, reset 60s out > 5s min window → throttled
+        assert!(c.is_proactively_throttled(now, 5, 5));
+        // Reset already passed → not throttled (snapshot is stale).
+        assert!(!c.is_proactively_throttled(now + 70_000, 5, 5));
+        // Within the min-window → waiting is cheaper, don't rotate.
+        c.rate_limit = Some(snap_with_pct(now, 2, 3_000));
+        assert!(!c.is_proactively_throttled(now, 5, 5));
+        // Threshold disabled (0) → never throttle, even at 0% remaining.
+        c.rate_limit = Some(snap_with_pct(now, 0, 60_000));
+        assert!(!c.is_proactively_throttled(now, 0, 5));
+        // No snapshot → not throttled.
+        c.rate_limit = None;
+        assert!(!c.is_proactively_throttled(now, 5, 5));
+    }
+
+    #[test]
+    fn pick_skips_proactively_throttled_credential() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(&db, &path, Provider::OpenRouter, proactive_cfg(5, 5))
+            .expect("pool");
+
+        let entries = pool.entries();
+        let id_a = entries[0].id.clone();
+        let id_b = entries[1].id.clone();
+
+        // Mark A near-empty with a far-out reset; B stays healthy.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        pool.report_rate_limit_headers(&id_a, snap_with_pct(now, 1, 120_000));
+
+        // FillFirst would normally pick A (lower priority). With the proactive
+        // filter it should skip to B.
+        let picked = pool.pick().expect("pick");
+        assert_eq!(
+            picked.id, id_b,
+            "pool should skip near-empty credential A in favor of healthy B"
+        );
+
+        // Now mark B near-empty too. Every credential is throttled, but the
+        // fallback pass must still pick *something* — otherwise the caller
+        // would synthesize an exhaustion error for a key that's actually live.
+        pool.report_rate_limit_headers(&id_b, snap_with_pct(now, 1, 120_000));
+        let picked = pool.pick().expect("pick under all-throttled");
+        assert!(
+            picked.id == id_a || picked.id == id_b,
+            "fallback pick must still return a live credential"
+        );
+    }
+
+    #[test]
+    fn report_rate_limit_headers_overwrites_prior_snapshot() {
+        // Regression guard: the latest provider observation always wins. If we
+        // ever changed `report_rate_limit_headers` to merge / max / preserve
+        // an older snapshot, a recovered bucket would never re-enable a
+        // credential until something else cleared the field.
+        let (db, path, _g) = open_test_db();
+        let pool =
+            CredentialPool::load(&db, &path, Provider::OpenRouter, proactive_cfg(5, 5)).unwrap();
+        let id = pool.entries()[0].id.clone();
+        let now = 2_000_000;
+        pool.report_rate_limit_headers(&id, snap_with_pct(now, 1, 60_000));
+        pool.report_rate_limit_headers(&id, snap_with_pct(now, 90, 60_000));
+        let snap = pool.entries()[0].rate_limit.clone().expect("snapshot");
+        assert_eq!(
+            snap.requests.unwrap().remaining,
+            900,
+            "latest snapshot must replace the prior one, not merge"
+        );
+    }
+
+    #[test]
+    fn report_rate_limit_headers_on_removed_is_noop() {
+        let (db, path, _g) = open_test_db();
+        let pool =
+            CredentialPool::load(&db, &path, Provider::OpenRouter, proactive_cfg(5, 5)).unwrap();
+        let id = pool.entries()[0].id.clone();
+        // Tombstone it.
+        pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+        let now = 3_000_000;
+        pool.report_rate_limit_headers(&id, snap_with_pct(now, 1, 60_000));
+        // Snapshot must not have been attached to a tombstoned credential —
+        // otherwise `borg auth list` shows phantom bucket state on a key that
+        // can never be used again.
+        assert!(pool.entries()[0].rate_limit.is_none());
     }
 }

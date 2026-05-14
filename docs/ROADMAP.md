@@ -159,11 +159,6 @@ top-down by priority, not by section order.
   screenshot analysis, cheap default for the rest. Today Borg switches
   the whole gateway binding; per-turn override is finer-grained. CLI flag
   plus a TUI affordance.
-- **Proactive rate-limit tracker.** `[H]` Deferred. Track observed
-  token/request rates per provider and rotate keys _before_ the provider
-  returns 429 instead of reacting to it. Extends the credential pool
-  (currently reactive — waits for the 429) with proactive avoidance.
-  Reduces mean latency under sustained load.
 - **Additional providers (prioritized).** `[O+H]` Deferred. Enterprise +
   frontier gaps surfaced by the 2026-05 reference survey. Self-hosted
   endpoints (LM Studio, vLLM, llama.cpp) already work via the custom

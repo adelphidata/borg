@@ -231,6 +231,8 @@ async fn reset_clears_cooled_entries_only() {
             config.llm.credential_strategy,
             config.llm.credential_cooldown_secs,
             config.llm.max_concurrent_per_credential,
+            config.llm.proactive_rate_limit_threshold_pct,
+            config.llm.proactive_rate_limit_min_window_secs,
         )
         .expect("pool");
         let id = pool.entries()[0].id.clone();

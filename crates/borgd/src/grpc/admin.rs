@@ -1540,6 +1540,10 @@ impl Admin for AdminSvc {
                     config.llm.max_concurrent_per_credential,
                     vec![],
                 );
+                load_cfg.proactive_rate_limit_threshold_pct =
+                    config.llm.proactive_rate_limit_threshold_pct;
+                load_cfg.proactive_rate_limit_min_window_secs =
+                    config.llm.proactive_rate_limit_min_window_secs;
                 load_cfg.env_vars.clear();
                 let pool = CredentialPool::load(&db, &db_path, provider, load_cfg)?;
 
@@ -1828,6 +1832,8 @@ fn build_primary_pool(
         config.llm.credential_strategy,
         config.llm.credential_cooldown_secs,
         config.llm.max_concurrent_per_credential,
+        config.llm.proactive_rate_limit_threshold_pct,
+        config.llm.proactive_rate_limit_min_window_secs,
     )
     .ok_or_else(|| {
         anyhow::anyhow!(

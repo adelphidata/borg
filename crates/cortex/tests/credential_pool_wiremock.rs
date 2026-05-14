@@ -353,3 +353,250 @@ async fn single_key_pool_429_uses_fallback_provider() {
     let events = collect_events(rx).await;
     assert_eq!(events, vec!["text:fallback-ok", "done"]);
 }
+
+// ── Test 87: snapshot captured from a successful response cools the pool ──
+//
+// Positive guard for the success-path branch of the proactive layer. Without
+// this, the layer would only fire when the prior request was a 429 — which
+// already triggered the reactive cooldown anyway, defeating the point.
+
+#[tokio::test]
+async fn rate_limit_headers_from_success_response_skip_near_empty_key() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (mut config, key_a, key_b) = two_key_config(&server.uri());
+    // 5% threshold, 5s min window — defaults, but pin them in the test for
+    // readability of what we're asserting against.
+    config.llm.proactive_rate_limit_threshold_pct = 5;
+    config.llm.proactive_rate_limit_min_window_secs = 5;
+
+    // Key A: 200 OK with near-empty bucket headers (0.1% remaining,
+    // resets in 120s — well past the 5s min window).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-limit-requests", "1000")
+                .insert_header("x-ratelimit-remaining-requests", "1")
+                .insert_header("x-ratelimit-reset-requests", "120s")
+                .set_body_raw(sse_done("ok-a"), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Key B: 200 OK with healthy bucket. Must receive the second request.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_b}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-limit-requests", "1000")
+                .insert_header("x-ratelimit-remaining-requests", "999")
+                .insert_header("x-ratelimit-reset-requests", "60s")
+                .set_body_raw(sse_done("ok-b"), "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).expect("client");
+
+    // First request: FillFirst picks A. A succeeds and reports a near-empty
+    // bucket via its response headers.
+    let (tx1, rx1) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("first"), None, tx1)
+        .await
+        .expect("first request via A succeeds");
+    let _ = collect_events(rx1).await;
+
+    // Verify the snapshot landed specifically on A (not just "some credential"):
+    // FillFirst picks lowest priority, seed order gives A priority 0, so the
+    // only entry with use_count > 0 after request 1 is A. Pinning the spec
+    // here means a routing regression (e.g. picking B first) fails this test
+    // instead of silently passing on B's healthy snapshot.
+    let pool = client.primary_pool().cloned().expect("pool");
+    let entries = pool.entries();
+    let a = entries
+        .iter()
+        .find(|c| c.use_count > 0)
+        .expect("the credential that ran request 1");
+    let b = entries
+        .iter()
+        .find(|c| c.use_count == 0)
+        .expect("the credential that has not yet been used");
+    let a_req = a
+        .rate_limit
+        .as_ref()
+        .and_then(|s| s.requests)
+        .expect("A has a captured snapshot");
+    assert_eq!(a_req.remaining, 1, "A's snapshot reflects A's headers");
+    assert_eq!(a_req.limit, 1000);
+    assert!(
+        b.rate_limit.is_none(),
+        "B has not been hit yet, so it must not carry a snapshot"
+    );
+
+    // Second request: proactive avoidance should skip A (0.1% < 5%) and
+    // route to B. Wiremock's `.expect(1)` on B's mock will fail if B is not
+    // hit exactly once.
+    let (tx2, rx2) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("second"), None, tx2)
+        .await
+        .expect("second request routes to B");
+    let _ = collect_events(rx2).await;
+
+    // Drop client so wiremock's `.expect()` assertions are evaluated on
+    // server drop.
+    drop(client);
+}
+
+// ── Test 88: proactive avoidance disabled (threshold=0) keeps using A ────
+
+#[tokio::test]
+async fn proactive_disabled_keeps_using_near_empty_credential() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (mut config, key_a, _key_b) = two_key_config(&server.uri());
+    // Disable proactive avoidance.
+    config.llm.proactive_rate_limit_threshold_pct = 0;
+
+    // Key A returns 200 with near-empty bucket on EVERY request. We expect
+    // both requests to land on A because the feature is off.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-limit-requests", "1000")
+                .insert_header("x-ratelimit-remaining-requests", "1")
+                .insert_header("x-ratelimit-reset-requests", "120s")
+                .set_body_raw(sse_done("ok"), "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    for _ in 0..2 {
+        let (tx, rx) = mpsc::channel(64);
+        client
+            .stream_chat(&user_message("ping"), None, tx)
+            .await
+            .expect("request succeeds via A");
+        let _ = collect_events(rx).await;
+    }
+    drop(client);
+}
+
+// ── Test 89: within the min-window, wait rather than rotate ──────────────
+
+#[tokio::test]
+async fn proactive_within_min_window_does_not_rotate() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (mut config, key_a, _key_b) = two_key_config(&server.uri());
+    config.llm.proactive_rate_limit_threshold_pct = 5;
+    // 10s min window — bucket resets in 2s, so the layer should let A keep
+    // serving rather than rotate to B.
+    config.llm.proactive_rate_limit_min_window_secs = 10;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-limit-requests", "1000")
+                .insert_header("x-ratelimit-remaining-requests", "1")
+                .insert_header("x-ratelimit-reset-requests", "2s")
+                .set_body_raw(sse_done("ok"), "text/event-stream"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    for _ in 0..2 {
+        let (tx, rx) = mpsc::channel(64);
+        client
+            .stream_chat(&user_message("ping"), None, tx)
+            .await
+            .expect("request succeeds via A");
+        let _ = collect_events(rx).await;
+    }
+    drop(client);
+}
+
+// ── Test 90: a 429 response also records its rate-limit snapshot ─────────
+
+#[tokio::test]
+async fn rate_limit_snapshot_captured_from_429_response() {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _tmp = isolated_data_dir();
+    let server = MockServer::start().await;
+    let (mut config, key_a, key_b) = two_key_config(&server.uri());
+    config.llm.proactive_rate_limit_threshold_pct = 5;
+    config.llm.proactive_rate_limit_min_window_secs = 5;
+
+    // Key A returns 429 with bucket headers attached. The pool should both:
+    //   1. Cool A reactively (existing behavior) via Retry-After.
+    //   2. Capture a rate-limit snapshot from the same response so future
+    //      sessions / restarts can act on the headers.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_a}").as_str()))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "60")
+                .insert_header("x-ratelimit-limit-requests", "1000")
+                .insert_header("x-ratelimit-remaining-requests", "0")
+                .insert_header("x-ratelimit-reset-requests", "60s")
+                .set_body_string("rate limited"),
+        )
+        .mount(&server)
+        .await;
+
+    // Key B handles the retry.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("authorization", format!("Bearer {key_b}").as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse_done("ok"), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let mut client = LlmClient::new(&config).expect("client");
+    let (tx, rx) = mpsc::channel(64);
+    client
+        .stream_chat(&user_message("hi"), None, tx)
+        .await
+        .expect("succeeds via B");
+    let _ = collect_events(rx).await;
+
+    let pool = client.primary_pool().cloned().expect("pool");
+    let entries = pool.entries();
+    let cooled = entries
+        .iter()
+        .find(|e| e.last_error_reset_at_ms.is_some())
+        .expect("A cooled by 429");
+    let snap = cooled
+        .rate_limit
+        .as_ref()
+        .expect("snapshot captured from 429 headers");
+    let req = snap.requests.expect("requests bucket parsed");
+    assert_eq!(req.remaining, 0);
+    assert_eq!(req.limit, 1000);
+}

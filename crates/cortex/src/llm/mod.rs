@@ -107,6 +107,7 @@ pub mod model_registry;
 pub mod oauth_refresh;
 mod pricing;
 pub mod provider;
+pub mod rate_limit_headers;
 mod transport;
 pub(crate) mod vertex;
 
@@ -630,6 +631,8 @@ impl LlmClient {
                 config.llm.credential_strategy,
                 config.llm.credential_cooldown_secs,
                 config.llm.max_concurrent_per_credential,
+                config.llm.proactive_rate_limit_threshold_pct,
+                config.llm.proactive_rate_limit_min_window_secs,
             )
         })
         .flatten();
@@ -868,6 +871,8 @@ impl LlmClient {
                     config.llm.credential_strategy,
                     config.llm.credential_cooldown_secs,
                     config.llm.max_concurrent_per_credential,
+                    config.llm.proactive_rate_limit_threshold_pct,
+                    config.llm.proactive_rate_limit_min_window_secs,
                 )
             })
             .flatten();
@@ -1557,6 +1562,12 @@ impl LlmClient {
             }
         };
 
+        // Capture rate-limit headers (success or failure — providers emit
+        // them on both, and the 429 itself carries the freshest bucket state
+        // for the proactive avoidance layer). This must happen before
+        // `response.text()` moves the response and drops the headers.
+        self.report_rate_limit_snapshot(response.headers());
+
         if !response.status().is_success() {
             let status = response.status();
             // Capture the `Retry-After` header BEFORE consuming the body —
@@ -1580,6 +1591,28 @@ impl LlmClient {
         }
 
         Ok(response)
+    }
+
+    /// Parse provider rate-limit headers from `headers` and report the
+    /// resulting snapshot to the active credential's pool entry. No-op when
+    /// the pool isn't wired up (legacy rotation path, tests without a pool)
+    /// or when the headers don't carry recognizable bucket state.
+    fn report_rate_limit_snapshot(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(pool) = self.primary_pool.as_ref() else {
+            return;
+        };
+        let Some(lease) = self._active_lease.as_ref() else {
+            return;
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if let Some(snap) =
+            crate::llm::rate_limit_headers::parse_rate_limit_headers(self.provider, headers, now_ms)
+        {
+            pool.report_rate_limit_headers(lease.id(), snap);
+        }
     }
 
     fn transport_request<'a>(

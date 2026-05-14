@@ -150,6 +150,18 @@ pub struct LlmConfig {
     /// least-leased key wins ties.
     #[serde(default = "default_max_concurrent_per_credential")]
     pub max_concurrent_per_credential: u32,
+    /// Proactive rate-limit avoidance: skip a credential during `pick()`
+    /// when the provider's `x-ratelimit-remaining-*` (or `anthropic-ratelimit-*`)
+    /// headers report less than this percentage of bucket headroom. Set to
+    /// `0` to disable proactive avoidance entirely (the pool stays purely
+    /// reactive to 429s).
+    #[serde(default = "default_proactive_rate_limit_threshold_pct")]
+    pub proactive_rate_limit_threshold_pct: u8,
+    /// Minimum seconds-until-reset for proactive avoidance to kick in.
+    /// Below this, waiting out the bucket is cheaper than rotating to a
+    /// sibling key, so we keep using the near-empty credential.
+    #[serde(default = "default_proactive_rate_limit_min_window_secs")]
+    pub proactive_rate_limit_min_window_secs: u64,
 }
 
 fn default_credential_cooldown_secs() -> u64 {
@@ -158,6 +170,14 @@ fn default_credential_cooldown_secs() -> u64 {
 
 fn default_max_concurrent_per_credential() -> u32 {
     1
+}
+
+fn default_proactive_rate_limit_threshold_pct() -> u8 {
+    5
+}
+
+fn default_proactive_rate_limit_min_window_secs() -> u64 {
+    5
 }
 
 /// TTL for Anthropic `cache_control` markers.
@@ -325,6 +345,8 @@ impl Default for LlmConfig {
             credential_strategy: crate::llm::credential_pool::CredentialStrategy::default(),
             credential_cooldown_secs: default_credential_cooldown_secs(),
             max_concurrent_per_credential: default_max_concurrent_per_credential(),
+            proactive_rate_limit_threshold_pct: default_proactive_rate_limit_threshold_pct(),
+            proactive_rate_limit_min_window_secs: default_proactive_rate_limit_min_window_secs(),
         }
     }
 }

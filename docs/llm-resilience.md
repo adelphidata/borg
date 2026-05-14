@@ -67,6 +67,46 @@ bounded by `llm.max_concurrent_per_credential` (default 1). Concurrent
 requests fan out across keys until every key is at the cap; the
 least-leased key then wins ties (Hermes parity — degraded but never blocked).
 
+### Proactive rate-limit avoidance
+
+The pool also reads provider rate-limit response headers on every request —
+both 2xx and 4xx — and skips credentials that are near-empty *before* they
+return a 429. Reduces mean latency under sustained load: each window
+otherwise costs one wasted 429 round-trip per key.
+
+Headers parsed (see `crates/cortex/src/llm/rate_limit_headers.rs`):
+
+- **OpenAI-compatible** (OpenAI, OpenRouter, Azure, Groq, xAI, Gemini-via-compat,
+  DeepSeek, Codex/Copilot OAuth, Custom endpoints):
+  `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`. Reset accepts
+  duration suffix strings (`6m0s`, `1h30m`, `250ms`) or epoch s/ms integers.
+- **Anthropic** (Anthropic API + ClaudeCode OAuth):
+  `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}`.
+  Reset values are RFC 3339 timestamps. When both `input-tokens` and
+  `output-tokens` are reported, the combined `tokens` bucket uses whichever
+  is more constrained — that's what'll trip first.
+- **Bedrock / ClaudeCli / Ollama**: not parsed (no standard headers; local
+  or AWS-signed).
+
+Skip rule on `pick()` / `acquire_lease()`:
+
+```
+remaining_pct < llm.proactive_rate_limit_threshold_pct  (default 5; 0 disables)
+AND reset_at  > now + llm.proactive_rate_limit_min_window_secs  (default 5s)
+```
+
+Below the `min_window` we keep using the near-empty key — waiting it out is
+cheaper than rotating to a sibling and losing in-flight context.
+
+This is a hint, not a hard block. When every credential is proactively
+throttled, the pool falls back to the unfiltered set so a request still
+gets made — proactive avoidance is meant to reduce the *expected* 429
+count, not block requests outright.
+
+Snapshots are held in memory only. They expire well within their own
+bucket reset window (seconds to minutes), so persisting them across
+restart would just mean acting on stale data on first boot.
+
 ### Retry-After parsing
 
 Order of precedence:
@@ -117,11 +157,13 @@ operators can:
 
 ### Settings
 
-| Setting                                  | Default      | Effect                                  |
-| ---------------------------------------- | ------------ | --------------------------------------- |
-| `llm.credential_strategy`                | `fill_first` | Selection algorithm.                    |
-| `llm.credential_cooldown_secs`           | `60`         | Default cooldown when no `Retry-After`. |
-| `llm.max_concurrent_per_credential`      | `1`          | Soft lease cap per credential.          |
+| Setting                                       | Default      | Effect                                                                          |
+| --------------------------------------------- | ------------ | ------------------------------------------------------------------------------- |
+| `llm.credential_strategy`                     | `fill_first` | Selection algorithm.                                                            |
+| `llm.credential_cooldown_secs`                | `60`         | Default cooldown when no `Retry-After`.                                         |
+| `llm.max_concurrent_per_credential`           | `1`          | Soft lease cap per credential.                                                  |
+| `llm.proactive_rate_limit_threshold_pct`      | `5`          | Skip a credential when observed bucket headroom falls below this %. `0` disables. |
+| `llm.proactive_rate_limit_min_window_secs`    | `5`          | Don't proactively rotate when reset is within this many seconds (wait it out).  |
 
 ### OAuth sources
 
