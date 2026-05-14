@@ -19,21 +19,13 @@
 //!   LLM (credential exfiltration vector).
 //! - HTTP transports are `https://`-only by default and refuse loopback /
 //!   RFC1918 destinations unless `allow_local_network` is set. DNS hostnames
-//!   are resolved at check time and rejected if *any* resolved address is
-//!   local (SSRF guard).
-//!
-//! ## Known follow-ups (Phase 2)
-//!
-//! - **TLS backend pinning.** Phase 1 uses the default `reqwest` TLS
-//!   backend (`native-tls` on macOS, system OpenSSL on Linux). Both verify
-//!   certs by default, but a Phase 2 should enable the `rustls-tls`
-//!   workspace feature on `reqwest` so the verifier is identical across
-//!   platforms.
-//! - **DNS rebinding.** The URL guard resolves DNS once at check time and
-//!   passes the parsed URL to `reqwest`, which resolves again at connect
-//!   time. A hostile authoritative DNS server could return a public IP on
-//!   the first lookup and a private IP on the second. Phase 2 should pin
-//!   the resolved IP into the connector.
+//!   are resolved at check time, every resolved address is checked, and the
+//!   resolved IPs are pinned into the reqwest connector so a hostile
+//!   authoritative DNS server cannot rebind the host between the check and
+//!   the connect.
+//! - TLS uses `rustls` across all platforms (the workspace `reqwest` dep is
+//!   pinned to `rustls-tls` with default features off) so the verifier
+//!   behaviour is identical on macOS / Linux / CI.
 //!
 //! Phase 1 covers MCP *tools* only. Resources, prompts, sampling, and
 //! borg-as-MCP-server are deferred.

@@ -9,7 +9,7 @@
 use super::Transport;
 use crate::errors::{McpError, Result};
 use crate::protocol::Message;
-use crate::transport::http::{check_url, check_url_syntactic, HttpPolicy};
+use crate::transport::http::{build_client, resolve_endpoint, HttpPolicy};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -64,13 +64,15 @@ impl SseTransport {
 
 /// Open an SSE transport. Waits up to `connect_timeout` for the server's
 /// `endpoint` event (which carries the POST URL).
+///
+/// DNS is resolved once for the SSE URL up-front and pinned into the GET
+/// client; the POST URL advertised by the server is resolved separately
+/// (full async policy re-check) and pinned into the POST client so
+/// rebinding is closed on both sides.
 pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTransport> {
-    let sse_url = check_url(&config.url, &config.policy).await?;
-    let client = Client::builder()
-        .timeout(config.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| McpError::Connect(format!("reqwest build failed: {e}")))?;
+    let sse_resolved = resolve_endpoint(&config.url, &config.policy).await?;
+    let sse_url = sse_resolved.url.clone();
+    let client = build_client(config.timeout, &sse_resolved.pins)?;
 
     let mut req = client
         .get(sse_url.clone())
@@ -131,14 +133,24 @@ pub async fn open(config: SseConfig, connect_timeout: Duration) -> Result<SseTra
 
     // The endpoint event may be either an absolute URL or a path relative to
     // the SSE URL; resolve relative against the SSE URL.
-    let post_url = sse_url
+    let post_url_parsed = sse_url
         .join(&endpoint)
         .map_err(|e| McpError::Connect(format!("invalid endpoint url '{endpoint}': {e}")))?;
-    // Re-check the resolved URL against policy — a hostile server cannot
-    // redirect us internal. Syntactic check is sufficient here because the
-    // SSE GET we already accepted resolves to the same hostname; we are
-    // guarding against `endpoint` being rewritten to e.g. `localhost`.
-    check_url_syntactic(post_url.as_str(), &config.policy)?;
+    // Full async re-check against policy — a hostile server cannot redirect
+    // us at an internal IP via the `endpoint` event, even if the POST URL
+    // host differs from the SSE host. Resolution is recorded so we can pin
+    // the POST host into the POST client too.
+    let post_resolved = resolve_endpoint(post_url_parsed.as_str(), &config.policy).await?;
+    let post_url = post_resolved.url;
+
+    // Build a second client that's pinned to both the SSE host (so any
+    // ambient code path that reuses this client for the SSE host still
+    // can't be rebound) and the POST host. reqwest's `resolve_to_addrs`
+    // is per-domain and accumulates across calls, so combining the two
+    // pin lists is safe.
+    let mut combined_pins = sse_resolved.pins.clone();
+    combined_pins.extend(post_resolved.pins);
+    let client = build_client(config.timeout, &combined_pins)?;
 
     // Spawn the pump for the remaining lifetime of the stream.
     let server_name_pump = config.server_name.clone();

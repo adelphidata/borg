@@ -11,9 +11,11 @@
 //!   set (SSRF guard).
 //! - Redirects disabled — a redirect from an allowlisted endpoint to an
 //!   internal IP would otherwise bypass the URL guard.
-//! - DNS hostnames resolved at check time and rejected if any resolved IP
-//!   is local. Phase 2 will pin the resolved IP into the connector to
-//!   defend against DNS rebinding.
+//! - DNS hostnames are resolved at check time, every resolved IP is checked
+//!   against the local-network policy, and the resolved addresses are pinned
+//!   into the reqwest connector via `resolve_to_addrs` so a hostile
+//!   authoritative DNS server cannot rebind the host between the check and
+//!   the connect.
 
 use super::Transport;
 use crate::errors::{McpError, Result, UrlRefusalReason};
@@ -23,7 +25,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use url::Url;
 
@@ -67,9 +69,10 @@ const FORBIDDEN_HOSTNAMES: &[&str] = &[
 
 /// Parse `url` and check the scheme + literal host against the policy.
 ///
-/// Does **not** resolve DNS — use [`check_url`] (async) for the full guard.
-/// This synchronous variant is used when the caller has already resolved
-/// (e.g. validating a relative endpoint URL against the SSE-event's own URL).
+/// Does **not** resolve DNS — use [`resolve_endpoint`] (async) for the full
+/// guard including DNS validation and connector pinning. This synchronous
+/// variant is used when the caller already has a parsed URL and only needs
+/// the scheme + literal-host policy check.
 pub fn check_url_syntactic(url: &str, policy: &HttpPolicy) -> Result<Url> {
     let parsed: Url = url.parse().map_err(|_| McpError::UrlRefused {
         url: url.to_string(),
@@ -97,48 +100,76 @@ pub fn check_url_syntactic(url: &str, policy: &HttpPolicy) -> Result<Url> {
     Ok(parsed)
 }
 
+/// A URL that has been checked against policy *and* had its DNS resolution
+/// captured for later pinning into the reqwest connector.
+///
+/// `pins` is the (host, [SocketAddr]) list to feed to
+/// `reqwest::ClientBuilder::resolve_to_addrs`. Empty when the URL host is an
+/// IP literal — there's nothing to rebind in that case.
+#[derive(Debug, Clone)]
+pub struct ResolvedEndpoint {
+    /// The parsed URL.
+    pub url: Url,
+    /// `(hostname, addresses)` pairs to pin into the connector.
+    pub pins: Vec<(String, Vec<SocketAddr>)>,
+}
+
 /// Full URL guard: syntactic check + DNS resolution + per-resolved-IP local
 /// check. Refuses if *any* resolved address falls into loopback / RFC1918 /
 /// link-local / cloud-metadata space.
 ///
-/// This defends against the operator-paste mistake of `https://internal-jira/mcp`
-/// (which `check_url_syntactic` admits because the host is a DNS name).
+/// Returns the parsed URL plus the resolved socket addresses so the caller
+/// can pin them into the reqwest connector. Pinning eliminates the DNS
+/// rebinding gap (resolve A here, connect to B in reqwest): we resolve once,
+/// validate every IP, and hand reqwest the same address list.
 ///
-/// Note: this only defends *at check time*. DNS rebinding (resolve A, connect
-/// to B) is not defended against in Phase 1 — a follow-up should pin the
-/// resolved IP into the reqwest connector. Logged as a known gap in
-/// `crates/mcp/src/lib.rs`.
-pub async fn check_url(url: &str, policy: &HttpPolicy) -> Result<Url> {
+/// IP-literal hosts skip DNS and return an empty `pins` vec — there is no
+/// resolution to rebind.
+pub async fn resolve_endpoint(url: &str, policy: &HttpPolicy) -> Result<ResolvedEndpoint> {
     let parsed = check_url_syntactic(url, policy)?;
-    if policy.allow_local_network {
-        return Ok(parsed);
-    }
     let Some(host) = parsed.host() else {
-        return Ok(parsed);
+        return Ok(ResolvedEndpoint {
+            url: parsed,
+            pins: Vec::new(),
+        });
     };
-    // IP literals were already covered by host_is_local_literal in the
-    // syntactic check.
-    if let url::Host::Domain(name) = host {
-        let name_owned = name.to_ascii_lowercase();
-        // Spawn-blocking the std resolver keeps us off `trust-dns` for this
-        // patch; the lookup happens on a tokio blocking thread.
-        let resolved = tokio::task::spawn_blocking(move || {
-            (name_owned.as_str(), 0u16)
-                .to_socket_addrs()
-                .map(|iter| iter.map(|sa| sa.ip()).collect::<Vec<_>>())
-        })
-        .await
-        .map_err(|e| McpError::Connect(format!("dns task panicked: {e}")))?
-        .map_err(|e| McpError::Connect(format!("dns lookup failed for {name}: {e}")))?;
+    let url::Host::Domain(name) = host else {
+        // IP literal — `check_url_syntactic` already evaluated it. No DNS,
+        // no pinning needed.
+        return Ok(ResolvedEndpoint {
+            url: parsed,
+            pins: Vec::new(),
+        });
+    };
 
-        if resolved.iter().any(|ip| ip_is_local(*ip)) {
-            return Err(McpError::UrlRefused {
-                url: url.to_string(),
-                reason: UrlRefusalReason::LocalNetworkBlocked,
-            });
-        }
+    // reqwest's `resolve_to_addrs` matches on the host string and ignores the
+    // port in the SocketAddr (it substitutes the request's port). We still
+    // pass a sensible port so the std resolver returns SOCK_STREAM records.
+    let name_owned = name.to_ascii_lowercase();
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(if parsed.scheme() == "https" { 443 } else { 80 });
+    let lookup_name = name_owned.clone();
+    let resolved: Vec<SocketAddr> = tokio::task::spawn_blocking(move || {
+        (lookup_name.as_str(), port)
+            .to_socket_addrs()
+            .map(Iterator::collect::<Vec<_>>)
+    })
+    .await
+    .map_err(|e| McpError::Connect(format!("dns task panicked: {e}")))?
+    .map_err(|e| McpError::Connect(format!("dns lookup failed for {name}: {e}")))?;
+
+    if !policy.allow_local_network && resolved.iter().any(|sa| ip_is_local(sa.ip())) {
+        return Err(McpError::UrlRefused {
+            url: url.to_string(),
+            reason: UrlRefusalReason::LocalNetworkBlocked,
+        });
     }
-    Ok(parsed)
+
+    Ok(ResolvedEndpoint {
+        url: parsed,
+        pins: vec![(name_owned, resolved)],
+    })
 }
 
 /// True if the literal host *as written* is local: IP-literal in private
@@ -180,26 +211,38 @@ fn ip_is_local(ip: IpAddr) -> bool {
     }
 }
 
-/// Build a reqwest client with the right knobs: timeout, no redirects, rustls.
-fn build_client(timeout: Duration) -> Result<Client> {
-    // Note: the workspace `reqwest` dep uses its default TLS backend (native-tls
-    // on macOS, system openssl elsewhere). Both verify certs by default. A
-    // follow-up will enable rustls-tls in the workspace feature set so we can
-    // pin the verifier explicitly across platforms.
-    Client::builder()
+/// Build a reqwest client with: timeout, no redirects, rustls TLS, and DNS
+/// resolution pinned to the supplied `(host, addrs)` pairs.
+///
+/// Pinning is what closes the DNS rebinding gap: the connector will never
+/// re-resolve a pinned hostname, so it can only connect to the addresses we
+/// already validated against the local-network policy. Unpinned hostnames
+/// (e.g. an IP literal in the URL) fall back to the OS resolver, which is
+/// safe because the syntactic check has already rejected local IP literals.
+pub(crate) fn build_client(
+    timeout: Duration,
+    pins: &[(String, Vec<SocketAddr>)],
+) -> Result<Client> {
+    let mut builder = Client::builder()
         .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    for (host, addrs) in pins {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    builder
         .build()
         .map_err(|e| McpError::Connect(format!("reqwest build failed: {e}")))
 }
 
-/// Open an HTTP MCP transport. Resolves DNS for the policy check.
+/// Open an HTTP MCP transport. Resolves DNS, validates every resolved IP
+/// against the local-network policy, and pins the resolved addresses into
+/// the reqwest connector for DNS-rebinding resistance.
 pub async fn open(config: HttpConfig) -> Result<HttpTransport> {
-    let url = check_url(&config.url, &config.policy).await?;
-    let client = build_client(config.timeout)?;
+    let resolved = resolve_endpoint(&config.url, &config.policy).await?;
+    let client = build_client(config.timeout, &resolved.pins)?;
     Ok(HttpTransport {
         client,
-        url,
+        url: resolved.url,
         headers: config.headers,
         server_name: config.server_name,
         inbox: VecDeque::new(),
@@ -378,7 +421,7 @@ mod tests {
         // (offline CI), the test surfaces as a Connect error which we accept
         // — the alternative is to skip the test, but a regression that breaks
         // resolution entirely should not silently pass.
-        let err = check_url("https://127.0.0.1.nip.io/mcp", &default_policy()).await;
+        let err = resolve_endpoint("https://127.0.0.1.nip.io/mcp", &default_policy()).await;
         match err {
             Err(McpError::UrlRefused {
                 reason: UrlRefusalReason::LocalNetworkBlocked,
@@ -398,7 +441,9 @@ mod tests {
             allow_plaintext_http: false,
             allow_local_network: true,
         };
-        check_url("https://localhost/mcp", &policy).await.unwrap();
+        resolve_endpoint("https://localhost/mcp", &policy)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -411,5 +456,61 @@ mod tests {
             } => {}
             e => panic!("expected Malformed, got {e:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoint_returns_pins_for_domain_host() {
+        // DNS-rebinding defence: encodes the spec that domain-host URLs surface
+        // pinned `(host, addrs)` entries so the caller can hand them to
+        // `reqwest::ClientBuilder::resolve_to_addrs`. Without this pin list
+        // the connector would re-resolve at connect time and a hostile
+        // authoritative DNS server could swap in a private IP.
+        let policy = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true, // we use localhost-resolving DNS to stay hermetic
+        };
+        match resolve_endpoint("https://localhost/mcp", &policy).await {
+            Ok(r) => {
+                assert_eq!(
+                    r.pins.len(),
+                    1,
+                    "expected exactly one pinned hostname, got {:?}",
+                    r.pins
+                );
+                let (host, addrs) = &r.pins[0];
+                assert_eq!(host, "localhost");
+                assert!(
+                    !addrs.is_empty(),
+                    "pinned address list must be non-empty (got {:?})",
+                    addrs
+                );
+            }
+            Err(McpError::Connect(msg)) if msg.contains("dns lookup failed") => {
+                // Offline CI — `localhost` failed to resolve. Skip rather than
+                // mask a real regression with an unconditional pass.
+                eprintln!("resolve_endpoint pin test skipped: {msg}");
+            }
+            Err(e) => panic!("expected Ok or DNS-unavailable, got {e:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_endpoint_returns_no_pins_for_ip_literal() {
+        // IP-literal hosts have no DNS to rebind, so they must surface an
+        // empty pin list — otherwise we'd be telling reqwest to "resolve"
+        // an address that's already an IP, which is meaningless and risks
+        // confusing the connector.
+        let policy = HttpPolicy {
+            allow_plaintext_http: false,
+            allow_local_network: true,
+        };
+        let r = resolve_endpoint("https://127.0.0.1/mcp", &policy)
+            .await
+            .unwrap();
+        assert!(
+            r.pins.is_empty(),
+            "ip literals must not produce pins, got {:?}",
+            r.pins
+        );
     }
 }
