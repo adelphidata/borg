@@ -49,6 +49,8 @@ pub mod budgets;
 pub mod channel_names;
 /// Claude Code CLI subprocess backend for subscription-based access.
 pub mod claude_cli;
+/// Opt-in codex `app-server` runtime: JSON-RPC client + event projection.
+pub mod codex_app_server;
 /// Configuration parsing, defaults, and runtime overrides.
 pub mod config;
 /// File watcher for live config reloading.
