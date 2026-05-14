@@ -6,7 +6,7 @@
 //! exfiltration, and invisible-character attacks.
 
 use anyhow::{bail, Result};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 /// Pattern category for injection detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,46 +29,47 @@ impl std::fmt::Display for InjectionCategory {
     }
 }
 
-static INJECTION_PATTERNS: OnceLock<Vec<(regex::Regex, InjectionCategory)>> = OnceLock::new();
-
-fn injection_patterns() -> &'static [(regex::Regex, InjectionCategory)] {
-    // SAFETY: These regex patterns are compile-time-valid literals.
-    #[allow(clippy::expect_used)]
-    INJECTION_PATTERNS.get_or_init(|| {
-        vec![
-            (
-                // Imperative injection framings. The `disregard …` and
-                // `you are now` clauses are anchored/qualified to avoid false
-                // positives on benign prose that mentions deprecated content
-                // ("disregard the old README instructions") or incidentally
-                // contains "you are now" mid-sentence ("I think you are now
-                // ready"). The anchor-word list for `disregard` keeps true
-                // injection patterns (above/previous/prior/following/these/those)
-                // while letting arbitrary nouns through.
-                regex::Regex::new(
-                    r"(?i)(ignore\s+(all\s+)?previous\s+instructions|(^|[\n.!?:]\s*)you\s+are\s+now\b|system\s+prompt\s+override|disregard\s+(\w+\s+){0,2}(above|previous|prior|following|these|those)\s+instructions|new\s+instructions?\s*:)"
-                ).expect("compile-time valid regex"),
-                InjectionCategory::PromptOverride,
-            ),
-            (
-                regex::Regex::new(
-                    r"(?i)(curl|wget|nc|ncat)\s+.*?(api.?key|secret|token|password|credential)"
-                ).expect("compile-time valid regex"),
-                InjectionCategory::Exfiltration,
-            ),
-            (
-                // Only reject zero-width joiners and bidi overrides that are
-                // commonly used for prompt-injection hiding. BOM (FEFF) and
-                // LTR/RTL marks (200E/200F) are legitimate in multilingual
-                // content and Windows-authored files — excluded here.
-                regex::Regex::new(
-                    r"[\x{200B}\x{200C}\x{200D}\x{202A}-\x{202E}\x{2060}]"
-                ).expect("compile-time valid regex"),
-                InjectionCategory::InvisibleUnicode,
-            ),
-        ]
-    })
-}
+/// Patterns and their categories, compiled once on first access.
+///
+/// Each regex is a compile-time-valid literal — a `panic!` on bad regex
+/// here is a build-time bug, not a runtime condition, so the `expect`s
+/// are the right shape. `LazyLock` collapses the `OnceLock + accessor fn`
+/// boilerplate the prior shape needed without changing the panic surface.
+#[allow(clippy::expect_used)]
+static INJECTION_PATTERNS: LazyLock<Vec<(regex::Regex, InjectionCategory)>> = LazyLock::new(|| {
+    vec![
+        (
+            // Imperative injection framings. The `disregard …` and
+            // `you are now` clauses are anchored/qualified to avoid false
+            // positives on benign prose that mentions deprecated content
+            // ("disregard the old README instructions") or incidentally
+            // contains "you are now" mid-sentence ("I think you are now
+            // ready"). The anchor-word list for `disregard` keeps true
+            // injection patterns (above/previous/prior/following/these/those)
+            // while letting arbitrary nouns through.
+            regex::Regex::new(
+                r"(?i)(ignore\s+(all\s+)?previous\s+instructions|(^|[\n.!?:]\s*)you\s+are\s+now\b|system\s+prompt\s+override|disregard\s+(\w+\s+){0,2}(above|previous|prior|following|these|those)\s+instructions|new\s+instructions?\s*:)"
+            ).expect("compile-time valid regex"),
+            InjectionCategory::PromptOverride,
+        ),
+        (
+            regex::Regex::new(
+                r"(?i)(curl|wget|nc|ncat)\s+.*?(api.?key|secret|token|password|credential)"
+            ).expect("compile-time valid regex"),
+            InjectionCategory::Exfiltration,
+        ),
+        (
+            // Only reject zero-width joiners and bidi overrides that are
+            // commonly used for prompt-injection hiding. BOM (FEFF) and
+            // LTR/RTL marks (200E/200F) are legitimate in multilingual
+            // content and Windows-authored files — excluded here.
+            regex::Regex::new(
+                r"[\x{200B}\x{200C}\x{200D}\x{202A}-\x{202E}\x{2060}]"
+            ).expect("compile-time valid regex"),
+            InjectionCategory::InvisibleUnicode,
+        ),
+    ]
+});
 
 /// Scan content for prompt injection patterns. Returns Ok(()) if clean,
 /// or an error identifying the detected category.
@@ -77,7 +78,7 @@ fn injection_patterns() -> &'static [(regex::Regex, InjectionCategory)] {
 /// — that would let a caller iteratively probe/craft bypasses. Position is
 /// logged via tracing::debug for operator debugging instead.
 pub fn scan_for_injection(content: &str) -> Result<()> {
-    for (re, category) in injection_patterns() {
+    for (re, category) in INJECTION_PATTERNS.iter() {
         if let Some(m) = re.find(content) {
             tracing::debug!(
                 "scan_for_injection: {category} match at byte offset {}",

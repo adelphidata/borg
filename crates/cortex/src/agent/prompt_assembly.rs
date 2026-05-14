@@ -25,38 +25,52 @@ use crate::memory::{
     load_memory_context_db_ranked_scoped_with, load_memory_context_db_scoped,
     load_memory_context_db_scoped_with, resolved_memory_scopes,
 };
+
+/// How [`Agent::load_memory`] selects which memory entries to surface.
+///
+/// `Recency` is the cheap fallback used when embeddings are disabled, the
+/// user's last turn is too short to rank meaningfully, or the embedding /
+/// ranking pipeline errors. `Ranked` is taken when an embedding query
+/// produced a non-empty similarity ordering — entries get pulled in score
+/// order on top of the global `INDEX`.
+enum LoadStrategy<'a> {
+    Recency,
+    Ranked(&'a [(String, String, f32)]),
+}
 use crate::skills::load_skills_context;
 use crate::types::{Message, ToolDefinition};
 
 use super::{spawn_logged, Agent, AgentEvent};
 
 impl Agent {
-    /// Recency-ordered memory load that reuses the agent's owned DB handle if
-    /// available, avoiding a per-turn `Database::open()` (which re-runs the
-    /// PRAGMA setup). Falls back to the connection-opening form only when the
-    /// agent has no DB attached (early init / tests).
-    fn load_memory_recency(&self, max_tokens: usize) -> Result<String> {
+    /// Load long-term memory under the given `strategy`, reusing the agent's
+    /// owned DB handle when available so a per-turn `Database::open()` (and
+    /// its PRAGMA setup) isn't paid on the hot path. Falls back to the
+    /// connection-opening form only when the agent has no DB attached
+    /// (early init / tests).
+    ///
+    /// Collapses the historical `load_memory_recency` / `load_memory_ranked`
+    /// pair — the surrounding guard+fallback dance was identical between
+    /// them, and a parameter is clearer than two near-duplicate methods.
+    fn load_memory(&self, max_tokens: usize, strategy: LoadStrategy<'_>) -> Result<String> {
         let scopes = resolved_memory_scopes(&self.config);
         let guard = self.db_guard();
-        if let Some(db) = guard.as_ref() {
-            return load_memory_context_db_scoped_with(db, &scopes, max_tokens);
+        match strategy {
+            LoadStrategy::Recency => {
+                if let Some(db) = guard.as_ref() {
+                    return load_memory_context_db_scoped_with(db, &scopes, max_tokens);
+                }
+                load_memory_context_db_scoped(&self.config, max_tokens)
+            }
+            LoadStrategy::Ranked(rankings) => {
+                if let Some(db) = guard.as_ref() {
+                    return load_memory_context_db_ranked_scoped_with(
+                        db, &scopes, max_tokens, rankings,
+                    );
+                }
+                load_memory_context_db_ranked_scoped(&self.config, max_tokens, rankings)
+            }
         }
-        load_memory_context_db_scoped(&self.config, max_tokens)
-    }
-
-    /// Ranked-by-similarity memory load — same DB-reuse pattern as
-    /// [`Self::load_memory_recency`].
-    fn load_memory_ranked(
-        &self,
-        max_tokens: usize,
-        rankings: &[(String, String, f32)],
-    ) -> Result<String> {
-        let scopes = resolved_memory_scopes(&self.config);
-        let guard = self.db_guard();
-        if let Some(db) = guard.as_ref() {
-            return load_memory_context_db_ranked_scoped_with(db, &scopes, max_tokens, rankings);
-        }
-        load_memory_context_db_ranked_scoped(&self.config, max_tokens, rankings)
     }
 
     /// Load memory context from the DB-backed `memory_entries` store,
@@ -66,7 +80,7 @@ impl Agent {
         let max_tokens = self.config.memory.max_context_tokens;
 
         if !self.config.memory.embeddings.enabled {
-            return self.load_memory_recency(max_tokens);
+            return self.load_memory(max_tokens, LoadStrategy::Recency);
         }
 
         let query = self.latest_user_query();
@@ -78,7 +92,7 @@ impl Agent {
         const MIN_QUERY_CHARS_FOR_RANKING: usize = 10;
         let trimmed = query.trim();
         if trimmed.len() < MIN_QUERY_CHARS_FOR_RANKING {
-            return self.load_memory_recency(max_tokens);
+            return self.load_memory(max_tokens, LoadStrategy::Recency);
         }
 
         // Generate query embedding once for ranking
@@ -90,7 +104,7 @@ impl Agent {
                     // embeddings.rs startup; this site fires per build_system_prompt
                     // (every turn). Demote to TRACE to keep DEBUG signal-to-noise high.
                     tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
-                    return self.load_memory_recency(max_tokens);
+                    return self.load_memory(max_tokens, LoadStrategy::Recency);
                 }
             };
 
@@ -106,18 +120,18 @@ impl Agent {
 
         let global_rankings = match ranking_result {
             Ok(Ok(r)) if !r.is_empty() => r,
-            Ok(Ok(_)) => return self.load_memory_recency(max_tokens),
+            Ok(Ok(_)) => return self.load_memory(max_tokens, LoadStrategy::Recency),
             Ok(Err(e)) => {
                 tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
-                return self.load_memory_recency(max_tokens);
+                return self.load_memory(max_tokens, LoadStrategy::Recency);
             }
             Err(e) => {
                 tracing::debug!("Ranking task panicked, falling back to recency: {e}");
-                return self.load_memory_recency(max_tokens);
+                return self.load_memory(max_tokens, LoadStrategy::Recency);
             }
         };
 
-        self.load_memory_ranked(max_tokens, &global_rankings)
+        self.load_memory(max_tokens, LoadStrategy::Ranked(&global_rankings))
     }
 
     #[instrument(skip_all)]
