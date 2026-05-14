@@ -812,7 +812,11 @@ pub mod legacy_hmac {
         }
     }
 
-    fn compute(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
+    /// Compute the legacy ("v1") HMAC over `manifest_bytes + wasm` under the
+    /// legacy framing (NUL-separated, no length prefix). Exposed for tests
+    /// that need to construct a legacy-sealed install to drive the auto-reseal
+    /// path in cortex; production never seals under this framing.
+    pub fn compute(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
         let mut mac =
             HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key length"))?;
         mac.update(manifest_bytes);
@@ -1658,6 +1662,32 @@ mod tests {
         manifest.capabilities = vec!["http".to_string()];
         let err = validate_manifest(&manifest).unwrap_err().to_string();
         assert!(err.contains("http capability requires"));
+    }
+
+    // Invariant: the `borg.plugin.v1` schema-version pin is the seam every
+    // other validation hangs off — a future schema bump must not silently
+    // accept old manifests, and a corruption that swaps the tag must surface
+    // as a clear rejection, not a confusing downstream error.
+    #[test]
+    fn manifest_rejects_wrong_schema_version() {
+        let wasm = minimal_wasm();
+        let mut manifest = manifest_for(&wasm);
+        manifest.schema_version = "borg.plugin.v2".to_string();
+        let err = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported") && err.contains("schema") && err.contains("borg.plugin.v2"),
+            "rejection must name the schema-version field and the offending tag with \
+             'unsupported' so operator tooling can pattern-match the failure mode; got: {err}",
+        );
+
+        // Empty string is a separate failure mode (tag stripped entirely).
+        let mut manifest = manifest_for(&wasm);
+        manifest.schema_version = String::new();
+        let err = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            err.contains("schema"),
+            "empty schema_version must also be rejected; got: {err}",
+        );
     }
 
     #[test]

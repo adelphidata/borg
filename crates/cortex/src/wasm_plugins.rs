@@ -128,7 +128,7 @@ pub const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
 /// in the plugins crate. If a plugin's stored seal verifies under the legacy
 /// scheme but not the current one, we reseal under the current scheme and
 /// emit `wasm_plugin_resealed` so the operator sees the migration happened.
-const LEGACY_HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac";
+pub const LEGACY_HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac";
 
 /// Names of built-in tools — WASM plugins may not shadow them.
 ///
