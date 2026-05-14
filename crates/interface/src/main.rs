@@ -627,7 +627,7 @@ async fn is_onboarded_async() -> bool {
     // Fresh install: no DB → never onboarded. Skip the daemon round-trip
     // (which would otherwise spin up borgd and create the file) so the
     // wizard runs cleanly on a brand-new system.
-    let db_path = data_dir.join("borg.db");
+    let db_path = cortex::paths::db_path(&data_dir);
     if !db_path.exists() {
         return false;
     }

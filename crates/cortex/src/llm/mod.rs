@@ -946,7 +946,7 @@ impl LlmClient {
             return;
         }
         let dir = match crate::config::Config::data_dir() {
-            Ok(d) => d.join("logs").join("debug"),
+            Ok(d) => crate::paths::subdir(&d, crate::paths::BorgSubdir::Logs).join("debug"),
             Err(_) => return,
         };
         if let Err(e) = std::fs::create_dir_all(&dir) {

@@ -11,10 +11,11 @@ use anyhow::{Context, Result};
 
 use cortex::backup::{create_backup, live_schema_version, restore_backup, verify_backup};
 use cortex::config::Config;
+use cortex::paths::{self, BorgSubdir};
 
 pub fn run_create() -> Result<()> {
     let home = Config::data_dir().context("locate BORG_HOME")?;
-    let out_dir = home.join("backups");
+    let out_dir = paths::subdir(&home, BorgSubdir::Backups);
     let schema_version = live_schema_version()?;
     let path = create_backup(&home, &out_dir, schema_version).context("create backup")?;
     println!("backup: {}", path.display());

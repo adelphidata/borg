@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tracing::warn;
 
-use crate::constants::{DB_FILE, IDENTITY_FILE, MEMORY_INDEX_FILE};
 use crate::llm::provider::Provider;
+use crate::paths::{self, BorgSubdir};
 use crate::policy::ExecutionPolicy;
 
 /// Top-level configuration, loaded from SQLite settings DB.
@@ -221,19 +221,17 @@ where
 }
 
 impl Config {
-    /// Returns the borg data directory (`~/.borg/` or `$BORG_DATA_DIR`).
+    /// Returns the borg data directory.
+    ///
+    /// Delegates to [`paths::resolve_borg_home_readonly`] — see that module
+    /// for the env-var resolution order. Does NOT create the directory.
     pub fn data_dir() -> Result<PathBuf> {
-        if let Ok(dir) = std::env::var("BORG_DATA_DIR") {
-            return Ok(PathBuf::from(dir));
-        }
-        Ok(dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
-            .join(".borg"))
+        paths::resolve_borg_home_readonly(None)
     }
 
     /// Returns the memory directory path (`~/.borg/memory/`).
     pub fn memory_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("memory"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Memory))
     }
 
     /// Detect the host's IANA timezone via the OS.
@@ -264,42 +262,42 @@ impl Config {
 
     /// Returns the skills directory path (`~/.borg/skills/`).
     pub fn skills_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("skills"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Skills))
     }
 
     /// Returns the channels directory path (`~/.borg/channels/`).
     pub fn channels_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("channels"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Channels))
     }
 
     /// Returns the scripts directory path (`~/.borg/scripts/`).
     pub fn scripts_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("scripts"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Scripts))
     }
 
     /// Returns the logs directory path (`~/.borg/logs/`).
     pub fn logs_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("logs"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Logs))
     }
 
     /// Returns the sessions directory path (`~/.borg/sessions/`).
     pub fn sessions_dir() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join("sessions"))
+        Ok(paths::subdir(&Self::data_dir()?, BorgSubdir::Sessions))
     }
 
     /// Returns the database file path (`~/.borg/borg.db`).
     pub fn db_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join(DB_FILE))
+        Ok(paths::db_path(&Self::data_dir()?))
     }
 
     /// Returns the identity file path (`~/.borg/IDENTITY.md`).
     pub fn identity_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join(IDENTITY_FILE))
+        Ok(paths::identity_path(&Self::data_dir()?))
     }
 
     /// Returns the memory index file path (`~/.borg/MEMORY.md`).
     pub fn memory_index_path() -> Result<PathBuf> {
-        Ok(Self::data_dir()?.join(MEMORY_INDEX_FILE))
+        Ok(paths::memory_index_path(&Self::data_dir()?))
     }
 
     /// Load config from the database (DB overrides + compiled defaults).

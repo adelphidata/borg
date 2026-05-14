@@ -174,7 +174,7 @@ pub fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
         .context("verify: extract inner tar")?;
 
     let extracted_home = inner_dir.join("borg_home");
-    let db_path = extracted_home.join("borg.db");
+    let db_path = crate::paths::db_path(&extracted_home);
     if !db_path.exists() {
         bail!("backup is missing borg.db");
     }
@@ -241,7 +241,7 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
     // audit chain captures the cutover. Best-effort — if the restore is
     // followed immediately by daemon startup, the daemon will append its
     // own daemon_start event right after.
-    let db_path = borg_home.join("borg.db");
+    let db_path = crate::paths::db_path(borg_home);
     if db_path.exists() {
         let db = Database::open_at(&db_path).context("restore: open restored SQLite")?;
         let payload = serde_json::json!({

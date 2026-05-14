@@ -19,10 +19,11 @@ use anyhow::{anyhow, Context, Result};
 use cortex::config::security::KekBackend;
 use cortex::config::Config as CoreConfig;
 use cortex::db::Database;
+use cortex::paths::{self, BorgSubdir};
 #[cfg(unix)]
 use cortex::util::unix_ext::set_unix_mode;
 use identity::{FileKekStore, KekStore, KeychainStore};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Filename of the passphrase env file written under `<BORG_HOME>/secrets/`.
@@ -42,10 +43,9 @@ const PROBE_VALUE: &[u8] = b"v1";
 /// readable only by root (0600 on the env file).
 pub const PASSPHRASE_ENV: &str = "BORG_KEK_PASSPHRASE";
 
-/// File path under `$BORG_HOME` for the encrypted KEK blob.
-pub fn kek_file_path(borg_home: &Path) -> PathBuf {
-    borg_home.join("secrets").join("kek.enc")
-}
+// Use [`cortex::paths::kek_file_path`] directly; the local helper used to
+// live here but is now centralized so every crate computes the same path.
+pub use cortex::paths::kek_file_path;
 
 /// Build the KEK store for this daemon process. Resolves `Auto` and
 /// persists the chosen backend so the posture snapshot reads a concrete
@@ -144,7 +144,7 @@ fn open_file_store_auto(borg_home: &Path) -> Result<Arc<dyn KekStore>> {
 /// systemd-style `BORG_KEK_PASSPHRASE=...` line) or generate a new one
 /// and write it. The env file is created at 0600 under a 0700 parent.
 fn load_or_provision_passphrase(borg_home: &Path) -> Result<String> {
-    let secrets_dir = borg_home.join("secrets");
+    let secrets_dir = paths::subdir(borg_home, BorgSubdir::Secrets);
     let env_path = secrets_dir.join(KEK_ENV_FILE);
     if let Ok(body) = std::fs::read_to_string(&env_path) {
         for line in body.lines() {

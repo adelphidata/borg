@@ -494,7 +494,7 @@ pub fn skills_dir() -> Result<PathBuf> {
 /// Install bundled skills to the filesystem at `data_dir/skills/<name>/SKILL.md`.
 /// Skips any skill that already exists (preserving user customizations).
 pub fn install_default_skills(data_dir: &std::path::Path) -> Result<usize> {
-    let skills_dir = data_dir.join("skills");
+    let skills_dir = crate::paths::subdir(data_dir, crate::paths::BorgSubdir::Skills);
     let mut installed = 0;
 
     for &(name, content) in BUNDLED_SKILLS {

@@ -118,6 +118,10 @@ pub mod multi_agent;
 pub mod output_redaction;
 /// Sender pairing and access control for gateway channels.
 pub mod pairing;
+/// Canonical filesystem paths under `$BORG_HOME`. Single source of truth
+/// for `~/.borg` resolution, subdirectory enumeration, and well-known
+/// filenames across every crate.
+pub mod paths;
 /// Execution policy for collaboration modes.
 pub mod policy;
 /// Token pricing per provider and model.

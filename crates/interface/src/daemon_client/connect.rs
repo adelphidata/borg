@@ -72,20 +72,16 @@ fn require_kek_pem<K: KekStore>(kek: &K, account: &str) -> Result<String> {
 /// 1. `$BORG_DAEMON_UDS` if set — explicit override, used by the ACP
 ///    integration test harness to pin a subprocess at a per-test socket
 ///    without auto-spawning a real daemon.
-/// 2. `$BORG_HOME/borgd.sock` if `$BORG_HOME` is set.
-/// 3. `~/.borg/borgd.sock` otherwise.
-///
-/// Mirrors `borgd::paths::resolve_borg_home` for cases 2 and 3.
+/// 2. `cortex::paths::resolve_borg_home_readonly` then `borgd.sock` —
+///    honors `$BORG_HOME` / `$BORG_DATA_DIR` / `~/.borg` exactly as the
+///    daemon does, with no side effects (no directory creation).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("BORG_DAEMON_UDS") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("BORG_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".borg")))
-        .unwrap_or_else(|| PathBuf::from(".borg"));
-    home.join("borgd.sock")
+    let home =
+        cortex::paths::resolve_borg_home_readonly(None).unwrap_or_else(|_| PathBuf::from(".borg"));
+    cortex::paths::socket_path(&home)
 }
 
 /// Connect over `socket_path` (defaults to [`default_socket_path`] if `None`).
