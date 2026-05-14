@@ -169,6 +169,20 @@ pub(crate) struct PreRunOutcome {
     pub timed_out: bool,
 }
 
+/// Construct a `sh -c <command>` invocation with the parent env stripped
+/// down to the [`cortex::security::env_allowlist`] filter. The shared entry
+/// point for every agent-spawned shell in this crate so the leak fix can't
+/// be undone at one site without being undone at the other.
+pub(crate) fn build_filtered_sh_command(command: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command);
+    cortex::security::env_allowlist::apply_filtered_env(
+        &mut cmd,
+        &std::collections::HashMap::new(),
+    );
+    cmd
+}
+
 /// Run a scheduled task's optional `pre_run_command` and capture its
 /// output. Honors `pre_run_cwd` (defaults to `$HOME`) and
 /// `pre_run_timeout_ms`. Stdout and stderr are each capped at
@@ -190,8 +204,8 @@ pub(crate) async fn run_pre_run_command(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let timeout = std::time::Duration::from_millis(timeout_ms.max(1) as u64);
 
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command).current_dir(&resolved_cwd);
+    let mut cmd = build_filtered_sh_command(command);
+    cmd.current_dir(&resolved_cwd);
 
     let result = tokio::time::timeout(timeout, cmd.output()).await;
     match result {
@@ -390,14 +404,8 @@ async fn execute_command_task(ctx: &TaskExecContext) {
         pre_run_cwd: _,
         pre_run_timeout_ms: _,
     } = ctx;
-    let result = tokio::time::timeout(
-        *timeout,
-        tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(command.as_str())
-            .output(),
-    )
-    .await;
+    let mut cmd = build_filtered_sh_command(command.as_str());
+    let result = tokio::time::timeout(*timeout, cmd.output()).await;
 
     match result {
         Ok(Ok(output)) => {
@@ -1376,6 +1384,87 @@ mod pre_run_tests {
             outcome.stdout.len() <= PRE_RUN_OUTPUT_CAP + 16,
             "stdout exceeded cap: {} bytes",
             outcome.stdout.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_filtered_sh_command_strips_parent_env_secrets() {
+        // Helper-level regression: every agent-spawned shell in this
+        // crate (pre_run_command, command-type scheduled tasks) goes
+        // through `build_filtered_sh_command`. If a future contributor
+        // inlines a `Command::new("sh")` somewhere new, the per-site
+        // tests below will still pass — this one fails the moment the
+        // helper itself drops `apply_filtered_env`.
+        let leak_name = "BORG_SH_HELPER_TEST_FAKE_API_KEY";
+        let leak_value = "must-not-reach-child-stdout-2e7c";
+        unsafe {
+            std::env::set_var(leak_name, leak_value);
+        }
+
+        let mut cmd = build_filtered_sh_command("env");
+        let output = cmd.output().await.expect("helper command should run");
+
+        unsafe {
+            std::env::remove_var(leak_name);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "env should exit 0; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !stdout.contains(leak_value),
+            "leak_value appeared in helper subprocess stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("PATH="),
+            "PATH must survive the filter: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pre_run_command_does_not_leak_parent_env_secrets() {
+        // Regression: a scheduled task's pre_run_command was previously
+        // spawned with full parent env. A user-configured `env`-style
+        // pre_run would have echoed every provider key in borgd's env
+        // straight into <preprocessed_context>, then into the LLM, then
+        // possibly into the channel reply.
+        let leak_name = "BORG_PRE_RUN_TEST_FAKE_API_KEY";
+        let leak_value = "must-not-appear-in-pre-run-output-7b1a";
+        unsafe {
+            std::env::set_var(leak_name, leak_value);
+        }
+
+        let outcome = run_pre_run_command("env", None, 5_000).await;
+
+        unsafe {
+            std::env::remove_var(leak_name);
+        }
+
+        assert!(
+            outcome.success,
+            "env should exit 0; stderr={}",
+            outcome.stderr
+        );
+        assert!(
+            !outcome.stdout.contains(leak_value),
+            "leak_value appeared in pre_run stdout: {}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.contains(leak_name),
+            "leak_name appeared in pre_run stdout: {}",
+            outcome.stdout
+        );
+        // Sanity floor: PATH must remain or `env` wouldn't have been
+        // findable, and a stdout that's missing PATH would be a
+        // degenerate "filter stripped everything" pass.
+        assert!(
+            outcome.stdout.contains("PATH="),
+            "PATH must survive the filter: {}",
+            outcome.stdout
         );
     }
 }

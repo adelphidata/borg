@@ -386,11 +386,6 @@ top-down by priority, not by section order.
   response runbook with critical/high/medium/low tiers, coordinated
   disclosure rules, CVE issuance criteria. `SECURITY.md` exists; this
   is the operational complement.
-- **Env-var allowlist for shell exec.** `[H]` Whitelist of ~200
-  known-safe env vars passed into agent-spawned subprocesses;
-  everything else stripped. Prevents accidental leak of
-  `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` etc. into shell tool
-  output that gets logged or echoed back.
 - **Browser anti-detection + supervisor.** `[H]` Drop-in
   browser provider with anti-bot stealth headers, dialog auto-handling,
   and a supervisor that restarts crashed sessions. Borg's `browser`

@@ -226,9 +226,11 @@ pub async fn handle_run_shell_with_context(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     cmd.current_dir(&cwd_path);
-    for (key, val) in &filtered_creds {
-        cmd.env(key, val);
-    }
+    // Strip the parent env down to the allowlist before re-injecting
+    // skill-declared credentials. Without this, the daemon's loaded
+    // provider keys (OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ...) would
+    // be visible to any `env` / `printenv` in the agent's shell.
+    crate::security::env_allowlist::apply_filtered_env(&mut cmd, &filtered_creds);
 
     let mut child = cmd
         .kill_on_drop(true)
@@ -347,7 +349,10 @@ async fn run_in_pty(
     if let Some(dir) = workdir {
         builder.cwd(dir);
     }
-    for (key, val) in env {
+    // Mirror the non-PTY spawn site: env_clear + allowlist-filtered parent
+    // env, with skill-declared creds layered on top.
+    builder.env_clear();
+    for (key, val) in crate::security::env_allowlist::build_filtered_env(env) {
         builder.env(key, val);
     }
 
@@ -658,6 +663,60 @@ mod tests {
         assert!(
             tmp.path().join("routed.txt").exists(),
             "patched file should be created in cwd"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_does_not_leak_parent_env_secrets() {
+        // The actual leak regression: a provider-shaped env var on the
+        // parent must NOT appear in the captured shell output. Without
+        // `apply_filtered_env` on the spawn site, `env` would echo it
+        // straight back to the agent (and into ~/.borg/logs/{date}.jsonl).
+        let leak_name = "BORG_RUN_SHELL_TEST_FAKE_API_KEY";
+        let leak_value = "must-not-appear-in-stdout-9f3d8c";
+        unsafe {
+            std::env::set_var(leak_name, leak_value);
+        }
+
+        // Pass an explicit workdir so this test doesn't race with other
+        // tests in this module that mutate process-global cwd (see
+        // `run_shell_reroutes_apply_patch_heredoc_to_verified_path`).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config::default();
+        let policy = ExecutionPolicy::default();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let args = serde_json::json!({
+            "command": "env",
+            "workdir": tmp.path().to_string_lossy().as_ref(),
+        });
+
+        let result = handle_run_shell(&args, &config, &policy, &event_tx, "call-1", None)
+            .await
+            .expect("env command should run");
+
+        unsafe {
+            std::env::remove_var(leak_name);
+        }
+
+        assert!(
+            result.contains("Exit code: 0"),
+            "env should exit cleanly, got: {result}"
+        );
+        assert!(
+            !result.contains(leak_value),
+            "leak_value appeared in run_shell output (env_clear/filter missing): {result}"
+        );
+        assert!(
+            !result.contains(leak_name),
+            "leak_name appeared in run_shell output: {result}"
+        );
+        // Sanity floor: PATH should still be forwarded or the shell
+        // wouldn't have found `env` in the first place. This also rules
+        // out a degenerate "stdout was empty" pass.
+        assert!(
+            result.contains("PATH="),
+            "PATH must survive the filter for shells to be usable: {result}"
         );
     }
 }
