@@ -7,6 +7,7 @@ pub mod status;
 pub mod telemetry;
 
 use crate::cost_events::CostEventBus;
+use crate::goal_bus::GoalEventBus;
 use crate::heartbeat::HeartbeatBus;
 use crate::heartbeat::HeartbeatTrigger;
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
@@ -64,6 +65,10 @@ pub struct AdminExtras {
     /// Daemon-wide subprocess registry — Admin RPCs (`GetSubprocesses`,
     /// `SetSubprocessPinned`) and `Admin.Heal` use this when set.
     pub process_registry: Option<cortex::process_registry::ProcessRegistry>,
+    /// Bus that `Admin.SubscribeGoalEvents` reads from and the goal RPC
+    /// handlers publish into. Production wires this through the
+    /// orchestrator so the agent loop and the RPC handlers share one bus.
+    pub goal_bus: Option<GoalEventBus>,
 }
 
 /// Like [`build_services`] but additionally wires Admin extras (heartbeat
@@ -93,6 +98,9 @@ pub fn build_services_with_extras(
     }
     if let Some(reg) = extras.process_registry {
         admin_svc = admin_svc.with_process_registry(reg);
+    }
+    if let Some(bus) = extras.goal_bus {
+        admin_svc = admin_svc.with_goal_bus(bus);
     }
     Services {
         status: StatusServer::new(status::StatusSvc::new()),

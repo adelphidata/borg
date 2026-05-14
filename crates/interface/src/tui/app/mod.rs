@@ -226,6 +226,18 @@ pub enum BacktrackPhase {
 
 /// Result of a background `/btw` run, sent from the spawned task back to the
 /// TUI event loop so it can drive the popup state machine on the main thread.
+/// One goal-lifecycle update forwarded from the daemon. The forwarder task
+/// translates `protocols::admin::GoalEvent` into this UI-side type so the
+/// app loop doesn't see the wire format directly.
+#[derive(Debug, Clone)]
+pub struct GoalUiEvent {
+    /// Lifecycle kind from `cortex::goals::event_kind`. Used only for
+    /// disambiguating `cleared` (no goal) vs. everything else.
+    pub kind: String,
+    /// Status of the goal after the mutation, or `None` for kind=cleared.
+    pub status: Option<cortex::goals::GoalStatus>,
+}
+
 pub struct BtwResult {
     pub question: String,
     pub outcome: Result<String, String>,
@@ -462,6 +474,11 @@ pub struct App<'a> {
     pub config: Config,
     pub event_rx: Option<mpsc::Receiver<AgentEvent>>,
     pub heartbeat_rx: Option<mpsc::Receiver<HeartbeatEvent>>,
+    /// Receives goal-lifecycle events forwarded from the daemon's
+    /// `Admin.SubscribeGoalEvents` stream. The TUI's select! loop drains
+    /// this and updates [`Self::goal_status`] so the footer reacts within
+    /// the broadcast latency (~100ms locally).
+    pub goal_event_rx: Option<mpsc::Receiver<GoalUiEvent>>,
     /// Retained for symmetry with the legacy in-process heartbeat scheduler;
     /// the daemon owns scheduling now so nothing in the TUI feeds events
     /// back through this sender. Kept on the struct so re-introducing a
@@ -529,6 +546,11 @@ pub struct App<'a> {
     pub toasts: super::toast::ToastStack,
     /// Shared daemon client for admin RPCs from popups + commands.
     pub client: Arc<Mutex<DaemonClient>>,
+    /// Cached goal status for the active session. Updated by the
+    /// `SubscribeGoalEvents` listener spawned at startup so the footer
+    /// reacts within ~100ms of a daemon-side mutation. `None` until the
+    /// initial `GetGoal` seed completes (or when no goal is set).
+    pub goal_status: Option<cortex::goals::GoalStatus>,
 }
 
 impl<'a> App<'a> {
@@ -538,6 +560,7 @@ impl<'a> App<'a> {
         heartbeat_event_tx: Option<mpsc::Sender<HeartbeatEvent>>,
         poke_tx: Option<mpsc::Sender<()>>,
         client: Arc<Mutex<DaemonClient>>,
+        goal_event_rx: Option<mpsc::Receiver<GoalUiEvent>>,
     ) -> Self {
         let blocked_paths = config.security.blocked_paths.clone();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -570,6 +593,7 @@ impl<'a> App<'a> {
             config,
             event_rx: None,
             heartbeat_rx,
+            goal_event_rx,
             heartbeat_event_tx,
             poke_tx,
             cancel_token: None,
@@ -606,6 +630,7 @@ impl<'a> App<'a> {
             doctor_rx: None,
             toasts: super::toast::ToastStack::new(),
             client,
+            goal_status: None,
         };
         app.refresh_ambient_status();
         // One-shot persistent-warning notice. Rendered once after the
@@ -616,6 +641,17 @@ impl<'a> App<'a> {
                 .push(super::history::HistoryCell::DoctorWarning { warnings });
         }
         app
+    }
+
+    /// Apply a goal-lifecycle update streamed from the daemon. Updates the
+    /// cached `goal_status` field so the footer hint re-renders on the next
+    /// frame.
+    pub fn apply_goal_event(&mut self, evt: GoalUiEvent) {
+        if evt.kind == cortex::goals::event_kind::CLEARED {
+            self.goal_status = None;
+        } else {
+            self.goal_status = evt.status;
+        }
     }
 
     /// Refresh the cached `AmbientStatus` via the daemon. Called from
@@ -1122,7 +1158,7 @@ mod tests {
     fn make_app() -> App<'static> {
         let config = Config::default();
         let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
-        App::new(config, None, None, None, client)
+        App::new(config, None, None, None, client, None)
     }
 
     // ========================================================================
@@ -2609,7 +2645,7 @@ mod tests {
         let config = Config::default();
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
-        let mut app = App::new(config, None, None, Some(tx), client);
+        let mut app = App::new(config, None, None, Some(tx), client, None);
         let result = app.try_handle_command("/poke");
         assert!(result.is_some());
         let action = result.unwrap().unwrap();
@@ -2637,7 +2673,7 @@ mod tests {
         // Fill the channel
         tx.try_send(()).unwrap();
         let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
-        let mut app = App::new(config, None, None, Some(tx), client);
+        let mut app = App::new(config, None, None, Some(tx), client, None);
         let result = app.try_handle_command("/poke");
         assert!(result.is_some());
         let action = result.unwrap().unwrap();

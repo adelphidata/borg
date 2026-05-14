@@ -138,6 +138,7 @@ async fn send_approval_greeting_accepts_request_when_executor_wired() {
         BorgMetrics::noop(),
         None,
         None,
+        None,
     ));
     let admin = AdminSvc::new(registry).with_executor(executor);
 

@@ -529,6 +529,19 @@ Rules:
         &mut self,
         iteration: usize,
     ) -> Result<Option<(Vec<Message>, Vec<ToolDefinition>)>> {
+        // Goal sync runs BEFORE building the system prompt so a goal
+        // replaced between iterations is picked up in this iteration's
+        // <goal_context> block. mark_turn_started is idempotent within a
+        // baseline window — `take_turn_delta` at the end of the previous
+        // iteration cleared it, so this re-arms the per-iteration window.
+        self.sync_goal_runtime_for_turn();
+        // Drain any one-shot steering queued during the previous turn's
+        // accounting (budget-limit) or by `sync_goal_runtime_for_turn`
+        // (objective-updated). Pushed into history before message
+        // assembly so the LLM sees it as a synthetic user message and
+        // the transcript captures the steering for audit.
+        self.drain_pending_goal_steering();
+
         let mut system_prompt = self
             .build_system_prompt()
             .await

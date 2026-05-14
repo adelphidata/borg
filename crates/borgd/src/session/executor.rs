@@ -8,6 +8,7 @@
 //! everything routes through the daemon's single-writer-per-session
 //! [`SessionRegistry`] now.
 
+use crate::goal_bus::GoalEventBus;
 use crate::session::{backend::AgentBackend, convert, SessionHost, SessionRegistry};
 use async_trait::async_trait;
 use cortex::agent::AgentEvent;
@@ -29,18 +30,25 @@ pub struct DaemonSessionExecutor {
     metrics: BorgMetrics,
     config_rx: Option<watch::Receiver<Config>>,
     cost_event_sink: Option<Arc<dyn CostEventSink>>,
+    goal_bus: Option<GoalEventBus>,
 }
 
 impl DaemonSessionExecutor {
     /// Build an executor wrapping `registry`. `config` and `metrics` are used
     /// only when a new [`SessionHost`] needs to be constructed; resumed hosts
     /// from the registry already carry their own `Agent`.
+    ///
+    /// `goal_bus`, when provided, is the same broadcast bus
+    /// `Admin.SubscribeGoalEvents` reads from. The agent loop publishes
+    /// `goal_created` / `goal_completed` / `goal_budget_limited` lifecycle
+    /// events into it so TUI footers update in real time.
     pub fn new(
         registry: SessionRegistry,
         config: Config,
         metrics: BorgMetrics,
         config_rx: Option<watch::Receiver<Config>>,
         cost_event_sink: Option<Arc<dyn CostEventSink>>,
+        goal_bus: Option<GoalEventBus>,
     ) -> Self {
         Self {
             registry,
@@ -48,6 +56,7 @@ impl DaemonSessionExecutor {
             metrics,
             config_rx,
             cost_event_sink,
+            goal_bus,
         }
     }
 
@@ -80,6 +89,7 @@ impl DaemonSessionExecutor {
             self.config_rx.clone(),
             self.cost_event_sink.clone(),
             None,
+            self.goal_bus.clone(),
         )?;
         let host = SessionHost::new(backend);
         self.registry.insert(host.clone());
@@ -195,6 +205,7 @@ mod tests {
             startup,
             BorgMetrics::noop(),
             Some(rx),
+            None,
             None,
         );
 

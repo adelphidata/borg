@@ -114,6 +114,16 @@ service Admin {
   // the daemon's home directory and seeds whatever it finds into the pool.
   rpc PairCredential(PairCredentialRequest) returns (PairCredentialResponse);
 
+  // Per-session goal (Ralph-loop objective). The TUI's `/goal …` command
+  // talks to these RPCs; the daemon owns the SQLite row and the broadcast
+  // bus so any subscriber (TUI footer today, replicated dashboards later)
+  // reacts to mutations without polling.
+  rpc GetGoal(GoalRef) returns (GoalDetail);
+  rpc SetGoal(GoalMutation) returns (GoalDetail);
+  rpc ClearGoal(GoalRef) returns (Empty);
+  rpc PauseGoalOnInterrupt(GoalRef) returns (GoalDetail);
+  rpc SubscribeGoalEvents(Empty) returns (stream GoalEvent);
+
   // Subprocess registry — daemon-side ProcessRegistry inspection + pinning.
   // `GetSubprocesses` returns a snapshot of running + recently-finished
   // entries; `SetSubprocessPinned` flips the auto-reap pin on a specific
@@ -620,4 +630,66 @@ message SubprocessSnapshot {
 message SetSubprocessPinnedRequest {
   uint64 id = 1;
   bool pinned = 2;
+}
+
+// Goal — Ralph-loop per-session objective ───────────────────────────────────
+// Empty `session_id` on the request resolves to the most-recently-updated
+// session row server-side, mirroring how the TUI's `/goal …` operates on
+// "the current session" without the client needing to track session ids.
+message GoalRef {
+  string session_id = 1;
+}
+
+// Wire projection of `borg_core::goals::Goal`. `present=false` is returned
+// when no row exists for the resolved session (or when the requested
+// session id was empty and no session has ever been created).
+message GoalDetail {
+  bool present = 1;
+  string session_id = 2;
+  string goal_id = 3;
+  string objective = 4;
+  // "active" | "paused" | "budget_limited" | "complete"
+  string status = 5;
+  bool token_budget_present = 6;
+  int64 token_budget = 7;
+  int64 tokens_used = 8;
+  int64 time_used_seconds = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+// Mutation request. The `op` discriminator picks which subset of fields is
+// meaningful; the server rejects requests where the required fields for
+// the chosen op are absent.
+message GoalMutation {
+  string session_id = 1;
+  Op op = 2;
+  // OP_CREATE / OP_REPLACE: required, validated against MAX_OBJECTIVE_CHARS.
+  string objective = 3;
+  bool token_budget_present = 4;
+  // OP_CREATE / OP_REPLACE / OP_SET_BUDGET: must be > 0 when present.
+  int64 token_budget = 5;
+  // OP_SET_STATUS: one of "active" (resume) | "paused" | "complete".
+  // BudgetLimited is system-only and cannot be set via this RPC.
+  string status = 6;
+  enum Op {
+    OP_UNSPECIFIED = 0;
+    OP_CREATE = 1;       // fail if row already exists for this session
+    OP_REPLACE = 2;      // create-or-replace; regenerates goal_id
+    OP_SET_STATUS = 3;   // pause / resume / mark complete
+    OP_SET_BUDGET = 4;   // change token budget only
+  }
+}
+
+// Streamed lifecycle event. `goal` is unset only for kind="cleared" (the
+// row no longer exists). Subscribers that lag (slow render loop, briefly
+// paused TUI) drop messages — the next event or a fresh GetGoal re-syncs
+// state, so the broadcast bus stays unbounded-free.
+message GoalEvent {
+  string session_id = 1;
+  // "created" | "replaced" | "status_changed" | "budget_limited" |
+  // "completed" | "cleared"
+  string kind = 2;
+  GoalDetail goal = 3;
+  int64 emitted_at_unix = 4;
 }

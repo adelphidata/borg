@@ -106,6 +106,15 @@ impl GoalRuntimeState {
         }
     }
 
+    /// Snapshot the currently-adopted goal id, if any. Used by the agent
+    /// loop to detect "the goal row's `goal_id` changed under us"
+    /// (objective replacement) so an `ObjectiveUpdated` steering can be
+    /// queued before the next LLM call.
+    pub fn current_goal_id(&self) -> Option<String> {
+        let inner = self.lock_inner();
+        inner.active_goal_id.clone()
+    }
+
     /// Drop the currently-tracked goal (cleared, completed, paused at user
     /// request, etc.). Subsequent accounting calls are no-ops until [`adopt`]
     /// is called again.
@@ -290,6 +299,23 @@ mod tests {
         assert!(!rt.try_reserve_continuation("turn-1"));
         // Different turn — succeeds.
         assert!(rt.try_reserve_continuation("turn-2"));
+    }
+
+    #[test]
+    fn current_goal_id_tracks_adopt_and_forget() {
+        let rt = GoalRuntimeState::new();
+        // Fresh runtime has no adopted goal.
+        assert_eq!(rt.current_goal_id(), None);
+        rt.adopt(&goal("g1", GoalStatus::Active));
+        assert_eq!(rt.current_goal_id().as_deref(), Some("g1"));
+        // Re-adopting the same id is a no-op for the snapshot.
+        rt.adopt(&goal("g1", GoalStatus::Paused));
+        assert_eq!(rt.current_goal_id().as_deref(), Some("g1"));
+        // Replacing surfaces the new id so the agent can detect the swap.
+        rt.adopt(&goal("g2", GoalStatus::Active));
+        assert_eq!(rt.current_goal_id().as_deref(), Some("g2"));
+        rt.forget();
+        assert_eq!(rt.current_goal_id(), None);
     }
 
     #[test]

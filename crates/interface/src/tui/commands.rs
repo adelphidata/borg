@@ -365,7 +365,41 @@ impl App<'_> {
             self.event_rx = None;
             self.steer_tx = None;
             self.pending_steers.clear();
-            self.push_system_message("[cancelled]".to_string());
+            // Pause any Active goal so the Ralph loop doesn't immediately
+            // self-continue past the operator's Esc/`/cancel`. The RPC is a
+            // no-op when no Active goal exists (returns present=false), so
+            // we never push a noisy "no goal" message in the normal case.
+            // Transport failures are logged + swallowed: cancel itself must
+            // succeed even if the daemon is briefly unreachable, because
+            // dropping the cancel would orphan the in-flight turn.
+            // Only attempt the pause RPC when a Tokio runtime is available.
+            // Unit tests for `cmd_cancel` run outside an async context (the
+            // app surface is sync); cancel must still succeed there. In real
+            // operation the TUI always runs on a Tokio runtime.
+            let paused = if tokio::runtime::Handle::try_current().is_ok() {
+                let client = self.client.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async move {
+                        let mut c = client.lock().await;
+                        c.pause_goal_on_interrupt("").await
+                    })
+                })
+            } else {
+                Ok(protocols::admin::GoalDetail::default())
+            };
+            match paused {
+                Ok(detail) if detail.present => {
+                    self.push_system_message(format!(
+                        "[cancelled] /goal: paused — \"{}\"",
+                        detail.objective
+                    ));
+                }
+                Ok(_) => self.push_system_message("[cancelled]".to_string()),
+                Err(e) => {
+                    tracing::warn!("cmd_cancel: pause_goal_on_interrupt failed: {e}");
+                    self.push_system_message("[cancelled]".to_string());
+                }
+            }
             Ok(AppAction::Continue)
         } else {
             self.push_system_message("Nothing to cancel.".to_string());
@@ -867,7 +901,7 @@ impl App<'_> {
     /// session. The daemon may be writing concurrently, but `Database::open_readonly`
     /// is safe under WAL.
     fn cmd_goal_show(&mut self) -> Result<AppAction> {
-        let body = match read_current_goal_summary() {
+        let body = match self.fetch_goal_summary_via_rpc() {
             Ok(text) => text,
             Err(e) => format!("/goal: failed to read goal — {e}"),
         };
@@ -875,47 +909,64 @@ impl App<'_> {
         Ok(AppAction::Continue)
     }
 
+    /// Render the current goal as a 5-7 line summary card. Talks to the
+    /// daemon over gRPC (rather than opening the SQLite file directly) so
+    /// the TUI is correct even when the daemon is on a different host or
+    /// the file is locked by a write transaction.
+    fn fetch_goal_summary_via_rpc(&self) -> Result<String> {
+        let client = self.client.clone();
+        let detail = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.get_goal("").await
+            })
+        })?;
+        if !detail.present {
+            return Ok("No goal set for this session.\nUse `/goal <text>` to set one.".to_string());
+        }
+        Ok(format_goal_detail(&detail))
+    }
+
     /// `/goal <args>` — dispatch user-driven goal management. Pause / resume /
-    /// clear / edit / `--budget N text` / `<text>` are all routed by sending
-    /// the agent an instruction so it uses the model-visible `create_goal` /
-    /// `update_goal` tools.
-    ///
-    /// This avoids a duplicate write path: the agent already has the tools, and
-    /// `<goal_context>` in the system prompt reflects the live state next turn.
+    /// clear / set / replace all route through the Admin gRPC RPCs so the
+    /// daemon owns the canonical write and publishes the lifecycle event
+    /// onto the shared bus the TUI footer subscribes to. No more direct DB
+    /// writes from the TUI; no more synthetic agent instructions for the
+    /// initial-set path.
     fn cmd_goal_dispatch(&mut self, args: &str) -> Result<AppAction> {
-        let instruction = match args {
-            "" => return self.cmd_goal_show(),
+        match args {
+            "" => self.cmd_goal_show(),
             "clear" => {
-                // Direct DB write for "clear": no agent involvement needed.
-                let report = match clear_current_goal() {
-                    Ok(true) => "/goal: cleared".to_string(),
-                    Ok(false) => "/goal: no goal to clear".to_string(),
+                let report = match self.rpc_clear_goal() {
+                    Ok(()) => "/goal: cleared".to_string(),
                     Err(e) => format!("/goal: clear failed — {e}"),
                 };
                 self.push_system_message(report);
-                return Ok(AppAction::Continue);
+                Ok(AppAction::Continue)
             }
             "pause" => {
-                let report = match set_current_goal_status(cortex::goals::GoalStatus::Paused) {
-                    Ok(Some(g)) => format!("/goal: paused — \"{}\"", g.objective),
-                    Ok(None) => "/goal: no active goal to pause".to_string(),
+                let report = match self.rpc_set_goal_status("paused") {
+                    Ok(detail) if detail.present => {
+                        format!("/goal: paused — \"{}\"", detail.objective)
+                    }
+                    Ok(_) => "/goal: no active goal to pause".to_string(),
                     Err(e) => format!("/goal: pause failed — {e}"),
                 };
                 self.push_system_message(report);
-                return Ok(AppAction::Continue);
+                Ok(AppAction::Continue)
             }
             "resume" => {
-                let report = match set_current_goal_status(cortex::goals::GoalStatus::Active) {
-                    Ok(Some(g)) => format!("/goal: resumed — \"{}\"", g.objective),
-                    Ok(None) => "/goal: no paused goal to resume".to_string(),
+                let report = match self.rpc_set_goal_status("active") {
+                    Ok(detail) if detail.present => {
+                        format!("/goal: resumed — \"{}\"", detail.objective)
+                    }
+                    Ok(_) => "/goal: no paused goal to resume".to_string(),
                     Err(e) => format!("/goal: resume failed — {e}"),
                 };
                 self.push_system_message(report);
-                return Ok(AppAction::Continue);
+                Ok(AppAction::Continue)
             }
             _ => {
-                // Treat everything else as either a new objective (optionally
-                // with `--budget N`) or `edit <text>`.
                 let (budget, body) = parse_goal_budget_prefix(args);
                 let stripped = body.strip_prefix("edit ").unwrap_or(body).trim();
                 if stripped.is_empty() {
@@ -942,37 +993,92 @@ impl App<'_> {
                         return Ok(AppAction::Continue);
                     }
                 }
-                // If a goal already exists, replace it directly via the DB
-                // (regenerates goal_id + resets accounting). If none exists,
-                // hand the agent a synthetic instruction so it calls
-                // `create_goal` — keeping the agent in the loop for the
-                // initial set so the goal lands inside the running session
-                // context.
-                match set_or_replace_goal(&trimmed, budget) {
-                    Ok(GoalWriteOutcome::Replaced(g)) => {
-                        self.push_system_message(format!(
-                            "/goal: replaced — \"{}\"",
-                            g.objective
-                        ));
-                        return Ok(AppAction::Continue);
-                    }
-                    Ok(GoalWriteOutcome::NeedsAgent) => match budget {
-                        Some(b) => format!(
-                            "Set the session goal to: {trimmed}\n(Use create_goal with token_budget={b}.)"
-                        ),
-                        None => format!("Set the session goal to: {trimmed}\n(Use create_goal.)"),
-                    },
-                    Err(e) => {
-                        self.push_system_message(format!("/goal: set failed — {e}"));
-                        return Ok(AppAction::Continue);
-                    }
-                }
+                // SetGoal{Replace} = "create or replace", so this is the
+                // single path for both initial-set and edit. The daemon
+                // publishes the lifecycle event onto the goal bus; the
+                // agent's next prompt build picks up the new `<goal_context>`.
+                let report = match self.rpc_set_goal_replace(&trimmed, budget) {
+                    Ok(detail) => format!("/goal: set — \"{}\"", detail.objective),
+                    Err(e) => format!("/goal: set failed — {e}"),
+                };
+                self.push_system_message(report);
+                Ok(AppAction::Continue)
             }
-        };
-        // Send as a regular user message so the agent picks it up and calls
-        // create_goal for the initial-set case.
-        self.handle_submit(&instruction)
+        }
     }
+
+    fn rpc_clear_goal(&self) -> Result<()> {
+        let client = self.client.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.clear_goal("").await
+            })
+        })
+    }
+
+    fn rpc_set_goal_status(&self, status: &str) -> Result<protocols::admin::GoalDetail> {
+        let client = self.client.clone();
+        let status = status.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.set_goal_status("", &status).await
+            })
+        })
+    }
+
+    fn rpc_set_goal_replace(
+        &self,
+        objective: &str,
+        budget: Option<i64>,
+    ) -> Result<protocols::admin::GoalDetail> {
+        let client = self.client.clone();
+        let objective = objective.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut c = client.lock().await;
+                c.set_goal_replace("", &objective, budget).await
+            })
+        })
+    }
+}
+
+/// Render a [`protocols::admin::GoalDetail`] as a 5-7 line summary card body.
+/// Mirrors [`format_goal_summary`] — but consumes the wire type rather than
+/// the in-process `cortex::goals::Goal`, since the TUI no longer opens the
+/// DB directly for reads.
+fn format_goal_detail(detail: &protocols::admin::GoalDetail) -> String {
+    let mut out = String::from("Goal\n────\n");
+    let status_label = cortex::goals::GoalStatus::from_str(&detail.status)
+        .map(|s| s.label().to_string())
+        .unwrap_or_else(|| detail.status.clone());
+    out.push_str(&format!("Status:    {}\n", status_label));
+    out.push_str(&format!("Objective: {}\n", detail.objective));
+    out.push_str(&format!(
+        "Time used: {}\n",
+        format_elapsed_seconds(detail.time_used_seconds)
+    ));
+    let budget = if detail.token_budget_present {
+        detail.token_budget.to_string()
+    } else {
+        "unbounded".to_string()
+    };
+    out.push_str(&format!("Tokens:    {} / {}\n", detail.tokens_used, budget));
+    let parsed = cortex::goals::GoalStatus::from_str(&detail.status);
+    let hint = match parsed {
+        Some(cortex::goals::GoalStatus::Active) => {
+            "Commands: /goal <new text>, /goal pause, /goal clear"
+        }
+        Some(cortex::goals::GoalStatus::Paused) => {
+            "Commands: /goal <new text>, /goal resume, /goal clear"
+        }
+        Some(cortex::goals::GoalStatus::BudgetLimited)
+        | Some(cortex::goals::GoalStatus::Complete) => "Commands: /goal <new text>, /goal clear",
+        None => "Commands: /goal <new text>, /goal clear",
+    };
+    out.push_str(hint);
+    out
 }
 
 /// Parse a leading `--budget N` flag from `args`, returning `(budget, rest)`.
@@ -986,121 +1092,6 @@ fn parse_goal_budget_prefix(args: &str) -> (Option<i64>, &str) {
         }
     }
     (None, args)
-}
-
-/// Open the daemon DB read-only and look up the most-recently-active session's
-/// goal. Returns a formatted summary card body.
-fn read_current_goal_summary() -> Result<String> {
-    let db = cortex::db::Database::open_readonly()?;
-    let session_id = match latest_session_id(&db)? {
-        Some(id) => id,
-        None => return Ok("No session yet — start chatting first.".to_string()),
-    };
-    let Some(goal) = db.get_goal(&session_id)? else {
-        return Ok("No goal set for this session.\nUse `/goal <text>` to set one.".to_string());
-    };
-    Ok(format_goal_summary(&goal))
-}
-
-fn latest_session_id(db: &cortex::db::Database) -> Result<Option<String>> {
-    let rows = db.list_sessions(1)?;
-    Ok(rows.into_iter().next().map(|r| r.id))
-}
-
-/// Open the daemon DB read-write to flip the current session's goal status.
-/// Returns the post-update goal (or `None` if no eligible goal existed).
-fn set_current_goal_status(
-    status: cortex::goals::GoalStatus,
-) -> Result<Option<cortex::goals::Goal>> {
-    let db = cortex::db::Database::open()?;
-    let Some(session_id) = latest_session_id(&db)? else {
-        return Ok(None);
-    };
-    let Some(current) = db.get_goal(&session_id)? else {
-        return Ok(None);
-    };
-    // Only act on legal transitions: pause Active -> Paused, resume Paused -> Active.
-    use cortex::goals::GoalStatus as S;
-    let allowed = matches!(
-        (current.status, status),
-        (S::Active, S::Paused) | (S::Paused, S::Active)
-    );
-    if !allowed {
-        return Ok(None);
-    }
-    db.update_goal(
-        &session_id,
-        cortex::db::GoalUpdate {
-            status: Some(status),
-            expected_goal_id: Some(current.goal_id),
-            ..Default::default()
-        },
-    )
-}
-
-/// Outcome of `/goal <text>`: either the DB row was replaced in-place
-/// (a goal already existed) or there was no goal to replace and the
-/// caller should fall back to handing the agent a `create_goal`
-/// instruction.
-enum GoalWriteOutcome {
-    Replaced(cortex::goals::Goal),
-    NeedsAgent,
-}
-
-/// Detect existing-goal state and either replace it directly or signal
-/// the caller to delegate to the agent. Keeps the "set a brand new
-/// goal" path going through the model (so `<goal_context>` and any
-/// future create-time hooks fire), while making the
-/// replace-existing path a single atomic DB write.
-fn set_or_replace_goal(objective: &str, budget: Option<i64>) -> Result<GoalWriteOutcome> {
-    let db = cortex::db::Database::open()?;
-    let Some(session_id) = latest_session_id(&db)? else {
-        return Ok(GoalWriteOutcome::NeedsAgent);
-    };
-    if db.get_goal(&session_id)?.is_none() {
-        return Ok(GoalWriteOutcome::NeedsAgent);
-    }
-    let g = db.replace_goal(
-        &session_id,
-        objective,
-        cortex::goals::GoalStatus::Active,
-        budget,
-    )?;
-    Ok(GoalWriteOutcome::Replaced(g))
-}
-
-fn clear_current_goal() -> Result<bool> {
-    let db = cortex::db::Database::open()?;
-    let Some(session_id) = latest_session_id(&db)? else {
-        return Ok(false);
-    };
-    db.delete_goal(&session_id)
-}
-
-/// Render a [`cortex::goals::Goal`] as a 5-7 line summary card body.
-fn format_goal_summary(goal: &cortex::goals::Goal) -> String {
-    let mut out = String::from("Goal\n────\n");
-    out.push_str(&format!("Status:    {}\n", goal.status.label()));
-    out.push_str(&format!("Objective: {}\n", goal.objective));
-    out.push_str(&format!(
-        "Time used: {}\n",
-        format_elapsed_seconds(goal.time_used_seconds)
-    ));
-    out.push_str(&format!(
-        "Tokens:    {} / {}\n",
-        goal.tokens_used,
-        goal.token_budget
-            .map(|b| b.to_string())
-            .unwrap_or_else(|| "unbounded".to_string())
-    ));
-    use cortex::goals::GoalStatus as S;
-    let hint = match goal.status {
-        S::Active => "Commands: /goal <new text>, /goal pause, /goal clear",
-        S::Paused => "Commands: /goal <new text>, /goal resume, /goal clear",
-        S::BudgetLimited | S::Complete => "Commands: /goal <new text>, /goal clear",
-    };
-    out.push_str(hint);
-    out
 }
 
 fn format_elapsed_seconds(s: i64) -> String {
@@ -1232,19 +1223,21 @@ mod tests {
     }
 
     #[test]
-    fn format_goal_summary_lists_status_and_objective_and_hint() {
-        let goal = cortex::goals::Goal {
+    fn format_goal_detail_lists_status_and_objective_and_hint() {
+        let detail = protocols::admin::GoalDetail {
+            present: true,
             session_id: "s".into(),
             goal_id: "g1".into(),
             objective: "ship it".into(),
-            status: cortex::goals::GoalStatus::Active,
-            token_budget: Some(5000),
+            status: "active".into(),
+            token_budget_present: true,
+            token_budget: 5000,
             tokens_used: 1200,
             time_used_seconds: 125,
             created_at: 0,
             updated_at: 0,
         };
-        let s = format_goal_summary(&goal);
+        let s = format_goal_detail(&detail);
         assert!(s.contains("Status:    active"));
         assert!(s.contains("Objective: ship it"));
         assert!(s.contains("2m 5s"));
@@ -1253,19 +1246,21 @@ mod tests {
     }
 
     #[test]
-    fn format_goal_summary_drops_pause_hint_when_complete() {
-        let goal = cortex::goals::Goal {
+    fn format_goal_detail_drops_pause_hint_when_complete() {
+        let detail = protocols::admin::GoalDetail {
+            present: true,
             session_id: "s".into(),
             goal_id: "g1".into(),
             objective: "done".into(),
-            status: cortex::goals::GoalStatus::Complete,
-            token_budget: None,
+            status: "complete".into(),
+            token_budget_present: false,
+            token_budget: 0,
             tokens_used: 0,
             time_used_seconds: 0,
             created_at: 0,
             updated_at: 0,
         };
-        let s = format_goal_summary(&goal);
+        let s = format_goal_detail(&detail);
         assert!(!s.contains("pause"));
         assert!(!s.contains("resume"));
         assert!(s.contains("/goal clear"));

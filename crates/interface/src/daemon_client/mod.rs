@@ -27,16 +27,16 @@ use protocols::admin::{
     ApprovedSenderRef, ClientTokenRef, CreateWebhookRequest, CreateWebhookResponse,
     CredentialEntry, CredentialList, DaemonStatus, DoctorSquelchClearRequest,
     DoctorSquelchSetRequest, DreamReport, Empty as AdminEmpty, ExportSessionRequest,
-    ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
-    HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
-    ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal, MonthlyTotalCost,
-    OnboardingState, PairingApproval, PairingFilter, PairingRequestList, PluginInstallRequest,
-    PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest, ResetCredentialsRequest,
-    RevokedClientToken, ScheduledTask, ScheduledTaskCreate, ScheduledTaskDetail, ScheduledTaskList,
-    ScheduledTaskRef, ScheduledTaskRunList, ScheduledTaskUpdate, SessionDetail, SessionList,
-    SessionRef, SetCredentialStrategyRequest, SetSubprocessPinnedRequest, SettingKey,
-    SettingMutation, SettingsSnapshot, SubprocessSnapshot, TriggerHeartbeatRequest, WarningList,
-    WebhookRef,
+    ExportSessionResponse, GetScheduledTaskRunsRequest, GoalDetail, GoalEvent as PbGoalEvent,
+    GoalMutation, GoalRef, HealReport, HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest,
+    IssueClientTokenResponse, ListCredentialsRequest, LogActivityRequest, MonthlyTokenTotal,
+    MonthlyTotalCost, OnboardingState, PairingApproval, PairingFilter, PairingRequestList,
+    PluginInstallRequest, PluginInstallResponse, RemoveCredentialRequest, RemoveProviderRequest,
+    ResetCredentialsRequest, RevokedClientToken, ScheduledTask, ScheduledTaskCreate,
+    ScheduledTaskDetail, ScheduledTaskList, ScheduledTaskRef, ScheduledTaskRunList,
+    ScheduledTaskUpdate, SessionDetail, SessionList, SessionRef, SetCredentialStrategyRequest,
+    SetSubprocessPinnedRequest, SettingKey, SettingMutation, SettingsSnapshot, SubprocessSnapshot,
+    TriggerHeartbeatRequest, WarningList, WebhookRef,
 };
 use protocols::pki::pki_client::PkiClient;
 use protocols::pki::{
@@ -1152,6 +1152,121 @@ impl DaemonClient {
             .await
             .context("Admin.SendApprovalGreeting failed")?;
         Ok(())
+    }
+
+    /// Read the goal for `session_id`. Empty `session_id` resolves to the
+    /// most-recently-active session (matches the TUI's "current session"
+    /// semantics). Returns the wire `GoalDetail`; callers check `present`
+    /// before reading other fields.
+    pub async fn get_goal(&mut self, session_id: &str) -> Result<GoalDetail> {
+        Ok(self
+            .admin
+            .get_goal(GoalRef {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.GetGoal failed")?
+            .into_inner())
+    }
+
+    /// Create a brand-new goal. Fails when one already exists.
+    pub async fn set_goal_create(
+        &mut self,
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> Result<GoalDetail> {
+        Ok(self
+            .admin
+            .set_goal(GoalMutation {
+                session_id: session_id.to_string(),
+                op: protocols::admin::goal_mutation::Op::Create as i32,
+                objective: objective.to_string(),
+                token_budget_present: token_budget.is_some(),
+                token_budget: token_budget.unwrap_or(0),
+                status: String::new(),
+            })
+            .await
+            .context("Admin.SetGoal{Create} failed")?
+            .into_inner())
+    }
+
+    /// Create or replace the goal. Regenerates `goal_id` and resets
+    /// accounting on replace.
+    pub async fn set_goal_replace(
+        &mut self,
+        session_id: &str,
+        objective: &str,
+        token_budget: Option<i64>,
+    ) -> Result<GoalDetail> {
+        Ok(self
+            .admin
+            .set_goal(GoalMutation {
+                session_id: session_id.to_string(),
+                op: protocols::admin::goal_mutation::Op::Replace as i32,
+                objective: objective.to_string(),
+                token_budget_present: token_budget.is_some(),
+                token_budget: token_budget.unwrap_or(0),
+                status: String::new(),
+            })
+            .await
+            .context("Admin.SetGoal{Replace} failed")?
+            .into_inner())
+    }
+
+    /// Change goal status. Accepted values: `active` (resume), `paused`,
+    /// `complete`. Daemon rejects illegal transitions.
+    pub async fn set_goal_status(&mut self, session_id: &str, status: &str) -> Result<GoalDetail> {
+        Ok(self
+            .admin
+            .set_goal(GoalMutation {
+                session_id: session_id.to_string(),
+                op: protocols::admin::goal_mutation::Op::SetStatus as i32,
+                objective: String::new(),
+                token_budget_present: false,
+                token_budget: 0,
+                status: status.to_string(),
+            })
+            .await
+            .context("Admin.SetGoal{SetStatus} failed")?
+            .into_inner())
+    }
+
+    /// Delete the goal row. No-op when none exists.
+    pub async fn clear_goal(&mut self, session_id: &str) -> Result<()> {
+        self.admin
+            .clear_goal(GoalRef {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.ClearGoal failed")?;
+        Ok(())
+    }
+
+    /// Flip an Active goal to Paused — wired to `/cancel` so an in-flight
+    /// turn aborted by the operator also pauses the Ralph loop. Returns
+    /// `present=false` on the detail when there was nothing to pause
+    /// (matches the no-op semantics on the server side).
+    pub async fn pause_goal_on_interrupt(&mut self, session_id: &str) -> Result<GoalDetail> {
+        Ok(self
+            .admin
+            .pause_goal_on_interrupt(GoalRef {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .context("Admin.PauseGoalOnInterrupt failed")?
+            .into_inner())
+    }
+
+    /// Subscribe to goal lifecycle events. Caller drains the stream;
+    /// dropping it cleans up the daemon-side subscriber.
+    pub async fn subscribe_goal_events(&mut self) -> Result<Streaming<PbGoalEvent>> {
+        Ok(self
+            .admin
+            .subscribe_goal_events(AdminEmpty {})
+            .await
+            .context("Admin.SubscribeGoalEvents failed")?
+            .into_inner())
     }
 
     /// Subscribe to heartbeat lifecycle events. Caller drains the stream;

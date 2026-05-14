@@ -13,6 +13,40 @@ pub mod metrics;
 pub mod prompts;
 pub mod runtime;
 
+/// Lifecycle kinds emitted to a [`GoalEventSink`]. Mirrors the wire-format
+/// `kind` field on the admin gRPC `GoalEvent` so the daemon can forward the
+/// value without re-mapping. Strings (not an enum) keep the trait surface
+/// stable when new kinds are added without cortex needing a recompile of
+/// downstream binaries.
+pub mod event_kind {
+    /// A goal row was just inserted (`create_goal` tool / `SetGoal{Create}` RPC).
+    pub const CREATED: &str = "created";
+    /// An existing goal's objective was replaced (regenerated `goal_id`).
+    pub const REPLACED: &str = "replaced";
+    /// Status changed (paused, resumed, etc.).
+    pub const STATUS_CHANGED: &str = "status_changed";
+    /// Accounting flipped status to `budget_limited`.
+    pub const BUDGET_LIMITED: &str = "budget_limited";
+    /// Goal completed via `update_goal`.
+    pub const COMPLETED: &str = "completed";
+    /// Goal row was deleted (`ClearGoal`).
+    pub const CLEARED: &str = "cleared";
+}
+
+/// Best-effort lifecycle sink for goal mutations. Implemented by the daemon
+/// (forwards onto the `SubscribeGoalEvents` broadcast channel) so any
+/// subscriber — TUI footer, future remote dashboard — can react without
+/// polling the DB.
+///
+/// `goal` is `None` for the `cleared` kind (the row no longer exists);
+/// always `Some` otherwise. Implementations MUST NOT panic; the agent loop
+/// fires these on hot paths and treats them as fire-and-forget.
+pub trait GoalEventSink: Send + Sync + 'static {
+    /// Forward one lifecycle event. `kind` is one of the [`event_kind`]
+    /// constants. `session_id` is non-empty.
+    fn emit(&self, kind: &str, session_id: &str, goal: Option<&Goal>);
+}
+
 /// Hard cap on objective length, mirrors codex's protocol cap and prevents the
 /// objective from blowing out the system-prompt suffix.
 pub const MAX_OBJECTIVE_CHARS: usize = 4_000;

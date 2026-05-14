@@ -142,6 +142,12 @@ Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreig
 
 `schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs (Hermes-style — silent preamble failures lose user trust). Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
 
+### Goals
+
+Per-session Ralph-loop objective. The DB row in `goals` is the source of truth; `GoalRuntimeState` (`crates/cortex/src/goals/runtime.rs`) caches the active `goal_id`, per-turn token/time baseline, and a one-shot steering queue. Each iteration the agent loop reads the row, calls `adopt()` to detect mid-flight objective swaps, marks the turn baseline (skipped in Plan mode), drains pending steering into history before the LLM call, charges `db.account_goal_usage` at `EndTurn` (atomic Active→BudgetLimited flip), and self-continues by injecting `continuation_prompt` whenever `should_continue(status, pending, plan_mode)` is true. Continuation is capped to one per turn-id via `try_reserve_continuation`.
+
+Model-visible tools: `get_goal` (read-only, Plan-mode OK), `create_goal`, `update_goal` (mark complete only). Operator surface: `/goal [pause|resume|clear|<text>]` via Admin gRPC `GetGoal` / `SetGoal` / `ClearGoal` / `PauseGoalOnInterrupt`. Lifecycle telemetry (`goal_created`, `goal_completed`, `goal_budget_limited`) is recorded as `EventCategory::Telemetry` vitals events with zero stat deltas — pure metrics, no posture multiplier change. The TUI footer subscribes to `SubscribeGoalEvents` for sub-100ms paused/budget-limited indicators. Sub-agents (`spawn_agent`) get a fresh `session_id` and intentionally do NOT inherit the parent goal.
+
 ### Config
 
 DB-only — `crates/cortex/src/config/`. All settings in SQLite `settings` table. Two-tier: DB → compiled defaults. `Config::load_from_db()` builds runtime; `SettingsResolver` for set/get/unset. No config.toml.

@@ -8,18 +8,20 @@
 //!   (set via `with_heartbeat_trigger_sender`).
 //! - The daemon's `shutdown_tx` for Shutdown (set via `with_shutdown_sender`).
 
+use crate::goal_bus::GoalEventBus;
 use crate::heartbeat::{HeartbeatBus, HeartbeatSource, HeartbeatTrigger};
 use crate::session::{DaemonSessionExecutor, SessionRegistry};
 use cortex::db::Database;
 use cortex::process_registry::{ProcessEntry, ProcessRegistry};
 use cortex::settings::SettingsResolver;
 use protocols::admin::{
-    admin_server::Admin, ActivityLogQuery, ActivityLogText, AddCredentialRequest,
-    AddProviderRequest, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef, ApiKeyValue,
-    ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList, ApprovedSenderRef, ClientTokenRef,
-    CreateWebhookRequest, CreateWebhookResponse, CredentialEntry, CredentialList, DaemonStatus,
-    DoctorSquelchClearRequest, DoctorSquelchClearResponse, DoctorSquelchSetRequest, DreamReport,
-    Empty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest, HealReport,
+    admin_server::Admin, goal_mutation::Op as GoalMutationOp, ActivityLogQuery, ActivityLogText,
+    AddCredentialRequest, AddProviderRequest, AmbientStatus, ApiKeyEntry, ApiKeyList, ApiKeyRef,
+    ApiKeyValue, ApprovalGreetingRequest, ApprovedSender, ApprovedSenderList, ApprovedSenderRef,
+    ClientTokenRef, CreateWebhookRequest, CreateWebhookResponse, CredentialEntry, CredentialList,
+    DaemonStatus, DoctorSquelchClearRequest, DoctorSquelchClearResponse, DoctorSquelchSetRequest,
+    DreamReport, Empty, ExportSessionRequest, ExportSessionResponse, GetScheduledTaskRunsRequest,
+    GoalDetail, GoalEvent as PbGoalEvent, GoalMutation, GoalRef, HealReport,
     HeartbeatEvent as PbHeartbeatEvent, IssueClientTokenRequest, IssueClientTokenResponse,
     KeychainRef, ListCredentialsRequest, LogActivityRequest, MessageView, MonthlyTokenTotal,
     MonthlyTotalCost, OnboardingState, PairCredentialRequest, PairCredentialResponse,
@@ -48,6 +50,7 @@ pub struct AdminSvc {
     executor: Mutex<Option<Arc<DaemonSessionExecutor>>>,
     config_notify_tx: Mutex<Option<mpsc::Sender<cortex::config::Config>>>,
     process_registry: Mutex<Option<ProcessRegistry>>,
+    goal_bus: Mutex<Option<GoalEventBus>>,
 }
 
 impl AdminSvc {
@@ -61,7 +64,26 @@ impl AdminSvc {
             executor: Mutex::new(None),
             config_notify_tx: Mutex::new(None),
             process_registry: Mutex::new(None),
+            goal_bus: Mutex::new(None),
         }
+    }
+
+    /// Wire the goal-event broadcast bus. `Admin.SubscribeGoalEvents` reads
+    /// from this; the four goal RPC handlers and the agent loop publish
+    /// into it via [`GoalEventBus::publish`] / [`GoalEventBus::as_sink`].
+    pub fn with_goal_bus(self, bus: GoalEventBus) -> Self {
+        *self
+            .goal_bus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bus);
+        self
+    }
+
+    fn goal_bus_handle(&self) -> Option<GoalEventBus> {
+        self.goal_bus
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Wire the daemon-side subprocess registry. `Admin.GetSubprocesses`
@@ -1683,6 +1705,317 @@ impl Admin for AdminSvc {
         };
         result.map_err(|e| TStatus::not_found(e.to_string()))?;
         Ok(Response::new(Empty {}))
+    }
+
+    async fn get_goal(&self, req: Request<GoalRef>) -> Result<Response<GoalDetail>, TStatus> {
+        let session_id_req = req.into_inner().session_id;
+        let detail = tokio::task::spawn_blocking(move || -> anyhow::Result<GoalDetail> {
+            let db = Database::open()?;
+            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
+                return Ok(GoalDetail::default());
+            };
+            Ok(db
+                .get_goal(&session_id)?
+                .map(|g| goal_to_detail(&g))
+                .unwrap_or_default())
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("get_goal task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("get_goal failed: {e}")))?;
+        Ok(Response::new(detail))
+    }
+
+    async fn set_goal(&self, req: Request<GoalMutation>) -> Result<Response<GoalDetail>, TStatus> {
+        let req = req.into_inner();
+        let op = GoalMutationOp::try_from(req.op).map_err(|_| {
+            TStatus::invalid_argument(format!("unknown op discriminator: {}", req.op))
+        })?;
+        if op == GoalMutationOp::Unspecified {
+            return Err(TStatus::invalid_argument("op is required (UNSPECIFIED)"));
+        }
+        let session_id_req = req.session_id.clone();
+        let objective = req.objective.clone();
+        let status_raw = req.status.clone();
+        let token_budget = if req.token_budget_present {
+            Some(req.token_budget)
+        } else {
+            None
+        };
+        let bus = self.goal_bus_handle();
+        let outcome = tokio::task::spawn_blocking(move || -> anyhow::Result<SetGoalOutcome> {
+            let db = Database::open()?;
+            let session_id = resolve_goal_session_id(&db, &session_id_req)?
+                .ok_or_else(|| anyhow::anyhow!("no active session — start a turn first"))?;
+            match op {
+                GoalMutationOp::Unspecified => unreachable!(),
+                GoalMutationOp::Create => {
+                    let obj = cortex::goals::validate_objective(&objective)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let inserted = db.insert_goal(
+                        &session_id,
+                        &obj,
+                        cortex::goals::GoalStatus::Active,
+                        budget,
+                    )?;
+                    let goal = inserted
+                        .ok_or_else(|| anyhow::anyhow!("goal already exists for this session"))?;
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind: cortex::goals::event_kind::CREATED,
+                    })
+                }
+                GoalMutationOp::Replace => {
+                    let obj = cortex::goals::validate_objective(&objective)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let existed = db.get_goal(&session_id)?.is_some();
+                    let g = db.replace_goal(
+                        &session_id,
+                        &obj,
+                        cortex::goals::GoalStatus::Active,
+                        budget,
+                    )?;
+                    Ok(SetGoalOutcome {
+                        goal: Some(g),
+                        kind: if existed {
+                            cortex::goals::event_kind::REPLACED
+                        } else {
+                            cortex::goals::event_kind::CREATED
+                        },
+                    })
+                }
+                GoalMutationOp::SetStatus => {
+                    let new_status = cortex::goals::GoalStatus::from_str(status_raw.trim())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "status must be one of active|paused|complete (got {status_raw:?})"
+                            )
+                        })?;
+                    if matches!(new_status, cortex::goals::GoalStatus::BudgetLimited) {
+                        return Err(anyhow::anyhow!(
+                            "budget_limited is system-only; cannot be set via RPC"
+                        ));
+                    }
+                    let current = db
+                        .get_goal(&session_id)?
+                        .ok_or_else(|| anyhow::anyhow!("no goal set for this session"))?;
+                    use cortex::goals::GoalStatus as S;
+                    let allowed = matches!(
+                        (current.status, new_status),
+                        (S::Active, S::Paused)
+                            | (S::Paused, S::Active)
+                            | (S::Active, S::Complete)
+                            | (S::Paused, S::Complete)
+                            | (S::BudgetLimited, S::Complete)
+                    );
+                    if !allowed {
+                        return Err(anyhow::anyhow!(
+                            "illegal transition {} -> {}",
+                            current.status.as_str(),
+                            new_status.as_str()
+                        ));
+                    }
+                    let updated = db.update_goal(
+                        &session_id,
+                        cortex::db::GoalUpdate {
+                            status: Some(new_status),
+                            expected_goal_id: Some(current.goal_id),
+                            ..Default::default()
+                        },
+                    )?;
+                    let goal = updated
+                        .ok_or_else(|| anyhow::anyhow!("goal disappeared during status update"))?;
+                    let kind = if goal.status == cortex::goals::GoalStatus::Complete {
+                        cortex::goals::event_kind::COMPLETED
+                    } else {
+                        cortex::goals::event_kind::STATUS_CHANGED
+                    };
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind,
+                    })
+                }
+                GoalMutationOp::SetBudget => {
+                    let budget = cortex::goals::validate_budget(token_budget)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let current = db
+                        .get_goal(&session_id)?
+                        .ok_or_else(|| anyhow::anyhow!("no goal set for this session"))?;
+                    let updated = db.update_goal(
+                        &session_id,
+                        cortex::db::GoalUpdate {
+                            token_budget: Some(budget),
+                            expected_goal_id: Some(current.goal_id),
+                            ..Default::default()
+                        },
+                    )?;
+                    let goal = updated
+                        .ok_or_else(|| anyhow::anyhow!("goal disappeared during budget update"))?;
+                    Ok(SetGoalOutcome {
+                        goal: Some(goal),
+                        kind: cortex::goals::event_kind::STATUS_CHANGED,
+                    })
+                }
+            }
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("set_goal task panicked: {e}")))?
+        .map_err(|e| TStatus::invalid_argument(format!("set_goal: {e}")))?;
+
+        let detail = outcome
+            .goal
+            .as_ref()
+            .map(goal_to_detail)
+            .unwrap_or_default();
+        if let (Some(bus), Some(goal)) = (bus, outcome.goal.as_ref()) {
+            bus.publish(crate::goal_bus::DaemonGoalEvent {
+                session_id: goal.session_id.clone(),
+                kind: outcome.kind.to_string(),
+                goal: Some(goal.clone()),
+                emitted_at_unix: now_unix(),
+            });
+        }
+        Ok(Response::new(detail))
+    }
+
+    async fn clear_goal(&self, req: Request<GoalRef>) -> Result<Response<Empty>, TStatus> {
+        let session_id_req = req.into_inner().session_id;
+        let bus = self.goal_bus_handle();
+        let removed = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+            let db = Database::open()?;
+            let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
+                return Ok(None);
+            };
+            let did_remove = db.delete_goal(&session_id)?;
+            Ok(if did_remove { Some(session_id) } else { None })
+        })
+        .await
+        .map_err(|e| TStatus::internal(format!("clear_goal task panicked: {e}")))?
+        .map_err(|e| TStatus::internal(format!("clear_goal failed: {e}")))?;
+        if let (Some(bus), Some(session_id)) = (bus, removed) {
+            bus.publish(crate::goal_bus::DaemonGoalEvent {
+                session_id,
+                kind: cortex::goals::event_kind::CLEARED.to_string(),
+                goal: None,
+                emitted_at_unix: now_unix(),
+            });
+        }
+        Ok(Response::new(Empty {}))
+    }
+
+    async fn pause_goal_on_interrupt(
+        &self,
+        req: Request<GoalRef>,
+    ) -> Result<Response<GoalDetail>, TStatus> {
+        let session_id_req = req.into_inner().session_id;
+        let bus = self.goal_bus_handle();
+        let paused =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<cortex::goals::Goal>> {
+                let db = Database::open()?;
+                let Some(session_id) = resolve_goal_session_id(&db, &session_id_req)? else {
+                    return Ok(None);
+                };
+                db.pause_active_goal(&session_id)
+            })
+            .await
+            .map_err(|e| TStatus::internal(format!("pause_goal task panicked: {e}")))?
+            .map_err(|e| TStatus::internal(format!("pause_goal failed: {e}")))?;
+        let detail = paused.as_ref().map(goal_to_detail).unwrap_or_default();
+        if let (Some(bus), Some(goal)) = (bus, paused.as_ref()) {
+            bus.publish(crate::goal_bus::DaemonGoalEvent {
+                session_id: goal.session_id.clone(),
+                kind: cortex::goals::event_kind::STATUS_CHANGED.to_string(),
+                goal: Some(goal.clone()),
+                emitted_at_unix: now_unix(),
+            });
+        }
+        Ok(Response::new(detail))
+    }
+
+    type SubscribeGoalEventsStream =
+        Pin<Box<dyn Stream<Item = Result<PbGoalEvent, TStatus>> + Send + 'static>>;
+
+    async fn subscribe_goal_events(
+        &self,
+        _req: Request<Empty>,
+    ) -> Result<Response<Self::SubscribeGoalEventsStream>, TStatus> {
+        let bus = self
+            .goal_bus_handle()
+            .ok_or_else(|| TStatus::failed_precondition("goal event bus not wired"))?;
+        let mut sub = bus.subscribe();
+        let (tx, rx) = mpsc::channel::<Result<PbGoalEvent, TStatus>>(16);
+        tokio::spawn(async move {
+            loop {
+                match sub.recv().await {
+                    Ok(evt) => {
+                        let pb = PbGoalEvent {
+                            session_id: evt.session_id,
+                            kind: evt.kind,
+                            goal: Some(evt.goal.as_ref().map(goal_to_detail).unwrap_or_default()),
+                            emitted_at_unix: evt.emitted_at_unix,
+                        };
+                        if tx.send(Ok(pb)).await.is_err() {
+                            return; // client gone
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("goal stream subscriber lagged by {n}; continuing");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+struct SetGoalOutcome {
+    goal: Option<cortex::goals::Goal>,
+    kind: &'static str,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Resolve the session id the goal RPC operates on. Empty session_id means
+/// "the most recently active session"; matches the TUI's `latest_session_id`
+/// behaviour so users issuing `/goal …` from a freshly-opened terminal hit
+/// the session they expect. Returns `None` when no session exists yet.
+fn resolve_goal_session_id(
+    db: &cortex::db::Database,
+    requested: &str,
+) -> anyhow::Result<Option<String>> {
+    let trimmed = requested.trim();
+    if !trimmed.is_empty() {
+        return Ok(Some(trimmed.to_string()));
+    }
+    Ok(db.list_sessions(1)?.into_iter().next().map(|r| r.id))
+}
+
+/// Convert the core goal struct to its wire projection. `Option<i64>` budget
+/// is encoded as `(present, value)` so the proto can distinguish "no
+/// budget" from "budget == 0" (which `validate_budget` rejects anyway, but
+/// the wire is self-describing).
+fn goal_to_detail(g: &cortex::goals::Goal) -> GoalDetail {
+    GoalDetail {
+        present: true,
+        session_id: g.session_id.clone(),
+        goal_id: g.goal_id.clone(),
+        objective: g.objective.clone(),
+        status: g.status.as_str().to_string(),
+        token_budget_present: g.token_budget.is_some(),
+        token_budget: g.token_budget.unwrap_or(0),
+        tokens_used: g.tokens_used,
+        time_used_seconds: g.time_used_seconds,
+        created_at: g.created_at,
+        updated_at: g.updated_at,
     }
 }
 

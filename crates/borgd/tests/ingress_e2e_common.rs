@@ -234,6 +234,7 @@ fn install_global_executor() {
         BorgMetrics::noop(),
         None,
         None,
+        None,
     ));
     session_executor::set_global(exec);
 }

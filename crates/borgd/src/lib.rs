@@ -17,6 +17,7 @@ pub mod budget_tick;
 pub mod channel_delivery;
 pub mod cost_events;
 pub mod daemon;
+pub mod goal_bus;
 pub mod grpc;
 pub mod heartbeat;
 pub mod heartbeat_augmenters;

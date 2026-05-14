@@ -84,6 +84,10 @@ const RATE_LIMITS: &[(&str, u32)] = &[
     ("correction", 3),
     ("creation", 3),
     ("negative_sentiment", 3),
+    // Telemetry records lifecycle facts (e.g. goal_*) that contribute no
+    // stat deltas; keep the cap high enough that several goal cycles per
+    // hour don't get silently dropped.
+    ("telemetry", 20),
 ];
 
 const RATE_LIMIT_DEFAULT: u32 = 5;
@@ -137,6 +141,11 @@ pub enum EventCategory {
     Creation,
     /// User expressed strong negative sentiment (profanity, hostility).
     NegativeSentiment,
+    /// Lifecycle / telemetry fact recorded into the audit chain with zero
+    /// stat deltas. Used for events like `goal_created`, `goal_completed`,
+    /// `goal_budget_limited` that should be replayable from the chain but
+    /// must not move stability/focus/sync/growth/happiness.
+    Telemetry,
 }
 
 impl fmt::Display for EventCategory {
@@ -148,6 +157,7 @@ impl fmt::Display for EventCategory {
             Self::Correction => write!(f, "correction"),
             Self::Creation => write!(f, "creation"),
             Self::NegativeSentiment => write!(f, "negative_sentiment"),
+            Self::Telemetry => write!(f, "telemetry"),
         }
     }
 }
@@ -162,6 +172,7 @@ impl EventCategory {
             "correction" => Some(Self::Correction),
             "creation" => Some(Self::Creation),
             "negative_sentiment" => Some(Self::NegativeSentiment),
+            "telemetry" => Some(Self::Telemetry),
             _ => None,
         }
     }
@@ -322,6 +333,16 @@ pub fn deltas_for(category: EventCategory) -> StatDeltas {
             growth: 0,
             happiness: -10,
         },
+        // Telemetry is a pure audit-trail entry. Zero deltas keep posture
+        // multipliers untouched while still pinning the fact into the
+        // HMAC-verified chain so replay can prove it happened.
+        EventCategory::Telemetry => StatDeltas {
+            stability: 0,
+            focus: 0,
+            sync: 0,
+            growth: 0,
+            happiness: 0,
+        },
     }
 }
 
@@ -335,6 +356,7 @@ pub(crate) fn validate_deltas(category: &str, deltas: StatDeltas) -> Result<(), 
         "correction" => deltas_for(EventCategory::Correction),
         "creation" => deltas_for(EventCategory::Creation),
         "negative_sentiment" => deltas_for(EventCategory::NegativeSentiment),
+        "telemetry" => deltas_for(EventCategory::Telemetry),
         _ => return Err("unknown vitals category"),
     };
     if deltas != expected {
@@ -841,6 +863,31 @@ mod tests {
             (d.stability, d.focus, d.sync, d.growth, d.happiness),
             (-2, -1, 0, 0, -10)
         );
+
+        // Telemetry must be a pure audit-trail entry: zero deltas across
+        // every stat so posture multipliers stay untouched. This is the
+        // invariant that lets `/goal` events live on the HMAC chain
+        // without inflating or deflating stability/focus/etc.
+        let d = deltas_for(EventCategory::Telemetry);
+        assert_eq!(
+            (d.stability, d.focus, d.sync, d.growth, d.happiness),
+            (0, 0, 0, 0, 0)
+        );
+        // Round-trip the wire string so future renames don't silently
+        // diverge.
+        assert_eq!(format!("{}", EventCategory::Telemetry), "telemetry");
+        assert!(matches!(
+            EventCategory::parse("telemetry"),
+            Some(EventCategory::Telemetry)
+        ));
+        // validate_deltas must accept the zero-delta shape.
+        assert!(validate_deltas("telemetry", d).is_ok());
+        // …and reject any nonzero shape for that category.
+        let bad = StatDeltas {
+            stability: 1,
+            ..Default::default()
+        };
+        assert!(validate_deltas("telemetry", bad).is_err());
     }
 
     #[test]

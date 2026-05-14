@@ -356,6 +356,86 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         });
     }
 
+    // Goal-lifecycle subscription. Mirrors the heartbeat pattern above:
+    // open the stream once at TUI startup, forward each event into the
+    // App's `goal_event_rx`. The App updates `goal_status` so the footer
+    // hint reflects "paused" / "budget reached" within broadcast latency
+    // without polling. Initial seed comes from `GetGoal` so the footer is
+    // already correct before the first event lands.
+    let (goal_ui_tx, goal_ui_rx) = mpsc::channel::<crate::tui::app::GoalUiEvent>(16);
+    let goal_event_rx: Option<mpsc::Receiver<crate::tui::app::GoalUiEvent>> = Some(goal_ui_rx);
+    {
+        let seed_client = client.clone();
+        let seed_tx = goal_ui_tx.clone();
+        tokio::spawn(async move {
+            let mut c = seed_client;
+            match c.get_goal("").await {
+                Ok(detail) if detail.present => {
+                    let status = cortex::goals::GoalStatus::from_str(&detail.status);
+                    let _ = seed_tx
+                        .send(crate::tui::app::GoalUiEvent {
+                            kind: "status_changed".to_string(),
+                            status,
+                        })
+                        .await;
+                }
+                Ok(_) => {
+                    let _ = seed_tx
+                        .send(crate::tui::app::GoalUiEvent {
+                            kind: cortex::goals::event_kind::CLEARED.to_string(),
+                            status: None,
+                        })
+                        .await;
+                }
+                Err(e) => tracing::warn!("initial GetGoal seed failed: {e}"),
+            }
+        });
+    }
+    {
+        let mut sub_client = client.clone();
+        let cancel = heartbeat_cancel.clone();
+        tokio::spawn(async move {
+            let mut stream = match sub_client.subscribe_goal_events().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("subscribe_goal_events failed: {e}");
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    next = stream.message() => {
+                        match next {
+                            Ok(Some(evt)) => {
+                                let status = evt
+                                    .goal
+                                    .as_ref()
+                                    .filter(|g| g.present)
+                                    .and_then(|g| cortex::goals::GoalStatus::from_str(&g.status));
+                                if goal_ui_tx
+                                    .send(crate::tui::app::GoalUiEvent {
+                                        kind: evt.kind,
+                                        status,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(None) => return,
+                            Err(e) => {
+                                tracing::warn!("goal stream error: {e}");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Auto-start gateway if enabled and any channels are installed
     let gateway_shutdown_token = CancellationToken::new();
     let _gateway_guard = gateway_shutdown_token.clone().drop_guard();
@@ -389,6 +469,7 @@ pub async fn run(resume: Option<String>) -> Result<Option<ResumeHint>> {
         heartbeat_event_tx,
         poke_tx,
         app_client,
+        goal_event_rx,
     );
     if let Some((title, count)) = resumed_info {
         app.push_system_message(format!("Resumed session: {title} ({count} messages)"));
@@ -693,6 +774,18 @@ async fn run_event_loop(
                         drain_queued_if_idle(app)?
                     }
                 }
+            }
+
+            // Goal-lifecycle events (footer indicator only).
+            Some(evt) = async {
+                if let Some(rx) = &mut app.goal_event_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                app.apply_goal_event(evt);
+                AppAction::Continue
             }
 
             // Heartbeat events

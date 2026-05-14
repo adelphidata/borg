@@ -616,6 +616,16 @@ mod tests {
     }
 
     #[test]
+    fn goal_tools_plan_mode_gating() {
+        // get_goal is read-only and explicitly allowed in Plan mode.
+        assert!(allowed_in_plan_mode_name(tn::GET_GOAL));
+        // create_goal / update_goal mutate the goals table — must be
+        // blocked in Plan mode (the agent runs them in Execute only).
+        assert!(!allowed_in_plan_mode_name(tn::CREATE_GOAL));
+        assert!(!allowed_in_plan_mode_name(tn::UPDATE_GOAL));
+    }
+
+    #[test]
     fn parallel_safe_matches_legacy_dispatcher() {
         // The pre-refactor `dispatch_parallel_safe_tool` table is the
         // ground truth for which tools the dispatcher actually has a

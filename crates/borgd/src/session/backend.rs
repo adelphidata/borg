@@ -199,6 +199,11 @@ pub struct AgentBackend {
 impl AgentBackend {
     /// Build a backend hosting a fresh agent. `resume_id` (if set) loads
     /// existing session history; otherwise a new session is started.
+    ///
+    /// `goal_event_sink` is the daemon-side bus that `Admin.SubscribeGoalEvents`
+    /// publishes to — passing `None` is fine (the agent loop tolerates an
+    /// absent sink), but production wires one through so the TUI footer and
+    /// any other subscribers see lifecycle events without polling.
     pub fn new(
         config: Config,
         metrics: BorgMetrics,
@@ -206,6 +211,7 @@ impl AgentBackend {
         config_rx: Option<watch::Receiver<Config>>,
         cost_event_sink: Option<Arc<dyn CostEventSink>>,
         execution_context: Option<cortex::execution_context::ExecutionContext>,
+        goal_bus: Option<crate::goal_bus::GoalEventBus>,
     ) -> anyhow::Result<Arc<Self>> {
         let mut agent = Agent::new(config, metrics)?;
         if let Some(execution_context) = execution_context {
@@ -216,6 +222,9 @@ impl AgentBackend {
         }
         if let Some(sink) = cost_event_sink {
             agent.set_cost_event_sink(sink);
+        }
+        if let Some(bus) = goal_bus {
+            agent.set_goal_event_sink(bus.as_sink());
         }
 
         // Register the same hook set the in-process REPL/TUI uses. Failed

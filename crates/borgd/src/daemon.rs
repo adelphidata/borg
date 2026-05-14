@@ -37,6 +37,7 @@ struct DaemonSessionFactory {
     config_rx: tokio::sync::watch::Receiver<CoreConfig>,
     cost_event_sink: Arc<dyn CostEventSink>,
     process_registry: cortex::process_registry::ProcessRegistry,
+    goal_bus: Option<crate::goal_bus::GoalEventBus>,
 }
 
 impl SessionFactory for DaemonSessionFactory {
@@ -59,6 +60,7 @@ impl SessionFactory for DaemonSessionFactory {
             Some(self.config_rx.clone()),
             Some(self.cost_event_sink.clone()),
             execution_context,
+            self.goal_bus.clone(),
         )?;
         Ok(SessionHost::new(backend))
     }
@@ -146,10 +148,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     // find it without threading parameters through the dispatcher.
     let process_registry = cortex::process_registry::ProcessRegistry::new();
     cortex::process_registry::install_global(process_registry.clone());
+    // Single goal-event bus shared by the orchestrator's session executor,
+    // the SessionFactory used for `Session.Open` connections, and the Admin
+    // RPC layer — so every mutation path (agent loop, four goal RPCs, the
+    // TUI's `/cancel`) publishes onto the same channel the TUI footer
+    // subscribes to. Created once here so both `Session.Open`-created
+    // backends and orchestrator-spawned backends see the same bus.
+    let goal_bus = crate::goal_bus::GoalEventBus::new();
     let factory: Arc<dyn SessionFactory> = Arc::new(DaemonSessionFactory {
         config_rx: config_watcher.subscribe(),
         cost_event_sink: cost_event_sink.clone(),
         process_registry: process_registry.clone(),
+        goal_bus: Some(goal_bus.clone()),
     });
     let capability_router = Arc::new(CapabilityRouter::new());
 
@@ -205,6 +215,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 orchestrator_token.clone(),
                 config_watcher.subscribe(),
                 cost_event_sink.clone(),
+                goal_bus.clone(),
             );
             grpc::AdminExtras {
                 heartbeat_bus: Some(handles.heartbeat_bus),
@@ -213,6 +224,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 shutdown_tx: Some(shutdown_tx.clone()),
                 config_notify_tx: Some(config_watcher.notify_sender()),
                 process_registry: Some(process_registry.clone()),
+                goal_bus: Some(handles.goal_bus),
             }
         }
         Err(e) => {
@@ -226,6 +238,7 @@ pub async fn run(cfg: Config) -> Result<()> {
                 shutdown_tx: Some(shutdown_tx.clone()),
                 config_notify_tx: Some(config_watcher.notify_sender()),
                 process_registry: Some(process_registry.clone()),
+                goal_bus: Some(goal_bus.clone()),
             }
         }
     };

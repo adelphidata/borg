@@ -5,6 +5,7 @@
 //! `service::run_daemon` shim — the latter remains until the legacy entry
 //! points are fully retired.
 
+use crate::goal_bus::GoalEventBus;
 use crate::heartbeat::HeartbeatTrigger;
 use crate::heartbeat::{self, HeartbeatBus};
 use crate::scheduler;
@@ -102,6 +103,10 @@ pub struct OrchestratorHandles {
     pub poke_tx: mpsc::Sender<()>,
     /// Executor `Admin.SendApprovalGreeting` and the heartbeat scheduler share.
     pub executor: Arc<DaemonSessionExecutor>,
+    /// Bus subscribers read for `Admin.SubscribeGoalEvents`. The same bus
+    /// is plumbed into every agent backend so accounting transitions and
+    /// the four goal RPC handlers all publish to one place.
+    pub goal_bus: GoalEventBus,
 }
 
 /// Start every long-running subsystem managed by `borgd`. Returns control
@@ -114,6 +119,7 @@ pub fn start(
     shutdown: CancellationToken,
     config_rx: watch::Receiver<Config>,
     cost_event_sink: Arc<dyn CostEventSink>,
+    goal_bus: GoalEventBus,
 ) -> OrchestratorHandles {
     let executor = Arc::new(DaemonSessionExecutor::new(
         registry,
@@ -121,6 +127,7 @@ pub fn start(
         BorgMetrics::noop(),
         Some(config_rx.clone()),
         Some(cost_event_sink.clone()),
+        Some(goal_bus.clone()),
     ));
     let (heartbeat_bus, heartbeat_trigger_tx, poke_tx) = heartbeat::spawn(
         config.clone(),
@@ -296,6 +303,7 @@ pub fn start(
         heartbeat_trigger_tx,
         poke_tx,
         executor,
+        goal_bus,
     }
 }
 
@@ -322,6 +330,7 @@ pub async fn run_lifecycle(shutdown: CancellationToken) -> Result<()> {
         shutdown.clone(),
         config_rx,
         cost_event_sink,
+        GoalEventBus::new(),
     );
     shutdown.cancelled().await;
     Ok(())

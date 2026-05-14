@@ -556,6 +556,26 @@ impl<'a> App<'a> {
             ],
         };
 
+        // Goal-state hint. Surfaces the two cases the operator most needs to
+        // notice — Paused (Ralph loop is dormant; user needs to `/goal
+        // resume`) and BudgetLimited (auto-continuation stopped; user needs
+        // to bump the budget or wrap up). Active and Complete are silent
+        // because the regular tooling already makes them visible (the agent
+        // is mid-turn or the goal is done). Pushed onto `hints` so it
+        // participates in priority-based fitting when the terminal narrows.
+        let mut hints = hints;
+        match self.goal_status {
+            Some(cortex::goals::GoalStatus::Paused) => hints.push(FooterHint {
+                text: "Goal paused (/goal resume)".into(),
+                priority: 80,
+            }),
+            Some(cortex::goals::GoalStatus::BudgetLimited) => hints.push(FooterHint {
+                text: "Goal budget reached".into(),
+                priority: 75,
+            }),
+            _ => {}
+        }
+
         let pct = self.compute_context_pct();
         let pct_style = if pct >= 95 {
             theme::error_style()
@@ -1051,7 +1071,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::sync::Mutex;
         let client = Arc::new(Mutex::new(DaemonClient::lazy_for_tests()));
-        App::new(Config::default(), None, None, None, client)
+        App::new(Config::default(), None, None, None, client, None)
     }
 
     use super::super::AmbientStatus;
