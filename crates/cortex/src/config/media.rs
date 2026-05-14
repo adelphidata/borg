@@ -702,18 +702,38 @@ impl Default for PluginsConfig {
     }
 }
 
-/// WASM-plugin runtime kill switches.
+/// WASM-plugin runtime kill switches and rate limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WasmPluginsConfig {
     /// When false, WASM tool definitions are hidden from the LLM and dispatch
-    /// returns "tool not found" — useful for incident response.
+    /// returns "tool not found" — global incident-response kill switch.
     pub enabled: bool,
+    /// Per-plugin disable list (exact `plugin_id` match). A disabled plugin's
+    /// tools are hidden from the LLM and dispatch refuses to execute, but the
+    /// install row and on-disk files remain so re-enable is a one-flag toggle.
+    pub disabled_plugin_ids: Vec<String>,
+    /// Per-publisher disable list (base64 ed25519 verifying key). Hides every
+    /// plugin signed by the key without removing the key from
+    /// `security.trusted_publisher_keys` — for paused investigations rather
+    /// than full distrust.
+    pub disabled_publisher_keys: Vec<String>,
+    /// Refill rate for the per-plugin token bucket. Refused calls emit
+    /// `wasm_plugin_rate_limited` and never reach the wasmtime sandbox.
+    pub rate_limit_per_minute: u32,
+    /// Maximum bucket depth — controls burst tolerance.
+    pub rate_limit_burst: u32,
 }
 
 impl Default for WasmPluginsConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            disabled_plugin_ids: Vec::new(),
+            disabled_publisher_keys: Vec::new(),
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+        }
     }
 }
 

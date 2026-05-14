@@ -60,7 +60,7 @@ Account naming is `borg-<KEY>` under the service `borg-<plugin-id>`. The `servic
 
 ## WASM plugin sandbox
 
-Third-party tool plugins ship as signed, capability-sandboxed WebAssembly modules instead of native code. V1 is **tool-only**: a plugin contributes one or more LLM-callable tools. Channels, hooks, onboard scripts, and background tasks stay out of scope until the host boundary has more mileage.
+Third-party tool plugins ship as signed, capability-sandboxed WebAssembly modules instead of native code. The sandbox is **tool-only by design**: a plugin contributes one or more LLM-callable tools. Channels, hooks, onboarding scripts, and background tasks are first-class native subsystems and intentionally do not run as WASM plugins — they don't need the publisher-signed-untrusted-code trust model the sandbox exists to provide, and forcing them through a narrow ABI would cost ergonomics without buying security.
 
 Source: `crates/plugins/src/wasm.rs`. Schema tag: `borg.plugin.v1`.
 
@@ -150,10 +150,14 @@ Plugin-originated HTTP (when the capability is granted) goes through a host-boun
 - **Capability-gated host imports** plus **static validation at install** means an unexpected host call surfaces *before* runtime, not as a confusing runtime error.
 - **Narrow ABI** (`alloc` + `borg_tool_call`) keeps the host attack surface small and makes guest SDKs trivial to write in any language with a WASM target.
 
-### Out of scope for v1
+### Operator surface
 
-Channels, hooks, onboarding scripts, and long-running background tasks remain compiled-in or `~/.borg/`-script-only. They will reuse the same package + verification machinery when promoted, but the host boundary needs more mileage on tool-only plugins first.
+- **Kill switches.** `borg plugin disable <id>` / `enable <id>` flip a row's status without touching the install; `disable --publisher <key>` / `enable-publisher <key>` blanket-disable by signing key. Both lists live in `plugins.wasm.disabled_plugin_ids` / `plugins.wasm.disabled_publisher_keys` and are checked at tool-listing and dispatch time.
+- **Rate limiting.** Per-`plugin_id` token bucket gated by `plugins.wasm.rate_limit_per_minute` (default 60) and `plugins.wasm.rate_limit_burst` (default 10). Refused calls return a retry-after error to the model and emit a `wasm_plugin_rate_limited` audit event. Zero values fail closed — they don't unlock unlimited throughput.
+- **Key deprecation.** `security.deprecated_publisher_keys` carries `{ key, sunset_at, reason }` entries. Install under a deprecated-but-pre-sunset key warns + records `deprecated_key=true` in the audit row; post-sunset installs are rejected.
+- **Auto-reseal.** Hosts upgrading across HMAC framing changes re-verify legacy-sealed installs and rewrite the seal under the current framing, emitting `wasm_plugin_resealed`. The operator never has to manually reinstall to track a framing bump.
+- **Observability.** OpenTelemetry counters/histograms under the `borg.wasm.*` namespace: `installs_total`, `executes_total`, `execute_duration_ms`, `quarantines_total`, `cache_hits_total` / `cache_misses_total`, `rate_limited_total`, `resource_exhausted_total{kind}`, `resealed_total`. Wired through the same `Metrics` seam as the rest of the agent — enable with `telemetry.metrics_enabled`.
 
 ## Roadmap
 
-See `docs/ROADMAP.md` → "Plugins & extensibility" for the marketplace follow-ups (`plugin.json` onboard hooks, plugin SDK seams, doctor-driven dep install) and the WASM marketplace work above this entry. Current invariants are pinned by tests in `crates/plugins/src/wasm.rs` and `crates/plugins/src/verifier.rs`.
+See `docs/ROADMAP.md` → "Plugins & extensibility" for the marketplace follow-ups (`plugin.json` onboard hooks, plugin SDK seams, doctor-driven dep install). Current invariants are pinned by tests in `crates/plugins/src/wasm.rs` and `crates/plugins/src/verifier.rs`.

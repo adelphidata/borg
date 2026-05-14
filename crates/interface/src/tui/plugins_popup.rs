@@ -19,15 +19,56 @@ enum ItemKind {
     Channel { def: &'static PluginDef },
     /// A skill (enable/disable toggle).
     Skill,
+    /// A signed WASM plugin (toggle disable/enable; quarantined rows are
+    /// read-only and only clearable via `borg plugin verify`).
+    WasmPlugin {
+        /// True if the plugin row is in `'quarantined'` status — toggling
+        /// such rows is a no-op and the render shows a `[quarantined]` tag.
+        quarantined: bool,
+    },
+}
+
+/// Section heading for the popup grouping. Wraps `plugins::Category` so the
+/// WASM section can sit alongside the catalog categories without polluting a
+/// public enum that other crates consume.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Section {
+    Catalog(Category),
+    Wasm,
+}
+
+impl Section {
+    fn label(self) -> String {
+        match self {
+            Self::Catalog(c) => c.to_string(),
+            Self::Wasm => "WASM PLUGINS".to_string(),
+        }
+    }
+
+    fn order(self) -> usize {
+        match self {
+            Self::Catalog(Category::Channels) => 0,
+            Self::Catalog(Category::Core) => 1,
+            Self::Catalog(Category::Developer) => 2,
+            Self::Catalog(Category::Productivity) => 3,
+            Self::Catalog(Category::Utilities) => 4,
+            Self::Catalog(Category::Email) => 5,
+            Self::Catalog(Category::Payments) => 6,
+            // WASM items group at the end — they sit visually downstream of
+            // the curated marketplace surface so operators read the trusted
+            // built-ins first.
+            Self::Wasm => 7,
+        }
+    }
 }
 
 /// State for a single item in the unified plugins list.
 struct PluginItem {
     id: String,
     name: String,
-    category: Category,
+    section: Section,
     kind: ItemKind,
-    /// Current persisted state (installed/enabled).
+    /// Current persisted state (installed/enabled / not-disabled).
     original_enabled: bool,
     /// Current selection state after user interaction.
     toggled: bool,
@@ -66,6 +107,9 @@ pub enum PluginAction {
     Uninstall { id: String },
     /// Enable or disable a skill.
     SetSkillEnabled { name: String, enabled: bool },
+    /// Disable or enable an installed WASM plugin. Quarantined rows are not
+    /// emitted via this action — the popup filters those at toggle time.
+    SetWasmPluginDisabled { plugin_id: String, disabled: bool },
 }
 
 impl PluginsPopup {
@@ -98,7 +142,7 @@ impl PluginsPopup {
             items.push(PluginItem {
                 id: def.id.to_string(),
                 name: def.name.to_string(),
-                category: def.category,
+                section: Section::Catalog(def.category),
                 kind: ItemKind::Channel { def },
                 original_enabled: installed,
                 toggled: installed,
@@ -125,7 +169,7 @@ impl PluginsPopup {
                 items.push(PluginItem {
                     id: skill.manifest.name.clone(),
                     name: title_case(&skill.manifest.name),
-                    category: cat,
+                    section: Section::Catalog(cat),
                     kind: ItemKind::Skill,
                     original_enabled: enabled,
                     toggled: enabled,
@@ -133,21 +177,40 @@ impl PluginsPopup {
             }
         }
 
-        // Sort by category order, then by name within category
-        let cat_order = |c: &Category| -> usize {
-            match c {
-                Category::Channels => 0,
-                Category::Core => 1,
-                Category::Developer => 2,
-                Category::Productivity => 3,
-                Category::Utilities => 4,
-                Category::Email => 5,
-                Category::Payments => 6,
+        // Load WASM plugins — read-only listing of installed packages with
+        // toggle support for verified/disabled status. The popup must still
+        // render the catalog if the WASM subsystem is down, but log so the
+        // operator can correlate an empty WASM section with a real error
+        // rather than "nothing installed".
+        match cortex::db::Database::open() {
+            Ok(db) => match db.list_wasm_plugins() {
+                Ok(rows) => {
+                    for row in rows {
+                        let quarantined = row.status == "quarantined";
+                        let enabled_now = row.status == "verified";
+                        items.push(PluginItem {
+                            id: row.plugin_id.clone(),
+                            name: row.plugin_id.clone(),
+                            section: Section::Wasm,
+                            kind: ItemKind::WasmPlugin { quarantined },
+                            original_enabled: enabled_now,
+                            toggled: enabled_now,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("plugins popup: list_wasm_plugins failed: {e}");
+                }
+            },
+            Err(e) => {
+                tracing::warn!("plugins popup: Database::open failed: {e}");
             }
-        };
+        }
+
         items.sort_by(|a, b| {
-            cat_order(&a.category)
-                .cmp(&cat_order(&b.category))
+            a.section
+                .order()
+                .cmp(&b.section.order())
                 .then(a.name.cmp(&b.name))
         });
 
@@ -243,6 +306,19 @@ impl PluginsPopup {
                                 ));
                                 return None;
                             }
+                        }
+                        // Quarantined WASM plugins are read-only — toggling
+                        // would silently emit a no-op action; surface the
+                        // CLI escape hatch instead.
+                        if let ItemKind::WasmPlugin { quarantined: true } = &item.kind {
+                            self.status_message = Some((
+                                format!(
+                                    "{} is quarantined; run `borg plugin verify {}` after restoring on-disk files",
+                                    item.name, item.id
+                                ),
+                                false,
+                            ));
+                            return None;
                         }
                         item.toggled = !item.toggled;
                         self.status_message = None;
@@ -368,6 +444,23 @@ impl PluginsPopup {
                             }
                         }
 
+                        // Add WASM disable/enable actions. Rebuilding from
+                        // item state (not the cached immediate list) keeps
+                        // the credential-input branch in lockstep with the
+                        // no-credential one — a regression where WASM
+                        // toggles were silently dropped if combined with a
+                        // credentialed channel install must not be possible.
+                        for item in &self.items {
+                            if let ItemKind::WasmPlugin { quarantined: false } = item.kind {
+                                if item.toggled != item.original_enabled {
+                                    final_actions.push(PluginAction::SetWasmPluginDisabled {
+                                        plugin_id: item.id.clone(),
+                                        disabled: !item.toggled,
+                                    });
+                                }
+                            }
+                        }
+
                         // Add channel uninstall actions
                         for item in &self.items {
                             if matches!(item.kind, ItemKind::Channel { .. })
@@ -399,9 +492,12 @@ impl PluginsPopup {
         }
     }
 
-    /// Returns (skill_actions, channel_actions) for pending changes.
+    /// Returns (immediate_actions, channel_actions) for pending changes.
+    /// `immediate_actions` covers skills and WASM-plugin status flips that
+    /// don't need credential capture; `channel_actions` is the list of
+    /// catalog channels that need install (true) or uninstall (false).
     fn compute_pending_actions(&self) -> (Vec<PluginAction>, Vec<(String, bool)>) {
-        let mut skill_actions = Vec::new();
+        let mut immediate = Vec::new();
         let mut channel_actions = Vec::new();
 
         for item in &self.items {
@@ -410,10 +506,22 @@ impl PluginsPopup {
             }
             match &item.kind {
                 ItemKind::Skill => {
-                    skill_actions.push(PluginAction::SetSkillEnabled {
+                    immediate.push(PluginAction::SetSkillEnabled {
                         name: item.id.clone(),
                         enabled: item.toggled,
                     });
+                }
+                ItemKind::WasmPlugin { quarantined: false } => {
+                    // toggled == true → re-enable; toggled == false → disable.
+                    immediate.push(PluginAction::SetWasmPluginDisabled {
+                        plugin_id: item.id.clone(),
+                        disabled: !item.toggled,
+                    });
+                }
+                ItemKind::WasmPlugin { quarantined: true } => {
+                    // Render path prevents toggling a quarantined item, but
+                    // double-check here so a future keybind change cannot
+                    // sneak an action through.
                 }
                 ItemKind::Channel { .. } => {
                     if item.toggled && !item.original_enabled {
@@ -425,7 +533,7 @@ impl PluginsPopup {
             }
         }
 
-        (skill_actions, channel_actions)
+        (immediate, channel_actions)
     }
 
     pub fn render(&self, frame: &mut Frame) {
@@ -438,24 +546,29 @@ impl PluginsPopup {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut row_indices: Vec<usize> = Vec::new();
 
-        let mut last_category: Option<Category> = None;
+        let mut last_section: Option<Section> = None;
         for (i, item) in self.items.iter().enumerate() {
-            if last_category != Some(item.category) {
-                if last_category.is_some() {
+            if last_section != Some(item.section) {
+                if last_section.is_some() {
                     lines.push(Line::default());
                 }
                 lines.push(Line::from(Span::styled(
-                    format!(" {}", item.category),
+                    format!(" {}", item.section.label()),
                     theme::bold(),
                 )));
-                last_category = Some(item.category);
+                last_section = Some(item.section);
             }
 
             row_indices.push(lines.len());
 
             let check = if item.toggled { "x" } else { " " };
 
-            let status = "";
+            // Tag quarantined WASM rows so the operator sees the read-only
+            // state at a glance — toggling does nothing for those.
+            let status = match &item.kind {
+                ItemKind::WasmPlugin { quarantined: true } => "  [quarantined]",
+                _ => "",
+            };
 
             // Platform note for channels
             let platform_note = if let ItemKind::Channel { def } = &item.kind {
@@ -672,20 +785,26 @@ mod tests {
     #[test]
     fn category_grouping_order() {
         let popup = make_test_popup();
-        let categories: Vec<Category> = {
+        let sections: Vec<Section> = {
             let mut cats = Vec::new();
             for item in &popup.items {
-                if cats.last() != Some(&item.category) {
-                    cats.push(item.category);
+                if cats.last() != Some(&item.section) {
+                    cats.push(item.section);
                 }
             }
             cats
         };
         // Channels should come first, Core second
-        if let Some(channels_pos) = categories.iter().position(|c| *c == Category::Channels) {
+        if let Some(channels_pos) = sections
+            .iter()
+            .position(|s| *s == Section::Catalog(Category::Channels))
+        {
             assert_eq!(channels_pos, 0, "Channels should be the first category");
         }
-        if let Some(core_pos) = categories.iter().position(|c| *c == Category::Core) {
+        if let Some(core_pos) = sections
+            .iter()
+            .position(|s| *s == Section::Catalog(Category::Core))
+        {
             assert_eq!(core_pos, 1, "Core should be the second category");
         }
     }
@@ -697,8 +816,8 @@ mod tests {
         for id in &core_skill_ids {
             if let Some(item) = popup.items.iter().find(|i| i.id == *id) {
                 assert_eq!(
-                    item.category,
-                    Category::Core,
+                    item.section,
+                    Section::Catalog(Category::Core),
                     "skill {id} should be in Core category"
                 );
             }

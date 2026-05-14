@@ -1179,6 +1179,7 @@ dependencies = [
  "image",
  "keyring",
  "libc",
+ "lru",
  "notify",
  "nucleo-matcher",
  "opentelemetry",

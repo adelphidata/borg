@@ -234,6 +234,26 @@ pub struct SecurityConfig {
     /// key is not in this list. Empty by default — operators must opt in.
     #[serde(default)]
     pub trusted_publisher_keys: Vec<String>,
+    /// Publisher keys scheduled for retirement. While `sunset_at` is in the
+    /// future, install still succeeds with a printed warning + audit row
+    /// (`deprecated_key=true`); once `sunset_at` is reached, install is
+    /// rejected. Keys here must also appear in `trusted_publisher_keys`
+    /// (deprecation is a state on a trusted key, not a third trust tier).
+    #[serde(default)]
+    pub deprecated_publisher_keys: Vec<DeprecatedPublisherKey>,
+}
+
+/// One scheduled-retirement entry for a trusted publisher key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeprecatedPublisherKey {
+    /// Base64-encoded Ed25519 verifying key (must also be in
+    /// `trusted_publisher_keys`).
+    pub key: String,
+    /// Unix seconds after which install must reject this key.
+    pub sunset_at: i64,
+    /// Optional operator-facing reason printed in the warning at install.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 fn default_gateway_action_limits() -> crate::rate_guard::ActionLimits {
@@ -266,6 +286,7 @@ impl Default for SecurityConfig {
             kek_backend: KekBackend::Auto,
             url_policy: UrlPolicyConfig::default(),
             trusted_publisher_keys: Vec::new(),
+            deprecated_publisher_keys: Vec::new(),
         }
     }
 }

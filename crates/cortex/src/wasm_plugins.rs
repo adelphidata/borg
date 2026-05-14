@@ -1,11 +1,15 @@
 //! Runtime bridge for verified WASM plugin tools.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use plugins::wasm::{HostHttpFetch, HostHttpResponse, HostServices};
+use plugins::wasm::{
+    classify_execute_error, HostHttpFetch, HostHttpResponse, HostServices, WasmExecuteErrorKind,
+};
 
 use crate::config::Config;
 use crate::db::{Database, NewWasmPlugin};
@@ -16,19 +20,20 @@ use crate::tool::names;
 /// bytes) — `try_execute_tool` re-verifies the on-disk seal before every
 /// lookup, so a tampered file never reaches the cache.
 pub(crate) mod compiled_cache {
-    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
     use std::sync::{Mutex, OnceLock};
 
     use anyhow::{anyhow, Result};
+    use lru::LruCache;
     use plugins::wasm::{WasmEngine as Engine, WasmModule as Module};
 
-    /// Cap matches the gauntlet's installable-plugin envelope. A bulk-clear on
-    /// overflow is fine: recompiling 64 modules is cheap and a >64-plugin
-    /// install is exceptional.
+    /// Cap matches the gauntlet's installable-plugin envelope. We use a true
+    /// LRU so a hot module survives churn from a one-shot 65th install — the
+    /// previous bulk-clear strategy would evict every hot module on overflow.
     const MAX_ENTRIES: usize = 64;
 
     static ENGINE: OnceLock<Engine> = OnceLock::new();
-    static CACHE: OnceLock<Mutex<HashMap<String, Module>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<LruCache<String, Module>>> = OnceLock::new();
 
     pub(crate) fn engine() -> Result<&'static Engine> {
         if let Some(e) = ENGINE.get() {
@@ -38,20 +43,49 @@ pub(crate) mod compiled_cache {
         Ok(ENGINE.get_or_init(|| built))
     }
 
-    pub(crate) fn module_for(local_hmac: &str, wasm: &[u8]) -> Result<Module> {
-        let map = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut guard = map
+    fn cache() -> &'static Mutex<LruCache<String, Module>> {
+        // `MAX_ENTRIES` is a non-zero const, but the cortex crate forbids
+        // `.expect`/`.unwrap`. `unwrap_or(NonZeroUsize::MIN)` keeps the cache
+        // functional (cap 1) even if a future edit drops MAX_ENTRIES to 0.
+        CACHE.get_or_init(|| {
+            Mutex::new(LruCache::new(
+                NonZeroUsize::new(MAX_ENTRIES).unwrap_or(NonZeroUsize::MIN),
+            ))
+        })
+    }
+
+    /// Recorded outcome for the most recent `module_for` call. The agent loop
+    /// uses this to emit cache-hit/miss metrics without us threading metric
+    /// state through the plugins crate.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum CacheOutcome {
+        Hit,
+        Miss,
+    }
+
+    pub(crate) fn module_for(local_hmac: &str, wasm: &[u8]) -> Result<(Module, CacheOutcome)> {
+        let mut guard = cache()
             .lock()
             .map_err(|e| anyhow!("wasm module cache mutex poisoned: {e}"))?;
         if let Some(m) = guard.get(local_hmac) {
-            return Ok(m.clone());
+            return Ok((m.clone(), CacheOutcome::Hit));
         }
-        if guard.len() >= MAX_ENTRIES {
-            guard.clear();
-        }
+        // LruCache::put evicts least-recently-used when over capacity — no
+        // explicit bulk-clear, hot modules survive churn.
         let module = plugins::wasm::compile_module(engine()?, wasm)?;
-        guard.insert(local_hmac.to_string(), module.clone());
-        Ok(module)
+        guard.put(local_hmac.to_string(), module.clone());
+        Ok((module, CacheOutcome::Miss))
+    }
+
+    /// Promote `local_hmac` to most-recently-used without inserting if missing.
+    /// Used by the reseal path so the old key is dropped cleanly when we
+    /// rewrite the seal.
+    pub(crate) fn invalidate(local_hmac: &str) {
+        if let Some(m) = CACHE.get() {
+            if let Ok(mut g) = m.lock() {
+                g.pop(local_hmac);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -60,6 +94,14 @@ pub(crate) mod compiled_cache {
             .get()
             .and_then(|m| m.lock().ok().map(|g| g.len()))
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(local_hmac: &str) -> bool {
+        CACHE
+            .get()
+            .and_then(|m| m.lock().ok().map(|g| g.contains(local_hmac)))
+            .unwrap_or(false)
     }
 
     #[cfg(test)]
@@ -72,11 +114,21 @@ pub(crate) mod compiled_cache {
     }
 }
 
-// v2 bumps the derived-key domain alongside the framing change in
-// compute_local_hmac (length-prefixed over NUL-separated). Pre-v2 installs
-// re-verify under a different MAC, fail integrity, and quarantine themselves —
-// the migration is `borg plugin remove && borg plugin install`.
+/// HMAC derived-key domain currently in use. Cortex passes the key derived
+/// from this domain as the local-HMAC key for every install + verify. A
+/// pre-current ("v1") install whose seal verifies under `LEGACY_HMAC_DOMAIN`
+/// but not this one is auto-resealed (see `legacy_hmac::verify`); operators
+/// do not have to reinstall to track a framing bump.
+///
+/// `pub` so cross-crate integration tests can derive the same key when
+/// fabricating installs end-to-end.
 pub const HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac-v2";
+
+/// Pre-current ("v1") domain. Verification-only — see `legacy_hmac::verify`
+/// in the plugins crate. If a plugin's stored seal verifies under the legacy
+/// scheme but not the current one, we reseal under the current scheme and
+/// emit `wasm_plugin_resealed` so the operator sees the migration happened.
+const LEGACY_HMAC_DOMAIN: &[u8] = b"borg-wasm-plugin-local-hmac";
 
 /// Names of built-in tools — WASM plugins may not shadow them.
 ///
@@ -132,22 +184,129 @@ fn is_builtin_tool_name(name: &str) -> bool {
         .any(|n| n.eq_ignore_ascii_case(name))
 }
 
-/// Cheap check for whether the WASM plugin subsystem is allowed to advertise
-/// tools or dispatch calls. Falls back to `true` (the default) if config can't
-/// be loaded — we don't want a transient DB hiccup to silently disable plugins.
-fn wasm_enabled() -> bool {
-    match Config::load_from_db() {
-        Ok(cfg) => cfg.plugins.wasm.enabled,
-        Err(e) => {
-            tracing::warn!("WASM plugin enabled flag unreadable, defaulting on: {e}");
-            true
+/// Snapshot of the operator-controlled WASM kill-switch state. Captured once
+/// per `tool_definitions()` / `try_execute_tool()` so filtering and dispatch
+/// share a consistent view even if config reloads mid-call.
+#[derive(Clone, Default)]
+struct WasmGuardState {
+    enabled: bool,
+    disabled_plugin_ids: Vec<String>,
+    disabled_publisher_keys: Vec<String>,
+    rate_limit_per_minute: u32,
+    rate_limit_burst: u32,
+}
+
+impl WasmGuardState {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            enabled: cfg.plugins.wasm.enabled,
+            disabled_plugin_ids: cfg.plugins.wasm.disabled_plugin_ids.clone(),
+            disabled_publisher_keys: cfg.plugins.wasm.disabled_publisher_keys.clone(),
+            rate_limit_per_minute: cfg.plugins.wasm.rate_limit_per_minute,
+            rate_limit_burst: cfg.plugins.wasm.rate_limit_burst,
         }
+    }
+
+    fn is_plugin_disabled(&self, plugin_id: &str) -> bool {
+        self.disabled_plugin_ids.iter().any(|d| d == plugin_id)
+    }
+
+    fn is_publisher_disabled(&self, publisher_key: &str) -> bool {
+        self.disabled_publisher_keys
+            .iter()
+            .any(|d| d == publisher_key)
+    }
+}
+
+/// Load config, returning a permissive default if the DB is unreachable. We
+/// don't want a transient DB hiccup to silently disable plugins; an operator
+/// who explicitly disabled the subsystem will have the value persisted, and
+/// `Config::load_from_db` is otherwise the source of truth.
+fn guard_state() -> WasmGuardState {
+    match Config::load_from_db() {
+        Ok(cfg) => WasmGuardState::from_config(&cfg),
+        Err(e) => {
+            tracing::warn!("WASM plugin config unreadable, defaulting open: {e}");
+            WasmGuardState {
+                enabled: true,
+                disabled_plugin_ids: Vec::new(),
+                disabled_publisher_keys: Vec::new(),
+                rate_limit_per_minute: 60,
+                rate_limit_burst: 10,
+            }
+        }
+    }
+}
+
+/// Per-plugin token bucket. Tokens accrue at `per_minute / 60` per second up
+/// to `burst` and one is consumed per dispatch. Refused calls return a
+/// `WasmRateLimited` to the caller, emit an audit row, and never reach the
+/// wasmtime sandbox.
+struct TokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl TokenBucket {
+    fn new(initial: f64) -> Self {
+        Self {
+            tokens: initial,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill the bucket against wall-clock and try to consume one token.
+    /// Returns `None` on success, or `Some(retry_after)` on refusal so the
+    /// caller can surface a sensible message to the LLM.
+    fn try_consume(&mut self, per_minute: u32, burst: u32) -> Option<Duration> {
+        if per_minute == 0 || burst == 0 {
+            // Misconfigured to off — fail closed: zero throughput. Operators
+            // who want unlimited should leave defaults alone.
+            return Some(Duration::from_secs(60));
+        }
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        let refill = elapsed * (f64::from(per_minute) / 60.0);
+        self.tokens = (self.tokens + refill).min(f64::from(burst));
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            None
+        } else {
+            let deficit = 1.0 - self.tokens;
+            let seconds_to_one = deficit / (f64::from(per_minute) / 60.0);
+            Some(Duration::from_secs_f64(seconds_to_one.max(0.001)))
+        }
+    }
+}
+
+fn rate_buckets() -> &'static Mutex<HashMap<String, TokenBucket>> {
+    static BUCKETS: OnceLock<Mutex<HashMap<String, TokenBucket>>> = OnceLock::new();
+    BUCKETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn try_consume_rate_token(plugin_id: &str, guard: &WasmGuardState) -> Option<Duration> {
+    let mut map = match rate_buckets().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let bucket = map
+        .entry(plugin_id.to_string())
+        .or_insert_with(|| TokenBucket::new(f64::from(guard.rate_limit_burst)));
+    bucket.try_consume(guard.rate_limit_per_minute, guard.rate_limit_burst)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_rate_buckets_for_test() {
+    if let Ok(mut m) = rate_buckets().lock() {
+        m.clear();
     }
 }
 
 /// Return verified WASM tool definitions stored in the DB.
 pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
-    if !wasm_enabled() {
+    let guard = guard_state();
+    if !guard.enabled {
         return Vec::new();
     }
     let db = match Database::open() {
@@ -157,44 +316,76 @@ pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
             return Vec::new();
         }
     };
-    match db.list_verified_wasm_tool_definitions() {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|row| {
-                if is_builtin_tool_name(&row.name) {
-                    tracing::warn!(
-                        tool = %row.name,
-                        "Hiding WASM tool: name collides with built-in"
-                    );
-                    return None;
-                }
-                let schema = serde_json::from_str::<serde_json::Value>(&row.input_schema_json)
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "Skipping WASM tool {} with invalid schema JSON: {e}",
-                            row.name
-                        );
-                    })
-                    .ok()?;
-                Some(crate::types::ToolDefinition::new(
-                    row.name,
-                    row.description,
-                    schema,
-                ))
-            })
-            .collect(),
+    // We need publisher_key for the publisher-disable check, so iterate the
+    // full plugin rows and join tool defs in-memory. Counts are tiny
+    // (capped at 64 installs), so this is cheap.
+    let plugin_rows = match db.list_wasm_plugins() {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("Failed to list WASM plugins: {e}");
+            return Vec::new();
+        }
+    };
+    let tool_rows = match db.list_verified_wasm_tool_definitions() {
+        Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("Failed to load WASM tool definitions: {e}");
-            Vec::new()
+            return Vec::new();
         }
-    }
+    };
+    let publisher_by_plugin: HashMap<&str, &str> = plugin_rows
+        .iter()
+        .map(|p| (p.plugin_id.as_str(), p.publisher_key.as_str()))
+        .collect();
+    tool_rows
+        .into_iter()
+        .filter_map(|row| {
+            if is_builtin_tool_name(&row.name) {
+                tracing::warn!(
+                    tool = %row.name,
+                    "Hiding WASM tool: name collides with built-in"
+                );
+                return None;
+            }
+            // list_verified_wasm_tool_definitions filters by p.status='verified',
+            // so disabled rows are already excluded — but the publisher-disable
+            // list still needs to be applied here.
+            let plugin_id = db.plugin_id_for_tool(&row.name).ok().flatten();
+            if let Some(plugin_id) = plugin_id.as_deref() {
+                if guard.is_plugin_disabled(plugin_id) {
+                    return None;
+                }
+                if let Some(pk) = publisher_by_plugin.get(plugin_id) {
+                    if guard.is_publisher_disabled(pk) {
+                        return None;
+                    }
+                }
+            }
+            let schema = serde_json::from_str::<serde_json::Value>(&row.input_schema_json)
+                .map_err(|e| {
+                    tracing::warn!(
+                        "Skipping WASM tool {} with invalid schema JSON: {e}",
+                        row.name
+                    );
+                })
+                .ok()?;
+            Some(crate::types::ToolDefinition::new(
+                row.name,
+                row.description,
+                schema,
+            ))
+        })
+        .collect()
 }
 
 /// Execute `name` if it belongs to a verified WASM plugin.
 ///
-/// Returns `Ok(None)` when the tool name is not a WASM plugin tool.
+/// Returns `Ok(None)` when the tool name is not a WASM plugin tool. Surfaces
+/// rate-limit denials, kill-switch refusals, and quarantine triggers as
+/// `Err`s that the LLM sees as a normal tool failure.
 pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<String>> {
-    if !wasm_enabled() {
+    let guard = guard_state();
+    if !guard.enabled {
         return Ok(None);
     }
     if is_builtin_tool_name(name) {
@@ -207,6 +398,49 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
         return Ok(None);
     };
 
+    // Kill-switch checks happen *after* we resolve the runtime row so we know
+    // the publisher key; before any IO so disabled plugins never read bytes.
+    //
+    // Note the layering: `get_verified_wasm_tool_runtime` joins on
+    // `status='verified'`, so a row whose status was flipped to `'disabled'`
+    // via the DB path already short-circuits above. The explicit check here
+    // is the *config-only* path — an operator who sets
+    // `plugins.wasm.disabled_plugin_ids` without touching the row status
+    // (live setting update, programmatic toggle, future hot-reload) still
+    // gets refused at dispatch. Both signals are belt-and-suspenders; the
+    // CLI/TUI flip both for consistency.
+    let plugin_row = db.get_wasm_plugin(&row.plugin_id)?;
+    if guard.is_plugin_disabled(&row.plugin_id) {
+        anyhow::bail!("WASM plugin '{}' is disabled", row.plugin_id);
+    }
+    if let Some(p) = plugin_row.as_ref() {
+        if guard.is_publisher_disabled(&p.publisher_key) {
+            anyhow::bail!("WASM plugin '{}' publisher key is disabled", row.plugin_id);
+        }
+    }
+
+    // Rate-limit gate — refused calls never reach the sandbox.
+    if let Some(retry_after) = try_consume_rate_token(&row.plugin_id, &guard) {
+        let retry_secs = retry_after.as_secs_f64().max(0.1);
+        crate::telemetry::wasm_metrics::record_rate_limited(&row.plugin_id);
+        crate::db::try_emit_global(
+            crate::db::audit_events::WASM_PLUGIN_RATE_LIMITED,
+            &row.plugin_id,
+            &serde_json::json!({
+                "plugin_id": &row.plugin_id,
+                "tool_name": &row.tool_name,
+                "retry_after_secs": retry_secs,
+                "limit_per_minute": guard.rate_limit_per_minute,
+                "burst": guard.rate_limit_burst,
+            }),
+        );
+        anyhow::bail!(
+            "WASM plugin '{}' is rate-limited; retry in {:.1}s",
+            row.plugin_id,
+            retry_secs
+        );
+    }
+
     let manifest_path = Path::new(&row.manifest_path);
     let wasm_path = Path::new(&row.wasm_path);
     let manifest_bytes = std::fs::read(manifest_path)
@@ -215,21 +449,70 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
         .with_context(|| format!("failed to read {}", wasm_path.display()))?;
     let key = db.derive_hmac_key(HMAC_DOMAIN);
 
-    if let Err(e) =
+    let mut effective_hmac = row.local_hmac.clone();
+    if let Err(current_err) =
         plugins::wasm::verify_installed_hmac(&key, &manifest_bytes, &wasm, &row.local_hmac)
     {
-        // Emit before the DB UPDATE so the audit trail records the quarantine
-        // intent even if the UPDATE itself fails.
-        crate::db::try_emit_global(
-            crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
-            &row.plugin_id,
-            &serde_json::json!({
-                "plugin_id": &row.plugin_id,
-                "reason": e.to_string(),
-            }),
-        );
-        db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())?;
-        return Err(e).context("WASM plugin quarantined");
+        // The seal didn't verify under the current scheme. Try the legacy
+        // scheme before quarantining: a plugin sealed by a previous borg
+        // release should auto-migrate, not force the operator to reinstall.
+        let legacy_key = db.derive_hmac_key(LEGACY_HMAC_DOMAIN);
+        if plugins::wasm::legacy_hmac::verify(&legacy_key, &manifest_bytes, &wasm, &row.local_hmac)
+            .is_ok()
+        {
+            // Recompute under the current scheme and persist. We
+            // intentionally re-run the full v2 install seal so the new MAC
+            // is what `verify_installed_hmac` would expect on the next call.
+            match plugins::wasm::compute_local_hmac_current(&key, &manifest_bytes, &wasm) {
+                Ok(new_seal) => {
+                    db.update_wasm_plugin_local_hmac(&row.plugin_id, &new_seal)
+                        .with_context(|| format!("persist resealed HMAC for {}", row.plugin_id))?;
+                    compiled_cache::invalidate(&row.local_hmac);
+                    crate::telemetry::wasm_metrics::record_reseal(&row.plugin_id);
+                    crate::db::try_emit_global(
+                        crate::db::audit_events::WASM_PLUGIN_RESEALED,
+                        &row.plugin_id,
+                        &serde_json::json!({
+                            "plugin_id": &row.plugin_id,
+                            "from": "legacy",
+                            "to": "current",
+                        }),
+                    );
+                    effective_hmac = new_seal;
+                }
+                Err(e) => {
+                    crate::telemetry::wasm_metrics::record_quarantine(
+                        &row.plugin_id,
+                        "reseal_failed",
+                    );
+                    crate::db::try_emit_global(
+                        crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
+                        &row.plugin_id,
+                        &serde_json::json!({
+                            "plugin_id": &row.plugin_id,
+                            "reason": e.to_string(),
+                            "reason_category": "reseal_failed",
+                        }),
+                    );
+                    db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())?;
+                    return Err(e).context("WASM plugin quarantined");
+                }
+            }
+        } else {
+            // Neither scheme verifies — genuine tamper / corruption.
+            crate::telemetry::wasm_metrics::record_quarantine(&row.plugin_id, "integrity_failure");
+            crate::db::try_emit_global(
+                crate::db::audit_events::WASM_PLUGIN_QUARANTINED,
+                &row.plugin_id,
+                &serde_json::json!({
+                    "plugin_id": &row.plugin_id,
+                    "reason": current_err.to_string(),
+                    "reason_category": "integrity_failure",
+                }),
+            );
+            db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())?;
+            return Err(current_err).context("WASM plugin quarantined");
+        }
     }
 
     let manifest: plugins::wasm::WasmPluginManifest =
@@ -246,7 +529,13 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
     )?);
 
     let engine = compiled_cache::engine()?;
-    let module = compiled_cache::module_for(&row.local_hmac, &wasm)?;
+    let (module, cache_outcome) = compiled_cache::module_for(&effective_hmac, &wasm)?;
+    crate::telemetry::wasm_metrics::record_cache(match cache_outcome {
+        compiled_cache::CacheOutcome::Hit => crate::telemetry::wasm_metrics::WasmCacheOutcome::Hit,
+        compiled_cache::CacheOutcome::Miss => {
+            crate::telemetry::wasm_metrics::WasmCacheOutcome::Miss
+        }
+    });
 
     let start = std::time::Instant::now();
     let result = plugins::wasm::execute_tool_prepared(
@@ -259,10 +548,16 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
         services,
     );
     let duration_ms = start.elapsed().as_millis() as u64;
-    let error_message = result
-        .as_ref()
-        .err()
-        .map(std::string::ToString::to_string);
+    let (error_category, error_message) = match result.as_ref() {
+        Ok(_) => (None, None),
+        Err(e) => (Some(classify_execute_error(e)), Some(e.to_string())),
+    };
+    crate::telemetry::wasm_metrics::record_execute(
+        &row.plugin_id,
+        &row.tool_name,
+        duration_ms,
+        error_category,
+    );
     crate::db::try_emit_global(
         crate::db::audit_events::WASM_PLUGIN_EXECUTED,
         &row.plugin_id,
@@ -271,6 +566,7 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
             "tool_name": &row.tool_name,
             "success": result.is_ok(),
             "error_message": error_message,
+            "error_category": error_category.map(WasmExecuteErrorKind::as_str),
             "duration_ms": duration_ms,
         }),
     );
@@ -444,6 +740,131 @@ mod tests {
         assert!(is_builtin_tool_name("rUn_ShElL"));
         assert!(!is_builtin_tool_name("plugin_specific_tool"));
         assert!(!is_builtin_tool_name(""));
+    }
+
+    #[test]
+    fn token_bucket_refuses_after_burst_and_refills() {
+        // Reasonable defaults: 60/min = 1/sec, burst 2. First two consume
+        // succeed, third refuses. This locks the math down so an off-by-one
+        // in the refill formula surfaces immediately.
+        let mut bucket = TokenBucket::new(2.0);
+        assert!(bucket.try_consume(60, 2).is_none(), "first take succeeds");
+        assert!(bucket.try_consume(60, 2).is_none(), "second take succeeds");
+        let denial = bucket
+            .try_consume(60, 2)
+            .expect("third take must be refused");
+        // Refill at 1/sec, deficit ≈ 1 token, so retry_after ≈ 1s. Allow
+        // wide slack — clock noise can shave a few ms either way.
+        assert!(
+            denial.as_secs_f64() > 0.5 && denial.as_secs_f64() < 2.0,
+            "retry_after should be ~1s, got {denial:?}",
+        );
+    }
+
+    #[test]
+    fn token_bucket_zero_config_fails_closed() {
+        // Setting per_minute=0 must NOT silently mean "unlimited" — that would
+        // turn a clumsy operator into a denial-of-budget. Burst=0 likewise.
+        let mut bucket = TokenBucket::new(10.0);
+        assert!(bucket.try_consume(0, 10).is_some());
+        let mut bucket = TokenBucket::new(10.0);
+        assert!(bucket.try_consume(60, 0).is_some());
+    }
+
+    #[test]
+    fn guard_state_filters_by_plugin_id_and_publisher_key() {
+        // The kill-switch path branches on these two checks at dispatch time;
+        // a typo that lowercased one side or used `contains()` substring match
+        // would silently let a disabled publisher's plugins through.
+        let guard = WasmGuardState {
+            enabled: true,
+            disabled_plugin_ids: vec!["dev/bad".to_string(), "vendor/x".to_string()],
+            disabled_publisher_keys: vec!["AAAA_pubkey_base64".to_string()],
+            rate_limit_per_minute: 60,
+            rate_limit_burst: 10,
+        };
+        assert!(guard.is_plugin_disabled("dev/bad"));
+        assert!(guard.is_plugin_disabled("vendor/x"));
+        assert!(!guard.is_plugin_disabled("dev/good"));
+        // Substring of a disabled id must not match — exact equality only.
+        assert!(!guard.is_plugin_disabled("dev/ba"));
+        assert!(!guard.is_plugin_disabled("dev/bad/extra"));
+
+        assert!(guard.is_publisher_disabled("AAAA_pubkey_base64"));
+        assert!(!guard.is_publisher_disabled("AAAA_pubkey_base6"));
+        assert!(!guard.is_publisher_disabled("aaaa_pubkey_base64"));
+    }
+
+    /// LRU eviction regression: insert MAX_ENTRIES+1 distinct modules,
+    /// "touching" entry 0 between inserts to mark it most-recently-used,
+    /// and assert that entry 1 (the actual LRU at overflow) was evicted
+    /// while entry 0 survived. The previous bulk-`clear()` strategy would
+    /// drop EVERY entry on overflow, which is what this test guards against.
+    #[test]
+    fn compiled_cache_evicts_lru_not_bulk_clear() {
+        // The simplest valid wasm: magic + version + an empty type section.
+        // wasmtime will compile this without complaint.
+        let wasm: Vec<u8> = vec![
+            0x00, 0x61, 0x73, 0x6d, // \0asm
+            0x01, 0x00, 0x00, 0x00, // version 1
+        ];
+        compiled_cache::clear();
+
+        // Fill the cache to capacity. Keys are unique strings so the LruCache
+        // sees 64 distinct entries, all compiling the same wasm.
+        for i in 0..64 {
+            let key = format!("k{i:02}");
+            compiled_cache::module_for(&key, &wasm).expect("compile module");
+        }
+        assert_eq!(compiled_cache::cache_len(), 64);
+        assert!(compiled_cache::contains("k00"));
+        assert!(compiled_cache::contains("k01"));
+
+        // Touch k00 so it becomes most-recently-used. k01 is now the LRU.
+        compiled_cache::module_for("k00", &wasm).expect("touch k00");
+
+        // Insert one more — must evict the LRU (k01), not k00.
+        compiled_cache::module_for("k64", &wasm).expect("insert k64");
+        assert_eq!(
+            compiled_cache::cache_len(),
+            64,
+            "cap must hold at MAX_ENTRIES, not grow",
+        );
+        assert!(
+            compiled_cache::contains("k00"),
+            "touched entry must survive overflow — this is the regression guard \
+             against the old bulk-clear behavior",
+        );
+        assert!(
+            !compiled_cache::contains("k01"),
+            "true LRU (k01) must be evicted on overflow",
+        );
+        assert!(
+            compiled_cache::contains("k64"),
+            "newly inserted entry must be present",
+        );
+
+        compiled_cache::clear();
+    }
+
+    /// Invalidate must remove a specific key without touching the rest —
+    /// the reseal path relies on this to drop the stale-keyed cache entry
+    /// when it rewrites the local_hmac. A bulk-clear under the hood would
+    /// thrash unrelated plugins on every reseal.
+    #[test]
+    fn compiled_cache_invalidate_is_surgical() {
+        let wasm: Vec<u8> = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        compiled_cache::clear();
+        for i in 0..3 {
+            compiled_cache::module_for(&format!("inv{i}"), &wasm).expect("compile");
+        }
+        assert_eq!(compiled_cache::cache_len(), 3);
+        compiled_cache::invalidate("inv1");
+        assert!(compiled_cache::contains("inv0"));
+        assert!(!compiled_cache::contains("inv1"));
+        assert!(compiled_cache::contains("inv2"));
+        assert_eq!(compiled_cache::cache_len(), 2);
+        compiled_cache::clear();
     }
 }
 
@@ -641,6 +1062,7 @@ mod e2e_tests {
 
         // ── Positive: cache miss → hit ──
         compiled_cache::clear();
+        super::reset_rate_buckets_for_test();
         assert_eq!(
             compiled_cache::cache_len(),
             0,
@@ -685,6 +1107,11 @@ mod e2e_tests {
                 serde_json::from_str(&row.event_json).expect("payload json");
             assert_eq!(payload["success"], serde_json::Value::Bool(true));
             assert_eq!(payload["tool_name"], "e2e_echo");
+            assert_eq!(
+                payload["error_category"],
+                serde_json::Value::Null,
+                "successful execute must carry null error_category, not a stale string",
+            );
         }
 
         // ── Negative: tamper → quarantine + audit ──
@@ -712,6 +1139,12 @@ mod e2e_tests {
             after_tamper
         );
         assert_eq!(quarantine_rows[0].principal_id, "dev/e2e-echo");
+        let q_payload: serde_json::Value =
+            serde_json::from_str(&quarantine_rows[0].event_json).expect("quarantine payload");
+        assert_eq!(
+            q_payload["reason_category"], "integrity_failure",
+            "tamper quarantine must carry a category, not a free-form string only",
+        );
 
         // Plugin row should be marked quarantined and hidden from the runtime.
         let row = db
@@ -792,6 +1225,46 @@ pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
     )
     .context("verify plugin package")?;
 
+    // After signature verification we know which publisher actually signed —
+    // check the sunset list. Sunsetted keys reject hard; not-yet-sunsetted
+    // deprecated keys warn but still install (operators need a window to
+    // migrate to a fresh signing key).
+    let mut deprecated_warning: Option<String> = None;
+    if let Some(dep) = config
+        .security
+        .deprecated_publisher_keys
+        .iter()
+        .find(|d| d.key == package.manifest.publisher.public_key)
+    {
+        let now = chrono::Utc::now().timestamp();
+        if now >= dep.sunset_at {
+            anyhow::bail!(
+                "publisher key {} reached its sunset_at ({}); install rejected{}",
+                dep.key,
+                chrono::DateTime::from_timestamp(dep.sunset_at, 0)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| dep.sunset_at.to_string()),
+                dep.reason
+                    .as_deref()
+                    .map(|r| format!(" — {r}"))
+                    .unwrap_or_default()
+            );
+        }
+        let sunset_display = chrono::DateTime::from_timestamp(dep.sunset_at, 0)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_else(|| dep.sunset_at.to_string());
+        eprintln!(
+            "warning: publisher key {} is deprecated and sunsets at {}{}",
+            dep.key,
+            sunset_display,
+            dep.reason
+                .as_deref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default()
+        );
+        deprecated_warning = Some(sunset_display);
+    }
+
     let data_dir = Config::data_dir()?;
     let installed = plugins::wasm::install_verified_package(&data_dir, &package)
         .context("write installed package files")?;
@@ -846,8 +1319,11 @@ pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
             "version": &package.manifest.version,
             "tool_count": package.manifest.tools.len(),
             "manifest_sha": manifest_sha,
+            "deprecated_key": deprecated_warning.is_some(),
+            "sunset_at": deprecated_warning,
         }),
     );
+    crate::telemetry::wasm_metrics::record_install(&package.manifest.publisher.public_key);
 
     Ok(InstalledSummary {
         plugin_id: package.manifest.id,

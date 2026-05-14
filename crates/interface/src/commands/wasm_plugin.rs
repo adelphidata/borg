@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 
-use cortex::db::Database;
+use cortex::config::Config;
+use cortex::db::{audit_events, try_emit_global, Database};
 use cortex::wasm_plugins;
 
 #[derive(Subcommand)]
@@ -43,6 +44,32 @@ pub enum WasmPluginAction {
         /// Plugin id to remove.
         plugin_id: String,
     },
+    /// Disable a plugin: tools hidden from the LLM, dispatch refuses. Install
+    /// row and files remain so re-enable is a one-flag toggle. Use this for
+    /// incident response that doesn't justify a full uninstall.
+    Disable {
+        /// Plugin id to disable.
+        plugin_id: String,
+    },
+    /// Re-enable a previously-disabled plugin. Quarantined rows must go
+    /// through `verify` instead — enable does not silently clear a
+    /// quarantine.
+    Enable {
+        /// Plugin id to enable.
+        plugin_id: String,
+    },
+    /// Disable every plugin signed by `publisher_key`. Operator-curated trust
+    /// in `security.trusted_publisher_keys` is unaffected — this is a paused
+    /// state, not a withdrawal.
+    DisablePublisher {
+        /// Base64 Ed25519 verifying key.
+        publisher_key: String,
+    },
+    /// Re-enable plugins signed by `publisher_key`.
+    EnablePublisher {
+        /// Base64 Ed25519 verifying key.
+        publisher_key: String,
+    },
 }
 
 pub fn dispatch(action: WasmPluginAction) -> Result<()> {
@@ -52,6 +79,10 @@ pub fn dispatch(action: WasmPluginAction) -> Result<()> {
         WasmPluginAction::Show { plugin_id } => show(&plugin_id),
         WasmPluginAction::Verify { plugin_id } => verify(&plugin_id),
         WasmPluginAction::Remove { plugin_id } => remove(&plugin_id),
+        WasmPluginAction::Disable { plugin_id } => disable_plugin(&plugin_id),
+        WasmPluginAction::Enable { plugin_id } => enable_plugin(&plugin_id),
+        WasmPluginAction::DisablePublisher { publisher_key } => disable_publisher(&publisher_key),
+        WasmPluginAction::EnablePublisher { publisher_key } => enable_publisher(&publisher_key),
     }
 }
 
@@ -64,6 +95,147 @@ fn install(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn deprecated_sunset_for(config: &Config, publisher_key: &str) -> Option<i64> {
+    config
+        .security
+        .deprecated_publisher_keys
+        .iter()
+        .find(|d| d.key == publisher_key)
+        .map(|d| d.sunset_at)
+}
+
+fn disable_plugin(plugin_id: &str) -> Result<()> {
+    let db = Database::open().context("open db")?;
+    let row = db
+        .get_wasm_plugin(plugin_id)?
+        .ok_or_else(|| anyhow!("plugin '{plugin_id}' not installed"))?;
+    if row.status == "quarantined" {
+        bail!("plugin '{plugin_id}' is quarantined; use `borg plugin verify` instead of disable");
+    }
+    // Update the runtime kill-switch list in addition to flipping the row
+    // status — the runtime guard reads the config list, not the DB column,
+    // so a TUI / CLI restart must keep the disable in force.
+    let mut config = Config::load_from_db().context("load config")?;
+    if !config
+        .plugins
+        .wasm
+        .disabled_plugin_ids
+        .iter()
+        .any(|p| p == plugin_id)
+    {
+        config
+            .plugins
+            .wasm
+            .disabled_plugin_ids
+            .push(plugin_id.to_string());
+        let json = serde_json::to_string(&config.plugins.wasm.disabled_plugin_ids)?;
+        db.set_setting("plugins.wasm.disabled_plugin_ids", &json)
+            .context("persist disabled_plugin_ids")?;
+    }
+    db.disable_wasm_plugin(plugin_id)
+        .context("set status=disabled")?;
+    try_emit_global(
+        audit_events::WASM_PLUGIN_DISABLED,
+        plugin_id,
+        &serde_json::json!({ "plugin_id": plugin_id, "scope": "plugin" }),
+    );
+    println!("disabled {plugin_id}");
+    Ok(())
+}
+
+fn enable_plugin(plugin_id: &str) -> Result<()> {
+    let db = Database::open().context("open db")?;
+    let row = db
+        .get_wasm_plugin(plugin_id)?
+        .ok_or_else(|| anyhow!("plugin '{plugin_id}' not installed"))?;
+    if row.status == "quarantined" {
+        bail!(
+            "plugin '{plugin_id}' is quarantined; `enable` does not clear quarantine. Run `borg plugin verify` after restoring the on-disk files."
+        );
+    }
+    let mut config = Config::load_from_db().context("load config")?;
+    let before = config.plugins.wasm.disabled_plugin_ids.len();
+    config
+        .plugins
+        .wasm
+        .disabled_plugin_ids
+        .retain(|p| p != plugin_id);
+    if config.plugins.wasm.disabled_plugin_ids.len() != before {
+        let json = serde_json::to_string(&config.plugins.wasm.disabled_plugin_ids)?;
+        db.set_setting("plugins.wasm.disabled_plugin_ids", &json)
+            .context("persist disabled_plugin_ids")?;
+    }
+    db.enable_wasm_plugin(plugin_id)
+        .context("set status=verified")?;
+    try_emit_global(
+        audit_events::WASM_PLUGIN_ENABLED,
+        plugin_id,
+        &serde_json::json!({ "plugin_id": plugin_id, "scope": "plugin" }),
+    );
+    println!("enabled {plugin_id}");
+    Ok(())
+}
+
+fn disable_publisher(publisher_key: &str) -> Result<()> {
+    if publisher_key.trim().is_empty() {
+        bail!("publisher_key is required");
+    }
+    let db = Database::open().context("open db")?;
+    let mut config = Config::load_from_db().context("load config")?;
+    if !config
+        .plugins
+        .wasm
+        .disabled_publisher_keys
+        .iter()
+        .any(|k| k == publisher_key)
+    {
+        config
+            .plugins
+            .wasm
+            .disabled_publisher_keys
+            .push(publisher_key.to_string());
+        let json = serde_json::to_string(&config.plugins.wasm.disabled_publisher_keys)?;
+        db.set_setting("plugins.wasm.disabled_publisher_keys", &json)
+            .context("persist disabled_publisher_keys")?;
+    }
+    try_emit_global(
+        audit_events::WASM_PLUGIN_DISABLED,
+        "system",
+        &serde_json::json!({
+            "publisher_key": publisher_key,
+            "scope": "publisher",
+        }),
+    );
+    println!("disabled all plugins signed by {publisher_key}");
+    Ok(())
+}
+
+fn enable_publisher(publisher_key: &str) -> Result<()> {
+    let db = Database::open().context("open db")?;
+    let mut config = Config::load_from_db().context("load config")?;
+    let before = config.plugins.wasm.disabled_publisher_keys.len();
+    config
+        .plugins
+        .wasm
+        .disabled_publisher_keys
+        .retain(|k| k != publisher_key);
+    if config.plugins.wasm.disabled_publisher_keys.len() != before {
+        let json = serde_json::to_string(&config.plugins.wasm.disabled_publisher_keys)?;
+        db.set_setting("plugins.wasm.disabled_publisher_keys", &json)
+            .context("persist disabled_publisher_keys")?;
+    }
+    try_emit_global(
+        audit_events::WASM_PLUGIN_ENABLED,
+        "system",
+        &serde_json::json!({
+            "publisher_key": publisher_key,
+            "scope": "publisher",
+        }),
+    );
+    println!("enabled plugins signed by {publisher_key}");
+    Ok(())
+}
+
 fn list() -> Result<()> {
     let db = Database::open().context("open db")?;
     let rows = db.list_wasm_plugins().context("list wasm plugins")?;
@@ -71,19 +243,47 @@ fn list() -> Result<()> {
         println!("(no WASM plugins installed)");
         return Ok(());
     }
-    println!("{:<32}  {:<10}  {:<5}  INSTALLED", "ID", "STATUS", "TOOLS");
+    let config = Config::load_from_db().ok();
+    let show_sunset = config
+        .as_ref()
+        .is_some_and(|c| !c.security.deprecated_publisher_keys.is_empty());
+    if show_sunset {
+        println!(
+            "{:<32}  {:<10}  {:<5}  {:<12}  KEY_SUNSET",
+            "ID", "STATUS", "TOOLS", "INSTALLED"
+        );
+    } else {
+        println!("{:<32}  {:<10}  {:<5}  INSTALLED", "ID", "STATUS", "TOOLS");
+    }
     for row in rows {
         let tools = db.count_wasm_plugin_tools(&row.plugin_id).unwrap_or(0);
         let installed = chrono::DateTime::from_timestamp(row.installed_at, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "?".into());
-        println!(
-            "{:<32}  {:<10}  {:<5}  {}",
-            truncate(&row.plugin_id, 32),
-            row.status,
-            tools,
-            installed
-        );
+        if show_sunset {
+            let sunset = config
+                .as_ref()
+                .and_then(|c| deprecated_sunset_for(c, &row.publisher_key))
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<32}  {:<10}  {:<5}  {:<12}  {}",
+                truncate(&row.plugin_id, 32),
+                row.status,
+                tools,
+                installed,
+                sunset,
+            );
+        } else {
+            println!(
+                "{:<32}  {:<10}  {:<5}  {}",
+                truncate(&row.plugin_id, 32),
+                row.status,
+                tools,
+                installed
+            );
+        }
     }
     Ok(())
 }

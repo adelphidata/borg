@@ -88,6 +88,7 @@ define_settings! {
         "security.blocked_paths" => security.blocked_paths, json;
         "security.allowed_paths" => security.allowed_paths, json;
         "security.trusted_publisher_keys" => security.trusted_publisher_keys, json;
+        "security.deprecated_publisher_keys" => security.deprecated_publisher_keys, json;
         "security.action_limits" => security.action_limits, json_set;
         "security.gateway_action_limits" => security.gateway_action_limits, json_set;
         // security.verifier handled in custom_apply below (FromStr enum).
@@ -222,6 +223,10 @@ define_settings! {
         "plugins.enabled" => plugins.enabled, parsed(bool);
         "plugins.auto_verify" => plugins.auto_verify, parsed(bool);
         "plugins.wasm.enabled" => plugins.wasm.enabled, parsed(bool);
+        "plugins.wasm.disabled_plugin_ids" => plugins.wasm.disabled_plugin_ids, json;
+        "plugins.wasm.disabled_publisher_keys" => plugins.wasm.disabled_publisher_keys, json;
+        "plugins.wasm.rate_limit_per_minute" => plugins.wasm.rate_limit_per_minute, parsed(u32);
+        "plugins.wasm.rate_limit_burst" => plugins.wasm.rate_limit_burst, parsed(u32);
 
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");

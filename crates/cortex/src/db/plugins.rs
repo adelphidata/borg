@@ -347,6 +347,45 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the new local HMAC after an auto-reseal. Idempotent — only
+    /// rewrites the seal column, leaving status and quarantine fields alone.
+    /// Used by the v1→v2 migration path in `cortex::wasm_plugins`.
+    pub fn update_wasm_plugin_local_hmac(&self, plugin_id: &str, local_hmac: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE wasm_plugins SET local_hmac = ?1 WHERE plugin_id = ?2",
+            params![local_hmac, plugin_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a verified plugin disabled. Disabled plugins keep their install
+    /// row and on-disk files but their tools are hidden from the LLM and
+    /// dispatch refuses to execute them. Quarantined rows are not changed —
+    /// quarantine outranks operator-disable.
+    pub fn disable_wasm_plugin(&self, plugin_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE wasm_plugins
+             SET status = 'disabled'
+             WHERE plugin_id = ?1 AND status = 'verified'",
+            params![plugin_id],
+        )?;
+        Ok(())
+    }
+
+    /// Move a disabled plugin back to verified. Quarantined rows must go
+    /// through `restore_wasm_plugin` instead — re-enable does not silently
+    /// clear a quarantine.
+    pub fn enable_wasm_plugin(&self, plugin_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            "UPDATE wasm_plugins
+             SET status = 'verified', verified_at = ?1
+             WHERE plugin_id = ?2 AND status = 'disabled'",
+            params![now, plugin_id],
+        )?;
+        Ok(())
+    }
+
     /// Remove all DB state for a WASM plugin. Returns true if a row existed.
     /// The on-disk install directory is NOT touched — the caller (CLI / TUI)
     /// owns filesystem cleanup so this method stays usable from contexts that
@@ -379,6 +418,20 @@ impl Database {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Resolve a WASM tool name to its owning plugin_id regardless of status.
+    /// Used by the kill-switch filter so a disabled-by-publisher row is still
+    /// reachable for the publisher-key check.
+    pub fn plugin_id_for_tool(&self, tool_name: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT plugin_id FROM wasm_plugin_tools WHERE name = ?1 LIMIT 1")?;
+        let mut rows = stmt.query_map(params![tool_name], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// Look up runtime metadata for a verified WASM tool.

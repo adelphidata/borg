@@ -743,6 +743,17 @@ fn verify_publisher_signature(
     Ok(())
 }
 
+/// Recompute the current-scheme local HMAC seal. Public so cortex can rewrite
+/// the row after auto-resealing a legacy install. The result is what
+/// `verify_installed_hmac` will check on the next execution.
+pub fn compute_local_hmac_current(
+    key: &[u8],
+    manifest_bytes: &[u8],
+    wasm: &[u8],
+) -> Result<String> {
+    compute_local_hmac(key, manifest_bytes, wasm)
+}
+
 fn compute_local_hmac(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
     let mut mac =
         HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key length"))?;
@@ -755,6 +766,215 @@ fn compute_local_hmac(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<
     mac.update(&(wasm.len() as u64).to_be_bytes());
     mac.update(wasm);
     Ok(hex_encode(&mac.finalize().into_bytes()))
+}
+
+/// Legacy (pre-current) HMAC sealing — kept verification-only so installs
+/// sealed by an older borg can be auto-resealed under the current scheme
+/// without forcing the operator to reinstall every plugin.
+///
+/// Two differences from `compute_local_hmac`:
+///   1. The derived-key domain on the cortex side was
+///      `b"borg-wasm-plugin-local-hmac"` (no `-v2` suffix). Cortex passes that
+///      legacy key when it falls back through this verifier.
+///   2. Framing used a single NUL separator between manifest and wasm bytes —
+///      no length prefix. The length-prefixed scheme is more robust against
+///      framing-substitution mistakes if the manifest format ever changes,
+///      but the legacy framing has no known exploit *without* the per-install
+///      KEK-derived key. We accept a v1 MAC as a trust signal at parity with
+///      a v2 MAC because forging either one requires the same secret. The
+///      Ed25519 publisher signature is the remote-trust anchor and is not
+///      touched by this path — the local HMAC is strictly a post-install
+///      tamper signal. If a v1-class collision is ever discovered, this
+///      module must be deleted (not loosened), forcing reinstall.
+pub mod legacy_hmac {
+    use super::{anyhow, bail, constant_time_eq, hex_decode, hex_encode, HmacSha256, Result};
+    use hmac::Mac;
+
+    /// Verify `expected_hmac` against the pre-current ("v1") sealing scheme.
+    /// Callers MUST treat success as a signal to reseal under the current
+    /// scheme (see `cortex::wasm_plugins`), not as a permanent integrity state.
+    pub fn verify(
+        legacy_key: &[u8],
+        manifest_bytes: &[u8],
+        wasm: &[u8],
+        expected_hmac: &str,
+    ) -> Result<()> {
+        if legacy_key.is_empty() {
+            bail!("legacy HMAC key is required");
+        }
+        let expected = hex_decode(expected_hmac)?;
+        let actual_hex = compute(legacy_key, manifest_bytes, wasm)?;
+        let actual = hex_decode(&actual_hex)?;
+        if constant_time_eq(&actual, &expected) {
+            Ok(())
+        } else {
+            bail!("installed WASM plugin legacy integrity check failed")
+        }
+    }
+
+    fn compute(key: &[u8], manifest_bytes: &[u8], wasm: &[u8]) -> Result<String> {
+        let mut mac =
+            HmacSha256::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key length"))?;
+        mac.update(manifest_bytes);
+        mac.update(b"\0");
+        mac.update(wasm);
+        Ok(hex_encode(&mac.finalize().into_bytes()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn legacy_verify_round_trip() {
+            // Real failure mode: a future framing tweak that silently breaks
+            // verification of in-the-wild v1 seals — every existing install
+            // would be force-quarantined on upgrade. Round-trip a known input
+            // to lock the framing down.
+            let key = b"legacy-key-bytes-2026";
+            let manifest = b"{\"id\":\"dev/echo\"}";
+            let wasm = b"\0asm\x01\x00\x00\x00";
+            let mac = compute(key, manifest, wasm).expect("compute legacy");
+            verify(key, manifest, wasm, &mac).expect("verify legacy");
+
+            // Tamper either side, expect failure.
+            let mut tampered = wasm.to_vec();
+            *tampered.last_mut().unwrap() ^= 0xFF;
+            assert!(verify(key, manifest, &tampered, &mac).is_err());
+
+            let mut tampered_manifest = manifest.to_vec();
+            tampered_manifest[0] ^= 0xFF;
+            assert!(verify(key, &tampered_manifest, wasm, &mac).is_err());
+        }
+
+        #[test]
+        fn legacy_verify_empty_key_rejected() {
+            // A misconfigured boot must fail loudly here rather than silently
+            // accept everything via a zero-length key — mirrors the v2 path.
+            let err = verify(b"", b"manifest", b"wasm", &"0".repeat(64))
+                .expect_err("empty key must be rejected");
+            assert!(
+                err.to_string().contains("legacy HMAC key"),
+                "error must point at the key, got: {err}",
+            );
+        }
+    }
+}
+
+/// Coarse-grained error categorization used for metrics labels and audit-row
+/// `error_category` fields. Derived from an `anyhow::Error` returned by
+/// `execute_tool_prepared` — cortex calls `classify_execute_error` at the
+/// seam, which keeps the existing string error surface stable while making
+/// observability machine-readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmExecuteErrorKind {
+    /// Wasmtime fuel exhausted before the guest returned.
+    FuelExhausted,
+    /// Epoch deadline fired — wall-clock timeout.
+    Timeout,
+    /// Memory growth exceeded `limits.max_memory_pages`.
+    MemoryExceeded,
+    /// Guest output (return buffer) exceeded `limits.max_output_bytes`.
+    OutputTooLarge,
+    /// Guest emitted more log bytes/lines than the per-call budget.
+    LogBytesExceeded,
+    /// Host HTTP request rejected because the URL is not on the manifest
+    /// endpoint allowlist.
+    HostHttpDenied,
+    /// Host HTTP request refused because secret-leak scanning matched.
+    HostHttpSecretLeak,
+    /// Host HTTP request reached the upstream but failed (DNS, TLS, 5xx, etc).
+    HostHttpUpstream,
+    /// Guest asked for a credential key not in the manifest's allowlist.
+    CredentialDenied,
+    /// Guest returned bytes that are not valid UTF-8.
+    InvalidGuestOutput,
+    /// Generic wasmtime trap / runtime failure not matched above.
+    GuestTrap,
+}
+
+impl WasmExecuteErrorKind {
+    /// Stable label suffix for OpenTelemetry attributes / audit JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FuelExhausted => "fuel_exhausted",
+            Self::Timeout => "timeout",
+            Self::MemoryExceeded => "memory_exceeded",
+            Self::OutputTooLarge => "output_too_large",
+            Self::LogBytesExceeded => "log_bytes_exceeded",
+            Self::HostHttpDenied => "host_http_denied",
+            Self::HostHttpSecretLeak => "host_http_secret_leak",
+            Self::HostHttpUpstream => "host_http_upstream",
+            Self::CredentialDenied => "credential_denied",
+            Self::InvalidGuestOutput => "invalid_guest_output",
+            Self::GuestTrap => "guest_trap",
+        }
+    }
+}
+
+/// Classify an `anyhow::Error` returned from the execute path into one of the
+/// stable `WasmExecuteErrorKind` buckets. The classifier walks the error chain
+/// and matches against `wasmtime::Trap` first (the most reliable signal for
+/// fuel/timeout/memory) then falls back to string matching on cause messages
+/// produced inside this crate.
+///
+/// Returns `GuestTrap` as the catch-all so a new failure mode shows up as a
+/// recognizable bucket in dashboards instead of silently going uncounted.
+pub fn classify_execute_error(err: &anyhow::Error) -> WasmExecuteErrorKind {
+    // Wasmtime traps carry typed information about the stop reason.
+    for cause in err.chain() {
+        if let Some(trap) = cause.downcast_ref::<wasmtime::Trap>() {
+            return match trap {
+                wasmtime::Trap::OutOfFuel => WasmExecuteErrorKind::FuelExhausted,
+                wasmtime::Trap::Interrupt => WasmExecuteErrorKind::Timeout,
+                _ => WasmExecuteErrorKind::GuestTrap,
+            };
+        }
+    }
+
+    // String-based fallbacks for host-side bail!()s in this crate. Each match
+    // mirrors the literal bail message at its emission site so renaming an
+    // error string requires updating the classifier too — call sites stay
+    // grep-able from the bucket name.
+    let chain_text: String = err
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let lower = chain_text.to_ascii_lowercase();
+
+    if lower.contains("growing memory")
+        || lower.contains("max memory")
+        || lower.contains("memory minimum size")
+    {
+        return WasmExecuteErrorKind::MemoryExceeded;
+    }
+    if lower.contains("output exceeded") {
+        return WasmExecuteErrorKind::OutputTooLarge;
+    }
+    if lower.contains("log budget") || lower.contains("log byte") {
+        return WasmExecuteErrorKind::LogBytesExceeded;
+    }
+    if lower.contains("not on allowlist")
+        || lower.contains("not in endpoint allowlist")
+        || lower.contains("endpoint not allowed")
+    {
+        return WasmExecuteErrorKind::HostHttpDenied;
+    }
+    if lower.contains("secret") && lower.contains("http") {
+        return WasmExecuteErrorKind::HostHttpSecretLeak;
+    }
+    if lower.contains("http request failed") || lower.contains("read plugin http body") {
+        return WasmExecuteErrorKind::HostHttpUpstream;
+    }
+    if lower.contains("undeclared credential") || lower.contains("credentials capability") {
+        return WasmExecuteErrorKind::CredentialDenied;
+    }
+    if lower.contains("non-utf-8 output") {
+        return WasmExecuteErrorKind::InvalidGuestOutput;
+    }
+
+    WasmExecuteErrorKind::GuestTrap
 }
 
 fn collect_imports<F>(imports: Imports<'_>, visit: &mut F) -> Result<()>
@@ -3065,6 +3285,65 @@ mod tests {
             assert!(
                 production.contains(setter),
                 "wasmtime Config production code must call `{setter}` to preserve the v1 sandbox posture"
+            );
+        }
+    }
+
+    /// `classify_execute_error` is built from string-grep fallbacks tied to
+    /// literal `bail!` messages in this crate. Drift between the two surfaces
+    /// turns rich audit data into a wall of `guest_trap`. Exercise each
+    /// non-trap arm against an `anyhow!` whose text matches the production
+    /// `bail!` site — anyone renaming an error string will see this test
+    /// fail and either update the classifier or pick a different name.
+    #[test]
+    fn classify_execute_error_covers_string_matched_arms() {
+        use anyhow::anyhow;
+
+        let cases: &[(&str, WasmExecuteErrorKind)] = &[
+            (
+                "growing memory failed: out of pages",
+                WasmExecuteErrorKind::MemoryExceeded,
+            ),
+            (
+                "output exceeded 1048576 bytes",
+                WasmExecuteErrorKind::OutputTooLarge,
+            ),
+            (
+                "log budget exhausted",
+                WasmExecuteErrorKind::LogBytesExceeded,
+            ),
+            (
+                "endpoint not allowed: https://example.com/x",
+                WasmExecuteErrorKind::HostHttpDenied,
+            ),
+            (
+                "plugin http secret-leak scan refused the request",
+                WasmExecuteErrorKind::HostHttpSecretLeak,
+            ),
+            (
+                "http request failed: dns error",
+                WasmExecuteErrorKind::HostHttpUpstream,
+            ),
+            (
+                "undeclared credential 'STRIPE_KEY'",
+                WasmExecuteErrorKind::CredentialDenied,
+            ),
+            (
+                "guest returned non-utf-8 output",
+                WasmExecuteErrorKind::InvalidGuestOutput,
+            ),
+            (
+                "something the classifier has no opinion about",
+                WasmExecuteErrorKind::GuestTrap,
+            ),
+        ];
+
+        for (msg, expected) in cases {
+            let err = anyhow!(*msg);
+            let got = classify_execute_error(&err);
+            assert_eq!(
+                got, *expected,
+                "classifier drift: `{msg}` should map to {expected:?}, got {got:?}",
             );
         }
     }

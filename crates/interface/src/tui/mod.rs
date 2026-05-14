@@ -1171,6 +1171,75 @@ async fn run_event_loop(
                                 }
                             }
                         }
+                        plugins_popup::PluginAction::SetWasmPluginDisabled {
+                            plugin_id,
+                            disabled,
+                        } => {
+                            // The popup never emits this for a quarantined row,
+                            // so we only handle the verified ↔ disabled flip.
+                            let setting_key = "plugins.wasm.disabled_plugin_ids";
+                            let mut next_list = app.config.plugins.wasm.disabled_plugin_ids.clone();
+                            if disabled {
+                                if !next_list.iter().any(|p| p == &plugin_id) {
+                                    next_list.push(plugin_id.clone());
+                                }
+                            } else {
+                                next_list.retain(|p| p != &plugin_id);
+                            }
+                            let json = match serde_json::to_string(&next_list) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    results.push(format!("Failed to serialize disabled list: {e}"));
+                                    continue;
+                                }
+                            };
+                            match app.config.apply_setting(setting_key, &json) {
+                                Ok(_) => match client.set_setting(setting_key, &json).await {
+                                    Ok(()) => {
+                                        // Also flip the DB row status so a
+                                        // restart with no setting reload still
+                                        // honors the disable.
+                                        let db_outcome =
+                                            cortex::db::Database::open().and_then(|db| {
+                                                if disabled {
+                                                    db.disable_wasm_plugin(&plugin_id)
+                                                } else {
+                                                    db.enable_wasm_plugin(&plugin_id)
+                                                }
+                                            });
+                                        if let Err(e) = db_outcome {
+                                            results.push(format!(
+                                                "{plugin_id}: persist status failed: {e}"
+                                            ));
+                                            continue;
+                                        }
+                                        let event = if disabled {
+                                            cortex::db::audit_events::WASM_PLUGIN_DISABLED
+                                        } else {
+                                            cortex::db::audit_events::WASM_PLUGIN_ENABLED
+                                        };
+                                        cortex::db::try_emit_global(
+                                            event,
+                                            &plugin_id,
+                                            &serde_json::json!({
+                                                "plugin_id": &plugin_id,
+                                                "scope": "plugin",
+                                            }),
+                                        );
+                                        let verb = if disabled { "disabled" } else { "enabled" };
+                                        results.push(format!("{plugin_id}: {verb}"));
+                                    }
+                                    Err(e) => {
+                                        results.push(format!(
+                                            "Error persisting WASM disable list: {e}"
+                                        ));
+                                    }
+                                },
+                                Err(e) => {
+                                    results.push(format!("Error updating WASM disable list: {e}"));
+                                }
+                            }
+                        }
                         plugins_popup::PluginAction::Uninstall { id } => {
                             if let Some(def) = plugins::catalog::find_by_id(&id) {
                                 // Remove keychain entries

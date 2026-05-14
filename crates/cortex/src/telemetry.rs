@@ -228,6 +228,174 @@ impl BorgMetrics {
     }
 }
 
+/// WASM-plugin metric instruments and emission helpers.
+///
+/// These are global so the runtime dispatch path (`crate::wasm_plugins`) can
+/// emit without threading a `BorgMetrics` through every call site. The
+/// instruments are lazily constructed against `opentelemetry::global::meter`
+/// — before a meter provider is installed they are no-ops, so it is safe to
+/// call the `record_*` helpers from anywhere including tests.
+pub mod wasm_metrics {
+    use std::sync::OnceLock;
+
+    use opentelemetry::metrics::{Counter, Histogram};
+    use opentelemetry::KeyValue;
+
+    use plugins::wasm::WasmExecuteErrorKind;
+
+    /// Discriminated outcome reported by `wasm_plugins::compiled_cache`. Re-
+    /// declared here to avoid a circular telemetry → wasm_plugins import.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum WasmCacheOutcome {
+        Hit,
+        Miss,
+    }
+
+    struct Instruments {
+        installs: Counter<u64>,
+        executes: Counter<u64>,
+        execute_duration_ms: Histogram<u64>,
+        quarantines: Counter<u64>,
+        cache_hits: Counter<u64>,
+        cache_misses: Counter<u64>,
+        rate_limited: Counter<u64>,
+        resource_exhausted: Counter<u64>,
+        resealed: Counter<u64>,
+    }
+
+    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+
+    fn instruments() -> &'static Instruments {
+        INSTRUMENTS.get_or_init(|| {
+            let m = opentelemetry::global::meter("borg");
+            Instruments {
+                installs: m
+                    .u64_counter("borg.wasm.installs_total")
+                    .with_description("Successful WASM plugin installs")
+                    .build(),
+                executes: m
+                    .u64_counter("borg.wasm.executes_total")
+                    .with_description("WASM plugin tool dispatches (labelled by outcome)")
+                    .build(),
+                execute_duration_ms: m
+                    .u64_histogram("borg.wasm.execute_duration_ms")
+                    .with_description("WASM plugin tool execution duration in milliseconds")
+                    .with_unit("ms")
+                    .build(),
+                quarantines: m
+                    .u64_counter("borg.wasm.quarantines_total")
+                    .with_description("Plugins moved into quarantine (labelled by reason)")
+                    .build(),
+                cache_hits: m
+                    .u64_counter("borg.wasm.cache_hits_total")
+                    .with_description("Compiled-module cache hits")
+                    .build(),
+                cache_misses: m
+                    .u64_counter("borg.wasm.cache_misses_total")
+                    .with_description("Compiled-module cache misses (JIT compile)")
+                    .build(),
+                rate_limited: m
+                    .u64_counter("borg.wasm.rate_limited_total")
+                    .with_description("Plugin dispatches refused by the per-plugin token bucket")
+                    .build(),
+                resource_exhausted: m
+                    .u64_counter("borg.wasm.resource_exhausted_total")
+                    .with_description("Plugin executions stopped by a resource ceiling")
+                    .build(),
+                resealed: m
+                    .u64_counter("borg.wasm.resealed_total")
+                    .with_description("Plugins whose local HMAC was upgraded to the current scheme")
+                    .build(),
+            }
+        })
+    }
+
+    /// Record an install. Caller passes the publisher key fingerprint so
+    /// dashboards can attribute install volume per signer.
+    pub fn record_install(publisher_key: &str) {
+        instruments().installs.add(
+            1,
+            &[KeyValue::new("publisher_key", publisher_key.to_string())],
+        );
+    }
+
+    /// Record one tool dispatch. `error_category` is `None` on success.
+    pub fn record_execute(
+        plugin_id: &str,
+        tool_name: &str,
+        duration_ms: u64,
+        error_category: Option<WasmExecuteErrorKind>,
+    ) {
+        let outcome = error_category
+            .map(WasmExecuteErrorKind::as_str)
+            .unwrap_or("ok");
+        let attrs = [
+            KeyValue::new("plugin_id", plugin_id.to_string()),
+            KeyValue::new("tool_name", tool_name.to_string()),
+            KeyValue::new("outcome", outcome),
+        ];
+        instruments().executes.add(1, &attrs);
+        instruments()
+            .execute_duration_ms
+            .record(duration_ms, &attrs);
+        // Surface resource-exhaustion explicitly so operators can spot
+        // misconfigured fuel/memory budgets without slicing the executes
+        // counter by every error category.
+        if let Some(kind) = error_category {
+            if matches!(
+                kind,
+                WasmExecuteErrorKind::FuelExhausted
+                    | WasmExecuteErrorKind::Timeout
+                    | WasmExecuteErrorKind::MemoryExceeded
+                    | WasmExecuteErrorKind::OutputTooLarge
+                    | WasmExecuteErrorKind::LogBytesExceeded
+            ) {
+                instruments().resource_exhausted.add(
+                    1,
+                    &[
+                        KeyValue::new("plugin_id", plugin_id.to_string()),
+                        KeyValue::new("kind", kind.as_str()),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Record a quarantine event. `reason_category` is a free-form short
+    /// label (e.g. `integrity_failure`, `reseal_failed`).
+    pub fn record_quarantine(plugin_id: &str, reason_category: &str) {
+        instruments().quarantines.add(
+            1,
+            &[
+                KeyValue::new("plugin_id", plugin_id.to_string()),
+                KeyValue::new("reason_category", reason_category.to_string()),
+            ],
+        );
+    }
+
+    /// Record one cache lookup.
+    pub fn record_cache(outcome: WasmCacheOutcome) {
+        match outcome {
+            WasmCacheOutcome::Hit => instruments().cache_hits.add(1, &[]),
+            WasmCacheOutcome::Miss => instruments().cache_misses.add(1, &[]),
+        }
+    }
+
+    /// Record a rate-limited refusal.
+    pub fn record_rate_limited(plugin_id: &str) {
+        instruments()
+            .rate_limited
+            .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+    }
+
+    /// Record a legacy-seal → current-seal HMAC rewrite.
+    pub fn record_reseal(plugin_id: &str) {
+        instruments()
+            .resealed
+            .add(1, &[KeyValue::new("plugin_id", plugin_id.to_string())]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
