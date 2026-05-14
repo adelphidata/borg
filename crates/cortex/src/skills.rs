@@ -185,8 +185,19 @@ pub struct InstallSpec {
     pub url: Option<String>,
 }
 
+/// Legacy `prerequisites` block from agentskills.io frontmatter. Normalized
+/// into `SkillRequires` at parse time so the rest of the loader doesn't have
+/// to know about two shapes.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PrerequisitesLegacy {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub env_vars: Vec<String>,
+}
+
 /// Parsed YAML frontmatter from a SKILL.md file.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct SkillManifest {
     /// Unique skill identifier.
     pub name: String,
@@ -198,8 +209,9 @@ pub struct SkillManifest {
     /// Runtime requirements (binaries, env vars).
     #[serde(default)]
     pub requires: SkillRequires,
-    /// Supported operating systems (empty means all).
-    #[serde(default)]
+    /// Supported operating systems (empty means all). Accepts `platforms` as an
+    /// alias for cross-compatibility with the agentskills.io standard.
+    #[serde(default, alias = "platforms")]
     pub os: Vec<String>,
     /// Per-dependency install instructions keyed by dependency name.
     #[serde(default)]
@@ -207,6 +219,26 @@ pub struct SkillManifest {
     /// Plugin category for unified UI grouping (e.g., "developer", "utilities").
     #[serde(default)]
     pub category: Option<String>,
+    /// Semantic version (agentskills.io standard, optional).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Author / creator attribution (agentskills.io standard, optional).
+    #[serde(default)]
+    pub author: Option<String>,
+    /// SPDX license identifier (agentskills.io standard, optional).
+    #[serde(default)]
+    pub license: Option<String>,
+    /// Compatibility notes (agentskills.io standard, optional).
+    #[serde(default)]
+    pub compatibility: Option<String>,
+    /// Arbitrary vendor metadata. agentskills.io convention nests under
+    /// `metadata.<vendor>.*`; we just round-trip it for now.
+    #[serde(default)]
+    pub metadata: Option<serde_yaml::Value>,
+    /// Legacy agentskills.io requirement block. Folded into `requires` during
+    /// parsing when `requires` is absent; do not consume directly.
+    #[serde(default)]
+    pub prerequisites: Option<PrerequisitesLegacy>,
 }
 
 /// A loaded skill with its manifest, body, and runtime metadata.
@@ -403,8 +435,22 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String)> {
     let yaml_str = &after_first[..end];
     let body = after_first[end + 4..].trim().to_string();
 
-    let manifest: SkillManifest =
+    let mut manifest: SkillManifest =
         serde_yaml::from_str(yaml_str).context("Failed to parse SKILL.md YAML frontmatter")?;
+
+    // Fold legacy `prerequisites` (agentskills.io frontmatter) into `requires`
+    // when no explicit `requires` was provided. Explicit requires always wins:
+    // a SKILL.md that sets both is treating `requires` as the source of truth
+    // and likely shipped `prerequisites` for cross-tool compatibility.
+    if let Some(prereqs) = manifest.prerequisites.take() {
+        let requires_empty = manifest.requires.bins.is_empty()
+            && manifest.requires.env.is_empty()
+            && manifest.requires.any_bins.is_empty();
+        if requires_empty {
+            manifest.requires.bins = prereqs.commands;
+            manifest.requires.env = prereqs.env_vars;
+        }
+    }
 
     Ok((manifest, body))
 }
@@ -1137,6 +1183,104 @@ Body here.
     }
 
     #[test]
+    fn parse_agentskills_io_frontmatter_round_trips_and_normalizes_prerequisites() {
+        // Hermes-shaped frontmatter (agentskills.io standard): `platforms`
+        // alias for os, `prerequisites.commands`/`env_vars` folded into
+        // requires, vendor `metadata.*` round-trips, version/author/license
+        // preserved.
+        let src = r#"---
+name: apple-reminders
+description: "Apple Reminders via remindctl: add, list, complete."
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+compatibility: macOS 13+
+platforms: [macos]
+metadata:
+  hermes:
+    tags: [Reminders, tasks, todo]
+prerequisites:
+  commands: [remindctl]
+  env_vars: [REMINDCTL_TOKEN]
+---
+
+# Apple Reminders
+
+body
+"#;
+        let (m, _body) = parse_skill_md(src).unwrap();
+        assert_eq!(m.name, "apple-reminders");
+        assert_eq!(m.version.as_deref(), Some("1.0.0"));
+        assert_eq!(m.author.as_deref(), Some("Hermes Agent"));
+        assert_eq!(m.license.as_deref(), Some("MIT"));
+        assert_eq!(m.compatibility.as_deref(), Some("macOS 13+"));
+        assert_eq!(m.os, vec!["macos".to_string()]);
+        assert_eq!(m.requires.bins, vec!["remindctl".to_string()]);
+        assert_eq!(m.requires.env, vec!["REMINDCTL_TOKEN".to_string()]);
+        // prerequisites was consumed during normalization
+        assert!(m.prerequisites.is_none());
+        // metadata round-trips for downstream consumers
+        let meta = m.metadata.as_ref().expect("metadata preserved");
+        let tag = meta
+            .get("hermes")
+            .and_then(|h| h.get("tags"))
+            .and_then(|t| t.as_sequence())
+            .and_then(|s| s.first())
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(tag, "Reminders");
+    }
+
+    #[test]
+    fn explicit_requires_wins_over_prerequisites() {
+        // When a SKILL.md provides both, the explicit `requires` block is the
+        // source of truth — `prerequisites` is ignored to avoid double-loading.
+        let src = r#"---
+name: both-blocks
+description: "Has both shapes."
+requires:
+  bins: [explicit-bin]
+prerequisites:
+  commands: [legacy-bin]
+---
+
+body
+"#;
+        let (m, _) = parse_skill_md(src).unwrap();
+        assert_eq!(m.requires.bins, vec!["explicit-bin".to_string()]);
+        assert!(
+            !m.requires.bins.iter().any(|b| b == "legacy-bin"),
+            "prerequisites must not leak when explicit requires is set"
+        );
+    }
+
+    #[test]
+    fn platforms_alias_matches_os() {
+        // `platforms` is the agentskills.io spelling; `os` is the Borg native
+        // one. Both must deserialize into the same field so existing built-in
+        // skills (using `os`) keep working alongside imported third-party
+        // skills (using `platforms`).
+        let with_os = r#"---
+name: a
+description: "with os"
+os: [linux, macos]
+---
+body
+"#;
+        let with_platforms = r#"---
+name: a
+description: "with platforms"
+platforms: [linux, macos]
+---
+body
+"#;
+        let (a, _) = parse_skill_md(with_os).unwrap();
+        let (b, _) = parse_skill_md(with_platforms).unwrap();
+        assert_eq!(a.os, vec!["linux".to_string(), "macos".to_string()]);
+        assert_eq!(b.os, vec!["linux".to_string(), "macos".to_string()]);
+    }
+
+    #[test]
     fn parse_missing_frontmatter() {
         let err = parse_skill_md("# No frontmatter\nJust a body.")
             .expect_err("missing frontmatter must error");
@@ -1296,6 +1440,7 @@ Short body.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -1556,6 +1701,7 @@ Short body.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "built-in body".to_string(),
             source: SkillSource::BuiltIn,
@@ -1576,6 +1722,7 @@ Short body.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "user body".to_string(),
             source: SkillSource::User,
@@ -1601,6 +1748,7 @@ Short body.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "# Full Body\n\nLots of content here.\n\n## Section 2\n\nMore content."
                 .to_string(),
@@ -1631,6 +1779,7 @@ Short body.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "# Title\n\nFirst paragraph here.\n\n## Section 2\n\nMore content.".to_string(),
             source: SkillSource::BuiltIn,
@@ -1658,6 +1807,7 @@ Short body.
                     os: vec![],
                     install: std::collections::HashMap::new(),
                     category: None,
+                    ..Default::default()
                 },
                 body: format!("# Skill {i}\n\nBody content for skill {i}.\n\n## Usage\n\nDetailed usage instructions for skill {i} with examples and documentation."),
                 source: SkillSource::BuiltIn,
@@ -1962,6 +2112,7 @@ Old copy from a previous install.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -2184,6 +2335,7 @@ Use docker commands.
                 os: vec![],
                 install,
                 category: None,
+                ..Default::default()
             },
             body: String::new(),
             source: SkillSource::BuiltIn,
@@ -2438,6 +2590,7 @@ Use docker commands.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "body".to_string(),
             source: SkillSource::BuiltIn,
@@ -2469,6 +2622,7 @@ Use docker commands.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "body".to_string(),
             source: SkillSource::User,
@@ -2505,6 +2659,7 @@ Use docker commands.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: "# Title\n\nFirst paragraph.".to_string(),
             source: SkillSource::BuiltIn,
@@ -2595,6 +2750,7 @@ Use docker commands.
                 os: vec![],
                 install: std::collections::HashMap::new(),
                 category: None,
+                ..Default::default()
             },
             body: String::new(),
             source,
@@ -2689,6 +2845,7 @@ Use docker commands.
             os: vec![],
             install: std::collections::HashMap::new(),
             category: None,
+            ..Default::default()
         };
         let denied = crate::security::skill::validate_skill_env(&manifest, None);
         assert!(denied.contains(&"ANTHROPIC_API_KEY".to_string()));
@@ -2708,6 +2865,7 @@ Use docker commands.
             os: vec![],
             install: std::collections::HashMap::new(),
             category: None,
+            ..Default::default()
         };
         let config = crate::config::SkillEntryConfig {
             enabled: true,

@@ -312,6 +312,7 @@ mod tests {
             os: vec![],
             install: std::collections::HashMap::new(),
             category: None,
+            ..Default::default()
         }
     }
 
