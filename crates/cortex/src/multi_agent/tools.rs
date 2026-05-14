@@ -1,11 +1,32 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::tool::names as tool_names;
 use crate::tool_handlers::require_str_param;
 use crate::types::ToolDefinition;
 
 use super::roles;
 use super::AgentControl;
+
+/// One-line summaries for multi-agent tools, surfaced in the system prompt's
+/// `<tooling>` section. Mirrors [`crate::tool::definitions::TOOL_SUMMARIES`]
+/// but lives here so the prose stays next to the definitions.
+///
+/// **Intentionally narrow.** `send_to_agent` is *not* listed because
+/// `tool_definitions` does not emit its definition (the receive path is a
+/// stub — see the NOTE block in [`tool_definitions`]); summarising a tool
+/// the LLM cannot call would be dead text in the prompt. `list_agents` and
+/// `manage_roles` are intentional fallbacks — `system_prompt`'s
+/// description-first-sentence path renders an acceptable summary for them
+/// without needing a hand-crafted entry here.
+pub const MULTI_AGENT_TOOL_SUMMARIES: &[(&str, &str)] = &[
+    (tool_names::SPAWN_AGENT, "Spawn an isolated sub-agent"),
+    (
+        tool_names::WAIT_FOR_AGENT,
+        "Wait for a sub-agent to complete",
+    ),
+    (tool_names::CLOSE_AGENT, "Close a running sub-agent"),
+];
 
 /// Tool definitions for the multi-agent system.
 pub fn tool_definitions(spawn_depth: u32, max_spawn_depth: u32) -> Vec<ToolDefinition> {
@@ -469,6 +490,46 @@ pub fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same drift guard as `tool::definitions::tool_summaries_cover_all_core_tool_definitions`,
+    /// but for the multi-agent surface. A future rename of `SPAWN_AGENT`
+    /// (or the others) would silently demote the static one-line summary
+    /// to the description-fallback path in the system prompt; this test
+    /// fails first.
+    #[test]
+    fn multi_agent_summaries_cover_their_definitions() {
+        let defs = tool_definitions(0, /*max_spawn_depth*/ 2);
+        let def_names: std::collections::HashSet<&str> =
+            defs.iter().map(|d| d.function.name.as_str()).collect();
+
+        for (name, _) in MULTI_AGENT_TOOL_SUMMARIES {
+            assert!(
+                def_names.contains(name),
+                "MULTI_AGENT_TOOL_SUMMARIES has `{name}` but no \
+                 multi-agent definition produces it — remove the stale summary"
+            );
+        }
+
+        // `list_agents` and `manage_roles` intentionally fall through to the
+        // first-sentence fallback in `system_prompt::build_tooling_section`;
+        // they're discovery/management tools where the verbose description
+        // is fine.
+        let intentional_fallbacks: &[&str] = &["list_agents", "manage_roles"];
+        let summary_names: std::collections::HashSet<&str> =
+            MULTI_AGENT_TOOL_SUMMARIES.iter().map(|(n, _)| *n).collect();
+        for def in &defs {
+            let name = def.function.name.as_str();
+            if intentional_fallbacks.contains(&name) {
+                continue;
+            }
+            assert!(
+                summary_names.contains(name),
+                "multi-agent tool `{name}` has a definition but no entry in \
+                 MULTI_AGENT_TOOL_SUMMARIES — add one or list it in this \
+                 test's `intentional_fallbacks`"
+            );
+        }
+    }
 
     #[test]
     fn test_spawn_agent_tool_definition() {

@@ -66,45 +66,14 @@ impl Agent {
     }
 
     /// Build the `<tooling>` section listing available tools with summaries.
+    ///
+    /// Summaries are pulled from the per-module `TOOL_SUMMARIES` tables
+    /// (`tool::definitions::TOOL_SUMMARIES` for the core set,
+    /// `multi_agent::tools::MULTI_AGENT_TOOL_SUMMARIES` for the spawn/send/
+    /// wait/close set). Dynamic tools (WASM plugins, integrations registered
+    /// via skills) won't have a static entry — for those the section falls
+    /// back to the first sentence of the tool's `ToolDefinition::description`.
     pub(super) fn build_tooling_section(&self) -> String {
-        let tool_summaries: &[(&str, &str)] = &[
-            ("write_memory", "Write/append long-term memory entries"),
-            ("read_memory", "Read a long-term memory entry"),
-            (
-                "memory_search",
-                "Search long-term memory, knowledge files, and sessions",
-            ),
-            ("list", "List resources (skills, channels, agents)"),
-            ("apply_patch", "Create/update/delete files via patch DSL"),
-            (
-                "run_shell",
-                "Execute shell commands (full system access, not sandboxed)",
-            ),
-            (
-                "read_file",
-                "Read file contents with line numbers, images, PDFs",
-            ),
-            ("list_dir", "List directory contents"),
-            ("web_fetch", "Fetch URL content"),
-            ("web_search", "Search the web"),
-            ("browser", "Control headless Chrome browser"),
-            (
-                "schedule",
-                "Manage scheduled jobs: prompt tasks and cron commands",
-            ),
-            (
-                "request_user_input",
-                "Last-resort prompt for information no other tool can obtain (personal preference, credential, external decision). Do not use for questions answerable by reading files or running commands.",
-            ),
-            ("generate_image", "Generate images from text descriptions"),
-            ("text_to_speech", "Convert text to speech audio"),
-            ("spawn_agent", "Spawn an isolated sub-agent"),
-            ("send_to_agent", "Send message to a running sub-agent"),
-            ("wait_for_agent", "Wait for a sub-agent to complete"),
-            ("close_agent", "Close a running sub-agent"),
-        ];
-
-        // Build the full tool list including multi-agent tools when available
         let mut defs = crate::tool::definitions::core_tool_definitions(&self.config);
         if self.agent_control.is_some() {
             defs.extend(crate::multi_agent::tools::tool_definitions(
@@ -112,25 +81,25 @@ impl Agent {
                 self.config.agents.max_spawn_depth,
             ));
         }
-        let available: std::collections::HashSet<&str> =
-            defs.iter().map(|d| d.function.name.as_str()).collect();
+
+        let static_summary = |name: &str| -> Option<&'static str> {
+            crate::tool::definitions::TOOL_SUMMARIES
+                .iter()
+                .chain(crate::multi_agent::tools::MULTI_AGENT_TOOL_SUMMARIES.iter())
+                .find_map(|(n, summary)| (*n == name).then_some(*summary))
+        };
 
         let mut lines = vec![
             "## Tooling".to_string(),
             "Available tools (filtered by config):".to_string(),
         ];
-        for &(name, summary) in tool_summaries {
-            if available.contains(name) {
-                lines.push(format!("- {name}: {summary}"));
-            }
-        }
-        // Include any tools not in the static list (e.g. integration tools)
         for def in &defs {
             let name = def.function.name.as_str();
-            if !tool_summaries.iter().any(|&(n, _)| n == name) {
-                let desc = def.function.description.split('.').next().unwrap_or("");
-                lines.push(format!("- {name}: {desc}"));
-            }
+            let summary = static_summary(name).unwrap_or_else(|| {
+                // Fallback for dynamic tools (WASM plugins / integrations).
+                def.function.description.split('.').next().unwrap_or("")
+            });
+            lines.push(format!("- {name}: {summary}"));
         }
         lines.push(String::new());
         format!("\n<tooling>\n{}\n</tooling>\n", lines.join("\n"))

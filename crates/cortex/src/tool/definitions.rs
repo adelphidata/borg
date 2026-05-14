@@ -2,6 +2,76 @@ use crate::config::Config;
 use crate::tool::names as tool_names;
 use crate::types::ToolDefinition;
 
+/// Per-tool one-line summaries used in the system prompt's `<tooling>` section.
+///
+/// **Single source of truth.** The system prompt previously hand-maintained a
+/// parallel table; keeping the summaries co-located with the definitions
+/// keeps the prose for "what this tool does" in one place. Multi-agent tool
+/// summaries live in [`crate::multi_agent::tools::MULTI_AGENT_TOOL_SUMMARIES`]
+/// alongside their definitions; `agent::system_prompt` chains the two
+/// sources. WASM plugins are dynamic and have no static summary — the
+/// system prompt falls back to the first sentence of the tool's description
+/// for any name not present in either table.
+///
+/// Adding a new core tool requires a new entry here. The
+/// `tool_summaries_cover_all_core_tool_definitions` guard test in this
+/// module fails if a tool definition is added without a matching summary,
+/// so drift can't land silently.
+pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
+    (tool_names::WRITE_MEMORY, "Write/append long-term memory entries"),
+    (tool_names::READ_MEMORY, "Read a long-term memory entry"),
+    (
+        tool_names::MEMORY_SEARCH,
+        "Search long-term memory, knowledge files, and sessions",
+    ),
+    (tool_names::LIST, "List resources (skills, channels, agents)"),
+    (
+        tool_names::APPLY_PATCH,
+        "Create/update/delete files via patch DSL",
+    ),
+    (
+        tool_names::RUN_SHELL,
+        "Execute shell commands (full system access, not sandboxed)",
+    ),
+    (
+        tool_names::READ_FILE,
+        "Read file contents with line numbers, images, PDFs",
+    ),
+    (tool_names::LIST_DIR, "List directory contents"),
+    (tool_names::WEB_FETCH, "Fetch URL content"),
+    (tool_names::WEB_SEARCH, "Search the web"),
+    (tool_names::BROWSER, "Control headless Chrome browser"),
+    (
+        tool_names::SCHEDULE,
+        "Manage scheduled jobs: prompt tasks and cron commands",
+    ),
+    (
+        tool_names::REQUEST_USER_INPUT,
+        "Last-resort prompt for information no other tool can obtain (personal preference, credential, external decision). Do not use for questions answerable by reading files or running commands.",
+    ),
+    (
+        tool_names::GENERATE_IMAGE,
+        "Generate images from text descriptions",
+    ),
+    (tool_names::TEXT_TO_SPEECH, "Convert text to speech audio"),
+    (
+        tool_names::VISION_ANALYZE,
+        "Describe or answer questions about a remote image",
+    ),
+    (
+        tool_names::GET_GOAL,
+        "Read this session's active goal (status, budget, usage)",
+    ),
+    (
+        tool_names::CREATE_GOAL,
+        "Create a session goal (only when the user explicitly asks)",
+    ),
+    (
+        tool_names::UPDATE_GOAL,
+        "Mark this session's goal complete",
+    ),
+];
+
 /// Build the core tool definitions sent to the LLM.
 ///
 /// IMPORTANT: Be conservative adding new tools here. Every tool's JSON schema is
@@ -336,6 +406,50 @@ mod tests {
         assert!(!names.contains(&"projects"), "projects tool was demolished");
         assert!(!names.contains(&"workflow"), "workflow tool was demolished");
         assert!(names.contains(&"request_user_input"));
+    }
+
+    /// Guard against drift between the system-prompt summary table and the
+    /// actual tool definitions. Adding a new core tool definition without a
+    /// matching `TOOL_SUMMARIES` entry would silently produce a `- name:`
+    /// line in the prompt with no human-readable hint; missing the line
+    /// would force the LLM to fall back to the verbose schema description.
+    ///
+    /// `goals.enabled` is off by default — flip every gate to ensure every
+    /// optional tool that ships a definition also ships a summary.
+    #[test]
+    fn tool_summaries_cover_all_core_tool_definitions() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        config.web.enabled = true;
+        config.tts.enabled = true;
+        config.image_gen.enabled = true;
+        config.goals.enabled = true;
+        let defs = core_tool_definitions(&config);
+
+        let summary_names: std::collections::HashSet<&str> =
+            TOOL_SUMMARIES.iter().map(|(n, _)| *n).collect();
+
+        for def in &defs {
+            let name = def.function.name.as_str();
+            assert!(
+                summary_names.contains(name),
+                "tool `{name}` has a definition but no entry in TOOL_SUMMARIES — \
+                 add one in tool/definitions.rs"
+            );
+        }
+
+        // Reverse: every summary entry must correspond to a name some
+        // configuration of `core_tool_definitions` produces. A summary without
+        // a definition is dead text in the system prompt.
+        let all_names: std::collections::HashSet<&str> =
+            defs.iter().map(|d| d.function.name.as_str()).collect();
+        for (name, _) in TOOL_SUMMARIES {
+            assert!(
+                all_names.contains(name),
+                "TOOL_SUMMARIES has `{name}` but no Config combo produces \
+                 that tool definition — remove the stale summary"
+            );
+        }
     }
 
     #[test]
