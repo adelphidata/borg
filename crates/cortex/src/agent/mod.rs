@@ -2394,6 +2394,11 @@ impl Agent {
             crate::tool::Tool::RequestUserInput(args) => {
                 return crate::tool::request_user_input::handle(args, event_tx).await;
             }
+            crate::tool::Tool::VisionAnalyze(args) => {
+                let out = crate::tool::vision_analyze::handle(args, &self.config).await?;
+                self.maybe_refresh_skills_after_tool(name, &raw_args, "");
+                return Ok(out);
+            }
             _ => {}
         }
 
@@ -2531,8 +2536,9 @@ impl Agent {
             crate::tool::Tool::ReadFile(_)
             | crate::tool::Tool::Browser(_)
             | crate::tool::Tool::TextToSpeech(_)
-            | crate::tool::Tool::RequestUserInput(_) => unreachable!(
-                "ReadFile/Browser/TextToSpeech/RequestUserInput are handled in the early-return match above"
+            | crate::tool::Tool::RequestUserInput(_)
+            | crate::tool::Tool::VisionAnalyze(_) => unreachable!(
+                "ReadFile/Browser/TextToSpeech/RequestUserInput/VisionAnalyze are handled in the early-return match above"
             ),
         };
         let text = text_result?;

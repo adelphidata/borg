@@ -87,6 +87,30 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
         ));
     }
 
+    // Vision analyze — gated by `web.enabled` since it fetches remote URLs.
+    // Data URIs work even with web disabled, but keeping the gate behind a
+    // single network-policy switch is the safer default.
+    if config.web.enabled {
+        defs.push(ToolDefinition::new(
+            tool_names::VISION_ANALYZE,
+            "Fetch an image from an http(s) URL or data: URI and return it inline so multimodal LLMs can describe it. Local files should be opened with read_file instead.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_url": {
+                        "type": "string",
+                        "description": "https URL or data:image/... base64 URI"
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional question to focus the visual analysis"
+                    }
+                },
+                "required": ["image_url"]
+            }),
+        ));
+    }
+
     if config.image_gen.enabled {
         defs.push(ToolDefinition::new(
             tool_names::GENERATE_IMAGE,

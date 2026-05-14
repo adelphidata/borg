@@ -47,6 +47,7 @@ pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod text_to_speech;
 pub(crate) mod update_goal;
+pub(crate) mod vision_analyze;
 pub(crate) mod web_fetch;
 pub(crate) mod web_search;
 pub(crate) mod write_memory;
@@ -67,6 +68,7 @@ pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
+pub(crate) use vision_analyze::VisionAnalyzeArgs;
 pub(crate) use web_fetch::WebFetchArgs;
 pub(crate) use web_search::WebSearchArgs;
 pub(crate) use write_memory::WriteMemoryArgs;
@@ -112,6 +114,7 @@ pub(crate) enum Tool {
     Browser(BrowserArgs),
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
+    VisionAnalyze(VisionAnalyzeArgs),
 
     // User interaction
     RequestUserInput(RequestUserInputArgs),
@@ -197,6 +200,7 @@ impl Tool {
             tn::BROWSER => Tool::Browser(from(tn::BROWSER, args)?),
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
+            tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
 
             // User input
             tn::REQUEST_USER_INPUT => Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?),
@@ -241,6 +245,7 @@ impl Tool {
             Tool::Browser(_) => tn::BROWSER,
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
+            Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
             Tool::RequestUserInput(_) => tn::REQUEST_USER_INPUT,
             Tool::GetGoal(_) => tn::GET_GOAL,
             Tool::CreateGoal(_) => tn::CREATE_GOAL,
@@ -270,7 +275,8 @@ impl Tool {
             | Tool::WebFetch(_)
             | Tool::WebSearch(_)
             | Tool::ApplyPatch(_)
-            | Tool::ApplySkillPatch(_) => true,
+            | Tool::ApplySkillPatch(_)
+            | Tool::VisionAnalyze(_) => true,
 
             Tool::WriteMemory(_)
             | Tool::CreateChannel(_)
@@ -316,7 +322,8 @@ impl Tool {
             | Tool::WebFetch(_)
             | Tool::WebSearch(_)
             | Tool::RequestUserInput(_)
-            | Tool::GetGoal(_) => true,
+            | Tool::GetGoal(_)
+            | Tool::VisionAnalyze(_) => true,
 
             Tool::WriteMemory(_)
             | Tool::ApplyPatch(_)
@@ -362,7 +369,9 @@ impl Tool {
             Tool::WebFetch(_) | Tool::WebSearch(_) => ToolGroup::Web,
             Tool::Browser(_) => ToolGroup::Ui,
             Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) => ToolGroup::Scheduling,
-            Tool::GenerateImage(_) | Tool::TextToSpeech(_) => ToolGroup::Media,
+            Tool::GenerateImage(_) | Tool::TextToSpeech(_) | Tool::VisionAnalyze(_) => {
+                ToolGroup::Media
+            }
             Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
             | Tool::WaitForAgent(_)
@@ -393,6 +402,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::WEB_SEARCH,
             tn::REQUEST_USER_INPUT,
             tn::GET_GOAL,
+            tn::VISION_ANALYZE,
         ],
     )
 }
@@ -415,6 +425,7 @@ pub(crate) const fn is_parallel_safe_name(name: &str) -> bool {
             tn::WEB_SEARCH,
             tn::APPLY_PATCH,
             tn::APPLY_SKILL_PATCH,
+            tn::VISION_ANALYZE,
         ],
     )
 }
@@ -485,6 +496,10 @@ mod tests {
             ),
             (tn::GENERATE_IMAGE, json!({"prompt":"a cat"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
+            (
+                tn::VISION_ANALYZE,
+                json!({"image_url":"https://example.com/x.png"}),
+            ),
             (
                 tn::REQUEST_USER_INPUT,
                 json!({"questions":[{"id":"a","header":"H","question":"?","options":[{"label":"x","description":"y"},{"label":"z","description":"w"}]}]}),
@@ -581,6 +596,10 @@ mod tests {
             (tn::GENERATE_IMAGE, json!({"prompt":"x"})),
             (tn::TEXT_TO_SPEECH, json!({"text":"hi"})),
             (
+                tn::VISION_ANALYZE,
+                json!({"image_url":"https://example.com/x.png"}),
+            ),
+            (
                 tn::REQUEST_USER_INPUT,
                 json!({"questions":[{"id":"a","header":"H","question":"?","options":[{"label":"x","description":"y"},{"label":"z","description":"w"}]}]}),
             ),
@@ -613,6 +632,7 @@ mod tests {
             tn::WEB_SEARCH,
             tn::APPLY_PATCH,
             tn::APPLY_SKILL_PATCH,
+            tn::VISION_ANALYZE,
         ];
         for (name, args) in round_trip_cases() {
             let tool = Tool::parse(name, args).expect("parse");

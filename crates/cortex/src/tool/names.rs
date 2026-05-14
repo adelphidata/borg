@@ -26,6 +26,7 @@ pub const MANAGE_CRON: &str = "manage_cron";
 pub const BROWSER: &str = "browser";
 pub const GENERATE_IMAGE: &str = "generate_image";
 pub const TEXT_TO_SPEECH: &str = "text_to_speech";
+pub const VISION_ANALYZE: &str = "vision_analyze";
 
 // ── User interaction ──
 pub const REQUEST_USER_INPUT: &str = "request_user_input";

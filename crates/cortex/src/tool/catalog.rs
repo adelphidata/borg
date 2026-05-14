@@ -65,6 +65,7 @@ const PRIMARY_TOOLS: &[(&str, ToolGroup)] = &[
     // Media
     (crate::tool::names::GENERATE_IMAGE, ToolGroup::Media),
     (crate::tool::names::TEXT_TO_SPEECH, ToolGroup::Media),
+    (crate::tool::names::VISION_ANALYZE, ToolGroup::Media),
     // Integration (skill-driven; not dispatched by the agent loop directly)
     (crate::tool::names::GMAIL, ToolGroup::Integration),
     (crate::tool::names::GOOGLE_CALENDAR, ToolGroup::Integration),
@@ -776,6 +777,7 @@ mod tests {
             tool_names::BROWSER,
             tool_names::GENERATE_IMAGE,
             tool_names::TEXT_TO_SPEECH,
+            tool_names::VISION_ANALYZE,
             tool_names::REQUEST_USER_INPUT,
             tool_names::APPLY_SKILL_PATCH,
             tool_names::CREATE_CHANNEL,

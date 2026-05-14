@@ -53,9 +53,8 @@ pub(crate) fn classify_action(tool_name: &str) -> ActionType {
         "apply_patch" | "apply_skill_patch" | "create_channel" => ActionType::FileWrite,
         "write_memory" => ActionType::MemoryWrite,
         "memory_search" | "read_memory" => ActionType::ToolCall,
-        "web_fetch" | "web_search" | "browser" | "text_to_speech" | "generate_image" => {
-            ActionType::WebRequest
-        }
+        "web_fetch" | "web_search" | "browser" | "text_to_speech" | "generate_image"
+        | "vision_analyze" => ActionType::WebRequest,
         _ => ActionType::ToolCall,
     }
 }

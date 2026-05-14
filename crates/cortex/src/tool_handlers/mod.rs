@@ -271,8 +271,8 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         assert_eq!(
             names.len(),
-            16,
-            "expected 16 core tools (all enabled, incl. 3 goal tools), got: {names:?}"
+            17,
+            "expected 17 core tools (all enabled, incl. 3 goal tools + vision_analyze), got: {names:?}"
         );
 
         let mut minimal_config = Config::default();

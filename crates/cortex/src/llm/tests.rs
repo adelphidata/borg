@@ -583,6 +583,60 @@ fn anthropic_tool_result_conversion() {
 }
 
 #[test]
+fn anthropic_tool_result_carries_multimodal_image_blocks() {
+    // Invariant: a tool result with image parts (e.g. computer_use screenshot,
+    // vision_analyze native path) must reach Anthropic as content-block array
+    // with text + image entries — not flattened to a single string.
+    use crate::types::{ContentPart, MediaData};
+
+    let parts = vec![
+        ContentPart::Text("captured window".to_string()),
+        ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
+                filename: None,
+            },
+        },
+    ];
+    let messages = vec![
+        Message::user("screenshot the active window"),
+        Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_cap".to_string(),
+                call_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "computer_use".to_string(),
+                    arguments: r#"{"action":"capture"}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        Message::tool_result_multimodal("call_cap", parts),
+    ];
+
+    let anthropic_msgs = build_anthropic_messages(&messages);
+    let tool_user = &anthropic_msgs[2];
+    let tool_result = &tool_user["content"][0];
+    assert_eq!(tool_result["type"], "tool_result");
+    assert_eq!(tool_result["tool_use_id"], "call_cap");
+
+    let inner = tool_result["content"]
+        .as_array()
+        .expect("multimodal tool_result.content must be a block array");
+    assert_eq!(inner.len(), 2, "expected text + image blocks");
+    assert_eq!(inner[0]["type"], "text");
+    assert_eq!(inner[0]["text"], "captured window");
+    assert_eq!(inner[1]["type"], "image");
+    assert_eq!(inner[1]["source"]["type"], "base64");
+    assert_eq!(inner[1]["source"]["media_type"], "image/png");
+    assert_eq!(inner[1]["source"]["data"], "iVBORw0KGgo=");
+}
+
+#[test]
 fn anthropic_tool_definition_conversion() {
     let tools = vec![ToolDefinition::new(
         "test_tool",

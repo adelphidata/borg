@@ -906,12 +906,72 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
                 }));
             }
             Role::Tool => {
+                // Bedrock Converse toolResult.content accepts {text:...} and {image:...}
+                // blocks. Multimodal tool results (e.g. computer_use screenshots)
+                // need the image blocks so they reach the model intact.
+                let mut tool_result_content: Vec<serde_json::Value> = Vec::new();
+                match &message.content {
+                    Some(crate::types::MessageContent::Parts(parts)) => {
+                        for part in parts {
+                            match part {
+                                crate::types::ContentPart::Text(text) => {
+                                    if !text.is_empty() {
+                                        tool_result_content
+                                            .push(serde_json::json!({ "text": text }));
+                                    }
+                                }
+                                crate::types::ContentPart::ImageBase64 { media } => {
+                                    // Bedrock Converse only accepts {png,jpeg,gif,webp}.
+                                    // Falling through to a text block for anything else
+                                    // keeps the request well-formed instead of letting
+                                    // the API reject it.
+                                    let fmt = match media.mime_type.as_str() {
+                                        "image/png" => Some("png"),
+                                        "image/jpeg" | "image/jpg" => Some("jpeg"),
+                                        "image/gif" => Some("gif"),
+                                        "image/webp" => Some("webp"),
+                                        _ => None,
+                                    };
+                                    match fmt {
+                                        Some(fmt) => tool_result_content.push(serde_json::json!({
+                                            "image": {
+                                                "format": fmt,
+                                                "source": { "bytes": media.data },
+                                            }
+                                        })),
+                                        None => tool_result_content.push(serde_json::json!({
+                                            "text": format!("[image omitted: unsupported format {}]", media.mime_type)
+                                        })),
+                                    }
+                                }
+                                crate::types::ContentPart::ImageUrl { url } => {
+                                    tool_result_content.push(serde_json::json!({
+                                        "text": format!("[image: {url}]")
+                                    }));
+                                }
+                                crate::types::ContentPart::AudioBase64 { media } => {
+                                    tool_result_content.push(serde_json::json!({
+                                        "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        tool_result_content.push(serde_json::json!({
+                            "text": message.text_content().unwrap_or(""),
+                        }));
+                    }
+                }
+                if tool_result_content.is_empty() {
+                    tool_result_content.push(serde_json::json!({ "text": "" }));
+                }
                 bedrock_messages.push(serde_json::json!({
                     "role": "user",
                     "content": [{
                         "toolResult": {
                             "toolUseId": message.tool_call_id.as_deref().unwrap_or(""),
-                            "content": [{ "text": message.text_content().unwrap_or("") }],
+                            "content": tool_result_content,
                         }
                     }],
                 }));
@@ -1314,6 +1374,40 @@ mod tests {
         let tool_result = &tool_result_msg["content"][0]["toolResult"];
         assert_eq!(tool_result["toolUseId"], "call_42");
         assert_eq!(tool_result["content"][0]["text"], "/tmp");
+    }
+
+    #[test]
+    fn build_bedrock_request_carries_multimodal_tool_result_image_block() {
+        // Invariant: a tool result with image parts must reach Bedrock as
+        // `toolResult.content` with both text and image blocks. Flattening
+        // to a single text block would lose the screenshot bytes that
+        // computer_use/vision_analyze just paid to capture.
+        use crate::types::{ContentPart, MediaData};
+
+        let parts = vec![
+            ContentPart::Text("captured".to_string()),
+            ContentPart::ImageBase64 {
+                media: MediaData {
+                    mime_type: "image/png".to_string(),
+                    data: "iVBORw0KGgo=".to_string(),
+                    filename: None,
+                },
+            },
+        ];
+        let messages = vec![
+            Message::user("screenshot"),
+            Message::tool_result_multimodal("call_cap", parts),
+        ];
+        let body = build_bedrock_request(&bedrock_request(&messages));
+        let tool_result = &body["messages"][1]["content"][0]["toolResult"];
+        assert_eq!(tool_result["toolUseId"], "call_cap");
+        let inner = tool_result["content"]
+            .as_array()
+            .expect("multimodal toolResult.content must be a block array");
+        assert_eq!(inner.len(), 2);
+        assert_eq!(inner[0]["text"], "captured");
+        assert_eq!(inner[1]["image"]["format"], "png");
+        assert_eq!(inner[1]["image"]["source"]["bytes"], "iVBORw0KGgo=");
     }
 
     #[test]

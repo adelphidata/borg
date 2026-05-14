@@ -144,10 +144,63 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                 }));
             }
             Role::Tool => {
+                // Anthropic tool_result.content accepts either a plain string or an
+                // array of {text, image} blocks. Multimodal tool results
+                // (e.g. computer_use screenshots) need the array form so images
+                // reach the model instead of being flattened.
+                let content_value = match &msg.content {
+                    Some(crate::types::MessageContent::Parts(parts)) => {
+                        let mut blocks: Vec<serde_json::Value> = Vec::new();
+                        for part in parts {
+                            match part {
+                                crate::types::ContentPart::Text(t) => {
+                                    if !t.is_empty() {
+                                        blocks.push(serde_json::json!({
+                                            "type": "text",
+                                            "text": t,
+                                        }));
+                                    }
+                                }
+                                crate::types::ContentPart::ImageBase64 { media } => {
+                                    blocks.push(serde_json::json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media.mime_type,
+                                            "data": media.data,
+                                        },
+                                    }));
+                                }
+                                crate::types::ContentPart::ImageUrl { url } => {
+                                    blocks.push(serde_json::json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "url",
+                                            "url": url,
+                                        },
+                                    }));
+                                }
+                                crate::types::ContentPart::AudioBase64 { media } => {
+                                    blocks.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
+                                    }));
+                                }
+                            }
+                        }
+                        if blocks.is_empty() {
+                            serde_json::json!("")
+                        } else {
+                            serde_json::Value::Array(blocks)
+                        }
+                    }
+                    _ => serde_json::json!(msg.text_content().unwrap_or("")),
+                };
+
                 let tool_result_block = serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                    "content": msg.text_content().unwrap_or(""),
+                    "content": content_value,
                 });
 
                 // Anthropic requires tool results in a user message. Merge with previous

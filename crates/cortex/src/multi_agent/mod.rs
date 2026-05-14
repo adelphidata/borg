@@ -1352,6 +1352,7 @@ mod tests {
             "web_search",
             "request_user_input",
             "get_goal",
+            "vision_analyze",
         ]
         .into_iter()
         .collect();
