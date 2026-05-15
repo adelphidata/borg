@@ -203,6 +203,23 @@ pub fn infer_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes[0] == 0x42 && bytes[1] == 0x4D {
         return Some("image/bmp");
     }
+    // ISO BMFF container (mp4, quicktime, etc.): the `ftyp` box header sits
+    // at bytes 4..8 with the major brand at 8..12. We branch on the brand
+    // because every QuickTime export uses `qt  ` (two trailing spaces) while
+    // mp4 and its cousins (`isom`, `avc1`, `mp42`, `iso2`, `dash`, ...) all
+    // route to `video/mp4` per RFC 4337 / ISO/IEC 14496-12.
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        if &bytes[8..12] == b"qt  " {
+            return Some("video/quicktime");
+        }
+        return Some("video/mp4");
+    }
+    // Matroska/WebM EBML header. We collapse both to `video/webm` because
+    // that's what Gemini accepts and what `video_analyze` produces — an mkv
+    // routed here is functionally the same container family.
+    if bytes[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some("video/webm");
+    }
     None
 }
 
@@ -299,6 +316,48 @@ mod tests {
     #[test]
     fn infer_mime_unknown() {
         assert_eq!(infer_mime_from_bytes(&[0x00, 0x00, 0x00, 0x00]), None);
+    }
+
+    #[test]
+    fn infer_mime_mp4() {
+        // Minimal ftyp box: size=32, "ftyp", brand "mp42", padding, compat
+        // brands. Bytes pulled from the M1 spec, which sources them directly
+        // from the ISO BMFF (ISO/IEC 14496-12) brand registry.
+        let bytes: [u8; 32] = [
+            0x00, 0x00, 0x00, 0x20, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2', 0x00, 0x00,
+            0x00, 0x00, b'm', b'p', b'4', b'2', b'i', b's', b'o', b'm', b'a', b'v', b'c', b'1',
+            b'm', b'p', b'4', b'1',
+        ];
+        assert_eq!(infer_mime_from_bytes(&bytes), Some("video/mp4"));
+    }
+
+    #[test]
+    fn infer_mime_quicktime() {
+        // Brand "qt  " (two trailing spaces) is the QuickTime marker — every
+        // other ISO BMFF brand routes to video/mp4. This branch only fires
+        // when an operator uploads a `.mov` exported by Apple tooling.
+        let mut bytes = vec![0x00, 0x00, 0x00, 0x14];
+        bytes.extend_from_slice(b"ftyp");
+        bytes.extend_from_slice(b"qt  ");
+        bytes.extend_from_slice(&[0x00; 4]);
+        assert_eq!(infer_mime_from_bytes(&bytes), Some("video/quicktime"));
+    }
+
+    #[test]
+    fn infer_mime_webm() {
+        // Matroska/WebM EBML header. We collapse mkv to webm — the actual
+        // wire format Gemini consumes is identical for the subset we ship.
+        let bytes = [0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81];
+        assert_eq!(infer_mime_from_bytes(&bytes), Some("video/webm"));
+    }
+
+    #[test]
+    fn infer_mime_rejects_short_ftyp_prefix() {
+        // The ftyp branch requires 12 bytes — anything shorter must not
+        // false-positive into `video/mp4`. Regression guard for the off-by-
+        // one in the bounds check.
+        let bytes = [0x00, 0x00, 0x00, 0x20, b'f', b't', b'y', b'p'];
+        assert_eq!(infer_mime_from_bytes(&bytes), None);
     }
 
     #[test]

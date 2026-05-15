@@ -954,6 +954,16 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
                                         "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
                                     }));
                                 }
+                                crate::types::ContentPart::VideoBase64 { media } => {
+                                    // Bedrock Converse `toolResult.content`
+                                    // accepts text and image blocks only; video
+                                    // surfaces as a text placeholder so the
+                                    // model still sees that something was
+                                    // attached.
+                                    tool_result_content.push(serde_json::json!({
+                                        "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video"))
+                                    }));
+                                }
                             }
                         }
                     }
@@ -1055,6 +1065,11 @@ fn append_bedrock_content(content: &mut Vec<serde_json::Value>, message: &Messag
                     crate::types::ContentPart::AudioBase64 { media } => {
                         content.push(serde_json::json!({
                             "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
+                        }));
+                    }
+                    crate::types::ContentPart::VideoBase64 { media } => {
+                        content.push(serde_json::json!({
+                            "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video"))
                         }));
                     }
                 }

@@ -257,6 +257,12 @@ fn flatten_content(content: Option<&MessageContent>) -> String {
                             media.filename.as_deref().unwrap_or("attached")
                         ));
                     }
+                    ContentPart::VideoBase64 { media } => {
+                        buf.push_str(&format!(
+                            " [video: {}]",
+                            media.filename.as_deref().unwrap_or("attached")
+                        ));
+                    }
                 }
             }
             buf

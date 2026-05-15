@@ -92,6 +92,16 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                                         "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
                                     }));
                             }
+                            crate::types::ContentPart::VideoBase64 { media } => {
+                                // Anthropic Messages has no native video block.
+                                // Degrade to a text placeholder so the message
+                                // round-trips; operator routing should land
+                                // video on Gemini-family models.
+                                content_blocks.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video")),
+                                }));
+                            }
                         }
                     }
                     result.push(serde_json::json!({
@@ -184,6 +194,12 @@ pub(super) fn build_anthropic_messages(messages: &[Message]) -> Vec<serde_json::
                                     blocks.push(serde_json::json!({
                                         "type": "text",
                                         "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio")),
+                                    }));
+                                }
+                                crate::types::ContentPart::VideoBase64 { media } => {
+                                    blocks.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video")),
                                     }));
                                 }
                             }
