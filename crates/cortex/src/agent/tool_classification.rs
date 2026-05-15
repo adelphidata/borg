@@ -61,7 +61,7 @@ pub(crate) fn classify_action(tool_name: &str) -> ActionType {
         "write_memory" => ActionType::MemoryWrite,
         "memory_search" | "read_memory" => ActionType::ToolCall,
         "web_fetch" | "web_search" | "browser" | "text_to_speech" | "generate_image"
-        | "vision_analyze" => ActionType::WebRequest,
+        | "vision_analyze" | "video_analyze" => ActionType::WebRequest,
         _ => ActionType::ToolCall,
     }
 }

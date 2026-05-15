@@ -127,6 +127,17 @@ pub fn compress_content_parts(parts: &mut [ContentPart], max_bytes: usize) {
     }
 }
 
+/// True when `mime_type` names a video container Gemini accepts via
+/// `inline_data`. The intent is to gate `video_analyze` inputs at the
+/// boundary so non-video bytes with a hopeful filename never reach the
+/// model.
+pub fn is_supported_video(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "video/mp4" | "video/quicktime" | "video/webm" | "video/x-matroska"
+    )
+}
+
 /// Check if MIME type is a compressible image format.
 pub fn is_compressible_image(mime_type: &str) -> bool {
     matches!(

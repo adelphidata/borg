@@ -48,6 +48,7 @@ pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod text_to_speech;
 pub(crate) mod update_goal;
+pub(crate) mod video_analyze;
 pub(crate) mod vision_analyze;
 pub(crate) mod web_fetch;
 pub(crate) mod web_search;
@@ -70,6 +71,7 @@ pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
+pub(crate) use video_analyze::VideoAnalyzeArgs;
 pub(crate) use vision_analyze::VisionAnalyzeArgs;
 pub(crate) use web_fetch::WebFetchArgs;
 pub(crate) use web_search::WebSearchArgs;
@@ -117,6 +119,7 @@ pub(crate) enum Tool {
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
     VisionAnalyze(VisionAnalyzeArgs),
+    VideoAnalyze(VideoAnalyzeArgs),
     ComputerUse(ComputerUseArgs),
 
     // User interaction
@@ -204,6 +207,7 @@ impl Tool {
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
             tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
+            tn::VIDEO_ANALYZE => Tool::VideoAnalyze(from(tn::VIDEO_ANALYZE, args)?),
             tn::COMPUTER_USE => Tool::ComputerUse(from(tn::COMPUTER_USE, args)?),
 
             // User input
@@ -250,6 +254,7 @@ impl Tool {
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
             Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
+            Tool::VideoAnalyze(_) => tn::VIDEO_ANALYZE,
             Tool::ComputerUse(_) => tn::COMPUTER_USE,
             Tool::RequestUserInput(_) => tn::REQUEST_USER_INPUT,
             Tool::GetGoal(_) => tn::GET_GOAL,
@@ -281,7 +286,8 @@ impl Tool {
             | Tool::WebSearch(_)
             | Tool::ApplyPatch(_)
             | Tool::ApplySkillPatch(_)
-            | Tool::VisionAnalyze(_) => true,
+            | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_) => true,
 
             Tool::WriteMemory(_)
             | Tool::CreateChannel(_)
@@ -329,7 +335,8 @@ impl Tool {
             | Tool::WebSearch(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
-            | Tool::VisionAnalyze(_) => true,
+            | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_) => true,
 
             // computer_use is action-discriminated: only the read-only
             // actions (capture / list_apps / wait) are safe in Plan mode.
@@ -383,6 +390,7 @@ impl Tool {
             Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
             | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_)
             | Tool::ComputerUse(_) => ToolGroup::Media,
             Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
@@ -420,6 +428,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::REQUEST_USER_INPUT,
             tn::GET_GOAL,
             tn::VISION_ANALYZE,
+            tn::VIDEO_ANALYZE,
             tn::COMPUTER_USE,
         ],
     )
@@ -444,6 +453,7 @@ pub(crate) const fn is_parallel_safe_name(name: &str) -> bool {
             tn::APPLY_PATCH,
             tn::APPLY_SKILL_PATCH,
             tn::VISION_ANALYZE,
+            tn::VIDEO_ANALYZE,
         ],
     )
 }
@@ -517,6 +527,10 @@ mod tests {
             (
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
+            ),
+            (
+                tn::VIDEO_ANALYZE,
+                json!({"video_url":"https://example.com/x.mp4"}),
             ),
             (tn::COMPUTER_USE, json!({"action":"capture"})),
             (
@@ -618,6 +632,10 @@ mod tests {
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
             ),
+            (
+                tn::VIDEO_ANALYZE,
+                json!({"video_url":"https://example.com/x.mp4"}),
+            ),
             (tn::COMPUTER_USE, json!({"action":"capture"})),
             (
                 tn::REQUEST_USER_INPUT,
@@ -663,6 +681,7 @@ mod tests {
             tn::APPLY_PATCH,
             tn::APPLY_SKILL_PATCH,
             tn::VISION_ANALYZE,
+            tn::VIDEO_ANALYZE,
         ];
         for (name, args) in round_trip_cases() {
             let tool = Tool::parse(name, args).expect("parse");

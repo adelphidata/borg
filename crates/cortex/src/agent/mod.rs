@@ -2492,6 +2492,11 @@ impl Agent {
                 self.maybe_refresh_skills_after_tool(name, &raw_args, "");
                 return Ok(out);
             }
+            crate::tool::Tool::VideoAnalyze(args) => {
+                let out = crate::tool::video_analyze::handle(args, &self.config).await?;
+                self.maybe_refresh_skills_after_tool(name, &raw_args, "");
+                return Ok(out);
+            }
             crate::tool::Tool::ComputerUse(args) => {
                 let out = crate::tool::computer_use::handle(args, &self.config).await?;
                 self.maybe_refresh_skills_after_tool(name, &raw_args, "");
@@ -2650,8 +2655,9 @@ impl Agent {
             | crate::tool::Tool::TextToSpeech(_)
             | crate::tool::Tool::RequestUserInput(_)
             | crate::tool::Tool::VisionAnalyze(_)
+            | crate::tool::Tool::VideoAnalyze(_)
             | crate::tool::Tool::ComputerUse(_) => unreachable!(
-                "ReadFile/Browser/TextToSpeech/RequestUserInput/VisionAnalyze/ComputerUse are handled in the early-return match above"
+                "ReadFile/Browser/TextToSpeech/RequestUserInput/VisionAnalyze/VideoAnalyze/ComputerUse are handled in the early-return match above"
             ),
         };
         let text = text_result?;

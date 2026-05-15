@@ -180,6 +180,29 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                 "required": ["image_url"]
             }),
         ));
+
+        // video_analyze: Gemini-only. The handler returns a clean error on
+        // any other provider; the schema is still advertised so the model
+        // can attempt the call (the failure message instructs it to switch
+        // provider rather than silently degrade).
+        defs.push(ToolDefinition::new(
+            tool_names::VIDEO_ANALYZE,
+            "Fetch a video from an http(s) URL or data: URI and forward it inline to a Gemini-family model for description. Supports mp4, quicktime, webm, mkv. Gemini-only — fails fast on other providers.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "video_url": {
+                        "type": "string",
+                        "description": "https URL or data:video/... base64 URI"
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional question to focus the analysis"
+                    }
+                },
+                "required": ["video_url"]
+            }),
+        ));
     }
 
     // computer_use — macOS-only host UI automation via `cua-driver`.
