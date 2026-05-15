@@ -45,6 +45,23 @@ const SERVER_REQUEST_BUFFER: usize = 64;
 /// tail for diagnostic surfaces.
 const STDERR_TAIL_CAP: usize = 500;
 
+/// Env vars that must never reach the subprocess — these are dynamic-linker
+/// hooks that would let an attacker who can write to the operator's
+/// environment inject arbitrary code into the codex process. Stripped from
+/// the inherited env and forbidden in `SpawnOptions::env`.
+const ENV_DENY_LIST: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_AUDIT",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_FRAMEWORK_PATH",
+    "DYLD_VERSIONED_LIBRARY_PATH",
+    "DYLD_VERSIONED_FRAMEWORK_PATH",
+];
+
 /// Lock a `std::sync::Mutex`, recovering from poisoning by taking the inner value.
 ///
 /// Poisoning would only occur if a previous holder panicked while holding the
@@ -57,13 +74,11 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// Options for spawning the codex `app-server` subprocess.
 ///
-/// **Stage 5 follow-up:** the config layer that populates this struct from
-/// operator settings MUST validate `env` and `extra_args` against an allowlist
-/// (`CODEX_HOME`, `RUST_LOG`, codex-specific OAuth keys). Forbid `LD_PRELOAD`,
-/// `DYLD_*`, and `PATH` overrides — a misconfigured channel binding shouldn't
-/// be able to inject library shims into the child. Tracking this on the struct
-/// itself rather than in a separate validator type so the constraint is
-/// visible at every call site.
+/// The spawn boundary scrubs library-injection vectors (`LD_PRELOAD`,
+/// `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH`, `DYLD_FALLBACK_LIBRARY_PATH`)
+/// from both the inherited env and the `env` overlay. Stage 5's settings layer
+/// is expected to layer a stricter allowlist on top, but the deny-list here
+/// makes Stage 1 safe-by-default.
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
     /// Path or name of the codex CLI binary (default `"codex"`).
@@ -190,10 +205,22 @@ impl CodexAppServerClient {
         for arg in &opts.extra_args {
             cmd.arg(arg);
         }
+        // Strip library-injection vectors from inherited env — the parent may
+        // have them set legitimately for borg's own loader, but the child must
+        // not be configured to load an attacker-controlled shim.
+        for key in ENV_DENY_LIST {
+            cmd.env_remove(key);
+        }
         if let Some(home) = &opts.codex_home {
             cmd.env("CODEX_HOME", home);
         }
         for (k, v) in &opts.env {
+            if ENV_DENY_LIST.iter().any(|d| k.eq_ignore_ascii_case(d)) {
+                bail!(
+                    "codex app-server: env overlay key {k:?} is in the deny-list \
+                     (LD_PRELOAD / DYLD_* are forbidden to prevent library injection)"
+                );
+            }
             cmd.env(k, v);
         }
         // Codex emits tracing to stderr; keep it quiet by default. Operators can
@@ -547,25 +574,64 @@ async fn read_stdout_loop(
                         warn!("codex app-server: notification with empty method");
                         continue;
                     }
-                    if notif_tx
-                        .send(Notification { method, params })
-                        .await
-                        .is_err()
-                    {
-                        debug!("codex app-server: notification receiver dropped");
-                        finish_reader(&reader_done, &pending, "notification receiver dropped");
-                        return;
+                    // try_send (not send().await): the reader must never block
+                    // on consumer back-pressure, because that would also stall
+                    // in-flight Response frames and turn legit replies into
+                    // spurious timeouts. Dropping a notification on overflow is
+                    // a degraded but contained failure; deadlocking responses
+                    // is a hard failure.
+                    match notif_tx.try_send(Notification { method, params }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(n)) => {
+                            warn!(
+                                method = %n.method,
+                                buffer = NOTIFICATION_BUFFER,
+                                "codex app-server: notification buffer full, dropping frame"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!("codex app-server: notification receiver dropped");
+                            finish_reader(&reader_done, &pending, "notification receiver dropped");
+                            return;
+                        }
                     }
                 }
                 Some(Ok(InboundFrame::ServerRequest { id, method, params })) => {
-                    if srv_tx
-                        .send(ServerRequest { id, method, params })
-                        .await
-                        .is_err()
-                    {
-                        debug!("codex app-server: server-request receiver dropped");
-                        finish_reader(&reader_done, &pending, "server-request receiver dropped");
-                        return;
+                    match srv_tx.try_send(ServerRequest { id, method, params }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(req)) => {
+                            // The reader can't hold the stdin mutex to send a
+                            // synchronous error reply (writers also need it),
+                            // so we surface the dropped frame to diagnostics
+                            // and warn loudly.
+                            //
+                            // TODO(stage 2): server-initiated requests expect
+                            // a reply. Dropping one stalls the codex
+                            // subprocess waiting on its oneshot — not just the
+                            // single call. Stage 2's projector MUST either
+                            // auto-respond with `respond_error(-32603,
+                            // "consumer overloaded")` via a queued-writer path
+                            // or size SERVER_REQUEST_BUFFER for the maximum
+                            // burst codex emits. Do not soften this comment.
+                            warn!(
+                                method = %req.method,
+                                buffer = SERVER_REQUEST_BUFFER,
+                                "codex app-server: server-request buffer full, dropping frame"
+                            );
+                            push_stderr_line(
+                                &stderr_tail,
+                                format!("<dropped server-request> {}", req.method),
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            debug!("codex app-server: server-request receiver dropped");
+                            finish_reader(
+                                &reader_done,
+                                &pending,
+                                "server-request receiver dropped",
+                            );
+                            return;
+                        }
                     }
                 }
             },
@@ -586,8 +652,15 @@ async fn read_stdout_loop(
 
 async fn read_stderr_loop(stderr: tokio::process::ChildStderr, tail: Arc<Mutex<Vec<String>>>) {
     let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        push_stderr_line(&tail, line);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => push_stderr_line(&tail, line),
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "codex app-server: stderr read error");
+                return;
+            }
+        }
     }
 }
 

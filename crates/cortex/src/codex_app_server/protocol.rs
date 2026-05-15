@@ -10,8 +10,7 @@
 //!    Approval prompts arrive this way; the client MUST `respond` with the same id.
 //!
 //! Codex tags id as either a number or a string; we follow JSON-RPC and accept both.
-//! The `jsonrpc` field is omitted on send to stay compatible with codex's tolerant
-//! parser (Hermes' Python client omits it too).
+//! Outbound frames carry `"jsonrpc": "2.0"` per spec.
 //!
 //! This module is pure data shapes — no IO. Lives next to `client.rs`, which owns
 //! the subprocess and reader loop.
@@ -193,10 +192,12 @@ fn parse_id(v: &serde_json::Value) -> Option<RequestId> {
 }
 
 /// `serde_json::to_string` on a `serde_json::Value` is infallible — every field
-/// we encode is already a JSON value. The fallback returns an empty object string
-/// only to satisfy the `expect_used` lint without panicking.
+/// we encode is already a JSON value, so the only way this could fail is a
+/// `serde_json` bug. Panic rather than ship `{}` as the wire frame, which
+/// would silently turn into a caller-side timeout with no diagnostic trail.
+#[allow(clippy::expect_used)]
 fn encode_value(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(value).expect("serde_json::Value is always serializable")
 }
 
 /// Encode an outbound JSON-RPC request to its on-wire JSON object.

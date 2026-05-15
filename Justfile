@@ -22,8 +22,9 @@ test:
     fi
 
 # Run the full workspace test suite (integration tests included). Use before shipping.
+# `test-support` enables the gated fixture binary for codex_app_server integration tests.
 test-all:
-    cargo test --workspace 2>&1 | tee /tmp/borg-test-all.log
+    cargo test --workspace --features cortex/test-support 2>&1 | tee /tmp/borg-test-all.log
 
 # Run tests for a single crate. Example: just test-crate cortex
 test-crate crate:
@@ -80,7 +81,7 @@ deny:
 
 # Run everything CI runs (format, clippy, test, build, audit, deny)
 ci: lint
-    cargo test --workspace
+    cargo test --workspace --features cortex/test-support
     cargo build
     just audit
     just deny

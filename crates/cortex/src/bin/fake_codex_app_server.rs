@@ -5,8 +5,12 @@
 //! `turn/start` → streamed `item/*` notifications → `turn/completed`.
 //!
 //! The behavior is hard-coded — this is a test fixture, not a re-implementation.
-//! When invoked with the env var `FAKE_CODEX_MODE=garbage`, it emits a malformed
-//! line so the client's error-path can be exercised.
+//! `FAKE_CODEX_MODE` env-var modes:
+//!
+//! - `garbage` — emit a malformed line on `initialize` and keep stdin open, so
+//!   the client's error-path can be exercised without subprocess exit.
+//! - `exit_after_init` — respond to `initialize` normally, then exit. Used to
+//!   drive the client's reader to EOF without going through `close()`.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -51,6 +55,14 @@ fn main() {
             }
             "initialized" => {
                 // notification — no response
+                if mode == "exit_after_init" {
+                    // Drop stdout/stdin and exit so the client's reader sees
+                    // EOF without the client having to issue close().
+                    // Exercises the EOF-race short-circuit. We wait until
+                    // after `initialized` so `client.initialize()` returns
+                    // cleanly before the reader sees EOF.
+                    return;
+                }
             }
             "thread/start" => {
                 send(

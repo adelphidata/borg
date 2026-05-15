@@ -74,6 +74,19 @@ libc = { workspace = true }
 # require `BORG_ALLOW_LIVE_TESTS=1` at runtime so a feature-only build still
 # stays green offline.
 live-llm = []
+# Gates test-only auxiliary binaries (e.g., the hermetic `codex app-server`
+# fixture) out of regular `cargo build` so they cannot ship in release
+# artifacts. Enable explicitly when running integration tests that need the
+# fixture binary.
+test-support = []
+
+# Test fixture: hermetic stand-in for `codex app-server`. Gated behind
+# `test-support` so it is not produced by default `cargo build` and never
+# lands in a release binary set.
+[[bin]]
+name = "fake_codex_app_server"
+path = "src/bin/fake_codex_app_server.rs"
+required-features = ["test-support"]
 
 [lints]
 workspace = true

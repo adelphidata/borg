@@ -4,7 +4,11 @@
 //! These tests exercise the actual subprocess + stdio path — not a mock of the
 //! client's internals — so a regression in framing, request/response correlation,
 //! or notification ordering will fail here.
+//!
+//! Gated on the `test-support` feature so the fixture binary is not built into
+//! release artifacts. Run with: `cargo test -p cortex --features test-support`.
 
+#![cfg(feature = "test-support")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::path::PathBuf;
@@ -23,10 +27,6 @@ fn spawn_options() -> SpawnOptions {
     }
 }
 
-/// The fake's first arg is `app-server`, just like real codex. Strip it by
-/// pointing the client at a shim that ignores its first arg. We don't need a
-/// shim here because the fake binary itself doesn't parse args — it just runs
-/// the wire loop. The client still passes `app-server` as the first arg.
 #[tokio::test]
 async fn full_handshake_and_turn_drains_notifications() {
     let client = CodexAppServerClient::spawn(spawn_options())
@@ -201,21 +201,46 @@ async fn request_to_garbage_peer_times_out_cleanly() {
 
 #[tokio::test]
 async fn request_after_subprocess_exit_returns_disconnected() {
-    // Guards the EOF race fix: once the reader has exited and drained pending,
-    // a fresh request must not hang on its oneshot — it should fail fast with
-    // `Disconnected`. Triggered here by closing the client, which drops stdin,
-    // which makes the fake exit, which makes the reader exit.
-    let client = CodexAppServerClient::spawn(spawn_options())
-        .await
-        .expect("spawn");
+    // Guards the EOF race fix in `client.rs`: once `read_stdout_loop` observes
+    // stdout EOF it must (a) drain in-flight waiters AND (b) set `reader_done`
+    // so that *fresh* requests inserted afterward post-check the flag and
+    // self-remove from `pending` instead of hanging on their oneshot until the
+    // timeout fires.
+    //
+    // We MUST trigger the reader exit without going through `client.close()` —
+    // close() also sets the `closed` flag, and `write_line` bails on that flag
+    // before the reader_done check is ever reached, so the original test
+    // passed whether or not the reader_done machinery existed. Here we use
+    // `FAKE_CODEX_MODE=exit_after_init` so the fake responds to `initialize`
+    // and then exits, dropping its stdout, which drives the client's reader to
+    // EOF while `closed` stays false.
+    let opts = SpawnOptions {
+        codex_bin: fake_codex_path(),
+        env: vec![("FAKE_CODEX_MODE".to_string(), "exit_after_init".to_string())],
+        ..Default::default()
+    };
+    let client = CodexAppServerClient::spawn(opts).await.expect("spawn");
     let _ = client
         .initialize("borg-test", "Borg Test", "0.0")
         .await
         .expect("init");
 
-    client.close(Duration::from_secs(2)).await.expect("close");
+    // Poll for the subprocess to actually exit. The reader sets `reader_done`
+    // shortly after stdout EOF, which follows process exit.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while client.is_alive().await {
+        if std::time::Instant::now() > deadline {
+            panic!("fake did not exit within 2s of initialize response");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Grace so the reader's EOF handler completes and flips reader_done.
+    // 250ms gives loaded CI machines headroom between OS-level child reap
+    // and the tokio task waking to handle stdout EOF.
+    tokio::time::sleep(Duration::from_millis(250)).await;
 
-    // After close, a new request must fail without waiting out the timeout.
+    // Fresh request: must fast-fail via the reader_done short-circuit, not via
+    // a timeout or via write_line's `closed` check (which is still false).
     let started = std::time::Instant::now();
     let err = client
         .request(
@@ -224,14 +249,22 @@ async fn request_after_subprocess_exit_returns_disconnected() {
             Duration::from_secs(60), // very generous: we expect fast-fail, not timeout
         )
         .await
-        .expect_err("post-close request must error");
+        .expect_err("post-EOF request must error");
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(2),
         "request hung for {elapsed:?}; should fast-fail via Disconnected"
     );
-    assert!(
-        matches!(err, ClientError::Disconnected(_)),
-        "expected Disconnected, got {err:?}"
-    );
+    match &err {
+        ClientError::Disconnected(msg) => {
+            assert!(
+                msg.contains("reader task already exited"),
+                "Disconnected via wrong path: {msg:?} — \
+                 expected the reader_done short-circuit, not write_line failure"
+            );
+        }
+        other => panic!("expected Disconnected, got {other:?}"),
+    }
+
+    client.close(Duration::from_secs(2)).await.expect("close");
 }
