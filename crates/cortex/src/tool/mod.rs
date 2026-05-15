@@ -33,6 +33,7 @@ pub mod policy;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;
+pub(crate) mod computer_use;
 pub(crate) mod create_goal;
 pub(crate) mod generate_image;
 pub(crate) mod get_goal;
@@ -54,6 +55,7 @@ pub(crate) mod write_memory;
 
 pub(crate) use apply_patch::ApplyPatchArgs;
 pub(crate) use browser::BrowserArgs;
+pub(crate) use computer_use::ComputerUseArgs;
 pub(crate) use create_goal::CreateGoalArgs;
 pub(crate) use generate_image::GenerateImageArgs;
 pub(crate) use get_goal::GetGoalArgs;
@@ -115,6 +117,7 @@ pub(crate) enum Tool {
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
     VisionAnalyze(VisionAnalyzeArgs),
+    ComputerUse(ComputerUseArgs),
 
     // User interaction
     RequestUserInput(RequestUserInputArgs),
@@ -201,6 +204,7 @@ impl Tool {
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
             tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
+            tn::COMPUTER_USE => Tool::ComputerUse(from(tn::COMPUTER_USE, args)?),
 
             // User input
             tn::REQUEST_USER_INPUT => Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?),
@@ -246,6 +250,7 @@ impl Tool {
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
             Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
+            Tool::ComputerUse(_) => tn::COMPUTER_USE,
             Tool::RequestUserInput(_) => tn::REQUEST_USER_INPUT,
             Tool::GetGoal(_) => tn::GET_GOAL,
             Tool::CreateGoal(_) => tn::CREATE_GOAL,
@@ -288,6 +293,7 @@ impl Tool {
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::ComputerUse(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
             | Tool::CreateGoal(_)
@@ -309,7 +315,7 @@ impl Tool {
     /// variant exists so any post-parse caller has the same single source
     /// of truth without re-implementing the read-only allowlist.
     #[allow(dead_code)]
-    pub(crate) const fn allowed_in_plan_mode(&self) -> bool {
+    pub(crate) fn allowed_in_plan_mode(&self) -> bool {
         match self {
             Tool::ReadFile(_)
             | Tool::ListDir(_)
@@ -324,6 +330,11 @@ impl Tool {
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
             | Tool::VisionAnalyze(_) => true,
+
+            // computer_use is action-discriminated: only the read-only
+            // actions (capture / list_apps / wait) are safe in Plan mode.
+            // Mutating actions land in a follow-up commit and stay blocked.
+            Tool::ComputerUse(args) => computer_use::action_allowed_in_plan_mode(&args.action),
 
             Tool::WriteMemory(_)
             | Tool::ApplyPatch(_)
@@ -369,9 +380,10 @@ impl Tool {
             Tool::WebFetch(_) | Tool::WebSearch(_) => ToolGroup::Web,
             Tool::Browser(_) => ToolGroup::Ui,
             Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) => ToolGroup::Scheduling,
-            Tool::GenerateImage(_) | Tool::TextToSpeech(_) | Tool::VisionAnalyze(_) => {
-                ToolGroup::Media
-            }
+            Tool::GenerateImage(_)
+            | Tool::TextToSpeech(_)
+            | Tool::VisionAnalyze(_)
+            | Tool::ComputerUse(_) => ToolGroup::Media,
             Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
             | Tool::WaitForAgent(_)
@@ -387,6 +399,11 @@ impl Tool {
 /// works on raw names (so callers can gate Plan-mode access before
 /// arg-parsing has happened).
 pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
+    // Note: `COMPUTER_USE` is listed here because *some* of its actions are
+    // read-only. The agent loop must additionally consult
+    // [`Tool::allowed_in_plan_mode`] after parsing to enforce the per-action
+    // gate — mutating actions (click/type/key/etc., landing in a follow-up
+    // commit) MUST stay blocked in Plan mode.
     matches_any(
         name,
         &[
@@ -403,6 +420,7 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::REQUEST_USER_INPUT,
             tn::GET_GOAL,
             tn::VISION_ANALYZE,
+            tn::COMPUTER_USE,
         ],
     )
 }
@@ -500,6 +518,7 @@ mod tests {
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
             ),
+            (tn::COMPUTER_USE, json!({"action":"capture"})),
             (
                 tn::REQUEST_USER_INPUT,
                 json!({"questions":[{"id":"a","header":"H","question":"?","options":[{"label":"x","description":"y"},{"label":"z","description":"w"}]}]}),
@@ -599,6 +618,7 @@ mod tests {
                 tn::VISION_ANALYZE,
                 json!({"image_url":"https://example.com/x.png"}),
             ),
+            (tn::COMPUTER_USE, json!({"action":"capture"})),
             (
                 tn::REQUEST_USER_INPUT,
                 json!({"questions":[{"id":"a","header":"H","question":"?","options":[{"label":"x","description":"y"},{"label":"z","description":"w"}]}]}),

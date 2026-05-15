@@ -1353,6 +1353,11 @@ mod tests {
             "request_user_input",
             "get_goal",
             "vision_analyze",
+            // `computer_use` is name-level readonly because *some* of its
+            // actions are (capture / list_apps / wait). The per-action gate
+            // (see `Tool::allowed_in_plan_mode`) blocks mutating actions at
+            // dispatch — name-level blocking would over-restrict the child.
+            "computer_use",
         ]
         .into_iter()
         .collect();

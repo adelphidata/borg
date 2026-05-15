@@ -182,6 +182,41 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
         ));
     }
 
+    // computer_use — macOS-only host UI automation via `cua-driver`.
+    // Read-only actions (capture / list_apps / wait) only in this commit;
+    // mutating actions land in a follow-up. Gated by `[computer_use] enabled`
+    // so the schema is omitted (saving tokens every turn) on Linux and when
+    // the operator has explicitly disabled the tool.
+    if config.computer_use.enabled {
+        defs.push(ToolDefinition::new(
+            tool_names::COMPUTER_USE,
+            "Drive the host macOS GUI via cua-driver. `capture` returns a screenshot inline as a multimodal image part. `list_apps` returns running applications with pids. `wait` blocks for duration_ms (max 5min) — useful between captures to let UI redraws settle. Optional pid/window_id on capture targets a specific window without stealing focus.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["capture", "list_apps", "wait"],
+                        "description": "Which action to take."
+                    },
+                    "pid": {
+                        "type": "integer",
+                        "description": "Capture only. Target process id; pairs with window_id to capture a specific app's window without raising it."
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "Capture only. Target window id (from list_windows)."
+                    },
+                    "duration_ms": {
+                        "type": "integer",
+                        "description": "Wait only. Milliseconds to sleep (capped at 300000)."
+                    }
+                },
+                "required": ["action"]
+            }),
+        ));
+    }
+
     if config.image_gen.enabled {
         defs.push(ToolDefinition::new(
             tool_names::GENERATE_IMAGE,

@@ -269,10 +269,13 @@ mod tests {
         let config = Config::default();
         let defs = core_tool_definitions(&config);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        // Expected count varies by platform because `computer_use` is gated
+        // by `[computer_use] enabled`, which defaults on for macOS only.
+        let expected_all = if cfg!(target_os = "macos") { 18 } else { 17 };
         assert_eq!(
             names.len(),
-            17,
-            "expected 17 core tools (all enabled, incl. 3 goal tools + vision_analyze), got: {names:?}"
+            expected_all,
+            "expected {expected_all} core tools (all enabled; macOS adds computer_use), got: {names:?}"
         );
 
         let mut minimal_config = Config::default();
@@ -280,10 +283,11 @@ mod tests {
         minimal_config.browser.enabled = false;
         let defs = core_tool_definitions(&minimal_config);
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        let expected_min = if cfg!(target_os = "macos") { 14 } else { 13 };
         assert_eq!(
             names.len(),
-            13,
-            "expected 13 base tools (incl. goals), got: {names:?}"
+            expected_min,
+            "expected {expected_min} base tools (incl. goals; macOS adds computer_use), got: {names:?}"
         );
     }
 

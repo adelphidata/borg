@@ -212,6 +212,11 @@ define_settings! {
         "image_gen.enabled" => image_gen.enabled, parsed(bool);
         "image_gen.default_size" => image_gen.default_size, string;
 
+        // ── Computer Use (macOS-only cua-driver-backed tool) ──
+        "computer_use.enabled" => computer_use.enabled, parsed(bool);
+        "computer_use.driver_path" => computer_use.driver_path, string;
+        "computer_use.driver_version_pin" => computer_use.driver_version_pin, string;
+
         // ── Scripts ──
         "scripts.enabled" => scripts.enabled, parsed(bool);
         "scripts.default_timeout_ms" => scripts.default_timeout_ms, parsed(u64);

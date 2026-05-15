@@ -138,7 +138,15 @@ Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreig
 
 ### Tools
 
-`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`. Definitions in `crates/cortex/src/tool_definitions.rs`.
+`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`, `vision_analyze`, `computer_use` (macOS-only, gated by `[computer_use] enabled`). Definitions in `crates/cortex/src/tool/definitions.rs`; handlers in `crates/cortex/src/tool/<name>.rs`.
+
+`computer_use` intentionally bypasses sandbox-exec — the whole point is
+to drive other macOS apps via Accessibility, which a Seatbelt profile
+would forbid. The action allowlist (and the per-action Plan-mode gate)
+is the security boundary instead. Read-only actions ship in the first
+pass; mutating actions ship with a static denylist (logout / lockscreen /
+force-quit key combos, fork-bomb-shaped `type` payloads, security-pane
+`focus_app` targets). See `docs/computer-use.md`.
 
 `schedule.create` for `type=prompt` accepts an optional `pre_run_command` (with `pre_run_cwd`, `pre_run_timeout_ms` defaulting to 60s). Stdout is injected into the prompt as a `<preprocessed_context source="pre_run" exit_code="N">` block before the LLM runs; non-zero exit / timeout / spawn failure surface as `status="failed"` and the LLM still runs (Hermes-style — silent preamble failures lose user trust). Stdout/stderr capped at 64KB. If the LLM response's first non-empty line equals `[SILENT]`, channel delivery is suppressed.
 
