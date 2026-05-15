@@ -20,7 +20,10 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::transport::{Transport, TransportRequest, TransportResponse};
-use super::{llm_error::FailoverReason, LlmError, Message, Role, ToolDefinition, UsageData};
+use super::{
+    llm_error::FailoverReason, LlmError, Message, Role, StreamEvent, ToolDefinition, UsageData,
+};
+use crate::sse::SseAction;
 use crate::types::{ContentPart, FunctionCall, MessageContent, ToolCall};
 
 /// Default AI Studio base URL. Override via `BORG_GEMINI_BASE_URL` (for tests
@@ -137,17 +140,21 @@ impl Transport for GeminiTransport {
 
     fn parse_stream_line(
         &self,
-        _line: &str,
-        _provider: &str,
-        _model: &str,
-        _state: &mut super::transport::StreamState,
-    ) -> crate::sse::SseAction {
-        // M3 implements SSE parsing. Until then the adapter is not wired
-        // into the dispatcher (gated by `Provider::Gemini.is_openai_compatible()`
-        // still returning true), so this path is unreachable from production
-        // code — keeping it `Continue` rather than panicking means a stray
-        // test wiring won't crash the loop.
-        crate::sse::SseAction::Continue
+        line: &str,
+        provider: &str,
+        model: &str,
+        state: &mut super::transport::StreamState,
+    ) -> SseAction {
+        let state = match state {
+            super::transport::StreamState::Gemini(s) => s,
+            // Defensive: this can only fire if the dispatcher wires a
+            // non-Gemini provider through this transport. M4 routes only
+            // Gemini here, so the only realistic trigger is a stray test
+            // wiring. Continuing keeps the stream alive instead of crashing
+            // the agent loop on a misconfiguration.
+            _ => return SseAction::Continue,
+        };
+        parse_gemini_sse_line(line, provider, model, state)
     }
 
     fn parse_chat_response(
@@ -539,6 +546,167 @@ fn parse_gemini_response(
 /// scheme to stay consistent across streaming/non-streaming.
 fn synth_call_id(name: &str, idx: usize) -> String {
     format!("gem_call_{name}_{idx}")
+}
+
+// ── SSE streaming parser ─────────────────────────────────────────────────
+
+/// Parse one SSE line from `streamGenerateContent?alt=sse`. The driver in
+/// `crate::sse` strips empty lines and `:`-prefixed comments before
+/// dispatch, but we still defensively skip anything that isn't a `data:`
+/// payload — Gemini occasionally emits `event:` lines for keepalive that
+/// must not be mis-parsed.
+///
+/// Returns `Done` only when `finishReason` is terminal and we have nothing
+/// further to surface. Otherwise we emit deltas/usage and rely on the SSE
+/// driver to send the `Done` event when the upstream socket closes.
+pub(crate) fn parse_gemini_sse_line(
+    line: &str,
+    provider: &str,
+    model: &str,
+    state: &mut GeminiStreamState,
+) -> SseAction {
+    let Some(payload) = line.strip_prefix("data:") else {
+        return SseAction::Continue;
+    };
+    let payload = payload.trim();
+    if payload.is_empty() {
+        return SseAction::Continue;
+    }
+    // Gemini doesn't emit `[DONE]`; the socket just closes. We guard
+    // anyway because relays sometimes inject it.
+    if payload == "[DONE]" {
+        return SseAction::Done(vec![]);
+    }
+
+    let value: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(provider, model, error = %e, "gemini SSE: failed to parse data line");
+            return SseAction::Continue;
+        }
+    };
+
+    // Prompt-level safety block: the model didn't run. Surface as Error
+    // and stop the stream so the agent doesn't treat empty as success.
+    if let Some(reason) = value
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+    {
+        return SseAction::Done(vec![StreamEvent::Error(format!(
+            "gemini blocked prompt: {reason}"
+        ))]);
+    }
+
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let mut done_after = false;
+
+    // ── candidates[0].content.parts → text / thought / functionCall ──
+    if let Some(parts) = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(Value::as_array)
+    {
+        for part in parts {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    state.accumulator.text.push_str(text);
+                    events.push(StreamEvent::TextDelta(text.to_string()));
+                }
+                continue;
+            }
+            // Gemini 2.5 Thinking surfaces reasoning as `{"thought": "..."}`
+            // (separate from `text`). Surface it on its own channel so the
+            // TUI can dim it the way it does Anthropic thinking.
+            if let Some(thought) = part.get("thought").and_then(Value::as_str) {
+                if !thought.is_empty() {
+                    events.push(StreamEvent::ThinkingDelta(thought.to_string()));
+                }
+                continue;
+            }
+            if let Some(fc) = part.get("functionCall") {
+                let name = fc
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+                let args_text = serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
+                let idx = state.accumulator.pending_function_calls.len();
+                let id = synth_call_id(&name, idx);
+                state
+                    .accumulator
+                    .pending_function_calls
+                    .push(PendingFunctionCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        args_text: args_text.clone(),
+                    });
+                events.push(StreamEvent::ToolCallDelta {
+                    index: idx,
+                    id: Some(id),
+                    name: Some(name),
+                    arguments_delta: args_text,
+                });
+                continue;
+            }
+        }
+    }
+
+    // ── finishReason (candidate-level) ──
+    if let Some(reason) = value
+        .pointer("/candidates/0/finishReason")
+        .and_then(Value::as_str)
+    {
+        state.accumulator.finish_reason = Some(reason.to_string());
+        match reason {
+            "STOP" => {
+                done_after = true;
+            }
+            "MAX_TOKENS" => {
+                events.push(StreamEvent::Truncated);
+                done_after = true;
+            }
+            "SAFETY" | "RECITATION" => {
+                // Mid-stream candidate-level block — surface and stop.
+                events.push(StreamEvent::Error(format!(
+                    "gemini candidate blocked: {reason}"
+                )));
+                done_after = true;
+            }
+            other => {
+                tracing::warn!(
+                    provider,
+                    model,
+                    "gemini SSE: unknown finishReason `{other}` — treating as STOP"
+                );
+                done_after = true;
+            }
+        }
+    }
+
+    // ── usageMetadata (last event) ──
+    if let Some(u) = value.get("usageMetadata") {
+        let pick = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let usage = UsageData {
+            prompt_tokens: pick("promptTokenCount"),
+            completion_tokens: pick("candidatesTokenCount"),
+            total_tokens: pick("totalTokenCount"),
+            cached_input_tokens: pick("cachedContentTokenCount"),
+            cache_creation_tokens: 0,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            provider_cost_usd: None,
+        };
+        state.accumulator.usage = Some(usage.clone());
+        events.push(StreamEvent::Usage(usage));
+    }
+
+    if events.is_empty() && !done_after {
+        SseAction::Continue
+    } else if done_after {
+        SseAction::Done(events)
+    } else {
+        SseAction::Emit(events)
+    }
 }
 
 // ── Error classification (entry point for M4 dispatch) ───────────────────
@@ -1002,14 +1170,18 @@ mod tests {
         }
     }
 
+    /// Serialises the three endpoint tests so their `BORG_GEMINI_BASE_URL`
+    /// mutations don't race. Cargo's default parallel runner would
+    /// otherwise let test A `set_var` and test B `remove_var` interleave.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn endpoint_non_streaming_uses_generate_content_path() {
+        let _g = ENV_LOCK.lock().unwrap();
         let cfg = default_cfg();
         let msgs: Vec<Message> = Vec::new();
         let req = make_request(&msgs, None, &cfg);
-        // Clear env so the default base is used.
-        // SAFETY: tests run single-threaded per binary in cargo test by default;
-        // and the env var is one we own.
+        // SAFETY: the lock guards every test that touches this env var.
         unsafe {
             std::env::remove_var(GEMINI_BASE_URL_ENV);
         }
@@ -1021,6 +1193,7 @@ mod tests {
 
     #[test]
     fn endpoint_streaming_uses_stream_path_with_alt_sse() {
+        let _g = ENV_LOCK.lock().unwrap();
         let cfg = default_cfg();
         let msgs: Vec<Message> = Vec::new();
         let req = make_request(&msgs, None, &cfg);
@@ -1033,10 +1206,11 @@ mod tests {
 
     #[test]
     fn endpoint_respects_borg_gemini_base_url_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
         let cfg = default_cfg();
         let msgs: Vec<Message> = Vec::new();
         let req = make_request(&msgs, None, &cfg);
-        // SAFETY: env mutation; this test owns this variable name.
+        // SAFETY: env mutation guarded by ENV_LOCK above.
         unsafe {
             std::env::set_var(GEMINI_BASE_URL_ENV, "http://127.0.0.1:9999");
         }
@@ -1048,5 +1222,195 @@ mod tests {
             url.starts_with("http://127.0.0.1:9999/"),
             "expected override to win, got {url}"
         );
+    }
+
+    // ── M3 SSE streaming tests ───────────────────────────────────────────
+
+    /// Feed an SSE byte sequence one line at a time and collect every event
+    /// emitted along the way. Mirrors how `crate::sse` drives the parser.
+    fn feed(events: &[&str]) -> (GeminiStreamState, Vec<StreamEvent>, bool) {
+        let mut state = GeminiStreamState::default();
+        let mut emitted: Vec<StreamEvent> = Vec::new();
+        let mut done = false;
+        for line in events {
+            match parse_gemini_sse_line(line, "gemini", "gemini-2.5-flash", &mut state) {
+                SseAction::Continue => {}
+                SseAction::Emit(evs) => emitted.extend(evs),
+                SseAction::Done(evs) => {
+                    emitted.extend(evs);
+                    done = true;
+                    break;
+                }
+                SseAction::Error(e) => panic!("unexpected SseAction::Error in test: {e}"),
+            }
+        }
+        (state, emitted, done)
+    }
+
+    #[test]
+    fn stream_text_deltas_accumulate_to_full_text() {
+        let events = &[
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hello"}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":" "}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"role":"model","parts":[{"text":"world"}]}}]}"#,
+        ];
+        let (state, emitted, _) = feed(events);
+        let texts: Vec<&str> = emitted
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["Hello", " ", "world"]);
+        assert_eq!(state.accumulator.text, "Hello world");
+    }
+
+    #[test]
+    fn stream_function_call_event_emitted_with_synth_id() {
+        let line = r#"data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"vision_analyze","args":{"x":1}}}]}}]}"#;
+        let (state, emitted, _) = feed(&[line]);
+        assert_eq!(emitted.len(), 1);
+        match &emitted[0] {
+            StreamEvent::ToolCallDelta {
+                index,
+                id,
+                name,
+                arguments_delta,
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(id.as_deref(), Some("gem_call_vision_analyze_0"));
+                assert_eq!(name.as_deref(), Some("vision_analyze"));
+                // Borg's wire is a string; assert it round-trips back to {x:1}.
+                let args: Value = serde_json::from_str(arguments_delta).unwrap();
+                assert_eq!(args["x"], 1);
+            }
+            other => panic!("expected ToolCallDelta, got {other:?}"),
+        }
+        assert_eq!(state.accumulator.pending_function_calls.len(), 1);
+    }
+
+    #[test]
+    fn stream_multiple_function_calls_in_sequence_get_distinct_synth_ids() {
+        let lines = &[
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"a","args":{}}}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"b","args":{}}}]}}]}"#,
+        ];
+        let (_, emitted, _) = feed(lines);
+        let ids: Vec<&str> = emitted
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallDelta { id, .. } => id.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["gem_call_a_0", "gem_call_b_1"]);
+    }
+
+    #[test]
+    fn stream_usage_metadata_emits_usage_event() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[]}}],"usageMetadata":{"promptTokenCount":15,"candidatesTokenCount":12,"totalTokenCount":27}}"#;
+        let (state, emitted, _) = feed(&[line]);
+        let usage = emitted
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Usage(u) => Some(u),
+                _ => None,
+            })
+            .expect("expected Usage event");
+        assert_eq!(usage.prompt_tokens, 15);
+        assert_eq!(usage.completion_tokens, 12);
+        assert_eq!(usage.total_tokens, 27);
+        assert_eq!(state.accumulator.usage.as_ref().unwrap().prompt_tokens, 15);
+    }
+
+    #[test]
+    fn stream_safety_block_emits_error_and_stops() {
+        // promptFeedback.blockReason in the SSE stream is just as fatal as
+        // in the non-streaming path. Surfacing as success would let the
+        // agent think it got an empty reply on purpose.
+        let line = r#"data: {"promptFeedback":{"blockReason":"SAFETY"}}"#;
+        let (_, emitted, done) = feed(&[line]);
+        assert!(done, "stream should terminate on safety block");
+        let err = emitted
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Error(msg) => Some(msg.as_str()),
+                _ => None,
+            })
+            .expect("expected Error event");
+        assert!(err.contains("SAFETY"));
+    }
+
+    #[test]
+    fn stream_finish_reason_max_tokens_emits_truncated() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#;
+        let (_, emitted, done) = feed(&[line]);
+        assert!(done);
+        assert!(emitted.iter().any(|e| matches!(e, StreamEvent::Truncated)));
+    }
+
+    #[test]
+    fn stream_finish_reason_recitation_emits_error() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"RECITATION"}]}"#;
+        let (_, emitted, done) = feed(&[line]);
+        assert!(done);
+        assert!(emitted
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error(msg) if msg.contains("RECITATION"))));
+    }
+
+    #[test]
+    fn stream_thinking_delta_surfaced_for_gemini_2_5_thinking() {
+        // Gemini 2.5 Thinking emits `{"thought": "..."}` parts that the TUI
+        // needs to render on a separate channel.
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":"reasoning..."}]}}]}"#;
+        let (_, emitted, _) = feed(&[line]);
+        assert!(
+            emitted
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ThinkingDelta(t) if t == "reasoning...")),
+            "expected ThinkingDelta, got {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn stream_invalid_json_warns_and_continues() {
+        // The agent loop must not crash on a malformed line — log a warn
+        // and keep reading. (Tracing capture is wired via `tracing_test`
+        // elsewhere; here we just assert no panic + no event.)
+        let (_, emitted, done) = feed(&[r#"data: not-json"#]);
+        assert!(emitted.is_empty());
+        assert!(!done);
+    }
+
+    #[test]
+    fn stream_empty_lines_and_event_prefixes_ignored() {
+        // The SSE driver typically strips these before calling us, but the
+        // parser still has to be robust — a comment or `event:` line must
+        // not be misinterpreted as data.
+        let (_, emitted, done) = feed(&["", ": heartbeat", "event: ping"]);
+        assert!(emitted.is_empty());
+        assert!(!done);
+    }
+
+    #[test]
+    fn stream_finish_reason_stop_terminates_stream() {
+        let lines = &[
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#,
+        ];
+        let (state, _, done) = feed(lines);
+        assert!(done, "STOP must terminate the stream");
+        assert_eq!(state.accumulator.finish_reason.as_deref(), Some("STOP"));
+    }
+
+    #[test]
+    fn stream_done_sentinel_terminates_even_though_gemini_does_not_send_it() {
+        // Defensive: some relays inject `data: [DONE]`. We must still close
+        // out the stream cleanly rather than try to JSON-parse it.
+        let (_, emitted, done) = feed(&["data: [DONE]"]);
+        assert!(done);
+        assert!(emitted.is_empty());
     }
 }
