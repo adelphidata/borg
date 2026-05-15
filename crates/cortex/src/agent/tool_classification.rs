@@ -14,6 +14,13 @@ use crate::rate_guard::ActionType;
 /// [`crate::tool::allowed_in_plan_mode_name`] so the read-only set has a
 /// single source of truth on the [`crate::tool::Tool`] enum.
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
+    // MCP tools live outside the typed Tool enum. External servers cannot
+    // self-declare safety — only operator config via per-server
+    // `tools.read_only` flips a tool to non-mutating. Default-on-miss is
+    // `false` (treated as mutating, blocked in Plan mode).
+    if name.starts_with("mcp_") {
+        return !crate::mcp_clients::is_read_only_mcp_tool(name);
+    }
     !crate::tool::allowed_in_plan_mode_name(name)
 }
 

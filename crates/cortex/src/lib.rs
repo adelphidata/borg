@@ -104,6 +104,10 @@ pub mod logging;
 /// Daily self-healing maintenance runner (doctor sweep, log/activity
 /// pruning, persistent-warning surfacing). Seeded as a scheduled task.
 pub mod maintenance;
+/// MCP (Model Context Protocol) client adapter. Mirrors
+/// [`wasm_plugins`]'s shape: opt-in via `mcp.enabled`, contributes
+/// tool definitions to the agent loop, additive when disabled.
+pub mod mcp_clients;
 /// Multimodal I/O: parsing/compression (core), image gen, TTS, understanding.
 pub mod media;
 /// Memory loading with token budget and semantic search.

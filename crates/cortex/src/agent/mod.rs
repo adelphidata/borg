@@ -2416,6 +2416,19 @@ impl Agent {
             }
         };
 
+        // MCP tools live outside the typed `Tool` enum and use a reserved
+        // `mcp_` prefix. Short-circuit before `Tool::parse` so the LLM
+        // cannot shadow an MCP tool by reusing its name through the
+        // tagged deser, and so MCP failures surface with structured error
+        // shape rather than masquerading as `UnknownTool`.
+        if name.starts_with("mcp_") {
+            let result = crate::mcp_clients::try_execute_tool(name, &raw_args).await?;
+            return match result {
+                Some(text) => Ok(ToolOutput::Text(text)),
+                None => Err(anyhow::anyhow!("Unknown MCP tool: {name}")),
+            };
+        }
+
         // Single tagged-deser entry point. Schema-validation errors surface
         // here as structured tool output so the LLM can recover; the dispatch
         // arms below see only typed `Args`.

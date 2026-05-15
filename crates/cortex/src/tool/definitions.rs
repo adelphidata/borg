@@ -99,6 +99,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     defs.push(build_schedule_tool_def());
 
     defs.extend(crate::wasm_plugins::tool_definitions());
+    defs.extend(crate::mcp_clients::tool_definitions());
 
     if config.browser.enabled {
         defs.push(ToolDefinition::new(

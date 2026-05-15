@@ -4,6 +4,7 @@ pub mod gateway;
 pub mod goals;
 pub mod llm;
 pub mod maintenance;
+pub mod mcp;
 pub mod media;
 pub mod process_registry;
 pub mod security;
@@ -21,6 +22,7 @@ pub use gateway::*;
 pub use goals::*;
 pub use llm::*;
 pub use maintenance::*;
+pub use mcp::{HttpAuthSpec, McpConfig, McpServerConfig, TransportSpec};
 pub use media::*;
 pub use process_registry::*;
 pub use security::*;
@@ -94,6 +96,9 @@ pub struct Config {
     /// Plugin marketplace settings.
     #[serde(default, alias = "customizations")]
     pub plugins: PluginsConfig,
+    /// MCP (Model Context Protocol) client settings.
+    #[serde(default)]
+    pub mcp: McpConfig,
     /// Multi-agent orchestration settings.
     #[serde(default)]
     pub agents: MultiAgentConfig,

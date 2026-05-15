@@ -10,6 +10,7 @@ repository.workspace = true
 coding = { path = "../coding" }
 sandbox = { path = "../sandbox" }
 plugins = { path = "../plugins" }
+mcp = { path = "../mcp" }
 lru = "0.12"
 tokio = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }

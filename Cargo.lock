@@ -1180,6 +1180,7 @@ dependencies = [
  "keyring",
  "libc",
  "lru",
+ "mcp",
  "notify",
  "nucleo-matcher",
  "opentelemetry",

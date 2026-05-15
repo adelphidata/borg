@@ -232,6 +232,14 @@ define_settings! {
         "plugins.wasm.rate_limit_per_minute" => plugins.wasm.rate_limit_per_minute, parsed(u32);
         "plugins.wasm.rate_limit_burst" => plugins.wasm.rate_limit_burst, parsed(u32);
 
+        // ── MCP (Model Context Protocol) ──
+        "mcp.enabled" => mcp.enabled, parsed(bool);
+        "mcp.max_tools_total" => mcp.max_tools_total, parsed(usize);
+        "mcp.allow_plaintext_http" => mcp.allow_plaintext_http, parsed(bool);
+        "mcp.allow_local_network" => mcp.allow_local_network, parsed(bool);
+        "mcp.disabled_servers" => mcp.disabled_servers, json;
+        "mcp.servers" => mcp.servers, json;
+
         // ── Credentials ──
         "credentials" => credentials, json_count("entries");
 
@@ -631,6 +639,11 @@ define_settings! {
 
         // — Per-session goals (/goal) —
         "goals.enabled" => "Enable /goal", Bool, "Goals";
+
+        // — MCP (Model Context Protocol) — per-server config is JSON-only
+        // (edited via the Slice 3 CLI), so only the kill switch surfaces
+        // in the TUI popup.
+        "mcp.enabled" => "MCP", Bool, "MCP";
 
         // — Advanced — power-user / esoteric knobs
         "llm.cache.strategy" => "Cache layout", Select, "Advanced";

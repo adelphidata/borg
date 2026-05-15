@@ -57,6 +57,10 @@ pub mod audit_events {
     pub const WASM_PLUGIN_RESEALED: &str = "wasm_plugin_resealed";
     pub const WASM_PLUGIN_DISABLED: &str = "wasm_plugin_disabled";
     pub const WASM_PLUGIN_ENABLED: &str = "wasm_plugin_enabled";
+
+    pub const MCP_TOOL_EXECUTED: &str = "mcp_tool_executed";
+    pub const MCP_RATE_LIMITED: &str = "mcp_rate_limited";
+    pub const MCP_SCHEMA_REJECTED: &str = "mcp_schema_rejected";
 }
 
 #[derive(Clone)]
