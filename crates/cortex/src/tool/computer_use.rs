@@ -570,6 +570,28 @@ static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
     "#).expect("compile-time literal regex")
 });
 
+/// Fold a driver response's `text` parts into the action's success summary.
+/// cua-driver reports soft failures (`element not focusable`, `target window
+/// vanished`) as JSON-RPC success with a text-part — without this merge the
+/// agent would see fake success, violating CLAUDE.md's
+/// "if we report success it must succeed" invariant.
+fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
+    let driver_text: String = resp
+        .content
+        .into_iter()
+        .filter_map(|p| match p {
+            DriverContent::Text(t) if !t.is_empty() => Some(t),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if driver_text.is_empty() {
+        ToolOutput::Text(summary)
+    } else {
+        ToolOutput::Text(format!("{summary}\n{driver_text}"))
+    }
+}
+
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
     let x = args
         .x
@@ -581,8 +603,8 @@ async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Res
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
-    let _ = driver.call(method, params).await?;
-    Ok(ToolOutput::Text(format!("{method} at ({x}, {y})")))
+    let resp = driver.call(method, params).await?;
+    Ok(merge_driver_text(format!("{method} at ({x}, {y})"), resp))
 }
 
 async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -602,10 +624,11 @@ async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput>
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
-    let _ = driver.call("drag", params).await?;
-    Ok(ToolOutput::Text(format!(
-        "drag ({from_x},{from_y}) → ({to_x},{to_y})"
-    )))
+    let resp = driver.call("drag", params).await?;
+    Ok(merge_driver_text(
+        format!("drag ({from_x},{from_y}) → ({to_x},{to_y})"),
+        resp,
+    ))
 }
 
 async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -619,8 +642,8 @@ async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutpu
         ));
     }
     let params = json!({"x": x, "y": y, "delta_x": dx, "delta_y": dy});
-    let _ = driver.call("scroll", params).await?;
-    Ok(ToolOutput::Text(format!("scroll ({dx},{dy})")))
+    let resp = driver.call("scroll", params).await?;
+    Ok(merge_driver_text(format!("scroll ({dx},{dy})"), resp))
 }
 
 async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -632,11 +655,11 @@ async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     if let Some(pid) = args.pid {
         params["pid"] = json!(pid);
     }
-    let _ = driver.call("type_text", params).await?;
-    Ok(ToolOutput::Text(format!(
-        "typed {} chars",
-        text.chars().count()
-    )))
+    let resp = driver.call("type_text", params).await?;
+    Ok(merge_driver_text(
+        format!("typed {} chars", text.chars().count()),
+        resp,
+    ))
 }
 
 async fn key(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -647,15 +670,18 @@ async fn key(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> 
         if let Some(pid) = args.pid {
             params["pid"] = json!(pid);
         }
-        let _ = driver.call("hotkey", params).await?;
-        Ok(ToolOutput::Text(format!("hotkey {}", combo.join("+"))))
+        let resp = driver.call("hotkey", params).await?;
+        Ok(merge_driver_text(
+            format!("hotkey {}", combo.join("+")),
+            resp,
+        ))
     } else if let Some(k) = &args.key {
         let mut params = json!({"key": k});
         if let Some(pid) = args.pid {
             params["pid"] = json!(pid);
         }
-        let _ = driver.call("press_key", params).await?;
-        Ok(ToolOutput::Text(format!("press_key {k}")))
+        let resp = driver.call("press_key", params).await?;
+        Ok(merge_driver_text(format!("press_key {k}"), resp))
     } else {
         Ok(ToolOutput::Text(
             "Error: computer_use.key requires either `key` (single) or `keys` (hotkey array)"
@@ -684,10 +710,11 @@ async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
         "element_index": element_index,
         "value": value,
     });
-    let _ = driver.call("set_value", params).await?;
-    Ok(ToolOutput::Text(format!(
-        "set_value [{element_index}] = {value:?}"
-    )))
+    let resp = driver.call("set_value", params).await?;
+    Ok(merge_driver_text(
+        format!("set_value [{element_index}] = {value:?}"),
+        resp,
+    ))
 }
 
 async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -701,9 +728,12 @@ async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOu
     if let Some(window_id) = args.window_id {
         params["window_id"] = json!(window_id);
     }
-    let _ = driver.call("focus_app", params).await?;
+    let resp = driver.call("focus_app", params).await?;
     let mode = if raise { "raised" } else { "backgrounded" };
-    Ok(ToolOutput::Text(format!("focus_app {target} ({mode})")))
+    Ok(merge_driver_text(
+        format!("focus_app {target} ({mode})"),
+        resp,
+    ))
 }
 
 #[cfg(test)]
@@ -1109,6 +1139,73 @@ mod tests {
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (_, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(params["raise_window"], true);
+    }
+
+    #[tokio::test]
+    async fn click_surfaces_driver_soft_failure_text() {
+        // Regression guard: cua-driver returns soft failures (element-not-
+        // focusable, target-window-vanished) as JSON-RPC success with a
+        // text-part. Before the fix the tool said "click at (x, y)" and the
+        // model believed it; the user only saw the failure when the next
+        // capture showed nothing changed. The merge surfaces the driver's
+        // message so the agent can recover on the next turn.
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(
+                "error: target element not focusable".into(),
+            )],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(100);
+        args.y = Some(200);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(text.contains("click at (100, 200)"), "summary missing: {text}");
+        assert!(
+            text.contains("error: target element not focusable"),
+            "driver soft-failure text missing: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn focus_app_surfaces_driver_soft_failure_text() {
+        // Covers the focus_app branch — the no-foreground contract makes this
+        // a particularly easy soft-failure surface to ignore (the driver
+        // can't raise a sandboxed app and shrugs back a text-part).
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(
+                "error: target app sandbox prevents activation".into(),
+            )],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::FocusApp);
+        args.target = Some("com.google.Chrome".into());
+        args.raise_window = Some(false);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert!(text.contains("focus_app com.google.Chrome"));
+        assert!(text.contains("error: target app sandbox prevents activation"));
+    }
+
+    #[tokio::test]
+    async fn click_empty_driver_text_keeps_summary_only() {
+        // No trailing newline when the driver returns no text — matches the
+        // pre-fix behaviour for the happy path so existing log output / model
+        // expectations don't shift.
+        let driver = FakeDriver::new(vec![DriverResponse { content: vec![] }]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(1);
+        args.y = Some(2);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        assert_eq!(text, "click at (1, 2)");
     }
 
     #[test]
