@@ -281,50 +281,28 @@ pub(crate) fn imessage_post_install(data_dir: &std::path::Path) -> Vec<String> {
         return notes;
     }
 
-    let db_uri = format!("file:{}?mode=ro", db_path.display());
-    match rusqlite::Connection::open_with_flags(
-        &db_uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ) {
-        Ok(conn) => {
-            // Initialize state with current max ROWID
-            match conn.query_row("SELECT MAX(ROWID) FROM message", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            }) {
-                Ok(Some(max_rowid)) => {
-                    let state = format!("{{\"last_rowid\": {max_rowid}}}");
-                    if let Err(e) = std::fs::write(&state_path, &state) {
-                        notes.push(format!("Warning: failed to write state file: {e}"));
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    notes.push(format!("Warning: could not query Messages DB: {e}"));
-                }
-            }
-
-            notes.push("Full Disk Access detected".to_string());
-
-            // Try to detect the user's iMessage address
-            if let Ok(address) = conn.query_row(
-                "SELECT DISTINCT h.id FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE m.is_from_me = 1 LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            ) {
-                notes.push(format!("Your iMessage address: {address}"));
-            }
-
-            notes.push("Messages will be processed automatically when Borg is running".to_string());
-            notes.push(
-                "Note: Messages you send to yourself are ignored (prevents loops). Test by texting from another device.".to_string(),
-            );
-        }
-        Err(_) => {
-            notes.push("Full Disk Access required:".to_string());
-            notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
-            notes.push("  Add your terminal app, then restart Borg".to_string());
-        }
+    // NOTE (phase 8a): the previous implementation read `chat.db` via
+    // `rusqlite` to seed state.json with `MAX(ROWID)` and auto-detect the
+    // operator's iMessage handle. After the workspace-wide turso migration,
+    // rusqlite is no longer a dependency. Phase 8b will rewire this through
+    // an async turso read-only connection from the gateway runtime. Until
+    // then we write a sentinel state file that the gateway loader treats as
+    // "uninitialized — seed from MAX(ROWID) on first poll" so existing
+    // history is not replayed.
+    let state = "{\"last_rowid\": null}";
+    if let Err(e) = std::fs::write(&state_path, state) {
+        notes.push(format!("Warning: failed to write state file: {e}"));
     }
+    let _ = db_path; // referenced above; presence check already done.
+    notes.push("Full Disk Access required:".to_string());
+    notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
+    notes.push("  Add your terminal app, then restart Borg".to_string());
+    notes.push(
+        "Messages will be processed automatically when Borg is running".to_string(),
+    );
+    notes.push(
+        "Note: Messages you send to yourself are ignored (prevents loops). Test by texting from another device.".to_string(),
+    );
 
     notes
 }

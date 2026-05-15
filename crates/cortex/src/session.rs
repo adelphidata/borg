@@ -123,19 +123,21 @@ impl Session {
 ///
 /// Returns the new `Session`. Caller is responsible for switching the agent
 /// to it (typically via `LoadSession`).
-pub fn fork_session(parent_id: &str, anchor_message_id: i64) -> Result<Session> {
+pub async fn fork_session(parent_id: &str, anchor_message_id: i64) -> Result<Session> {
     validate_session_id(parent_id)?;
-    let db = Database::open()?;
+    let db = Database::open().await?;
     let parent_row = db
-        .session_by_id(parent_id)?
+        .session_by_id(parent_id)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Session '{parent_id}' not found"))?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
     let now_secs = chrono::Utc::now().timestamp();
     let new_title = format!("{} (fork)", parent_row.title);
-    db.fork_session(parent_id, anchor_message_id, &new_id, &new_title, now_secs)?;
+    db.fork_session(parent_id, anchor_message_id, &new_id, &new_title, now_secs)
+        .await?;
 
-    let messages = recover_session_from_db(&new_id)?.unwrap_or_default();
+    let messages = recover_session_from_db(&new_id).await?.unwrap_or_default();
     let now_iso = Local::now().to_rfc3339();
     let session = Session {
         meta: SessionMeta {
@@ -171,9 +173,9 @@ struct SessionMetaOnly {
 }
 
 /// Attempt to recover a session's messages from SQLite if the JSON file is stale or missing.
-pub fn recover_session_from_db(session_id: &str) -> Result<Option<Vec<Message>>> {
-    let db = Database::open()?;
-    let rows = db.load_session_messages(session_id)?;
+pub async fn recover_session_from_db(session_id: &str) -> Result<Option<Vec<Message>>> {
+    let db = Database::open().await?;
+    let rows = db.load_session_messages(session_id).await?;
     if rows.is_empty() {
         return Ok(None);
     }

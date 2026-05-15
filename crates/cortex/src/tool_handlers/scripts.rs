@@ -6,22 +6,37 @@ use crate::db::Database;
 
 use super::{check_enabled, optional_bool_param, optional_str_param, require_str_param, with_db};
 
-pub fn handle_manage_scripts(args: &serde_json::Value, config: &Config) -> Result<String> {
+pub async fn handle_manage_scripts(
+    args: &serde_json::Value,
+    config: &Config,
+) -> Result<String> {
     if let Some(msg) = check_enabled(config.scripts.enabled, "scripts") {
         return Ok(msg);
     }
-    with_db(|db| {
-        crate::dispatch_action!(args, {
-            "create" => scripts_create(args, config, db),
-            "update" => scripts_update(args, db),
-            "delete" => scripts_delete(args, db),
-            "get" => scripts_get(args, db),
-            "list" => crate::scripts::list_scripts(db),
-        })
+    let args = args.clone();
+    let config = config.clone();
+    with_db(move |db| async move {
+        let action = require_str_param(&args, "action")?.to_string();
+        match action.as_str() {
+            "create" => scripts_create(&args, &config, &db).await,
+            "update" => scripts_update(&args, &db).await,
+            "delete" => scripts_delete(&args, &db).await,
+            "get" => scripts_get(&args, &db).await,
+            "list" => crate::scripts::list_scripts(&db).await,
+            other => Ok(format!(
+                "Unknown action: '{}'. Valid actions: create, update, delete, get, list",
+                other
+            )),
+        }
     })
+    .await
 }
 
-fn scripts_create(args: &serde_json::Value, config: &Config, db: &Database) -> Result<String> {
+async fn scripts_create(
+    args: &serde_json::Value,
+    config: &Config,
+    db: &Database,
+) -> Result<String> {
     let name = require_str_param(args, "name")?;
     let patch = require_str_param(args, "patch")?;
     let description = optional_str_param(args, "description").unwrap_or("");
@@ -64,22 +79,23 @@ fn scripts_create(args: &serde_json::Value, config: &Config, db: &Database) -> R
             max_scripts: config.scripts.max_scripts,
         },
     )
+    .await
 }
 
-fn scripts_update(args: &serde_json::Value, db: &Database) -> Result<String> {
+async fn scripts_update(args: &serde_json::Value, db: &Database) -> Result<String> {
     let name = require_str_param(args, "name")?;
     let patch = require_str_param(args, "patch")?;
-    crate::scripts::update_script(db, name, patch)
+    crate::scripts::update_script(db, name, patch).await
 }
 
-fn scripts_delete(args: &serde_json::Value, db: &Database) -> Result<String> {
+async fn scripts_delete(args: &serde_json::Value, db: &Database) -> Result<String> {
     let name = require_str_param(args, "name")?;
-    crate::scripts::delete_script(db, name)
+    crate::scripts::delete_script(db, name).await
 }
 
-fn scripts_get(args: &serde_json::Value, db: &Database) -> Result<String> {
+async fn scripts_get(args: &serde_json::Value, db: &Database) -> Result<String> {
     let name = require_str_param(args, "name")?;
-    crate::scripts::get_script(db, name)
+    crate::scripts::get_script(db, name).await
 }
 
 #[instrument(skip_all, fields(tool.name = "run_script"))]
@@ -144,11 +160,13 @@ mod tests {
         assert!(result.contains("Unknown audit category"));
     }
 
-    #[test]
-    fn handle_manage_scripts_disabled_short_circuits() {
+    #[tokio::test]
+    async fn handle_manage_scripts_disabled_short_circuits() {
         let mut config = Config::default();
         config.scripts.enabled = false;
-        let result = handle_manage_scripts(&json!({"action": "list"}), &config).unwrap();
+        let result = handle_manage_scripts(&json!({"action": "list"}), &config)
+            .await
+            .unwrap();
         assert!(result.contains("disabled"), "got: {result}");
     }
 

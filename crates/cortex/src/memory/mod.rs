@@ -121,14 +121,20 @@ fn enforce_memory_size(name: &str, scope: &str, projected_tokens: usize) -> Resu
 /// a hard size cap before writing — large entries get silently dropped by
 /// the token-budget loader, so we fail loud at write time and force the
 /// caller to split into topic-sized pieces.
-pub fn write_memory_db(name: &str, content: &str, mode: WriteMode, scope: &str) -> Result<String> {
+pub async fn write_memory_db(
+    name: &str,
+    content: &str,
+    mode: WriteMode,
+    scope: &str,
+) -> Result<String> {
     scan_for_injection(content)?;
-    let db = crate::db::Database::open()?;
+    let db = crate::db::Database::open().await?;
     let projected_tokens = match mode {
         WriteMode::Overwrite => estimate_tokens(content),
         WriteMode::Append => {
             let existing = db
-                .get_memory_entry(scope, name)?
+                .get_memory_entry(scope, name)
+                .await?
                 .map(|e| e.content)
                 .unwrap_or_default();
             estimate_tokens(&existing) + estimate_tokens(content)
@@ -136,8 +142,8 @@ pub fn write_memory_db(name: &str, content: &str, mode: WriteMode, scope: &str) 
     };
     enforce_memory_size(name, scope, projected_tokens)?;
     match mode {
-        WriteMode::Overwrite => db.upsert_memory_entry(scope, name, content)?,
-        WriteMode::Append => db.append_memory_entry(scope, name, content)?,
+        WriteMode::Overwrite => db.upsert_memory_entry(scope, name, content).await?,
+        WriteMode::Append => db.append_memory_entry(scope, name, content).await?,
     }
     Ok(format!("Written to memory: {name} (scope: {scope})"))
 }
@@ -148,50 +154,51 @@ pub fn write_memory_db(name: &str, content: &str, mode: WriteMode, scope: &str) 
 /// so they can detect "not found" without string-sniffing. Tool handlers wrap the
 /// `None` case with a user-facing "not found" message via
 /// [`read_memory_db_or_not_found`].
-pub fn read_memory_db(name: &str, scope: &str) -> Result<Option<String>> {
-    let db = crate::db::Database::open()?;
-    read_memory_db_with(&db, name, scope)
+pub async fn read_memory_db(name: &str, scope: &str) -> Result<Option<String>> {
+    let db = crate::db::Database::open().await?;
+    read_memory_db_with(&db, name, scope).await
 }
 
 /// DB-passing form of [`read_memory_db`]. Tests use this with an in-memory
 /// `Database::test_db()` so they don't touch (or depend on the health of)
 /// the production DB at `~/.borg/borg.db`.
-pub fn read_memory_db_with(
+pub async fn read_memory_db_with(
     db: &crate::db::Database,
     name: &str,
     scope: &str,
 ) -> Result<Option<String>> {
-    Ok(db.get_memory_entry(scope, name)?.map(|e| e.content))
+    Ok(db.get_memory_entry(scope, name).await?.map(|e| e.content))
 }
 
 /// Read a memory entry, returning a human-readable "not found" message if missing.
 /// For use by tool handlers that surface results to the LLM.
-pub fn read_memory_db_or_not_found(name: &str, scope: &str) -> Result<String> {
-    Ok(read_memory_db(name, scope)?.unwrap_or_else(|| format!("Memory entry '{name}' not found.")))
+pub async fn read_memory_db_or_not_found(name: &str, scope: &str) -> Result<String> {
+    Ok(read_memory_db(name, scope)
+        .await?
+        .unwrap_or_else(|| format!("Memory entry '{name}' not found.")))
 }
 
 /// DB-passing form of [`read_memory_db_or_not_found`].
-pub fn read_memory_db_or_not_found_with(
+pub async fn read_memory_db_or_not_found_with(
     db: &crate::db::Database,
     name: &str,
     scope: &str,
 ) -> Result<String> {
-    Ok(read_memory_db_with(db, name, scope)?
+    Ok(read_memory_db_with(db, name, scope)
+        .await?
         .unwrap_or_else(|| format!("Memory entry '{name}' not found.")))
 }
 
 /// List all memory entries for a scope.
-pub fn list_memory_entries(scope: &str) -> Result<Vec<crate::db::MemoryEntryRow>> {
-    let db = crate::db::Database::open()?;
-    db.list_memory_entries(scope)
+pub async fn list_memory_entries(scope: &str) -> Result<Vec<crate::db::MemoryEntryRow>> {
+    let db = crate::db::Database::open().await?;
+    db.list_memory_entries(scope).await
 }
 
-/// Look up `entry`'s estimated token count in `cache`, falling back to a live
-/// BPE encode + persisting the result so subsequent turns read from the cache.
-/// A persist failure is logged but never bubbles up — we'd still rather load
-/// memory than hard-fail on a UPDATE race.
+/// Look up `entry`'s estimated token count in `cache`. Returns the cached
+/// value if present, otherwise computes via BPE. Persisting newly-computed
+/// values is the responsibility of [`prime_token_cache`] (async pre-pass).
 fn tokens_for_entry(
-    db: &crate::db::Database,
     entry: &crate::db::MemoryEntryRow,
     cache: &std::collections::HashMap<String, i64>,
 ) -> usize {
@@ -200,47 +207,73 @@ fn tokens_for_entry(
             return cached as usize;
         }
     }
-    let computed = estimate_tokens(&entry.content);
-    if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed as i64) {
-        tracing::warn!(
-            "failed to cache estimated_tokens for {}/{}: {e}",
-            entry.scope,
-            entry.name
-        );
+    estimate_tokens(&entry.content)
+}
+
+/// Compute missing token counts for `entries` and persist them, then return
+/// a complete `name → tokens` map. Persist failures log + continue —
+/// caching is best-effort.
+async fn prime_token_cache(
+    db: &crate::db::Database,
+    entries: &[crate::db::MemoryEntryRow],
+    seed: std::collections::HashMap<String, i64>,
+) -> std::collections::HashMap<String, i64> {
+    let mut cache = seed;
+    for entry in entries {
+        let needs_compute = match cache.get(&entry.name) {
+            Some(&v) if v >= 0 => false,
+            _ => true,
+        };
+        if !needs_compute {
+            continue;
+        }
+        let computed = estimate_tokens(&entry.content) as i64;
+        cache.insert(entry.name.clone(), computed);
+        if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed).await {
+            tracing::warn!(
+                "failed to cache estimated_tokens for {}/{}: {e}",
+                entry.scope,
+                entry.name
+            );
+        }
     }
-    computed
+    cache
 }
 
 /// Load memory context from DB within the given token budget.
 /// Loads INDEX entry first, then remaining entries by updated_at DESC.
 #[instrument(skip_all, fields(token_budget = max_tokens))]
-pub fn load_memory_context_db(max_tokens: usize) -> Result<String> {
+pub async fn load_memory_context_db(max_tokens: usize) -> Result<String> {
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let db = crate::db::Database::open()?;
-    load_memory_context_db_with(&db, max_tokens)
+    let db = crate::db::Database::open().await?;
+    load_memory_context_db_with(&db, max_tokens).await
 }
 
 /// DB-passing form of [`load_memory_context_db`]. Tests use this with an
 /// in-memory `Database::test_db()` so they don't depend on the production
 /// DB being healthy or even present.
-pub fn load_memory_context_db_with(db: &crate::db::Database, max_tokens: usize) -> Result<String> {
+pub async fn load_memory_context_db_with(
+    db: &crate::db::Database,
+    max_tokens: usize,
+) -> Result<String> {
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let entries = db.list_memory_entries("global")?;
-    let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
+    let entries = db.list_memory_entries("global").await?;
+    let seed = db.list_memory_tokens_map("global").await.unwrap_or_else(|e| {
         tracing::warn!("failed to load cached token estimates, will recompute: {e}");
         std::collections::HashMap::new()
     });
+    let token_cache = prime_token_cache(db, &entries, seed).await;
 
     let mut parts = Vec::new();
     let mut estimated_tokens = 0;
 
     // Always load INDEX first
     if let Some(index) = entries.iter().find(|e| e.name == "INDEX") {
-        let tokens = tokens_for_entry(db, index, &token_cache);
+        let tokens = tokens_for_entry(index, &token_cache);
         if estimated_tokens + tokens <= max_tokens {
             let safe_name = escape_xml_attr("INDEX");
             parts.push(format!(
@@ -257,7 +290,7 @@ pub fn load_memory_context_db_with(db: &crate::db::Database, max_tokens: usize) 
         if entry.name == "INDEX" {
             continue;
         }
-        let tokens = tokens_for_entry(db, entry, &token_cache);
+        let tokens = tokens_for_entry(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
             debug!("Skipping {} (would exceed token budget)", entry.name);
             continue;
@@ -281,19 +314,19 @@ pub fn load_memory_context_db_with(db: &crate::db::Database, max_tokens: usize) 
 /// Load memory context from DB with semantic ranking.
 /// Entries in `ranked` are loaded first (by similarity score), then remaining by updated_at.
 #[instrument(skip_all, fields(token_budget = max_tokens))]
-pub fn load_memory_context_db_ranked(
+pub async fn load_memory_context_db_ranked(
     max_tokens: usize,
     ranked: &[(String, f32)],
 ) -> Result<String> {
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let db = crate::db::Database::open()?;
-    load_memory_context_db_ranked_with(&db, max_tokens, ranked)
+    let db = crate::db::Database::open().await?;
+    load_memory_context_db_ranked_with(&db, max_tokens, ranked).await
 }
 
 /// DB-passing form of [`load_memory_context_db_ranked`].
-pub fn load_memory_context_db_ranked_with(
+pub async fn load_memory_context_db_ranked_with(
     db: &crate::db::Database,
     max_tokens: usize,
     ranked: &[(String, f32)],
@@ -301,11 +334,12 @@ pub fn load_memory_context_db_ranked_with(
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let entries = db.list_memory_entries("global")?;
-    let token_cache = db.list_memory_tokens_map("global").unwrap_or_else(|e| {
+    let entries = db.list_memory_entries("global").await?;
+    let seed = db.list_memory_tokens_map("global").await.unwrap_or_else(|e| {
         tracing::warn!("failed to load cached token estimates, will recompute: {e}");
         std::collections::HashMap::new()
     });
+    let token_cache = prime_token_cache(db, &entries, seed).await;
 
     // Build a name → index map once so ranked lookup is O(1) per name
     // instead of O(n·m) linear scan.
@@ -323,7 +357,7 @@ pub fn load_memory_context_db_ranked_with(
                     estimated_tokens: &mut usize,
                     parts: &mut Vec<String>,
                     loaded: &mut std::collections::HashSet<String>| {
-        let tokens = tokens_for_entry(db, entry, &token_cache);
+        let tokens = tokens_for_entry(entry, &token_cache);
         if *estimated_tokens + tokens > max_tokens {
             return;
         }
@@ -377,7 +411,6 @@ pub fn load_memory_context_db_ranked_with(
 }
 
 fn tokens_for_entry_scoped(
-    db: &crate::db::Database,
     entry: &MemoryEntryRow,
     cache: &std::collections::HashMap<(String, String), i64>,
 ) -> usize {
@@ -386,15 +419,37 @@ fn tokens_for_entry_scoped(
             return cached as usize;
         }
     }
-    let computed = estimate_tokens(&entry.content);
-    if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed as i64) {
-        tracing::warn!(
-            "failed to cache estimated_tokens for {}/{}: {e}",
-            entry.scope,
-            entry.name
-        );
+    estimate_tokens(&entry.content)
+}
+
+/// Async pre-pass: compute and persist any missing token counts for `entries`,
+/// returning a fully-populated `(scope, name) → tokens` map.
+async fn prime_token_cache_scoped(
+    db: &crate::db::Database,
+    entries: &[MemoryEntryRow],
+    seed: std::collections::HashMap<(String, String), i64>,
+) -> std::collections::HashMap<(String, String), i64> {
+    let mut cache = seed;
+    for entry in entries {
+        let key = (entry.scope.clone(), entry.name.clone());
+        let needs_compute = match cache.get(&key) {
+            Some(&v) if v >= 0 => false,
+            _ => true,
+        };
+        if !needs_compute {
+            continue;
+        }
+        let computed = estimate_tokens(&entry.content) as i64;
+        cache.insert(key, computed);
+        if let Err(e) = db.set_memory_tokens(&entry.scope, &entry.name, computed).await {
+            tracing::warn!(
+                "failed to cache estimated_tokens for {}/{}: {e}",
+                entry.scope,
+                entry.name
+            );
+        }
     }
-    computed
+    cache
 }
 
 fn render_long_term_entry(entry: &MemoryEntryRow) -> String {
@@ -406,11 +461,11 @@ fn render_long_term_entry(entry: &MemoryEntryRow) -> String {
     )
 }
 
-fn load_entries_for_scopes(
+async fn load_entries_for_scopes(
     db: &crate::db::Database,
     scopes: &[String],
 ) -> Result<Vec<MemoryEntryRow>> {
-    let mut entries = db.list_memory_entries_for_scopes(scopes)?;
+    let mut entries = db.list_memory_entries_for_scopes(scopes).await?;
     entries.sort_by(|a, b| {
         if a.name == "INDEX" && b.name != "INDEX" {
             std::cmp::Ordering::Less
@@ -426,11 +481,11 @@ fn load_entries_for_scopes(
     Ok(entries)
 }
 
-fn token_cache_for_scopes(
+async fn token_cache_for_scopes(
     db: &crate::db::Database,
     scopes: &[String],
 ) -> std::collections::HashMap<(String, String), i64> {
-    match db.list_memory_tokens_map_for_scopes(scopes) {
+    match db.list_memory_tokens_map_for_scopes(scopes).await {
         Ok(cache) => cache,
         Err(e) => {
             tracing::warn!(
@@ -443,16 +498,16 @@ fn token_cache_for_scopes(
 
 /// Load long-term SQLite memory for the configured scopes.
 #[instrument(skip_all, fields(token_budget = max_tokens))]
-pub fn load_memory_context_db_scoped(config: &Config, max_tokens: usize) -> Result<String> {
+pub async fn load_memory_context_db_scoped(config: &Config, max_tokens: usize) -> Result<String> {
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let db = crate::db::Database::open()?;
-    load_memory_context_db_scoped_with(&db, &resolved_memory_scopes(config), max_tokens)
+    let db = crate::db::Database::open().await?;
+    load_memory_context_db_scoped_with(&db, &resolved_memory_scopes(config), max_tokens).await
 }
 
 /// DB-passing form of [`load_memory_context_db_scoped`].
-pub fn load_memory_context_db_scoped_with(
+pub async fn load_memory_context_db_scoped_with(
     db: &crate::db::Database,
     scopes: &[String],
     max_tokens: usize,
@@ -460,8 +515,9 @@ pub fn load_memory_context_db_scoped_with(
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let entries = load_entries_for_scopes(db, scopes)?;
-    let token_cache = token_cache_for_scopes(db, scopes);
+    let entries = load_entries_for_scopes(db, scopes).await?;
+    let seed = token_cache_for_scopes(db, scopes).await;
+    let token_cache = prime_token_cache_scoped(db, &entries, seed).await;
     let mut parts = Vec::new();
     let mut estimated_tokens = 0usize;
     let mut index_loaded = false;
@@ -473,7 +529,7 @@ pub fn load_memory_context_db_scoped_with(
             }
             index_loaded = true;
         }
-        let tokens = tokens_for_entry_scoped(db, entry, &token_cache);
+        let tokens = tokens_for_entry_scoped(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
             continue;
         }
@@ -486,7 +542,7 @@ pub fn load_memory_context_db_scoped_with(
 
 /// Load long-term SQLite memory with scope-aware ranking.
 #[instrument(skip_all, fields(token_budget = max_tokens))]
-pub fn load_memory_context_db_ranked_scoped(
+pub async fn load_memory_context_db_ranked_scoped(
     config: &Config,
     max_tokens: usize,
     ranked: &[(String, String, f32)],
@@ -494,17 +550,18 @@ pub fn load_memory_context_db_ranked_scoped(
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let db = crate::db::Database::open()?;
+    let db = crate::db::Database::open().await?;
     load_memory_context_db_ranked_scoped_with(
         &db,
         &resolved_memory_scopes(config),
         max_tokens,
         ranked,
     )
+    .await
 }
 
 /// DB-passing form of [`load_memory_context_db_ranked_scoped`].
-pub fn load_memory_context_db_ranked_scoped_with(
+pub async fn load_memory_context_db_ranked_scoped_with(
     db: &crate::db::Database,
     scopes: &[String],
     max_tokens: usize,
@@ -513,8 +570,9 @@ pub fn load_memory_context_db_ranked_scoped_with(
     if max_tokens == 0 {
         return Ok(String::new());
     }
-    let entries = load_entries_for_scopes(db, scopes)?;
-    let token_cache = token_cache_for_scopes(db, scopes);
+    let entries = load_entries_for_scopes(db, scopes).await?;
+    let seed = token_cache_for_scopes(db, scopes).await;
+    let token_cache = prime_token_cache_scoped(db, &entries, seed).await;
     let by_key: std::collections::HashMap<(String, String), usize> = entries
         .iter()
         .enumerate()
@@ -529,7 +587,7 @@ pub fn load_memory_context_db_ranked_scoped_with(
         if loaded.contains(&key) {
             return;
         }
-        let tokens = tokens_for_entry_scoped(db, entry, &token_cache);
+        let tokens = tokens_for_entry_scoped(entry, &token_cache);
         if estimated_tokens + tokens > max_tokens {
             return;
         }
@@ -560,9 +618,9 @@ pub fn load_memory_context_db_ranked_scoped_with(
 }
 
 /// Delete a memory entry from the database.
-pub fn delete_memory_db(name: &str, scope: &str) -> Result<bool> {
-    let db = crate::db::Database::open()?;
-    db.delete_memory_entry(scope, name)
+pub async fn delete_memory_db(name: &str, scope: &str) -> Result<bool> {
+    let db = crate::db::Database::open().await?;
+    db.delete_memory_entry(scope, name).await
 }
 
 /// Load the HEARTBEAT.md checklist if it exists and is non-empty.
@@ -578,9 +636,9 @@ pub fn load_heartbeat_checklist() -> Option<String> {
 /// Returns DB entries with their name, content size in bytes, and `updated_at`
 /// timestamp. Sorted by `updated_at` ascending so oldest appear first (candidates
 /// for cleanup/review).
-pub fn list_memory_files() -> Result<Vec<MemoryFileInfo>> {
-    let db = crate::db::Database::open()?;
-    let entries = db.list_memory_entries("global")?;
+pub async fn list_memory_files() -> Result<Vec<MemoryFileInfo>> {
+    let db = crate::db::Database::open().await?;
+    let entries = db.list_memory_entries("global").await?;
     let mut files: Vec<MemoryFileInfo> = entries
         .into_iter()
         .map(|e| MemoryFileInfo {
@@ -856,13 +914,13 @@ pub fn load_knowledge_context(config: &Config, query: &str, max_tokens: usize) -
 }
 
 /// List SQLite long-term memory and markdown knowledge files for `/memory`.
-pub fn list_memory_inventory(config: &Config) -> Result<Vec<MemoryListItem>> {
-    let db = crate::db::Database::open()?;
+pub async fn list_memory_inventory(config: &Config) -> Result<Vec<MemoryListItem>> {
+    let db = crate::db::Database::open().await?;
     let scopes = resolved_memory_scopes(config);
     let mut items = Vec::new();
 
     for scope in &scopes {
-        for entry in db.list_memory_entries(scope)? {
+        for entry in db.list_memory_entries(scope).await? {
             items.push(MemoryListItem {
                 name: entry.name,
                 store: MemoryStoreKind::LongTerm,

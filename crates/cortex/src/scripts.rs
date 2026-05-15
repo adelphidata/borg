@@ -266,7 +266,7 @@ pub struct CreateScriptParams<'a> {
 }
 
 /// Create a new script: apply patch to `~/.borg/scripts/<name>/`, compute HMAC, store in DB.
-pub fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Result<String> {
+pub async fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Result<String> {
     validate_script_name(params.name)?;
     let CreateScriptParams {
         name,
@@ -282,13 +282,13 @@ pub fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Result<S
         max_scripts,
     } = params;
     // Check script limit
-    let existing = db.list_scripts()?;
+    let existing = db.list_scripts().await?;
     if existing.len() >= *max_scripts {
         bail!("Script limit reached ({max_scripts}). Delete unused scripts first.");
     }
 
     // Check name uniqueness
-    if db.get_script_by_name(name)?.is_some() {
+    if db.get_script_by_name(name).await?.is_some() {
         bail!("Script '{name}' already exists. Use update action to modify it.");
     }
 
@@ -319,7 +319,7 @@ pub fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Result<S
                 created_at: now,
                 updated_at: now,
             };
-            db.create_script(&new_script)?;
+            db.create_script(&new_script).await?;
 
             Ok(format!(
                 "Script '{name}' created successfully. HMAC integrity recorded.\n{}",
@@ -335,10 +335,11 @@ pub fn create_script(db: &Database, params: &CreateScriptParams<'_>) -> Result<S
 }
 
 /// Update an existing script: apply patch, recompute HMAC, update DB.
-pub fn update_script(db: &Database, name: &str, patch: &str) -> Result<String> {
+pub async fn update_script(db: &Database, name: &str, patch: &str) -> Result<String> {
     validate_script_name(name)?;
     let script = db
-        .get_script_by_name(name)?
+        .get_script_by_name(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Script '{name}' not found."))?;
 
     let scripts_dir = Config::scripts_dir()?;
@@ -349,7 +350,7 @@ pub fn update_script(db: &Database, name: &str, patch: &str) -> Result<String> {
             let key = get_or_create_hmac_key()?;
             let hmac = compute_directory_hmac(&key, &script_dir)?;
             let now = chrono::Utc::now().timestamp();
-            db.update_script_hmac(&script.id, &hmac, now)?;
+            db.update_script_hmac(&script.id, &hmac, now).await?;
 
             Ok(format!(
                 "Script '{name}' updated. HMAC re-signed.\n{}",
@@ -366,9 +367,10 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
     // Read script metadata and verify HMAC before the async boundary.
     // Database is not Send, so we do all DB work in a sync block first.
     let (runtime, script_dir, sandbox_policy, entrypoint_path, timeout, script_id) = {
-        let db = Database::open()?;
+        let db = Database::open().await?;
         let script = db
-            .get_script_by_name(name)?
+            .get_script_by_name(name)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("Script '{name}' not found."))?;
 
         let scripts_dir = Config::scripts_dir()?;
@@ -425,9 +427,13 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
     .await?;
 
     // Record execution (open DB again after the await)
-    match Database::open().and_then(|db| db.record_script_run(&script_id)) {
-        Ok(()) => {}
-        Err(e) => tracing::warn!("Failed to record script run for '{name}': {e}"),
+    match Database::open().await {
+        Ok(db) => {
+            if let Err(e) = db.record_script_run(&script_id).await {
+                tracing::warn!("Failed to record script run for '{name}': {e}");
+            }
+        }
+        Err(e) => tracing::warn!("Failed to open DB to record script run for '{name}': {e}"),
     }
 
     if ok {
@@ -438,14 +444,15 @@ pub async fn execute_script(config: &Config, name: &str, args_json: &str) -> Res
 }
 
 /// Delete a script: remove DB entry first, then files (safer ordering).
-pub fn delete_script(db: &Database, name: &str) -> Result<String> {
+pub async fn delete_script(db: &Database, name: &str) -> Result<String> {
     validate_script_name(name)?;
     let script = db
-        .get_script_by_name(name)?
+        .get_script_by_name(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Script '{name}' not found."))?;
 
     // Remove DB entry first (safer: orphaned files are benign, orphaned DB rows are not)
-    db.delete_script(&script.id)?;
+    db.delete_script(&script.id).await?;
 
     // Remove files
     let scripts_dir = Config::scripts_dir()?;
@@ -458,18 +465,19 @@ pub fn delete_script(db: &Database, name: &str) -> Result<String> {
 }
 
 /// Get script details from DB.
-pub fn get_script(db: &Database, name: &str) -> Result<String> {
+pub async fn get_script(db: &Database, name: &str) -> Result<String> {
     validate_script_name(name)?;
     let script = db
-        .get_script_by_name(name)?
+        .get_script_by_name(name)
+        .await?
         .ok_or_else(|| anyhow::anyhow!("Script '{name}' not found."))?;
 
     Ok(format_script_detail(&script))
 }
 
 /// List all scripts from DB.
-pub fn list_scripts(db: &Database) -> Result<String> {
-    let scripts = db.list_scripts()?;
+pub async fn list_scripts(db: &Database) -> Result<String> {
+    let scripts = db.list_scripts().await?;
     if scripts.is_empty() {
         return Ok("No scripts created.".to_string());
     }
