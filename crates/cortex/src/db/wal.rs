@@ -168,6 +168,27 @@ pub async fn run_wal_and_vacuum(
         "maintenance: running VACUUM (freelist={freelist}, page_count={page_count}, ~{} MB)",
         bytes_before / (1024 * 1024)
     );
+    // Drop in-flight prepared statements before VACUUM. The Turso 0.6 spike
+    // hit "SQL statements in progress" intermittently without this — Turso
+    // tracks open cursors per connection and refuses VACUUM while any of
+    // them are alive. `cacheflush` is the lightest hammer that releases
+    // them; if it fails, we still attempt VACUUM (the cursor may already
+    // have been dropped between the check and the call).
+    if let Err(e) = db.conn().cacheflush() {
+        tracing::warn!("maintenance: cacheflush before VACUUM failed: {e}");
+    }
+    // We deliberately keep plain `VACUUM` rather than `VACUUM INTO '<tmp>'`
+    // + atomic rename. The rename path would need to close-and-reopen the
+    // live connection — Turso 0.6's `Connection` is shared by reference
+    // through `&Database` here, and `run_wal_and_vacuum` is called as
+    // `&self` with no way to mutate the connection handle in place.
+    // Renaming the file under a held fd would orphan all subsequent writes
+    // on this connection to the unlinked inode while fresh `Database::open`
+    // calls would see the compacted file — silent divergence. Plain
+    // `VACUUM` reclaims space in place on the live connection (Turso 0.6
+    // supports it under `experimental_vacuum(true)` set in
+    // `build_connection`); the `VACUUM INTO` swap is deferred until the
+    // `Database` lifecycle grows a path-aware `reopen` method.
     if let Err(e) = db.conn().execute_batch("VACUUM;").await {
         tracing::warn!("maintenance: VACUUM failed: {e}");
         return outcome;
