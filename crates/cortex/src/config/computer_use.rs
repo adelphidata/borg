@@ -20,12 +20,6 @@ pub struct ComputerUseConfig {
     /// (for example a per-user `~/.local/bin` install).
     #[serde(default)]
     pub driver_path: String,
-
-    /// Optional version string the runtime asserts against `cua-driver --version`
-    /// before issuing requests. Empty means "no pin" — the agent trusts whatever
-    /// is on `PATH`. Tighten when reproducibility matters.
-    #[serde(default)]
-    pub driver_version_pin: String,
 }
 
 #[cfg(target_os = "macos")]
@@ -43,7 +37,6 @@ impl Default for ComputerUseConfig {
         Self {
             enabled: default_enabled(),
             driver_path: String::new(),
-            driver_version_pin: String::new(),
         }
     }
 }
@@ -78,13 +71,12 @@ mod tests {
 
     #[test]
     fn deserializes_from_partial_toml() {
-        // Operators set one or two fields, not all three; serde defaults must
+        // Operators typically set one field, not both; serde defaults must
         // fill the rest so the apply_setting hot-path doesn't need to know
         // about every field.
         let cfg: ComputerUseConfig =
             toml::from_str(r#"driver_path = "/usr/local/bin/cua-driver""#).unwrap();
         assert_eq!(cfg.driver_path, "/usr/local/bin/cua-driver");
-        assert_eq!(cfg.driver_version_pin, "");
         assert_eq!(cfg.enabled, default_enabled());
     }
 }
