@@ -1123,6 +1123,15 @@ impl LlmClient {
                 Some(cost) => (Some(cost), true, "table_openai".to_string()),
                 None => (None, false, "unknown".to_string()),
             },
+            Provider::Gemini => match pricing::estimate_cost_usd(
+                Provider::Gemini,
+                &model,
+                u64::from(prompt_tokens),
+                u64::from(completion_tokens),
+            ) {
+                Some(cost) => (Some(cost), true, "table_gemini".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
             Provider::Anthropic => match pricing::estimate_anthropic_cost_usd(
                 &model,
                 u64::from(prompt_tokens),
@@ -1302,6 +1311,9 @@ impl LlmClient {
                 {
                     self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
                         .await
+                } else if matches!(self.provider, Provider::Gemini) {
+                    self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
+                        .await
                 } else if self.provider.is_openai_compatible() {
                     self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
                         .await
@@ -1460,6 +1472,8 @@ impl LlmClient {
             && vertex::is_anthropic_model(&self.llm_config.model)
         {
             self.chat_vertex_anthropic(messages, tools).await
+        } else if matches!(self.provider, Provider::Gemini) {
+            self.chat_gemini(messages, tools).await
         } else if self.provider.is_openai_compatible() {
             self.chat_openai(messages, tools).await
         } else {
@@ -1673,6 +1687,7 @@ impl LlmClient {
         let request_url = if self.provider == Provider::Bedrock
             || (self.provider == Provider::VertexAi
                 && vertex::is_anthropic_model(&self.llm_config.model))
+            || self.provider == Provider::Gemini
         {
             transport
                 .endpoint(&request, true)
@@ -1831,6 +1846,7 @@ impl LlmClient {
         let request_url = if self.provider == Provider::Bedrock
             || (self.provider == Provider::VertexAi
                 && vertex::is_anthropic_model(&self.llm_config.model))
+            || self.provider == Provider::Gemini
         {
             transport.endpoint(&request, false)?
         } else {
@@ -2088,6 +2104,28 @@ impl LlmClient {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
         self.chat_http_transport_inner(transport::vertex_anthropic_transport(), messages, tools)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "gemini"))]
+    async fn stream_chat_gemini_inner(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), LlmError> {
+        self.stream_http_transport_inner(transport::gemini_transport(), messages, tools, tx, cancel)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "gemini"))]
+    async fn chat_gemini(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        self.chat_http_transport_inner(transport::gemini_transport(), messages, tools)
             .await
     }
 }

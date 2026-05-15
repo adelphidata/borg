@@ -149,6 +149,13 @@ impl Provider {
     }
 
     /// Whether this provider uses the OpenAI-compatible chat completions format.
+    ///
+    /// Gemini was historically routed through OpenAI-compat (Gemini AI Studio
+    /// exposes an OpenAI-shaped façade at `/v1beta/openai/chat/completions`),
+    /// but that path strips `inline_data` for video and refuses
+    /// Gemini-specific request fields (`thinkingConfig`, `cachedContents`).
+    /// Now routed through the native `gemini_transport()` so video parts and
+    /// the full request shape reach the model.
     pub fn is_openai_compatible(&self) -> bool {
         !matches!(
             self,
@@ -156,6 +163,7 @@ impl Provider {
                 | Provider::Bedrock
                 | Provider::ClaudeCli
                 | Provider::ClaudeCodeOAuth
+                | Provider::Gemini
         )
     }
 
@@ -691,7 +699,11 @@ mod tests {
     fn is_openai_compatible() {
         assert!(Provider::OpenRouter.is_openai_compatible());
         assert!(Provider::OpenAi.is_openai_compatible());
-        assert!(Provider::Gemini.is_openai_compatible());
+        // Gemini is intentionally NOT OpenAI-compatible: the AI Studio
+        // OpenAI-shaped façade strips `inline_data` for video and refuses
+        // Gemini-specific request fields. The dispatcher must route
+        // Gemini through the native transport instead.
+        assert!(!Provider::Gemini.is_openai_compatible());
         assert!(Provider::DeepSeek.is_openai_compatible());
         assert!(Provider::Groq.is_openai_compatible());
         assert!(Provider::Ollama.is_openai_compatible());

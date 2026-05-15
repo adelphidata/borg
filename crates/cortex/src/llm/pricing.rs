@@ -21,6 +21,11 @@ struct AnthropicModelRate {
 }
 
 // Sources captured on 2026-05-02:
+// Google AI Studio (Gemini) pricing:
+// - https://ai.google.dev/gemini-api/docs/pricing
+//   (≤200K-context tier where the model has tiered pricing; ≥200K
+//   tiered tier intentionally omitted because cost.rs doesn't carry
+//   per-request context-length state today.)
 // OpenAI official pricing/model docs:
 // - https://openai.com/api/pricing/
 // - https://developers.openai.com/api/docs/models/gpt-4
@@ -128,6 +133,39 @@ static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(
     ])
 });
 
+static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
+    HashMap::from([
+        (
+            "gemini-2.5-pro",
+            ModelRate {
+                input_per_mtok: "1.25",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gemini-2.5-flash",
+            ModelRate {
+                input_per_mtok: "0.30",
+                output_per_mtok: "2.50",
+            },
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            ModelRate {
+                input_per_mtok: "0.10",
+                output_per_mtok: "0.40",
+            },
+        ),
+        (
+            "gemini-2.0-flash",
+            ModelRate {
+                input_per_mtok: "0.10",
+                output_per_mtok: "0.40",
+            },
+        ),
+    ])
+});
+
 static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = LazyLock::new(|| {
     HashMap::from([
         (
@@ -217,12 +255,15 @@ fn normalize_model_id(model: &str) -> &str {
     model
         .strip_prefix("openai/")
         .or_else(|| model.strip_prefix("anthropic/"))
+        .or_else(|| model.strip_prefix("google/"))
+        .or_else(|| model.strip_prefix("gemini/"))
         .unwrap_or(model)
 }
 
 fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelRate>> {
     match provider {
         Provider::OpenAi => Some(&OPENAI_RATES),
+        Provider::Gemini => Some(&GEMINI_RATES),
         _ => None,
     }
 }
@@ -280,6 +321,7 @@ pub fn has_model_rate(provider: Provider, model: &str) -> bool {
     match provider {
         Provider::OpenAi => OPENAI_RATES.contains_key(normalize_model_id(model)),
         Provider::Anthropic => ANTHROPIC_RATES.contains_key(normalize_model_id(model)),
+        Provider::Gemini => GEMINI_RATES.contains_key(normalize_model_id(model)),
         _ => false,
     }
 }
@@ -335,6 +377,24 @@ mod tests {
     #[test]
     fn unknown_model_returns_none() {
         assert!(estimate_cost_usd(Provider::OpenAi, "missing", 1_000, 500).is_none());
+    }
+
+    #[test]
+    fn gemini_cost_is_deterministic() {
+        // gemini-2.5-flash at $0.30 input / $2.50 output per Mtok.
+        // 1k input + 500 output = 0.0003 + 0.00125 = 0.00155.
+        let cost = estimate_cost_usd(Provider::Gemini, "gemini-2.5-flash", 1_000, 500).unwrap();
+        assert_eq!(cost, "0.00155");
+    }
+
+    #[test]
+    fn gemini_normalizes_provider_prefixes() {
+        // OpenRouter-style and Google-style model IDs both resolve.
+        let a = estimate_cost_usd(Provider::Gemini, "google/gemini-2.5-flash", 1_000, 500).unwrap();
+        let b = estimate_cost_usd(Provider::Gemini, "gemini/gemini-2.5-flash", 1_000, 500).unwrap();
+        let c = estimate_cost_usd(Provider::Gemini, "gemini-2.5-flash", 1_000, 500).unwrap();
+        assert_eq!(a, c);
+        assert_eq!(b, c);
     }
 
     #[test]

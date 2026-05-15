@@ -28,10 +28,9 @@ pub(crate) enum StreamState {
     OpenAiCompat,
     Anthropic(AnthropicStreamState),
     Bedrock(BedrockStreamState),
-    /// Native Gemini SSE accumulator. M2 only adds the variant so the
-    /// closed enum has space for it; M3 fills in
-    /// `parse_stream_line`'s Gemini branch.
-    #[allow(dead_code)]
+    /// Native Gemini SSE accumulator. M4 wires this into the dispatcher
+    /// — `Provider::Gemini` now routes through `gemini_transport()`,
+    /// which produces this variant from `new_stream_state()`.
     Gemini(crate::llm::gemini::GeminiStreamState),
 }
 
@@ -109,9 +108,10 @@ pub(crate) fn vertex_anthropic_transport() -> &'static dyn Transport {
     &VERTEX_ANTHROPIC_TRANSPORT
 }
 
-/// Native Gemini AI Studio transport. M4 wires this into the dispatcher;
-/// until then it's exercised only by its own unit tests.
-#[allow(dead_code)]
+/// Native Gemini AI Studio transport. Wired into the dispatcher in M4 —
+/// `Provider::Gemini` routes through this transport rather than the
+/// OpenAI-compat façade so video parts and Gemini-specific request
+/// fields survive the round-trip.
 pub(crate) fn gemini_transport() -> &'static dyn Transport {
     &GEMINI_TRANSPORT
 }

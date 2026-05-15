@@ -37,24 +37,21 @@ pub(crate) const GEMINI_BASE_URL_ENV: &str = "BORG_GEMINI_BASE_URL";
 
 pub(crate) struct GeminiTransport;
 
-/// SSE accumulator. M2 only stores the empty struct so the `StreamState`
-/// closed enum has the variant; M3 will use it for SSE buffering across
-/// chunks.
+/// SSE accumulator for Gemini's `streamGenerateContent?alt=sse` endpoint.
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct GeminiStreamState {
-    /// SSE buffer carrying a partial JSON object across chunk boundaries.
-    /// `streamGenerateContent` with `alt=sse` emits one JSON object per
-    /// event, but reqwest can split a single event mid-frame.
+    /// Reserved scratch buffer for partial-frame reassembly. The SSE
+    /// processor today hands us complete lines, so the field stays inert
+    /// behind the public surface — present for adapter symmetry with
+    /// transports that need cross-chunk buffering.
+    #[allow(dead_code)]
     pub(crate) buf: String,
     /// Accumulator for the assistant message under construction.
     pub(crate) accumulator: AssistantAccumulator,
 }
 
-/// Per-stream accumulator. M3 fills these out from incremental SSE events;
-/// M2 leaves it inert.
+/// Per-stream accumulator built from incremental SSE events.
 #[derive(Default)]
-#[allow(dead_code)]
 pub(crate) struct AssistantAccumulator {
     pub(crate) text: String,
     pub(crate) pending_function_calls: Vec<PendingFunctionCall>,
@@ -65,6 +62,10 @@ pub(crate) struct AssistantAccumulator {
 /// One in-flight function call. Gemini doesn't emit a synthetic call id, so
 /// we mint one of the form `gem_call_<name>_<index>` at finalisation time.
 /// The id stays stable for the next user turn's `functionResponse` matching.
+///
+/// Fields are populated for accumulator parity with other transports;
+/// today the values are emitted directly via `StreamEvent::ToolCallDelta`
+/// rather than being re-read here, so the struct sits at the boundary.
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct PendingFunctionCall {
@@ -1412,5 +1413,26 @@ mod tests {
         let (_, emitted, done) = feed(&["data: [DONE]"]);
         assert!(done);
         assert!(emitted.is_empty());
+    }
+
+    // ── M4 dispatch wiring regression guards ─────────────────────────────
+
+    #[test]
+    fn gemini_provider_is_not_openai_compatible_after_m4_flip() {
+        // The whole point of M4: Gemini stops sharing the OpenAI dispatch
+        // path so the native transport (and inline_data video parts) reach
+        // the model. If someone reverts `is_openai_compatible()` to true,
+        // Gemini silently goes back through the lossy façade.
+        assert!(!crate::llm::provider::Provider::Gemini.is_openai_compatible());
+    }
+
+    #[test]
+    fn gemini_native_transport_protocol_label_is_distinct() {
+        // The dispatcher selects transports by protocol/identity; the
+        // native transport's label must not collide with `openai-compat`
+        // or `anthropic`, otherwise debug logging and lifecycle telemetry
+        // misattribute Gemini requests.
+        let t = super::super::transport::gemini_transport();
+        assert_eq!(t.protocol_name(), "gemini-native");
     }
 }
