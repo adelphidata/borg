@@ -4,6 +4,7 @@ mod audit_writer;
 mod delivery;
 mod device_pairing;
 pub mod doctor_squelch;
+pub(crate) mod encryption;
 mod goals;
 mod issue_state;
 mod maintenance;
