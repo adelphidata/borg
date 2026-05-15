@@ -25,13 +25,14 @@ pub(crate) fn check_enabled(enabled: bool, feature: &str) -> Option<String> {
     }
 }
 
-/// Open the database and run a callback, formatting the open error if it fails.
-pub(crate) fn with_db<F>(f: F) -> Result<String>
+/// Open the database and run an async callback, formatting the open error if it fails.
+pub(crate) async fn with_db<F, Fut>(f: F) -> Result<String>
 where
-    F: FnOnce(&Database) -> Result<String>,
+    F: FnOnce(Database) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
 {
-    match Database::open() {
-        Ok(db) => f(&db),
+    match Database::open().await {
+        Ok(db) => f(db).await,
         Err(e) => {
             tracing::warn!("Failed to open database: {e}");
             Ok(format!("Error opening database: {e}"))
