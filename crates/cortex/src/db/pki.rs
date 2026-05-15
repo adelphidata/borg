@@ -1,6 +1,6 @@
 //! Persistence for the daemon's internal CA, paired devices, and revocation list.
 use anyhow::{anyhow, Result};
-use rusqlite::{params, OptionalExtension};
+use turso::params;
 
 use super::Database;
 
@@ -32,7 +32,7 @@ pub struct PairedDeviceRow {
 }
 
 impl Database {
-    pub fn insert_internal_cert(
+    pub async fn insert_internal_cert(
         &self,
         kind: &str,
         pem: &str,
@@ -42,76 +42,90 @@ impl Database {
         not_after: i64,
     ) -> Result<i64> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO internal_ca_certs
+        self.conn
+            .execute(
+                "INSERT INTO internal_ca_certs
              (kind, pem, fingerprint, subject, not_before, not_after, status, issued_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
-            params![kind, pem, fingerprint, subject, not_before, not_after, now],
-        )?;
+                params!(kind, pem, fingerprint, subject, not_before, not_after, now),
+            )
+            .await?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn latest_active_cert(&self, kind: &str) -> Result<Option<InternalCertRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT serial, kind, pem, fingerprint, subject, not_before, not_after,
+    pub async fn latest_active_cert(&self, kind: &str) -> Result<Option<InternalCertRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT serial, kind, pem, fingerprint, subject, not_before, not_after,
                     status, issued_at, revoked_at
              FROM internal_ca_certs
              WHERE kind = ?1 AND status = 'active'
              ORDER BY issued_at DESC LIMIT 1",
-        )?;
-        let row = stmt
-            .query_row(params![kind], |r| {
-                Ok(InternalCertRow {
-                    serial: r.get(0)?,
-                    kind: r.get(1)?,
-                    pem: r.get(2)?,
-                    fingerprint: r.get(3)?,
-                    subject: r.get(4)?,
-                    not_before: r.get(5)?,
-                    not_after: r.get(6)?,
-                    status: r.get(7)?,
-                    issued_at: r.get(8)?,
-                    revoked_at: r.get(9)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+                params!(kind),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(r) => Ok(Some(InternalCertRow {
+                serial: r.get::<i64>(0)?,
+                kind: r.get::<String>(1)?,
+                pem: r.get::<String>(2)?,
+                fingerprint: r.get::<String>(3)?,
+                subject: r.get::<String>(4)?,
+                not_before: r.get::<i64>(5)?,
+                not_after: r.get::<i64>(6)?,
+                status: r.get::<String>(7)?,
+                issued_at: r.get::<i64>(8)?,
+                revoked_at: r.get::<Option<i64>>(9)?,
+            })),
+            None => Ok(None),
+        }
     }
 
-    pub fn mark_cert_renewed(&self, serial: i64) -> Result<()> {
-        let n = self.conn.execute(
-            "UPDATE internal_ca_certs SET status = 'renewed' WHERE serial = ?1",
-            params![serial],
-        )?;
+    pub async fn mark_cert_renewed(&self, serial: i64) -> Result<()> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE internal_ca_certs SET status = 'renewed' WHERE serial = ?1",
+                params!(serial),
+            )
+            .await?;
         if n == 0 {
             return Err(anyhow!("no internal cert with serial {serial}"));
         }
         Ok(())
     }
 
-    pub fn mark_cert_revoked(&self, serial: i64, reason: Option<&str>) -> Result<()> {
+    pub async fn mark_cert_revoked(&self, serial: i64, reason: Option<&str>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "UPDATE internal_ca_certs
+        self.conn
+            .execute(
+                "UPDATE internal_ca_certs
              SET status = 'revoked', revoked_at = ?1
              WHERE serial = ?2 AND status != 'revoked'",
-            params![now, serial],
-        )?;
-        if let Some(cert) = self
-            .conn
-            .query_row(
-                "SELECT fingerprint FROM internal_ca_certs WHERE serial = ?1",
-                params![serial],
-                |r| r.get::<_, String>(0),
+                params!(now, serial),
             )
-            .optional()?
-        {
-            self.add_revoked_fingerprint(&cert, reason)?;
+            .await?;
+        let fingerprint: Option<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT fingerprint FROM internal_ca_certs WHERE serial = ?1",
+                    params!(serial),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<String>(0)?),
+                None => None,
+            }
+        };
+        if let Some(fp) = fingerprint {
+            self.add_revoked_fingerprint(&fp, reason).await?;
         }
         Ok(())
     }
 
-    pub fn insert_paired_device(
+    pub async fn insert_paired_device(
         &self,
         fingerprint: &str,
         device_label: &str,
@@ -130,81 +144,113 @@ impl Database {
                 principal_id = excluded.principal_id,
                 cert_serial  = excluded.cert_serial,
                 status       = 'active'",
-            params![
+            params!(
                 fingerprint,
                 device_label,
                 scope_json,
                 now,
                 principal_id,
                 cert_serial
-            ],
-        )?;
-        let id: i64 = self.conn.query_row(
-            "SELECT id FROM paired_devices WHERE fingerprint = ?1",
-            params![fingerprint],
-            |r| r.get(0),
-        )?;
+            ),
+        ).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM paired_devices WHERE fingerprint = ?1",
+                params!(fingerprint),
+            )
+            .await?;
+        let id: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => anyhow::bail!("paired_devices row vanished after upsert"),
+        };
         Ok(id)
     }
 
-    pub fn find_active_paired_device(&self, fingerprint: &str) -> Result<Option<PairedDeviceRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, fingerprint, device_label, scope_json, paired_at, last_seen_at,
+    pub async fn find_active_paired_device(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<PairedDeviceRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, fingerprint, device_label, scope_json, paired_at, last_seen_at,
                     status, principal_id, cert_serial
              FROM paired_devices
              WHERE fingerprint = ?1 AND status = 'active'",
-        )?;
-        let row = stmt
-            .query_row(params![fingerprint], map_paired_row)
-            .optional()?;
-        Ok(row)
+                params!(fingerprint),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(paired_row_from_turso(&row)?)),
+            None => Ok(None),
+        }
     }
 
-    pub fn list_paired_devices(&self) -> Result<Vec<PairedDeviceRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, fingerprint, device_label, scope_json, paired_at, last_seen_at,
+    pub async fn list_paired_devices(&self) -> Result<Vec<PairedDeviceRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, fingerprint, device_label, scope_json, paired_at, last_seen_at,
                     status, principal_id, cert_serial
              FROM paired_devices ORDER BY paired_at DESC",
-        )?;
-        let rows = stmt.query_map([], map_paired_row)?;
+                (),
+            )
+            .await?;
         let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+        while let Some(row) = rows.next().await? {
+            out.push(paired_row_from_turso(&row)?);
         }
         Ok(out)
     }
 
-    pub fn touch_paired_device(&self, fingerprint: &str) -> Result<()> {
+    pub async fn touch_paired_device(&self, fingerprint: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "UPDATE paired_devices SET last_seen_at = ?1 WHERE fingerprint = ?2",
-            params![now, fingerprint],
-        )?;
+        self.conn
+            .execute(
+                "UPDATE paired_devices SET last_seen_at = ?1 WHERE fingerprint = ?2",
+                params!(now, fingerprint),
+            )
+            .await?;
         Ok(())
     }
 
-    pub fn revoke_paired_device(&self, fingerprint: &str, reason: Option<&str>) -> Result<()> {
+    pub async fn revoke_paired_device(
+        &self,
+        fingerprint: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "UPDATE paired_devices SET status = 'revoked' WHERE fingerprint = ?1",
-            params![fingerprint],
-        )?;
-        self.add_revoked_fingerprint(fingerprint, reason)?;
-        self.conn.execute(
-            "UPDATE internal_ca_certs SET status = 'revoked', revoked_at = ?1
+        self.conn
+            .execute(
+                "UPDATE paired_devices SET status = 'revoked' WHERE fingerprint = ?1",
+                params!(fingerprint),
+            )
+            .await?;
+        self.add_revoked_fingerprint(fingerprint, reason).await?;
+        self.conn
+            .execute(
+                "UPDATE internal_ca_certs SET status = 'revoked', revoked_at = ?1
              WHERE fingerprint = ?2 AND status != 'revoked'",
-            params![now, fingerprint],
-        )?;
+                params!(now, fingerprint),
+            )
+            .await?;
         Ok(())
     }
 
-    pub fn add_revoked_fingerprint(&self, fingerprint: &str, reason: Option<&str>) -> Result<()> {
+    pub async fn add_revoked_fingerprint(
+        &self,
+        fingerprint: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO revoked_fingerprints (fingerprint, revoked_at, reason)
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO revoked_fingerprints (fingerprint, revoked_at, reason)
              VALUES (?1, ?2, ?3)",
-            params![fingerprint, now, reason],
-        )?;
+                params!(fingerprint, now, reason.map(|s| s.to_string())),
+            )
+            .await?;
         Ok(())
     }
 
@@ -213,115 +259,144 @@ impl Database {
     /// unknown, revoked, or has no active cert in `internal_ca_certs`. Used
     /// by the auth interceptor to detect certs nearing expiry so it can
     /// stamp a renewal-due hint on the response.
-    pub fn paired_device_cert_expiry(&self, fingerprint: &str) -> Result<Option<i64>> {
-        let row: Option<i64> = self
+    pub async fn paired_device_cert_expiry(&self, fingerprint: &str) -> Result<Option<i64>> {
+        let mut rows = self
             .conn
-            .query_row(
+            .query(
                 "SELECT c.not_after
                  FROM paired_devices p
                  JOIN internal_ca_certs c ON c.serial = p.cert_serial
                  WHERE p.fingerprint = ?1
                    AND p.status = 'active'
                    AND c.status = 'active'",
-                params![fingerprint],
-                |r| r.get(0),
+                params!(fingerprint),
             )
-            .optional()?;
-        Ok(row)
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<i64>(0)?)),
+            None => Ok(None),
+        }
     }
 
-    pub fn is_fingerprint_revoked(&self, fingerprint: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(1) FROM revoked_fingerprints WHERE fingerprint = ?1",
-            params![fingerprint],
-            |r| r.get(0),
-        )?;
+    pub async fn is_fingerprint_revoked(&self, fingerprint: &str) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(1) FROM revoked_fingerprints WHERE fingerprint = ?1",
+                params!(fingerprint),
+            )
+            .await?;
+        let n: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
         Ok(n > 0)
     }
 }
 
-fn map_paired_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PairedDeviceRow> {
+fn paired_row_from_turso(r: &turso::Row) -> Result<PairedDeviceRow> {
     Ok(PairedDeviceRow {
-        id: r.get(0)?,
-        fingerprint: r.get(1)?,
-        device_label: r.get(2)?,
-        scope_json: r.get(3)?,
-        paired_at: r.get(4)?,
-        last_seen_at: r.get(5)?,
-        status: r.get(6)?,
-        principal_id: r.get(7)?,
-        cert_serial: r.get(8)?,
+        id: r.get::<i64>(0)?,
+        fingerprint: r.get::<String>(1)?,
+        device_label: r.get::<String>(2)?,
+        scope_json: r.get::<String>(3)?,
+        paired_at: r.get::<i64>(4)?,
+        last_seen_at: r.get::<Option<i64>>(5)?,
+        status: r.get::<String>(6)?,
+        principal_id: r.get::<String>(7)?,
+        cert_serial: r.get::<i64>(8)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
-    fn test_db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("in-mem db"))
-            .expect("init db")
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn revoked_fingerprint_round_trip() {
-        let db = test_db();
-        assert!(!db.is_fingerprint_revoked("fp-A").expect("query"));
+    #[tokio::test]
+    async fn revoked_fingerprint_round_trip() {
+        let db = test_db().await;
+        assert!(!db.is_fingerprint_revoked("fp-A").await.expect("query"));
         db.add_revoked_fingerprint("fp-A", Some("manual"))
+            .await
             .expect("insert");
-        assert!(db.is_fingerprint_revoked("fp-A").expect("query"));
+        assert!(db.is_fingerprint_revoked("fp-A").await.expect("query"));
         db.add_revoked_fingerprint("fp-A", Some("again"))
+            .await
             .expect("idempotent");
     }
 
-    #[test]
-    fn paired_device_upsert_preserves_id() {
-        let db = test_db();
+    #[tokio::test]
+    async fn paired_device_upsert_preserves_id() {
+        let db = test_db().await;
         let serial = db
             .insert_internal_cert("client", "PEM", "fp-1", "alice", 0, 100)
+            .await
             .expect("cert");
         let id1 = db
             .insert_paired_device("fp-1", "alice", "{}", "alice", serial)
+            .await
             .expect("first");
         let id2 = db
             .insert_paired_device("fp-1", "alice-renamed", "{}", "alice", serial)
+            .await
             .expect("second upsert");
         assert_eq!(id1, id2, "upsert should reuse id");
         let row = db
             .find_active_paired_device("fp-1")
+            .await
             .expect("q")
             .expect("present");
         assert_eq!(row.device_label, "alice-renamed");
     }
 
-    #[test]
-    fn revoke_paired_device_blocks_lookup_and_marks_revocation_list() {
-        let db = test_db();
+    #[tokio::test]
+    async fn revoke_paired_device_blocks_lookup_and_marks_revocation_list() {
+        let db = test_db().await;
         let serial = db
             .insert_internal_cert("client", "PEM", "fp-2", "bob", 0, 100)
+            .await
             .expect("cert");
         db.insert_paired_device("fp-2", "bob", "{}", "bob", serial)
+            .await
             .expect("pair");
-        assert!(db.find_active_paired_device("fp-2").expect("q").is_some());
+        assert!(db
+            .find_active_paired_device("fp-2")
+            .await
+            .expect("q")
+            .is_some());
         db.revoke_paired_device("fp-2", Some("lost laptop"))
+            .await
             .expect("revoke");
-        assert!(db.find_active_paired_device("fp-2").expect("q").is_none());
-        assert!(db.is_fingerprint_revoked("fp-2").expect("q"));
+        assert!(db
+            .find_active_paired_device("fp-2")
+            .await
+            .expect("q")
+            .is_none());
+        assert!(db.is_fingerprint_revoked("fp-2").await.expect("q"));
     }
 
-    #[test]
-    fn latest_active_cert_returns_newest_active_only() {
-        let db = test_db();
+    #[tokio::test]
+    async fn latest_active_cert_returns_newest_active_only() {
+        let db = test_db().await;
         let s1 = db
             .insert_internal_cert("server", "OLD", "fp-old", "borgd", 0, 100)
+            .await
             .expect("cert1");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let _s2 = db
             .insert_internal_cert("server", "NEW", "fp-new", "borgd", 0, 200)
+            .await
             .expect("cert2");
-        db.mark_cert_renewed(s1).expect("renew old");
-        let latest = db.latest_active_cert("server").expect("q").expect("some");
+        db.mark_cert_renewed(s1).await.expect("renew old");
+        let latest = db
+            .latest_active_cert("server")
+            .await
+            .expect("q")
+            .expect("some");
         assert_eq!(latest.fingerprint, "fp-new");
     }
 }

@@ -1,7 +1,7 @@
 //! Persistence for doctor/maintenance issue lifecycle state.
 
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use turso::params;
 
 use super::Database;
 
@@ -30,41 +30,42 @@ pub struct IssueStateRow {
 
 impl Database {
     /// Load the latest lifecycle state for a single issue key.
-    pub fn get_issue_state(&self, issue_key: &str) -> Result<Option<IssueStateRow>> {
-        self.conn
-            .query_row(
+    pub async fn get_issue_state(&self, issue_key: &str) -> Result<Option<IssueStateRow>> {
+        let mut rows = self
+            .conn
+            .query(
                 "SELECT issue_key, first_seen_at, last_seen_at, consecutive_count,
                         last_status, auto_fix_attempts, last_auto_fix_at,
                         last_auto_fix_result, resolved_at
                  FROM maintenance_issue_state
                  WHERE issue_key = ?1",
-                params![issue_key],
-                |row| {
-                    Ok(IssueStateRow {
-                        issue_key: row.get(0)?,
-                        first_seen_at: row.get(1)?,
-                        last_seen_at: row.get(2)?,
-                        consecutive_count: row.get(3)?,
-                        last_status: row.get(4)?,
-                        auto_fix_attempts: row.get(5)?,
-                        last_auto_fix_at: row.get(6)?,
-                        last_auto_fix_result: row.get(7)?,
-                        resolved_at: row.get(8)?,
-                    })
-                },
+                params!(issue_key),
             )
-            .optional()
-            .map_err(Into::into)
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(IssueStateRow {
+                issue_key: row.get::<String>(0)?,
+                first_seen_at: row.get::<i64>(1)?,
+                last_seen_at: row.get::<i64>(2)?,
+                consecutive_count: row.get::<i64>(3)?,
+                last_status: row.get::<String>(4)?,
+                auto_fix_attempts: row.get::<i64>(5)?,
+                last_auto_fix_at: row.get::<Option<i64>>(6)?,
+                last_auto_fix_result: row.get::<Option<String>>(7)?,
+                resolved_at: row.get::<Option<i64>>(8)?,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Upsert the lifecycle state for an issue observed this sweep.
-    pub fn upsert_issue_state_observed(
+    pub async fn upsert_issue_state_observed(
         &self,
         issue_key: &str,
         now: i64,
         status: &str,
     ) -> Result<()> {
-        let prior = self.get_issue_state(issue_key)?;
+        let prior = self.get_issue_state(issue_key).await?;
         let status_is_open = status != "resolved";
         let (
             first_seen_at,
@@ -99,8 +100,9 @@ impl Database {
             (now, if status_is_open { 1 } else { 0 }, 0, None, None)
         };
         let resolved_at = if status_is_open { None } else { Some(now) };
-        self.conn.execute(
-            "INSERT INTO maintenance_issue_state
+        self.conn
+            .execute(
+                "INSERT INTO maintenance_issue_state
                 (issue_key, first_seen_at, last_seen_at, consecutive_count, last_status,
                  auto_fix_attempts, last_auto_fix_at, last_auto_fix_result, resolved_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
@@ -113,95 +115,105 @@ impl Database {
                 last_auto_fix_at = ?7,
                 last_auto_fix_result = ?8,
                 resolved_at = ?9",
-            params![
-                issue_key,
-                first_seen_at,
-                now,
-                consecutive_count,
-                status,
-                auto_fix_attempts,
-                last_auto_fix_at,
-                last_auto_fix_result,
-                resolved_at
-            ],
-        )?;
+                params!(
+                    issue_key,
+                    first_seen_at,
+                    now,
+                    consecutive_count,
+                    status,
+                    auto_fix_attempts,
+                    last_auto_fix_at,
+                    last_auto_fix_result,
+                    resolved_at
+                ),
+            )
+            .await?;
         Ok(())
     }
 
     /// Mark a previously-observed issue as resolved on this sweep.
-    pub fn resolve_issue_state(&self, issue_key: &str, now: i64) -> Result<()> {
-        let prior = self.get_issue_state(issue_key)?;
+    pub async fn resolve_issue_state(&self, issue_key: &str, now: i64) -> Result<()> {
+        let prior = self.get_issue_state(issue_key).await?;
         let Some(prior) = prior else {
             return Ok(());
         };
-        self.conn.execute(
-            "UPDATE maintenance_issue_state
+        self.conn
+            .execute(
+                "UPDATE maintenance_issue_state
              SET last_seen_at = ?2,
                  consecutive_count = 0,
                  last_status = 'resolved',
                  resolved_at = ?2
              WHERE issue_key = ?1",
-            params![issue_key, now],
-        )?;
+                params!(issue_key, now),
+            )
+            .await?;
         debug_assert!(prior.first_seen_at <= now);
         Ok(())
     }
 
     /// Record the result of an auto-fix attempt for an issue.
-    pub fn record_issue_auto_fix_attempt(
+    pub async fn record_issue_auto_fix_attempt(
         &self,
         issue_key: &str,
         now: i64,
         result: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE maintenance_issue_state
+        self.conn
+            .execute(
+                "UPDATE maintenance_issue_state
              SET auto_fix_attempts = auto_fix_attempts + 1,
                  last_auto_fix_at = ?2,
                  last_auto_fix_result = ?3
              WHERE issue_key = ?1",
-            params![issue_key, now, result],
-        )?;
+                params!(issue_key, now, result),
+            )
+            .await?;
         Ok(())
     }
 
     /// Return all issues that are still open and have persisted for 2+ runs.
-    pub fn list_persistent_open_issues(&self) -> Result<Vec<IssueStateRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT issue_key, first_seen_at, last_seen_at, consecutive_count,
+    pub async fn list_persistent_open_issues(&self) -> Result<Vec<IssueStateRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT issue_key, first_seen_at, last_seen_at, consecutive_count,
                     last_status, auto_fix_attempts, last_auto_fix_at,
                     last_auto_fix_result, resolved_at
              FROM maintenance_issue_state
              WHERE last_status != 'resolved' AND consecutive_count >= 2
              ORDER BY consecutive_count DESC, issue_key ASC",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(IssueStateRow {
-                    issue_key: row.get(0)?,
-                    first_seen_at: row.get(1)?,
-                    last_seen_at: row.get(2)?,
-                    consecutive_count: row.get(3)?,
-                    last_status: row.get(4)?,
-                    auto_fix_attempts: row.get(5)?,
-                    last_auto_fix_at: row.get(6)?,
-                    last_auto_fix_result: row.get(7)?,
-                    resolved_at: row.get(8)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(IssueStateRow {
+                issue_key: row.get::<String>(0)?,
+                first_seen_at: row.get::<i64>(1)?,
+                last_seen_at: row.get::<i64>(2)?,
+                consecutive_count: row.get::<i64>(3)?,
+                last_status: row.get::<String>(4)?,
+                auto_fix_attempts: row.get::<i64>(5)?,
+                last_auto_fix_at: row.get::<Option<i64>>(6)?,
+                last_auto_fix_result: row.get::<Option<String>>(7)?,
+                resolved_at: row.get::<Option<i64>>(8)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Delete resolved issue-state rows older than the given cutoff.
-    pub fn prune_resolved_issue_state_before(&self, cutoff: i64) -> Result<usize> {
-        self.conn
+    pub async fn prune_resolved_issue_state_before(&self, cutoff: i64) -> Result<usize> {
+        let n = self
+            .conn
             .execute(
                 "DELETE FROM maintenance_issue_state
                  WHERE last_status = 'resolved' AND resolved_at IS NOT NULL AND resolved_at < ?1",
-                params![cutoff],
+                params!(cutoff),
             )
-            .map_err(Into::into)
+            .await?;
+        Ok(n as usize)
     }
 }
 
@@ -209,30 +221,36 @@ impl Database {
 mod tests {
     use super::*;
 
-    #[test]
-    fn issue_state_observation_and_resolution_lifecycle() {
-        let db = Database::test_db();
+    #[tokio::test]
+    async fn issue_state_observation_and_resolution_lifecycle() {
+        let db = Database::test_db().await;
         db.upsert_issue_state_observed("Embeddings:chunk coverage", 100, "warn")
+            .await
             .unwrap();
         let row = db
             .get_issue_state("Embeddings:chunk coverage")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.consecutive_count, 1);
         assert_eq!(row.last_status, "warn");
 
         db.upsert_issue_state_observed("Embeddings:chunk coverage", 200, "warn")
+            .await
             .unwrap();
         let row = db
             .get_issue_state("Embeddings:chunk coverage")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.consecutive_count, 2);
 
         db.upsert_issue_state_observed("Embeddings:chunk coverage", 300, "fail")
+            .await
             .unwrap();
         let row = db
             .get_issue_state("Embeddings:chunk coverage")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -242,18 +260,22 @@ mod tests {
         assert_eq!(row.last_status, "fail");
 
         db.record_issue_auto_fix_attempt("Embeddings:chunk coverage", 310, "fixed")
+            .await
             .unwrap();
         let row = db
             .get_issue_state("Embeddings:chunk coverage")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.auto_fix_attempts, 1);
         assert_eq!(row.last_auto_fix_result.as_deref(), Some("fixed"));
 
         db.resolve_issue_state("Embeddings:chunk coverage", 300)
+            .await
             .unwrap();
         let row = db
             .get_issue_state("Embeddings:chunk coverage")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(row.last_status, "resolved");
@@ -261,15 +283,21 @@ mod tests {
         assert_eq!(row.resolved_at, Some(300));
     }
 
-    #[test]
-    fn list_persistent_open_issues_filters_resolved() {
-        let db = Database::test_db();
-        db.upsert_issue_state_observed("A:x", 10, "warn").unwrap();
-        db.upsert_issue_state_observed("A:x", 20, "warn").unwrap();
-        db.upsert_issue_state_observed("B:y", 10, "warn").unwrap();
-        db.resolve_issue_state("B:y", 20).unwrap();
+    #[tokio::test]
+    async fn list_persistent_open_issues_filters_resolved() {
+        let db = Database::test_db().await;
+        db.upsert_issue_state_observed("A:x", 10, "warn")
+            .await
+            .unwrap();
+        db.upsert_issue_state_observed("A:x", 20, "warn")
+            .await
+            .unwrap();
+        db.upsert_issue_state_observed("B:y", 10, "warn")
+            .await
+            .unwrap();
+        db.resolve_issue_state("B:y", 20).await.unwrap();
 
-        let rows = db.list_persistent_open_issues().unwrap();
+        let rows = db.list_persistent_open_issues().await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].issue_key, "A:x");
     }
