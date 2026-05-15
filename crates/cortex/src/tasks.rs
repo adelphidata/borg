@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
-use rusqlite::params;
 use std::str::FromStr;
+use turso::params;
 
 use crate::constants::{SECS_PER_DAY, SECS_PER_HOUR};
 use crate::db::{Database, ScheduledTaskRow};
@@ -53,21 +53,26 @@ pub fn format_run_status(status: &str) -> &str {
 
 /// Advance a task's next_run using raw SQL on a connection (for use within transactions).
 /// Returns Ok(()) on success.
-pub fn advance_next_run_raw(conn: &rusqlite::Connection, task: &ScheduledTaskRow) -> Result<()> {
+pub async fn advance_next_run_raw(
+    conn: &turso::Connection,
+    task: &ScheduledTaskRow,
+) -> Result<()> {
     match task.schedule_type.as_str() {
         SCHEDULE_TYPE_ONCE => {
             conn.execute(
                 "UPDATE scheduled_tasks SET status = ?1, next_run = NULL WHERE id = ?2",
-                params![TASK_STATUS_COMPLETED, task.id],
-            )?;
+                params!(TASK_STATUS_COMPLETED, task.id.clone()),
+            )
+            .await?;
         }
         SCHEDULE_TYPE_CRON | SCHEDULE_TYPE_INTERVAL => {
             let next = calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone)
                 .unwrap_or(None);
             conn.execute(
                 "UPDATE scheduled_tasks SET next_run = ?1 WHERE id = ?2",
-                params![next, task.id],
-            )?;
+                params!(next, task.id.clone()),
+            )
+            .await?;
         }
         _ => {}
     }
@@ -175,8 +180,8 @@ pub fn parse_once_timestamp(expr: &str) -> Result<i64> {
 }
 
 /// Advance a task's next_run after execution.
-pub fn advance_next_run(task: &ScheduledTaskRow, db: &Database) -> Result<()> {
-    advance_next_run_raw(db.conn(), task)
+pub async fn advance_next_run(task: &ScheduledTaskRow, db: &Database) -> Result<()> {
+    advance_next_run_raw(db.conn(), task).await
 }
 
 /// When more than this many recurring tasks look stalled in a single
@@ -208,8 +213,8 @@ pub struct HealReport {
 /// intent is "fire on schedule from here on", not "catch up on everything
 /// we lost while the machine was asleep". Failures on individual tasks are
 /// logged and the scan continues; the caller gets an aggregate report.
-pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<HealReport> {
-    let stalled = db.find_stalled_tasks(now, grace_secs)?;
+pub async fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<HealReport> {
+    let stalled = db.find_stalled_tasks(now, grace_secs).await?;
     let aggregate = stalled.len() > CLOCK_JUMP_AGGREGATE_THRESHOLD;
     let mut report = HealReport {
         detected: stalled.len(),
@@ -227,7 +232,7 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
             "self-healing: clock-jump detected — {n} recurring tasks drifted (max {max_overdue_secs}s)",
             n = stalled.len()
         );
-        if let Err(e) = db.record_missed_run(&first_id, now, &note) {
+        if let Err(e) = db.record_missed_run(&first_id, now, &note).await {
             tracing::warn!(
                 error = %e,
                 "failed to record aggregate clock-jump audit row"
@@ -239,7 +244,7 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
         if !aggregate {
             let note =
                 format!("self-healing: next_run drifted {overdue_secs}s into past without firing");
-            if let Err(e) = db.record_missed_run(&task.id, now, &note) {
+            if let Err(e) = db.record_missed_run(&task.id, now, &note).await {
                 tracing::warn!(
                     task_id = %task.id,
                     task_name = %task.name,
@@ -250,7 +255,7 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
         }
         match calculate_next_run(&task.schedule_type, &task.schedule_expr, &task.timezone) {
             Ok(next) => {
-                if let Err(e) = db.update_task_next_run(&task.id, next) {
+                if let Err(e) = db.update_task_next_run(&task.id, next).await {
                     tracing::warn!(
                         task_id = %task.id,
                         task_name = %task.name,
@@ -273,7 +278,7 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
                 // forever. A bad schedule_expr that passed validation at
                 // insert time but errors now (corrupted row, library bump)
                 // should fail loud in the UI, not spam task_runs.
-                if let Err(se) = db.update_task_status(&task.id, TASK_STATUS_PAUSED) {
+                if let Err(se) = db.update_task_status(&task.id, TASK_STATUS_PAUSED).await {
                     tracing::warn!(
                         task_id = %task.id,
                         task_name = %task.name,
@@ -299,8 +304,12 @@ pub fn heal_stalled_tasks(db: &Database, now: i64, grace_secs: i64) -> Result<He
 /// executions don't sit forever — the daemon-startup-only
 /// [`Database::recover_stale_runs`] is not enough when the daemon
 /// stays alive but a single task wedges.
-pub fn recover_wedged_runs(db: &Database, now: i64, default_grace_secs: i64) -> Result<u64> {
-    db.recover_wedged_runs(now, default_grace_secs)
+pub async fn recover_wedged_runs(
+    db: &Database,
+    now: i64,
+    default_grace_secs: i64,
+) -> Result<u64> {
+    db.recover_wedged_runs(now, default_grace_secs).await
 }
 
 /// Format a task row for display.
