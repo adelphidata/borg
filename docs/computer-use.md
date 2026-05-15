@@ -5,9 +5,12 @@ spawns the external [`cua-driver`](https://github.com/cua-ai/cua-driver)
 binary as an MCP-over-stdio child process per tool call and speaks framed
 JSON-RPC 2.0.
 
-This commit adds the **read-only** actions (`capture`, `list_apps`, `wait`).
-Mutating actions (`click`, `type`, `key`, `focus_app`, …) land in a follow-up
-along with a hard-deny keystroke/target list.
+Ships with both read-only actions (`capture`, `list_apps`, `wait`) and
+mutating actions (`click` family, `drag`, `scroll`, `type`, `key`,
+`set_value`, `focus_app`). A hard denylist refuses logout/lock/force-quit
+hotkeys, fork-bomb-shaped `type` payloads, and `focus_app` targets that
+match the macOS login window or Security settings — checked **before** the
+driver is spawned.
 
 ## Install
 
@@ -24,6 +27,8 @@ borg settings set computer_use.driver_path /opt/cua/bin/cua-driver
 
 ## Actions
 
+### Read-only (plan-mode safe)
+
 | Action      | Args                            | Returns                                          |
 | ----------- | ------------------------------- | ------------------------------------------------ |
 | `capture`   | optional `pid`, `window_id`     | `Multimodal { text, parts: [Text, ImageBase64] }` |
@@ -33,26 +38,72 @@ borg settings set computer_use.driver_path /opt/cua/bin/cua-driver
 `wait` is capped at 5 minutes (300 000 ms) so a runaway loop can't pin the
 worker indefinitely.
 
+### Mutating (blocked in plan mode)
+
+| Action          | Args                                  | Returns          |
+| --------------- | ------------------------------------- | ---------------- |
+| `click`         | required `x`, `y`                     | `Text` confirmation |
+| `double_click`  | required `x`, `y`                     | `Text` |
+| `right_click`   | required `x`, `y`                     | `Text` |
+| `middle_click`  | required `x`, `y`                     | `Text` |
+| `drag`          | required `x`, `y`, `to_x`, `to_y`     | `Text` |
+| `scroll`        | required `x`, `y`, `delta_x`, `delta_y` | `Text` |
+| `type`          | required `text`                       | `Text` |
+| `key`           | one of `key` (string) or `keys` (array) | `Text` |
+| `set_value`     | required `element_index`, `value`     | `Text` |
+| `focus_app`     | required `target`; optional `raise_window` (default `true`) | `Text` — `raised` or `backgrounded` |
+
+`focus_app(raise_window: false)` is the opt-in "drive in the background"
+path — input routes to the target app without stealing focus from the
+user's frontmost window. Default `true` keeps the safer-by-visibility
+behaviour where the user can see what the agent is doing.
+
+## Denylist
+
+The denylist runs in `check_denylist` (`tool/computer_use.rs`) **before**
+the driver is spawned, mirroring `policy::HARDCODED_DENY` for shell
+commands. Refused inputs surface a clear error to the LLM so it can
+re-plan without burning budget probing what's blocked.
+
+**Hotkeys** — normalised to lowercased, alphabetically sorted modifier
+list so `cmd+shift+q` and `shift+cmd+q` both match:
+
+- Cmd+Shift+Q — would log the user out of their macOS session.
+- Cmd+Ctrl+Q — would lock the screen.
+- Cmd+Option+Esc — opens the force-quit menu.
+
+**`type` payloads** — fork-bomb-shaped function-definitions that pipe
+themselves (`:(){:|:&};:` and near-cousins) are rejected via a static
+regex. The agent should reach for `run_shell` rather than typing shell
+into an open terminal anyway.
+
+**`focus_app` targets** — `loginwindow`, `Screen Lock`, `ScreenSaver`,
+`System Settings`, `System Preferences`, and `Security & Privacy` are
+treated as macOS security surfaces that must never be driven.
+
 ## Plan-mode semantics
 
-The whole tool name passes `allowed_in_plan_mode_name`, but the per-action
-gate enforced by `Tool::allowed_in_plan_mode` blocks any non-read-only
-action when the agent is in Plan mode. With only `capture` / `list_apps` /
-`wait` shipped today, every action is permitted. Once mutating actions
-land, only the read-only three remain plan-mode-safe.
+The tool name passes `allowed_in_plan_mode_name` (which is name-level
+only), but `Tool::allowed_in_plan_mode` discriminates per-action against
+`ComputerUseAction::is_readonly`. In Plan mode only `capture`, `list_apps`,
+and `wait` reach the driver; every mutating action surfaces a plan-mode
+block at dispatch time.
 
 ## Why no approval prompts
 
 Borg's "agent just executes" invariant (`CLAUDE.md` → UX — No Approval
-Prompts) applies here. Unlike Hermes' per-call callback, computer_use has
-no UI dialog. Safety comes from:
+Prompts) applies here. Unlike Hermes' per-call callback, `computer_use`
+has no UI dialog — including for mutating actions. Safety comes from:
 
-1. The action allowlist (mutating actions ship behind a static denylist —
-   see the follow-up commit).
+1. The static denylist (logout/lock/force-quit/fork-bomb/security-surface
+   refusal before driver dispatch).
 2. Plan-mode gating (read-only actions only when the operator opts in via
    `/plan`).
 3. The macOS Accessibility permission grant the host already requires for
    `cua-driver` to function — revoke that and every action fails.
+4. The user can revoke screen recording / Accessibility / Input Monitoring
+   in System Settings → Privacy & Security at any time and the tool stops
+   working immediately.
 
 ## Why no sandbox-exec wrapper
 

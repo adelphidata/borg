@@ -183,20 +183,27 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     }
 
     // computer_use — macOS-only host UI automation via `cua-driver`.
-    // Read-only actions (capture / list_apps / wait) only in this commit;
-    // mutating actions land in a follow-up. Gated by `[computer_use] enabled`
-    // so the schema is omitted (saving tokens every turn) on Linux and when
-    // the operator has explicitly disabled the tool.
+    // Read-only actions (capture / list_apps / wait) plus mutating actions
+    // (click family / drag / scroll / type / key / set_value / focus_app).
+    // A hard denylist rejects destructive hotkeys (logout, lock, force-quit),
+    // fork-bomb-shaped `type` payloads, and `focus_app` targeting the login
+    // window or Security settings — checked before the driver is spawned.
+    // Gated by `[computer_use] enabled` so the schema is omitted (saving
+    // tokens every turn) on Linux and when the operator has disabled it.
     if config.computer_use.enabled {
         defs.push(ToolDefinition::new(
             tool_names::COMPUTER_USE,
-            "Drive the host macOS GUI via cua-driver. `capture` returns a screenshot inline as a multimodal image part. `list_apps` returns running applications with pids. `wait` blocks for duration_ms (max 5min) — useful between captures to let UI redraws settle. Optional pid/window_id on capture targets a specific window without stealing focus.",
+            "Drive the host macOS GUI via cua-driver. Readonly: `capture` returns a screenshot inline as a multimodal image part; `list_apps` returns running applications with pids; `wait` blocks for duration_ms. Mutating: `click`/`double_click`/`right_click`/`middle_click` at (x,y); `drag` from (x,y) to (to_x,to_y); `scroll` by (delta_x,delta_y) at (x,y); `type` literal text; `key` a single hotkey (e.g. 'cmd+c') or a sequence via `keys`; `set_value` writes directly to a focused AX text field (preferred for forms — bypasses typing entirely); `focus_app` brings a target app to front (or routes input without raising via raise_window=false). Denylist refuses logout/lock/force-quit hotkeys and the loginwindow / Security settings focus targets before touching the driver.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["capture", "list_apps", "wait"],
+                        "enum": [
+                            "capture", "list_apps", "wait",
+                            "click", "double_click", "right_click", "middle_click",
+                            "drag", "scroll", "type", "key", "set_value", "focus_app"
+                        ],
                         "description": "Which action to take."
                     },
                     "pid": {
@@ -210,6 +217,59 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     "duration_ms": {
                         "type": "integer",
                         "description": "Wait only. Milliseconds to sleep (capped at 300000)."
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": "Click/scroll/drag origin x in screen coordinates."
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Click/scroll/drag origin y in screen coordinates."
+                    },
+                    "to_x": {
+                        "type": "integer",
+                        "description": "Drag only. Destination x in screen coordinates."
+                    },
+                    "to_y": {
+                        "type": "integer",
+                        "description": "Drag only. Destination y in screen coordinates."
+                    },
+                    "delta_x": {
+                        "type": "integer",
+                        "description": "Scroll only. Horizontal scroll delta in line units."
+                    },
+                    "delta_y": {
+                        "type": "integer",
+                        "description": "Scroll only. Vertical scroll delta in line units (negative = scroll up)."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Type only. Literal text to type."
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Key only. Single hotkey to send, e.g. 'cmd+c', 'return', 'esc'."
+                    },
+                    "keys": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Key only. Sequence of hotkeys to send in order (alternative to `key`)."
+                    },
+                    "element_index": {
+                        "type": "integer",
+                        "description": "Set_value only. AX element index from a prior accessibility tree dump."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Set_value only. Text to write directly into the focused AX field."
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Focus_app only. Application name or bundle id (e.g. 'Safari', 'com.apple.Safari')."
+                    },
+                    "raise_window": {
+                        "type": "boolean",
+                        "description": "Focus_app only. If false, routes input to the app without raising its window (default true)."
                     }
                 },
                 "required": ["action"]

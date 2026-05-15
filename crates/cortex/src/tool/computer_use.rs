@@ -43,6 +43,7 @@ use crate::types::{ContentPart, MediaData, ToolOutput};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ComputerUseAction {
+    // ── Read-only (plan-mode-safe) ──
     /// Capture the screen as a PNG. Returns a multimodal envelope so the
     /// model gets pixels on the next turn.
     Capture,
@@ -51,11 +52,49 @@ pub(crate) enum ComputerUseAction {
     /// Block for `duration_ms` milliseconds. Useful for waiting on
     /// animations or async UI redraws between captures.
     Wait,
+
+    // ── Mutating (blocked in plan mode) ──
+    /// Single left-click at `(x, y)` pixel coordinates in the screen frame.
+    Click,
+    /// Double-click at `(x, y)`.
+    DoubleClick,
+    /// Right-click at `(x, y)`.
+    RightClick,
+    /// Middle-click at `(x, y)`.
+    MiddleClick,
+    /// Click-and-drag from `(from_x, from_y)` to `(to_x, to_y)`.
+    Drag,
+    /// Scroll at `(x, y)` by `(delta_x, delta_y)`.
+    Scroll,
+    /// Type literal text via the keyboard. Goes through the hard denylist
+    /// so fork-bomb-shaped payloads can't reach the OS.
+    Type,
+    /// Press a single named key (e.g. "Return", "Escape") or a hotkey
+    /// described by `keys` (e.g. ["cmd", "s"]). Hotkeys hit the denylist.
+    Key,
+    /// Replace an AX-element's `AXValue` directly.
+    SetValue,
+    /// Bring an app to the foreground or route input without raising. When
+    /// `raise_window` is `false`, focus is preserved — see the no-foreground
+    /// contract in `docs/computer-use.md`.
+    FocusApp,
 }
 
-/// Args for `computer_use`. The schema fans out per-action — `duration_ms` is
-/// only meaningful for `Wait`, etc. We leave them all optional and validate
-/// per-action below so the LLM gets a single, predictable schema.
+impl ComputerUseAction {
+    /// True for the three actions that don't mutate host state.
+    pub(crate) const fn is_readonly(&self) -> bool {
+        matches!(
+            self,
+            ComputerUseAction::Capture | ComputerUseAction::ListApps | ComputerUseAction::Wait
+        )
+    }
+}
+
+/// Args for `computer_use`. The schema fans out per-action — `duration_ms`
+/// is only meaningful for `Wait`, `x`/`y` for click family, etc. We leave
+/// them all optional and validate per-action so the LLM gets a single
+/// predictable schema. Per-action required-field checks happen inside the
+/// handler so the error path stays as one place to look.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ComputerUseArgs {
     pub action: ComputerUseAction,
@@ -66,7 +105,7 @@ pub(crate) struct ComputerUseArgs {
     #[serde(default)]
     pub pid: Option<i64>,
 
-    /// Capture only. Optional `window_id` paired with `pid`.
+    /// Capture / focus_app only. Optional `window_id` paired with `pid`.
     #[serde(default)]
     pub window_id: Option<i64>,
 
@@ -74,6 +113,51 @@ pub(crate) struct ComputerUseArgs {
     /// `action == Wait`.
     #[serde(default)]
     pub duration_ms: Option<u64>,
+
+    /// Click family + drag start. Pixel x.
+    #[serde(default)]
+    pub x: Option<i32>,
+    /// Click family + drag start. Pixel y.
+    #[serde(default)]
+    pub y: Option<i32>,
+    /// Drag end. Pixel x.
+    #[serde(default)]
+    pub to_x: Option<i32>,
+    /// Drag end. Pixel y.
+    #[serde(default)]
+    pub to_y: Option<i32>,
+    /// Scroll deltas.
+    #[serde(default)]
+    pub delta_x: Option<i32>,
+    #[serde(default)]
+    pub delta_y: Option<i32>,
+
+    /// `type` literal text. The denylist scans this before sending.
+    #[serde(default)]
+    pub text: Option<String>,
+
+    /// `key` single named key, e.g. "Return". Mutually exclusive with `keys`.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// `key` hotkey combo, e.g. `["cmd", "s"]`. Lowercase modifier names.
+    #[serde(default)]
+    pub keys: Option<Vec<String>>,
+
+    /// `set_value` element index (from cua-driver's AX cache).
+    #[serde(default)]
+    pub element_index: Option<i32>,
+    /// `set_value` new value.
+    #[serde(default)]
+    pub value: Option<String>,
+
+    /// `focus_app` target — accepts a bundle id ("com.apple.Finder"),
+    /// a process name, or a pid (string-encoded).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// `focus_app` — when `false`, route input without stealing focus from
+    /// the user's frontmost app. Default `true` (safe — raises and activates).
+    #[serde(default)]
+    pub raise_window: Option<bool>,
 }
 
 /// JSON-RPC response envelope from cua-driver.
@@ -250,10 +334,26 @@ pub(crate) async fn handle_with_driver(
     args: &ComputerUseArgs,
     driver: &dyn Driver,
 ) -> Result<ToolOutput> {
+    // Hard denylist — runs BEFORE we touch the driver so a malicious or
+    // confused LLM can't burn its budget probing the denylist via real
+    // keystrokes. Mirrors `policy::HARDCODED_DENY` in spirit.
+    if let Some(reason) = check_denylist(args) {
+        return Ok(ToolOutput::Text(format!("Error: {reason}")));
+    }
     match args.action {
         ComputerUseAction::Capture => capture(args, driver).await,
         ComputerUseAction::ListApps => list_apps(driver).await,
         ComputerUseAction::Wait => wait(args).await,
+        ComputerUseAction::Click => click(args, "click", driver).await,
+        ComputerUseAction::DoubleClick => click(args, "double_click", driver).await,
+        ComputerUseAction::RightClick => click(args, "right_click", driver).await,
+        ComputerUseAction::MiddleClick => click(args, "middle_click", driver).await,
+        ComputerUseAction::Drag => drag(args, driver).await,
+        ComputerUseAction::Scroll => scroll(args, driver).await,
+        ComputerUseAction::Type => type_text(args, driver).await,
+        ComputerUseAction::Key => key(args, driver).await,
+        ComputerUseAction::SetValue => set_value(args, driver).await,
+        ComputerUseAction::FocusApp => focus_app(args, driver).await,
     }
 }
 
@@ -347,12 +447,263 @@ async fn wait(args: &ComputerUseArgs) -> Result<ToolOutput> {
 
 /// True iff the given action is allowed when the agent is in Plan mode.
 /// Plan mode blocks anything that mutates the host; the three read-only
-/// actions here pass.
+/// actions here pass and everything else is blocked.
 pub(crate) const fn action_allowed_in_plan_mode(action: &ComputerUseAction) -> bool {
-    matches!(
-        action,
-        ComputerUseAction::Capture | ComputerUseAction::ListApps | ComputerUseAction::Wait
-    )
+    action.is_readonly()
+}
+
+/// Hotkey combos that are always blocked. The strings match a normalised
+/// form (modifiers lowercased, sorted alphabetically, joined by `+`) so
+/// trivial reorderings ("shift+cmd+q" vs "cmd+shift+q") collapse to the
+/// same key. Patterns mirror the catastrophic-command list in
+/// `crate::policy::HARDCODED_DENY` — different surface, same idea: refuse
+/// to even try to run the action.
+const DENIED_HOTKEYS: &[(&str, &str)] = &[
+    // Entries MUST be in the normalised form produced by `normalised_hotkey`:
+    // lowercased, modifier aliases collapsed (option/alt → opt, command → cmd,
+    // control → ctrl, escape → esc), then sorted alphabetically, joined by `+`.
+    (
+        "cmd+q+shift",
+        "logout — quits the current macOS user session",
+    ),
+    (
+        "cmd+ctrl+q",
+        "lock screen — would lock the host out of its own session",
+    ),
+    ("cmd+esc+opt", "force-quit menu — disruptive system overlay"),
+];
+
+/// Prefix list for `focus_app` targets that must never be raised — these
+/// are macOS system surfaces where activating them could log the user out
+/// or grant the agent control over security settings.
+const DENIED_FOCUS_TARGETS: &[&str] = &[
+    "loginwindow",
+    "Screen Lock",
+    "ScreenSaver",
+    "System Settings",
+    "System Preferences",
+    "Security & Privacy",
+];
+
+/// Returns `Some(reason)` if the action is denied. `None` means proceed.
+fn check_denylist(args: &ComputerUseArgs) -> Option<String> {
+    match args.action {
+        ComputerUseAction::Key => {
+            if let Some(combo) = normalised_hotkey(args) {
+                for (denied, reason) in DENIED_HOTKEYS {
+                    if combo == *denied {
+                        return Some(format!(
+                            "computer_use denied hotkey '{combo}' — {reason}. This is a hard denylist; refusing to dispatch."
+                        ));
+                    }
+                }
+            }
+            None
+        }
+        ComputerUseAction::Type => {
+            // Fork-bomb shape detection. The canonical bash fork bomb is
+            // `:(){:|:&};:` — any near-cousin gets rejected too. We err on
+            // the side of refusing rather than letting it through.
+            let text = args.text.as_deref().unwrap_or("");
+            if FORK_BOMB.is_match(text) {
+                return Some(
+                    "computer_use refused to type a fork-bomb-shaped payload. \
+                     If this was a false positive, dispatch via a safer mechanism (run_shell with --no-exec, or paste from clipboard)."
+                        .into(),
+                );
+            }
+            None
+        }
+        ComputerUseAction::FocusApp => {
+            let target = args.target.as_deref().unwrap_or("");
+            for denied in DENIED_FOCUS_TARGETS {
+                if target.eq_ignore_ascii_case(denied)
+                    || target
+                        .to_ascii_lowercase()
+                        .contains(&denied.to_ascii_lowercase())
+                {
+                    return Some(format!(
+                        "computer_use denied focus_app target '{target}': matches '{denied}', a macOS security surface that must not be driven."
+                    ));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Normalise `args` into a canonical hotkey string for denylist matching.
+/// Returns `None` when this isn't a hotkey (single key or absent).
+fn normalised_hotkey(args: &ComputerUseArgs) -> Option<String> {
+    let keys = args.keys.as_ref()?;
+    if keys.len() < 2 {
+        return None;
+    }
+    let mut lowered: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            let l = k.to_ascii_lowercase();
+            // Common aliases people use interchangeably.
+            match l.as_str() {
+                "control" => "ctrl".into(),
+                "command" => "cmd".into(),
+                "option" => "opt".into(),
+                "alt" => "opt".into(),
+                "escape" => "esc".into(),
+                _ => l,
+            }
+        })
+        .collect();
+    lowered.sort();
+    Some(lowered.join("+"))
+}
+
+#[allow(clippy::expect_used)]
+static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    // `:(){...}` or `bomb(){...}` — function definitions that recursively
+    // pipe themselves into themselves are the shape we care about. The
+    // pattern is intentionally a little loose so trivial obfuscations don't
+    // walk past it.
+    regex::Regex::new(r#"(?x)
+        [A-Za-z_:][A-Za-z0-9_:]* \s* \(\) \s* \{ [^}]* \| [^}]* \&? [^}]* \} \s* ;? \s* [A-Za-z_:][A-Za-z0-9_:]* \s* ;?
+    "#).expect("compile-time literal regex")
+});
+
+async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
+    let x = args
+        .x
+        .ok_or_else(|| anyhow::anyhow!("computer_use.{method} requires `x` and `y`"))?;
+    let y = args
+        .y
+        .ok_or_else(|| anyhow::anyhow!("computer_use.{method} requires `x` and `y`"))?;
+    let mut params = json!({"x": x, "y": y});
+    if let Some(pid) = args.pid {
+        params["pid"] = json!(pid);
+    }
+    let _ = driver.call(method, params).await?;
+    Ok(ToolOutput::Text(format!("{method} at ({x}, {y})")))
+}
+
+async fn drag(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let from_x = args
+        .x
+        .ok_or_else(|| anyhow::anyhow!("computer_use.drag requires `x`/`y`/`to_x`/`to_y`"))?;
+    let from_y = args
+        .y
+        .ok_or_else(|| anyhow::anyhow!("computer_use.drag requires `x`/`y`/`to_x`/`to_y`"))?;
+    let to_x = args
+        .to_x
+        .ok_or_else(|| anyhow::anyhow!("computer_use.drag requires `to_x`/`to_y`"))?;
+    let to_y = args
+        .to_y
+        .ok_or_else(|| anyhow::anyhow!("computer_use.drag requires `to_x`/`to_y`"))?;
+    let mut params = json!({"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y});
+    if let Some(pid) = args.pid {
+        params["pid"] = json!(pid);
+    }
+    let _ = driver.call("drag", params).await?;
+    Ok(ToolOutput::Text(format!(
+        "drag ({from_x},{from_y}) → ({to_x},{to_y})"
+    )))
+}
+
+async fn scroll(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let x = args.x.unwrap_or(0);
+    let y = args.y.unwrap_or(0);
+    let dx = args.delta_x.unwrap_or(0);
+    let dy = args.delta_y.unwrap_or(0);
+    if dx == 0 && dy == 0 {
+        return Ok(ToolOutput::Text(
+            "Error: computer_use.scroll requires non-zero `delta_x` or `delta_y`".into(),
+        ));
+    }
+    let params = json!({"x": x, "y": y, "delta_x": dx, "delta_y": dy});
+    let _ = driver.call("scroll", params).await?;
+    Ok(ToolOutput::Text(format!("scroll ({dx},{dy})")))
+}
+
+async fn type_text(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let text = args
+        .text
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("computer_use.type requires `text`"))?;
+    let mut params = json!({"text": text});
+    if let Some(pid) = args.pid {
+        params["pid"] = json!(pid);
+    }
+    let _ = driver.call("type_text", params).await?;
+    Ok(ToolOutput::Text(format!(
+        "typed {} chars",
+        text.chars().count()
+    )))
+}
+
+async fn key(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    // Branch: single key vs hotkey. The `key`/`keys` discrimination matches
+    // the cua-driver CLI's `press_key` vs `hotkey` split.
+    if let Some(combo) = &args.keys {
+        let mut params = json!({"keys": combo});
+        if let Some(pid) = args.pid {
+            params["pid"] = json!(pid);
+        }
+        let _ = driver.call("hotkey", params).await?;
+        Ok(ToolOutput::Text(format!("hotkey {}", combo.join("+"))))
+    } else if let Some(k) = &args.key {
+        let mut params = json!({"key": k});
+        if let Some(pid) = args.pid {
+            params["pid"] = json!(pid);
+        }
+        let _ = driver.call("press_key", params).await?;
+        Ok(ToolOutput::Text(format!("press_key {k}")))
+    } else {
+        Ok(ToolOutput::Text(
+            "Error: computer_use.key requires either `key` (single) or `keys` (hotkey array)"
+                .into(),
+        ))
+    }
+}
+
+async fn set_value(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let element_index = args
+        .element_index
+        .ok_or_else(|| anyhow::anyhow!("computer_use.set_value requires `element_index`"))?;
+    let value = args
+        .value
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("computer_use.set_value requires `value`"))?;
+    let pid = args
+        .pid
+        .ok_or_else(|| anyhow::anyhow!("computer_use.set_value requires `pid`"))?;
+    let window_id = args.window_id.ok_or_else(|| {
+        anyhow::anyhow!("computer_use.set_value requires `window_id` (AX cache key)")
+    })?;
+    let params = json!({
+        "pid": pid,
+        "window_id": window_id,
+        "element_index": element_index,
+        "value": value,
+    });
+    let _ = driver.call("set_value", params).await?;
+    Ok(ToolOutput::Text(format!(
+        "set_value [{element_index}] = {value:?}"
+    )))
+}
+
+async fn focus_app(args: &ComputerUseArgs, driver: &dyn Driver) -> Result<ToolOutput> {
+    let target = args.target.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("computer_use.focus_app requires `target` (bundle id or process name)")
+    })?;
+    // `raise_window` defaults to true (visible, focus-stealing) per the
+    // safer-default principle. Background co-work is opt-in.
+    let raise = args.raise_window.unwrap_or(true);
+    let mut params = json!({"target": target, "raise_window": raise});
+    if let Some(window_id) = args.window_id {
+        params["window_id"] = json!(window_id);
+    }
+    let _ = driver.call("focus_app", params).await?;
+    let mode = if raise { "raised" } else { "backgrounded" };
+    Ok(ToolOutput::Text(format!("focus_app {target} ({mode})")))
 }
 
 #[cfg(test)]
@@ -449,19 +800,33 @@ mod tests {
         assert!(err.contains("screen capture failed"), "got: {err}");
     }
 
-    /// Plan-mode allowlist invariant: capture / list_apps / wait are safe,
-    /// every other action (added in commit 2) is not. Encoded as a single
-    /// table so a new variant that forgets a row fails this test, not just
-    /// "the implementation matches itself" rubber-stamping.
+    /// Plan-mode allowlist invariant: capture / list_apps / wait are safe;
+    /// every mutating action is not. Encoded as one exhaustive table so a
+    /// new variant that forgets a row fails this test, not just "the
+    /// implementation matches itself" rubber-stamping.
     #[test]
     fn plan_mode_allowlist_covers_readonly_only() {
-        let allowed: Vec<ComputerUseAction> = vec![
-            ComputerUseAction::Capture,
-            ComputerUseAction::ListApps,
-            ComputerUseAction::Wait,
+        let cases: &[(ComputerUseAction, bool)] = &[
+            (ComputerUseAction::Capture, true),
+            (ComputerUseAction::ListApps, true),
+            (ComputerUseAction::Wait, true),
+            (ComputerUseAction::Click, false),
+            (ComputerUseAction::DoubleClick, false),
+            (ComputerUseAction::RightClick, false),
+            (ComputerUseAction::MiddleClick, false),
+            (ComputerUseAction::Drag, false),
+            (ComputerUseAction::Scroll, false),
+            (ComputerUseAction::Type, false),
+            (ComputerUseAction::Key, false),
+            (ComputerUseAction::SetValue, false),
+            (ComputerUseAction::FocusApp, false),
         ];
-        for a in &allowed {
-            assert!(action_allowed_in_plan_mode(a), "{a:?} should be allowed");
+        for (action, expected) in cases {
+            assert_eq!(
+                action_allowed_in_plan_mode(action),
+                *expected,
+                "plan-mode drift on {action:?}: expected {expected}"
+            );
         }
     }
 
@@ -480,12 +845,7 @@ mod tests {
                 },
             ],
         }]);
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::Capture,
-            pid: None,
-            window_id: None,
-            duration_ms: None,
-        };
+        let args = args_with_action(ComputerUseAction::Capture);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let (text, parts) = match out {
             ToolOutput::Multimodal { text, parts } => (text, parts),
@@ -514,12 +874,9 @@ mod tests {
                 base64: one_by_one_png_b64(),
             }],
         }]);
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::Capture,
-            pid: Some(1234),
-            window_id: Some(42),
-            duration_ms: None,
-        };
+        let mut args = args_with_action(ComputerUseAction::Capture);
+        args.pid = Some(1234);
+        args.window_id = Some(42);
         let _ = handle_with_driver(&args, &driver).await.unwrap();
         let (_, params) = driver.calls.lock().unwrap()[0].clone();
         assert_eq!(params["pid"], 1234);
@@ -534,12 +891,7 @@ mod tests {
                 DriverContent::Text("Finder (pid=2)".into()),
             ],
         }]);
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::ListApps,
-            pid: None,
-            window_id: None,
-            duration_ms: None,
-        };
+        let args = args_with_action(ComputerUseAction::ListApps);
         let out = handle_with_driver(&args, &driver).await.unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
@@ -555,12 +907,8 @@ mod tests {
         // to detect a "wait returns immediately" regression — `tokio::sleep`
         // has worst-case ~ms-scale wakeup jitter, not 50ms.
         let driver = FakeDriver::new(vec![]);
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::Wait,
-            pid: None,
-            window_id: None,
-            duration_ms: Some(50),
-        };
+        let mut args = args_with_action(ComputerUseAction::Wait);
+        args.duration_ms = Some(50);
         let start = std::time::Instant::now();
         handle_with_driver(&args, &driver).await.unwrap();
         let elapsed = start.elapsed();
@@ -575,12 +923,7 @@ mod tests {
     #[tokio::test]
     async fn wait_requires_duration_ms() {
         let driver = FakeDriver::new(vec![]);
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::Wait,
-            pid: None,
-            window_id: None,
-            duration_ms: None,
-        };
+        let args = args_with_action(ComputerUseAction::Wait);
         let err = handle_with_driver(&args, &driver).await.unwrap_err();
         assert!(err.to_string().contains("duration_ms"));
     }
@@ -592,12 +935,7 @@ mod tests {
         // Bake in a non-existent driver path so any spawn attempt would fail
         // loudly — the assertion is that we *never* even try.
         config.computer_use.driver_path = "/definitely/does/not/exist/cua-driver".into();
-        let args = ComputerUseArgs {
-            action: ComputerUseAction::Capture,
-            pid: None,
-            window_id: None,
-            duration_ms: None,
-        };
+        let args = args_with_action(ComputerUseAction::Capture);
         let out = handle(&args, &config).await.unwrap();
         let text = match out {
             ToolOutput::Text(t) => t,
@@ -618,5 +956,170 @@ mod tests {
         let result: std::result::Result<ComputerUseArgs, _> =
             serde_json::from_value(json!({"action": "launch_app"}));
         assert!(result.is_err(), "unknown action should fail schema parse");
+    }
+
+    fn args_with_action(action: ComputerUseAction) -> ComputerUseArgs {
+        ComputerUseArgs {
+            action,
+            pid: None,
+            window_id: None,
+            duration_ms: None,
+            x: None,
+            y: None,
+            to_x: None,
+            to_y: None,
+            delta_x: None,
+            delta_y: None,
+            text: None,
+            key: None,
+            keys: None,
+            element_index: None,
+            value: None,
+            target: None,
+            raise_window: None,
+        }
+    }
+
+    fn ok_response() -> DriverResponse {
+        DriverResponse {
+            content: vec![DriverContent::Text("ok".into())],
+        }
+    }
+
+    /// Denylist invariant: every hotkey shaped like a logout / lock /
+    /// force-quit must be refused BEFORE the driver is reached. Encoded as
+    /// a table so adding a new combo to the denylist requires a matching
+    /// test row.
+    #[tokio::test]
+    async fn dispatch_rejects_unsafe_keystrokes() {
+        let combos: &[Vec<&str>] = &[
+            // user-typed orderings differ; the normaliser must collapse them.
+            vec!["cmd", "shift", "q"],
+            vec!["shift", "cmd", "q"],
+            vec!["cmd", "ctrl", "q"],
+            vec!["cmd", "option", "esc"],
+            vec!["cmd", "alt", "esc"],
+        ];
+        for combo in combos {
+            let driver = FakeDriver::new(vec![ok_response()]);
+            let mut args = args_with_action(ComputerUseAction::Key);
+            args.keys = Some(combo.iter().map(|s| s.to_string()).collect());
+            let out = handle_with_driver(&args, &driver).await.unwrap();
+            let text = match out {
+                ToolOutput::Text(t) => t,
+                other => panic!("expected text error, got {other:?}"),
+            };
+            assert!(
+                text.contains("denied hotkey"),
+                "combo {combo:?} should have been denied, got: {text}"
+            );
+            // The driver must NOT have been called.
+            assert!(
+                driver.calls.lock().unwrap().is_empty(),
+                "combo {combo:?} reached driver"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_logout_focus_target() {
+        // `loginwindow` is the canonical "this will log the user out" target.
+        let denied_targets = ["loginwindow", "Screen Lock", "System Settings"];
+        for target in denied_targets {
+            let driver = FakeDriver::new(vec![ok_response()]);
+            let mut args = args_with_action(ComputerUseAction::FocusApp);
+            args.target = Some(target.into());
+            let out = handle_with_driver(&args, &driver).await.unwrap();
+            let text = match out {
+                ToolOutput::Text(t) => t,
+                other => panic!("expected text error, got {other:?}"),
+            };
+            assert!(
+                text.contains("denied focus_app"),
+                "target {target} should have been denied, got: {text}"
+            );
+            assert!(driver.calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_fork_bomb_type_payload() {
+        // The classic shape — function definition that pipes itself.
+        let payload = ":(){ :|:& };:";
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.text = Some(payload.into());
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        assert!(text.contains("fork-bomb"), "got: {text}");
+        assert!(driver.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn click_invokes_driver_with_coords() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(42);
+        args.y = Some(13);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "click");
+        assert_eq!(params["x"], 42);
+        assert_eq!(params["y"], 13);
+    }
+
+    #[tokio::test]
+    async fn type_invokes_driver_with_text() {
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::Type);
+        args.text = Some("Hello world".into());
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "type_text");
+        assert_eq!(params["text"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn focus_app_no_raise_passes_flag_through() {
+        // The whole point of the `raise_window: false` knob is that the
+        // user's frontmost app stays frontmost. If the flag silently
+        // becomes `true` somewhere along the way the no-foreground contract
+        // breaks — this guards exactly that.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::FocusApp);
+        args.target = Some("com.google.Chrome".into());
+        args.raise_window = Some(false);
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (method, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(method, "focus_app");
+        assert_eq!(params["target"], "com.google.Chrome");
+        assert_eq!(params["raise_window"], false);
+    }
+
+    #[tokio::test]
+    async fn focus_app_defaults_to_raise_true() {
+        // Safer default — anything that defaults to "stealth-mode UI driving"
+        // is too easy to misuse. Operators have to ask for backgrounded.
+        let driver = FakeDriver::new(vec![ok_response()]);
+        let mut args = args_with_action(ComputerUseAction::FocusApp);
+        args.target = Some("com.apple.Finder".into());
+        let _ = handle_with_driver(&args, &driver).await.unwrap();
+        let (_, params) = driver.calls.lock().unwrap()[0].clone();
+        assert_eq!(params["raise_window"], true);
+    }
+
+    #[test]
+    fn hotkey_normaliser_collapses_aliases_and_order() {
+        // "command" and "cmd" are the same key; ordering shouldn't matter.
+        let mut a = args_with_action(ComputerUseAction::Key);
+        a.keys = Some(vec!["shift".into(), "command".into(), "Q".into()]);
+        assert_eq!(normalised_hotkey(&a).unwrap(), "cmd+q+shift");
+
+        let mut b = args_with_action(ComputerUseAction::Key);
+        b.keys = Some(vec!["cmd".into(), "shift".into(), "q".into()]);
+        assert_eq!(normalised_hotkey(&b).unwrap(), "cmd+q+shift");
     }
 }
