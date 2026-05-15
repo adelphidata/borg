@@ -1162,7 +1162,10 @@ mod tests {
             ToolOutput::Text(t) => t,
             other => panic!("expected text, got {other:?}"),
         };
-        assert!(text.contains("click at (100, 200)"), "summary missing: {text}");
+        assert!(
+            text.contains("click at (100, 200)"),
+            "summary missing: {text}"
+        );
         assert!(
             text.contains("error: target element not focusable"),
             "driver soft-failure text missing: {text}"
