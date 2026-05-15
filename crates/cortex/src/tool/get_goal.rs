@@ -11,8 +11,12 @@ use crate::db::Database;
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct GetGoalArgs {}
 
-pub(crate) fn handle(_args: &GetGoalArgs, db: &Database, session_id: &str) -> Result<String> {
-    let goal = db.get_goal(session_id)?;
+pub(crate) async fn handle(
+    _args: &GetGoalArgs,
+    db: &Database,
+    session_id: &str,
+) -> Result<String> {
+    let goal = db.get_goal(session_id).await?;
     let payload = match goal {
         Some(g) => {
             let remaining = g

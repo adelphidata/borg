@@ -48,15 +48,15 @@ impl Agent {
     /// Returns the freshly-read goal so callers can avoid a second DB hit.
     /// Returns `None` when goals are disabled, the DB is unavailable, or no
     /// goal exists.
-    pub(super) fn sync_goal_runtime_for_turn(&mut self) -> Option<Goal> {
+    pub(super) async fn sync_goal_runtime_for_turn(&mut self) -> Option<Goal> {
         if !self.config.goals.enabled {
             return None;
         }
         let session_id = self.session.meta.id.clone();
         let goal = {
-            let guard = self.db_guard();
+            let guard = self.db_guard().await;
             let db = guard.as_ref()?;
-            match db.get_goal(&session_id) {
+            match db.get_goal(&session_id).await {
                 Ok(g) => g,
                 Err(e) => {
                     tracing::warn!("sync_goal_runtime_for_turn: get_goal failed: {e}");
@@ -119,7 +119,7 @@ impl Agent {
     /// Returns the post-accounting goal (re-fetched), or `None` if no
     /// accounting fired (Plan mode, no baseline, no goal, DB unavailable).
     /// Best-effort: errors are logged but not surfaced.
-    pub(super) fn account_goal_at_turn_end(&mut self) -> Option<Goal> {
+    pub(super) async fn account_goal_at_turn_end(&mut self) -> Option<Goal> {
         if !self.config.goals.enabled {
             return None;
         }
@@ -133,18 +133,23 @@ impl Agent {
         let session_tokens_now = crate::conversation::history_tokens(&self.history) as i64;
         let delta = self.goal_runtime.take_turn_delta(session_tokens_now)?;
         let goal_id = self.goal_runtime.current_goal_id()?;
-        let guard = self.db_guard();
-        let db = guard.as_ref()?;
-        let outcome = match db.account_goal_usage(
-            &session_id,
-            delta.token_delta,
-            delta.time_delta_seconds,
-            Some(goal_id.as_str()),
-        ) {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!("account_goal_usage failed: {e}");
-                return None;
+        let outcome = {
+            let guard = self.db_guard().await;
+            let db = guard.as_ref()?;
+            match db
+                .account_goal_usage(
+                    &session_id,
+                    delta.token_delta,
+                    delta.time_delta_seconds,
+                    Some(goal_id.as_str()),
+                )
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::warn!("account_goal_usage failed: {e}");
+                    return None;
+                }
             }
         };
         let goal = match outcome {
@@ -161,7 +166,7 @@ impl Agent {
                 reason: SteeringReason::BudgetLimited,
                 body,
             });
-            self.emit_goal_vitals_event("goal_budget_limited", &goal);
+            self.emit_goal_vitals_event("goal_budget_limited", &goal).await;
             self.emit_goal_lifecycle(event_kind::BUDGET_LIMITED, Some(&goal));
         }
         Some(goal)
@@ -179,7 +184,7 @@ impl Agent {
     /// - User steering pending → false.
     /// - Same `turn_id` already reserved → false (so a max-iterations cap
     ///   on the inner loop can't spawn infinite continuations).
-    pub(super) fn maybe_inject_goal_continuation(&mut self, turn_id: &str) -> bool {
+    pub(super) async fn maybe_inject_goal_continuation(&mut self, turn_id: &str) -> bool {
         if !self.config.goals.enabled {
             return false;
         }
@@ -188,12 +193,12 @@ impl Agent {
         }
         let session_id = self.session.meta.id.clone();
         let goal = {
-            let guard = self.db_guard();
+            let guard = self.db_guard().await;
             let db = match guard.as_ref() {
                 Some(db) => db,
                 None => return false,
             };
-            match db.get_goal(&session_id) {
+            match db.get_goal(&session_id).await {
                 Ok(Some(g)) => g,
                 Ok(None) => return false,
                 Err(e) => {
@@ -239,8 +244,8 @@ impl Agent {
     /// Record a goal lifecycle event into the HMAC-verified vitals chain.
     /// The `Telemetry` category contributes zero stat deltas so the posture
     /// multiplier stays untouched — these are pure audit-trail entries.
-    pub(super) fn emit_goal_vitals_event(&self, source: &str, goal: &Goal) {
-        let guard = self.db_guard();
+    pub(super) async fn emit_goal_vitals_event(&self, source: &str, goal: &Goal) {
+        let guard = self.db_guard().await;
         let Some(db) = guard.as_ref() else { return };
         let metadata = serde_json::json!({
             "goal_id": goal.goal_id,
@@ -252,12 +257,15 @@ impl Agent {
         })
         .to_string();
         let deltas = crate::vitals::deltas_for(crate::vitals::EventCategory::Telemetry);
-        if let Err(e) = db.record_vitals_event(
-            &crate::vitals::EventCategory::Telemetry.to_string(),
-            source,
-            &deltas,
-            Some(metadata.as_str()),
-        ) {
+        if let Err(e) = db
+            .record_vitals_event(
+                &crate::vitals::EventCategory::Telemetry.to_string(),
+                source,
+                &deltas,
+                Some(metadata.as_str()),
+            )
+            .await
+        {
             tracing::warn!("emit_goal_vitals_event({source}) failed: {e}");
         }
     }
@@ -267,18 +275,18 @@ impl Agent {
     /// runtime cache so the next iteration starts charging accounting, and
     /// emit `goal_created` audit + lifecycle events. Best-effort: failures
     /// are logged but never bubbled back into the tool result.
-    pub(super) fn on_goal_created_via_tool(&mut self, handler_text: &str) {
+    pub(super) async fn on_goal_created_via_tool(&mut self, handler_text: &str) {
         let Some(v) = serde_json::from_str::<serde_json::Value>(handler_text).ok() else {
             return;
         };
         if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return;
         }
-        let Some(goal) = self.fetch_current_goal() else {
+        let Some(goal) = self.fetch_current_goal().await else {
             return;
         };
         self.goal_runtime.adopt(&goal);
-        self.emit_goal_vitals_event("goal_created", &goal);
+        self.emit_goal_vitals_event("goal_created", &goal).await;
         self.emit_goal_lifecycle(event_kind::CREATED, Some(&goal));
     }
 
@@ -287,7 +295,7 @@ impl Agent {
     /// we treat it as a completion: emit `goal_completed` + lifecycle and
     /// clear the runtime cache so a fresh objective can be adopted next
     /// turn without a stale baseline.
-    pub(super) fn on_goal_updated_via_tool(&mut self, handler_text: &str) {
+    pub(super) async fn on_goal_updated_via_tool(&mut self, handler_text: &str) {
         let Some(v) = serde_json::from_str::<serde_json::Value>(handler_text).ok() else {
             return;
         };
@@ -300,13 +308,13 @@ impl Agent {
         {
             return;
         }
-        let Some(goal) = self.fetch_current_goal() else {
+        let Some(goal) = self.fetch_current_goal().await else {
             return;
         };
         if goal.status != GoalStatus::Complete {
             return;
         }
-        self.emit_goal_vitals_event("goal_completed", &goal);
+        self.emit_goal_vitals_event("goal_completed", &goal).await;
         self.emit_goal_lifecycle(event_kind::COMPLETED, Some(&goal));
         self.goal_runtime.forget();
     }
@@ -314,11 +322,11 @@ impl Agent {
     /// Re-read the active goal row for this session. Used after a tool
     /// handler mutates the DB so we can pass the canonical row (not just
     /// the handler's JSON projection) into vitals/lifecycle emitters.
-    fn fetch_current_goal(&self) -> Option<Goal> {
+    async fn fetch_current_goal(&self) -> Option<Goal> {
         let session_id = self.session.meta.id.clone();
-        let guard = self.db_guard();
+        let guard = self.db_guard().await;
         let db = guard.as_ref()?;
-        match db.get_goal(&session_id) {
+        match db.get_goal(&session_id).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!("fetch_current_goal: get_goal failed: {e}");

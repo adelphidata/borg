@@ -52,23 +52,30 @@ impl Agent {
     /// Collapses the historical `load_memory_recency` / `load_memory_ranked`
     /// pair — the surrounding guard+fallback dance was identical between
     /// them, and a parameter is clearer than two near-duplicate methods.
-    fn load_memory(&self, max_tokens: usize, strategy: LoadStrategy<'_>) -> Result<String> {
+    async fn load_memory(
+        &self,
+        max_tokens: usize,
+        strategy: LoadStrategy<'_>,
+    ) -> Result<String> {
         let scopes = resolved_memory_scopes(&self.config);
-        let guard = self.db_guard();
+        let guard = self.db_guard().await;
         match strategy {
             LoadStrategy::Recency => {
                 if let Some(db) = guard.as_ref() {
-                    return load_memory_context_db_scoped_with(db, &scopes, max_tokens);
+                    return load_memory_context_db_scoped_with(db, &scopes, max_tokens).await;
                 }
-                load_memory_context_db_scoped(&self.config, max_tokens)
+                drop(guard);
+                load_memory_context_db_scoped(&self.config, max_tokens).await
             }
             LoadStrategy::Ranked(rankings) => {
                 if let Some(db) = guard.as_ref() {
                     return load_memory_context_db_ranked_scoped_with(
                         db, &scopes, max_tokens, rankings,
-                    );
+                    )
+                    .await;
                 }
-                load_memory_context_db_ranked_scoped(&self.config, max_tokens, rankings)
+                drop(guard);
+                load_memory_context_db_ranked_scoped(&self.config, max_tokens, rankings).await
             }
         }
     }
@@ -80,7 +87,7 @@ impl Agent {
         let max_tokens = self.config.memory.max_context_tokens;
 
         if !self.config.memory.embeddings.enabled {
-            return self.load_memory(max_tokens, LoadStrategy::Recency);
+            return self.load_memory(max_tokens, LoadStrategy::Recency).await;
         }
 
         let query = self.latest_user_query();
@@ -92,7 +99,7 @@ impl Agent {
         const MIN_QUERY_CHARS_FOR_RANKING: usize = 10;
         let trimmed = query.trim();
         if trimmed.len() < MIN_QUERY_CHARS_FOR_RANKING {
-            return self.load_memory(max_tokens, LoadStrategy::Recency);
+            return self.load_memory(max_tokens, LoadStrategy::Recency).await;
         }
 
         // Generate query embedding once for ranking
@@ -104,7 +111,7 @@ impl Agent {
                     // embeddings.rs startup; this site fires per build_system_prompt
                     // (every turn). Demote to TRACE to keep DEBUG signal-to-noise high.
                     tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
-                    return self.load_memory(max_tokens, LoadStrategy::Recency);
+                    return self.load_memory(max_tokens, LoadStrategy::Recency).await;
                 }
             };
 
@@ -120,18 +127,19 @@ impl Agent {
 
         let global_rankings = match ranking_result {
             Ok(Ok(r)) if !r.is_empty() => r,
-            Ok(Ok(_)) => return self.load_memory(max_tokens, LoadStrategy::Recency),
+            Ok(Ok(_)) => return self.load_memory(max_tokens, LoadStrategy::Recency).await,
             Ok(Err(e)) => {
                 tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
-                return self.load_memory(max_tokens, LoadStrategy::Recency);
+                return self.load_memory(max_tokens, LoadStrategy::Recency).await;
             }
             Err(e) => {
                 tracing::debug!("Ranking task panicked, falling back to recency: {e}");
-                return self.load_memory(max_tokens, LoadStrategy::Recency);
+                return self.load_memory(max_tokens, LoadStrategy::Recency).await;
             }
         };
 
         self.load_memory(max_tokens, LoadStrategy::Ranked(&global_rankings))
+            .await
     }
 
     #[instrument(skip_all)]
@@ -536,7 +544,7 @@ Rules:
         // <goal_context> block. mark_turn_started is idempotent within a
         // baseline window — `take_turn_delta` at the end of the previous
         // iteration cleared it, so this re-arms the per-iteration window.
-        self.sync_goal_runtime_for_turn();
+        self.sync_goal_runtime_for_turn().await;
         // Drain any one-shot steering queued during the previous turn's
         // accounting (budget-limit) or by `sync_goal_runtime_for_turn`
         // (objective-updated). Pushed into history before message

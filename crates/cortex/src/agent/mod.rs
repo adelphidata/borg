@@ -1576,7 +1576,7 @@ impl Agent {
         // accounting is per-iteration, not per-turn, so a multi-iteration
         // turn charges incrementally and the budget-limit flip can happen
         // mid-turn.
-        let _ = self.account_goal_at_turn_end();
+        let _ = self.account_goal_at_turn_end().await;
         // Self-continuation only applies to what would otherwise be a real
         // `EndTurn`. A continuation injects a synthetic user message and
         // returns `NudgeAndContinue` to re-enter the loop; the
@@ -1585,7 +1585,7 @@ impl Agent {
         match outcome {
             IterationOutcome::EndTurn => {
                 let turn_id = format!("{}:{}", self.session.meta.id, self.turn_count);
-                if self.maybe_inject_goal_continuation(&turn_id) {
+                if self.maybe_inject_goal_continuation(&turn_id).await {
                     IterationOutcome::NudgeAndContinue
                 } else {
                     IterationOutcome::EndTurn
@@ -2585,9 +2585,11 @@ impl Agent {
                         serde_json::json!({"error": "goals are disabled"}).to_string(),
                     ));
                 }
-                let guard = self.db_guard();
+                let guard = self.db_guard().await;
                 match guard.as_ref() {
-                    Some(db) => crate::tool::get_goal::handle(args, db, &self.session.meta.id),
+                    Some(db) => {
+                        crate::tool::get_goal::handle(args, db, &self.session.meta.id).await
+                    }
                     None => Ok("null".to_string()),
                 }
             }
@@ -2598,19 +2600,24 @@ impl Agent {
                     ));
                 }
                 let handler_out = {
-                    let guard = self.db_guard();
+                    let guard = self.db_guard().await;
                     match guard.as_ref() {
-                        Some(db) => crate::tool::create_goal::handle(
-                            args,
-                            db,
-                            &self.session.meta.id,
-                            self.config.goals.default_token_budget,
-                        ),
-                        None => Ok(serde_json::json!({"error":"database unavailable"}).to_string()),
+                        Some(db) => {
+                            crate::tool::create_goal::handle(
+                                args,
+                                db,
+                                &self.session.meta.id,
+                                self.config.goals.default_token_budget,
+                            )
+                            .await
+                        }
+                        None => {
+                            Ok(serde_json::json!({"error":"database unavailable"}).to_string())
+                        }
                     }
                 };
                 if let Ok(ref text) = handler_out {
-                    self.on_goal_created_via_tool(text);
+                    self.on_goal_created_via_tool(text).await;
                 }
                 handler_out
             }
@@ -2621,16 +2628,19 @@ impl Agent {
                     ));
                 }
                 let handler_out = {
-                    let guard = self.db_guard();
+                    let guard = self.db_guard().await;
                     match guard.as_ref() {
                         Some(db) => {
                             crate::tool::update_goal::handle(args, db, &self.session.meta.id)
+                                .await
                         }
-                        None => Ok(serde_json::json!({"error":"database unavailable"}).to_string()),
+                        None => {
+                            Ok(serde_json::json!({"error":"database unavailable"}).to_string())
+                        }
                     }
                 };
                 if let Ok(ref text) = handler_out {
-                    self.on_goal_updated_via_tool(text);
+                    self.on_goal_updated_via_tool(text).await;
                 }
                 handler_out
             }

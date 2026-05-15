@@ -13,11 +13,11 @@
 //! with [`ResolveError::AirGapPolicyViolation`].
 
 use anyhow::Result;
-use rusqlite::Connection;
 use thiserror::Error;
 
 use super::category::ProviderCategory;
 use super::row::ProviderRow;
+use crate::db::Database;
 use crate::llm::provider::Provider;
 
 /// Reason a `provider_id` couldn't be resolved.
@@ -58,8 +58,8 @@ pub struct ProviderRegistry;
 
 impl ProviderRegistry {
     /// Resolve a `provider_id`, applying air-gap policy.
-    pub fn resolve(
-        conn: &Connection,
+    pub async fn resolve(
+        db: &Database,
         id: &str,
         outbound_allowed: bool,
     ) -> Result<ResolvedProvider, ResolveError> {
@@ -71,7 +71,8 @@ impl ProviderRegistry {
                 builtin: Some(builtin),
             }
         } else {
-            let row = ProviderRow::load(conn, id)
+            let row = ProviderRow::load(db, id)
+                .await
                 .map_err(ResolveError::Db)?
                 .ok_or_else(|| ResolveError::Unknown(id.to_string()))?;
             ResolvedProvider {

@@ -31,13 +31,13 @@ const BTW_PROMPT_PREFIX: &str =
 /// `Agent::build_system_prompt` machinery — that loads skills, tool docs, and
 /// workflow guidance that are all irrelevant here (no tools are exposed) and
 /// would waste tokens on every side question.
-fn build_btw_system_prompt() -> String {
+async fn build_btw_system_prompt() -> String {
     let identity = crate::identity::load_identity().unwrap_or_else(|e| {
         tracing::warn!("/btw: failed to load identity, using default: {e}");
         "You are Borg, a personal AI assistant.\n".to_string()
     });
 
-    let memory_preamble = match crate::memory::load_memory_context_db(2000) {
+    let memory_preamble = match crate::memory::load_memory_context_db(2000).await {
         Ok(m) if !m.is_empty() => {
             format!("\n<long_term_memory trust=\"stored\">\n{m}\n</long_term_memory>\n")
         }
@@ -77,10 +77,10 @@ pub async fn run_btw(
         return Err(anyhow!("empty question"));
     }
 
-    let mut client = LlmClient::new(&config)?;
+    let mut client = LlmClient::new(&config).await?;
 
     let mut messages: Vec<Message> = Vec::with_capacity(transcript_snapshot.len() + 2);
-    messages.push(Message::system(build_btw_system_prompt()));
+    messages.push(Message::system(build_btw_system_prompt().await));
     messages.extend(transcript_snapshot);
     messages.push(Message::user(format!("{BTW_PROMPT_PREFIX}{question}")));
 
@@ -239,9 +239,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn system_prompt_mentions_btw_and_no_tools() {
-        let p = build_btw_system_prompt();
+    #[tokio::test]
+    async fn system_prompt_mentions_btw_and_no_tools() {
+        let p = build_btw_system_prompt().await;
         assert!(
             p.contains("/btw"),
             "system prompt should reference /btw framing"

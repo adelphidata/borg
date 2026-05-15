@@ -17,14 +17,18 @@ pub(crate) struct UpdateGoalArgs {
     pub status: String,
 }
 
-pub(crate) fn handle(args: &UpdateGoalArgs, db: &Database, session_id: &str) -> Result<String> {
+pub(crate) async fn handle(
+    args: &UpdateGoalArgs,
+    db: &Database,
+    session_id: &str,
+) -> Result<String> {
     if args.status != "complete" {
         return Ok(json!({
             "error": format!("status must be \"complete\" (got {:?}); pause/resume are user-controlled", args.status)
         })
         .to_string());
     }
-    let current = match db.get_goal(session_id)? {
+    let current = match db.get_goal(session_id).await? {
         Some(g) => g,
         None => {
             return Ok(json!({
@@ -41,14 +45,16 @@ pub(crate) fn handle(args: &UpdateGoalArgs, db: &Database, session_id: &str) -> 
         })
         .to_string());
     }
-    let updated = db.update_goal(
-        session_id,
-        GoalUpdate {
-            status: Some(GoalStatus::Complete),
-            expected_goal_id: Some(current.goal_id),
-            ..Default::default()
-        },
-    )?;
+    let updated = db
+        .update_goal(
+            session_id,
+            GoalUpdate {
+                status: Some(GoalStatus::Complete),
+                expected_goal_id: Some(current.goal_id),
+                ..Default::default()
+            },
+        )
+        .await?;
     match updated {
         Some(g) => {
             crate::goals::metrics::record_completed(&g);

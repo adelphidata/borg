@@ -18,7 +18,7 @@ pub(crate) struct CreateGoalArgs {
     pub token_budget: Option<i64>,
 }
 
-pub(crate) fn handle(
+pub(crate) async fn handle(
     args: &CreateGoalArgs,
     db: &Database,
     session_id: &str,
@@ -36,7 +36,10 @@ pub(crate) fn handle(
         Ok(b) => b,
         Err(e) => return Ok(json!({"error": e}).to_string()),
     };
-    match db.insert_goal(session_id, &objective, GoalStatus::Active, budget)? {
+    match db
+        .insert_goal(session_id, &objective, GoalStatus::Active, budget)
+        .await?
+    {
         Some(g) => {
             crate::goals::metrics::record_created(&g);
             Ok(json!({
