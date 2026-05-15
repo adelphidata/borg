@@ -386,8 +386,15 @@ impl Database {
         tokens.join(" ")
     }
 
-    /// Full-text search over chunk content within a scope.
-    /// Returns matching (ChunkRow, bm25_score) pairs sorted by relevance, limited to `limit`.
+    /// Full-text candidate search over chunk content within a scope.
+    /// Returns `(ChunkRow, 0.0)` pairs for every row matching the sanitized
+    /// query — Turso's `USING fts` index method does not expose a
+    /// SQL-callable `bm25()`, so BM25 ranking moves to the caller (see
+    /// [`crate::memory::bm25`]). The `f32` slot is preserved for API
+    /// symmetry; the caller is expected to overwrite it.
+    ///
+    /// `limit` is the final post-rank result count; this method oversamples
+    /// by 4× (capped at 200) so the BM25 re-rank has enough breadth.
     pub async fn fts_search(
         &self,
         scope: &str,
@@ -398,17 +405,15 @@ impl Database {
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
+        let candidate_limit = limit.saturating_mul(4).min(200).max(limit);
         let mut rows = self.conn.query(
-            "SELECT mc.id, mc.scope, mc.filename, mc.chunk_index, mc.start_line, mc.end_line,
-                    mc.content, mc.content_hash, mc.embedding, mc.created_at,
-                    -bm25(memory_chunks_fts) AS score
-             FROM memory_chunks_fts
-             JOIN memory_chunks mc ON mc.id = memory_chunks_fts.rowid
-             WHERE memory_chunks_fts MATCH ?1
-               AND mc.scope = ?2
-             ORDER BY score DESC
+            "SELECT id, scope, filename, chunk_index, start_line, end_line,
+                    content, content_hash, embedding, created_at
+             FROM memory_chunks
+             WHERE content MATCH ?1
+               AND scope = ?2
              LIMIT ?3",
-            params!(sanitized, scope, limit as i64),
+            params!(sanitized, scope, candidate_limit as i64),
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -425,7 +430,7 @@ impl Database {
                     embedding: row.get::<Option<Vec<u8>>>(8)?,
                     created_at: row.get::<i64>(9)?,
                 },
-                row.get::<f64>(10)? as f32,
+                0.0,
             ));
         }
         Ok(out)

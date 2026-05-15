@@ -419,7 +419,7 @@ impl Database {
     }
 
     /// Current schema version. Bump this when adding new migrations.
-    const CURRENT_VERSION: u32 = 1;
+    const CURRENT_VERSION: u32 = 2;
 
     async fn run_migrations(&self) -> Result<()> {
         // Ensure meta table exists for version tracking (outside the writer
@@ -484,8 +484,11 @@ impl Database {
         if current < 1 {
             self.migrate_v1().await?;
         }
+        if current < 2 {
+            self.migrate_v2().await?;
+        }
         const _: () = assert!(
-            Database::CURRENT_VERSION == 1,
+            Database::CURRENT_VERSION == 2,
             "add the new migrate_vN call above and bump this constant",
         );
 

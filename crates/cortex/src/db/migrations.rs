@@ -22,6 +22,38 @@ impl Database {
         Ok(())
     }
 
+    /// Replace the SQLite FTS5 virtual tables (and their sync triggers) with
+    /// Turso's `USING fts` index method. The FTS5 virtual-table syntax was
+    /// inherited from rusqlite and is not supported by Turso 0.6; the index
+    /// method is the supported equivalent and keeps the index in sync with
+    /// the source table without manual triggers. BM25 ranking moves to Rust
+    /// (see `crate::memory::bm25`) because the index method does not expose
+    /// a SQL-callable `bm25()`.
+    pub(super) async fn migrate_v2(&self) -> Result<()> {
+        // messages: drop the FTS5 virtual table and its three sync triggers.
+        self.conn
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS messages_ai;
+                 DROP TRIGGER IF EXISTS messages_ad;
+                 DROP TRIGGER IF EXISTS messages_au;
+                 DROP TABLE IF EXISTS messages_fts;
+                 CREATE INDEX IF NOT EXISTS messages_fts ON messages USING fts (content);",
+            )
+            .await?;
+
+        // memory_chunks: same shape.
+        self.conn
+            .execute_batch(
+                "DROP TRIGGER IF EXISTS memory_chunks_ai;
+                 DROP TRIGGER IF EXISTS memory_chunks_ad;
+                 DROP TRIGGER IF EXISTS memory_chunks_au;
+                 DROP TABLE IF EXISTS memory_chunks_fts;
+                 CREATE INDEX IF NOT EXISTS memory_chunks_fts ON memory_chunks USING fts (content);",
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn seed_bundled_rate_cards(&self) -> Result<()> {
         const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
         let mut stmt = self

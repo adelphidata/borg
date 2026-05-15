@@ -530,12 +530,16 @@ impl Database {
         Ok(count as usize)
     }
 
-    /// FTS5 search over past session messages. Returns matches ordered by
-    /// BM25 relevance. `MessageFtsHit` carries the session_id so the caller
-    /// can fetch surrounding context if desired.
+    /// Full-text candidate search over past session messages. Returns rows
+    /// matching the sanitized query with `score = 0.0` — Turso's `USING fts`
+    /// index method does not expose a SQL-callable `bm25()`, so ranking is
+    /// computed in Rust by the caller via [`crate::memory::bm25`].
     ///
-    /// Query is passed through a minimal sanitizer: strips FTS5 operators
-    /// that could cause parse errors and quotes each word for phrase safety.
+    /// `limit` is the *final* result count the caller intends to surface;
+    /// this method oversamples by 4× (capped at 200) so the BM25 re-rank has
+    /// enough breadth to be meaningful. Pre-port the SQL `LIMIT 50` was
+    /// applied *after* BM25 ranking inside SQLite; with ranking moved out we
+    /// must widen the candidate set to compensate.
     pub async fn messages_fts_search(
         &self,
         query: &str,
@@ -545,15 +549,13 @@ impl Database {
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
+        let candidate_limit = limit.saturating_mul(4).min(200).max(limit);
         let mut rows = self.conn.query(
-            "SELECT m.id, m.session_id, m.role, m.content, m.created_at,
-                    -bm25(messages_fts) AS score
-             FROM messages_fts
-             JOIN messages m ON m.id = messages_fts.rowid
-             WHERE messages_fts MATCH ?1
-             ORDER BY score DESC
+            "SELECT id, session_id, role, content, created_at
+             FROM messages
+             WHERE content MATCH ?1
              LIMIT ?2",
-            params!(sanitized, limit as i64),
+            params!(sanitized, candidate_limit as i64),
         ).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
@@ -565,7 +567,7 @@ impl Database {
                     .get::<Option<String>>(3)?
                     .unwrap_or_default(),
                 created_at: row.get::<i64>(4)?,
-                score: row.get::<f64>(5)? as f32,
+                score: 0.0,
             });
         }
         Ok(out)

@@ -10,6 +10,8 @@ use crate::security::sanitize::escape_xml_attr;
 mod injection;
 pub use injection::{scan_for_injection, InjectionCategory};
 
+/// BM25 ranking over an FTS candidate set.
+pub mod bm25;
 /// Markdown-aware content chunking with code fence preservation.
 pub mod chunker;
 /// Memory consolidation pipeline (nightly/weekly scheduled tasks).
