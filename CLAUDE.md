@@ -25,16 +25,12 @@ Cargo workspace, no-prefix crate names:
 cargo build
 cargo fmt --check
 cargo clippy -- -D warnings
-cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
+timeout 600 cargo test --workspace --lib --bins 2>&1 | tee /tmp/borg-test.log
 ```
 
-**Run tests once.** `tee` to a log, then grep/tail. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage` / `just coverage-summary`. CI gates at 80% via `cargo llvm-cov --fail-under-lines 80` in `.github/workflows/ci.yml`.
+**Run tests once.** `tee` to a log, then grep/tail. `timeout 600` is a hard kill — if the run hits 10 min, exit code 124 fails the build instead of hanging forever. Use `--lib --bins` for feedback; full `--workspace` only for ship checks. Coverage: `just coverage` / `just coverage-summary`. CI gates at 80% via `cargo llvm-cov --fail-under-lines 80` in `.github/workflows/ci.yml`.
 
 **Live-LLM lane (opt-in).** `web_fetch` / `web_search` / `browser` are exercised against real network targets in `crates/cortex/tests/live_network_integration.rs`, gated by both the `live-llm` cargo feature and `BORG_ALLOW_LIVE_TESTS=1`. Default `cargo test` stays hermetic; full ship checks should run `BORG_ALLOW_LIVE_TESTS=1 cargo test -p cortex --features live-llm --test live_network_integration`.
-
-Requires one of `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `GROQ_API_KEY`, `XAI_API_KEY`, `AZURE_OPENAI_API_KEY` or Azure Entra ID (with `llm.azure_resource` / `llm.azure_deployment` / `llm.azure_api_version` set), AWS credential chain (Bedrock), Google Vertex AI service-account / metadata credentials (with `llm.vertex_project` set), Ollama, or Claude Code CLI.
-
-Smaller crates (apply-patch, sandbox, heartbeat, plugins) enforce `#![warn(missing_docs)]`. iMessage is macOS-only via `#[cfg(target_os = "macos")]`.
 
 ## Critical Invariants
 
