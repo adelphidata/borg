@@ -547,6 +547,30 @@ fn synth_call_id(name: &str, idx: usize) -> String {
     format!("gem_call_{name}_{idx}")
 }
 
+/// Append-or-push semantics for the SSE function-call accumulator. AI Studio
+/// today ships the full `args` object in a single frame, so the `push` branch
+/// is the live path. The `append` branch is the defensive symmetry with the
+/// Anthropic accumulator (`stream_handler::ToolCallDelta`'s
+/// `arguments.push_str`): if a proxy or future SDK ever splits a single call
+/// across multiple frames with a stable id, the accumulator concatenates
+/// rather than silently discarding the prior bytes.
+fn accumulate_function_call(
+    pending: &mut Vec<PendingFunctionCall>,
+    id: &str,
+    name: &str,
+    args_text: &str,
+) {
+    if let Some(existing) = pending.iter_mut().find(|p| p.id == id) {
+        existing.args_text.push_str(args_text);
+    } else {
+        pending.push(PendingFunctionCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            args_text: args_text.to_string(),
+        });
+    }
+}
+
 // ── SSE streaming parser ─────────────────────────────────────────────────
 
 /// Parse one SSE line from `streamGenerateContent?alt=sse`. The driver in
@@ -635,14 +659,12 @@ pub(crate) fn parse_gemini_sse_line(
                 let args_text = serde_json::to_string(&args).unwrap_or_else(|_| "{}".into());
                 let idx = state.accumulator.pending_function_calls.len();
                 let id = synth_call_id(&name, idx);
-                state
-                    .accumulator
-                    .pending_function_calls
-                    .push(PendingFunctionCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        args_text: args_text.clone(),
-                    });
+                accumulate_function_call(
+                    &mut state.accumulator.pending_function_calls,
+                    &id,
+                    &name,
+                    &args_text,
+                );
                 events.push(StreamEvent::ToolCallDelta {
                     index: idx,
                     id: Some(id),
@@ -1378,5 +1400,27 @@ mod tests {
         // misattribute Gemini requests.
         let t = super::super::transport::gemini_transport();
         assert_eq!(t.protocol_name(), "gemini-native");
+    }
+
+    #[test]
+    fn accumulate_function_call_pushes_then_appends_on_same_id() {
+        // Today AI Studio ships the full `args` object in one SSE frame, so
+        // the live path always pushes a fresh entry. This guards the
+        // append branch for any future proxy/SDK that splits a single call
+        // across frames with a stable id — the prior bytes must concat,
+        // not get silently discarded.
+        let mut pending: Vec<PendingFunctionCall> = Vec::new();
+        accumulate_function_call(&mut pending, "gem_call_foo_0", "foo", r#"{"x":"#);
+        accumulate_function_call(&mut pending, "gem_call_foo_0", "foo", r#""bar"}"#);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "gem_call_foo_0");
+        assert_eq!(pending[0].name, "foo");
+        assert_eq!(pending[0].args_text, r#"{"x":"bar"}"#);
+
+        // Distinct ids — including the legitimate "same tool twice in one
+        // turn" case from the spec — still produce separate entries.
+        accumulate_function_call(&mut pending, "gem_call_foo_1", "foo", r#"{"y":1}"#);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].args_text, r#"{"y":1}"#);
     }
 }
