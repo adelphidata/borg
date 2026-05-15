@@ -6,7 +6,7 @@
 //! hit is byte-identical to a live call.
 
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use super::Database;
@@ -56,7 +56,7 @@ impl Database {
                     fetched_at: row.get(4)?,
                 })
             })
-            .ok();
+            .optional()?;
         Ok(row)
     }
 

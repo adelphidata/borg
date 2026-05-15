@@ -36,7 +36,7 @@
 //! otherwise.
 use anyhow::Result;
 use blake3::Hasher;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use super::Database;
 
@@ -155,7 +155,7 @@ impl Database {
                 params![seq],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
             )
-            .ok();
+            .optional()?;
         let Some((event_type, already)) = row else {
             anyhow::bail!("audit_log_chain row {seq} not found");
         };

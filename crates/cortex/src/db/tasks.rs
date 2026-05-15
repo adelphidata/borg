@@ -539,17 +539,32 @@ impl Database {
     }
 
     /// Returns true if a daemon holds a non-stale lock (heartbeat within 300s).
+    ///
+    /// Doctor-only diagnostic. Returns `false` on DB error (with a `warn!`)
+    /// rather than propagating — the actual lock-acquisition path is
+    /// [`acquire_daemon_lock`](Self::acquire_daemon_lock), which uses
+    /// `BEGIN IMMEDIATE` and is the only safe gate against double-spawn.
     pub fn is_daemon_lock_held(&self) -> bool {
+        use rusqlite::OptionalExtension;
         let now = chrono::Utc::now().timestamp();
-        self.conn
+        match self
+            .conn
             .query_row(
                 "SELECT heartbeat_at FROM daemon_lock WHERE id = 1",
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .ok()
-            .map(|heartbeat_at| now - heartbeat_at <= 300)
-            .unwrap_or(false)
+            .optional()
+        {
+            Ok(Some(heartbeat_at)) => now - heartbeat_at <= 300,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "is_daemon_lock_held query failed: {e} (reporting lock as not held)"
+                );
+                false
+            }
+        }
     }
 
     /// Release the daemon lock on shutdown.

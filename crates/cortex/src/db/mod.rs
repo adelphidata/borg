@@ -43,7 +43,7 @@ pub use vitals::PendingCelebration;
 pub use web_search_cache::{hash_query as hash_search_query, WebSearchCacheRow};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use tracing::instrument;
 
@@ -282,7 +282,7 @@ impl Database {
                 rusqlite::params![pubkey_blob],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         let pubkey_id = match existing {
             Some(id) => id,
             None => {

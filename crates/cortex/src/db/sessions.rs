@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 use tracing::{instrument, warn};
 
@@ -52,7 +52,7 @@ impl Database {
                     forked_from_message_id: row.get(7)?,
                 })
             })
-            .ok();
+            .optional()?;
         Ok(row)
     }
 
@@ -187,7 +187,7 @@ impl Database {
                 params![parent_id, anchor_message_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         if anchor_in_parent.is_none() {
             anyhow::bail!("anchor message {anchor_message_id} not found in session '{parent_id}'");
         }
