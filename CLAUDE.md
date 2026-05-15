@@ -138,7 +138,7 @@ Guard tests live in `crates/borgd/tests/mtls_handshake_e2e.rs`: no-cert + foreig
 
 ### Tools
 
-`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`, `vision_analyze`, `computer_use` (macOS-only, gated by `[computer_use] enabled`). Definitions in `crates/cortex/src/tool/definitions.rs`; handlers in `crates/cortex/src/tool/<name>.rs`.
+`write_memory`, `read_memory`, `memory_search`, `list`, `apply_patch`, `run_shell`, `read_file`, `list_dir`, `browser`, `web_fetch`, `web_search`, `schedule`, `request_user_input`, `text_to_speech`, `generate_image`, `vision_analyze`, `video_analyze` (Gemini-only — fails fast on other providers), `computer_use` (macOS-only, gated by `[computer_use] enabled`). Definitions in `crates/cortex/src/tool/definitions.rs`; handlers in `crates/cortex/src/tool/<name>.rs`.
 
 `computer_use` intentionally bypasses sandbox-exec — the whole point is
 to drive other macOS apps via Accessibility, which a Seatbelt profile

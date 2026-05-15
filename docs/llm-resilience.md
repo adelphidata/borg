@@ -76,10 +76,12 @@ otherwise costs one wasted 429 round-trip per key.
 
 Headers parsed (see `crates/cortex/src/llm/rate_limit_headers.rs`):
 
-- **OpenAI-compatible** (OpenAI, OpenRouter, Azure, Groq, xAI, Gemini-via-compat,
-  DeepSeek, Codex/Copilot OAuth, Custom endpoints):
-  `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`. Reset accepts
-  duration suffix strings (`6m0s`, `1h30m`, `250ms`) or epoch s/ms integers.
+- **OpenAI-compatible** (OpenAI, OpenRouter, Azure, Groq, xAI, DeepSeek,
+  Codex/Copilot OAuth, Custom endpoints): `x-ratelimit-{limit,remaining,reset}-{requests,tokens}`.
+  Reset accepts duration suffix strings (`6m0s`, `1h30m`, `250ms`) or
+  epoch s/ms integers. Gemini is intentionally NOT in this list since
+  M4 — it runs on the native transport with Gemini-specific quota
+  headers.
 - **Anthropic** (Anthropic API + ClaudeCode OAuth):
   `anthropic-ratelimit-{requests,tokens,input-tokens,output-tokens}-{limit,remaining,reset}`.
   Reset values are RFC 3339 timestamps. When both `input-tokens` and
@@ -236,6 +238,44 @@ Configure `llm.vertex_project` and optionally `llm.vertex_location`
 (`global` default). Gemini models use Vertex's OpenAI-compatible chat
 endpoint; Claude/Anthropic model names use the Vertex Anthropic raw-predict
 endpoint with `anthropic_version = "vertex-2023-10-16"` in the request body.
+
+### Google AI Studio (Gemini native)
+
+`Provider::Gemini` (set `llm.provider = "gemini"`, credential
+`GEMINI_API_KEY`) routes through the **native** transport at
+`/v1beta/models/<model>:generateContent` (non-streaming) and
+`/v1beta/models/<model>:streamGenerateContent?alt=sse` (streaming),
+not the OpenAI-compatible façade. The flip is enforced by
+`Provider::Gemini.is_openai_compatible() == false` — the dispatcher in
+`crates/cortex/src/llm/mod.rs` picks `gemini_transport()` ahead of the
+openai-compat branch. Two motivations:
+
+- **`inline_data` survives the round-trip.** The OpenAI-compat façade
+  strips `inline_data` parts (`image`/`video`/`audio` base64) when
+  re-rendering the request, so `vision_analyze` and `video_analyze`
+  silently lost their payloads. The native path passes them through
+  as `parts[].inline_data.{mime_type,data}` exactly as authored.
+- **Gemini-specific request fields work.** `thinkingConfig`,
+  `safetySettings`, `cachedContents`, and `responseMimeType` are
+  rejected by the compat façade. The native transport forwards them
+  verbatim.
+
+Override the base URL for self-hosted relays or wiremock-based tests
+with `BORG_GEMINI_BASE_URL` (priority: env > `llm.base_url` > default).
+Function calls receive synthetic IDs (`gem_call_<name>_<index>`) since
+Gemini doesn't emit one; the ID stays stable so the next user turn's
+`functionResponse` matches by name + ordinal.
+
+Cost attribution: known model rates (`gemini-2.5-pro`,
+`gemini-2.5-flash`, `gemini-2.5-flash-lite`, `gemini-2.0-flash`) are
+in `llm::pricing::GEMINI_RATES` (≤200K-context tier). Unknown models
+emit `cost_source = "unknown"` with no `cost_usd`.
+
+Live-LLM lane: `cargo test -p cortex --features live-llm --test
+live_network_integration -- live_gemini_native_` exercises the native
+transport end-to-end. Operator-run only — requires both
+`BORG_ALLOW_LIVE_TESTS=1` and `GEMINI_API_KEY`; the standard hermetic
+suite never hits the AI Studio API.
 
 ### Fallback deferral
 

@@ -16,8 +16,9 @@
 
 use cortex::browser::BrowserSession;
 use cortex::config::Config;
+use cortex::llm::LlmClient;
 use cortex::tool_handlers;
-use cortex::types::ToolOutput;
+use cortex::types::{ContentPart, MediaData, Message, ToolOutput};
 
 fn live_enabled() -> bool {
     match std::env::var("BORG_ALLOW_LIVE_TESTS") {
@@ -108,5 +109,107 @@ async fn live_browser_navigate_example_dot_com() {
     assert!(
         !text.starts_with("Error"),
         "browser navigate failed (is Chrome installed?): {text}"
+    );
+}
+
+// ── Gemini native transport live lane ────────────────────────────────────
+//
+// Gates the M2/M3/M4 native Gemini adapter behind the same `live-llm` +
+// `BORG_ALLOW_LIVE_TESTS=1` opt-in as the rest of this file. The default
+// hermetic `cargo test` lane never reaches `:generateContent`. Requires
+// `GEMINI_API_KEY` to be set in addition to the opt-in env var — without
+// the key the test skips with a clear message rather than failing.
+
+fn gemini_key_present() -> Option<String> {
+    std::env::var("GEMINI_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+fn gemini_client(model: &str) -> LlmClient {
+    let mut config = Config::default();
+    config.llm.provider = Some("gemini".to_string());
+    config.llm.model = model.to_string();
+    // LlmClient::new reads the API key from this env var name.
+    config.llm.api_key_env = "GEMINI_API_KEY".to_string();
+    LlmClient::new(&config).expect("LlmClient construction for Gemini")
+}
+
+#[tokio::test]
+async fn live_gemini_native_text_chat_returns_non_empty_reply() {
+    require_live!("live_gemini_native_text_chat_returns_non_empty_reply");
+    let Some(_key) = gemini_key_present() else {
+        eprintln!("skipping live_gemini_native_text_chat: GEMINI_API_KEY not set");
+        return;
+    };
+
+    let client = gemini_client("gemini-2.5-flash");
+    let messages = vec![Message::user("Reply with exactly one word: ping.")];
+
+    let reply = client
+        .chat(&messages, None)
+        .await
+        .expect("Gemini chat must succeed against the live API");
+
+    let body = reply
+        .content
+        .as_ref()
+        .map(|c| c.full_text())
+        .unwrap_or_default();
+    assert!(
+        !body.trim().is_empty(),
+        "Gemini chat returned empty text body: {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_gemini_native_video_inline_data_returns_description() {
+    require_live!("live_gemini_native_video_inline_data_returns_description");
+    let Some(_key) = gemini_key_present() else {
+        eprintln!(
+            "skipping live_gemini_native_video_inline_data_returns_description: GEMINI_API_KEY not set"
+        );
+        return;
+    };
+
+    // Smallest mp4 fixture we can ship without a binary asset: a 4-byte
+    // size header + ftyp box + brand. The model will reject malformed
+    // payloads with a clear error rather than silently succeeding, so even
+    // this synthetic input is a valid wire-format smoke test.
+    let mp4_bytes: Vec<u8> = vec![
+        0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2', 0x00, 0x00, 0x00,
+        0x00, b'i', b's', b'o', b'm', b'm', b'p', b'4', b'2',
+    ];
+    let engine = base64::engine::general_purpose::STANDARD;
+    let b64 = <base64::engine::GeneralPurpose as base64::Engine>::encode(&engine, &mp4_bytes);
+
+    let client = gemini_client("gemini-2.5-pro");
+    let messages = vec![Message::user_multimodal(vec![
+        ContentPart::Text("Describe this video in one sentence.".into()),
+        ContentPart::VideoBase64 {
+            media: MediaData {
+                mime_type: "video/mp4".into(),
+                data: b64,
+                filename: Some("tiny.mp4".into()),
+            },
+        },
+    ])];
+
+    // The model may legitimately refuse a non-decodable stream — what we're
+    // really asserting here is that the request shape reaches Gemini
+    // (i.e. `inline_data` survived JSON serialisation), the auth succeeds,
+    // and we get *some* assistant reply back rather than a transport error.
+    let reply = client
+        .chat(&messages, None)
+        .await
+        .expect("Gemini video chat must succeed (request shape + auth)");
+    let body = reply
+        .content
+        .as_ref()
+        .map(|c| c.full_text())
+        .unwrap_or_default();
+    assert!(
+        !body.trim().is_empty(),
+        "Gemini returned empty reply for video request: {reply:?}"
     );
 }
