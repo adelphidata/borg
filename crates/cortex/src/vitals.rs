@@ -5,7 +5,9 @@
 //! events from baseline. HMAC chain prevents tampering; rate limiting caps
 //! impact per category per hour to prevent gaming.
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use tokio::sync::Mutex as AsyncMutex;
 use regex::Regex;
 use std::fmt;
 use std::sync::LazyLock;
@@ -741,29 +743,30 @@ pub fn format_drift_notice(drift: &[DriftFlag]) -> Option<String> {
 /// but rusqlite::Connection is !Sync.
 /// Lifecycle hook that records vitals events to SQLite on agent interactions.
 pub struct VitalsHook {
-    db: std::sync::Mutex<Database>,
+    db: AsyncMutex<Database>,
 }
 
 impl VitalsHook {
     /// Create a new vitals hook, opening a database connection.
-    pub fn new() -> anyhow::Result<Self> {
+    pub async fn new() -> anyhow::Result<Self> {
         Ok(Self {
-            db: std::sync::Mutex::new(Database::open()?),
+            db: AsyncMutex::new(Database::open().await?),
         })
     }
 
-    fn record(&self, category: EventCategory, source: &str) {
+    async fn record(&self, category: EventCategory, source: &str) {
         let deltas = deltas_for(category);
-        let Ok(db) = self.db.lock() else {
-            tracing::warn!("vitals: mutex poisoned, skipping event");
-            return;
-        };
-        if let Err(e) = db.record_vitals_event(&category.to_string(), source, &deltas, None) {
+        let db = self.db.lock().await;
+        if let Err(e) = db
+            .record_vitals_event(&category.to_string(), source, &deltas, None)
+            .await
+        {
             tracing::warn!("vitals: failed to record event: {e}");
         }
     }
 }
 
+#[async_trait]
 impl Hook for VitalsHook {
     fn name(&self) -> &str {
         "vitals"
@@ -777,23 +780,24 @@ impl Hook for VitalsHook {
         ]
     }
 
-    fn execute(&self, ctx: &HookContext) -> HookAction {
+    async fn execute(&self, ctx: &HookContext) -> HookAction {
         match &ctx.data {
             HookData::SessionStart { .. } => {
-                self.record(EventCategory::Interaction, "session_start");
+                self.record(EventCategory::Interaction, "session_start").await;
             }
             HookData::AgentStart { user_message } => {
                 if looks_like_negative_sentiment(user_message) {
-                    self.record(EventCategory::NegativeSentiment, "user_message");
+                    self.record(EventCategory::NegativeSentiment, "user_message")
+                        .await;
                 } else if looks_like_correction(user_message) {
-                    self.record(EventCategory::Correction, "user_message");
+                    self.record(EventCategory::Correction, "user_message").await;
                 } else {
-                    self.record(EventCategory::Interaction, "user_message");
+                    self.record(EventCategory::Interaction, "user_message").await;
                 }
             }
             HookData::ToolResult { name, is_error, .. } => {
                 let category = classify_tool(name, *is_error);
-                self.record(category, name);
+                self.record(category, name).await;
             }
             _ => {}
         }

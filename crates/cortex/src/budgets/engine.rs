@@ -14,8 +14,10 @@
 //! `pre_flight` refuses.
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
+use turso::params;
+
+use crate::db::Database;
 
 use super::usd::Usd;
 
@@ -100,15 +102,16 @@ impl BudgetEngine {
     /// Decide whether a call estimated at `estimate` USD is allowed for
     /// `principal_scope` (e.g. `"principal:p1"`). The daemon-wide `default`
     /// budget is always considered; the lower remaining headroom wins.
-    pub fn pre_flight(
-        conn: &Connection,
+    pub async fn pre_flight(
+        db: &Database,
         principal_scope: Option<&str>,
         estimate: Usd,
     ) -> Result<PreFlightDecision> {
-        let default = Self::load_row(conn, "default")?
+        let default = Self::load_row(db, "default")
+            .await?
             .ok_or_else(|| anyhow!("default budget row missing — schema not applied"))?;
         let principal = match principal_scope {
-            Some(s) if s != "default" => Self::load_row(conn, s)?,
+            Some(s) if s != "default" => Self::load_row(db, s).await?,
             _ => None,
         };
 
@@ -136,18 +139,20 @@ impl BudgetEngine {
                 "period_start": binding.current_period_start,
             })
             .to_string();
-            conn.execute(
-                "INSERT INTO provider_call_events
-                 (event_type, budget_scope, usd_cost, metadata_json, created_at)
-                 VALUES ('budget_hit', ?1, ?2, ?3, ?4)",
-                params![
-                    binding.scope,
-                    estimate.to_storage_string(),
-                    metadata,
-                    chrono::Utc::now().timestamp(),
-                ],
-            )
-            .context("failed to write budget_hit event")?;
+            db.conn()
+                .execute(
+                    "INSERT INTO provider_call_events
+                     (event_type, budget_scope, usd_cost, metadata_json, created_at)
+                     VALUES ('budget_hit', ?1, ?2, ?3, ?4)",
+                    params!(
+                        binding.scope.clone(),
+                        estimate.to_storage_string(),
+                        metadata,
+                        chrono::Utc::now().timestamp(),
+                    ),
+                )
+                .await
+                .context("failed to write budget_hit event")?;
             return Ok(PreFlightDecision::HardRefuse {
                 scope: binding.scope.clone(),
                 hard_cap: binding.hard_cap,
@@ -164,16 +169,18 @@ impl BudgetEngine {
             {
                 // Mark the toast as fired for this period so subsequent
                 // pre-flights inside the same period are quiet.
-                conn.execute(
-                    "UPDATE budgets SET last_soft_toast_period = ?1, updated_at = ?2
-                     WHERE scope = ?3",
-                    params![
-                        binding.current_period_start,
-                        chrono::Utc::now().timestamp(),
-                        binding.scope,
-                    ],
-                )
-                .context("failed to update last_soft_toast_period")?;
+                db.conn()
+                    .execute(
+                        "UPDATE budgets SET last_soft_toast_period = ?1, updated_at = ?2
+                         WHERE scope = ?3",
+                        params!(
+                            binding.current_period_start,
+                            chrono::Utc::now().timestamp(),
+                            binding.scope.clone(),
+                        ),
+                    )
+                    .await
+                    .context("failed to update last_soft_toast_period")?;
                 return Ok(PreFlightDecision::SoftWarn {
                     soft_cap,
                     spent: binding.current_spent,
@@ -190,8 +197,8 @@ impl BudgetEngine {
     /// from the budget standpoint (overshoots are absorbed; the *next*
     /// pre-flight refuses).
     #[allow(clippy::too_many_arguments)]
-    pub fn post_flight(
-        conn: &Connection,
+    pub async fn post_flight(
+        db: &Database,
         principal_scope: Option<&str>,
         provider_id: &str,
         model: &str,
@@ -203,144 +210,202 @@ impl BudgetEngine {
         session_id: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        // Use IMMEDIATE so a concurrent reset/post_flight sees serialized state.
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        // BEGIN IMMEDIATE so a concurrent reset/post_flight sees serialized state.
+        db.conn()
+            .execute_batch("BEGIN IMMEDIATE;")
+            .await
             .context("failed to begin post_flight transaction")?;
-
-        // Bump default; bump principal if it exists.
-        Self::bump_spent(&tx, "default", actual, now)?;
-        if let Some(scope) = principal_scope {
-            if scope != "default" {
-                // Only bump if the row exists (ignore if no per-principal cap).
-                let exists: i64 = tx
-                    .query_row(
-                        "SELECT COUNT(*) FROM budgets WHERE scope = ?1",
-                        params![scope],
-                        |r| r.get(0),
-                    )
-                    .context("failed to check principal budget row")?;
-                if exists > 0 {
-                    Self::bump_spent(&tx, scope, actual, now)?;
+        let res: Result<()> = async {
+            // Bump default; bump principal if it exists.
+            Self::bump_spent(db, "default", actual, now).await?;
+            if let Some(scope) = principal_scope {
+                if scope != "default" {
+                    // Only bump if the row exists (ignore if no per-principal cap).
+                    let mut rows = db
+                        .conn()
+                        .query(
+                            "SELECT COUNT(*) FROM budgets WHERE scope = ?1",
+                            params!(scope),
+                        )
+                        .await?;
+                    let exists: i64 = match rows.next().await? {
+                        Some(r) => r.get::<i64>(0)?,
+                        None => 0,
+                    };
+                    if exists > 0 {
+                        Self::bump_spent(db, scope, actual, now).await?;
+                    }
                 }
             }
+
+            let metadata = json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cached_tokens": cached_tokens,
+            })
+            .to_string();
+
+            db.conn()
+                .execute(
+                    "INSERT INTO provider_call_events
+                     (event_type, provider_id, model, rate_card_effective_at,
+                      prompt_tokens, completion_tokens, cached_tokens,
+                      usd_cost, budget_scope, metadata_json, session_id, created_at)
+                     VALUES ('provider_call', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params!(
+                        provider_id,
+                        model,
+                        rate_card_effective_at,
+                        prompt_tokens as i64,
+                        completion_tokens as i64,
+                        cached_tokens as i64,
+                        actual.to_storage_string(),
+                        principal_scope.unwrap_or("default").to_string(),
+                        metadata,
+                        session_id.map(|s| s.to_string()),
+                        now,
+                    ),
+                )
+                .await
+                .context("failed to write provider_call event")?;
+            Ok(())
         }
+        .await;
 
-        let metadata = json!({
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": cached_tokens,
-        })
-        .to_string();
-
-        tx.execute(
-            "INSERT INTO provider_call_events
-             (event_type, provider_id, model, rate_card_effective_at,
-              prompt_tokens, completion_tokens, cached_tokens,
-              usd_cost, budget_scope, metadata_json, session_id, created_at)
-             VALUES ('provider_call', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                provider_id,
-                model,
-                rate_card_effective_at,
-                prompt_tokens as i64,
-                completion_tokens as i64,
-                cached_tokens as i64,
-                actual.to_storage_string(),
-                principal_scope.unwrap_or("default"),
-                metadata,
-                session_id,
-                now,
-            ],
-        )
-        .context("failed to write provider_call event")?;
-
-        tx.commit().context("failed to commit post_flight")?;
-        Ok(())
+        match res {
+            Ok(()) => {
+                db.conn()
+                    .execute_batch("COMMIT;")
+                    .await
+                    .context("failed to commit post_flight")?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(rb) = db.conn().execute_batch("ROLLBACK;").await {
+                    tracing::warn!("post_flight rollback failed: {rb}");
+                }
+                Err(e)
+            }
+        }
     }
 
-    fn bump_spent(conn: &Connection, scope: &str, delta: Usd, now: i64) -> Result<()> {
-        let current: String = conn
-            .query_row(
+    async fn bump_spent(db: &Database, scope: &str, delta: Usd, now: i64) -> Result<()> {
+        let mut rows = db
+            .conn()
+            .query(
                 "SELECT current_spent_usd FROM budgets WHERE scope = ?1",
-                params![scope],
-                |r| r.get(0),
+                params!(scope),
             )
+            .await
             .with_context(|| format!("failed to read current_spent_usd for scope '{scope}'"))?;
+        let current: String = match rows.next().await? {
+            Some(r) => r.get::<String>(0)?,
+            None => return Err(anyhow!("budget scope '{scope}' missing")),
+        };
+        drop(rows);
         let new_spent = Usd::parse(&current)? + delta;
-        conn.execute(
-            "UPDATE budgets SET current_spent_usd = ?1, updated_at = ?2 WHERE scope = ?3",
-            params![new_spent.to_storage_string(), now, scope],
-        )
-        .with_context(|| format!("failed to update current_spent_usd for scope '{scope}'"))?;
+        db.conn()
+            .execute(
+                "UPDATE budgets SET current_spent_usd = ?1, updated_at = ?2 WHERE scope = ?3",
+                params!(new_spent.to_storage_string(), now, scope),
+            )
+            .await
+            .with_context(|| format!("failed to update current_spent_usd for scope '{scope}'"))?;
         Ok(())
     }
 
     /// Daemon tick: zero spend on rows whose period has elapsed and write a
     /// `budget_reset` event recording the prior spend. Returns the number
     /// of rows reset.
-    pub fn reset_if_due(conn: &Connection, now: i64) -> Result<usize> {
-        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+    pub async fn reset_if_due(db: &Database, now: i64) -> Result<usize> {
+        db.conn()
+            .execute_batch("BEGIN IMMEDIATE;")
+            .await
             .context("failed to begin reset_if_due transaction")?;
 
-        let mut stmt = tx
-            .prepare(
-                "SELECT id, scope, reset_period, hard_cap_usd, soft_cap_usd,
-                        current_spent_usd, current_period_start, last_soft_toast_period
-                 FROM budgets",
-            )
-            .context("failed to prepare budget scan")?;
-        let rows: Vec<BudgetRow> = stmt
-            .query_map([], Self::row_from_db)?
-            .collect::<Result<Vec<_>, _>>()
-            .context("failed to read budget rows")?;
-        drop(stmt);
-
-        let mut count = 0;
-        for row in rows {
-            if now < row.period_end() {
-                continue;
+        let res: Result<usize> = async {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT id, scope, reset_period, hard_cap_usd, soft_cap_usd,
+                            current_spent_usd, current_period_start, last_soft_toast_period
+                     FROM budgets",
+                    (),
+                )
+                .await
+                .context("failed to scan budgets")?;
+            let mut budget_rows: Vec<BudgetRow> = Vec::new();
+            while let Some(row) = rows.next().await? {
+                budget_rows.push(Self::row_from_db(&row)?);
             }
-            let prior = row.current_spent;
-            let new_period_start = row.current_period_start + row.period_secs();
-            tx.execute(
-                "UPDATE budgets
-                 SET current_spent_usd = '0',
-                     current_period_start = ?1,
-                     last_soft_toast_period = NULL,
-                     updated_at = ?2
-                 WHERE scope = ?3",
-                params![new_period_start, now, row.scope],
-            )
-            .with_context(|| format!("failed to reset scope '{}'", row.scope))?;
-            let metadata = json!({
-                "prior_spent_usd": prior.to_storage_string(),
-                "prior_period_start": row.current_period_start,
-                "new_period_start": new_period_start,
-            })
-            .to_string();
-            tx.execute(
-                "INSERT INTO provider_call_events
-                 (event_type, budget_scope, usd_cost, metadata_json, created_at)
-                 VALUES ('budget_reset', ?1, ?2, ?3, ?4)",
-                params![row.scope, prior.to_storage_string(), metadata, now],
-            )
-            .context("failed to write budget_reset event")?;
-            count += 1;
-        }
+            drop(rows);
 
-        tx.commit().context("failed to commit reset")?;
-        Ok(count)
+            let mut count = 0usize;
+            for row in budget_rows {
+                if now < row.period_end() {
+                    continue;
+                }
+                let prior = row.current_spent;
+                let new_period_start = row.current_period_start + row.period_secs();
+                db.conn()
+                    .execute(
+                        "UPDATE budgets
+                         SET current_spent_usd = '0',
+                             current_period_start = ?1,
+                             last_soft_toast_period = NULL,
+                             updated_at = ?2
+                         WHERE scope = ?3",
+                        params!(new_period_start, now, row.scope.clone()),
+                    )
+                    .await
+                    .with_context(|| format!("failed to reset scope '{}'", row.scope))?;
+                let metadata = json!({
+                    "prior_spent_usd": prior.to_storage_string(),
+                    "prior_period_start": row.current_period_start,
+                    "new_period_start": new_period_start,
+                })
+                .to_string();
+                db.conn()
+                    .execute(
+                        "INSERT INTO provider_call_events
+                         (event_type, budget_scope, usd_cost, metadata_json, created_at)
+                         VALUES ('budget_reset', ?1, ?2, ?3, ?4)",
+                        params!(row.scope, prior.to_storage_string(), metadata, now),
+                    )
+                    .await
+                    .context("failed to write budget_reset event")?;
+                count += 1;
+            }
+            Ok(count)
+        }
+        .await;
+
+        match res {
+            Ok(count) => {
+                db.conn()
+                    .execute_batch("COMMIT;")
+                    .await
+                    .context("failed to commit reset")?;
+                Ok(count)
+            }
+            Err(e) => {
+                if let Err(rb) = db.conn().execute_batch("ROLLBACK;").await {
+                    tracing::warn!("reset_if_due rollback failed: {rb}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Snapshot of `current_spent_usd` and `hard_cap_usd` for the binding
     /// scope (used by `/status`). Returns `None` if no budget exists.
-    pub fn status_snapshot(
-        conn: &Connection,
+    pub async fn status_snapshot(
+        db: &Database,
         principal_scope: Option<&str>,
     ) -> Result<Option<BudgetStatus>> {
-        let default = Self::load_row(conn, "default")?;
+        let default = Self::load_row(db, "default").await?;
         let principal = match principal_scope {
-            Some(s) if s != "default" => Self::load_row(conn, s)?,
+            Some(s) if s != "default" => Self::load_row(db, s).await?,
             _ => None,
         };
         let binding = match (default, principal) {
@@ -366,44 +431,37 @@ impl BudgetEngine {
         }))
     }
 
-    fn load_row(conn: &Connection, scope: &str) -> Result<Option<BudgetRow>> {
-        conn.query_row(
-            "SELECT id, scope, reset_period, hard_cap_usd, soft_cap_usd,
-                    current_spent_usd, current_period_start, last_soft_toast_period
-             FROM budgets WHERE scope = ?1",
-            params![scope],
-            Self::row_from_db,
-        )
-        .optional()
-        .with_context(|| format!("failed to load budget row '{scope}'"))
+    async fn load_row(db: &Database, scope: &str) -> Result<Option<BudgetRow>> {
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT id, scope, reset_period, hard_cap_usd, soft_cap_usd,
+                        current_spent_usd, current_period_start, last_soft_toast_period
+                 FROM budgets WHERE scope = ?1",
+                params!(scope),
+            )
+            .await
+            .with_context(|| format!("failed to load budget row '{scope}'"))?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(Self::row_from_db(&row)?)),
+            None => Ok(None),
+        }
     }
 
-    fn row_from_db(row: &rusqlite::Row<'_>) -> rusqlite::Result<BudgetRow> {
-        let _id: String = row.get(0)?;
-        let scope: String = row.get(1)?;
-        let reset_period_str: String = row.get(2)?;
-        let hard_cap_str: String = row.get(3)?;
-        let soft_cap_str: Option<String> = row.get(4)?;
-        let current_spent_str: String = row.get(5)?;
-        let current_period_start: i64 = row.get(6)?;
-        let last_soft_toast_period: Option<i64> = row.get(7)?;
+    fn row_from_db(row: &turso::Row) -> Result<BudgetRow> {
+        let _id: String = row.get::<String>(0)?;
+        let scope: String = row.get::<String>(1)?;
+        let reset_period_str: String = row.get::<String>(2)?;
+        let hard_cap_str: String = row.get::<String>(3)?;
+        let soft_cap_str: Option<String> = row.get::<Option<String>>(4)?;
+        let current_spent_str: String = row.get::<String>(5)?;
+        let current_period_start: i64 = row.get::<i64>(6)?;
+        let last_soft_toast_period: Option<i64> = row.get::<Option<i64>>(7)?;
 
-        let reset_period = ResetPeriod::from_db(&reset_period_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, e.into())
-        })?;
-        let hard_cap = Usd::parse(&hard_cap_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into())
-        })?;
-        let soft_cap = soft_cap_str
-            .as_deref()
-            .map(Usd::parse)
-            .transpose()
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
-            })?;
-        let current_spent = Usd::parse(&current_spent_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
-        })?;
+        let reset_period = ResetPeriod::from_db(&reset_period_str)?;
+        let hard_cap = Usd::parse(&hard_cap_str)?;
+        let soft_cap = soft_cap_str.as_deref().map(Usd::parse).transpose()?;
+        let current_spent = Usd::parse(&current_spent_str)?;
 
         Ok(BudgetRow {
             scope,

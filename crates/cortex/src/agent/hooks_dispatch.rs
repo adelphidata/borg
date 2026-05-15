@@ -21,7 +21,7 @@ impl Agent {
         }
     }
 
-    pub(super) fn fire_after_tool_hook(
+    pub(super) async fn fire_after_tool_hook(
         hook_registry: &mut HookRegistry,
         session_id: &str,
         turn_count: u32,
@@ -38,6 +38,6 @@ impl Agent {
                 is_error: result.starts_with("Error:"),
             },
         };
-        hook_registry.dispatch(&hook_ctx);
+        hook_registry.dispatch(&hook_ctx).await;
     }
 }

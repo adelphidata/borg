@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -285,6 +286,7 @@ impl ScriptHook {
     }
 }
 
+#[async_trait]
 impl Hook for ScriptHook {
     fn name(&self) -> &str {
         &self.name
@@ -294,7 +296,7 @@ impl Hook for ScriptHook {
         &self.points
     }
 
-    fn execute(&self, ctx: &HookContext) -> HookAction {
+    async fn execute(&self, ctx: &HookContext) -> HookAction {
         with_panic_guard(&self.name, || self.execute_inner(ctx))
     }
 }

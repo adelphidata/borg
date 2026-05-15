@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use tracing::{debug, trace};
 
 mod script;
@@ -104,13 +105,18 @@ pub enum HookAction {
 }
 
 /// Trait for implementing lifecycle hooks on the agent loop.
+///
+/// `execute` is async because hooks routinely persist state to the
+/// turso-backed `Database`, whose entire surface is async post-Phase-4.
+/// The trait stays object-safe via `#[async_trait]`.
+#[async_trait]
 pub trait Hook: Send + Sync {
     /// Human-readable hook name for logging.
     fn name(&self) -> &str;
     /// Which hook points this hook listens on.
     fn points(&self) -> &[HookPoint];
     /// Execute the hook and return an action.
-    fn execute(&self, ctx: &HookContext) -> HookAction;
+    async fn execute(&self, ctx: &HookContext) -> HookAction;
 }
 
 /// Registry of lifecycle hooks dispatched during the agent loop.
@@ -140,7 +146,7 @@ impl HookRegistry {
     }
 
     /// Dispatch a hook context to all registered hooks. Returns merged action.
-    pub fn dispatch(&self, ctx: &HookContext) -> HookAction {
+    pub async fn dispatch(&self, ctx: &HookContext) -> HookAction {
         let mut result = HookAction::Continue;
 
         for hook in &self.hooks {
@@ -151,7 +157,7 @@ impl HookRegistry {
             // Fires per (hook × dispatch_point) — up to ~30 lines/turn at
             // DEBUG, which drowns the actual signal. TRACE is the right level.
             trace!("Dispatching {:?} to hook '{}'", ctx.point, hook.name());
-            match hook.execute(ctx) {
+            match hook.execute(ctx).await {
                 HookAction::Continue => {}
                 HookAction::InjectContext(text) => {
                     result = match result {
@@ -195,6 +201,7 @@ mod tests {
         action: HookAction,
     }
 
+    #[async_trait]
     impl Hook for TestHook {
         fn name(&self) -> &str {
             &self.name
@@ -202,7 +209,7 @@ mod tests {
         fn points(&self) -> &[HookPoint] {
             &self.points
         }
-        fn execute(&self, _ctx: &HookContext) -> HookAction {
+        async fn execute(&self, _ctx: &HookContext) -> HookAction {
             self.action.clone()
         }
     }
