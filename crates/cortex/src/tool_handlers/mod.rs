@@ -271,7 +271,7 @@ mod tests {
         let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
         // Expected count varies by platform because `computer_use` is gated
         // by `[computer_use] enabled`, which defaults on for macOS only.
-        let expected_all = if cfg!(target_os = "macos") { 18 } else { 17 };
+        let expected_all = if cfg!(target_os = "macos") { 19 } else { 18 };
         assert_eq!(
             names.len(),
             expected_all,
