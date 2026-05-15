@@ -1,11 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::api::TelegramClient;
+use crate::constants::TELEGRAM_TYPING_KEEPALIVE_INTERVAL;
 use crate::typing_keepalive::{self, TypingIndicatorHandle, TypingKeepaliveConfig};
-
-/// Keepalive interval for re-sending typing action (Telegram typing expires ~5s).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Handle to a running typing indicator. Call `stop()` to clean up.
 pub struct TypingIndicator {
@@ -22,7 +19,7 @@ impl TypingIndicator {
         let inner = TypingIndicatorHandle::start(move |stop_rx| {
             Box::pin(async move {
                 let config = TypingKeepaliveConfig {
-                    keepalive_interval: KEEPALIVE_INTERVAL,
+                    keepalive_interval: TELEGRAM_TYPING_KEEPALIVE_INTERVAL,
                     label: "telegram",
                 };
                 typing_keepalive::run_keepalive(config, stop_rx, || {

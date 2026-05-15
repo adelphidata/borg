@@ -1,13 +1,10 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use tracing::warn;
 
 use super::api::SlackClient;
+use crate::constants::SLACK_TYPING_KEEPALIVE_INTERVAL;
 use crate::typing_keepalive::{self, TypingIndicatorHandle, TypingKeepaliveConfig};
-
-/// Keepalive interval for re-sending typing status.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Reaction emoji added to the user's message while typing.
 const TYPING_REACTION: &str = "thinking_face";
@@ -50,7 +47,7 @@ impl TypingIndicator {
                 }
 
                 let config = TypingKeepaliveConfig {
-                    keepalive_interval: KEEPALIVE_INTERVAL,
+                    keepalive_interval: SLACK_TYPING_KEEPALIVE_INTERVAL,
                     label: "slack",
                 };
                 typing_keepalive::run_keepalive(config, stop_rx, || {

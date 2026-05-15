@@ -1,11 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use super::api::DiscordClient;
+use crate::constants::DISCORD_TYPING_KEEPALIVE_INTERVAL;
 use crate::typing_keepalive::{self, TypingIndicatorHandle, TypingKeepaliveConfig};
-
-/// Keepalive interval for re-sending typing indicator (Discord typing lasts ~10s).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
 
 /// Discord API endpoint path for triggering typing indicator.
 #[cfg(test)]
@@ -28,7 +25,7 @@ impl TypingIndicator {
         let inner = TypingIndicatorHandle::start(move |stop_rx| {
             Box::pin(async move {
                 let config = TypingKeepaliveConfig {
-                    keepalive_interval: KEEPALIVE_INTERVAL,
+                    keepalive_interval: DISCORD_TYPING_KEEPALIVE_INTERVAL,
                     label: "discord",
                 };
                 typing_keepalive::run_keepalive(config, stop_rx, || {

@@ -84,6 +84,11 @@ pub const SLACK_TYPING_CB_FAILURE_THRESHOLD: u32 = 2;
 /// Slack typing indicator circuit breaker: suspension duration in seconds.
 pub const SLACK_TYPING_CB_SUSPENSION_SECS: u64 = 60;
 
+/// Slack typing indicator re-post interval. Slack's `assistant.threads.setStatus`
+/// fades quickly so we re-post on a tight 3s cadence; higher values produce a
+/// visible flicker in the client.
+pub const SLACK_TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(3);
+
 // ── Discord ───────────────────────────────────────────────────────
 
 /// Discord REST API base URL.
@@ -91,6 +96,17 @@ pub const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
 /// Discord message max length.
 pub const DISCORD_MESSAGE_CHUNK_SIZE: usize = 2000;
+
+/// Discord typing indicator re-trigger interval. Discord's typing indicator
+/// auto-expires after ~10s; 8s keeps it stable with one second of slack for
+/// jittery network round-trips.
+pub const DISCORD_TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
+
+// ── Telegram (typing) ─────────────────────────────────────────────
+
+/// Telegram `sendChatAction("typing")` re-trigger interval. Telegram clears
+/// the action after ~5s, so we re-issue at 4s to avoid a noticeable blink.
+pub const TELEGRAM_TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
 
 // ── Twilio ────────────────────────────────────────────────────────
 
