@@ -1,0 +1,1052 @@
+//! Native Gemini AI Studio adapter (generateContent / streamGenerateContent).
+//!
+//! This file lands in three milestones:
+//!
+//! - **M2 (this commit)** — request builder, non-streaming response parser,
+//!   error mapping, schema sanitisation, role/part conversion. The streaming
+//!   methods are placeholders that fail loudly with `LlmError::Fatal` so a
+//!   premature dispatch is obvious in logs.
+//! - **M3** — fills `parse_stream_line` and `new_stream_state` for SSE,
+//!   driven by `GeminiStreamState`.
+//! - **M4** — flips `Provider::Gemini.is_openai_compatible()` to `false` and
+//!   wires `transport.endpoint()` into the dispatcher for Gemini.
+//!
+//! Vertex AI's Gemini variant is intentionally *not* served by this adapter
+//! — Vertex auth (service-account OAuth, regionalised endpoints) lives in
+//! `crate::llm::vertex`. This file is for the AI Studio API-key endpoint at
+//! `generativelanguage.googleapis.com` only.
+
+use anyhow::{Context, Result};
+use serde_json::{json, Value};
+
+use super::transport::{Transport, TransportRequest, TransportResponse};
+use super::{llm_error::FailoverReason, LlmError, Message, Role, ToolDefinition, UsageData};
+use crate::types::{ContentPart, FunctionCall, MessageContent, ToolCall};
+
+/// Default AI Studio base URL. Override via `BORG_GEMINI_BASE_URL` (for tests
+/// pointing at `wiremock`) or via `llm.base_url` for self-hosted relays.
+const DEFAULT_GEMINI_BASE: &str = "https://generativelanguage.googleapis.com";
+
+/// Env var name read by [`GeminiTransport::resolve_base`] to override the
+/// default endpoint at runtime. Documented so the test harness has a single
+/// place to look.
+pub(crate) const GEMINI_BASE_URL_ENV: &str = "BORG_GEMINI_BASE_URL";
+
+pub(crate) struct GeminiTransport;
+
+/// SSE accumulator. M2 only stores the empty struct so the `StreamState`
+/// closed enum has the variant; M3 will use it for SSE buffering across
+/// chunks.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct GeminiStreamState {
+    /// SSE buffer carrying a partial JSON object across chunk boundaries.
+    /// `streamGenerateContent` with `alt=sse` emits one JSON object per
+    /// event, but reqwest can split a single event mid-frame.
+    pub(crate) buf: String,
+    /// Accumulator for the assistant message under construction.
+    pub(crate) accumulator: AssistantAccumulator,
+}
+
+/// Per-stream accumulator. M3 fills these out from incremental SSE events;
+/// M2 leaves it inert.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct AssistantAccumulator {
+    pub(crate) text: String,
+    pub(crate) pending_function_calls: Vec<PendingFunctionCall>,
+    pub(crate) usage: Option<UsageData>,
+    pub(crate) finish_reason: Option<String>,
+}
+
+/// One in-flight function call. Gemini doesn't emit a synthetic call id, so
+/// we mint one of the form `gem_call_<name>_<index>` at finalisation time.
+/// The id stays stable for the next user turn's `functionResponse` matching.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct PendingFunctionCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) args_text: String,
+}
+
+impl GeminiTransport {
+    /// Honour `BORG_GEMINI_BASE_URL` first, then explicit `llm.base_url`,
+    /// then the default AI Studio host. Trailing slashes are trimmed so
+    /// the path we append doesn't accidentally double-slash.
+    fn resolve_base(request: &TransportRequest<'_>) -> String {
+        if let Ok(env) = std::env::var(GEMINI_BASE_URL_ENV) {
+            if !env.is_empty() {
+                return env.trim_end_matches('/').to_string();
+            }
+        }
+        if let Some(b) = request.llm_config.base_url.as_deref() {
+            if !b.is_empty() {
+                return b.trim_end_matches('/').to_string();
+            }
+        }
+        DEFAULT_GEMINI_BASE.to_string()
+    }
+}
+
+impl Transport for GeminiTransport {
+    fn protocol_name(&self) -> &'static str {
+        "gemini-native"
+    }
+
+    fn debug_request_label(&self) -> &'static str {
+        "request_gemini_native"
+    }
+
+    fn endpoint(&self, request: &TransportRequest<'_>, stream: bool) -> Result<String> {
+        let base = Self::resolve_base(request);
+        let model = request.model;
+        let verb = if stream {
+            "streamGenerateContent"
+        } else {
+            "generateContent"
+        };
+        // M2 deliberately does NOT include `?key=...` in the URL. The caller
+        // layer threads credentials in via its existing auth path (mirroring
+        // every other transport). M4's dispatch wiring will route Gemini to
+        // either the API-key header (`x-goog-api-key`) or the query param
+        // depending on operator config — both are accepted by AI Studio. We
+        // keep the endpoint pure here so URL-shape tests don't depend on a
+        // secret being present.
+        if stream {
+            Ok(format!("{base}/v1beta/models/{model}:{verb}?alt=sse"))
+        } else {
+            Ok(format!("{base}/v1beta/models/{model}:{verb}"))
+        }
+    }
+
+    fn build_chat_request(&self, request: &TransportRequest<'_>) -> Result<Value> {
+        Ok(build_gemini_request(request))
+    }
+
+    fn build_streaming_request(
+        &self,
+        request: &TransportRequest<'_>,
+    ) -> std::result::Result<Value, LlmError> {
+        Ok(build_gemini_request(request))
+    }
+
+    fn new_stream_state(&self) -> super::transport::StreamState {
+        super::transport::StreamState::Gemini(GeminiStreamState::default())
+    }
+
+    fn parse_stream_line(
+        &self,
+        _line: &str,
+        _provider: &str,
+        _model: &str,
+        _state: &mut super::transport::StreamState,
+    ) -> crate::sse::SseAction {
+        // M3 implements SSE parsing. Until then the adapter is not wired
+        // into the dispatcher (gated by `Provider::Gemini.is_openai_compatible()`
+        // still returning true), so this path is unreachable from production
+        // code — keeping it `Continue` rather than panicking means a stray
+        // test wiring won't crash the loop.
+        crate::sse::SseAction::Continue
+    }
+
+    fn parse_chat_response(
+        &self,
+        response: Value,
+        provider: &str,
+        model: &str,
+    ) -> Result<TransportResponse> {
+        parse_gemini_response(response, provider, model)
+    }
+}
+
+// ── Request building ─────────────────────────────────────────────────────
+
+/// Build the full Gemini `generateContent` request body from a Borg
+/// `TransportRequest`. Pure function — every shape decision is in one place
+/// so the unit tests can exercise it end-to-end without spawning the
+/// transport.
+fn build_gemini_request(request: &TransportRequest<'_>) -> Value {
+    let (contents, system_instruction) = build_contents_and_system(request.messages);
+
+    let mut body = json!({
+        "contents": contents,
+        "safetySettings": safety_settings_block(),
+        "generationConfig": generation_config(request),
+    });
+
+    if let Some(system_text) = system_instruction {
+        body["systemInstruction"] = json!({
+            "parts": [{"text": system_text}],
+        });
+    }
+
+    if let Some(tools) = request.tools {
+        if !tools.is_empty() {
+            body["tools"] = json!([{
+                "functionDeclarations": tools
+                    .iter()
+                    .map(tool_definition_to_function_declaration)
+                    .collect::<Vec<_>>(),
+            }]);
+            // Default AUTO — let the model decide whether to call a tool.
+            body["toolConfig"] = json!({
+                "functionCallingConfig": {"mode": "AUTO"},
+            });
+        }
+    }
+
+    body
+}
+
+/// Split Borg messages into a Gemini `contents` array and a single optional
+/// `systemInstruction` string. All `Role::System` messages are concatenated
+/// (Gemini accepts only one); the rest map per the role table in the M2
+/// spec doc.
+fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String>) {
+    let mut system_chunks: Vec<String> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    // We need the previous assistant turn's function-call names so a
+    // following `Role::Tool` can fill in `functionResponse.name` (Gemini
+    // matches function-call ↔ response by name + ordinal, not by id).
+    let mut last_assistant_call_names: Vec<String> = Vec::new();
+    let mut pending_tool_responses: Vec<Value> = Vec::new();
+
+    let flush_tool_responses = |contents: &mut Vec<Value>, pending: &mut Vec<Value>| {
+        if !pending.is_empty() {
+            contents.push(json!({
+                "role": "user",
+                "parts": std::mem::take(pending),
+            }));
+        }
+    };
+
+    for msg in messages {
+        match msg.role {
+            Role::System => {
+                if let Some(text) = msg.text_content() {
+                    if !text.is_empty() {
+                        system_chunks.push(text.to_string());
+                    }
+                }
+            }
+            Role::User => {
+                flush_tool_responses(&mut contents, &mut pending_tool_responses);
+                let parts = message_to_user_parts(msg);
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "user", "parts": parts}));
+                }
+            }
+            Role::Assistant => {
+                flush_tool_responses(&mut contents, &mut pending_tool_responses);
+                let (parts, call_names) = message_to_model_parts(msg);
+                last_assistant_call_names = call_names;
+                if !parts.is_empty() {
+                    contents.push(json!({"role": "model", "parts": parts}));
+                }
+            }
+            Role::Tool => {
+                // Match this tool result to the corresponding prior call by
+                // ordinal: the first tool message after an assistant turn
+                // fills slot 0, the second fills slot 1, etc.
+                let name = last_assistant_call_names
+                    .get(pending_tool_responses.len())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        // No matching call — log + fall back to a synthetic
+                        // name so the request is still well-formed. Silently
+                        // dropping the result would mask the agent's progress.
+                        tracing::warn!(
+                            "gemini adapter: tool result has no matching prior functionCall — using placeholder name"
+                        );
+                        "unknown_tool".to_string()
+                    });
+                let content_text = msg.text_content().unwrap_or("").to_string();
+                pending_tool_responses.push(json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": {"content": content_text},
+                    }
+                }));
+            }
+        }
+    }
+    flush_tool_responses(&mut contents, &mut pending_tool_responses);
+
+    let system = if system_chunks.is_empty() {
+        None
+    } else {
+        Some(system_chunks.join("\n\n"))
+    };
+    (contents, system)
+}
+
+fn message_to_user_parts(msg: &Message) -> Vec<Value> {
+    match &msg.content {
+        Some(MessageContent::Text(t)) if !t.is_empty() => vec![json!({"text": t})],
+        Some(MessageContent::Parts(parts)) => parts.iter().map(content_part_to_value).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Returns (parts, function_call_names_in_order). The names list lets the
+/// following `Role::Tool` messages fill in `functionResponse.name`.
+fn message_to_model_parts(msg: &Message) -> (Vec<Value>, Vec<String>) {
+    let mut parts: Vec<Value> = Vec::new();
+    let mut call_names: Vec<String> = Vec::new();
+
+    match &msg.content {
+        Some(MessageContent::Text(t)) if !t.is_empty() => {
+            parts.push(json!({"text": t}));
+        }
+        Some(MessageContent::Parts(content_parts)) => {
+            for part in content_parts {
+                parts.push(content_part_to_value(part));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(tool_calls) = &msg.tool_calls {
+        for tc in tool_calls {
+            let args_value: Value =
+                serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        "gemini adapter: tool call args not valid JSON ({}); wrapping in _raw",
+                        e
+                    );
+                    json!({"_raw": tc.function.arguments})
+                });
+            parts.push(json!({
+                "functionCall": {
+                    "name": tc.function.name,
+                    "args": args_value,
+                }
+            }));
+            call_names.push(tc.function.name.clone());
+        }
+    }
+
+    (parts, call_names)
+}
+
+fn content_part_to_value(part: &ContentPart) -> Value {
+    match part {
+        ContentPart::Text(t) => json!({"text": t}),
+        ContentPart::ImageBase64 { media } => json!({
+            "inline_data": {
+                "mime_type": media.mime_type,
+                "data": media.data,
+            }
+        }),
+        ContentPart::ImageUrl { url } => {
+            // M2 surfaces this as a text placeholder; SSRF-safe URL fetch
+            // belongs in the vision_analyze path (M5), not the LLM adapter.
+            json!({"text": format!("[image: {url}]")})
+        }
+        ContentPart::AudioBase64 { media } => json!({
+            "inline_data": {
+                "mime_type": media.mime_type,
+                "data": media.data,
+            }
+        }),
+        ContentPart::VideoBase64 { media } => json!({
+            "inline_data": {
+                "mime_type": media.mime_type,
+                "data": media.data,
+            }
+        }),
+    }
+}
+
+/// Convert a Borg `ToolDefinition` into a Gemini `functionDeclarations`
+/// entry, stripping JSON-Schema constructs Gemini doesn't accept. We mutate
+/// a clone, never the original (the same `ToolDefinition` may be sent to
+/// other providers in the same turn under fallback).
+fn tool_definition_to_function_declaration(tool: &ToolDefinition) -> Value {
+    let mut params = tool.function.parameters.clone();
+    sanitize_schema_for_gemini(&mut params);
+    json!({
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "parameters": params,
+    })
+}
+
+/// Recursively strip JSON-Schema keys that Gemini's subset rejects. Drift
+/// to `oneOf` / `anyOf` / `allOf` etc. would make the whole request 400 —
+/// safer to drop the constraint and let the model misbehave once than to
+/// fail every turn.
+pub(crate) fn sanitize_schema_for_gemini(value: &mut Value) {
+    if let Value::Object(map) = value {
+        // Hard-banned keys. `additionalProperties` would surface as an
+        // INVALID_ARGUMENT and kill the request.
+        for k in &[
+            "additionalProperties",
+            "$schema",
+            "$ref",
+            "definitions",
+            "oneOf",
+            "anyOf",
+            "allOf",
+        ] {
+            if map.remove(*k).is_some() {
+                tracing::warn!(
+                    "gemini adapter: stripped unsupported schema key `{}` from tool parameters",
+                    k
+                );
+            }
+        }
+        // `format` is conditionally accepted (Gemini supports date-time and
+        // enum). Drop anything else so the request is well-formed; the
+        // model still sees the field by name.
+        if let Some(format) = map.get("format").and_then(Value::as_str) {
+            if !matches!(format, "date-time" | "enum") {
+                map.remove("format");
+            }
+        }
+        for (_, v) in map.iter_mut() {
+            sanitize_schema_for_gemini(v);
+        }
+    } else if let Value::Array(arr) = value {
+        for v in arr.iter_mut() {
+            sanitize_schema_for_gemini(v);
+        }
+    }
+}
+
+fn generation_config(request: &TransportRequest<'_>) -> Value {
+    let cfg = &request.llm_config;
+    let mut obj = serde_json::Map::new();
+    obj.insert("temperature".into(), json!(cfg.temperature));
+    obj.insert("maxOutputTokens".into(), json!(cfg.max_tokens));
+    Value::Object(obj)
+}
+
+/// Borg is an agent loop; the default Gemini safety thresholds block
+/// legitimate discussion of e.g. shell commands. The four categories are
+/// deliberately set to `BLOCK_NONE`, matching the no-safety-prompt stance
+/// the agent already takes with Anthropic and OpenAI.
+fn safety_settings_block() -> Value {
+    json!([
+        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+    ])
+}
+
+// ── Response parsing ─────────────────────────────────────────────────────
+
+fn parse_gemini_response(
+    response: Value,
+    provider: &str,
+    model: &str,
+) -> Result<TransportResponse> {
+    // Prompt-level safety block: the request never reached the model. Map
+    // to `LlmError::Fatal { reason: Unknown }` via `anyhow::bail!` — surfacing
+    // this as success would mislead the agent into thinking it got a reply.
+    if let Some(block_reason) = response
+        .get("promptFeedback")
+        .and_then(|f| f.get("blockReason"))
+        .and_then(Value::as_str)
+    {
+        anyhow::bail!("gemini blocked prompt: {block_reason}");
+    }
+
+    let candidates = response
+        .get("candidates")
+        .and_then(Value::as_array)
+        .context("gemini response missing `candidates`")?;
+    let candidate = candidates
+        .first()
+        .context("gemini response had empty `candidates`")?;
+
+    // Candidate-level safety/recitation blocks: also surface as errors.
+    if let Some(finish) = candidate.get("finishReason").and_then(Value::as_str) {
+        if matches!(finish, "SAFETY" | "RECITATION") {
+            anyhow::bail!("gemini candidate blocked: {finish}");
+        }
+    }
+
+    let parts = candidate
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut text_accum = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if let Some(text) = part.get("text").and_then(Value::as_str) {
+            text_accum.push_str(text);
+        } else if let Some(fc) = part.get("functionCall") {
+            let name = fc
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
+            let arguments = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            tool_calls.push(ToolCall {
+                id: synth_call_id(&name, idx),
+                call_type: "function".into(),
+                function: FunctionCall { name, arguments },
+            });
+        }
+    }
+
+    let content = if text_accum.is_empty() {
+        None
+    } else {
+        Some(MessageContent::Text(text_accum))
+    };
+
+    let tool_calls = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(tool_calls)
+    };
+
+    let message = Message {
+        role: Role::Assistant,
+        content,
+        tool_calls,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    let usage = response.get("usageMetadata").map(|u| {
+        let pick = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+        UsageData {
+            prompt_tokens: pick("promptTokenCount"),
+            completion_tokens: pick("candidatesTokenCount"),
+            total_tokens: pick("totalTokenCount"),
+            cached_input_tokens: pick("cachedContentTokenCount"),
+            cache_creation_tokens: 0,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            provider_cost_usd: None,
+        }
+    });
+
+    Ok(TransportResponse { message, usage })
+}
+
+/// Synthesize a stable id for a Gemini function call so subsequent tool
+/// results can be matched back to it. M3's streaming path uses the same
+/// scheme to stay consistent across streaming/non-streaming.
+fn synth_call_id(name: &str, idx: usize) -> String {
+    format!("gem_call_{name}_{idx}")
+}
+
+// ── Error classification (entry point for M4 dispatch) ───────────────────
+
+/// Map a Gemini error body to an `LlmError`. Wired by M4 once the
+/// dispatcher routes Gemini through this adapter. Kept here so the wiring
+/// only needs to import one symbol.
+#[allow(dead_code)]
+pub(crate) fn classify_gemini_error(status: u16, body: &str) -> LlmError {
+    let retry_after = parse_retry_after_seconds(body);
+    let reason_text = sanitized_message(body);
+
+    match status {
+        400 => LlmError::Fatal {
+            source: anyhow::anyhow!("gemini 400 invalid request: {reason_text}"),
+            reason: FailoverReason::Format,
+        },
+        401 | 403 => LlmError::Fatal {
+            source: anyhow::anyhow!("gemini {status} auth denied: {reason_text}"),
+            reason: FailoverReason::AuthPermanent,
+        },
+        404 => LlmError::Fatal {
+            source: anyhow::anyhow!("gemini 404 model not found: {reason_text}"),
+            reason: FailoverReason::ModelNotFound,
+        },
+        429 => LlmError::Retryable {
+            source: anyhow::anyhow!("gemini 429 rate limited: {reason_text}"),
+            retry_after,
+            reason: FailoverReason::RateLimit,
+        },
+        500 | 502 | 503 | 504 => LlmError::Retryable {
+            source: anyhow::anyhow!("gemini {status} provider unavailable: {reason_text}"),
+            retry_after: None,
+            reason: FailoverReason::Overloaded,
+        },
+        _ => LlmError::Retryable {
+            source: anyhow::anyhow!("gemini {status}: {reason_text}"),
+            retry_after,
+            reason: FailoverReason::Unknown,
+        },
+    }
+}
+
+/// Parse Gemini's `RetryInfo.retryDelay: "37s"` from a JSON error body.
+/// Falls back to `None` if the field is missing or malformed.
+fn parse_retry_after_seconds(body: &str) -> Option<std::time::Duration> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let details = v.get("error")?.get("details")?.as_array()?;
+    for d in details {
+        if let Some(delay) = d.get("retryDelay").and_then(Value::as_str) {
+            if let Some(secs) = delay.strip_suffix('s') {
+                if let Ok(n) = secs.parse::<f64>() {
+                    return Some(std::time::Duration::from_secs_f64(n));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Pull `error.message` from a JSON body if present, else fall back to the
+/// raw body. Keeps the user-facing error message tight.
+fn sanitized_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.chars().take(200).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LlmConfig;
+    use crate::llm::Provider;
+    use crate::types::{FunctionDefinition, MediaData};
+
+    fn make_request<'a>(
+        messages: &'a [Message],
+        tools: Option<&'a [ToolDefinition]>,
+        cfg: &'a LlmConfig,
+    ) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::Gemini,
+            model: "gemini-2.5-flash",
+            messages,
+            tools,
+            llm_config: cfg,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        }
+    }
+
+    fn default_cfg() -> LlmConfig {
+        let mut cfg = LlmConfig::default();
+        cfg.temperature = 0.7;
+        cfg.max_tokens = 4096;
+        cfg
+    }
+
+    #[test]
+    fn build_request_text_only_user_message() {
+        let msgs = vec![Message::user("hi")];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&msgs, None, &cfg));
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn build_request_collapses_multiple_system_messages_into_system_instruction() {
+        // Gemini allows only one systemInstruction — if Borg passes more than
+        // one System message, joining with `\n\n` keeps every instruction
+        // intact instead of silently dropping all but the first.
+        let msgs = vec![
+            Message::system("rule one"),
+            Message::system("rule two"),
+            Message::user("ok"),
+        ];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&msgs, None, &cfg));
+        let sys = body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap();
+        assert!(sys.contains("rule one"));
+        assert!(sys.contains("rule two"));
+        assert!(sys.contains("\n\n"), "expected double-newline join");
+    }
+
+    #[test]
+    fn build_request_assistant_message_uses_model_role() {
+        // The single rejection case Gemini will not forgive: a turn labelled
+        // `"assistant"` instead of `"model"` 400s every time.
+        let msgs = vec![Message::assistant("hello"), Message::user("hi")];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&msgs, None, &cfg));
+        let roles: Vec<&str> = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["model", "user"]);
+        assert!(!roles.contains(&"assistant"));
+    }
+
+    #[test]
+    fn build_request_tool_role_becomes_function_response_on_user_turn() {
+        // Gemini matches tool result ↔ prior call by name + ordinal, not id.
+        // The assistant's `functionCall.name` must flow into the next user
+        // turn's `functionResponse.name` — if it doesn't, the model has no
+        // way to correlate the result to the request.
+        let assistant_with_call = Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_abc".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "vision_analyze".into(),
+                    arguments: r#"{"image_url":"x"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        };
+        let tool_result = Message::tool_result("call_abc", "the image shows a cat");
+        let msgs = vec![Message::user("look"), assistant_with_call, tool_result];
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&msgs, None, &cfg));
+
+        // Find the user turn carrying the functionResponse.
+        let contents = body["contents"].as_array().unwrap();
+        let tool_user_turn = contents
+            .iter()
+            .find(|c| {
+                c["parts"]
+                    .as_array()
+                    .map(|p| p.iter().any(|x| x.get("functionResponse").is_some()))
+                    .unwrap_or(false)
+            })
+            .expect("expected a tool-result user turn");
+        let fr = &tool_user_turn["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "vision_analyze");
+        assert_eq!(fr["response"]["content"], "the image shows a cat");
+    }
+
+    #[test]
+    fn build_request_image_base64_maps_to_inline_data() {
+        let msg = Message::user_multimodal(vec![ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".into(),
+                data: "Zm9v".into(),
+                filename: None,
+            },
+        }]);
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[msg], None, &cfg));
+        let part = &body["contents"][0]["parts"][0];
+        assert_eq!(part["inline_data"]["mime_type"], "image/png");
+        assert_eq!(part["inline_data"]["data"], "Zm9v");
+    }
+
+    #[test]
+    fn build_request_video_base64_maps_to_inline_data() {
+        // The whole reason this adapter exists. A regression here means
+        // `video_analyze` is silently broken on Gemini.
+        let msg = Message::user_multimodal(vec![ContentPart::VideoBase64 {
+            media: MediaData {
+                mime_type: "video/mp4".into(),
+                data: "AAAA".into(),
+                filename: Some("clip.mp4".into()),
+            },
+        }]);
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[msg], None, &cfg));
+        let part = &body["contents"][0]["parts"][0];
+        assert_eq!(part["inline_data"]["mime_type"], "video/mp4");
+        assert_eq!(part["inline_data"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn build_request_tool_call_args_parsed_to_object() {
+        // Gemini requires `args` as a JSON object, not a stringified JSON.
+        // Borg stores OpenAI-shaped string arguments; the conversion has to
+        // happen in the adapter or the model sees `{"x": "{\"y\":1}"}`.
+        let assistant = Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "x".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "fn".into(),
+                    arguments: r#"{"y":1}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        };
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[assistant], None, &cfg));
+        let fc = &body["contents"][0]["parts"][0]["functionCall"];
+        assert_eq!(fc["name"], "fn");
+        assert!(
+            fc["args"].is_object(),
+            "expected args to be a JSON object, got {}",
+            fc["args"]
+        );
+        assert_eq!(fc["args"]["y"], 1);
+    }
+
+    #[test]
+    fn build_request_tool_call_args_invalid_json_falls_back_to_raw_wrapper() {
+        // A malformed arguments string should never crash request building —
+        // wrap it in `{"_raw": ...}` so the model at least sees that
+        // something was attempted, and emit a warn for observability.
+        let assistant = Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "x".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "fn".into(),
+                    arguments: "not-json".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        };
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[assistant], None, &cfg));
+        let args = &body["contents"][0]["parts"][0]["functionCall"]["args"];
+        assert!(args.is_object());
+        assert_eq!(args["_raw"], "not-json");
+    }
+
+    #[test]
+    fn build_request_sanitize_schema_strips_unsupported_keys() {
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "oneOf": [{"type": "string"}],
+            "properties": {
+                "name": {"type": "string", "format": "email"},
+                "ts": {"type": "string", "format": "date-time"},
+            }
+        });
+        sanitize_schema_for_gemini(&mut schema);
+        assert!(schema.get("additionalProperties").is_none());
+        assert!(schema.get("oneOf").is_none());
+        // `format: email` is unsupported -> stripped; `format: date-time`
+        // is in Gemini's accepted set -> preserved.
+        assert!(schema["properties"]["name"].get("format").is_none());
+        assert_eq!(schema["properties"]["ts"]["format"], "date-time");
+    }
+
+    #[test]
+    fn build_request_includes_tool_declarations() {
+        let tool = ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "vision_analyze".into(),
+                description: "look at an image".into(),
+                parameters: json!({"type":"object","properties":{}}),
+            },
+        };
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[Message::user("hi")], Some(&[tool]), &cfg));
+        let decls = body["tools"][0]["functionDeclarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["name"], "vision_analyze");
+        assert_eq!(body["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
+    }
+
+    #[test]
+    fn build_request_sets_safety_settings_to_block_none() {
+        // Borg deliberately disables Gemini's default safety filters
+        // (matching its stance on Anthropic and OpenAI) so the agent can
+        // discuss shell commands, security topics, etc. without surprise
+        // block-by-default rejections.
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(&[Message::user("hi")], None, &cfg));
+        let settings = body["safetySettings"].as_array().unwrap();
+        assert_eq!(settings.len(), 4);
+        for s in settings {
+            assert_eq!(s["threshold"], "BLOCK_NONE");
+        }
+    }
+
+    #[test]
+    fn build_request_generation_config_maps_temperature_and_max_tokens() {
+        let mut cfg = default_cfg();
+        cfg.temperature = 0.3;
+        cfg.max_tokens = 1234;
+        let body = build_gemini_request(&make_request(&[Message::user("hi")], None, &cfg));
+        let gc = &body["generationConfig"];
+        // serde JSON renders f32 as a number; compare via f64.
+        assert!((gc["temperature"].as_f64().unwrap() - 0.3).abs() < 1e-6);
+        assert_eq!(gc["maxOutputTokens"], 1234);
+    }
+
+    #[test]
+    fn parse_response_with_function_call_returns_tool_call() {
+        let resp = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "Let me check."},
+                        {"functionCall": {"name": "vision_analyze", "args": {"url": "x"}}}
+                    ]
+                },
+                "finishReason": "STOP"
+            }]
+        });
+        let parsed = parse_gemini_response(resp, "gemini", "gemini-2.5-flash").unwrap();
+        let msg = parsed.message;
+        assert_eq!(msg.role, Role::Assistant);
+        let tcs = msg.tool_calls.as_ref().unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "vision_analyze");
+        // arguments round-trip back to the original JSON object.
+        let args: Value = serde_json::from_str(&tcs[0].function.arguments).unwrap();
+        assert_eq!(args["url"], "x");
+        assert!(msg.content.is_some());
+    }
+
+    #[test]
+    fn parse_response_safety_block_returns_error() {
+        // promptFeedback.blockReason means the *prompt* was refused before
+        // the model ran. Surfacing this as `Ok(empty)` would silently lie
+        // to the agent loop; bail loudly instead.
+        let resp = json!({
+            "promptFeedback": {"blockReason": "SAFETY"}
+        });
+        let err = match parse_gemini_response(resp, "gemini", "gemini-2.5-flash") {
+            Err(e) => e,
+            Ok(_) => panic!("expected safety-block error, got Ok"),
+        };
+        assert!(err.to_string().contains("SAFETY"));
+    }
+
+    #[test]
+    fn parse_response_candidate_safety_block_returns_error() {
+        let resp = json!({
+            "candidates": [{"finishReason": "SAFETY", "content": {"parts": []}}]
+        });
+        let err = match parse_gemini_response(resp, "gemini", "gemini-2.5-flash") {
+            Err(e) => e,
+            Ok(_) => panic!("expected candidate-block error, got Ok"),
+        };
+        assert!(err.to_string().contains("SAFETY"));
+    }
+
+    #[test]
+    fn parse_response_usage_metadata_maps_correctly() {
+        let resp = json!({
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {
+                "promptTokenCount": 42,
+                "candidatesTokenCount": 17,
+                "totalTokenCount": 59,
+                "cachedContentTokenCount": 8
+            }
+        });
+        let parsed = parse_gemini_response(resp, "gemini", "gemini-2.5-flash").unwrap();
+        let usage = parsed.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 42);
+        assert_eq!(usage.completion_tokens, 17);
+        assert_eq!(usage.total_tokens, 59);
+        assert_eq!(usage.cached_input_tokens, 8);
+    }
+
+    #[test]
+    fn classify_error_429_extracts_retry_after_from_details() {
+        let body = r#"{
+            "error": {
+                "code": 429,
+                "message": "Quota exceeded",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"@type": "...RetryInfo", "retryDelay": "37s"}]
+            }
+        }"#;
+        let err = classify_gemini_error(429, body);
+        match err {
+            LlmError::Retryable {
+                retry_after,
+                reason,
+                ..
+            } => {
+                assert_eq!(reason, FailoverReason::RateLimit);
+                let ra = retry_after.expect("expected retry_after");
+                assert!((ra.as_secs_f64() - 37.0).abs() < 0.01);
+            }
+            other => unreachable!("expected Retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_403_is_auth_permanent() {
+        let body = r#"{"error":{"message":"API key not valid"}}"#;
+        let err = classify_gemini_error(403, body);
+        match err {
+            LlmError::Fatal { reason, .. } => assert_eq!(reason, FailoverReason::AuthPermanent),
+            other => unreachable!("expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_error_503_is_retryable_overloaded() {
+        let err = classify_gemini_error(503, "{\"error\":{\"message\":\"unavailable\"}}");
+        match err {
+            LlmError::Retryable { reason, .. } => assert_eq!(reason, FailoverReason::Overloaded),
+            other => unreachable!("expected Retryable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn endpoint_non_streaming_uses_generate_content_path() {
+        let cfg = default_cfg();
+        let msgs: Vec<Message> = Vec::new();
+        let req = make_request(&msgs, None, &cfg);
+        // Clear env so the default base is used.
+        // SAFETY: tests run single-threaded per binary in cargo test by default;
+        // and the env var is one we own.
+        unsafe {
+            std::env::remove_var(GEMINI_BASE_URL_ENV);
+        }
+        let url = GeminiTransport.endpoint(&req, false).unwrap();
+        assert!(url.starts_with(DEFAULT_GEMINI_BASE));
+        assert!(url.ends_with(":generateContent"));
+        assert!(url.contains("/models/gemini-2.5-flash:"));
+    }
+
+    #[test]
+    fn endpoint_streaming_uses_stream_path_with_alt_sse() {
+        let cfg = default_cfg();
+        let msgs: Vec<Message> = Vec::new();
+        let req = make_request(&msgs, None, &cfg);
+        unsafe {
+            std::env::remove_var(GEMINI_BASE_URL_ENV);
+        }
+        let url = GeminiTransport.endpoint(&req, true).unwrap();
+        assert!(url.ends_with("streamGenerateContent?alt=sse"));
+    }
+
+    #[test]
+    fn endpoint_respects_borg_gemini_base_url_env_override() {
+        let cfg = default_cfg();
+        let msgs: Vec<Message> = Vec::new();
+        let req = make_request(&msgs, None, &cfg);
+        // SAFETY: env mutation; this test owns this variable name.
+        unsafe {
+            std::env::set_var(GEMINI_BASE_URL_ENV, "http://127.0.0.1:9999");
+        }
+        let url = GeminiTransport.endpoint(&req, false).unwrap();
+        unsafe {
+            std::env::remove_var(GEMINI_BASE_URL_ENV);
+        }
+        assert!(
+            url.starts_with("http://127.0.0.1:9999/"),
+            "expected override to win, got {url}"
+        );
+    }
+}

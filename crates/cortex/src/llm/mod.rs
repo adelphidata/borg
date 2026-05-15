@@ -102,6 +102,7 @@ pub(crate) mod cloud_auth;
 mod cost;
 pub mod credential_pool;
 pub mod credential_sources;
+pub(crate) mod gemini;
 pub mod llm_error;
 pub mod model_registry;
 pub mod oauth_refresh;

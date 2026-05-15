@@ -28,6 +28,11 @@ pub(crate) enum StreamState {
     OpenAiCompat,
     Anthropic(AnthropicStreamState),
     Bedrock(BedrockStreamState),
+    /// Native Gemini SSE accumulator. M2 only adds the variant so the
+    /// closed enum has space for it; M3 fills in
+    /// `parse_stream_line`'s Gemini branch.
+    #[allow(dead_code)]
+    Gemini(crate::llm::gemini::GeminiStreamState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +91,7 @@ static OPENAI_COMPAT_TRANSPORT: OpenAiCompatTransport = OpenAiCompatTransport;
 static ANTHROPIC_TRANSPORT: AnthropicTransport = AnthropicTransport;
 static BEDROCK_TRANSPORT: BedrockTransport = BedrockTransport;
 static VERTEX_ANTHROPIC_TRANSPORT: VertexAnthropicTransport = VertexAnthropicTransport;
+static GEMINI_TRANSPORT: crate::llm::gemini::GeminiTransport = crate::llm::gemini::GeminiTransport;
 
 pub(crate) fn openai_compat_transport() -> &'static dyn Transport {
     &OPENAI_COMPAT_TRANSPORT
@@ -101,6 +107,13 @@ pub(crate) fn bedrock_transport() -> &'static dyn Transport {
 
 pub(crate) fn vertex_anthropic_transport() -> &'static dyn Transport {
     &VERTEX_ANTHROPIC_TRANSPORT
+}
+
+/// Native Gemini AI Studio transport. M4 wires this into the dispatcher;
+/// until then it's exercised only by its own unit tests.
+#[allow(dead_code)]
+pub(crate) fn gemini_transport() -> &'static dyn Transport {
+    &GEMINI_TRANSPORT
 }
 
 pub(crate) fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
