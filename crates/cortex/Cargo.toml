@@ -33,7 +33,7 @@ which = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-util = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true }
+turso = { workspace = true }
 scraper = { workspace = true }
 cron = { workspace = true }
 regex = { workspace = true }
@@ -95,5 +95,5 @@ workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 libc = { workspace = true }
 wiremock = "0.5"
-rusqlite = { workspace = true }
+turso = { workspace = true }
 wasm-encoder = "0.244"
