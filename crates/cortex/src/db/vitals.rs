@@ -220,7 +220,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::db::rollback_tx(&self.conn, "vitals record_event");
                 Err(e)
             }
         }
@@ -407,7 +407,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::db::rollback_tx(&self.conn, "vitals record_bond_event");
                 Err(e)
             }
         }
@@ -743,7 +743,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::db::rollback_tx(&self.conn, "vitals record_evolution_event");
                 Err(e)
             }
         }

@@ -35,7 +35,7 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::db::rollback_tx(&self.conn, "settings populate_defaults");
                 Err(e)
             }
         }

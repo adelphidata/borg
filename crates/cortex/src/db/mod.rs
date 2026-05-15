@@ -49,6 +49,21 @@ use tracing::instrument;
 
 use crate::config::Config;
 
+/// Roll back a transaction, logging (but not propagating) any failure.
+///
+/// `ROLLBACK` itself can fail when the connection is in a degraded state
+/// (e.g. SQLITE_BUSY, schema drift, pre-aborted tx). The original error
+/// that triggered the rollback path has already been captured by the caller
+/// — this helper exists so the rollback failure shows up in logs instead of
+/// disappearing into a `let _ =`. `context` identifies which transaction
+/// (e.g. `"settings populate_defaults"`) so a stuck/dirty connection is
+/// debuggable.
+pub(crate) fn rollback_tx(conn: &Connection, context: &str) {
+    if let Err(e) = conn.execute_batch("ROLLBACK") {
+        tracing::warn!("ROLLBACK failed in {context}: {e} (transaction may remain open)");
+    }
+}
+
 /// SQLite database for structured data (session metadata, scheduled tasks, task runs).
 pub struct Database {
     conn: Connection,
@@ -152,11 +167,21 @@ impl Database {
     }
 
     /// Restrict DB file to owner-only access on Unix.
+    ///
+    /// A failure here means the DB file may be world-readable. We can't
+    /// propagate (the caller path is open()/init), but a silent skip would
+    /// hide a real security regression — log loudly so it shows up in
+    /// `daemon.err` and can be picked up by the doctor sweep.
     fn set_file_permissions(path: &Path) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    "failed to set 0o600 on DB file {}: {e} (file may be world-readable)",
+                    path.display()
+                );
+            }
         }
         let _ = path; // suppress unused warning on non-unix
     }

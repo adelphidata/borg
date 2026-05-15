@@ -202,7 +202,7 @@ impl Database {
 
         let result = self.claim_due_tasks_inner(now);
         if result.is_err() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            crate::db::rollback_tx(&self.conn, "tasks claim_due_tasks");
         }
         result
     }
@@ -478,7 +478,7 @@ impl Database {
                 self.conn.execute_batch("COMMIT")?;
             }
             Err(_) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::db::rollback_tx(&self.conn, "tasks acquire_daemon_lock");
             }
         }
         result
