@@ -663,6 +663,44 @@ mod tests {
         assert!(!allowed_in_plan_mode_name(tn::UPDATE_GOAL));
     }
 
+    /// `Tool::ComputerUse` is the only variant whose plan-mode gate is
+    /// action-discriminated. This guards both the inner predicate
+    /// (`computer_use::action_allowed_in_plan_mode`) and the wiring through
+    /// `Tool::allowed_in_plan_mode` — so the parsed and pre-parse paths can't
+    /// drift. If they ever do, a mutating action (click/type/key/…) could
+    /// silently slip through Plan mode.
+    #[test]
+    fn computer_use_plan_mode_gates_per_action() {
+        // (action-name, expected `allowed_in_plan_mode`).
+        // Read-only: capture / list_apps / wait. Everything else mutates.
+        let cases: &[(&str, bool)] = &[
+            ("capture", true),
+            ("list_apps", true),
+            ("wait", true),
+            ("click", false),
+            ("double_click", false),
+            ("right_click", false),
+            ("middle_click", false),
+            ("drag", false),
+            ("scroll", false),
+            ("type", false),
+            ("key", false),
+            ("set_value", false),
+            ("focus_app", false),
+        ];
+        for (action, expected) in cases {
+            let tool = Tool::parse(tn::COMPUTER_USE, json!({"action": action}))
+                .unwrap_or_else(|e| panic!("parse computer_use action={action}: {e}"));
+            assert_eq!(
+                tool.allowed_in_plan_mode(),
+                *expected,
+                "drift on computer_use action `{action}`: \
+                 allowed_in_plan_mode={} expected={expected}",
+                tool.allowed_in_plan_mode()
+            );
+        }
+    }
+
     #[test]
     fn parallel_safe_matches_legacy_dispatcher() {
         // The pre-refactor `dispatch_parallel_safe_tool` table is the
