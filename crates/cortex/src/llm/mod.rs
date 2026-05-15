@@ -572,7 +572,7 @@ impl LlmClient {
     }
 
     /// Create a new LLM client from config (resolves provider and API keys).
-    pub fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         let (provider, keys) = config.resolve_api_keys()?;
         // Air-gap policy: when `providers.outbound_allowed = false` we refuse
         // any non-Local provider before constructing the client so no HTTP
@@ -622,9 +622,9 @@ impl LlmClient {
         // Try to build the primary credential pool. Best-effort: falls back
         // to legacy rotation when the DB is unreachable (tests, headless
         // embedded usage, first-boot before borgd has stamped a DB file).
-        let primary_pool = (provider.supports_credential_pool()
-            && keys.iter().any(|k| !k.is_empty()))
-        .then(|| {
+        let primary_pool = if provider.supports_credential_pool()
+            && keys.iter().any(|k| !k.is_empty())
+        {
             credential_pool::try_build_from_keys(
                 provider,
                 keys.clone(),
@@ -634,13 +634,15 @@ impl LlmClient {
                 config.llm.proactive_rate_limit_threshold_pct,
                 config.llm.proactive_rate_limit_min_window_secs,
             )
-        })
-        .flatten();
+            .await
+        } else {
+            None
+        };
 
         // Build provider-level failover slots
         let mut provider_slots = Vec::new();
         for fb in &config.llm.fallback {
-            match Self::resolve_fallback_slot(fb, config) {
+            match Self::resolve_fallback_slot(fb, config).await {
                 Ok(slot) => {
                     if let Err(e) = crate::providers::ProviderRegistry::check_builtin_air_gap(
                         slot.provider,
@@ -806,7 +808,7 @@ impl LlmClient {
     }
 
     /// Resolve a fallback config into a ProviderSlot.
-    fn resolve_fallback_slot(
+    async fn resolve_fallback_slot(
         fb: &crate::config::LlmFallback,
         config: &Config,
     ) -> Result<ProviderSlot> {
@@ -863,19 +865,22 @@ impl LlmClient {
             bail!("No API keys found for fallback provider {provider}");
         }
 
-        let pool = (provider.supports_credential_pool() && slot_keys.iter().any(|k| !k.is_empty()))
-            .then(|| {
-                credential_pool::try_build_from_keys(
-                    provider,
-                    slot_keys.clone(),
-                    config.llm.credential_strategy,
-                    config.llm.credential_cooldown_secs,
-                    config.llm.max_concurrent_per_credential,
-                    config.llm.proactive_rate_limit_threshold_pct,
-                    config.llm.proactive_rate_limit_min_window_secs,
-                )
-            })
-            .flatten();
+        let pool = if provider.supports_credential_pool()
+            && slot_keys.iter().any(|k| !k.is_empty())
+        {
+            credential_pool::try_build_from_keys(
+                provider,
+                slot_keys.clone(),
+                config.llm.credential_strategy,
+                config.llm.credential_cooldown_secs,
+                config.llm.max_concurrent_per_credential,
+                config.llm.proactive_rate_limit_threshold_pct,
+                config.llm.proactive_rate_limit_min_window_secs,
+            )
+            .await
+        } else {
+            None
+        };
 
         Ok(ProviderSlot {
             provider,
