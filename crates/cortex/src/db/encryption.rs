@@ -7,7 +7,7 @@
 //! secret storage. The KEK never leaves the keystore; only the derived
 //! sub-key reaches Turso.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -35,7 +35,7 @@ pub fn derive_db_hexkey(kek_bytes: &[u8]) -> Result<String> {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), kek_bytes);
     let mut okm = [0u8; KEY_LEN];
     hk.expand(HKDF_INFO, &mut okm)
-        .context("HKDF expand failed for turso db key")?;
+        .map_err(|e| anyhow::anyhow!("HKDF expand failed for turso db key: {e}"))?;
     Ok(hex_encode(&okm))
 }
 

@@ -273,12 +273,12 @@ impl Database {
         if !read_only {
             db.run_migrations().await?;
             // INSERT OR IGNORE preserves existing user overrides; idempotent.
-            db.ensure_all_settings()?;
+            db.ensure_all_settings().await?;
         }
         let salt = if read_only {
             Vec::new()
         } else {
-            db.get_or_create_hmac_salt()?
+            db.get_or_create_hmac_salt().await?
         };
         Ok(Self {
             conn: db.conn,
@@ -373,8 +373,8 @@ impl Database {
 
     /// Get or create a per-installation random salt for HMAC key derivation.
     /// Stored in the meta table so it persists across restarts but is unique per install.
-    fn get_or_create_hmac_salt(&self) -> Result<Vec<u8>> {
-        if let Some(hex) = self.get_meta("hmac_salt")? {
+    async fn get_or_create_hmac_salt(&self) -> Result<Vec<u8>> {
+        if let Some(hex) = self.get_meta("hmac_salt").await? {
             if hex.len() == 64 {
                 let bytes: Result<Vec<u8>, _> = (0..hex.len())
                     .step_by(2)
@@ -396,7 +396,7 @@ impl Database {
             let _ = write!(s, "{b:02x}");
             s
         });
-        self.set_meta("hmac_salt", &hex)?;
+        self.set_meta("hmac_salt", &hex).await?;
         Ok(salt)
     }
 
@@ -478,27 +478,24 @@ impl Database {
             return Ok(());
         }
 
-        const MIGRATIONS: &[fn(&Database) -> Result<()>] = &[Database::migrate_v1];
-        // Compile-time guard: adding a migration without updating CURRENT_VERSION (or vice versa)
-        // will fail the build.
+        // Async fn pointers don't compose into a slice literal the way sync
+        // ones did; the migration set is tiny so a direct dispatch keeps the
+        // CURRENT_VERSION→migrate_vN coupling explicit.
+        if current < 1 {
+            self.migrate_v1().await?;
+        }
         const _: () = assert!(
-            MIGRATIONS.len() == Database::CURRENT_VERSION as usize,
-            "MIGRATIONS array length must match CURRENT_VERSION"
+            Database::CURRENT_VERSION == 1,
+            "add the new migrate_vN call above and bump this constant",
         );
 
-        for (i, migrate_fn) in MIGRATIONS.iter().enumerate() {
-            let version = (i + 1) as u32;
-            if current < version {
-                migrate_fn(self)?;
-            }
-        }
-
-        self.set_meta("schema_version", &Self::CURRENT_VERSION.to_string())?;
+        self.set_meta("schema_version", &Self::CURRENT_VERSION.to_string())
+            .await?;
         Ok(())
     }
 
     pub async fn schema_version(&self) -> Result<u32> {
-        match self.get_meta("schema_version")? {
+        match self.get_meta("schema_version").await? {
             Some(v) => match v.parse() {
                 Ok(n) => Ok(n),
                 Err(_) => {

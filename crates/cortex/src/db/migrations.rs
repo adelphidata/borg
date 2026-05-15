@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use rusqlite::params;
+use turso::params;
 
 use super::Database;
 use crate::constants::{
@@ -11,39 +11,43 @@ use crate::constants::{
 impl Database {
     /// Full schema. Borg has no released DBs, so all prior incremental
     /// migrations were squashed into this single emit-the-final-shape step.
-    pub(super) fn migrate_v1(&self) -> Result<()> {
-        self.conn.execute_batch(&SCHEMA_SQL)?;
-        self.seed_default_tasks()?;
-        self.seed_consolidation_tasks()?;
-        self.seed_maintenance_task()?;
-        self.seed_heartbeat_task()?;
-        self.seed_default_budget()?;
-        self.seed_bundled_rate_cards()?;
+    pub(super) async fn migrate_v1(&self) -> Result<()> {
+        self.conn.execute_batch(SCHEMA_SQL.as_str()).await?;
+        self.seed_default_tasks().await?;
+        self.seed_consolidation_tasks().await?;
+        self.seed_maintenance_task().await?;
+        self.seed_heartbeat_task().await?;
+        self.seed_default_budget().await?;
+        self.seed_bundled_rate_cards().await?;
         Ok(())
     }
 
-    fn seed_bundled_rate_cards(&self) -> Result<()> {
+    async fn seed_bundled_rate_cards(&self) -> Result<()> {
         const BUNDLED_EFFECTIVE_AT: i64 = 1_745_020_800; // 2026-04-19T00:00:00Z
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO provider_rate_cards
-             (provider_id, model, effective_at, prompt_per_mtok_usd,
-              completion_per_mtok_usd, cached_per_mtok_usd, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'bundled')",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "INSERT OR IGNORE INTO provider_rate_cards
+                 (provider_id, model, effective_at, prompt_per_mtok_usd,
+                  completion_per_mtok_usd, cached_per_mtok_usd, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'bundled')",
+            )
+            .await?;
         for entry in crate::pricing::bundled_rate_card_entries() {
-            stmt.execute(params![
+            stmt.execute(params!(
                 entry.provider_id,
                 entry.model,
                 BUNDLED_EFFECTIVE_AT,
                 entry.prompt_per_mtok_usd,
                 entry.completion_per_mtok_usd,
-            ])?;
+            ))
+            .await?;
         }
         Ok(())
     }
 
     /// Built-in default tasks (monthly security audit + daily summary).
-    pub(super) fn seed_default_tasks(&self) -> Result<()> {
+    pub(super) async fn seed_default_tasks(&self) -> Result<()> {
         use crate::task_ids::{DAILY_SUMMARY_TASK_ID, SECURITY_AUDIT_TASK_ID};
         const SECURITY_AUDIT_CRON: &str = "0 0 9 1 * *";
         let next_run = crate::tasks::calculate_next_run("cron", SECURITY_AUDIT_CRON, "local")?;
@@ -52,7 +56,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9)",
-            params![
+            params!(
                 SECURITY_AUDIT_TASK_ID,
                 "Monthly Security Audit",
                 "Run a full security audit and report findings. Check firewall, open ports, SSH config, file permissions, disk encryption, OS updates, and running services.",
@@ -62,8 +66,8 @@ impl Database {
                 next_run,
                 now,
                 SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
-            ],
-        )?;
+            ),
+        ).await?;
 
         const DAILY_SUMMARY_CRON: &str = "0 0 9 * * 1-5";
         let next_run_daily = crate::tasks::calculate_next_run("cron", DAILY_SUMMARY_CRON, "local")?;
@@ -71,7 +75,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9)",
-            params![
+            params!(
                 DAILY_SUMMARY_TASK_ID,
                 "Daily Summary",
                 "Produce a daily standup summary of recent activity. Review sessions, tasks, and memory for what was done, what's planned, and any blockers.",
@@ -81,12 +85,12 @@ impl Database {
                 next_run_daily,
                 now,
                 SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
-            ],
-        )?;
+            ),
+        ).await?;
         Ok(())
     }
 
-    fn seed_consolidation_tasks(&self) -> Result<()> {
+    async fn seed_consolidation_tasks(&self) -> Result<()> {
         let nightly_task_id = crate::memory::consolidation::NIGHTLY_CONSOLIDATION_TASK_ID;
         let weekly_task_id = crate::memory::consolidation::WEEKLY_CONSOLIDATION_TASK_ID;
         let now = chrono::Utc::now().timestamp();
@@ -98,7 +102,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9, ?10, 'prompt')",
-            params![
+            params!(
                 nightly_task_id,
                 "Nightly Memory Consolidation",
                 "Review today's sessions and extract durable information into long-term memory. \
@@ -110,9 +114,9 @@ impl Database {
                 next_nightly,
                 now,
                 SEEDED_WORKFLOW_TIMEOUT_MS,
-                allowed_tools,
-            ],
-        )?;
+                allowed_tools.clone(),
+            ),
+        ).await?;
 
         const WEEKLY_CRON: &str = "0 0 4 * * 7";
         let next_weekly = crate::tasks::calculate_next_run("cron", WEEKLY_CRON, "local")?;
@@ -120,7 +124,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 3, ?9, ?10, 'prompt')",
-            params![
+            params!(
                 weekly_task_id,
                 "Weekly Memory Maintenance",
                 "Review all long-term memory for: (a) duplicate information across entries, \
@@ -134,12 +138,12 @@ impl Database {
                 now,
                 SEEDED_WORKFLOW_TIMEOUT_MS,
                 allowed_tools,
-            ],
-        )?;
+            ),
+        ).await?;
         Ok(())
     }
 
-    fn seed_maintenance_task(&self) -> Result<()> {
+    async fn seed_maintenance_task(&self) -> Result<()> {
         let task_id = crate::maintenance::MAINTENANCE_TASK_ID;
         const MAINTENANCE_CRON: &str = "0 0 2 * * *";
         let now = chrono::Utc::now().timestamp();
@@ -148,7 +152,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, allowed_tools, task_type)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 1, ?9, NULL, 'maintenance')",
-            params![
+            params!(
                 task_id,
                 "Daily Self-Healing Maintenance",
                 "Runs the doctor sweep, prunes old logs and activity rows, heals stalled scheduled tasks, and surfaces persistent warnings. Pure maintenance — does not invoke the LLM.",
@@ -158,12 +162,12 @@ impl Database {
                 next_run,
                 now,
                 SCHEDULED_TASK_DEFAULT_TIMEOUT_MS,
-            ],
-        )?;
+            ),
+        ).await?;
         Ok(())
     }
 
-    fn seed_heartbeat_task(&self) -> Result<()> {
+    async fn seed_heartbeat_task(&self) -> Result<()> {
         let task_id = crate::heartbeat_task::HEARTBEAT_TASK_ID;
         let now = chrono::Utc::now().timestamp();
         let next_run = crate::tasks::calculate_next_run("interval", "30m", "local")?;
@@ -171,7 +175,7 @@ impl Database {
             "INSERT OR IGNORE INTO scheduled_tasks
              (id, name, prompt, schedule_type, schedule_expr, timezone, status, next_run, created_at, max_retries, timeout_ms, delivery_channel, delivery_target, allowed_tools, task_type, pre_run_command, pre_run_cwd, pre_run_timeout_ms, min_interval_secs)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8, 0, ?9, ?10, NULL, NULL, 'heartbeat', NULL, NULL, ?11, ?12)",
-            rusqlite::params![
+            params!(
                 task_id,
                 "Heartbeat",
                 "",
@@ -184,20 +188,20 @@ impl Database {
                 crate::heartbeat_task::BROADCAST_DELIVERY,
                 PRE_RUN_DEFAULT_TIMEOUT_MS,
                 crate::constants::MIN_HEARTBEAT_INTERVAL_SECS as i64,
-            ],
-        )?;
+            ),
+        ).await?;
         Ok(())
     }
 
-    fn seed_default_budget(&self) -> Result<()> {
+    async fn seed_default_budget(&self) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn.execute(
             "INSERT OR IGNORE INTO budgets
              (id, scope, reset_period, hard_cap_usd, soft_cap_usd,
               current_spent_usd, current_period_start, created_at, updated_at)
              VALUES ('default', 'default', 'daily', '20', '5', '0', ?1, ?1, ?1)",
-            params![now],
-        )?;
+            params!(now),
+        ).await?;
         Ok(())
     }
 }

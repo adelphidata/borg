@@ -1,12 +1,12 @@
 use anyhow::Result;
-use rusqlite::params;
+use turso::params;
 
 use super::models::ActivityEntry;
 use super::Database;
 
 impl Database {
     /// Insert an activity log entry with the current unix timestamp.
-    pub fn log_activity(
+    pub async fn log_activity(
         &self,
         level: &str,
         category: &str,
@@ -14,11 +14,13 @@ impl Database {
         detail: Option<&str>,
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn.execute(
-            "INSERT INTO activity_log (level, category, message, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![level, category, message, detail, now],
-        )?;
+        self.conn
+            .execute(
+                "INSERT INTO activity_log (level, category, message, detail, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params!(level, category, message, detail.map(|s| s.to_string()), now),
+            )
+            .await?;
         Ok(())
     }
 
@@ -27,7 +29,7 @@ impl Database {
     /// `min_level` filters by level hierarchy: error > warn > info > debug.
     /// If `None`, defaults to info+ (error, warn, info).
     /// `category` optionally filters to a single category.
-    pub fn query_activity(
+    pub async fn query_activity(
         &self,
         count: usize,
         min_level: Option<&str>,
@@ -44,101 +46,85 @@ impl Database {
         let placeholders: Vec<String> = (1..=levels.len()).map(|i| format!("?{i}")).collect();
         let level_clause = format!("level IN ({})", placeholders.join(", "));
 
-        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
-            if let Some(cat) = category {
-                let param_idx = levels.len() + 1;
-                let count_idx = levels.len() + 2;
-                (
-                    format!(
-                        "SELECT id, level, category, message, detail, created_at
-                     FROM activity_log
-                     WHERE {level_clause} AND category = ?{param_idx}
-                     ORDER BY created_at DESC
-                     LIMIT ?{count_idx}"
-                    ),
-                    {
-                        let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = levels
-                            .iter()
-                            .map(|l| Box::new(l.to_string()) as _)
-                            .collect();
-                        p.push(Box::new(cat.to_string()));
-                        p.push(Box::new(count as i64));
-                        p
-                    },
-                )
-            } else {
-                let count_idx = levels.len() + 1;
-                (
-                    format!(
-                        "SELECT id, level, category, message, detail, created_at
-                     FROM activity_log
-                     WHERE {level_clause}
-                     ORDER BY created_at DESC
-                     LIMIT ?{count_idx}"
-                    ),
-                    {
-                        let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = levels
-                            .iter()
-                            .map(|l| Box::new(l.to_string()) as _)
-                            .collect();
-                        p.push(Box::new(count as i64));
-                        p
-                    },
-                )
-            };
+        let mut values: Vec<turso::Value> = levels
+            .iter()
+            .map(|l| turso::Value::Text((*l).to_string()))
+            .collect();
+        let sql = if let Some(cat) = category {
+            let param_idx = levels.len() + 1;
+            let count_idx = levels.len() + 2;
+            values.push(turso::Value::Text(cat.to_string()));
+            values.push(turso::Value::Integer(count as i64));
+            format!(
+                "SELECT id, level, category, message, detail, created_at
+                 FROM activity_log
+                 WHERE {level_clause} AND category = ?{param_idx}
+                 ORDER BY created_at DESC
+                 LIMIT ?{count_idx}"
+            )
+        } else {
+            let count_idx = levels.len() + 1;
+            values.push(turso::Value::Integer(count as i64));
+            format!(
+                "SELECT id, level, category, message, detail, created_at
+                 FROM activity_log
+                 WHERE {level_clause}
+                 ORDER BY created_at DESC
+                 LIMIT ?{count_idx}"
+            )
+        };
 
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params_vec.iter().map(|p| &**p).collect();
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            Ok(ActivityEntry {
-                id: row.get(0)?,
-                level: row.get(1)?,
-                category: row.get(2)?,
-                message: row.get(3)?,
-                detail: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?;
-
+        let mut stmt = self.conn.prepare(&sql).await?;
+        let mut rows = stmt.query(values).await?;
         let mut entries = Vec::new();
-        for row in rows {
-            entries.push(row?);
+        while let Some(row) = rows.next().await? {
+            entries.push(ActivityEntry {
+                id: row.get::<i64>(0)?,
+                level: row.get::<String>(1)?,
+                category: row.get::<String>(2)?,
+                message: row.get::<String>(3)?,
+                detail: row.get::<Option<String>>(4)?,
+                created_at: row.get::<i64>(5)?,
+            });
         }
         Ok(entries)
     }
 
     /// Delete activity log entries older than the given cutoff timestamp.
     /// Returns the number of deleted rows.
-    pub fn prune_activity_before(&self, cutoff_timestamp: i64) -> Result<usize> {
-        let deleted = self.conn.execute(
-            "DELETE FROM activity_log WHERE created_at < ?1",
-            params![cutoff_timestamp],
-        )?;
-        Ok(deleted)
+    pub async fn prune_activity_before(&self, cutoff_timestamp: i64) -> Result<usize> {
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM activity_log WHERE created_at < ?1",
+                params!(cutoff_timestamp),
+            )
+            .await?;
+        Ok(deleted as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
-    fn test_db() -> Database {
-        Database::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn test_log_and_query_activity() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_log_and_query_activity() {
+        let db = test_db().await;
         db.log_activity(
             "info",
             "migrate",
             "Migration complete: 2 config change(s) applied",
             None,
         )
+        .await
         .unwrap();
         db.log_activity("error", "migrate", "Migration failed: timeout", None)
+            .await
             .unwrap();
         db.log_activity(
             "info",
@@ -146,37 +132,40 @@ mod tests {
             "Gateway listening on 127.0.0.1:7842",
             None,
         )
+        .await
         .unwrap();
 
-        // Query all info+ entries
-        let entries = db.query_activity(50, Some("info"), None).unwrap();
+        let entries = db.query_activity(50, Some("info"), None).await.unwrap();
         assert_eq!(entries.len(), 3);
 
-        // Query filtered by category
         let migrate_entries = db
             .query_activity(50, Some("info"), Some("migrate"))
+            .await
             .unwrap();
         assert_eq!(migrate_entries.len(), 2);
         assert!(migrate_entries.iter().all(|e| e.category == "migrate"));
 
-        // Query errors only — should get only the migrate error
-        let errors = db.query_activity(50, Some("error"), None).unwrap();
+        let errors = db.query_activity(50, Some("error"), None).await.unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].message, "Migration failed: timeout");
     }
 
-    #[test]
-    fn test_log_activity_with_detail() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_log_activity_with_detail() {
+        let db = test_db().await;
         db.log_activity(
             "info",
             "migrate",
             "Migration complete",
             Some("2 config change(s), 1 credential(s)"),
         )
+        .await
         .unwrap();
 
-        let entries = db.query_activity(1, Some("info"), Some("migrate")).unwrap();
+        let entries = db
+            .query_activity(1, Some("info"), Some("migrate"))
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].detail.as_deref(),
@@ -184,17 +173,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_prune_activity() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_prune_activity() {
+        let db = test_db().await;
         db.log_activity("info", "migrate", "old entry", None)
+            .await
             .unwrap();
 
         let now = chrono::Utc::now().timestamp();
-        let pruned = db.prune_activity_before(now + 1).unwrap();
+        let pruned = db.prune_activity_before(now + 1).await.unwrap();
         assert_eq!(pruned, 1);
 
-        let entries = db.query_activity(50, Some("info"), None).unwrap();
+        let entries = db.query_activity(50, Some("info"), None).await.unwrap();
         assert!(entries.is_empty());
     }
 }

@@ -1,32 +1,37 @@
 use anyhow::Result;
-use rusqlite::params;
+use turso::params;
 
 use super::Database;
 
 impl Database {
     // ── Meta key-value ──
 
-    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM meta WHERE key = ?1")?;
-        let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
-        match rows.next() {
-            Some(Ok(val)) => Ok(Some(val)),
-            _ => Ok(None),
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = ?1", params!(key))
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            None => Ok(None),
         }
     }
 
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO meta (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = ?2",
-            params![key, value],
-        )?;
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = ?2",
+                params!(key, value),
+            )
+            .await?;
         Ok(())
     }
 
-    pub fn delete_meta(&self, key: &str) -> Result<()> {
+    pub async fn delete_meta(&self, key: &str) -> Result<()> {
         self.conn
-            .execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+            .execute("DELETE FROM meta WHERE key = ?1", params!(key))
+            .await?;
         Ok(())
     }
 }
