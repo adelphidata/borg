@@ -557,27 +557,49 @@ async fn xai_streams_via_openai_compat_transport() {
     std::env::remove_var(&env_key);
 }
 
-// ── Test: Gemini routes through the OpenAI-compat transport ──
+// ── Test: Gemini routes through the NATIVE transport (M4 flip) ──
 //
-// Mirrors `xai_streams_via_openai_compat_transport`. Gemini's wire endpoint is
-// `…/v1beta/openai/chat/completions` and the auth header must be
-// `Authorization: Bearer …` (not `x-goog-api-key`, which Gemini's *native*
-// API uses but the OpenAI-compat shim does not). Regressions here typically
-// look like 404s from `v1beta/models/...:streamGenerateContent` (the wrong
-// path) or 401s from the native API rejecting a Bearer header.
+// Before M4, Gemini shared the OpenAI-compat transport (POST to
+// `…/v1beta/openai/chat/completions` with `Authorization: Bearer …`),
+// which silently stripped `inline_data` parts so `vision_analyze` /
+// `video_analyze` lost their payloads. After M4 the dispatcher routes
+// Gemini to its own native transport (`gemini_transport()`):
+//   - URL:  `…/v1beta/models/<model>:streamGenerateContent?alt=sse`
+//   - Auth: `x-goog-api-key: <key>` (NOT Bearer — AI Studio rejects
+//           Bearer for raw API keys)
+//   - Body: Gemini-shape (`contents[].parts[].text`, not OpenAI
+//           `messages[].content`)
+//   - SSE:  Gemini chunks (`candidates[0].content.parts[].text` plus
+//           `finishReason: "STOP"`), not OpenAI `choices[].delta`.
+//
+// Regressions here typically look like a) 404s from
+// `/v1beta/openai/chat/completions` (the dispatcher fell back to the
+// compat path), b) 401s from the native API rejecting a Bearer header,
+// or c) empty TextDelta events because the OpenAI SSE parser ignores
+// Gemini chunks. The native-transport `endpoint()` / `build_headers()`
+// / SSE parser unit tests live next to the implementation
+// (`llm/gemini.rs`, `llm/provider.rs`); this test pins the
+// **end-to-end wire behavior** post-flip.
 #[tokio::test]
-async fn gemini_streams_via_openai_compat_transport() {
+async fn gemini_streams_via_native_transport() {
     let server = MockServer::start().await;
 
+    // Gemini SSE: one delta + one final chunk with `finishReason: "STOP"`
+    // + `usageMetadata`. No `[DONE]` sentinel — Google closes the socket.
     let body = sse_body(&[
-        r#"{"choices":[{"delta":{"content":"hi from Gemini"},"finish_reason":null}]}"#,
-        r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":4,"total_tokens":9}}"#,
-        "[DONE]",
+        r#"{"candidates":[{"content":{"parts":[{"text":"hi from Gemini"}]}}]}"#,
+        r#"{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":4,"totalTokenCount":9}}"#,
     ]);
 
+    // Path-match on the native streaming endpoint. The full URL is
+    // `…/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse`;
+    // wiremock `path()` matches the bare path, so the `?alt=sse` query
+    // param is asserted separately below via `received_requests`.
     Mock::given(method("POST"))
-        .and(path("/v1beta/openai/chat/completions"))
-        .and(header("authorization", "Bearer gemini-test-key"))
+        .and(path(
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ))
+        .and(header("x-goog-api-key", "gemini-test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
         .mount(&server)
         .await;
@@ -585,14 +607,15 @@ async fn gemini_streams_via_openai_compat_transport() {
     let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let env_key = format!("BORG_TEST_GEMINI_KEY_{n}");
     std::env::set_var(&env_key, "gemini-test-key");
+    // BORG_GEMINI_BASE_URL is the documented test/relay override and
+    // beats `llm.base_url` — using it here keeps the `compose_gemini_url`
+    // path itself in scope (so a future refactor that broke the env
+    // override would surface in this test).
+    std::env::set_var("BORG_GEMINI_BASE_URL", server.uri());
 
     let mut config = Config::default();
     config.llm.provider = Some("gemini".into());
     config.llm.api_key_env = env_key.clone();
-    // Point at the mock — overrides the static base_url and bypasses the
-    // `normalize_gemini_base` Google-host branch (`normalize_gemini_base`'s
-    // own behavior is covered by its unit test in llm/tests.rs).
-    config.llm.base_url = Some(format!("{}/v1beta/openai/chat/completions", server.uri()));
     config.llm.model = "gemini-2.5-flash".into();
     config.llm.max_retries = 0;
 
@@ -611,12 +634,14 @@ async fn gemini_streams_via_openai_compat_transport() {
     );
     assert!(
         events.iter().any(|e| e == "usage:5:4:9"),
-        "expected usage extraction, got {events:?}"
+        "expected usage extraction from usageMetadata, got {events:?}"
     );
     assert_eq!(
         events.last().map(|s| s.as_str()),
         Some("done"),
-        "stream must terminate with Done, got {events:?}"
+        "stream must terminate with Done (finishReason: STOP must emit \
+         StreamEvent::Done — without it, the agent loop logs 'stream \
+         ended unexpectedly' on every Gemini turn), got {events:?}"
     );
 
     let received = server
@@ -625,22 +650,44 @@ async fn gemini_streams_via_openai_compat_transport() {
         .expect("mock recorded requests");
     assert_eq!(received.len(), 1, "expected exactly one POST");
     let req = &received[0];
+
+    // Query-string check: streaming must opt into SSE via `?alt=sse`.
+    // Without this, `streamGenerateContent` returns a JSON array, not
+    // an event stream, and the SSE parser sees no `data:` prefix.
+    assert!(
+        req.url.as_str().contains("alt=sse"),
+        "streaming URL must include `?alt=sse`, got {}",
+        req.url
+    );
+
+    // Body shape: Gemini-native, not OpenAI-compat. The OpenAI body has
+    // `model` + `messages` + `stream:true` at the top level; Gemini has
+    // `contents` (no `model` — that's in the URL — and no `stream` field).
     let body_json: serde_json::Value =
         serde_json::from_slice(&req.body).expect("request body is JSON");
-    assert_eq!(
-        body_json.get("model").and_then(|v| v.as_str()),
-        Some("gemini-2.5-flash"),
-        "request model field must match the configured Gemini slug"
+    assert!(
+        body_json.get("contents").is_some(),
+        "Gemini-native body must have `contents` (OpenAI-compat would \
+         have had `messages`), got {body_json}"
     );
     assert!(
-        body_json
-            .get("stream")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        "request must opt into streaming"
+        body_json.get("messages").is_none(),
+        "post-M4 the body must NOT carry OpenAI-compat `messages` (that \
+         would mean the dispatcher fell back to the compat path), got {body_json}"
+    );
+    let contents = body_json["contents"].as_array().expect("contents array");
+    assert!(!contents.is_empty(), "contents must include the user turn");
+    let first_text = contents[0]
+        .pointer("/parts/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        first_text, "ping",
+        "user message text must reach the wire as `contents[0].parts[0].text`"
     );
 
     std::env::remove_var(&env_key);
+    std::env::remove_var("BORG_GEMINI_BASE_URL");
 }
 
 // ── Test: Azure OpenAI uses `api-key` header, not `Authorization: Bearer` ──

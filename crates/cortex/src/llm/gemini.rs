@@ -574,9 +574,13 @@ pub(crate) fn parse_gemini_sse_line(
         return SseAction::Continue;
     }
     // Gemini doesn't emit `[DONE]`; the socket just closes. We guard
-    // anyway because relays sometimes inject it.
+    // anyway because relays sometimes inject it. Always emit a terminal
+    // `StreamEvent::Done` so the agent loop's `received_terminal` flag
+    // flips — `SseAction::Done(vec![])` would suppress the synthetic
+    // EOF Done in `sse.rs` and the turn would log "stream ended
+    // unexpectedly".
     if payload == "[DONE]" {
-        return SseAction::Done(vec![]);
+        return SseAction::Done(vec![StreamEvent::Done]);
     }
 
     let value: Value = match serde_json::from_str(payload) {
@@ -704,6 +708,7 @@ pub(crate) fn parse_gemini_sse_line(
     if events.is_empty() && !done_after {
         SseAction::Continue
     } else if done_after {
+        events.push(StreamEvent::Done);
         SseAction::Done(events)
     } else {
         SseAction::Emit(events)
@@ -1409,10 +1414,62 @@ mod tests {
     #[test]
     fn stream_done_sentinel_terminates_even_though_gemini_does_not_send_it() {
         // Defensive: some relays inject `data: [DONE]`. We must still close
-        // out the stream cleanly rather than try to JSON-parse it.
+        // out the stream cleanly rather than try to JSON-parse it — AND
+        // emit `StreamEvent::Done` so the agent loop's terminal flag flips.
+        // If we drop the Done event here, `sse.rs` returns on `SseAction::Done`
+        // *without* synthesizing one (only EOF does that), and the agent
+        // logs "stream ended unexpectedly" on every turn.
         let (_, emitted, done) = feed(&["data: [DONE]"]);
         assert!(done);
-        assert!(emitted.is_empty());
+        assert!(
+            emitted.iter().any(|e| matches!(e, StreamEvent::Done)),
+            "expected StreamEvent::Done so stream_handler reaches Terminal, got {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn stream_finish_reason_stop_emits_terminal_done_event() {
+        // The full happy-path SSE termination: STOP must produce a
+        // `StreamEvent::Done` in the emitted events so the agent loop's
+        // `received_terminal` flips. Without this, the SSE driver ships
+        // the events and returns without `sse.rs` injecting an EOF-Done,
+        // because `parse_gemini_sse_line` returned `SseAction::Done(events)`
+        // — the `Ok(None)` branch in `sse.rs:94` is only reached when the
+        // upstream socket actually EOFs *before* a terminal `SseAction::Done`.
+        let line = r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#;
+        let (_, emitted, done) = feed(&[line]);
+        assert!(done, "STOP must terminate the stream");
+        assert!(
+            emitted.iter().any(|e| matches!(e, StreamEvent::Done)),
+            "STOP must emit StreamEvent::Done so stream_handler reaches Terminal, got {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn stream_finish_reason_max_tokens_emits_truncated_then_done() {
+        // MAX_TOKENS: must emit BOTH `Truncated` (sets the truncation flag
+        // for the next-turn hint) AND `Done` (terminates the loop). The
+        // order matters — `Done` short-circuits, so it must come last.
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#;
+        let (_, emitted, done) = feed(&[line]);
+        assert!(done);
+        let kinds: Vec<&str> = emitted
+            .iter()
+            .map(|e| match e {
+                StreamEvent::Truncated => "Truncated",
+                StreamEvent::Done => "Done",
+                StreamEvent::TextDelta(_) => "TextDelta",
+                _ => "Other",
+            })
+            .collect();
+        let trunc_idx = kinds.iter().position(|k| *k == "Truncated");
+        let done_idx = kinds.iter().position(|k| *k == "Done");
+        assert!(trunc_idx.is_some(), "expected Truncated, got {kinds:?}");
+        assert!(done_idx.is_some(), "expected Done, got {kinds:?}");
+        assert!(
+            trunc_idx < done_idx,
+            "Truncated must precede Done so the flag is set before terminal"
+        );
     }
 
     // ── M4 dispatch wiring regression guards ─────────────────────────────

@@ -198,15 +198,24 @@ impl Provider {
                 headers.insert("x-api-key", val);
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             }
-            Provider::OpenAi
-            | Provider::Gemini
-            | Provider::DeepSeek
-            | Provider::Groq
-            | Provider::XAi => {
+            Provider::OpenAi | Provider::DeepSeek | Provider::Groq | Provider::XAi => {
                 let bearer = format!("Bearer {api_key}");
                 let val = HeaderValue::from_str(&bearer)
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("Authorization", val);
+            }
+            Provider::Gemini => {
+                // Native AI Studio (`/v1beta/models/...:generateContent`)
+                // authenticates raw API keys with `x-goog-api-key`, NOT
+                // `Authorization: Bearer` (which is reserved for OAuth /
+                // service-account access tokens and returns 401 for an
+                // API key). The pre-M4 OpenAI-compat façade did accept
+                // Bearer, which is why this lived in the same arm; M4
+                // splits it because the native endpoint rejects Bearer
+                // for static API keys.
+                let val = HeaderValue::from_str(api_key)
+                    .context("API key contains invalid characters for HTTP headers")?;
+                headers.insert("x-goog-api-key", val);
             }
             Provider::ClaudeCodeOAuth => {
                 // Anthropic wire format, but auth is OAuth Bearer (not x-api-key).
@@ -744,6 +753,29 @@ mod tests {
             .unwrap()
             .contains("Bearer"));
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn build_headers_gemini_uses_x_goog_api_key_after_m4_flip() {
+        // The native Gemini API (`/v1beta/models/...:generateContent`)
+        // rejects `Authorization: Bearer <api-key>` for raw API keys and
+        // requires the `x-goog-api-key` header instead. The pre-M4
+        // OpenAI-compat façade accepted Bearer; M4 splits Gemini out of
+        // the OpenAi/DeepSeek/Groq/XAi Bearer arm. Regressing this gives
+        // a 401 on every Gemini turn after the dispatcher flip.
+        let headers = Provider::Gemini.build_headers("test-key").unwrap();
+        assert_eq!(
+            headers
+                .get("x-goog-api-key")
+                .expect("x-goog-api-key must be set")
+                .to_str()
+                .unwrap(),
+            "test-key"
+        );
+        assert!(
+            headers.get("Authorization").is_none(),
+            "native Gemini must NOT send Bearer for API keys"
+        );
     }
 
     #[test]
