@@ -448,14 +448,16 @@ Rules:
                         iterative,
                     })
                     .await;
-                if let Ok(guard) = self.db.lock() {
+                {
+                    let guard = self.db.lock().await;
                     if let Some(ref db) = *guard {
                         crate::activity_log::log_activity(
                             db,
                             "info",
                             "agent",
                             &format!("Compaction: dropped {dropped_count} messages"),
-                        );
+                        )
+                        .await;
                     }
                 }
             }
