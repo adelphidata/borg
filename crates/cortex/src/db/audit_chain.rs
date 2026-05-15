@@ -36,7 +36,7 @@
 //! otherwise.
 use anyhow::Result;
 use blake3::Hasher;
-use rusqlite::params;
+use turso::params;
 
 use super::Database;
 
@@ -104,21 +104,26 @@ fn is_tombstone_payload(event_json: &str) -> bool {
 }
 
 impl Database {
-    pub fn append_audit_event(
+    pub async fn append_audit_event(
         &self,
         event_type: &str,
         event_json: &str,
         principal_id: &str,
         ts: i64,
     ) -> Result<i64> {
-        let tx = self.conn.unchecked_transaction()?;
-        let prev: Vec<u8> = tx
-            .query_row(
-                "SELECT hash FROM audit_log_chain ORDER BY seq DESC LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| GENESIS_PREV_HASH.to_vec());
+        let tx = self.conn.unchecked_transaction().await?;
+        let prev: Vec<u8> = {
+            let mut rows = tx
+                .query(
+                    "SELECT hash FROM audit_log_chain ORDER BY seq DESC LIMIT 1",
+                    (),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => row.get::<Vec<u8>>(0)?,
+                None => GENESIS_PREV_HASH.to_vec(),
+            }
+        };
 
         let hash = compute_row_hash(&prev, event_type, event_json, ts, false);
 
@@ -126,17 +131,11 @@ impl Database {
             "INSERT INTO audit_log_chain
              (prev_hash, hash, event_type, event_json, ts, principal_id, event_purged)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![
-                prev,
-                hash.to_vec(),
-                event_type,
-                event_json,
-                ts,
-                principal_id
-            ],
-        )?;
-        let seq = tx.last_insert_rowid();
-        tx.commit()?;
+            params!(prev, hash.to_vec(), event_type, event_json, ts, principal_id),
+        )
+        .await?;
+        let seq = self.conn.last_insert_rowid();
+        tx.commit().await?;
         Ok(seq)
     }
 
@@ -146,21 +145,26 @@ impl Database {
     /// forensic anchor (per `data-handling.md` §"Tombstone-on-purge").
     ///
     /// Idempotent: tombstoning an already-tombstoned row is a no-op.
-    pub fn tombstone_audit_event(&self, seq: i64, purged_at: i64) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        let row: Option<(String, bool)> = tx
-            .query_row(
-                "SELECT event_type, event_purged
+    pub async fn tombstone_audit_event(&self, seq: i64, purged_at: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction().await?;
+        let row: Option<(String, bool)> = {
+            let mut rows = tx
+                .query(
+                    "SELECT event_type, event_purged
                  FROM audit_log_chain WHERE seq = ?1",
-                params![seq],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)),
-            )
-            .ok();
+                    params!(seq),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(r) => Some((r.get::<String>(0)?, r.get::<i64>(1)? != 0)),
+                None => None,
+            }
+        };
         let Some((event_type, already)) = row else {
             anyhow::bail!("audit_log_chain row {seq} not found");
         };
         if already {
-            tx.commit()?;
+            tx.commit().await?;
             return Ok(());
         }
         let payload = serde_json::json!({
@@ -173,29 +177,33 @@ impl Database {
             "UPDATE audit_log_chain
              SET event_json = ?1, event_purged = 1
              WHERE seq = ?2",
-            params![payload, seq],
-        )?;
-        tx.commit()?;
+            params!(payload, seq),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub fn verify_audit_chain(&self) -> Result<AuditChainOutcome> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, prev_hash, hash, event_type, event_json, ts, event_purged
+    pub async fn verify_audit_chain(&self) -> Result<AuditChainOutcome> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, prev_hash, hash, event_type, event_json, ts, event_purged
              FROM audit_log_chain ORDER BY seq ASC",
-        )?;
-        let mut rows = stmt.query([])?;
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
 
         let mut expected_prev: Vec<u8> = GENESIS_PREV_HASH.to_vec();
         let mut tombstone_count: usize = 0;
-        while let Some(r) = rows.next()? {
-            let seq: i64 = r.get(0)?;
-            let prev_hash: Vec<u8> = r.get(1)?;
-            let stored_hash: Vec<u8> = r.get(2)?;
-            let event_type: String = r.get(3)?;
-            let event_json: String = r.get(4)?;
-            let ts: i64 = r.get(5)?;
-            let event_purged: bool = r.get::<_, i64>(6)? != 0;
+        while let Some(r) = rows.next().await? {
+            let seq: i64 = r.get::<i64>(0)?;
+            let prev_hash: Vec<u8> = r.get::<Vec<u8>>(1)?;
+            let stored_hash: Vec<u8> = r.get::<Vec<u8>>(2)?;
+            let event_type: String = r.get::<String>(3)?;
+            let event_json: String = r.get::<String>(4)?;
+            let ts: i64 = r.get::<i64>(5)?;
+            let event_purged: bool = r.get::<i64>(6)? != 0;
 
             if prev_hash != expected_prev {
                 return Ok(AuditChainOutcome::Tampered { seq });
@@ -242,19 +250,29 @@ impl Database {
     /// so a partial failure leaves the chain in a verifiable state.
     ///
     /// This is the daemon-side helper used by the daily retention sweep.
-    pub fn tombstone_audit_events_before(&self, cutoff: i64, purged_at: i64) -> Result<usize> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq FROM audit_log_chain
+    pub async fn tombstone_audit_events_before(
+        &self,
+        cutoff: i64,
+        purged_at: i64,
+    ) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq FROM audit_log_chain
              WHERE ts < ?1 AND event_purged = 0
              ORDER BY seq ASC",
-        )?;
-        let seqs: Vec<i64> = stmt
-            .query_map(params![cutoff], |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<_>>()?;
+            )
+            .await?;
+        let mut rows = stmt.query(params!(cutoff)).await?;
+        let mut seqs: Vec<i64> = Vec::new();
+        while let Some(row) = rows.next().await? {
+            seqs.push(row.get::<i64>(0)?);
+        }
+        drop(rows);
         drop(stmt);
         let mut count = 0usize;
         for seq in seqs {
-            if let Err(e) = self.tombstone_audit_event(seq, purged_at) {
+            if let Err(e) = self.tombstone_audit_event(seq, purged_at).await {
                 tracing::warn!("audit: tombstone seq={seq} failed: {e}");
                 continue;
             }
@@ -266,34 +284,38 @@ impl Database {
     /// Delete `messages` rows older than `cutoff`. Hard delete — `messages`
     /// is not hash-chained, so retention can free disk directly. Returns
     /// the row count deleted.
-    pub fn purge_messages_before(&self, cutoff: i64) -> Result<usize> {
-        let n = self.conn.execute(
-            "DELETE FROM messages WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        Ok(n)
+    pub async fn purge_messages_before(&self, cutoff: i64) -> Result<usize> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM messages WHERE created_at < ?1",
+                params!(cutoff),
+            )
+            .await?;
+        Ok(n as usize)
     }
 
-    pub fn list_audit_events(&self) -> Result<Vec<AuditChainRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT seq, prev_hash, hash, event_type, event_json, ts, principal_id, event_purged
+    pub async fn list_audit_events(&self) -> Result<Vec<AuditChainRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, prev_hash, hash, event_type, event_json, ts, principal_id, event_purged
              FROM audit_log_chain ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(AuditChainRow {
-                seq: r.get(0)?,
-                prev_hash: r.get(1)?,
-                hash: r.get(2)?,
-                event_type: r.get(3)?,
-                event_json: r.get(4)?,
-                ts: r.get(5)?,
-                principal_id: r.get(6)?,
-                event_purged: r.get::<_, i64>(7)? != 0,
-            })
-        })?;
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
         let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+        while let Some(r) = rows.next().await? {
+            out.push(AuditChainRow {
+                seq: r.get::<i64>(0)?,
+                prev_hash: r.get::<Vec<u8>>(1)?,
+                hash: r.get::<Vec<u8>>(2)?,
+                event_type: r.get::<String>(3)?,
+                event_json: r.get::<String>(4)?,
+                ts: r.get::<i64>(5)?,
+                principal_id: r.get::<String>(6)?,
+                event_purged: r.get::<i64>(7)? != 0,
+            });
         }
         Ok(out)
     }
@@ -302,14 +324,12 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
-    fn test_db() -> Database {
-        Database::from_connection(Connection::open_in_memory().expect("in-mem db"))
-            .expect("init db")
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    fn append_n(db: &Database, n: i64) {
+    async fn append_n(db: &Database, n: i64) {
         for i in 0..n {
             db.append_audit_event(
                 "evt",
@@ -317,81 +337,86 @@ mod tests {
                 "principal-1",
                 1_700_000_000 + i,
             )
+            .await
             .expect("append");
         }
     }
 
-    #[test]
-    fn verify_empty_chain_ok() {
-        let db = test_db();
+    #[tokio::test]
+    async fn verify_empty_chain_ok() {
+        let db = test_db().await;
         assert_eq!(
-            db.verify_audit_chain().expect("verify"),
+            db.verify_audit_chain().await.expect("verify"),
             AuditChainOutcome::Ok
         );
     }
 
-    #[test]
-    fn append_then_verify_ok_for_long_chain() {
-        let db = test_db();
-        append_n(&db, 50);
+    #[tokio::test]
+    async fn append_then_verify_ok_for_long_chain() {
+        let db = test_db().await;
+        append_n(&db, 50).await;
         assert_eq!(
-            db.verify_audit_chain().expect("verify"),
+            db.verify_audit_chain().await.expect("verify"),
             AuditChainOutcome::Ok
         );
     }
 
-    #[test]
-    fn first_row_uses_genesis_prev_hash() {
-        let db = test_db();
+    #[tokio::test]
+    async fn first_row_uses_genesis_prev_hash() {
+        let db = test_db().await;
         db.append_audit_event("first", r#"{"a":1}"#, "p", 1_700_000_000)
+            .await
             .expect("append");
-        let rows = db.list_audit_events().expect("list");
+        let rows = db.list_audit_events().await.expect("list");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].prev_hash, GENESIS_PREV_HASH.to_vec());
         assert!(!rows[0].event_purged);
     }
 
-    #[test]
-    fn tamper_with_event_json_detected_at_correct_seq() {
-        let db = test_db();
-        append_n(&db, 20);
+    #[tokio::test]
+    async fn tamper_with_event_json_detected_at_correct_seq() {
+        let db = test_db().await;
+        append_n(&db, 20).await;
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = '{\"tampered\":true}' WHERE seq = 7",
-                [],
+                (),
             )
+            .await
             .expect("tamper");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 7),
             other => panic!("expected Tampered(7), got {other:?}"),
         }
     }
 
-    #[test]
-    fn tamper_with_prev_hash_detected() {
-        let db = test_db();
-        append_n(&db, 10);
+    #[tokio::test]
+    async fn tamper_with_prev_hash_detected() {
+        let db = test_db().await;
+        append_n(&db, 10).await;
         let zeros = vec![0u8; HASH_LEN];
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET prev_hash = ?1 WHERE seq = 4",
-                params![zeros],
+                params!(zeros),
             )
+            .await
             .expect("tamper");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 4),
             other => panic!("expected Tampered(4), got {other:?}"),
         }
     }
 
-    #[test]
-    fn deleting_a_middle_row_breaks_chain_linkage() {
-        let db = test_db();
-        append_n(&db, 6);
+    #[tokio::test]
+    async fn deleting_a_middle_row_breaks_chain_linkage() {
+        let db = test_db().await;
+        append_n(&db, 6).await;
         db.conn()
-            .execute("DELETE FROM audit_log_chain WHERE seq = 3", [])
+            .execute("DELETE FROM audit_log_chain WHERE seq = 3", ())
+            .await
             .expect("delete");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 4),
             other => panic!("expected Tampered(4), got {other:?}"),
         }
@@ -411,185 +436,167 @@ mod tests {
 
     // ── Tombstone tests ──
 
-    /// After tombstoning, verify reports `OkWithTombstones { count: 1 }`,
-    /// not `Tampered`. The seq=5 payload is the canonical tombstone shape.
-    #[test]
-    fn tombstone_roundtrip_verifies_clean() {
-        let db = test_db();
-        append_n(&db, 10);
+    #[tokio::test]
+    async fn tombstone_roundtrip_verifies_clean() {
+        let db = test_db().await;
+        append_n(&db, 10).await;
         db.tombstone_audit_event(5, 1_700_000_999)
+            .await
             .expect("tombstone");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 1),
             other => panic!("expected OkWithTombstones(1), got {other:?}"),
         }
-        let rows = db.list_audit_events().expect("list");
+        let rows = db.list_audit_events().await.expect("list");
         let r = rows.iter().find(|r| r.seq == 5).expect("seq 5");
         assert!(r.event_purged);
         assert!(is_tombstone_payload(&r.event_json));
     }
 
-    /// Appending after a tombstone keeps downstream linkage. By design
-    /// (`data-handling.md` §"Tombstone-on-purge") the tombstoned row's
-    /// stored `hash` is left untouched — it remains a forensic anchor
-    /// to the original payload — so the next row's `prev_hash` already
-    /// matches without any recompute. This test guards against a
-    /// regression where `tombstone_audit_event` rewrites either column
-    /// and breaks the chain at seq+1.
-    #[test]
-    fn tombstone_preserves_downstream_linkage() {
-        let db = test_db();
-        append_n(&db, 10);
+    #[tokio::test]
+    async fn tombstone_preserves_downstream_linkage() {
+        let db = test_db().await;
+        append_n(&db, 10).await;
         db.tombstone_audit_event(5, 1_700_000_999)
+            .await
             .expect("tombstone");
         db.append_audit_event("post_tomb", r#"{"k":11}"#, "p", 1_700_000_011)
+            .await
             .expect("append");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 1),
             other => panic!("expected OkWithTombstones(1), got {other:?}"),
         }
     }
 
-    /// Mask attack: flip `event_purged` to 1 without rewriting payload.
-    /// Hash domain includes the bit, so the row's stored hash no longer
-    /// matches → Tampered. This is the spec test posture in
-    /// `data-handling.md` §"Tombstone integrity".
-    #[test]
-    fn flipping_purged_bit_without_payload_rewrite_is_tampered() {
-        let db = test_db();
-        append_n(&db, 6);
+    #[tokio::test]
+    async fn flipping_purged_bit_without_payload_rewrite_is_tampered() {
+        let db = test_db().await;
+        append_n(&db, 6).await;
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_purged = 1 WHERE seq = 3",
-                [],
+                (),
             )
+            .await
             .expect("flip bit");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 3),
             other => panic!("expected Tampered(3), got {other:?}"),
         }
     }
 
-    /// Inverse mask: clear the bit on a real tombstone but leave the
-    /// tombstone payload in place. The "tombstone-shaped payload without
-    /// the bit" check rejects this even before hashes mismatch.
-    #[test]
-    fn tombstone_payload_without_purged_bit_is_tampered() {
-        let db = test_db();
-        append_n(&db, 6);
+    #[tokio::test]
+    async fn tombstone_payload_without_purged_bit_is_tampered() {
+        let db = test_db().await;
+        append_n(&db, 6).await;
         db.tombstone_audit_event(3, 1_700_000_999)
+            .await
             .expect("tombstone");
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_purged = 0 WHERE seq = 3",
-                [],
+                (),
             )
+            .await
             .expect("clear bit");
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::Tampered { seq } => assert_eq!(seq, 3),
             other => panic!("expected Tampered(3), got {other:?}"),
         }
     }
 
-    /// Tombstoning a row already tombstoned is a no-op (idempotent).
-    /// Daily retention can run twice across a row near the cutoff without
-    /// breaking the chain.
-    #[test]
-    fn tombstone_idempotent() {
-        let db = test_db();
-        append_n(&db, 4);
-        db.tombstone_audit_event(2, 1_700_000_999).expect("first");
-        let head_after_first: Vec<u8> = db
-            .conn()
-            .query_row(
-                "SELECT hash FROM audit_log_chain WHERE seq = ?1",
-                params![2_i64],
-                |r| r.get(0),
-            )
-            .expect("hash");
+    #[tokio::test]
+    async fn tombstone_idempotent() {
+        let db = test_db().await;
+        append_n(&db, 4).await;
+        db.tombstone_audit_event(2, 1_700_000_999).await.expect("first");
+        let head_after_first: Vec<u8> = {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT hash FROM audit_log_chain WHERE seq = ?1",
+                    params!(2_i64),
+                )
+                .await
+                .expect("hash");
+            rows.next().await.expect("next").expect("row").get::<Vec<u8>>(0).expect("hash bytes")
+        };
         db.tombstone_audit_event(2, 1_700_001_000)
+            .await
             .expect("idempotent re-tombstone");
-        let head_after_second: Vec<u8> = db
-            .conn()
-            .query_row(
-                "SELECT hash FROM audit_log_chain WHERE seq = ?1",
-                params![2_i64],
-                |r| r.get(0),
-            )
-            .expect("hash");
+        let head_after_second: Vec<u8> = {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT hash FROM audit_log_chain WHERE seq = ?1",
+                    params!(2_i64),
+                )
+                .await
+                .expect("hash");
+            rows.next().await.expect("next").expect("row").get::<Vec<u8>>(0).expect("hash bytes")
+        };
         // Idempotent: second call must NOT rewrite the hash with the new ts.
         assert_eq!(head_after_first, head_after_second);
         assert_eq!(
-            db.verify_audit_chain().expect("verify"),
+            db.verify_audit_chain().await.expect("verify"),
             AuditChainOutcome::OkWithTombstones { count: 1 }
         );
     }
 
-    /// Bulk tombstoning by cutoff: only rows with `ts < cutoff` get
-    /// tombstoned, and the chain still verifies. Regression target:
-    /// re-running the bulk helper must not re-tombstone (idempotency
-    /// at the DELETE FROM-style boundary).
-    #[test]
-    fn tombstone_audit_events_before_only_targets_old_rows() {
-        let db = test_db();
+    #[tokio::test]
+    async fn tombstone_audit_events_before_only_targets_old_rows() {
+        let db = test_db().await;
         for i in 0..10 {
             db.append_audit_event("evt", &format!(r#"{{"i":{i}}}"#), "p", 1_000 + i)
+                .await
                 .expect("append");
         }
         // Cutoff at 1_005 → rows with ts < 1_005 (seqs 1..=5) get tombstoned.
         let n = db
             .tombstone_audit_events_before(1_005, 9_999)
+            .await
             .expect("bulk tombstone");
         assert_eq!(n, 5);
-        match db.verify_audit_chain().expect("verify") {
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 5),
             other => panic!("expected OkWithTombstones(5), got {other:?}"),
         }
-        // Re-running with the same cutoff is a no-op — the existing
-        // tombstones short-circuit `tombstone_audit_event`.
         let n2 = db
             .tombstone_audit_events_before(1_005, 9_999)
+            .await
             .expect("idempotent bulk");
         assert_eq!(n2, 0);
     }
 
-    /// Multiple non-contiguous tombstones — count reports correctly.
-    #[test]
-    fn multiple_tombstones_counted() {
-        let db = test_db();
-        append_n(&db, 10);
-        db.tombstone_audit_event(2, 1_700_000_999).expect("t1");
-        db.tombstone_audit_event(7, 1_700_000_999).expect("t2");
-        match db.verify_audit_chain().expect("verify") {
+    #[tokio::test]
+    async fn multiple_tombstones_counted() {
+        let db = test_db().await;
+        append_n(&db, 10).await;
+        db.tombstone_audit_event(2, 1_700_000_999).await.expect("t1");
+        db.tombstone_audit_event(7, 1_700_000_999).await.expect("t2");
+        match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 2),
             other => panic!("expected OkWithTombstones(2), got {other:?}"),
         }
     }
 
-    /// Documented limitation: editing a tombstone's `purged_at` (or any
-    /// other field within the canonical tombstone shape) is *not*
-    /// detected by `verify_audit_chain`, by design. The spec
-    /// (`data-handling.md` §"Tombstone-on-purge") leaves `hash`
-    /// untouched on tombstone so the original hash remains a forensic
-    /// anchor for external ledgers. This test captures the edge case so
-    /// future readers don't mistake the gap for a bug — operators who
-    /// need cryptographic detection of tombstone-payload edits must
-    /// compare against a backup taken before the purge.
-    #[test]
-    fn rewriting_tombstone_payload_within_canonical_shape_is_not_detected() {
-        let db = test_db();
-        append_n(&db, 6);
+    #[tokio::test]
+    async fn rewriting_tombstone_payload_within_canonical_shape_is_not_detected() {
+        let db = test_db().await;
+        append_n(&db, 6).await;
         db.tombstone_audit_event(3, 1_700_000_999)
+            .await
             .expect("tombstone");
         db.conn()
             .execute(
                 "UPDATE audit_log_chain SET event_json = ?1 WHERE seq = 3",
-                params![r#"{"purged":1,"purged_at":99999,"original_type":"evt"}"#],
+                params!(r#"{"purged":1,"purged_at":99999,"original_type":"evt"}"#),
             )
+            .await
             .expect("backdate");
-        // Verifier still reports OkWithTombstones — by design.
         assert_eq!(
-            db.verify_audit_chain().expect("verify"),
+            db.verify_audit_chain().await.expect("verify"),
             AuditChainOutcome::OkWithTombstones { count: 1 }
         );
     }
