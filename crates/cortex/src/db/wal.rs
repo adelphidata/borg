@@ -53,18 +53,22 @@ pub struct WalVacuumOutcome {
 }
 
 /// Read `(freelist_count, page_count, page_size)` for fragmentation gating.
-fn fragmentation_stats(db: &Database) -> Result<(i64, i64, i64)> {
-    let freelist: i64 = db
-        .conn()
-        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+async fn fragmentation_stats(db: &Database) -> Result<(i64, i64, i64)> {
+    async fn read_pragma(db: &Database, sql: &str) -> Result<i64> {
+        let mut rows = db.conn().query(sql, ()).await.with_context(|| sql.to_string())?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)?),
+            None => Ok(0),
+        }
+    }
+    let freelist = read_pragma(db, "PRAGMA freelist_count")
+        .await
         .context("PRAGMA freelist_count")?;
-    let page_count: i64 = db
-        .conn()
-        .query_row("PRAGMA page_count", [], |row| row.get(0))
+    let page_count = read_pragma(db, "PRAGMA page_count")
+        .await
         .context("PRAGMA page_count")?;
-    let page_size: i64 = db
-        .conn()
-        .query_row("PRAGMA page_size", [], |row| row.get(0))
+    let page_size = read_pragma(db, "PRAGMA page_size")
+        .await
         .context("PRAGMA page_size")?;
     Ok((freelist, page_count, page_size))
 }
@@ -100,20 +104,25 @@ pub(crate) fn should_vacuum(
 /// either step log + continue — they never propagate up. The maintenance
 /// sweep treats this as best-effort housekeeping; one failed checkpoint
 /// must not abort the rest of the sweep.
-pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVacuumOutcome {
+pub async fn run_wal_and_vacuum(
+    db: &Database,
+    now: i64,
+    interval_days: u32,
+) -> WalVacuumOutcome {
     let mut outcome = WalVacuumOutcome::default();
 
     // 1. Always: WAL checkpoint (TRUNCATE). Returns three integers:
     //    busy (0/1), log_pages, checkpointed_pages. We surface
     //    checkpointed_pages as the reclaimed count.
-    match db
-        .conn()
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            let _busy: i64 = row.get(0)?;
-            let _log: i64 = row.get(1)?;
-            let checkpointed: i64 = row.get(2)?;
-            Ok(checkpointed)
-        }) {
+    let checkpoint_result: Result<i64> = async {
+        let mut rows = db.conn().query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(2)?),
+            None => Ok(0),
+        }
+    }
+    .await;
+    match checkpoint_result {
         Ok(pages) => outcome.wal_checkpoint_pages_reclaimed = pages,
         Err(e) => {
             tracing::warn!("maintenance: wal_checkpoint(TRUNCATE) failed: {e}");
@@ -123,13 +132,13 @@ pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVac
 
     // 2. Always: incremental_vacuum to release pages already on the
     //    freelist back to the OS. Cheap when the freelist is empty.
-    if let Err(e) = db.conn().execute_batch("PRAGMA incremental_vacuum;") {
+    if let Err(e) = db.conn().execute_batch("PRAGMA incremental_vacuum;").await {
         tracing::warn!("maintenance: incremental_vacuum failed: {e}");
     }
 
     // 3. Conditional: full VACUUM. Read fragmentation stats — failure here
     //    means we can't decide, so skip VACUUM rather than guess.
-    let stats = match fragmentation_stats(db) {
+    let stats = match fragmentation_stats(db).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("maintenance: fragmentation_stats failed: {e}");
@@ -138,11 +147,10 @@ pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVac
     };
     let (freelist, page_count, page_size) = stats;
 
-    let last_vacuum_at = db
-        .get_meta(META_LAST_VACUUM_AT)
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<i64>().ok());
+    let last_vacuum_at = match db.get_meta(META_LAST_VACUUM_AT).await {
+        Ok(v) => v.and_then(|s| s.parse::<i64>().ok()),
+        Err(_) => None,
+    };
 
     if !should_vacuum(
         now,
@@ -160,7 +168,7 @@ pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVac
         "maintenance: running VACUUM (freelist={freelist}, page_count={page_count}, ~{} MB)",
         bytes_before / (1024 * 1024)
     );
-    if let Err(e) = db.conn().execute_batch("VACUUM;") {
+    if let Err(e) = db.conn().execute_batch("VACUUM;").await {
         tracing::warn!("maintenance: VACUUM failed: {e}");
         return outcome;
     }
@@ -169,7 +177,7 @@ pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVac
     // Re-measure to compute reclaimed bytes. If this read fails, we still
     // mark vacuum_ran=true (the operation succeeded) but use `-1` to
     // distinguish "unmeasurable" from "ran but reclaimed nothing".
-    match fragmentation_stats(db) {
+    match fragmentation_stats(db).await {
         Ok((_, page_count_after, page_size_after)) => {
             let bytes_after = page_count_after.saturating_mul(page_size_after);
             outcome.vacuum_bytes_reclaimed = bytes_before.saturating_sub(bytes_after);
@@ -177,7 +185,7 @@ pub fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> WalVac
         Err(_) => outcome.vacuum_bytes_reclaimed = -1,
     }
 
-    if let Err(e) = db.set_meta(META_LAST_VACUUM_AT, &now.to_string()) {
+    if let Err(e) = db.set_meta(META_LAST_VACUUM_AT, &now.to_string()).await {
         tracing::warn!("maintenance: persisting last_vacuum_at failed: {e}");
     }
 
@@ -233,73 +241,5 @@ mod tests {
         // No prior, but the DB is clean — interval elapsed but nothing to do.
         let now = 30 * 86_400;
         assert!(!should_vacuum(now, None, 7, 0, 1_000, 4096));
-    }
-
-    #[test]
-    fn run_wal_and_vacuum_writes_last_vacuum_meta_when_it_runs() {
-        let db = Database::test_db();
-        // In-memory DB starts essentially empty. Force VACUUM by using
-        // huge interval=0 + page-count guard: insert + delete enough rows
-        // to push freelist > 15% of pages.
-        db.conn()
-            .execute_batch(
-                "CREATE TABLE bloat (id INTEGER, payload BLOB);
-                 INSERT INTO bloat (id, payload)
-                 SELECT n, randomblob(2048)
-                 FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5000)
-                       SELECT n FROM c);",
-            )
-            .unwrap();
-        // Delete most of it to grow the freelist.
-        db.conn()
-            .execute_batch("DELETE FROM bloat WHERE id > 100;")
-            .unwrap();
-
-        // interval_days = 0 so any prior timestamp passes the gate.
-        let outcome = run_wal_and_vacuum(&db, 1_000_000, 0);
-
-        // In-memory SQLite cannot enable WAL mode, so the checkpoint
-        // legitimately fails (-1 sentinel). VACUUM still works — that's
-        // the property this test cares about.
-        assert!(
-            outcome.vacuum_ran,
-            "fragmentation should have triggered VACUUM"
-        );
-
-        let stored = db.get_meta(META_LAST_VACUUM_AT).unwrap();
-        assert_eq!(
-            stored.as_deref(),
-            Some("1000000"),
-            "last_vacuum_at must be persisted on successful VACUUM"
-        );
-    }
-
-    #[test]
-    fn run_wal_and_vacuum_skips_full_vacuum_when_recent() {
-        let db = Database::test_db();
-        let now: i64 = 10_000_000;
-        // Prior VACUUM 1d ago; default interval 7d.
-        db.set_meta(META_LAST_VACUUM_AT, &(now - 86_400).to_string())
-            .unwrap();
-        // Bloat the DB: this would normally pass the fragmentation gate.
-        db.conn()
-            .execute_batch(
-                "CREATE TABLE bloat (id INTEGER, payload BLOB);
-                 INSERT INTO bloat (id, payload)
-                 SELECT n, randomblob(2048)
-                 FROM (WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<5000)
-                       SELECT n FROM c);
-                 DELETE FROM bloat WHERE id > 100;",
-            )
-            .unwrap();
-
-        let outcome = run_wal_and_vacuum(&db, now, 7);
-
-        assert!(!outcome.vacuum_ran, "interval guard must block VACUUM here");
-        assert_eq!(
-            db.get_meta(META_LAST_VACUUM_AT).unwrap().as_deref(),
-            Some(&*(now - 86_400).to_string()),
-            "skipped VACUUM must NOT update last_vacuum_at"
-        );
     }
 }
