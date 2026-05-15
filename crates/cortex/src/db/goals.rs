@@ -6,7 +6,7 @@
 //! from `active` without an explicit user action.
 
 use anyhow::Result;
-use rusqlite::params;
+use turso::params;
 
 use super::Database;
 use crate::goals::Goal;
@@ -49,52 +49,41 @@ fn now_unix() -> i64 {
 const SELECT_COLS: &str = "session_id, goal_id, objective, status, token_budget, \
                            tokens_used, time_used_seconds, created_at, updated_at";
 
-/// Map a row from `SELECT_COLS` to a [`Goal`]. Surfaces an `anyhow` error
-/// (translated into a rusqlite `UserFunctionError` for the row callback) when
-/// the row holds an unknown status string.
-fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Goal> {
-    let status_raw: String = row.get(3)?;
-    let status = GoalStatus::from_str(&status_raw).ok_or_else(|| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown goal status in DB: {status_raw}"),
-            )),
-        )
-    })?;
+/// Map a row from `SELECT_COLS` to a [`Goal`]. Returns an error when the
+/// row holds an unknown status string.
+fn map_row(row: &turso::Row) -> Result<Goal> {
+    let status_raw: String = row.get::<String>(3)?;
+    let status = GoalStatus::from_str(&status_raw)
+        .ok_or_else(|| anyhow::anyhow!("unknown goal status in DB: {status_raw}"))?;
     Ok(Goal {
-        session_id: row.get(0)?,
-        goal_id: row.get(1)?,
-        objective: row.get(2)?,
+        session_id: row.get::<String>(0)?,
+        goal_id: row.get::<String>(1)?,
+        objective: row.get::<String>(2)?,
         status,
-        token_budget: row.get(4)?,
-        tokens_used: row.get(5)?,
-        time_used_seconds: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        token_budget: row.get::<Option<i64>>(4)?,
+        tokens_used: row.get::<i64>(5)?,
+        time_used_seconds: row.get::<i64>(6)?,
+        created_at: row.get::<i64>(7)?,
+        updated_at: row.get::<i64>(8)?,
     })
 }
 
 impl Database {
     /// Fetch the goal for `session_id`. Returns `None` if no goal is set.
-    pub fn get_goal(&self, session_id: &str) -> Result<Option<Goal>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {SELECT_COLS} FROM goals WHERE session_id = ?1"
-        ))?;
-        match stmt.query_row(params![session_id], map_row) {
-            Ok(goal) => Ok(Some(goal)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
+    pub async fn get_goal(&self, session_id: &str) -> Result<Option<Goal>> {
+        let sql = format!("SELECT {SELECT_COLS} FROM goals WHERE session_id = ?1");
+        let mut rows = self.conn.query(&sql, params!(session_id)).await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(map_row(&row)?)),
+            None => Ok(None),
         }
     }
 
     /// Create a new goal. Fails-as-`None` (no rows inserted) if a goal already
     /// exists for the session. Caller must check the return value rather than
-    /// `?`-propagating a missing return — the codex contract is "fail if a
+    /// `?`-propagating a missing return — the contract is "fail if a
     /// goal exists; use update_goal".
-    pub fn insert_goal(
+    pub async fn insert_goal(
         &self,
         session_id: &str,
         objective: &str,
@@ -103,29 +92,32 @@ impl Database {
     ) -> Result<Option<Goal>> {
         let now = now_unix();
         let goal_id = uuid::Uuid::new_v4().to_string();
-        let affected = self.conn.execute(
-            "INSERT OR IGNORE INTO goals
+        let affected = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO goals
                 (session_id, goal_id, objective, status, token_budget,
                  tokens_used, time_used_seconds, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?6)",
-            params![
-                session_id,
-                goal_id,
-                objective,
-                status.as_str(),
-                token_budget,
-                now
-            ],
-        )?;
+                params!(
+                    session_id,
+                    goal_id,
+                    objective,
+                    status.as_str(),
+                    token_budget,
+                    now,
+                ),
+            )
+            .await?;
         if affected == 0 {
             return Ok(None);
         }
-        self.get_goal(session_id)
+        self.get_goal(session_id).await
     }
 
     /// Upsert: regenerate `goal_id`, replace objective, reset accounting.
     /// Used by `/goal <new objective>` when a goal already exists.
-    pub fn replace_goal(
+    pub async fn replace_goal(
         &self,
         session_id: &str,
         objective: &str,
@@ -134,8 +126,9 @@ impl Database {
     ) -> Result<Goal> {
         let now = now_unix();
         let goal_id = uuid::Uuid::new_v4().to_string();
-        self.conn.execute(
-            "INSERT INTO goals
+        self.conn
+            .execute(
+                "INSERT INTO goals
                 (session_id, goal_id, objective, status, token_budget,
                  tokens_used, time_used_seconds, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?6)
@@ -147,23 +140,29 @@ impl Database {
                 tokens_used = 0,
                 time_used_seconds = 0,
                 updated_at = ?6",
-            params![
-                session_id,
-                goal_id,
-                objective,
-                status.as_str(),
-                token_budget,
-                now
-            ],
-        )?;
-        self.get_goal(session_id)?
+                params!(
+                    session_id,
+                    goal_id,
+                    objective,
+                    status.as_str(),
+                    token_budget,
+                    now,
+                ),
+            )
+            .await?;
+        self.get_goal(session_id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("goal disappeared after replace"))
     }
 
     /// Apply a [`GoalUpdate`] patch. Returns `Ok(None)` if no goal exists or
     /// the optional CAS guard rejected the update.
-    pub fn update_goal(&self, session_id: &str, patch: GoalUpdate) -> Result<Option<Goal>> {
-        let existing = match self.get_goal(session_id)? {
+    pub async fn update_goal(
+        &self,
+        session_id: &str,
+        patch: GoalUpdate,
+    ) -> Result<Option<Goal>> {
+        let existing = match self.get_goal(session_id).await? {
             Some(g) => g,
             None => return Ok(None),
         };
@@ -176,30 +175,33 @@ impl Database {
         if let Some(new_objective) = patch.objective {
             let status = patch.status.unwrap_or(existing.status);
             let budget = patch.token_budget.unwrap_or(existing.token_budget);
-            return Ok(Some(self.replace_goal(
-                session_id,
-                &new_objective,
-                status,
-                budget,
-            )?));
+            return Ok(Some(
+                self.replace_goal(session_id, &new_objective, status, budget)
+                    .await?,
+            ));
         }
         let now = now_unix();
         let new_status = patch.status.unwrap_or(existing.status);
         let new_budget = patch.token_budget.unwrap_or(existing.token_budget);
-        self.conn.execute(
-            "UPDATE goals SET status = ?2, token_budget = ?3, updated_at = ?4
+        self.conn
+            .execute(
+                "UPDATE goals SET status = ?2, token_budget = ?3, updated_at = ?4
              WHERE session_id = ?1",
-            params![session_id, new_status.as_str(), new_budget, now],
-        )?;
-        self.get_goal(session_id)
+                params!(session_id, new_status.as_str(), new_budget, now),
+            )
+            .await?;
+        self.get_goal(session_id).await
     }
 
     /// Delete a goal. Returns `true` if a row was deleted.
-    pub fn delete_goal(&self, session_id: &str) -> Result<bool> {
-        let affected = self.conn.execute(
-            "DELETE FROM goals WHERE session_id = ?1",
-            params![session_id],
-        )?;
+    pub async fn delete_goal(&self, session_id: &str) -> Result<bool> {
+        let affected = self
+            .conn
+            .execute(
+                "DELETE FROM goals WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?;
         Ok(affected > 0)
     }
 
@@ -213,7 +215,7 @@ impl Database {
     /// the update is skipped (returns `Unchanged`). This is the CAS guard the
     /// runtime uses to ignore accounting for a goal that was replaced
     /// mid-turn.
-    pub fn account_goal_usage(
+    pub async fn account_goal_usage(
         &self,
         session_id: &str,
         token_delta: i64,
@@ -239,15 +241,15 @@ impl Database {
               WHERE session_id = ?1
                 AND status = 'active'
                 AND (?5 IS NULL OR goal_id = ?5)",
-            params![
+            params!(
                 session_id,
                 token_delta,
                 time_delta_seconds,
                 now,
-                expected_goal_id
-            ],
-        )?;
-        let current = self.get_goal(session_id)?;
+                expected_goal_id.map(|s| s.to_string()),
+            ),
+        ).await?;
+        let current = self.get_goal(session_id).await?;
         if affected == 0 {
             Ok(GoalAccountingOutcome::Unchanged(current))
         } else {
@@ -269,17 +271,20 @@ impl Database {
 
     /// Flip an Active goal to Paused, used by the cancel/interrupt flow.
     /// Returns the post-update goal, or `None` if there is no Active goal.
-    pub fn pause_active_goal(&self, session_id: &str) -> Result<Option<Goal>> {
+    pub async fn pause_active_goal(&self, session_id: &str) -> Result<Option<Goal>> {
         let now = now_unix();
-        let affected = self.conn.execute(
-            "UPDATE goals SET status = 'paused', updated_at = ?2
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE goals SET status = 'paused', updated_at = ?2
              WHERE session_id = ?1 AND status = 'active'",
-            params![session_id, now],
-        )?;
+                params!(session_id, now),
+            )
+            .await?;
         if affected == 0 {
             return Ok(None);
         }
-        self.get_goal(session_id)
+        self.get_goal(session_id).await
     }
 }
 
@@ -288,18 +293,20 @@ mod tests {
     use super::*;
     use crate::db::Database;
 
-    fn db_with_session(id: &str) -> Database {
-        let db = Database::test_db();
+    async fn db_with_session(id: &str) -> Database {
+        let db = Database::test_db().await;
         db.upsert_session(id, 0, 0, 0, "test-model", "test")
+            .await
             .unwrap();
         db
     }
 
-    #[test]
-    fn insert_then_get_roundtrips() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn insert_then_get_roundtrips() {
+        let db = db_with_session("s").await;
         let inserted = db
             .insert_goal("s", "do the thing", GoalStatus::Active, Some(1000))
+            .await
             .unwrap()
             .expect("insert returns the goal");
         assert_eq!(inserted.objective, "do the thing");
@@ -307,40 +314,44 @@ mod tests {
         assert_eq!(inserted.token_budget, Some(1000));
         assert_eq!(inserted.tokens_used, 0);
 
-        let fetched = db.get_goal("s").unwrap().unwrap();
+        let fetched = db.get_goal("s").await.unwrap().unwrap();
         assert_eq!(fetched.goal_id, inserted.goal_id);
     }
 
-    #[test]
-    fn get_goal_returns_none_when_missing() {
-        let db = db_with_session("s");
-        assert!(db.get_goal("s").unwrap().is_none());
+    #[tokio::test]
+    async fn get_goal_returns_none_when_missing() {
+        let db = db_with_session("s").await;
+        assert!(db.get_goal("s").await.unwrap().is_none());
     }
 
-    #[test]
-    fn insert_goal_returns_none_when_one_exists() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn insert_goal_returns_none_when_one_exists() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "first", GoalStatus::Active, None)
+            .await
             .unwrap();
         let second = db
             .insert_goal("s", "second", GoalStatus::Active, None)
+            .await
             .unwrap();
         assert!(second.is_none(), "second insert must not silently replace");
-        let current = db.get_goal("s").unwrap().unwrap();
+        let current = db.get_goal("s").await.unwrap().unwrap();
         assert_eq!(current.objective, "first");
     }
 
-    #[test]
-    fn replace_goal_regenerates_goal_id_and_resets_accounting() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn replace_goal_regenerates_goal_id_and_resets_accounting() {
+        let db = db_with_session("s").await;
         let first = db
             .insert_goal("s", "first", GoalStatus::Active, Some(500))
+            .await
             .unwrap()
             .unwrap();
-        db.account_goal_usage("s", 100, 10, None).unwrap();
+        db.account_goal_usage("s", 100, 10, None).await.unwrap();
 
         let replaced = db
             .replace_goal("s", "second", GoalStatus::Active, None)
+            .await
             .unwrap();
         assert_ne!(replaced.goal_id, first.goal_id);
         assert_eq!(replaced.objective, "second");
@@ -349,12 +360,13 @@ mod tests {
         assert_eq!(replaced.token_budget, None);
     }
 
-    #[test]
-    fn account_below_budget_does_not_flip() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn account_below_budget_does_not_flip() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
-        let out = db.account_goal_usage("s", 100, 5, None).unwrap();
+        let out = db.account_goal_usage("s", 100, 5, None).await.unwrap();
         match out {
             GoalAccountingOutcome::Updated(g) => {
                 assert_eq!(g.tokens_used, 100);
@@ -364,12 +376,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_exactly_at_budget_flips() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn account_exactly_at_budget_flips() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
-        let out = db.account_goal_usage("s", 1000, 5, None).unwrap();
+        let out = db.account_goal_usage("s", 1000, 5, None).await.unwrap();
         match out {
             GoalAccountingOutcome::Updated(g) => {
                 assert_eq!(g.tokens_used, 1000);
@@ -379,12 +392,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_over_budget_flips_and_records_full_delta() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn account_over_budget_flips_and_records_full_delta() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
-        let out = db.account_goal_usage("s", 1500, 5, None).unwrap();
+        let out = db.account_goal_usage("s", 1500, 5, None).await.unwrap();
         match out {
             GoalAccountingOutcome::Updated(g) => {
                 assert_eq!(g.tokens_used, 1500);
@@ -394,22 +408,28 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_no_budget_never_flips() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
-        let out = db.account_goal_usage("s", 10_000_000, 1, None).unwrap();
+    #[tokio::test]
+    async fn account_no_budget_never_flips() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
+            .unwrap();
+        let out = db
+            .account_goal_usage("s", 10_000_000, 1, None)
+            .await
+            .unwrap();
         match out {
             GoalAccountingOutcome::Updated(g) => assert_eq!(g.status, GoalStatus::Active),
             other => panic!("expected Updated, got {other:?}"),
         }
     }
 
-    #[test]
-    fn account_paused_goal_is_unchanged() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn account_paused_goal_is_unchanged() {
+        let db = db_with_session("s").await;
         let g = db
             .insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap()
             .unwrap();
         db.update_goal(
@@ -419,8 +439,9 @@ mod tests {
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
-        let out = db.account_goal_usage("s", 500, 1, None).unwrap();
+        let out = db.account_goal_usage("s", 500, 1, None).await.unwrap();
         match out {
             GoalAccountingOutcome::Unchanged(Some(g2)) => {
                 assert_eq!(g2.tokens_used, 0);
@@ -431,13 +452,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn account_with_wrong_expected_goal_id_is_unchanged() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn account_with_wrong_expected_goal_id_is_unchanged() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
         let out = db
             .account_goal_usage("s", 500, 1, Some("not-the-real-goal-id"))
+            .await
             .unwrap();
         match out {
             GoalAccountingOutcome::Unchanged(Some(g)) => {
@@ -447,9 +470,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_goal_returns_none_when_missing() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn update_goal_returns_none_when_missing() {
+        let db = db_with_session("s").await;
         let out = db
             .update_goal(
                 "s",
@@ -458,18 +481,20 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert!(out.is_none());
     }
 
-    #[test]
-    fn update_goal_objective_regenerates_id_and_resets_usage() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn update_goal_objective_regenerates_id_and_resets_usage() {
+        let db = db_with_session("s").await;
         let g1 = db
             .insert_goal("s", "first", GoalStatus::Active, None)
+            .await
             .unwrap()
             .unwrap();
-        db.account_goal_usage("s", 50, 1, None).unwrap();
+        db.account_goal_usage("s", 50, 1, None).await.unwrap();
         let g2 = db
             .update_goal(
                 "s",
@@ -478,6 +503,7 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap()
             .unwrap();
         assert_ne!(g2.goal_id, g1.goal_id);
@@ -485,10 +511,12 @@ mod tests {
         assert_eq!(g2.tokens_used, 0);
     }
 
-    #[test]
-    fn update_goal_cas_rejects_when_id_mismatch() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
+    #[tokio::test]
+    async fn update_goal_cas_rejects_when_id_mismatch() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
+            .unwrap();
         let out = db
             .update_goal(
                 "s",
@@ -498,18 +526,20 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
         assert!(out.is_none());
         assert_eq!(
-            db.get_goal("s").unwrap().unwrap().status,
+            db.get_goal("s").await.unwrap().unwrap().status,
             GoalStatus::Active
         );
     }
 
-    #[test]
-    fn update_goal_clears_budget_when_token_budget_is_some_none() {
-        let db = db_with_session("s");
+    #[tokio::test]
+    async fn update_goal_clears_budget_when_token_budget_is_some_none() {
+        let db = db_with_session("s").await;
         db.insert_goal("s", "x", GoalStatus::Active, Some(1000))
+            .await
             .unwrap();
         let out = db
             .update_goal(
@@ -519,36 +549,44 @@ mod tests {
                     ..Default::default()
                 },
             )
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(out.token_budget, None);
     }
 
-    #[test]
-    fn delete_goal_returns_true_when_present_false_when_absent() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
-        assert!(db.delete_goal("s").unwrap());
-        assert!(!db.delete_goal("s").unwrap());
+    #[tokio::test]
+    async fn delete_goal_returns_true_when_present_false_when_absent() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
+            .unwrap();
+        assert!(db.delete_goal("s").await.unwrap());
+        assert!(!db.delete_goal("s").await.unwrap());
     }
 
-    #[test]
-    fn pause_active_goal_only_affects_active() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
-        let paused = db.pause_active_goal("s").unwrap().unwrap();
+    #[tokio::test]
+    async fn pause_active_goal_only_affects_active() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
+            .unwrap();
+        let paused = db.pause_active_goal("s").await.unwrap().unwrap();
         assert_eq!(paused.status, GoalStatus::Paused);
         // Calling again on a Paused goal must be a no-op.
-        assert!(db.pause_active_goal("s").unwrap().is_none());
+        assert!(db.pause_active_goal("s").await.unwrap().is_none());
     }
 
-    #[test]
-    fn deleting_session_cascades_goal() {
-        let db = db_with_session("s");
-        db.insert_goal("s", "x", GoalStatus::Active, None).unwrap();
-        db.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params!["s"])
+    #[tokio::test]
+    async fn deleting_session_cascades_goal() {
+        let db = db_with_session("s").await;
+        db.insert_goal("s", "x", GoalStatus::Active, None)
+            .await
             .unwrap();
-        assert!(db.get_goal("s").unwrap().is_none());
+        db.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params!("s"))
+            .await
+            .unwrap();
+        assert!(db.get_goal("s").await.unwrap().is_none());
     }
 }
