@@ -1,7 +1,7 @@
 use anyhow::Result;
-use rusqlite::params;
 use std::collections::HashMap;
 use tracing::{instrument, warn};
+use turso::params;
 
 use super::models::{ChannelActivityRow, MessageRow, SessionRow};
 use super::Database;
@@ -13,7 +13,7 @@ use super::Database;
 const SESSIONS_SINCE_HARD_CAP: i64 = 10_000;
 
 impl Database {
-    pub fn upsert_session(
+    pub async fn upsert_session(
         &self,
         id: &str,
         created_at: i64,
@@ -27,56 +27,61 @@ impl Database {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET
                 updated_at = ?3, total_tokens = ?4, model = ?5, title = ?6",
-            params![id, created_at, updated_at, total_tokens, model, title],
-        )?;
+            params!(id, created_at, updated_at, total_tokens, model, title),
+        ).await?;
         Ok(())
     }
 
     /// Fetch a single session row by exact id. Returns `None` if absent.
-    pub fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, total_tokens, model, title,
+    pub async fn session_by_id(&self, id: &str) -> Result<Option<SessionRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, created_at, updated_at, total_tokens, model, title,
                     parent_session_id, forked_from_message_id
              FROM sessions WHERE id = ?1",
-        )?;
-        let row = stmt
-            .query_row(params![id], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    updated_at: row.get(2)?,
-                    total_tokens: row.get(3)?,
-                    model: row.get(4)?,
-                    title: row.get(5)?,
-                    parent_session_id: row.get(6)?,
-                    forked_from_message_id: row.get(7)?,
-                })
-            })
-            .ok();
-        Ok(row)
+                params!(id),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(SessionRow {
+                id: row.get::<String>(0)?,
+                created_at: row.get::<i64>(1)?,
+                updated_at: row.get::<i64>(2)?,
+                total_tokens: row.get::<i64>(3)?,
+                model: row.get::<String>(4)?,
+                title: row.get::<String>(5)?,
+                parent_session_id: row.get::<Option<String>>(6)?,
+                forked_from_message_id: row.get::<Option<i64>>(7)?,
+            })),
+            None => Ok(None),
+        }
     }
 
-    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, created_at, updated_at, total_tokens, model, title,
+    pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, created_at, updated_at, total_tokens, model, title,
                     parent_session_id, forked_from_message_id
              FROM sessions ORDER BY updated_at DESC LIMIT ?1",
-        )?;
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    updated_at: row.get(2)?,
-                    total_tokens: row.get(3)?,
-                    model: row.get(4)?,
-                    title: row.get(5)?,
-                    parent_session_id: row.get(6)?,
-                    forked_from_message_id: row.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+                params!(limit as i64),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(SessionRow {
+                id: row.get::<String>(0)?,
+                created_at: row.get::<i64>(1)?,
+                updated_at: row.get::<i64>(2)?,
+                total_tokens: row.get::<i64>(3)?,
+                model: row.get::<String>(4)?,
+                title: row.get::<String>(5)?,
+                parent_session_id: row.get::<Option<String>>(6)?,
+                forked_from_message_id: row.get::<Option<i64>>(7)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Return sessions updated since a given Unix timestamp, ordered by most recent first.
@@ -84,28 +89,28 @@ impl Database {
     /// Capped at [`SESSIONS_SINCE_HARD_CAP`] rows as a circuit-breaker. Callers
     /// like the heartbeat invoke this with `since=0` (= "all sessions"), which
     /// would otherwise scan the entire table for power users.
-    pub fn sessions_since(&self, since: i64) -> Result<Vec<SessionRow>> {
-        let mut stmt = self.conn.prepare(
+    pub async fn sessions_since(&self, since: i64) -> Result<Vec<SessionRow>> {
+        let mut rows = self.conn.query(
             "SELECT id, created_at, updated_at, total_tokens, model, title,
                     parent_session_id, forked_from_message_id
              FROM sessions WHERE updated_at >= ?1 ORDER BY updated_at DESC
              LIMIT ?2",
-        )?;
-        let rows: Vec<SessionRow> = stmt
-            .query_map(params![since, SESSIONS_SINCE_HARD_CAP], |row| {
-                Ok(SessionRow {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    updated_at: row.get(2)?,
-                    total_tokens: row.get(3)?,
-                    model: row.get(4)?,
-                    title: row.get(5)?,
-                    parent_session_id: row.get(6)?,
-                    forked_from_message_id: row.get(7)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if rows.len() == SESSIONS_SINCE_HARD_CAP as usize {
+            params!(since, SESSIONS_SINCE_HARD_CAP),
+        ).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(SessionRow {
+                id: row.get::<String>(0)?,
+                created_at: row.get::<i64>(1)?,
+                updated_at: row.get::<i64>(2)?,
+                total_tokens: row.get::<i64>(3)?,
+                model: row.get::<String>(4)?,
+                title: row.get::<String>(5)?,
+                parent_session_id: row.get::<Option<String>>(6)?,
+                forked_from_message_id: row.get::<Option<i64>>(7)?,
+            });
+        }
+        if out.len() == SESSIONS_SINCE_HARD_CAP as usize {
             // Hitting the cap means a future caller that walks the full set
             // will silently process a stale tail. Surface it so we notice
             // before someone relies on completeness.
@@ -114,14 +119,14 @@ impl Database {
                  results are truncated"
             );
         }
-        Ok(rows)
+        Ok(out)
     }
 
     // ── Message persistence ──
 
     #[instrument(skip_all)]
     #[allow(clippy::too_many_arguments)]
-    pub fn insert_message(
+    pub async fn insert_message(
         &self,
         session_id: &str,
         role: &str,
@@ -135,32 +140,32 @@ impl Database {
         self.conn.execute(
             "INSERT INTO messages (session_id, role, content, tool_calls_json, tool_call_id, timestamp, created_at, content_parts_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![session_id, role, content, tool_calls_json, tool_call_id, timestamp, now, content_parts_json],
-        )?;
+            params!(session_id, role, content, tool_calls_json, tool_call_id, timestamp, now, content_parts_json),
+        ).await?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn load_session_messages(&self, session_id: &str) -> Result<Vec<MessageRow>> {
-        let mut stmt = self.conn.prepare(
+    pub async fn load_session_messages(&self, session_id: &str) -> Result<Vec<MessageRow>> {
+        let mut rows = self.conn.query(
             "SELECT id, session_id, role, content, tool_calls_json, tool_call_id, timestamp, created_at, content_parts_json
              FROM messages WHERE session_id = ?1 ORDER BY id ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![session_id], |row| {
-                Ok(MessageRow {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get(3)?,
-                    tool_calls_json: row.get(4)?,
-                    tool_call_id: row.get(5)?,
-                    timestamp: row.get(6)?,
-                    created_at: row.get(7)?,
-                    content_parts_json: row.get(8)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params!(session_id),
+        ).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(MessageRow {
+                id: row.get::<i64>(0)?,
+                session_id: row.get::<String>(1)?,
+                role: row.get::<String>(2)?,
+                content: row.get::<Option<String>>(3)?,
+                tool_calls_json: row.get::<Option<String>>(4)?,
+                tool_call_id: row.get::<Option<String>>(5)?,
+                timestamp: row.get::<Option<String>>(6)?,
+                created_at: row.get::<i64>(7)?,
+                content_parts_json: row.get::<Option<String>>(8)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Create a forked session by copying message rows from `parent_id`
@@ -169,7 +174,7 @@ impl Database {
     ///
     /// Returns the number of messages copied. Errors if the anchor doesn't
     /// exist in the parent session, or if the parent session row is missing.
-    pub fn fork_session(
+    pub async fn fork_session(
         &self,
         parent_id: &str,
         anchor_message_id: i64,
@@ -178,35 +183,42 @@ impl Database {
         now: i64,
     ) -> Result<usize> {
         let parent = self
-            .session_by_id(parent_id)?
+            .session_by_id(parent_id)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("parent session '{parent_id}' not found"))?;
-        let anchor_in_parent: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM messages WHERE session_id = ?1 AND id = ?2",
-                params![parent_id, anchor_message_id],
-                |row| row.get(0),
-            )
-            .ok();
+        let anchor_in_parent: Option<i64> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM messages WHERE session_id = ?1 AND id = ?2",
+                    params!(parent_id, anchor_message_id),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<i64>(0)?),
+                None => None,
+            }
+        };
         if anchor_in_parent.is_none() {
             anyhow::bail!("anchor message {anchor_message_id} not found in session '{parent_id}'");
         }
 
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.conn.unchecked_transaction().await?;
         tx.execute(
             "INSERT INTO sessions
                 (id, created_at, updated_at, total_tokens, model, title,
                  parent_session_id, forked_from_message_id)
              VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5, ?6)",
-            params![
+            params!(
                 new_id,
                 now,
                 parent.model,
                 new_title,
                 parent_id,
-                anchor_message_id
-            ],
-        )?;
+                anchor_message_id,
+            ),
+        )
+        .await?;
         let copied = tx.execute(
             "INSERT INTO messages
                 (session_id, role, content, tool_calls_json, tool_call_id,
@@ -216,18 +228,21 @@ impl Database {
              FROM messages
              WHERE session_id = ?2 AND id <= ?3
              ORDER BY id ASC",
-            params![new_id, parent_id, anchor_message_id],
-        )?;
-        tx.commit()?;
-        Ok(copied)
+            params!(new_id, parent_id, anchor_message_id),
+        ).await?;
+        tx.commit().await?;
+        Ok(copied as usize)
     }
 
-    pub fn delete_session_messages(&self, session_id: &str) -> Result<usize> {
-        let count = self.conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        Ok(count)
+    pub async fn delete_session_messages(&self, session_id: &str) -> Result<usize> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?;
+        Ok(count as usize)
     }
 
     // ── Channel sessions ──
@@ -236,37 +251,44 @@ impl Database {
     /// `Ok(None)` when no row exists yet — used by read-only paths like
     /// `/btw` that need the current transcript snapshot but must not
     /// materialise a new session as a side effect.
-    pub fn lookup_channel_session(
+    pub async fn lookup_channel_session(
         &self,
         channel_name: &str,
         sender_id: &str,
     ) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
+        let mut rows = self.conn.query(
             "SELECT session_id FROM channel_sessions WHERE channel_name = ?1 AND sender_id = ?2",
-        )?;
-        let existing: Option<String> = stmt
-            .query_map(params![channel_name, sender_id], |row| row.get(0))?
-            .next()
-            .and_then(std::result::Result::ok);
-        Ok(existing)
+            params!(channel_name, sender_id),
+        ).await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get::<String>(0)?)),
+            None => Ok(None),
+        }
     }
 
-    pub fn resolve_channel_session(&self, channel_name: &str, sender_id: &str) -> Result<String> {
+    pub async fn resolve_channel_session(
+        &self,
+        channel_name: &str,
+        sender_id: &str,
+    ) -> Result<String> {
         let now = chrono::Utc::now().timestamp();
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id FROM channel_sessions WHERE channel_name = ?1 AND sender_id = ?2",
-        )?;
-        let existing: Option<String> = stmt
-            .query_map(params![channel_name, sender_id], |row| row.get(0))?
-            .next()
-            .and_then(std::result::Result::ok);
+        let existing: Option<String> = {
+            let mut rows = self.conn.query(
+                "SELECT session_id FROM channel_sessions WHERE channel_name = ?1 AND sender_id = ?2",
+                params!(channel_name, sender_id),
+            ).await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<String>(0)?),
+                None => None,
+            }
+        };
 
         match existing {
             Some(session_id) => {
                 self.conn.execute(
                     "UPDATE channel_sessions SET last_active = ?1 WHERE channel_name = ?2 AND sender_id = ?3",
-                    params![now, channel_name, sender_id],
-                )?;
+                    params!(now, channel_name, sender_id),
+                ).await?;
                 Ok(session_id)
             }
             None => {
@@ -274,14 +296,14 @@ impl Database {
                 self.conn.execute(
                     "INSERT INTO channel_sessions (channel_name, sender_id, session_id, created_at, last_active)
                      VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![channel_name, sender_id, session_id, now, now],
-                )?;
+                    params!(channel_name, sender_id, session_id.clone(), now, now),
+                ).await?;
                 Ok(session_id)
             }
         }
     }
 
-    pub fn log_channel_message(
+    pub async fn log_channel_message(
         &self,
         channel_name: &str,
         sender_id: &str,
@@ -294,13 +316,13 @@ impl Database {
         self.conn.execute(
             "INSERT INTO channel_messages (channel_name, sender_id, direction, content, metadata_json, session_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![channel_name, sender_id, direction, content, metadata_json, session_id, now],
-        )?;
+            params!(channel_name, sender_id, direction, content, metadata_json, session_id, now),
+        ).await?;
         Ok(self.conn.last_insert_rowid())
     }
 
     /// Update session_id for a channel session (used by /new command).
-    pub fn update_channel_session_id(
+    pub async fn update_channel_session_id(
         &self,
         channel_name: &str,
         sender_id: &str,
@@ -309,37 +331,58 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let updated = self.conn.execute(
             "UPDATE channel_sessions SET session_id = ?1, last_active = ?2 WHERE channel_name = ?3 AND sender_id = ?4",
-            params![new_session_id, now, channel_name, sender_id],
-        )?;
+            params!(new_session_id, now, channel_name, sender_id),
+        ).await?;
         Ok(updated > 0)
     }
 
     /// Count messages in a session.
-    pub fn count_session_messages(&self, session_id: &str) -> Result<usize> {
-        let mut stmt = self
+    pub async fn count_session_messages(&self, session_id: &str) -> Result<usize> {
+        let mut rows = self
             .conn
-            .prepare("SELECT COUNT(*) FROM messages WHERE session_id = ?1")?;
-        let count: i64 = stmt.query_row(params![session_id], |row| row.get(0))?;
-        Ok(count as usize)
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params!(session_id),
+            )
+            .await?;
+        let count: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
+        Ok(count.max(0) as usize)
     }
 
     /// Count sessions whose `updated_at` is at or after `since_ts`. A session
     /// counts as "active in window" if it was touched, not merely created
     /// before the window — matches the wording in `/usage`.
-    pub fn session_count_since(&self, since_ts: i64) -> Result<u64> {
-        let mut stmt = self
+    pub async fn session_count_since(&self, since_ts: i64) -> Result<u64> {
+        let mut rows = self
             .conn
-            .prepare("SELECT COUNT(*) FROM sessions WHERE updated_at >= ?1")?;
-        let count: i64 = stmt.query_row(params![since_ts], |row| row.get(0))?;
+            .query(
+                "SELECT COUNT(*) FROM sessions WHERE updated_at >= ?1",
+                params!(since_ts),
+            )
+            .await?;
+        let count: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
         Ok(count.max(0) as u64)
     }
 
     /// Count messages whose `created_at` is at or after `since_ts`.
-    pub fn message_count_since(&self, since_ts: i64) -> Result<u64> {
-        let mut stmt = self
+    pub async fn message_count_since(&self, since_ts: i64) -> Result<u64> {
+        let mut rows = self
             .conn
-            .prepare("SELECT COUNT(*) FROM messages WHERE created_at >= ?1")?;
-        let count: i64 = stmt.query_row(params![since_ts], |row| row.get(0))?;
+            .query(
+                "SELECT COUNT(*) FROM messages WHERE created_at >= ?1",
+                params!(since_ts),
+            )
+            .await?;
+        let count: i64 = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)?,
+            None => 0,
+        };
         Ok(count.max(0) as u64)
     }
 
@@ -348,27 +391,30 @@ impl Database {
     /// sorted by count descending.
     ///
     /// Two on-disk shapes are tolerated:
-    /// - OpenAI/Codex style: `[{ "function": { "name": "..." }, ... }, ...]`
+    /// - OpenAI-style: `[{ "function": { "name": "..." }, ... }, ...]`
     /// - Anthropic-style assistant tool blocks: `[{ "name": "...", "input": {...} }, ...]`
     ///
     /// Rows whose `tool_calls_json` fails to parse are skipped with a
     /// `tracing::warn!` and do not abort the aggregation — `/usage` must
     /// not fail if one corrupted row exists somewhere in history.
     #[instrument(skip_all)]
-    pub fn tool_call_counts_since(
+    pub async fn tool_call_counts_since(
         &self,
         since_ts: i64,
         top_n: usize,
     ) -> Result<Vec<(String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT tool_calls_json FROM messages
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT tool_calls_json FROM messages
              WHERE created_at >= ?1 AND tool_calls_json IS NOT NULL",
-        )?;
-        let rows = stmt.query_map(params![since_ts], |row| row.get::<_, String>(0))?;
+                params!(since_ts),
+            )
+            .await?;
 
         let mut counts: HashMap<String, u64> = HashMap::new();
-        for row in rows {
-            let json = match row {
+        while let Some(row) = rows.next().await? {
+            let json = match row.get::<String>(0) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!("tool_call_counts_since: row read failed: {e}");
@@ -414,43 +460,53 @@ impl Database {
     /// in the window (asserting MAX, not arbitrary-row, is a tested
     /// invariant). Sorted by message count descending.
     #[instrument(skip_all)]
-    pub fn channel_activity_since(&self, since_ts: i64) -> Result<Vec<ChannelActivityRow>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT channel_name, COUNT(*) AS msg_count, MAX(created_at) AS last_active
+    pub async fn channel_activity_since(
+        &self,
+        since_ts: i64,
+    ) -> Result<Vec<ChannelActivityRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT channel_name, COUNT(*) AS msg_count, MAX(created_at) AS last_active
              FROM channel_messages
              WHERE created_at >= ?1
              GROUP BY channel_name
              ORDER BY msg_count DESC, channel_name ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![since_ts], |row| {
-                let count: i64 = row.get(1)?;
-                Ok(ChannelActivityRow {
-                    channel_name: row.get(0)?,
-                    message_count: count.max(0) as u64,
-                    last_active_unix: row.get(2)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+                params!(since_ts),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let count: i64 = row.get::<i64>(1)?;
+            out.push(ChannelActivityRow {
+                channel_name: row.get::<String>(0)?,
+                message_count: count.max(0) as u64,
+                last_active_unix: row.get::<i64>(2)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Keep the last `keep` messages in a session, deleting older ones.
     /// Returns the number of deleted messages.
-    pub fn compact_session_messages(&self, session_id: &str, keep: usize) -> Result<usize> {
+    pub async fn compact_session_messages(
+        &self,
+        session_id: &str,
+        keep: usize,
+    ) -> Result<usize> {
         let count = self.conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id NOT IN \
              (SELECT id FROM messages WHERE session_id = ?1 ORDER BY id DESC LIMIT ?2)",
-            params![session_id, keep as i64],
-        )?;
-        Ok(count)
+            params!(session_id, keep as i64),
+        ).await?;
+        Ok(count as usize)
     }
 
     /// Delete the last assistant turn (assistant + tool messages) from a session.
     /// Walks backwards from the end, collecting messages until a `user` message is
     /// hit. Returns the number of deleted messages.
-    pub fn delete_last_assistant_turn(&self, session_id: &str) -> Result<usize> {
-        let messages = self.load_session_messages(session_id)?;
+    pub async fn delete_last_assistant_turn(&self, session_id: &str) -> Result<usize> {
+        let messages = self.load_session_messages(session_id).await?;
         let mut ids_to_delete = Vec::new();
         for msg in messages.iter().rev() {
             if msg.role == "user" {
@@ -461,20 +517,17 @@ impl Database {
         if ids_to_delete.is_empty() {
             return Ok(0);
         }
-        let placeholders: Vec<String> = ids_to_delete.iter().map(|_| "?".to_string()).collect();
+        // Message ids are i64 from SQLite ROWIDs — safe to embed in SQL.
+        let id_list: String = ids_to_delete
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
-            "DELETE FROM messages WHERE session_id = ?1 AND id IN ({})",
-            placeholders.join(",")
+            "DELETE FROM messages WHERE session_id = ?1 AND id IN ({id_list})"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut param_idx = 1;
-        stmt.raw_bind_parameter(param_idx, session_id)?;
-        for id in &ids_to_delete {
-            param_idx += 1;
-            stmt.raw_bind_parameter(param_idx, id)?;
-        }
-        let count = stmt.raw_execute()?;
-        Ok(count)
+        let count = self.conn.execute(&sql, params!(session_id)).await?;
+        Ok(count as usize)
     }
 
     /// FTS5 search over past session messages. Returns matches ordered by
@@ -483,12 +536,16 @@ impl Database {
     ///
     /// Query is passed through a minimal sanitizer: strips FTS5 operators
     /// that could cause parse errors and quotes each word for phrase safety.
-    pub fn messages_fts_search(&self, query: &str, limit: usize) -> Result<Vec<MessageFtsHit>> {
+    pub async fn messages_fts_search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageFtsHit>> {
         let sanitized = sanitize_messages_fts_query(query);
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
+        let mut rows = self.conn.query(
             "SELECT m.id, m.session_id, m.role, m.content, m.created_at,
                     -bm25(messages_fts) AS score
              FROM messages_fts
@@ -496,20 +553,22 @@ impl Database {
              WHERE messages_fts MATCH ?1
              ORDER BY score DESC
              LIMIT ?2",
-        )?;
-        let rows = stmt
-            .query_map(params![sanitized, limit as i64], |row| {
-                Ok(MessageFtsHit {
-                    id: row.get(0)?,
-                    session_id: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    created_at: row.get(4)?,
-                    score: row.get::<_, f64>(5)? as f32,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+            params!(sanitized, limit as i64),
+        ).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(MessageFtsHit {
+                id: row.get::<i64>(0)?,
+                session_id: row.get::<String>(1)?,
+                role: row.get::<String>(2)?,
+                content: row
+                    .get::<Option<String>>(3)?
+                    .unwrap_or_default(),
+                created_at: row.get::<i64>(4)?,
+                score: row.get::<f64>(5)? as f32,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -548,19 +607,21 @@ fn sanitize_messages_fts_query(query: &str) -> String {
 mod tests {
     use super::*;
 
-    fn test_db() -> Database {
-        Database::test_db()
+    async fn test_db() -> Database {
+        Database::test_db().await
     }
 
-    #[test]
-    fn test_upsert_and_list_sessions() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_upsert_and_list_sessions() {
+        let db = test_db().await;
         db.upsert_session("s1", 100, 200, 500, "gpt-4", "Session One")
+            .await
             .unwrap();
         db.upsert_session("s2", 150, 300, 1000, "claude", "Session Two")
+            .await
             .unwrap();
 
-        let sessions = db.list_sessions(10).unwrap();
+        let sessions = db.list_sessions(10).await.unwrap();
         assert!(sessions.len() >= 2);
         // Most recent updated_at first
         let s2_idx = sessions.iter().position(|s| s.id == "s2").unwrap();
@@ -571,15 +632,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_upsert_session_updates_existing() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_upsert_session_updates_existing() {
+        let db = test_db().await;
         db.upsert_session("s1", 100, 200, 500, "gpt-4", "Original")
+            .await
             .unwrap();
         db.upsert_session("s1", 100, 300, 1000, "claude", "Updated")
+            .await
             .unwrap();
 
-        let sessions = db.list_sessions(100).unwrap();
+        let sessions = db.list_sessions(100).await.unwrap();
         let s1 = sessions.iter().find(|s| s.id == "s1").unwrap();
         assert_eq!(s1.title, "Updated");
         assert_eq!(s1.total_tokens, 1000);
@@ -588,9 +651,9 @@ mod tests {
         assert_eq!(sessions.iter().filter(|s| s.id == "s1").count(), 1);
     }
 
-    #[test]
-    fn test_list_sessions_respects_limit() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_list_sessions_respects_limit() {
+        let db = test_db().await;
         for i in 0..5 {
             db.upsert_session(
                 &format!("s{i}"),
@@ -600,32 +663,42 @@ mod tests {
                 "model",
                 &format!("Session {i}"),
             )
+            .await
             .unwrap();
         }
-        let sessions = db.list_sessions(2).unwrap();
+        let sessions = db.list_sessions(2).await.unwrap();
         assert_eq!(sessions.len(), 2);
     }
 
-    #[test]
-    fn test_sessions_since() {
-        let db = test_db();
-        db.upsert_session("s1", 50, 100, 0, "m", "old").unwrap();
-        db.upsert_session("s2", 50, 200, 0, "m", "mid").unwrap();
-        db.upsert_session("s3", 50, 300, 0, "m", "new").unwrap();
+    #[tokio::test]
+    async fn test_sessions_since() {
+        let db = test_db().await;
+        db.upsert_session("s1", 50, 100, 0, "m", "old")
+            .await
+            .unwrap();
+        db.upsert_session("s2", 50, 200, 0, "m", "mid")
+            .await
+            .unwrap();
+        db.upsert_session("s3", 50, 300, 0, "m", "new")
+            .await
+            .unwrap();
 
-        let recent = db.sessions_since(150).unwrap();
+        let recent = db.sessions_since(150).await.unwrap();
         let ids: Vec<&str> = recent.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"s2"));
         assert!(ids.contains(&"s3"));
         assert!(!ids.contains(&"s1"));
     }
 
-    #[test]
-    fn test_insert_and_load_messages() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_insert_and_load_messages() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
 
         db.insert_message("s1", "user", Some("hello"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message(
             "s1",
@@ -636,11 +709,13 @@ mod tests {
             Some("2024-01-01T00:00:00Z"),
             None,
         )
+        .await
         .unwrap();
         db.insert_message("s1", "tool", Some("result"), None, Some("tc1"), None, None)
+            .await
             .unwrap();
 
-        let msgs = db.load_session_messages("s1").unwrap();
+        let msgs = db.load_session_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content.as_deref(), Some("hello"));
@@ -657,45 +732,63 @@ mod tests {
         assert!(msgs[1].id < msgs[2].id);
     }
 
-    #[test]
-    fn test_delete_session_messages() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_delete_session_messages() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         db.insert_message("s1", "user", Some("a"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "assistant", Some("b"), None, None, None, None)
+            .await
             .unwrap();
 
-        let deleted = db.delete_session_messages("s1").unwrap();
+        let deleted = db.delete_session_messages("s1").await.unwrap();
         assert_eq!(deleted, 2);
 
-        let msgs = db.load_session_messages("s1").unwrap();
+        let msgs = db.load_session_messages("s1").await.unwrap();
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn test_resolve_channel_session_creates_new() {
-        let db = test_db();
-        let sid1 = db.resolve_channel_session("telegram", "user1").unwrap();
-        let sid2 = db.resolve_channel_session("telegram", "user1").unwrap();
+    #[tokio::test]
+    async fn test_resolve_channel_session_creates_new() {
+        let db = test_db().await;
+        let sid1 = db
+            .resolve_channel_session("telegram", "user1")
+            .await
+            .unwrap();
+        let sid2 = db
+            .resolve_channel_session("telegram", "user1")
+            .await
+            .unwrap();
         assert_eq!(sid1, sid2, "same channel+sender should return same session");
     }
 
-    #[test]
-    fn test_resolve_channel_session_different_senders() {
-        let db = test_db();
-        let sid1 = db.resolve_channel_session("telegram", "user1").unwrap();
-        let sid2 = db.resolve_channel_session("telegram", "user2").unwrap();
+    #[tokio::test]
+    async fn test_resolve_channel_session_different_senders() {
+        let db = test_db().await;
+        let sid1 = db
+            .resolve_channel_session("telegram", "user1")
+            .await
+            .unwrap();
+        let sid2 = db
+            .resolve_channel_session("telegram", "user2")
+            .await
+            .unwrap();
         assert_ne!(
             sid1, sid2,
             "different senders should get different sessions"
         );
     }
 
-    #[test]
-    fn test_compact_session_messages() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_compact_session_messages() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         for i in 0..10 {
             db.insert_message(
                 "s1",
@@ -706,13 +799,14 @@ mod tests {
                 None,
                 None,
             )
+            .await
             .unwrap();
         }
 
-        let deleted = db.compact_session_messages("s1", 3).unwrap();
+        let deleted = db.compact_session_messages("s1", 3).await.unwrap();
         assert_eq!(deleted, 7);
 
-        let remaining = db.load_session_messages("s1").unwrap();
+        let remaining = db.load_session_messages("s1").await.unwrap();
         assert_eq!(remaining.len(), 3);
         // The newest 3 should remain
         assert_eq!(remaining[0].content.as_deref(), Some("msg7"));
@@ -720,48 +814,60 @@ mod tests {
         assert_eq!(remaining[2].content.as_deref(), Some("msg9"));
     }
 
-    #[test]
-    fn test_delete_last_assistant_turn() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_delete_last_assistant_turn() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         // user -> assistant -> tool -> user -> assistant -> tool
         db.insert_message("s1", "user", Some("q1"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "assistant", Some("a1"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "tool", Some("t1"), None, Some("tc1"), None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "user", Some("q2"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "assistant", Some("a2"), None, None, None, None)
+            .await
             .unwrap();
         db.insert_message("s1", "tool", Some("t2"), None, Some("tc2"), None, None)
+            .await
             .unwrap();
 
-        let deleted = db.delete_last_assistant_turn("s1").unwrap();
+        let deleted = db.delete_last_assistant_turn("s1").await.unwrap();
         assert_eq!(deleted, 2); // assistant + tool
 
-        let msgs = db.load_session_messages("s1").unwrap();
+        let msgs = db.load_session_messages("s1").await.unwrap();
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].role, "user");
         assert_eq!(msgs[3].content.as_deref(), Some("q2"));
     }
 
-    #[test]
-    fn test_delete_last_assistant_turn_only_user_messages() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_delete_last_assistant_turn_only_user_messages() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         db.insert_message("s1", "user", Some("q1"), None, None, None, None)
+            .await
             .unwrap();
 
-        let deleted = db.delete_last_assistant_turn("s1").unwrap();
+        let deleted = db.delete_last_assistant_turn("s1").await.unwrap();
         assert_eq!(deleted, 0);
     }
 
-    #[test]
-    fn fork_copies_messages_up_to_anchor_inclusive() {
-        let db = test_db();
+    #[tokio::test]
+    async fn fork_copies_messages_up_to_anchor_inclusive() {
+        let db = test_db().await;
         db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .await
             .unwrap();
         let mut ids = Vec::new();
         for i in 0..6 {
@@ -775,6 +881,7 @@ mod tests {
                     None,
                     None,
                 )
+                .await
                 .unwrap(),
             );
         }
@@ -782,11 +889,12 @@ mod tests {
 
         let copied = db
             .fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .await
             .unwrap();
         assert_eq!(copied, 4);
 
-        let parent_msgs = db.load_session_messages("parent").unwrap();
-        let child_msgs = db.load_session_messages("child").unwrap();
+        let parent_msgs = db.load_session_messages("parent").await.unwrap();
+        let child_msgs = db.load_session_messages("child").await.unwrap();
         assert_eq!(parent_msgs.len(), 6);
         assert_eq!(child_msgs.len(), 4);
         let parent_contents: Vec<_> = parent_msgs[..4]
@@ -800,100 +908,124 @@ mod tests {
         assert_eq!(parent_contents, child_contents);
     }
 
-    #[test]
-    fn fork_writes_independently() {
-        let db = test_db();
+    #[tokio::test]
+    async fn fork_writes_independently() {
+        let db = test_db().await;
         db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .await
             .unwrap();
         let anchor = db
             .insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .await
             .unwrap();
 
         db.fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .await
             .unwrap();
         db.insert_message("child", "user", Some("child-only"), None, None, None, None)
+            .await
             .unwrap();
 
-        let parent_msgs = db.load_session_messages("parent").unwrap();
-        let child_msgs = db.load_session_messages("child").unwrap();
+        let parent_msgs = db.load_session_messages("parent").await.unwrap();
+        let child_msgs = db.load_session_messages("child").await.unwrap();
         assert_eq!(parent_msgs.len(), 1);
         assert_eq!(child_msgs.len(), 2);
         assert_eq!(child_msgs[1].content.as_deref(), Some("child-only"));
     }
 
-    #[test]
-    fn fork_lineage_persisted_on_session_row() {
-        let db = test_db();
+    #[tokio::test]
+    async fn fork_lineage_persisted_on_session_row() {
+        let db = test_db().await;
         db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .await
             .unwrap();
         let anchor = db
             .insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .await
             .unwrap();
         db.fork_session("parent", anchor, "child", "Parent (fork)", 200)
+            .await
             .unwrap();
 
-        let row = db.session_by_id("child").unwrap().expect("child exists");
+        let row = db
+            .session_by_id("child")
+            .await
+            .unwrap()
+            .expect("child exists");
         assert_eq!(row.parent_session_id.as_deref(), Some("parent"));
         assert_eq!(row.forked_from_message_id, Some(anchor));
-        let parent_row = db.session_by_id("parent").unwrap().unwrap();
+        let parent_row = db.session_by_id("parent").await.unwrap().unwrap();
         assert_eq!(parent_row.parent_session_id, None);
         assert_eq!(parent_row.forked_from_message_id, None);
     }
 
-    #[test]
-    fn fork_invalid_anchor_errors_and_does_not_create_session() {
-        let db = test_db();
+    #[tokio::test]
+    async fn fork_invalid_anchor_errors_and_does_not_create_session() {
+        let db = test_db().await;
         db.upsert_session("parent", 100, 100, 0, "m", "Parent")
+            .await
             .unwrap();
         db.insert_message("parent", "user", Some("q1"), None, None, None, None)
+            .await
             .unwrap();
 
-        let bad = db.fork_session("parent", 999_999, "child", "fork", 200);
+        let bad = db
+            .fork_session("parent", 999_999, "child", "fork", 200)
+            .await;
         assert!(bad.is_err());
-        assert!(db.session_by_id("child").unwrap().is_none());
+        assert!(db.session_by_id("child").await.unwrap().is_none());
     }
 
-    #[test]
-    fn fork_unknown_parent_errors() {
-        let db = test_db();
-        let r = db.fork_session("ghost", 1, "child", "fork", 200);
+    #[tokio::test]
+    async fn fork_unknown_parent_errors() {
+        let db = test_db().await;
+        let r = db.fork_session("ghost", 1, "child", "fork", 200).await;
         assert!(r.is_err());
     }
 
-    #[test]
-    fn test_log_channel_message() {
-        let db = test_db();
+    #[tokio::test]
+    async fn test_log_channel_message() {
+        let db = test_db().await;
         let rowid = db
             .log_channel_message("telegram", "user1", "inbound", Some("hello"), None, None)
+            .await
             .unwrap();
         assert!(rowid > 0);
     }
 
-    #[test]
-    fn test_update_channel_session_id() {
-        let db = test_db();
-        let _sid = db.resolve_channel_session("telegram", "user1").unwrap();
+    #[tokio::test]
+    async fn test_update_channel_session_id() {
+        let db = test_db().await;
+        let _sid = db
+            .resolve_channel_session("telegram", "user1")
+            .await
+            .unwrap();
 
         let updated = db
             .update_channel_session_id("telegram", "user1", "new-session-id")
+            .await
             .unwrap();
         assert!(updated);
 
         // Non-existent returns false
         let not_found = db
             .update_channel_session_id("telegram", "nobody", "x")
+            .await
             .unwrap();
         assert!(!not_found);
     }
 
-    #[test]
-    fn test_count_session_messages() {
-        let db = test_db();
-        db.upsert_session("s1", 100, 100, 0, "m", "test").unwrap();
+    #[tokio::test]
+    async fn test_count_session_messages() {
+        let db = test_db().await;
+        db.upsert_session("s1", 100, 100, 0, "m", "test")
+            .await
+            .unwrap();
         for _ in 0..5 {
             db.insert_message("s1", "user", Some("msg"), None, None, None, None)
+                .await
                 .unwrap();
         }
-        assert_eq!(db.count_session_messages("s1").unwrap(), 5);
+        assert_eq!(db.count_session_messages("s1").await.unwrap(), 5);
     }
 }
