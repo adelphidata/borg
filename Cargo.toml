@@ -69,6 +69,9 @@ unicode-normalization = "0.1"
 unicode-width = "0.2"
 regex = "1"
 turso = "0.6"
+# Pinned to keep MSRV at 1.88 — roaring 0.11.3+ requires rustc 1.90.
+# Revisit when the workspace rust-toolchain bumps past 1.90.
+roaring = "=0.11.2"
 scraper = "0.22"
 pdf-extract = "0.7"
 shellexpand = "3"
