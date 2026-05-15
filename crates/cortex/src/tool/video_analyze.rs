@@ -27,16 +27,32 @@ pub(crate) struct VideoAnalyzeArgs {
 }
 
 pub(crate) async fn handle(args: &VideoAnalyzeArgs, config: &Config) -> Result<ToolOutput> {
-    // Gemini-only gate. Configured provider is the source of truth — the
-    // LLM dispatcher may failover at runtime, but at tool-call time the user
-    // ran us under whatever they configured, and that's what tool routing
-    // should reflect. If someone is on OpenAI, the model should choose
-    // another path rather than us paying to fetch a video we can't render.
+    // AI-Studio-Gemini-only gate. Configured provider is the source of
+    // truth — the LLM dispatcher may failover at runtime, but at tool-call
+    // time the user ran us under whatever they configured, and that's what
+    // tool routing should reflect. If someone is on OpenAI we'd rather
+    // refuse than burn bandwidth fetching a video we can't render. Vertex
+    // is called out by name because operators commonly assume Vertex-
+    // Gemini works here — it does not until parity work lands.
     if !provider_is_gemini(config) {
-        return Ok(ToolOutput::Text(
-            "video_analyze requires a Gemini-family model (configure `llm.provider = \"gemini\"`)."
-                .to_string(),
-        ));
+        let configured = config
+            .llm
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or("(unset)");
+        let detail = if configured.eq_ignore_ascii_case("vertex_ai")
+            || configured.eq_ignore_ascii_case("vertex")
+        {
+            " Vertex-Gemini is not yet supported — see docs/specs/gemini-adapter-10-vertex-followup.md."
+        } else {
+            ""
+        };
+        return Ok(ToolOutput::Text(format!(
+            "video_analyze requires AI Studio Gemini (configure `llm.provider = \"gemini\"`). \
+             Configured provider: `{configured}`.{detail}"
+        )));
     }
 
     let trimmed = args.video_url.trim();
@@ -269,6 +285,37 @@ mod tests {
                 assert!(t.contains("Gemini"), "got: {t}");
             }
             other => panic!("expected text error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_vertex_ai_with_pointer_to_followup_spec() {
+        // Vertex-Gemini is the most common operator confusion: they have
+        // GCP set up, they expect Gemini-on-Vertex to just work for video.
+        // The error message must call out Vertex by name and point them at
+        // the design follow-up rather than letting them think the tool is
+        // broken.
+        for raw in ["vertex_ai", "Vertex", "VERTEX_AI"] {
+            let mut c = Config::default();
+            c.llm.provider = Some(raw.into());
+            let args = VideoAnalyzeArgs {
+                video_url: "data:video/mp4;base64,AAAA".into(),
+                question: None,
+            };
+            let out = handle(&args, &c).await.unwrap();
+            let text = match out {
+                ToolOutput::Text(t) => t,
+                other => panic!("expected text error, got {other:?}"),
+            };
+            assert!(text.contains("AI Studio Gemini"), "raw={raw} got: {text}");
+            assert!(
+                text.contains("Vertex-Gemini is not yet supported"),
+                "raw={raw} got: {text}"
+            );
+            assert!(
+                text.contains("gemini-adapter-10-vertex-followup.md"),
+                "raw={raw} got: {text}"
+            );
         }
     }
 

@@ -59,6 +59,14 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
         "Describe or answer questions about a remote image",
     ),
     (
+        tool_names::VIDEO_ANALYZE,
+        "Describe or answer questions about a video (AI Studio Gemini only)",
+    ),
+    (
+        tool_names::COMPUTER_USE,
+        "macOS host UI automation: screen capture, click/type/scroll, app focus",
+    ),
+    (
         tool_names::GET_GOAL,
         "Read this session's active goal (status, budget, usage)",
     ),
@@ -181,13 +189,15 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
             }),
         ));
 
-        // video_analyze: Gemini-only. The handler returns a clean error on
-        // any other provider; the schema is still advertised so the model
-        // can attempt the call (the failure message instructs it to switch
-        // provider rather than silently degrade).
+        // video_analyze: AI Studio Gemini only. Vertex-Gemini parity is a
+        // separate effort (see `docs/specs/gemini-adapter-10-vertex-followup.md`).
+        // The handler returns a clean error on any other provider; the schema
+        // is still advertised so the model can attempt the call and the
+        // failure message instructs it to switch provider rather than
+        // silently degrade.
         defs.push(ToolDefinition::new(
             tool_names::VIDEO_ANALYZE,
-            "Fetch a video from an http(s) URL or data: URI and forward it inline to a Gemini-family model for description. Supports mp4, quicktime, webm, mkv. Gemini-only — fails fast on other providers.",
+            "Fetch a video from an http(s) URL or data: URI and forward it inline to a Gemini model for description. Supports mp4, quicktime, webm, mkv. Requires `[llm.aux]` (or `[llm]`) configured for AI Studio Gemini (`provider = \"gemini\"`); fails fast on other providers, including Vertex-Gemini.",
             serde_json::json!({
                 "type": "object",
                 "properties": {

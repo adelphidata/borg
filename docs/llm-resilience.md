@@ -239,6 +239,15 @@ Configure `llm.vertex_project` and optionally `llm.vertex_location`
 endpoint; Claude/Anthropic model names use the Vertex Anthropic raw-predict
 endpoint with `anthropic_version = "vertex-2023-10-16"` in the request body.
 
+**`video_analyze` does not run on Vertex-Gemini.** The OpenAI-compatible
+façade strips `inline_data` parts on the way to the wire, so a video would
+either be silently dropped or rejected with a 400. The
+`video_analyze` handler fast-fails with a clear error pointing operators
+at AI Studio Gemini. Parity with AI Studio's native transport (regional
+endpoint, GCP bearer auth, per-model wire routing) is captured as a
+follow-up design in `docs/specs/gemini-adapter-10-vertex-followup.md` and
+is intentionally out of scope for this milestone.
+
 ### Google AI Studio (Gemini native)
 
 `Provider::Gemini` (set `llm.provider = "gemini"`, credential
