@@ -16,6 +16,7 @@ use tracing::{debug, info, instrument, warn};
 use cortex::config::Config;
 use cortex::db::Database;
 use cortex::telemetry::BorgMetrics;
+use cortex::util::supervised::spawn_panic_logged;
 
 use crate::channel::channel_trait::{self, NativeChannelRegistry, WebhookContext};
 use crate::channel::registry::ChannelRegistry;
@@ -313,7 +314,7 @@ impl GatewayServer {
         let drain_shutdown = self.shutdown.clone();
         let drain_state = state.clone();
         let drain_health = health.clone();
-        tokio::spawn(async move {
+        spawn_panic_logged("gateway-delivery-drain", async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
@@ -455,7 +456,7 @@ impl GatewayServer {
                 );
 
                 let polling_client = tg_client.clone();
-                tokio::spawn(async move {
+                spawn_panic_logged("gateway-telegram-polling", async move {
                     crate::telegram::polling::run_polling(
                         polling_client,
                         poll_dedup,
@@ -528,7 +529,7 @@ impl GatewayServer {
                 });
 
             let sig_sse_client = sig_client.clone();
-            tokio::spawn(async move {
+            spawn_panic_logged("gateway-signal-sse", async move {
                 crate::signal::sse::run_sse_loop(sig_sse_client, callback, sse_shutdown).await;
             });
         }
@@ -566,7 +567,7 @@ impl GatewayServer {
             );
 
             let request_timeout = state.request_timeout;
-            let handle = tokio::spawn(async move {
+            let handle = spawn_panic_logged("gateway-channel-poll", async move {
                 let start = tokio::time::Instant::now() + Duration::from_millis(poll_interval_ms);
                 let mut interval =
                     tokio::time::interval_at(start, Duration::from_millis(poll_interval_ms));

@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+use cortex::util::supervised::spawn_panic_logged;
+
 const IDLE_TIMEOUT: Duration = Duration::from_secs(cortex::constants::SESSION_IDLE_TIMEOUT_SECS);
 const QUEUE_CAPACITY: usize = cortex::constants::SESSION_QUEUE_CAPACITY;
 const MAX_ACTIVE_CHATS: usize = cortex::constants::MAX_ACTIVE_SESSIONS;
@@ -84,7 +86,12 @@ impl ChatQueue {
 
         senders.insert(chat_id, tx);
 
-        tokio::spawn(async move {
+        // If `chat_consumer` panics, the cleanup block below never runs and the
+        // sender lingers in the map — but the next enqueue's `tx.send().await`
+        // will fail (receiver dropped), trigger the existing dead-sender path,
+        // and respawn. Self-heals on next message; only `senders.len()` is
+        // briefly inflated against MAX_ACTIVE_CHATS.
+        spawn_panic_logged("gateway-telegram-chat-consumer", async move {
             chat_consumer(chat_id, rx, handler).await;
 
             // Clean up when consumer exits
