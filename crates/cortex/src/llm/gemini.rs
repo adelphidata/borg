@@ -20,9 +20,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use super::transport::{Transport, TransportRequest, TransportResponse};
-use super::{
-    llm_error::FailoverReason, LlmError, Message, Role, StreamEvent, ToolDefinition, UsageData,
-};
+use super::{LlmError, Message, Role, StreamEvent, ToolDefinition, UsageData};
 use crate::sse::SseAction;
 use crate::types::{ContentPart, FunctionCall, MessageContent, ToolCall};
 
@@ -715,77 +713,10 @@ pub(crate) fn parse_gemini_sse_line(
     }
 }
 
-// ── Error classification (entry point for M4 dispatch) ───────────────────
-
-/// Map a Gemini error body to an `LlmError`. Wired by M4 once the
-/// dispatcher routes Gemini through this adapter. Kept here so the wiring
-/// only needs to import one symbol.
-#[allow(dead_code)]
-pub(crate) fn classify_gemini_error(status: u16, body: &str) -> LlmError {
-    let retry_after = parse_retry_after_seconds(body);
-    let reason_text = sanitized_message(body);
-
-    match status {
-        400 => LlmError::Fatal {
-            source: anyhow::anyhow!("gemini 400 invalid request: {reason_text}"),
-            reason: FailoverReason::Format,
-        },
-        401 | 403 => LlmError::Fatal {
-            source: anyhow::anyhow!("gemini {status} auth denied: {reason_text}"),
-            reason: FailoverReason::AuthPermanent,
-        },
-        404 => LlmError::Fatal {
-            source: anyhow::anyhow!("gemini 404 model not found: {reason_text}"),
-            reason: FailoverReason::ModelNotFound,
-        },
-        429 => LlmError::Retryable {
-            source: anyhow::anyhow!("gemini 429 rate limited: {reason_text}"),
-            retry_after,
-            reason: FailoverReason::RateLimit,
-        },
-        500 | 502 | 503 | 504 => LlmError::Retryable {
-            source: anyhow::anyhow!("gemini {status} provider unavailable: {reason_text}"),
-            retry_after: None,
-            reason: FailoverReason::Overloaded,
-        },
-        _ => LlmError::Retryable {
-            source: anyhow::anyhow!("gemini {status}: {reason_text}"),
-            retry_after,
-            reason: FailoverReason::Unknown,
-        },
-    }
-}
-
-/// Parse Gemini's `RetryInfo.retryDelay: "37s"` from a JSON error body.
-/// Falls back to `None` if the field is missing or malformed.
-fn parse_retry_after_seconds(body: &str) -> Option<std::time::Duration> {
-    let v: Value = serde_json::from_str(body).ok()?;
-    let details = v.get("error")?.get("details")?.as_array()?;
-    for d in details {
-        if let Some(delay) = d.get("retryDelay").and_then(Value::as_str) {
-            if let Some(secs) = delay.strip_suffix('s') {
-                if let Ok(n) = secs.parse::<f64>() {
-                    return Some(std::time::Duration::from_secs_f64(n));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Pull `error.message` from a JSON body if present, else fall back to the
-/// raw body. Keeps the user-facing error message tight.
-fn sanitized_message(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| body.chars().take(200).collect())
-}
+// Error classification lives in `llm_error::classify_status` for all
+// providers, including Gemini. The Google-specific `RetryInfo.retryDelay`
+// shape is parsed there via `parse_retry_after` so 429s honour the
+// server-supplied cooldown.
 
 #[cfg(test)]
 mod tests {
@@ -1130,50 +1061,6 @@ mod tests {
         assert_eq!(usage.completion_tokens, 17);
         assert_eq!(usage.total_tokens, 59);
         assert_eq!(usage.cached_input_tokens, 8);
-    }
-
-    #[test]
-    fn classify_error_429_extracts_retry_after_from_details() {
-        let body = r#"{
-            "error": {
-                "code": 429,
-                "message": "Quota exceeded",
-                "status": "RESOURCE_EXHAUSTED",
-                "details": [{"@type": "...RetryInfo", "retryDelay": "37s"}]
-            }
-        }"#;
-        let err = classify_gemini_error(429, body);
-        match err {
-            LlmError::Retryable {
-                retry_after,
-                reason,
-                ..
-            } => {
-                assert_eq!(reason, FailoverReason::RateLimit);
-                let ra = retry_after.expect("expected retry_after");
-                assert!((ra.as_secs_f64() - 37.0).abs() < 0.01);
-            }
-            other => unreachable!("expected Retryable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_error_403_is_auth_permanent() {
-        let body = r#"{"error":{"message":"API key not valid"}}"#;
-        let err = classify_gemini_error(403, body);
-        match err {
-            LlmError::Fatal { reason, .. } => assert_eq!(reason, FailoverReason::AuthPermanent),
-            other => unreachable!("expected Fatal, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_error_503_is_retryable_overloaded() {
-        let err = classify_gemini_error(503, "{\"error\":{\"message\":\"unavailable\"}}");
-        match err {
-            LlmError::Retryable { reason, .. } => assert_eq!(reason, FailoverReason::Overloaded),
-            other => unreachable!("expected Retryable, got {other:?}"),
-        }
     }
 
     /// Serialises the three endpoint tests so their `BORG_GEMINI_BASE_URL`

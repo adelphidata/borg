@@ -544,6 +544,11 @@ pub(crate) fn override_retry_after(err: LlmError, override_value: Option<Duratio
 /// the same finite/positive/24h-clamp guards as `parse_retry_after_header` so
 /// a degenerate `"retry_after": -1` or `999999999` doesn't park a credential
 /// for absurd durations.
+///
+/// Also recognises Google's `RetryInfo` shape — `error.details[].retryDelay:
+/// "37s"` — which Gemini AI Studio emits on 429 responses. Without this, a
+/// Gemini 429 would fall back to the default cooldown and ignore the
+/// server-honoured delay.
 pub fn parse_retry_after(body: &str) -> Option<Duration> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let raw = &v["error"]["retry_after"];
@@ -552,12 +557,33 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
     // value via OpenRouter's `error.metadata.raw` wrapper.
     let secs = raw
         .as_f64()
-        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        .or_else(|| parse_google_retry_delay(&v));
+    let secs = secs?;
     if !secs.is_finite() || secs <= 0.0 {
         return None;
     }
     const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
     Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+}
+
+/// Walk `error.details[]` for the first `retryDelay` string in Google's
+/// `RetryInfo` proto encoding (e.g. `"37s"`, `"1.5s"`). Returns seconds as
+/// `f64` so the caller can apply the same clamp guards as the other shapes.
+fn parse_google_retry_delay(v: &serde_json::Value) -> Option<f64> {
+    let details = v.get("error")?.get("details")?.as_array()?;
+    for d in details {
+        let Some(raw) = d.get("retryDelay").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(stripped) = raw.strip_suffix('s') else {
+            continue;
+        };
+        if let Ok(n) = stripped.parse::<f64>() {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Fallback extraction for free-form provider retry hints when the structured
@@ -963,6 +989,59 @@ mod tests {
         let dur =
             parse_retry_after(r#"{"error":{"retry_after":999999999}}"#).expect("clamped, not None");
         assert_eq!(dur, Duration::from_secs(24 * 60 * 60));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_google_retry_delay() {
+        // Gemini AI Studio 429s carry the server's cooldown in `RetryInfo`
+        // proto encoding inside `error.details[]`. Without this branch a
+        // Gemini 429 would fall back to the default cooldown and the pool
+        // would over-park the credential.
+        let body = r#"{
+          "error": {
+            "code": 429,
+            "message": "Quota exceeded.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+              {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []},
+              {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"}
+            ]
+          }
+        }"#;
+        assert_eq!(parse_retry_after(body), Some(Duration::from_secs(37)));
+    }
+
+    #[test]
+    fn classify_status_429_with_google_retry_delay_is_retryable_with_delay() {
+        // Wires the full path: status::classify_status → parse_retry_after →
+        // Google `retryDelay` parser. Regression guard for the Gemini 429
+        // backoff issue.
+        let body = r#"{
+          "error": {
+            "code": 429,
+            "message": "Quota exceeded.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+              {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"}
+            ]
+          }
+        }"#;
+        let err = classify_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body,
+            Provider::Gemini,
+        );
+        match err {
+            LlmError::Retryable {
+                retry_after,
+                reason,
+                ..
+            } => {
+                assert_eq!(reason, FailoverReason::RateLimit);
+                assert_eq!(retry_after, Some(Duration::from_secs(37)));
+            }
+            other => unreachable!("expected Retryable, got {other:?}"),
+        }
     }
 
     // ── parse_retry_after_header ──
