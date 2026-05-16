@@ -664,13 +664,22 @@ mod tests {
     }
 
     /// `Tool::ComputerUse` is the only variant whose plan-mode gate is
-    /// action-discriminated. This guards both the inner predicate
-    /// (`computer_use::action_allowed_in_plan_mode`) and the wiring through
-    /// `Tool::allowed_in_plan_mode` — so the parsed and pre-parse paths can't
-    /// drift. If they ever do, a mutating action (click/type/key/…) could
-    /// silently slip through Plan mode.
+    /// action-discriminated. This locks in the per-action allowlist via the
+    /// typed predicate `Tool::allowed_in_plan_mode`. The pre-parse raw-name
+    /// path (`allowed_in_plan_mode_name`) must stay permissive enough to let
+    /// the typed predicate run — the agent dispatcher gates on both, and the
+    /// raw-name table dropping `computer_use` would skip the typed check
+    /// entirely.
     #[test]
     fn computer_use_plan_mode_gates_per_action() {
+        // Raw-name gate must allow `computer_use` through so the typed,
+        // action-discriminated predicate gets a chance to run. If this flips
+        // to false the entire tool would be blocked in Plan mode regardless
+        // of action, which is a different bug than per-action drift.
+        assert!(
+            allowed_in_plan_mode_name(tn::COMPUTER_USE),
+            "raw-name path must let computer_use through to the typed predicate"
+        );
         // (action-name, expected `allowed_in_plan_mode`).
         // Read-only: capture / list_apps / wait. Everything else mutates.
         let cases: &[(&str, bool)] = &[

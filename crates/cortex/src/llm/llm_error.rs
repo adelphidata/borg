@@ -197,10 +197,21 @@ pub(crate) fn classify_status(
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
-        401 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
-            reason: FailoverReason::Auth,
-        },
+        401 => {
+            // Gemini AI Studio uses static API keys (no token-refresh dance)
+            // — a 401 means the key is wrong/revoked and rotation alone won't
+            // recover it. Treat as permanent so the pool retires the
+            // credential instead of cooling-down-and-retrying.
+            let reason = if matches!(provider, Provider::Gemini) {
+                FailoverReason::AuthPermanent
+            } else {
+                FailoverReason::Auth
+            };
+            LlmError::Fatal {
+                source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
+                reason,
+            }
+        }
         403 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
@@ -554,15 +565,25 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
     let raw = &v["error"]["retry_after"];
     // Number form is the spec'd shape (OpenAI, OpenRouter native); string form
     // ("30", "1.5") is a fallback for upstreams that pass through a stringified
-    // value via OpenRouter's `error.metadata.raw` wrapper.
+    // value via OpenRouter's `error.metadata.raw` wrapper. Each candidate is
+    // validated finite/positive before short-circuiting so a degenerate
+    // `retry_after: 0` doesn't mask a valid Google `retryDelay` fallback.
+    let valid = |n: f64| -> Option<f64> {
+        if n.is_finite() && n > 0.0 {
+            Some(n)
+        } else {
+            None
+        }
+    };
     let secs = raw
         .as_f64()
-        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-        .or_else(|| parse_google_retry_delay(&v));
-    let secs = secs?;
-    if !secs.is_finite() || secs <= 0.0 {
-        return None;
-    }
+        .and_then(valid)
+        .or_else(|| {
+            raw.as_str()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .and_then(valid)
+        })
+        .or_else(|| parse_google_retry_delay(&v).and_then(valid))?;
     const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
     Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
 }
@@ -570,6 +591,12 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
 /// Walk `error.details[]` for the first `retryDelay` string in Google's
 /// `RetryInfo` proto encoding (e.g. `"37s"`, `"1.5s"`). Returns seconds as
 /// `f64` so the caller can apply the same clamp guards as the other shapes.
+///
+/// The Google APIs spec puts `RetryInfo` in `details[]` at most once per
+/// response, so the first parseable match is canonical. Only the proto3-JSON
+/// Duration form (`"<N>s"` / `"<N.M>s"`) is recognised — the ISO-8601
+/// (`"PT37S"`) and ms-suffix (`"37000ms"`) variants seen on other Google
+/// surfaces don't appear on AI Studio's 429 path today.
 fn parse_google_retry_delay(v: &serde_json::Value) -> Option<f64> {
     let details = v.get("error")?.get("details")?.as_array()?;
     for d in details {
@@ -1012,6 +1039,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_after_zero_falls_through_to_google_retry_delay() {
+        // Regression guard: a degenerate top-level `retry_after: 0` (or any
+        // non-positive value) must not mask the Google `retryDelay` fallback.
+        // Pre-fix the early `secs?` short-circuited on the zero, the post-
+        // validation `<= 0.0` guard returned None, and the valid 37s hint
+        // was silently lost — the pool would over-park the credential.
+        let body = r#"{
+          "error": {
+            "code": 429,
+            "retry_after": 0,
+            "details": [
+              {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "37s"}
+            ]
+          }
+        }"#;
+        assert_eq!(parse_retry_after(body), Some(Duration::from_secs(37)));
+        let neg = r#"{
+          "error": {
+            "retry_after": -5,
+            "details": [
+              {"retryDelay": "12s"}
+            ]
+          }
+        }"#;
+        assert_eq!(parse_retry_after(neg), Some(Duration::from_secs(12)));
+    }
+
+    #[test]
     fn classify_status_429_with_google_retry_delay_is_retryable_with_delay() {
         // Wires the full path: status::classify_status → parse_retry_after →
         // Google `retryDelay` parser. Regression guard for the Gemini 429
@@ -1131,6 +1186,30 @@ mod tests {
     }
 
     // ── classify_status with retry_after in body ──
+
+    #[test]
+    fn classify_401_for_gemini_is_auth_permanent_not_rotatable() {
+        // Gemini AI Studio uses static API keys with no refresh path. A 401
+        // means the key is structurally bad, so the pool must retire the
+        // credential — not cool-down-and-retry it like a rotatable Auth.
+        // Guards a regression where consolidating the deleted Gemini-specific
+        // classifier into `classify_status` dropped the 401→AuthPermanent
+        // distinction the original encoded.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"API key not valid"}}"#,
+            Provider::Gemini,
+        );
+        assert_eq!(err.reason(), FailoverReason::AuthPermanent);
+        assert!(err.is_fast_fail());
+        // Sanity: OpenAI 401 keeps the rotatable Auth semantics.
+        let err = classify_status(
+            reqwest::StatusCode::UNAUTHORIZED,
+            r#"{"error":{"message":"Invalid API key"}}"#,
+            Provider::OpenAi,
+        );
+        assert_eq!(err.reason(), FailoverReason::Auth);
+    }
 
     // ── New variants: context overflow, payload too large, model not found ──
 

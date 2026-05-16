@@ -42,8 +42,14 @@ pub(crate) async fn handle(args: &VideoAnalyzeArgs, config: &Config) -> Result<T
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .unwrap_or("(unset)");
-        let detail = if configured.eq_ignore_ascii_case("vertex_ai")
-            || configured.eq_ignore_ascii_case("vertex")
+        // Match every spelling `Provider::from_str` accepts for Vertex —
+        // `vertex-ai` (canonical kebab), `vertex_ai`, `vertexai`, `vertex` —
+        // case-insensitive. Normalising `-` → `_` collapses the canonical
+        // form into the same key as the snake-case variant.
+        let normalized = configured.replace('-', "_");
+        let detail = if normalized.eq_ignore_ascii_case("vertex_ai")
+            || normalized.eq_ignore_ascii_case("vertexai")
+            || normalized.eq_ignore_ascii_case("vertex")
         {
             " Vertex-Gemini is not yet supported — see docs/specs/gemini-adapter-10-vertex-followup.md."
         } else {
@@ -295,7 +301,17 @@ mod tests {
         // The error message must call out Vertex by name and point them at
         // the design follow-up rather than letting them think the tool is
         // broken.
-        for raw in ["vertex_ai", "Vertex", "VERTEX_AI"] {
+        // Every alias `Provider::from_str` accepts — including the canonical
+        // `vertex-ai` kebab form that the prior loop silently missed.
+        for raw in [
+            "vertex_ai",
+            "vertex-ai",
+            "vertex",
+            "vertexai",
+            "Vertex",
+            "Vertex-AI",
+            "VERTEX_AI",
+        ] {
             let mut c = Config::default();
             c.llm.provider = Some(raw.into());
             let args = VideoAnalyzeArgs {

@@ -570,21 +570,44 @@ static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
     "#).expect("compile-time literal regex")
 });
 
-/// Fold a driver response's `text` parts into the action's success summary.
-/// cua-driver reports soft failures (`element not focusable`, `target window
-/// vanished`) as JSON-RPC success with a text-part — without this merge the
-/// agent would see fake success, violating CLAUDE.md's
-/// "if we report success it must succeed" invariant.
+/// Append any text the driver returned (success context OR soft-failure
+/// detail) to the action's synthesised summary. cua-driver is responsible
+/// for emitting failure text on soft failures (`element not focusable`,
+/// `target window vanished` — JSON-RPC success with a text-part); this
+/// helper does not classify success vs. failure, it forwards whatever the
+/// driver said so the model can react on the next turn. CLAUDE.md's
+/// "if we report success it must succeed" invariant is upheld by the
+/// driver-text contract, not by post-hoc inspection here.
+///
+/// Driver-returned text is capped at `MAX_DRIVER_TEXT_BYTES` to keep a
+/// misbehaving cua-driver build from pumping megabytes into LLM context.
 fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
-    let driver_text: String = resp
-        .content
-        .into_iter()
-        .filter_map(|p| match p {
-            DriverContent::Text(t) if !t.is_empty() => Some(t),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    const MAX_DRIVER_TEXT_BYTES: usize = 4096;
+    let mut driver_text = String::new();
+    for part in resp.content {
+        let DriverContent::Text(t) = part else {
+            continue;
+        };
+        if t.is_empty() {
+            continue;
+        }
+        if !driver_text.is_empty() {
+            driver_text.push('\n');
+        }
+        driver_text.push_str(&t);
+    }
+    if driver_text.len() > MAX_DRIVER_TEXT_BYTES {
+        // Truncate on a char boundary so we don't slice mid-UTF-8.
+        let mut cut = MAX_DRIVER_TEXT_BYTES;
+        while !driver_text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let overflow = driver_text.len() - cut;
+        driver_text.truncate(cut);
+        driver_text.push_str(&format!(
+            "\n… [truncated {overflow} bytes from driver output]"
+        ));
+    }
     if driver_text.is_empty() {
         ToolOutput::Text(summary)
     } else {
@@ -1192,6 +1215,37 @@ mod tests {
         };
         assert!(text.contains("focus_app com.google.Chrome"));
         assert!(text.contains("error: target app sandbox prevents activation"));
+    }
+
+    #[tokio::test]
+    async fn click_truncates_oversized_driver_text() {
+        // A misbehaving cua-driver build could return arbitrarily large text;
+        // every action's output flows into LLM context, so the merge must cap
+        // it. Guard the 4KB cap with a clear truncation marker — without this
+        // the merge would silently inflate context budget on every turn.
+        let huge = "x".repeat(10_000);
+        let driver = FakeDriver::new(vec![DriverResponse {
+            content: vec![DriverContent::Text(huge)],
+        }]);
+        let mut args = args_with_action(ComputerUseAction::Click);
+        args.x = Some(7);
+        args.y = Some(8);
+        let out = handle_with_driver(&args, &driver).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text, got {other:?}"),
+        };
+        // Summary preserved; driver text capped; truncation marker present.
+        assert!(text.starts_with("click at (7, 8)\n"));
+        assert!(
+            text.contains("truncated"),
+            "missing truncation marker: {text}"
+        );
+        assert!(
+            text.len() < 6_000,
+            "output not capped (len={}): {text}",
+            text.len()
+        );
     }
 
     #[tokio::test]
