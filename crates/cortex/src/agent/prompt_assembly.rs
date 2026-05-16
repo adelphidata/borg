@@ -231,7 +231,7 @@ Rules:
         ];
 
         let compaction_config = self.config.with_compaction_overrides();
-        let llm = match self.make_llm_client_from_config(&compaction_config) {
+        let llm = match self.make_llm_client_from_config(&compaction_config).await {
             Ok(l) => l,
             Err(e) => {
                 tracing::warn!("Pre-compaction flush LLM init failed: {e}");
@@ -260,7 +260,9 @@ Rules:
                         &content,
                         crate::memory::WriteMode::Append,
                         "global",
-                    ) {
+                    )
+                    .await
+                    {
                         tracing::warn!("Failed to write pre-compaction flush: {e}");
                     } else if self.config.memory.embeddings.enabled {
                         // Index the daily log so it's immediately searchable.
@@ -269,7 +271,7 @@ Rules:
                         // existing entry needs to be re-embedded together.
                         let config = Arc::clone(&self.config_arc);
                         let fname = entry_name;
-                        match crate::memory::read_memory_db(&fname, "global") {
+                        match crate::memory::read_memory_db(&fname, "global").await {
                             Ok(Some(full_content)) => {
                                 spawn_logged("embed_daily_log", async move {
                                     if let Err(e) =
@@ -406,7 +408,7 @@ Rules:
             }
 
             let compaction_config = self.config.with_compaction_overrides();
-            let compaction_llm = self.make_llm_client_from_config(&compaction_config)?;
+            let compaction_llm = self.make_llm_client_from_config(&compaction_config).await?;
 
             let protect_first_n = self.config.conversation.protect_first_n;
             // Seed the iterative-summary state from any prior compaction
@@ -595,7 +597,7 @@ Rules:
             }
         };
         let hook_ctx = self.hook_ctx(hook_point, hook_data);
-        match self.hook_registry.dispatch(&hook_ctx) {
+        match self.hook_registry.dispatch(&hook_ctx).await {
             HookAction::InjectContext(extra) => {
                 system_prompt.push_str("\n\n");
                 system_prompt.push_str(&extra);

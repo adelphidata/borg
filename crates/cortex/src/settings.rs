@@ -168,8 +168,10 @@ pub struct SettingsResolver {
 
 impl SettingsResolver {
     /// Open the database for settings resolution.
-    pub fn load() -> Result<Self> {
-        let db = Database::open().with_context(|| "Failed to open database for settings")?;
+    pub async fn load() -> Result<Self> {
+        let db = Database::open()
+            .await
+            .with_context(|| "Failed to open database for settings")?;
         Ok(Self { db })
     }
 
@@ -179,9 +181,9 @@ impl SettingsResolver {
     }
 
     /// Resolve a full Config from defaults + DB overrides.
-    pub fn resolve(&self) -> Result<Config> {
+    pub async fn resolve(&self) -> Result<Config> {
         let mut config = Config::default();
-        let db_settings = self.db.list_settings()?;
+        let db_settings = self.db.list_settings().await?;
         for (key, value, _) in &db_settings {
             if let Err(e) = config.apply_setting(key, value) {
                 warn_invalid_setting_once(key, &e);
@@ -192,19 +194,19 @@ impl SettingsResolver {
 
     /// Validate and write a setting to the database.
     /// Returns the confirmation string from `apply_setting`.
-    pub fn set(&self, key: &str, value: &str) -> Result<String> {
+    pub async fn set(&self, key: &str, value: &str) -> Result<String> {
         // Validate by applying to a throwaway config
         let mut scratch = Config::default();
         let confirmation = scratch.apply_setting(key, value)?;
-        let prev = self.read_prior_for_audit(key);
-        self.db.set_setting(key, value)?;
+        let prev = self.read_prior_for_audit(key).await;
+        self.db.set_setting(key, value).await?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value));
         // Clearing a parent blob (`llm.aux = ""`) must also wipe its
         // sub-key rows. Settings replay applies all rows in lex order, so
         // a leftover `llm.aux.model = "<old>"` would auto-resurrect aux
         // on the next reload — silently negating the user's clear.
         if key == "llm.aux" && value.trim().is_empty() {
-            self.cascade_clear_aux_subkeys();
+            self.cascade_clear_aux_subkeys().await;
         }
         Ok(confirmation)
     }
@@ -212,17 +214,17 @@ impl SettingsResolver {
     /// Revert a setting to its compiled default value.
     /// Writes the default back to the DB rather than deleting the row,
     /// keeping the settings table as the complete source of truth.
-    pub fn unset(&self, key: &str) -> Result<()> {
+    pub async fn unset(&self, key: &str) -> Result<()> {
         let defaults = Config::default();
         let default_value = config_value_for_key(&defaults, key)
             .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
-        let prev = self.read_prior_for_audit(key);
-        self.db.set_setting(key, &default_value)?;
+        let prev = self.read_prior_for_audit(key).await;
+        self.db.set_setting(key, &default_value).await?;
         emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value));
         // `unset llm.aux` writes the default ("") for the parent and must
         // cascade — see the matching path in `set` for rationale.
         if key == "llm.aux" {
-            self.cascade_clear_aux_subkeys();
+            self.cascade_clear_aux_subkeys().await;
         }
         Ok(())
     }
@@ -232,9 +234,9 @@ impl SettingsResolver {
     /// logged, not propagated — a stale sub-key is a soft-fail (worst
     /// case: aux re-materializes with the old model id, which the user
     /// can fix by editing the row).
-    fn cascade_clear_aux_subkeys(&self) {
+    async fn cascade_clear_aux_subkeys(&self) {
         for sub_key in ["llm.aux.model", "llm.aux.fallback"] {
-            if let Err(e) = self.db.delete_setting(sub_key) {
+            if let Err(e) = self.db.delete_setting(sub_key).await {
                 tracing::warn!(
                     %sub_key,
                     error = %e,
@@ -249,8 +251,8 @@ impl SettingsResolver {
     /// A read failure is non-fatal — we still want the write to land — but
     /// CLAUDE.md's no-silent-swallowing invariant requires we log it so
     /// operators can spot when audit fidelity is degraded.
-    fn read_prior_for_audit(&self, key: &str) -> Option<String> {
-        match self.db.get_setting(key) {
+    async fn read_prior_for_audit(&self, key: &str) -> Option<String> {
+        match self.db.get_setting(key).await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -266,12 +268,12 @@ impl SettingsResolver {
     /// Get the effective value and its source for a single key.
     /// Source is determined by comparing the DB value to the compiled default:
     /// matching values report `Default`, differing values report `Database`.
-    pub fn get_with_source(&self, key: &str) -> Result<(String, SettingSource)> {
+    pub async fn get_with_source(&self, key: &str) -> Result<(String, SettingSource)> {
         let defaults = Config::default();
         let default_value = config_value_for_key(&defaults, key)
             .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
 
-        if let Some(db_value) = self.db.get_setting(key)? {
+        if let Some(db_value) = self.db.get_setting(key).await? {
             let source = if db_value == default_value {
                 SettingSource::Default
             } else {
@@ -285,10 +287,10 @@ impl SettingsResolver {
     }
 
     /// List all settings with their effective values and sources.
-    pub fn list_all(&self) -> Result<Vec<SettingInfo>> {
+    pub async fn list_all(&self) -> Result<Vec<SettingInfo>> {
         let mut result = Vec::new();
         for &key in ALL_SETTING_KEYS.iter() {
-            match self.get_with_source(key) {
+            match self.get_with_source(key).await {
                 Ok((value, source)) => result.push(SettingInfo {
                     key: key.to_string(),
                     value,
