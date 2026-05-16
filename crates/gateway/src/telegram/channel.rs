@@ -11,6 +11,8 @@ use cortex::config::Config;
 use cortex::db::Database;
 
 use crate::channel::channel_trait::{NativeChannel, TypingHandle, WebhookContext, WebhookOutcome};
+use crate::channel::channel_verbs::Channel;
+use crate::constants::TELEGRAM_TYPING_KEEPALIVE_INTERVAL;
 use crate::health::ChannelHealthRegistry;
 
 use super::api::TelegramClient;
@@ -174,6 +176,64 @@ impl NativeChannel for TelegramChannel {
     }
 }
 
+/// Routing target for `Channel::send` on Telegram.
+///
+/// Mirrors the parameter set the gateway already feeds to
+/// `TelegramClient::send_message` so the trait path produces byte-identical
+/// wire output to the existing direct-call sites.
+#[derive(Debug, Clone)]
+pub struct TelegramSendTarget {
+    pub chat_id: i64,
+    pub thread_id: Option<i64>,
+    pub reply_to: Option<i64>,
+}
+
+impl TelegramSendTarget {
+    pub fn new(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            thread_id: None,
+            reply_to: None,
+        }
+    }
+}
+
+#[async_trait]
+impl Channel for TelegramChannel {
+    type Target = TelegramSendTarget;
+
+    fn name(&self) -> &'static str {
+        "telegram"
+    }
+
+    fn keepalive_interval(&self) -> std::time::Duration {
+        TELEGRAM_TYPING_KEEPALIVE_INTERVAL
+    }
+
+    fn verify(&self, headers: &HeaderMap, _body: &[u8]) -> Result<()> {
+        let Some(secret) = self.secret.as_deref() else {
+            return Ok(());
+        };
+        if super::verify::verify_secret_token(headers, secret) {
+            Ok(())
+        } else {
+            anyhow::bail!("Telegram webhook secret token verification failed");
+        }
+    }
+
+    async fn send(&self, target: &Self::Target, text: &str) -> Result<()> {
+        self.client
+            .send_message(
+                target.chat_id,
+                text,
+                None,
+                target.thread_id,
+                target.reply_to,
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +312,73 @@ mod tests {
             back.voice_reply_mode,
             Some(crate::voice::VoiceReplyMode::VoiceOnly)
         );
+    }
+
+    fn make_channel(secret: Option<&str>) -> TelegramChannel {
+        TelegramChannel {
+            client: Arc::new(TelegramClient::new("token").unwrap()),
+            dedup: Arc::new(Mutex::new(UpdateDeduplicator::new())),
+            secret: secret.map(str::to_string),
+            bot_username: None,
+            config: Config::default(),
+            tts_synthesizer: None,
+        }
+    }
+
+    #[test]
+    fn channel_trait_name_matches_native_channel_name() {
+        let ch = make_channel(None);
+        assert_eq!(Channel::name(&ch), "telegram");
+        assert_eq!(NativeChannel::names(&ch), vec!["telegram"]);
+    }
+
+    #[test]
+    fn channel_trait_keepalive_uses_telegram_constant() {
+        let ch = make_channel(None);
+        assert_eq!(
+            Channel::keepalive_interval(&ch),
+            TELEGRAM_TYPING_KEEPALIVE_INTERVAL
+        );
+    }
+
+    #[test]
+    fn verify_passes_when_no_secret_configured() {
+        let ch = make_channel(None);
+        let headers = HeaderMap::new();
+        Channel::verify(&ch, &headers, b"{}").expect("missing secret means no verification");
+    }
+
+    #[test]
+    fn verify_rejects_request_with_wrong_secret_token() {
+        let ch = make_channel(Some("expected-secret"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-telegram-bot-api-secret-token",
+            axum::http::HeaderValue::from_static("wrong-secret"),
+        );
+        let err = Channel::verify(&ch, &headers, b"{}").unwrap_err();
+        assert!(
+            err.to_string().contains("verification failed"),
+            "error must identify Telegram verification failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_request_with_correct_secret_token() {
+        let ch = make_channel(Some("expected-secret"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-telegram-bot-api-secret-token",
+            axum::http::HeaderValue::from_static("expected-secret"),
+        );
+        Channel::verify(&ch, &headers, b"{}").expect("matching secret must verify");
+    }
+
+    #[test]
+    fn send_target_constructor_clears_optional_fields() {
+        let target = TelegramSendTarget::new(42);
+        assert_eq!(target.chat_id, 42);
+        assert!(target.thread_id.is_none());
+        assert!(target.reply_to.is_none());
     }
 }

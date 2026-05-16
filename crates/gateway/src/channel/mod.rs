@@ -7,6 +7,9 @@
 pub(crate) mod channel_init;
 /// `Channel` trait and shared lifecycle types.
 pub mod channel_trait;
+/// Verb-shaped per-channel primitive trait (`name` / `verify` / `send` /
+/// `keepalive_interval`). Sits below the webhook-flow `NativeChannel` trait.
+pub mod channel_verbs;
 /// Channel discovery registry for the daemon.
 pub mod registry;
 /// Per-request channel routing and gateway-binding resolution.
