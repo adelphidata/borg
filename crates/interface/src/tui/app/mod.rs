@@ -1,6 +1,12 @@
+mod composer_submit;
 mod events;
 mod key_handlers;
+mod popups;
 mod render;
+mod streaming;
+
+pub(super) use popups::PopupHandler;
+pub use streaming::{BacktrackPhase, StreamStatus};
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -37,59 +43,6 @@ use super::status_popup::StatusPopup;
 use super::subprocesses_popup::SubprocessesPopup;
 use super::transcript_pager::TranscriptPager;
 use super::usage_popup::UsagePopup;
-
-/// Single source of truth for the list of popups that participate in
-/// key/paste/visibility routing. Every dispatch site in this file uses this
-/// macro, so adding a popup is a one-line change.
-///
-/// `$body!($self, $popup)` is invoked once per popup field. Callers define
-/// an inner `macro_rules!` for the per-popup step and pass its name.
-macro_rules! for_each_routed_popup {
-    ($self:ident, $body:ident) => {
-        $body!($self, settings_popup);
-        $body!($self, model_popup);
-        $body!($self, plugins_popup);
-        $body!($self, pairing_popup);
-        $body!($self, sessions_popup);
-        $body!($self, schedule_popup);
-        $body!($self, migrate_popup);
-        $body!($self, status_popup);
-        $body!($self, usage_popup);
-        $body!($self, subprocesses_popup);
-        $body!($self, btw_popup);
-    };
-}
-
-/// Trait for popup windows that handle keyboard and paste events.
-/// Each popup converts its domain-specific actions into `AppAction` variants internally.
-///
-/// Dispatch is currently macro-driven on concrete types (see
-/// `for_each_routed_popup!`), so the trait is not invoked through `dyn`; it
-/// documents the shared contract and makes accidental drift at the signature
-/// level a compile error.
-pub(super) trait PopupHandler {
-    #[allow(dead_code)]
-    fn is_visible(&self) -> bool;
-    /// Handle a key event. `config` is provided for popups that need to mutate settings.
-    /// Returns `Ok(Some(action))` if an action should be dispatched, `Ok(None)` to absorb
-    /// the event (caller will map to `Continue`).
-    fn handle_key_event(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-        config: &mut Config,
-    ) -> Result<Option<AppAction>>;
-    /// Handle a paste event. Returns `true` if consumed.
-    fn handle_paste_event(&mut self, _text: &str) -> bool {
-        false
-    }
-    /// True when the popup is currently in a free-text-input mode (API key,
-    /// cron expression, project name, etc.). Used by the global `/` fall-through
-    /// in `dispatch_key_to_popup` so we don't hijack `/` from legitimate input
-    /// like cron `*/5 * * * *` or paths/URLs in setting values.
-    fn wants_text_input(&self) -> bool {
-        false
-    }
-}
 
 /// Per-question UI state for the `AwaitingInput` carousel.
 ///
@@ -150,78 +103,10 @@ pub enum AppState {
     ConfirmingUninstall,
 }
 
-/// Live header + details shown in the status row while `AppState::Streaming`.
-///
-/// Driven by agent events (reasoning deltas, tool starts, etc.) so the user
-/// has evidence the turn is still doing work — elapsed time alone is
-/// indistinguishable from a hang on a multi-minute reasoning turn.
-#[derive(Debug, Clone)]
-pub struct StreamStatus {
-    pub header: String,
-    pub details: Option<String>,
-}
-
-impl Default for StreamStatus {
-    fn default() -> Self {
-        Self {
-            header: "Working".to_string(),
-            details: None,
-        }
-    }
-}
-
-/// Max displayed width (in chars) of the details snippet before left-ellipsis.
-/// Kept small so the row still fits on narrow terminals.
-const STREAM_STATUS_DETAILS_MAX_CHARS: usize = 80;
-
-impl StreamStatus {
-    pub fn reset(&mut self) {
-        self.header.clear();
-        self.header.push_str("Working");
-        self.details = None;
-    }
-
-    pub fn set_header(&mut self, header: impl Into<String>) {
-        self.header = header.into();
-    }
-
-    /// Update the details snippet. Newlines are flattened to spaces and the
-    /// string is trimmed to the tail `STREAM_STATUS_DETAILS_MAX_CHARS` chars
-    /// with a leading ellipsis so the freshest bytes stay visible.
-    pub fn set_details(&mut self, details: Option<String>) {
-        self.details = details
-            .map(|s| s.replace('\n', " ").trim().to_string())
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                let count = s.chars().count();
-                if count <= STREAM_STATUS_DETAILS_MAX_CHARS {
-                    s
-                } else {
-                    let skip = count - STREAM_STATUS_DETAILS_MAX_CHARS;
-                    let tail: String = s.chars().skip(skip).collect();
-                    format!("…{tail}")
-                }
-            });
-    }
-}
-
 /// A message queued during streaming, preserving both text and image attachments.
 pub struct QueuedMessage {
     pub text: String,
     pub images: Vec<super::composer::ImageAttachment>,
-}
-
-/// State machine for conversation backtracking (rewinding to a past user message).
-pub enum BacktrackPhase {
-    /// Not in backtrack mode.
-    Inactive,
-    /// User is selecting a past message to rewind to.
-    Selecting {
-        /// Indices into `App::cells` that are `HistoryCell::User` messages, ordered oldest-first.
-        user_message_indices: Vec<usize>,
-        /// Cursor position within `user_message_indices` (0 = most recent, at the end).
-        cursor: usize,
-    },
 }
 
 /// Result of a background `/btw` run, sent from the spawned task back to the
@@ -672,35 +557,6 @@ impl<'a> App<'a> {
         self.toasts.push(text, super::toast::ToastVariant::Info);
     }
 
-    pub fn tick_throbber(&mut self) {
-        if !matches!(self.state, AppState::Idle) {
-            self.throbber_state.calc_next();
-        }
-    }
-
-    /// Transition into `AppState::Streaming` and reset the live status row.
-    ///
-    /// Call this for *new* turns (user submit, queued message). For resume
-    /// transitions from approval/input prompts where the turn was already
-    /// in flight, use `resume_streaming` so the existing header/details
-    /// (e.g. "Running run_shell") aren't wiped while the tool is still
-    /// running server-side.
-    pub fn enter_streaming(&mut self) {
-        self.state = AppState::Streaming {
-            start: Instant::now(),
-        };
-        self.stream_status = StreamStatus::default();
-    }
-
-    /// Transition back to `AppState::Streaming` from a prompt state
-    /// (approval / input request) without touching `stream_status` —
-    /// the agent is still mid-turn and its header is still accurate.
-    pub fn resume_streaming(&mut self) {
-        self.state = AppState::Streaming {
-            start: Instant::now(),
-        };
-    }
-
     /// Drain any file-search result batches posted by the background walker
     /// and hand them to the popup. Stale batches (where the returned query
     /// no longer matches the popup's `pending_query`) are dropped inside
@@ -718,76 +574,6 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Returns `true` if any popup overlay is currently visible.
-    ///
-    /// Used to suppress input routing to the composer and to prevent
-    /// `drain_queued_if_idle` from starting a new streaming turn while the
-    /// user is interacting with a popup.
-    pub fn any_popup_visible(&self) -> bool {
-        macro_rules! check {
-            ($self:ident, $popup:ident) => {
-                if $self.$popup.is_visible() {
-                    return true;
-                }
-            };
-        }
-        for_each_routed_popup!(self, check);
-        false
-    }
-
-    /// Dismiss every routed popup. Used when a global key (e.g. `/`) needs to
-    /// reach the composer regardless of current popup state.
-    pub fn close_all_popups(&mut self) {
-        macro_rules! close {
-            ($self:ident, $popup:ident) => {
-                if $self.$popup.is_visible() {
-                    $self.$popup.dismiss();
-                }
-            };
-        }
-        for_each_routed_popup!(self, close);
-    }
-
-    /// True when any visible popup is currently in a free-text-input mode
-    /// (settings value editing, model API key entry, plugin credentials,
-    /// project name/description, schedule cron). The global `/` fall-through
-    /// must NOT fire while one of these is active — `/` is a valid character
-    /// in cron expressions, paths, URLs, and many credential formats.
-    pub fn any_popup_wants_text_input(&self) -> bool {
-        macro_rules! check {
-            ($self:ident, $popup:ident) => {
-                if $self.$popup.is_visible() && $self.$popup.wants_text_input() {
-                    return true;
-                }
-            };
-        }
-        for_each_routed_popup!(self, check);
-        false
-    }
-
-    /// Whether the TUI currently wants an alt-screen surface.
-    ///
-    /// True when any of the large popups in the spec's "alt-screen wrap audit"
-    /// is visible, or while the full-screen transcript pager is open. The
-    /// event loop reconciles this against [`super::tui_lifecycle::Tui::is_alt_screen_active`]
-    /// after every iteration; smaller popups (`command_popup`, `model_popup`,
-    /// `file_popup`, plan overlay, file search) stay inline.
-    pub fn wants_alt_screen(&self) -> bool {
-        if matches!(self.state, AppState::TranscriptPager) {
-            return true;
-        }
-        self.settings_popup.is_visible()
-            || self.pairing_popup.is_visible()
-            || self.sessions_popup.is_visible()
-            || self.schedule_popup.is_visible()
-            || self.migrate_popup.is_visible()
-            || self.status_popup.is_visible()
-            || self.usage_popup.is_visible()
-            || self.subprocesses_popup.is_visible()
-            || self.btw_popup.is_visible()
-            || self.plugins_popup.is_visible()
-    }
-
     /// Toggle the collapsed state on the most recent collapsible tool result.
     /// Returns `true` when a cell was flipped, `false` when nothing qualified.
     pub fn toggle_last_collapsible(&mut self) -> bool {
@@ -797,91 +583,6 @@ impl<'a> App<'a> {
             }
         }
         false
-    }
-
-    /// Route a paste event to the first visible popup that accepts paste input.
-    /// Returns `true` if a popup consumed the paste (caller should return Continue).
-    fn dispatch_paste_to_popup(&mut self, text: &str) -> bool {
-        macro_rules! route {
-            ($self:ident, $popup:ident) => {
-                if $self.$popup.is_visible() {
-                    $self.$popup.handle_paste_event(text);
-                    return true;
-                }
-            };
-        }
-        for_each_routed_popup!(self, route);
-        false
-    }
-
-    /// Route a key event to the first visible popup.
-    /// Returns `Some(AppAction)` if a popup handled the key, `None` if no popup is visible.
-    fn dispatch_key_to_popup(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<Option<AppAction>> {
-        // Slash is the global command-palette entry. When a non-text-input
-        // popup is open (e.g. Settings browsing list, Status overview),
-        // typing `/stats` would otherwise be silently dropped because popups
-        // have modal capture. Dismiss the popup and let `/` fall through to
-        // the composer.
-        //
-        // Skipped when a popup is in a text-input mode (cron `*/5`, API keys,
-        // paths, project names) — those need `/` as a literal character.
-        if matches!(key.code, crossterm::event::KeyCode::Char('/'))
-            && key.modifiers.is_empty()
-            && self.any_popup_visible()
-            && !self.any_popup_wants_text_input()
-        {
-            self.close_all_popups();
-            return Ok(None);
-        }
-
-        // The macro expands to a chain of `if popup.is_visible() { return ... }`
-        // blocks — one per popup. Writing it this way avoids the split-borrow
-        // problem that blocks iterating an `&mut dyn PopupHandler` array when
-        // `handle_key_event` also needs `&mut self.config`.
-        macro_rules! route {
-            ($self:ident, $popup:ident) => {
-                if $self.$popup.is_visible() {
-                    let action = $self.$popup.handle_key_event(key, &mut $self.config)?;
-                    return Ok(Some(action.unwrap_or(AppAction::Continue)));
-                }
-            };
-        }
-        for_each_routed_popup!(self, route);
-        Ok(None)
-    }
-
-    /// Handle a bracketed paste event (entire pasted text as a single string).
-    ///
-    /// Popups consume the paste exclusively — either into their text-input
-    /// buffer or as a no-op when no input field is active. Paste never leaks
-    /// to the composer while any popup is open, regardless of `AppState`.
-    pub fn handle_paste(&mut self, text: String) -> AppAction {
-        // Popups get absolute first priority across ALL states.
-        // A popup can be visible during Streaming if drain_queued_if_idle
-        // started a turn while a popup was open.
-        if self.dispatch_paste_to_popup(&text) {
-            return AppAction::Continue;
-        }
-
-        match self.state {
-            AppState::Idle | AppState::AwaitingInput { .. } => {
-                self.composer.handle_paste(&text);
-                // Update popup filters (same as after handle_key)
-                let composer_text = self.composer.text();
-                if composer_text.starts_with('/') {
-                    self.command_popup.update_filter(&composer_text);
-                }
-                AppAction::Continue
-            }
-            _ => {
-                // While streaming, queue the pasted text
-                self.pending_steers.push_back(text);
-                AppAction::Continue
-            }
-        }
     }
 
     pub(super) fn handle_logs_command(&mut self, arg: Option<&str>) -> Result<AppAction> {

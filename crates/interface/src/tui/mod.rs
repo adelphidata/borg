@@ -2163,6 +2163,9 @@ mod tests {
             include_str!("app/mod.rs"),
             include_str!("app/render.rs"),
             include_str!("app/events.rs"),
+            include_str!("app/composer_submit.rs"),
+            include_str!("app/popups.rs"),
+            include_str!("app/streaming.rs"),
         );
         let code = strip_tests_and_comments(src);
         for mode in FORBIDDEN_MODES {
@@ -2198,6 +2201,9 @@ mod tests {
             include_str!("app/mod.rs"),
             include_str!("app/render.rs"),
             include_str!("app/events.rs"),
+            include_str!("app/composer_submit.rs"),
+            include_str!("app/popups.rs"),
+            include_str!("app/streaming.rs"),
         );
         let code = strip_tests_and_comments(src);
         assert!(
@@ -2247,6 +2253,9 @@ mod tests {
             include_str!("app/mod.rs"),
             include_str!("app/render.rs"),
             include_str!("app/events.rs"),
+            include_str!("app/composer_submit.rs"),
+            include_str!("app/popups.rs"),
+            include_str!("app/streaming.rs"),
         );
         let code = strip_tests_and_comments(src);
         assert!(
