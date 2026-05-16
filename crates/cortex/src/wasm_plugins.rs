@@ -222,8 +222,8 @@ impl WasmGuardState {
 /// don't want a transient DB hiccup to silently disable plugins; an operator
 /// who explicitly disabled the subsystem will have the value persisted, and
 /// `Config::load_from_db` is otherwise the source of truth.
-fn guard_state() -> WasmGuardState {
-    match Config::load_from_db() {
+async fn guard_state() -> WasmGuardState {
+    match Config::load_from_db().await {
         Ok(cfg) => WasmGuardState::from_config(&cfg),
         Err(e) => {
             tracing::warn!("WASM plugin config unreadable, defaulting open: {e}");
@@ -304,12 +304,12 @@ pub(crate) fn reset_rate_buckets_for_test() {
 }
 
 /// Return verified WASM tool definitions stored in the DB.
-pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
-    let guard = guard_state();
+pub async fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
+    let guard = guard_state().await;
     if !guard.enabled {
         return Vec::new();
     }
-    let db = match Database::open() {
+    let db = match Database::open().await {
         Ok(db) => db,
         Err(e) => {
             tracing::warn!("WASM tool definitions unavailable, DB open failed: {e}");
@@ -319,14 +319,14 @@ pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
     // We need publisher_key for the publisher-disable check, so iterate the
     // full plugin rows and join tool defs in-memory. Counts are tiny
     // (capped at 64 installs), so this is cheap.
-    let plugin_rows = match db.list_wasm_plugins() {
+    let plugin_rows = match db.list_wasm_plugins().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("Failed to list WASM plugins: {e}");
             return Vec::new();
         }
     };
-    let tool_rows = match db.list_verified_wasm_tool_definitions() {
+    let tool_rows = match db.list_verified_wasm_tool_definitions().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("Failed to load WASM tool definitions: {e}");
@@ -337,45 +337,46 @@ pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
         .iter()
         .map(|p| (p.plugin_id.as_str(), p.publisher_key.as_str()))
         .collect();
-    tool_rows
-        .into_iter()
-        .filter_map(|row| {
-            if is_builtin_tool_name(&row.name) {
+    let mut out = Vec::new();
+    for row in tool_rows {
+        if is_builtin_tool_name(&row.name) {
+            tracing::warn!(
+                tool = %row.name,
+                "Hiding WASM tool: name collides with built-in"
+            );
+            continue;
+        }
+        // list_verified_wasm_tool_definitions filters by p.status='verified',
+        // so disabled rows are already excluded — but the publisher-disable
+        // list still needs to be applied here.
+        let plugin_id = db.plugin_id_for_tool(&row.name).await.ok().flatten();
+        if let Some(plugin_id) = plugin_id.as_deref() {
+            if guard.is_plugin_disabled(plugin_id) {
+                continue;
+            }
+            if let Some(pk) = publisher_by_plugin.get(plugin_id) {
+                if guard.is_publisher_disabled(pk) {
+                    continue;
+                }
+            }
+        }
+        let schema = match serde_json::from_str::<serde_json::Value>(&row.input_schema_json) {
+            Ok(s) => s,
+            Err(e) => {
                 tracing::warn!(
-                    tool = %row.name,
-                    "Hiding WASM tool: name collides with built-in"
+                    "Skipping WASM tool {} with invalid schema JSON: {e}",
+                    row.name
                 );
-                return None;
+                continue;
             }
-            // list_verified_wasm_tool_definitions filters by p.status='verified',
-            // so disabled rows are already excluded — but the publisher-disable
-            // list still needs to be applied here.
-            let plugin_id = db.plugin_id_for_tool(&row.name).ok().flatten();
-            if let Some(plugin_id) = plugin_id.as_deref() {
-                if guard.is_plugin_disabled(plugin_id) {
-                    return None;
-                }
-                if let Some(pk) = publisher_by_plugin.get(plugin_id) {
-                    if guard.is_publisher_disabled(pk) {
-                        return None;
-                    }
-                }
-            }
-            let schema = serde_json::from_str::<serde_json::Value>(&row.input_schema_json)
-                .map_err(|e| {
-                    tracing::warn!(
-                        "Skipping WASM tool {} with invalid schema JSON: {e}",
-                        row.name
-                    );
-                })
-                .ok()?;
-            Some(crate::types::ToolDefinition::new(
-                row.name,
-                row.description,
-                schema,
-            ))
-        })
-        .collect()
+        };
+        out.push(crate::types::ToolDefinition::new(
+            row.name,
+            row.description,
+            schema,
+        ));
+    }
+    out
 }
 
 /// Execute `name` if it belongs to a verified WASM plugin.
@@ -383,8 +384,8 @@ pub fn tool_definitions() -> Vec<crate::types::ToolDefinition> {
 /// Returns `Ok(None)` when the tool name is not a WASM plugin tool. Surfaces
 /// rate-limit denials, kill-switch refusals, and quarantine triggers as
 /// `Err`s that the LLM sees as a normal tool failure.
-pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<String>> {
-    let guard = guard_state();
+pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<String>> {
+    let guard = guard_state().await;
     if !guard.enabled {
         return Ok(None);
     }
@@ -393,8 +394,8 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
         // we must not let a plugin shadow it.
         return Ok(None);
     }
-    let db = Database::open()?;
-    let Some(row) = db.get_verified_wasm_tool_runtime(name)? else {
+    let db = Database::open().await?;
+    let Some(row) = db.get_verified_wasm_tool_runtime(name).await? else {
         return Ok(None);
     };
 
@@ -409,7 +410,7 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
     // (live setting update, programmatic toggle, future hot-reload) still
     // gets refused at dispatch. Both signals are belt-and-suspenders; the
     // CLI/TUI flip both for consistency.
-    let plugin_row = db.get_wasm_plugin(&row.plugin_id)?;
+    let plugin_row = db.get_wasm_plugin(&row.plugin_id).await?;
     if guard.is_plugin_disabled(&row.plugin_id) {
         anyhow::bail!("WASM plugin '{}' is disabled", row.plugin_id);
     }
@@ -466,6 +467,7 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
             match plugins::wasm::compute_local_hmac_current(&key, &manifest_bytes, &wasm) {
                 Ok(new_seal) => {
                     db.update_wasm_plugin_local_hmac(&row.plugin_id, &new_seal)
+                        .await
                         .with_context(|| format!("persist resealed HMAC for {}", row.plugin_id))?;
                     compiled_cache::invalidate(&row.local_hmac);
                     crate::telemetry::wasm_metrics::record_reseal(&row.plugin_id);
@@ -494,7 +496,8 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
                             "reason_category": "reseal_failed",
                         }),
                     );
-                    db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())?;
+                    db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())
+                        .await?;
                     return Err(e).context("WASM plugin quarantined");
                 }
             }
@@ -510,7 +513,8 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
                     "reason_category": "integrity_failure",
                 }),
             );
-            db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())?;
+            db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())
+                .await?;
             return Err(current_err).context("WASM plugin quarantined");
         }
     }
@@ -521,7 +525,7 @@ pub fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Option<S
     // Load config now so credential resolution works; if it fails, capability
     // calls will still return a clean error to the guest (-1) rather than
     // crashing the host.
-    let config = Config::load_from_db().ok().map(Arc::new);
+    let config = Config::load_from_db().await.ok().map(Arc::new);
     let services: Arc<dyn HostServices> = Arc::new(BorgHostServices::new(
         &row.plugin_id,
         manifest.credentials.clone(),
@@ -1191,7 +1195,7 @@ pub struct InstalledSummary {
 ///
 /// Shared by the `borg plugin install` CLI command and the integration test
 /// suite so both walk the same code path.
-pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
+pub async fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
     if !dir.is_dir() {
         bail!("{} is not a directory", dir.display());
     }
@@ -1206,14 +1210,14 @@ pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
     let wasm =
         std::fs::read(&wasm_path).with_context(|| format!("read {}", wasm_path.display()))?;
 
-    let config = Config::load_from_db().context("load config")?;
+    let config = Config::load_from_db().await.context("load config")?;
     if config.security.trusted_publisher_keys.is_empty() {
         bail!(
             "security.trusted_publisher_keys is empty; add at least one key with `borg settings set security.trusted_publisher_keys '[\"<base64-ed25519>\"]'`"
         );
     }
 
-    let db = Database::open().context("open db")?;
+    let db = Database::open().await.context("open db")?;
     let local_hmac_key = db.derive_hmac_key(HMAC_DOMAIN);
 
     let package = plugins::wasm::verify_package(
@@ -1305,6 +1309,7 @@ pub fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
         },
         &tool_refs,
     )
+    .await
     .context("persist plugin metadata")?;
 
     // Match the audit pattern established for WASM_PLUGIN_EXECUTED /
@@ -1351,11 +1356,12 @@ pub struct RemoveOutcome {
 /// The on-disk directory is only removed when it sits under
 /// `data_dir/wasm_plugins/` — a paranoia guard against a tampered DB row
 /// pointing at a path outside the borg data dir.
-pub fn remove(plugin_id: &str) -> Result<RemoveOutcome> {
-    let db = Database::open().context("open db")?;
-    let row = db.get_wasm_plugin(plugin_id)?;
+pub async fn remove(plugin_id: &str) -> Result<RemoveOutcome> {
+    let db = Database::open().await.context("open db")?;
+    let row = db.get_wasm_plugin(plugin_id).await?;
     let existed = db
         .delete_wasm_plugin(plugin_id)
+        .await
         .context("delete plugin rows")?;
     if !existed {
         return Ok(RemoveOutcome {

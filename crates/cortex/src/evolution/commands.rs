@@ -87,8 +87,8 @@ pub fn parse(msg: &str) -> Option<EvolutionCommand> {
 /// Phase 1 emits minimal but coherent text so the surfaces are exercised
 /// end-to-end. Streams A/B/E replace each branch's body with the real
 /// renderer from `evolution/format.rs` / `evolution/share_card.rs`.
-pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
-    let state = db.get_evolution_state()?;
+pub async fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
+    let state = db.get_evolution_state().await?;
 
     match cmd {
         EvolutionCommand::Evolution => {
@@ -97,14 +97,14 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             // to baseline state on DB failure and log the reason instead of
             // silently swallowing.
             let now = chrono::Utc::now();
-            let vitals_state = match db.get_vitals_state() {
+            let vitals_state = match db.get_vitals_state().await {
                 Ok(v) => vitals::apply_decay(&v, now),
                 Err(e) => {
                     tracing::warn!("evolution: vitals unavailable, using baseline: {e}");
                     vitals::baseline()
                 }
             };
-            let bond_state = match db.get_all_bond_events() {
+            let bond_state = match db.get_all_bond_events().await {
                 Ok(events) => {
                     let key = db.derive_hmac_key(bond::BOND_HMAC_DOMAIN);
                     bond::replay_events_with_key(&key, &events)
@@ -122,7 +122,7 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
 
             let mut text = format_evolution_overview(&state);
             text.push('\n');
-            text.push_str(&format_posture_line(db));
+            text.push_str(&format_posture_line(db).await);
             if !hints.is_empty() {
                 text.push('\n');
                 text.push_str(&format_next_step_hints(&hints));
@@ -133,12 +133,12 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             })
         }
         EvolutionCommand::Xp => {
-            let events = db.load_all_evolution_events()?;
+            let events = db.load_all_evolution_events().await?;
             let now = chrono::Utc::now().timestamp();
             let summary = xp_summary(&events, now);
             let feed = recent_xp_feed(&events, 10);
             let mut text = String::new();
-            text.push_str(&format_posture_line(db));
+            text.push_str(&format_posture_line(db).await);
             text.push_str(&format_xp_summary(&summary));
             text.push('\n');
             text.push_str(&format_xp_feed(&feed));
@@ -152,14 +152,14 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
             // so the card shows a baseline (Stable) instead of an em dash
             // when pure replay leaves `state.mood = None`.
             let now = chrono::Utc::now();
-            let vitals_state = match db.get_vitals_state() {
+            let vitals_state = match db.get_vitals_state().await {
                 Ok(v) => vitals::apply_decay(&v, now),
                 Err(e) => {
                     tracing::warn!("card: vitals unavailable, using baseline: {e}");
                     vitals::baseline()
                 }
             };
-            let bond_state = match db.get_all_bond_events() {
+            let bond_state = match db.get_all_bond_events().await {
                 Ok(events) => {
                     let key = db.derive_hmac_key(bond::BOND_HMAC_DOMAIN);
                     bond::replay_events_with_key(&key, &events)
@@ -194,8 +194,8 @@ pub fn dispatch(cmd: EvolutionCommand, db: &Database) -> Result<CommandOutput> {
 ///
 /// Renders the head of `posture_snapshots`. `Default × 1.00` shows up
 /// verbatim on a fresh DB so the line is informative rather than missing.
-fn format_posture_line(db: &Database) -> String {
-    let (state, _seq, fallback) = current_posture_for_xp(db);
+async fn format_posture_line(db: &Database) -> String {
+    let (state, _seq, fallback) = current_posture_for_xp(db).await;
     let label = match state {
         PostureState::Reduced => "Reduced",
         PostureState::Default => "Default",
