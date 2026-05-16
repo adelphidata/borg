@@ -23,9 +23,9 @@ pub(super) struct EmbeddingRepairReport {
     pub(super) fixed_issue_keys: Vec<String>,
 }
 
-pub(super) fn embedding_scopes(db: &Database, config: &Config) -> Vec<String> {
+pub(super) async fn embedding_scopes(db: &Database, config: &Config) -> Vec<String> {
     let mut scopes = crate::memory::resolved_memory_scopes(config);
-    if let Ok(mut db_scopes) = db.list_memory_scopes() {
+    if let Ok(mut db_scopes) = db.list_memory_scopes().await {
         scopes.append(&mut db_scopes);
     }
     scopes.sort();
@@ -52,7 +52,7 @@ pub(super) fn count_stale_chunks(
         .count()
 }
 
-pub(super) fn repair_embedding_backlog(
+pub(super) async fn repair_embedding_backlog(
     db: &Database,
     config: &Config,
 ) -> Result<EmbeddingRepairReport> {
@@ -67,26 +67,24 @@ pub(super) fn repair_embedding_backlog(
 
     let max_files = config.maintenance.embedding_repair_max_files as usize;
     let max_chunks = config.maintenance.embedding_repair_max_chunks as usize;
-    let scopes = embedding_scopes(db, config);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let scopes = embedding_scopes(db, config).await;
 
     for scope in scopes {
-        let entries = db.list_memory_entries(&scope)?;
+        let entries = db.list_memory_entries(&scope).await?;
         for entry in entries {
             if report.repaired_files >= max_files {
                 return Ok(report);
             }
             let whole_missing = db
-                .get_embedding(&scope, &entry.name)?
+                .get_embedding(&scope, &entry.name)
+                .await?
                 .is_none_or(|row| row.content_hash != entry.content_hash);
             let expected_chunks = crate::memory::chunker::chunk_content(
                 &entry.content,
                 config.memory.embeddings.chunk_size_tokens,
                 config.memory.embeddings.chunk_overlap_tokens,
             );
-            let existing_chunks = db.get_chunks_for_file(&scope, &entry.name)?;
+            let existing_chunks = db.get_chunks_for_file(&scope, &entry.name).await?;
             let stale_chunk_count = count_stale_chunks(&expected_chunks, &existing_chunks);
             let chunk_missing = expected_chunks.is_empty()
                 || existing_chunks.len() != expected_chunks.len()
@@ -101,31 +99,19 @@ pub(super) fn repair_embedding_backlog(
                 }
             }
 
-            let scope_clone = scope.clone();
-            let name_clone = entry.name.clone();
-            let content_clone = entry.content.clone();
-            let config_clone = config.clone();
-            runtime.block_on(async {
-                if whole_missing {
-                    crate::memory::embeddings::embed_memory_file(
-                        &config_clone,
-                        &name_clone,
-                        &content_clone,
-                        &scope_clone,
-                    )
+            if whole_missing {
+                crate::memory::embeddings::embed_memory_file(config, &entry.name, &entry.content, &scope)
                     .await?;
-                }
-                if chunk_missing {
-                    crate::memory::embeddings::embed_memory_file_chunked(
-                        &config_clone,
-                        &name_clone,
-                        &content_clone,
-                        &scope_clone,
-                    )
-                    .await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            })?;
+            }
+            if chunk_missing {
+                crate::memory::embeddings::embed_memory_file_chunked(
+                    config,
+                    &entry.name,
+                    &entry.content,
+                    &scope,
+                )
+                .await?;
+            }
 
             report.repaired_files += 1;
             if chunk_missing {

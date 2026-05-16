@@ -32,7 +32,7 @@ pub use fs_setup::{ensure_data_subdirs, ensure_global_index};
 pub use gateway_recovery::recover_gateway_if_abandoned;
 
 use budget::BudgetTracker;
-use embeddings::{repair_embedding_backlog, EMBEDDING_CACHE_TTL_SECS};
+use embeddings::{repair_embedding_backlog, EmbeddingRepairReport, EMBEDDING_CACHE_TTL_SECS};
 use issues::{group_issues_by_remediation, issue_snapshots, RepairExecution};
 use log_prune::{
     prune_log_files, truncate_oversized_logs, CAPPED_LOG_FILES, LOG_FILE_KEEP_BYTES,
@@ -211,14 +211,17 @@ impl MaintenanceReport {
 ///
 /// The daemon's task dispatcher and `Admin.Heal` RPC call the registry
 /// variant so subprocess reap/auto-kill actually runs in production.
-pub fn run_daily_maintenance(db: &Database, config: &Config) -> Result<MaintenanceReport> {
-    run_daily_maintenance_with_registry(db, config, None)
+pub async fn run_daily_maintenance(
+    db: &Database,
+    config: &Config,
+) -> Result<MaintenanceReport> {
+    run_daily_maintenance_with_registry(db, config, None).await
 }
 
 /// Run the full daily maintenance sweep. Never propagates errors from
 /// individual steps — each is logged and the sweep continues so one
 /// broken step can't block the others.
-pub fn run_daily_maintenance_with_registry(
+pub async fn run_daily_maintenance_with_registry(
     db: &Database,
     config: &Config,
     registry: Option<&ProcessRegistry>,
@@ -246,12 +249,12 @@ pub fn run_daily_maintenance_with_registry(
             tracing::warn!("maintenance: ensure_data_subdirs failed: {e}");
         }
     }
-    if let Err(e) = ensure_global_index(db) {
+    if let Err(e) = ensure_global_index(db).await {
         tracing::warn!("maintenance: ensure_global_index failed: {e}");
     }
 
     // 1. Headless doctor sweep, before bounded auto-repairs.
-    let initial_diag = run_diagnostics_with_registry(config, registry);
+    let initial_diag = run_diagnostics_with_registry(config, registry).await;
     let initial_issues = issue_snapshots(&initial_diag.checks);
 
     // 2. Prune filesystem logs. Best-effort — missing dir is fine.
@@ -278,7 +281,7 @@ pub fn run_daily_maintenance_with_registry(
     // 3. Prune activity-log rows beyond retention window.
     let activity_cutoff = now - (config.maintenance.activity_retention_days as i64) * SECS_PER_DAY;
     if !budget.is_blown() {
-        match db.prune_activity_before(activity_cutoff) {
+        match db.prune_activity_before(activity_cutoff).await {
             Ok(n) => {
                 report.activity_rows_deleted = n;
                 budget.try_spend(n);
@@ -289,7 +292,7 @@ pub fn run_daily_maintenance_with_registry(
 
     // 4. Prune stale embedding-cache entries.
     if !budget.is_blown() {
-        match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS) {
+        match db.prune_embedding_cache(EMBEDDING_CACHE_TTL_SECS).await {
             Ok(n) => {
                 report.embeddings_pruned = n;
                 budget.try_spend(n);
@@ -303,7 +306,7 @@ pub fn run_daily_maintenance_with_registry(
     //     security findings the user has acknowledged are intentionally
     //     bounded so they don't disappear from the radar forever.
     if !budget.is_blown() {
-        match db.doctor_squelch_prune_expired(now) {
+        match db.doctor_squelch_prune_expired(now).await {
             Ok(n) => {
                 report.squelches_expired = n;
                 budget.try_spend(n);
@@ -319,7 +322,7 @@ pub fn run_daily_maintenance_with_registry(
     //     `DataConfig::should_auto_purge`.
     if !budget.is_blown() && config.data.should_auto_purge() {
         if let Some(cutoff) = config.data.purge_cutoff(now) {
-            match db.purge_messages_before(cutoff) {
+            match db.purge_messages_before(cutoff).await {
                 Ok(n) => {
                     report.messages_purged = n;
                     budget.try_spend(n);
@@ -327,7 +330,7 @@ pub fn run_daily_maintenance_with_registry(
                 Err(e) => tracing::warn!("maintenance: messages retention purge failed: {e}"),
             }
             if !budget.is_blown() {
-                match db.tombstone_audit_events_before(cutoff, now) {
+                match db.tombstone_audit_events_before(cutoff, now).await {
                     Ok(n) => {
                         report.audit_events_tombstoned = n;
                         budget.try_spend(n);
@@ -343,7 +346,9 @@ pub fn run_daily_maintenance_with_registry(
     //    here covers the case where the daemon isn't running and the user
     //    fires this task manually with `borg schedule run <id>`.
     if !budget.is_blown() {
-        match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS) {
+        match crate::tasks::heal_stalled_tasks(db, now, crate::constants::STALLED_TASK_GRACE_SECS)
+            .await
+        {
             Ok(h) => {
                 report.stalled_tasks_healed = h.reset;
                 budget.try_spend(h.reset);
@@ -353,6 +358,7 @@ pub fn run_daily_maintenance_with_registry(
     }
     if !budget.is_blown() {
         match crate::tasks::recover_wedged_runs(db, now, crate::constants::STALLED_TASK_GRACE_SECS)
+            .await
         {
             Ok(n) => {
                 report.wedged_runs_recovered = n as usize;
@@ -414,7 +420,7 @@ pub fn run_daily_maintenance_with_registry(
                     now.saturating_sub(entry.started_at),
                     entry.command
                 );
-                crate::activity_log::log_activity(db, "warn", "process_registry", &line);
+                crate::activity_log::log_activity(db, "warn", "process_registry", &line).await;
             }
 
             // Repeat-offender: same normalized command auto-reaped two
@@ -451,7 +457,8 @@ pub fn run_daily_maintenance_with_registry(
     //     Not counted against the action budget — these are SQLite
     //     housekeeping, not row-mutating work, and the bounded VACUUM
     //     gating is already a separate budget.
-    let wv = crate::db::wal::run_wal_and_vacuum(db, now, config.maintenance.vacuum_interval_days);
+    let wv =
+        crate::db::wal::run_wal_and_vacuum(db, now, config.maintenance.vacuum_interval_days).await;
     report.wal_checkpoint_pages_reclaimed = wv.wal_checkpoint_pages_reclaimed;
     report.vacuum_ran = wv.vacuum_ran;
     report.vacuum_bytes_reclaimed = wv.vacuum_bytes_reclaimed;
@@ -472,7 +479,7 @@ pub fn run_daily_maintenance_with_registry(
     //     here); a clean daemon restart is still required for true
     //     recovery, but this stops the alert from being a permanent
     //     scar after the user already fixed the underlying issue.
-    if let Err(e) = recover_gateway_if_abandoned(db, config) {
+    if let Err(e) = recover_gateway_if_abandoned(db, config).await {
         tracing::warn!("maintenance: gateway recovery probe failed: {e}");
     }
 
@@ -487,12 +494,14 @@ pub fn run_daily_maintenance_with_registry(
         group_issues_by_remediation(&initial_issues)
     };
     for (key, issues) in grouped {
-        let result = match key {
+        let result: Result<(bool, Option<EmbeddingRepairReport>)> = match key {
             "data.ensure_subdirs" => Config::data_dir()
                 .and_then(|dir| ensure_data_subdirs(&dir))
                 .map(|_| (true, None)),
-            "memory.ensure_global_index" => ensure_global_index(db).map(|changed| (changed, None)),
-            "embeddings.repair" => repair_embedding_backlog(db, config).map(|r| {
+            "memory.ensure_global_index" => ensure_global_index(db)
+                .await
+                .map(|changed| (changed, None)),
+            "embeddings.repair" => repair_embedding_backlog(db, config).await.map(|r| {
                 report.embeddings_repaired_files += r.repaired_files;
                 report.embeddings_repaired_chunks += r.repaired_chunks;
                 budget.try_spend(r.repaired_files);
@@ -524,8 +533,9 @@ pub fn run_daily_maintenance_with_registry(
                     }
                 }
                 for issue in &issues {
-                    if let Err(e) =
-                        db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    if let Err(e) = db
+                        .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                        .await
                     {
                         tracing::warn!("maintenance: issue-state observe failed: {e}");
                     }
@@ -534,7 +544,9 @@ pub fn run_daily_maintenance_with_registry(
                     } else {
                         "attempted"
                     };
-                    if let Err(e) = db.record_issue_auto_fix_attempt(&issue.issue_key, now, outcome)
+                    if let Err(e) = db
+                        .record_issue_auto_fix_attempt(&issue.issue_key, now, outcome)
+                        .await
                     {
                         tracing::warn!("maintenance: issue auto-fix attempt record failed: {e}");
                     }
@@ -546,13 +558,15 @@ pub fn run_daily_maintenance_with_registry(
                     repair_execution
                         .failed_issues
                         .insert(issue.issue_key.clone());
-                    if let Err(se) =
-                        db.upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                    if let Err(se) = db
+                        .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+                        .await
                     {
                         tracing::warn!("maintenance: issue-state observe failed: {se}");
                     }
-                    if let Err(se) =
-                        db.record_issue_auto_fix_attempt(&issue.issue_key, now, "failed")
+                    if let Err(se) = db
+                        .record_issue_auto_fix_attempt(&issue.issue_key, now, "failed")
+                        .await
                     {
                         tracing::warn!("maintenance: issue auto-fix attempt record failed: {se}");
                     }
@@ -562,7 +576,7 @@ pub fn run_daily_maintenance_with_registry(
     }
 
     // 7. Re-run diagnostics so the recorded report reflects post-repair state.
-    let mut diag = run_diagnostics_with_registry(config, registry);
+    let mut diag = run_diagnostics_with_registry(config, registry).await;
     if subprocess_repeat_offender {
         // Two consecutive sweeps auto-reaped the same workload. Surface
         // as a persistent warning so the operator either pins it or adds
@@ -605,25 +619,31 @@ pub fn run_daily_maintenance_with_registry(
         .count();
 
     for issue in &initial_issues {
-        if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status) {
+        if let Err(e) = db
+            .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+            .await
+        {
             tracing::warn!("maintenance: issue-state observe failed: {e}");
         }
     }
     let final_keys: BTreeSet<String> = final_issues.iter().map(|i| i.issue_key.clone()).collect();
     for issue in &final_issues {
-        if let Err(e) = db.upsert_issue_state_observed(&issue.issue_key, now, issue.status) {
+        if let Err(e) = db
+            .upsert_issue_state_observed(&issue.issue_key, now, issue.status)
+            .await
+        {
             tracing::warn!("maintenance: issue-state final observe failed: {e}");
         }
     }
     let initial_keys: BTreeSet<String> =
         initial_issues.iter().map(|i| i.issue_key.clone()).collect();
     for resolved in initial_keys.difference(&final_keys) {
-        if let Err(e) = db.resolve_issue_state(resolved, now) {
+        if let Err(e) = db.resolve_issue_state(resolved, now).await {
             tracing::warn!("maintenance: issue-state resolve failed: {e}");
         }
     }
     let resolved_cutoff = now - (config.maintenance.issue_state_keep_days as i64) * SECS_PER_DAY;
-    if let Err(e) = db.prune_resolved_issue_state_before(resolved_cutoff) {
+    if let Err(e) = db.prune_resolved_issue_state_before(resolved_cutoff).await {
         tracing::warn!("maintenance: issue-state prune failed: {e}");
     }
     // Active /doctor squelches drop their findings out of persistent_warnings
@@ -632,6 +652,7 @@ pub fn run_daily_maintenance_with_registry(
     // warning resumes.
     let active_squelches: std::collections::HashSet<String> = db
         .doctor_squelch_list_active(now)
+        .await
         .map(|rows| {
             rows.into_iter()
                 .map(|r| format!("{}:{}", r.category, r.name))
@@ -640,6 +661,7 @@ pub fn run_daily_maintenance_with_registry(
         .unwrap_or_default();
     report.persistent_warnings = db
         .list_persistent_open_issues()
+        .await
         .map(|rows| {
             rows.into_iter()
                 .map(|r| r.issue_key)
@@ -661,21 +683,25 @@ pub fn run_daily_maintenance_with_registry(
             budget.spent,
             budget.budget,
         );
-        if let Err(e) = db.log_activity(
-            "warn",
-            "maintenance",
-            &format!(
-                "heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
-                budget.spent, budget.budget
-            ),
-            None,
-        ) {
+        if let Err(e) = db
+            .log_activity(
+                "warn",
+                "maintenance",
+                &format!(
+                    "heal action budget exhausted at {} actions (cap {}); remaining mutating steps skipped",
+                    budget.spent, budget.budget
+                ),
+                None,
+            )
+            .await
+        {
             tracing::warn!("maintenance: failed to record budget-exhaust activity row: {e}");
         }
         // Surface as an issue so the existing persistent-warning lifecycle
         // promotes it on the second consecutive exhaust.
-        if let Err(e) =
-            db.upsert_issue_state_observed("Maintenance:heal action budget", now, "warn")
+        if let Err(e) = db
+            .upsert_issue_state_observed("Maintenance:heal action budget", now, "warn")
+            .await
         {
             tracing::warn!("maintenance: budget issue-state observe failed: {e}");
         }
@@ -684,6 +710,7 @@ pub fn run_daily_maintenance_with_registry(
         // for this sweep.
         let active_squelches: std::collections::HashSet<String> = db
             .doctor_squelch_list_active(now)
+            .await
             .map(|rows| {
                 rows.into_iter()
                     .map(|r| format!("{}:{}", r.category, r.name))
@@ -692,6 +719,7 @@ pub fn run_daily_maintenance_with_registry(
             .unwrap_or_default();
         report.persistent_warnings = db
             .list_persistent_open_issues()
+            .await
             .map(|rows| {
                 rows.into_iter()
                     .map(|r| r.issue_key)
@@ -703,9 +731,12 @@ pub fn run_daily_maintenance_with_registry(
 
     // 8. Persist the run (best-effort; losing the audit row must not
     //    block the sweep).
-    if let Err(e) = db.record_doctor_run(&report) {
+    if let Err(e) = db.record_doctor_run(&report).await {
         tracing::warn!("maintenance: failed to record doctor_runs row: {e}");
-    } else if let Err(e) = db.prune_doctor_runs(config.maintenance.doctor_runs_keep as usize) {
+    } else if let Err(e) = db
+        .prune_doctor_runs(config.maintenance.doctor_runs_keep as usize)
+        .await
+    {
         tracing::warn!("maintenance: failed to prune doctor_runs: {e}");
     }
 

@@ -44,8 +44,8 @@ pub fn ensure_data_subdirs(data_dir: &Path) -> Result<()> {
 /// nightly memory consolidation crons will rewrite the body later — this
 /// just makes sure the doctor "no INDEX entry" check stops firing on a
 /// fresh install. Returns `true` if a new INDEX was written.
-pub fn ensure_global_index(db: &Database) -> Result<bool> {
-    let entries = db.list_memory_entries("global")?;
+pub async fn ensure_global_index(db: &Database) -> Result<bool> {
+    let entries = db.list_memory_entries("global").await?;
     if entries.is_empty() {
         // No memory at all yet — doctor's check_memory passes ("no entries
         // in DB yet"), so nothing to seed.
@@ -58,7 +58,7 @@ pub fn ensure_global_index(db: &Database) -> Result<bool> {
     for e in &entries {
         body.push_str(&format!("- {}\n", e.name));
     }
-    db.upsert_memory_entry("global", "INDEX", &body)?;
+    db.upsert_memory_entry("global", "INDEX", &body).await?;
     tracing::info!(
         "maintenance: seeded global/INDEX with {} entry/entries",
         entries.len()

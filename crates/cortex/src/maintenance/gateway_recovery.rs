@@ -30,8 +30,8 @@ const GATEWAY_UNRECOVERABLE_AT_KEY: &str = "gateway_unrecoverable_at";
 /// underlying problem (port conflict, OOM, etc.) and restarted —
 /// without it, the augmenter would keep nagging until someone
 /// hand-cleared the meta key.
-pub fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()> {
-    if db.get_meta(GATEWAY_UNRECOVERABLE_KEY)?.as_deref() != Some("1") {
+pub async fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()> {
+    if db.get_meta(GATEWAY_UNRECOVERABLE_KEY).await?.as_deref() != Some("1") {
         return Ok(());
     }
     let addr = format!("{}:{}", config.gateway.host, config.gateway.port);
@@ -49,8 +49,8 @@ pub fn recover_gateway_if_abandoned(db: &Database, config: &Config) -> Result<()
             tracing::info!("gateway probe at {addr} succeeded — clearing unrecoverable flag");
             // Delete rather than set to "0" — the augmenter only checks
             // for "1", and a leftover sentinel pollutes DB exports.
-            db.delete_meta(GATEWAY_UNRECOVERABLE_KEY)?;
-            db.delete_meta(GATEWAY_UNRECOVERABLE_AT_KEY)?;
+            db.delete_meta(GATEWAY_UNRECOVERABLE_KEY).await?;
+            db.delete_meta(GATEWAY_UNRECOVERABLE_AT_KEY).await?;
         }
         Err(e) => {
             tracing::debug!("gateway probe at {addr} still failing: {e}");
