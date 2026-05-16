@@ -82,10 +82,10 @@ pub async fn install(
 
     // 7. Post-install hooks (plugin-specific — e.g., iMessage seeds the
     //    Messages-DB cursor once Full Disk Access is confirmed).
-    let notes = def
-        .post_install
-        .map(|hook| hook(data_dir))
-        .unwrap_or_default();
+    let notes = match def.post_install {
+        Some(hook) => hook(data_dir.to_path_buf()).await,
+        None => Vec::new(),
+    };
     let result = InstallResult {
         notes,
         credential_entries,
@@ -264,47 +264,107 @@ fn remove_credential(service: &str, key: &str) {
 
 /// Post-install hook for iMessage: initialize state.json with current max ROWID
 /// so only future messages are processed. Returns user-facing notes.
-pub(crate) fn imessage_post_install(data_dir: &std::path::Path) -> Vec<String> {
-    let mut notes = Vec::new();
-    let state_path = data_dir
-        .join("channels")
-        .join("imessage")
-        .join("state.json");
-    let db_path = dirs::home_dir()
-        .map(|h| h.join("Library/Messages/chat.db"))
-        .unwrap_or_default();
+///
+/// Reads the macOS Messages database (`~/Library/Messages/chat.db`) via turso
+/// in unencrypted-open mode. We never write to chat.db — the SELECTs below are
+/// the only statements issued, which is the application-boundary read-only
+/// enforcement called out in the migration plan (Turso has no
+/// `SQLITE_OPEN_READ_ONLY` open-flag equivalent).
+pub(crate) fn imessage_post_install(data_dir: std::path::PathBuf) -> crate::catalog::PostInstallFuture {
+    Box::pin(async move {
+        let mut notes = Vec::new();
+        let state_path = data_dir
+            .join("channels")
+            .join("imessage")
+            .join("state.json");
+        let db_path = dirs::home_dir()
+            .map(|h| h.join("Library/Messages/chat.db"))
+            .unwrap_or_default();
 
-    if !db_path.exists() {
-        notes.push("Full Disk Access required:".to_string());
-        notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
-        notes.push("  Add your terminal app, then restart Borg".to_string());
-        return notes;
+        if !db_path.exists() {
+            notes.push("Full Disk Access required:".to_string());
+            notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
+            notes.push("  Add your terminal app, then restart Borg".to_string());
+            return notes;
+        }
+
+        match open_messages_db(&db_path).await {
+            Ok(conn) => {
+                match read_max_rowid(&conn).await {
+                    Ok(Some(max_rowid)) => {
+                        let state = format!("{{\"last_rowid\": {max_rowid}}}");
+                        if let Err(e) = std::fs::write(&state_path, &state) {
+                            notes.push(format!("Warning: failed to write state file: {e}"));
+                        }
+                    }
+                    Ok(None) => {
+                        // Empty messages table — write null sentinel so the
+                        // gateway will seed on first arrival.
+                        if let Err(e) = std::fs::write(&state_path, "{\"last_rowid\": null}") {
+                            notes.push(format!("Warning: failed to write state file: {e}"));
+                        }
+                    }
+                    Err(e) => {
+                        notes.push(format!("Warning: could not query Messages DB: {e}"));
+                    }
+                }
+
+                notes.push("Full Disk Access detected".to_string());
+
+                if let Ok(Some(address)) = read_self_handle(&conn).await {
+                    notes.push(format!("Your iMessage address: {address}"));
+                }
+
+                notes.push(
+                    "Messages will be processed automatically when Borg is running".to_string(),
+                );
+                notes.push(
+                    "Note: Messages you send to yourself are ignored (prevents loops). Test by texting from another device.".to_string(),
+                );
+            }
+            Err(e) => {
+                tracing::debug!("turso open of chat.db failed: {e}");
+                notes.push("Full Disk Access required:".to_string());
+                notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
+                notes.push("  Add your terminal app, then restart Borg".to_string());
+            }
+        }
+
+        notes
+    })
+}
+
+async fn open_messages_db(db_path: &std::path::Path) -> anyhow::Result<turso::Connection> {
+    let db = turso::Builder::new_local(&db_path.to_string_lossy())
+        .build()
+        .await?;
+    let conn = db.connect()?;
+    Ok(conn)
+}
+
+async fn read_max_rowid(conn: &turso::Connection) -> anyhow::Result<Option<i64>> {
+    let mut rows = conn
+        .query("SELECT MAX(ROWID) FROM message", ())
+        .await?;
+    if let Some(row) = rows.next().await? {
+        Ok(row.get::<Option<i64>>(0)?)
+    } else {
+        Ok(None)
     }
+}
 
-    // NOTE (phase 8a): the previous implementation read `chat.db` via
-    // `rusqlite` to seed state.json with `MAX(ROWID)` and auto-detect the
-    // operator's iMessage handle. After the workspace-wide turso migration,
-    // rusqlite is no longer a dependency. Phase 8b will rewire this through
-    // an async turso read-only connection from the gateway runtime. Until
-    // then we write a sentinel state file that the gateway loader treats as
-    // "uninitialized — seed from MAX(ROWID) on first poll" so existing
-    // history is not replayed.
-    let state = "{\"last_rowid\": null}";
-    if let Err(e) = std::fs::write(&state_path, state) {
-        notes.push(format!("Warning: failed to write state file: {e}"));
+async fn read_self_handle(conn: &turso::Connection) -> anyhow::Result<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT DISTINCT h.id FROM message m JOIN handle h ON m.handle_id = h.ROWID WHERE m.is_from_me = 1 LIMIT 1",
+            (),
+        )
+        .await?;
+    if let Some(row) = rows.next().await? {
+        Ok(Some(row.get::<String>(0)?))
+    } else {
+        Ok(None)
     }
-    let _ = db_path; // referenced above; presence check already done.
-    notes.push("Full Disk Access required:".to_string());
-    notes.push("  System Settings > Privacy & Security > Full Disk Access".to_string());
-    notes.push("  Add your terminal app, then restart Borg".to_string());
-    notes.push(
-        "Messages will be processed automatically when Borg is running".to_string(),
-    );
-    notes.push(
-        "Note: Messages you send to yourself are ignored (prevents loops). Test by texting from another device.".to_string(),
-    );
-
-    notes
 }
 
 async fn send_event(tx: Option<&mpsc::Sender<InstallEvent>>, event: InstallEvent) {

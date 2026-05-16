@@ -1,9 +1,15 @@
 use crate::{Category, CredentialSpec, Platform, PluginKind, TemplateFile, TemplateTarget};
 
+/// Future returned by [`PostInstallHook`]. Boxed so the hook type can stay a
+/// plain function pointer while still allowing `.await` inside.
+pub type PostInstallFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>;
+
 /// Optional post-install hook run after templates and credentials are in
 /// place. Returns a list of notes (e.g. OS-permission prompts) shown to the
-/// user on completion.
-pub type PostInstallHook = fn(&std::path::Path) -> Vec<String>;
+/// user on completion. The hook is async so it can perform I/O (e.g. read
+/// the macOS Messages DB via turso) without blocking the installer task.
+pub type PostInstallHook = fn(std::path::PathBuf) -> PostInstallFuture;
 
 /// A static plugin definition — embedded in the binary.
 #[derive(Debug, Clone)]
