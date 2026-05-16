@@ -40,3 +40,8 @@ pub mod policy;
 pub mod runner;
 /// macOS Seatbelt profile generation.
 pub mod seatbelt;
+/// Windows sandbox backend (trampoline arg construction, restricted-token
+/// and elevated-IPC backends). Trampoline arg construction is
+/// platform-neutral so it builds and tests on all hosts; the actual
+/// Windows API calls live under `cfg(target_os = "windows")` submodules.
+pub mod windows;

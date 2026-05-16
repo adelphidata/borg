@@ -67,6 +67,23 @@ fn filter_blocked(paths: &[String], blocked_paths: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Construct a `SandboxCommand` that fails closed when Windows sandbox
+/// setup cannot be completed. Used by `wrap_windows()` on
+/// `current_exe()` resolution failure. Not `cfg(windows)`-gated because
+/// `wrap_command` dispatches via the runtime `cfg!()` macro (not
+/// `#[cfg]`), so the helper must compile on every target even though
+/// it's only ever called when the running OS is Windows.
+fn fail_closed_windows(context: &str, detail: &str) -> SandboxCommand {
+    tracing::error!("Windows sandbox refused to run unsandboxed: {context}: {detail}");
+    SandboxCommand {
+        program: "cmd.exe".to_string(),
+        args: vec![
+            "/c".to_string(),
+            format!("echo Borg sandbox setup failed: {context}: {detail} 1>&2 && exit 1"),
+        ],
+    }
+}
+
 /// Expand tilde in all paths, returning Strings to preserve the
 /// `Vec<String>` shape used by `SandboxPolicy::fs_read`/`fs_write`.
 fn expand_tilde_paths(paths: &[String]) -> Vec<String> {
@@ -143,6 +160,8 @@ impl SandboxPolicy {
             self.wrap_seatbelt(program, args, tool_dir)
         } else if cfg!(target_os = "linux") {
             self.wrap_bubblewrap(program, args, tool_dir)
+        } else if cfg!(target_os = "windows") {
+            self.wrap_windows(program, args, tool_dir)
         } else {
             tracing::warn!("Sandboxing not available on this platform; running unsandboxed");
             SandboxCommand {
@@ -150,6 +169,33 @@ impl SandboxPolicy {
                 args: args.to_vec(),
             }
         }
+    }
+
+    /// Build a Windows-sandboxed command by re-execing the running `borg`
+    /// binary with the `__windows-sandbox-spawn` hidden subcommand. The
+    /// trampoline subcommand applies the restricted-token + DACL ACEs
+    /// (Tier 1) or routes through the elevated runner (Tier 2) before
+    /// spawning the real child.
+    ///
+    /// **Fails closed** on every error path. Both `current_exe()` failure
+    /// (corrupt install, deleted-exe race, symlink games) and trampoline-
+    /// argv construction failure return a `cmd.exe /c exit 1` stub rather
+    /// than running unsandboxed. CLAUDE.md `Critical Invariants — Error
+    /// Handling` is explicit: "if we report success to the user, it MUST
+    /// actually succeed" — silent un-sandboxing on a path-resolution
+    /// failure would let a local attacker who can perturb `current_exe()`
+    /// resolution win a free sandbox bypass.
+    fn wrap_windows(
+        &self,
+        program: &str,
+        args: &[String],
+        tool_dir: &std::path::Path,
+    ) -> SandboxCommand {
+        let self_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => return fail_closed_windows("current_exe() failed", &e.to_string()),
+        };
+        crate::windows::build_trampoline_command(&self_exe, self, program, args, tool_dir)
     }
 
     #[cfg(target_os = "macos")]
@@ -568,16 +614,31 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_falls_through_to_unsandboxed() {
+    fn windows_wraps_via_trampoline_subcommand() {
+        // Spec: on Windows wrap_command must re-exec the running borg
+        // binary with the hidden __windows-sandbox-spawn subcommand,
+        // *not* return the raw program. A regression to passthrough
+        // would silently disable sandboxing for every Windows user.
         let policy = SandboxPolicy::default();
         let args = vec!["script.py".to_string()];
         let cmd = policy.wrap_command("python3", &args, Path::new(r"C:\tools\test"));
-        // On Windows, should pass through without sandboxing
-        assert_eq!(cmd.program, "python3");
-        assert_eq!(cmd.args, vec!["script.py"]);
+
+        let current_exe =
+            std::env::current_exe().expect("test env should have a resolvable current_exe");
+        assert_eq!(std::path::PathBuf::from(&cmd.program), current_exe);
+        assert_eq!(cmd.args[0], crate::windows::SPAWN_SUBCOMMAND);
+
+        // The wrapped program + args must round-trip through the
+        // trampoline parser — otherwise the trampoline subcommand would
+        // spawn the wrong thing or fail to spawn at all.
+        let parsed = crate::windows::parse_trampoline_args(&cmd.args[1..])
+            .expect("trampoline args must parse");
+        assert_eq!(parsed.program, "python3");
+        assert_eq!(parsed.args, vec!["script.py".to_string()]);
+        assert_eq!(parsed.tool_dir, Path::new(r"C:\tools\test"));
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     #[test]
     fn unsupported_platform_passes_through() {
         let policy = SandboxPolicy {
