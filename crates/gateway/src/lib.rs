@@ -34,6 +34,8 @@ pub mod commands;
 pub mod constants;
 pub mod crypto;
 pub mod discord;
+/// Typed error surface for the crate's public API.
+pub mod error;
 pub mod executor;
 /// Generic signed-payload webhook surface — `POST /v1/webhook/{name}`
 /// with HMAC-SHA256 verification. Lets users wire arbitrary upstream
@@ -72,6 +74,7 @@ pub mod verify_common;
 pub mod voice;
 
 pub use channel::registry::ChannelRegistry;
+pub use error::{Error, Result};
 pub use server::GatewayServer;
 pub use session_executor::{InboundTurn, InlineImage, SessionExecutor, SessionExecutorHandle};
 
