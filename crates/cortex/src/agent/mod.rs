@@ -50,6 +50,56 @@ mod tool_validation;
 
 use parallel_dispatch::dispatch_parallel_safe_tool;
 
+/// Decide whether the active model accepts image/audio/video inputs.
+///
+/// Returns `true` (default-allow) when the provider is unset or unrecognized,
+/// matching `Provider::supports_vision`'s "don't silently downgrade unknown
+/// endpoints" policy. Only when the configured provider+model pair is known
+/// to be text-only does this return `false`.
+fn active_model_supports_vision(cfg: &crate::config::LlmConfig) -> bool {
+    use crate::llm::provider::Provider;
+    use std::str::FromStr;
+    let Some(provider_str) = cfg.provider.as_deref() else {
+        return true;
+    };
+    match Provider::from_str(provider_str) {
+        Ok(provider) => provider.supports_vision(&cfg.model),
+        Err(_) => true,
+    }
+}
+
+/// Build the tool-result `Message`, dropping non-text content parts when the
+/// active model is text-only. Without this gate, a `vision_analyze` /
+/// `computer_use` result that carries image parts would poison the session:
+/// the provider rejects the request, and because the offending tool message
+/// is already in canonical history every subsequent turn fails too. The
+/// `<tool_output>` text block (built by callers) is preserved verbatim either
+/// way, so text-only models still see the tool's textual summary.
+///
+/// Ported from hermes-agent commit a28add199 ("fix(agent): keep image tool
+/// results from poisoning text-only sessions", 2026-05-14).
+fn build_tool_result_message(
+    tool_call_id: &str,
+    xml: String,
+    extra_parts: Option<Vec<ContentPart>>,
+    supports_vision: bool,
+) -> Message {
+    let Some(parts) = extra_parts else {
+        return Message::tool_result(tool_call_id, xml);
+    };
+    let non_text: Vec<ContentPart> = parts
+        .into_iter()
+        .filter(|p| !matches!(p, ContentPart::Text(_)))
+        .collect();
+    if non_text.is_empty() || !supports_vision {
+        return Message::tool_result(tool_call_id, xml);
+    }
+    let mut msg_parts = Vec::with_capacity(1 + non_text.len());
+    msg_parts.push(ContentPart::Text(xml));
+    msg_parts.extend(non_text);
+    Message::tool_result_multimodal(tool_call_id, msg_parts)
+}
+
 use stream_handler::{StreamEventOutcome, TextOnlyOutcome};
 use system_prompt_cache::SystemPromptCache;
 
@@ -2180,17 +2230,25 @@ impl Agent {
                     result: redacted,
                 })
                 .await;
-            let msg = if let Some(parts) = extra_parts {
-                let mut msg_parts = vec![ContentPart::Text(xml)];
-                msg_parts.extend(
-                    parts
-                        .into_iter()
-                        .filter(|p| !matches!(p, ContentPart::Text(_))),
-                );
-                Message::tool_result_multimodal(&tool_call.id, msg_parts)
-            } else {
-                Message::tool_result(&tool_call.id, &xml)
-            };
+            let supports_vision = active_model_supports_vision(&self.config.llm);
+            if !supports_vision {
+                if let Some(parts) = extra_parts.as_ref() {
+                    let dropped = parts
+                        .iter()
+                        .filter(|p| !matches!(p, ContentPart::Text(_)))
+                        .count();
+                    if dropped > 0 {
+                        warn!(
+                            tool = %name,
+                            dropped_parts = dropped,
+                            provider = self.config.llm.provider.as_deref().unwrap_or("<unset>"),
+                            model = %self.config.llm.model,
+                            "dropping image/media tool-result parts: active model is text-only",
+                        );
+                    }
+                }
+            }
+            let msg = build_tool_result_message(&tool_call.id, xml, extra_parts, supports_vision);
             self.log_and_persist(msg);
         }
     }
@@ -2387,17 +2445,25 @@ impl Agent {
                     result: redacted,
                 })
                 .await;
-            let msg = if let Some(parts) = extra_parts {
-                let mut msg_parts = vec![ContentPart::Text(xml)];
-                msg_parts.extend(
-                    parts
-                        .into_iter()
-                        .filter(|p| !matches!(p, ContentPart::Text(_))),
-                );
-                Message::tool_result_multimodal(&tool_call.id, msg_parts)
-            } else {
-                Message::tool_result(&tool_call.id, &xml)
-            };
+            let supports_vision = active_model_supports_vision(&self.config.llm);
+            if !supports_vision {
+                if let Some(parts) = extra_parts.as_ref() {
+                    let dropped = parts
+                        .iter()
+                        .filter(|p| !matches!(p, ContentPart::Text(_)))
+                        .count();
+                    if dropped > 0 {
+                        warn!(
+                            tool = %name,
+                            dropped_parts = dropped,
+                            provider = self.config.llm.provider.as_deref().unwrap_or("<unset>"),
+                            model = %self.config.llm.model,
+                            "dropping image/media tool-result parts: active model is text-only",
+                        );
+                    }
+                }
+            }
+            let msg = build_tool_result_message(&tool_call.id, xml, extra_parts, supports_vision);
             self.log_and_persist(msg);
         }
     }
@@ -3676,6 +3742,163 @@ mod tests {
                  Approved mutators: {approved_mutators:?}"
             );
         }
+    }
+
+    // ── Vision-capability gate for tool-result messages ──
+    //
+    // Regression guard for the image-poisoning bug ported from hermes-agent
+    // `fix(agent): keep image tool results from poisoning text-only sessions`
+    // (commit a28add199, 2026-05-14).
+    //
+    // Without the gate, a `vision_analyze` / `computer_use` result that carried
+    // image parts into a text-only session would make the provider reject the
+    // request, and the offending tool message would stay in canonical history
+    // so every subsequent turn failed too.
+
+    use crate::config::LlmConfig;
+    use crate::types::MediaData;
+
+    fn sample_image_part() -> ContentPart {
+        ContentPart::ImageBase64 {
+            media: MediaData {
+                mime_type: "image/png".into(),
+                data: "deadbeef".into(),
+                filename: None,
+            },
+        }
+    }
+
+    fn tool_xml() -> String {
+        "<tool_output name=\"vision_analyze\" trust=\"external\">\nsummary text\n</tool_output>"
+            .to_string()
+    }
+
+    fn llm_cfg(provider: Option<&str>, model: &str) -> LlmConfig {
+        let mut cfg = LlmConfig::default();
+        cfg.provider = provider.map(String::from);
+        cfg.model = model.into();
+        cfg
+    }
+
+    #[test]
+    fn tool_result_drops_image_parts_for_text_only_model() {
+        // deepseek-chat is known text-only per Provider::supports_vision
+        // (only `*vl*` deepseek models accept images).
+        let cfg = llm_cfg(Some("deepseek"), "deepseek-chat");
+        assert!(
+            !active_model_supports_vision(&cfg),
+            "deepseek-chat must be classified text-only; otherwise the regression \
+             guard below is vacuous"
+        );
+
+        let xml = tool_xml();
+        let msg = build_tool_result_message(
+            "call-1",
+            xml.clone(),
+            Some(vec![sample_image_part()]),
+            active_model_supports_vision(&cfg),
+        );
+
+        // Must be the text-only variant — image parts MUST NOT survive into
+        // canonical history for a model that will reject the request.
+        match msg.content.as_ref().expect("content must be present") {
+            crate::types::MessageContent::Text(t) => {
+                assert_eq!(t, &xml, "text payload must equal the <tool_output> XML");
+            }
+            crate::types::MessageContent::Parts(_) => panic!(
+                "text-only model must receive Message::tool_result (Text content), \
+                 not tool_result_multimodal (Parts) — otherwise the session is poisoned"
+            ),
+        }
+    }
+
+    #[test]
+    fn tool_result_keeps_image_parts_for_vision_model() {
+        let cfg = llm_cfg(Some("anthropic"), "claude-sonnet-4-6");
+        assert!(
+            active_model_supports_vision(&cfg),
+            "claude-sonnet-4-6 must be vision-capable per Provider::supports_vision"
+        );
+
+        let xml = tool_xml();
+        let msg = build_tool_result_message(
+            "call-2",
+            xml.clone(),
+            Some(vec![sample_image_part()]),
+            active_model_supports_vision(&cfg),
+        );
+
+        // Vision-capable model: image part must survive alongside the text XML.
+        let parts = match msg.content.as_ref().expect("content must be present") {
+            crate::types::MessageContent::Parts(p) => p,
+            crate::types::MessageContent::Text(_) => panic!(
+                "vision-capable model must receive multimodal tool result with \
+                 image part attached"
+            ),
+        };
+        assert_eq!(
+            parts.len(),
+            2,
+            "expected text + 1 image part, got {parts:?}"
+        );
+        assert!(
+            matches!(parts[0], ContentPart::Text(ref t) if t == &xml),
+            "first part must be the <tool_output> XML text"
+        );
+        assert!(
+            matches!(parts[1], ContentPart::ImageBase64 { .. }),
+            "second part must be the image"
+        );
+    }
+
+    #[test]
+    fn tool_result_keeps_image_parts_when_provider_unset() {
+        // Default-allow policy: if the operator hasn't configured a provider
+        // (or it's an unknown custom endpoint) we must NOT silently downgrade
+        // multimodal payloads. Mirrors Provider::supports_vision's policy of
+        // defaulting to true for unknown providers.
+        let cfg = llm_cfg(None, "some-custom-model");
+        assert!(
+            active_model_supports_vision(&cfg),
+            "unset provider must default to vision-allowed"
+        );
+
+        let msg = build_tool_result_message(
+            "call-3",
+            tool_xml(),
+            Some(vec![sample_image_part()]),
+            active_model_supports_vision(&cfg),
+        );
+        assert!(
+            matches!(msg.content, Some(crate::types::MessageContent::Parts(_))),
+            "image part must pass through when provider is unknown"
+        );
+    }
+
+    #[test]
+    fn tool_result_keeps_image_parts_for_unrecognized_provider_string() {
+        // Same default-allow policy when the provider string doesn't parse.
+        let cfg = llm_cfg(Some("not-a-real-provider"), "whatever");
+        assert!(
+            active_model_supports_vision(&cfg),
+            "unparseable provider string must default to vision-allowed"
+        );
+    }
+
+    #[test]
+    fn tool_result_is_text_only_when_no_extra_parts() {
+        // Baseline: text-only tools still produce text-only messages
+        // regardless of vision capability.
+        let msg_no_vision = build_tool_result_message("call-4", tool_xml(), None, false);
+        let msg_with_vision = build_tool_result_message("call-5", tool_xml(), None, true);
+        assert!(matches!(
+            msg_no_vision.content,
+            Some(crate::types::MessageContent::Text(_))
+        ));
+        assert!(matches!(
+            msg_with_vision.content,
+            Some(crate::types::MessageContent::Text(_))
+        ));
     }
 }
 
