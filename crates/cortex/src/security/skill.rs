@@ -209,7 +209,7 @@ impl SkillAuditFinding {
 ///
 /// A missing or unreadable skills directory is treated as "no skills",
 /// not an error, so early-install environments don't spam warnings.
-pub fn audit_user_skills(db: &Database, skills_dir: &Path) -> Vec<SkillAuditFinding> {
+pub async fn audit_user_skills(db: &Database, skills_dir: &Path) -> Vec<SkillAuditFinding> {
     let mut findings = Vec::new();
     let entries = match std::fs::read_dir(skills_dir) {
         Ok(e) => e,
@@ -254,7 +254,7 @@ pub fn audit_user_skills(db: &Database, skills_dir: &Path) -> Vec<SkillAuditFind
             }
         };
         let sha = compute_sha256(&content);
-        match db.record_skill_seen(&name, &sha) {
+        match db.record_skill_seen(&name, &sha).await {
             Ok(outcome) => {
                 if let SkillAuditOutcome::Modified { prev_sha256 } = &outcome {
                     tracing::warn!(

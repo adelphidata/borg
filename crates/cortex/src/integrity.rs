@@ -14,12 +14,12 @@ pub struct IntegrityResult {
 
 /// Verify the integrity of files for a given plugin by comparing
 /// their SHA-256 hashes against the stored values in the database.
-pub fn verify_integrity(
+pub async fn verify_integrity(
     db: &Database,
     plugin_id: &str,
     data_dir: &Path,
 ) -> Result<IntegrityResult> {
-    let stored_hashes = db.get_file_hashes(plugin_id)?;
+    let stored_hashes = db.get_file_hashes(plugin_id).await?;
 
     if stored_hashes.is_empty() {
         return Ok(IntegrityResult {

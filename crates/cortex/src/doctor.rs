@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 use crate::config::Config;
 use crate::constants::{IDENTITY_FILE, SECS_PER_DAY};
 use crate::db::Database;
@@ -228,7 +230,10 @@ impl DiagnosticRunner {
     }
 
     /// Run the next check group. Returns `None` when all groups are done.
-    pub fn next_step(&mut self, config: &Config) -> Option<(&'static str, Vec<DiagnosticCheck>)> {
+    pub async fn next_step(
+        &mut self,
+        config: &Config,
+    ) -> Option<(&'static str, Vec<DiagnosticCheck>)> {
         if self.step >= STEP_COUNT {
             return None;
         }
@@ -247,19 +252,19 @@ impl DiagnosticRunner {
                 "Sandbox"
             }
             3 => {
-                check_skills(config, &mut checks);
+                check_skills(config, &mut checks).await;
                 "Skills"
             }
             4 => {
-                check_memory(&mut checks);
+                check_memory(&mut checks).await;
                 "Memory"
             }
             5 => {
-                check_embeddings(config, &mut checks);
+                check_embeddings(config, &mut checks).await;
                 "Embeddings"
             }
             6 => {
-                check_data_dir(&mut checks);
+                check_data_dir(&mut checks).await;
                 "Data"
             }
             7 => {
@@ -267,19 +272,19 @@ impl DiagnosticRunner {
                 "Gateway"
             }
             8 => {
-                check_heartbeat(config, &mut checks);
+                check_heartbeat(config, &mut checks).await;
                 "Heartbeat"
             }
             9 => {
-                check_budget(config, &mut checks);
+                check_budget(config, &mut checks).await;
                 "Budget"
             }
             10 => {
-                check_prompt_cache(config, &mut checks);
+                check_prompt_cache(config, &mut checks).await;
                 "Prompt Cache"
             }
             11 => {
-                check_plugins(&mut checks);
+                check_plugins(&mut checks).await;
                 "Plugins"
             }
             12 => {
@@ -321,20 +326,20 @@ impl DiagnosticRunner {
 /// [`run_diagnostics_with_registry`] with `None` — preserved for call
 /// sites (`borg doctor` CLI, tests) that don't have a process registry
 /// handle.
-pub fn run_diagnostics(config: &Config) -> DiagnosticReport {
-    run_diagnostics_with_registry(config, None)
+pub async fn run_diagnostics(config: &Config) -> DiagnosticReport {
+    run_diagnostics_with_registry(config, None).await
 }
 
 /// Run all diagnostic checks plus the `Subprocesses` check when the
 /// caller has a live registry. The daemon's maintenance sweep and
 /// `Admin.Heal` RPC use this variant.
-pub fn run_diagnostics_with_registry(
+pub async fn run_diagnostics_with_registry(
     config: &Config,
     registry: Option<&ProcessRegistry>,
 ) -> DiagnosticReport {
     let mut runner = DiagnosticRunner::new();
     let mut checks = Vec::new();
-    while let Some((_label, step_checks)) = runner.next_step(config) {
+    while let Some((_label, step_checks)) = runner.next_step(config).await {
         checks.extend(step_checks);
     }
     if let Some(reg) = registry {
@@ -603,7 +608,7 @@ fn check_sandbox(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     let resolved_creds = config.resolve_credentials();
     match load_all_skills(&resolved_creds, &config.skills) {
         Ok(skills) => {
@@ -627,9 +632,9 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     // compares against the stored hash in the skill_audit table.
     // First-seen skills are recorded silently (user put them there);
     // subsequent content changes are flagged as potential tampering.
-    match (crate::skills::skills_dir(), Database::open()) {
+    match (crate::skills::skills_dir(), Database::open().await) {
         (Ok(dir), Ok(db)) => {
-            let findings = crate::security::skill::audit_user_skills(&db, &dir);
+            let findings = crate::security::skill::audit_user_skills(&db, &dir).await;
             let modified: Vec<String> = findings
                 .iter()
                 .filter(|f| f.is_modified())
@@ -652,9 +657,9 @@ fn check_skills(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
-    match Database::open() {
-        Ok(db) => match db.list_memory_entries("global") {
+async fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
+    match Database::open().await {
+        Ok(db) => match db.list_memory_entries("global").await {
             Ok(entries) => {
                 let has_index = entries.iter().any(|e| e.name == "INDEX");
                 let total = entries.len();
@@ -719,7 +724,7 @@ fn check_memory(checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
+async fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
     match Config::data_dir() {
         Ok(data_dir) => {
             if data_dir.exists() {
@@ -764,7 +769,7 @@ fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
     checks.push(DiagnosticCheck::from_result(
         "Data",
         "database accessible",
-        Database::open(),
+        Database::open().await,
     ));
 
     // `PRAGMA integrity_check` — surfaces SQLite-level corruption so a
@@ -775,11 +780,16 @@ fn check_data_dir(checks: &mut Vec<DiagnosticCheck>) {
     // after it appears on two consecutive runs.
     // `Err` branch already surfaced by the "database accessible" check
     // above — don't double-report. Only run integrity if we could open.
-    if let Ok(db) = Database::open() {
-        match db
-            .conn()
-            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-        {
+    if let Ok(db) = Database::open().await {
+        let integrity_result: Result<String> = async {
+            let mut rows = db.conn().query("PRAGMA integrity_check", ()).await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.get::<String>(0)?),
+                None => Ok(String::new()),
+            }
+        }
+        .await;
+        match integrity_result {
             Ok(result) if result == "ok" => {
                 checks.push(DiagnosticCheck::pass("Data", "database integrity"));
             }
@@ -896,16 +906,16 @@ pub fn format_relative_time(timestamp: i64) -> String {
     }
 }
 
-fn check_heartbeat(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_heartbeat(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     checks.push(DiagnosticCheck::pass(
         "Heartbeat",
         format!("interval: {}", config.heartbeat.interval),
     ));
 
     // Check last heartbeat from activity log
-    match crate::db::Database::open() {
+    match crate::db::Database::open().await {
         Ok(db) => {
-            match db.query_activity(1, Some("info"), Some("heartbeat")) {
+            match db.query_activity(1, Some("info"), Some("heartbeat")).await {
                 Ok(entries) if !entries.is_empty() => {
                     let last = &entries[0];
                     let age_secs = chrono::Utc::now().timestamp() - last.created_at;
@@ -947,7 +957,7 @@ fn check_heartbeat(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             }
 
             // Check if daemon is running (heartbeat runs in daemon or TUI)
-            if db.is_daemon_lock_held() {
+            if db.is_daemon_lock_held().await {
                 checks.push(DiagnosticCheck::pass(
                     "Heartbeat",
                     "daemon is running (heartbeat active)".to_string(),
@@ -970,7 +980,7 @@ fn check_heartbeat(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_budget(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_budget(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     let limit = config.budget.monthly_token_limit;
     if limit == 0 {
         checks.push(DiagnosticCheck::warn(
@@ -981,8 +991,8 @@ fn check_budget(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         return;
     }
 
-    match Database::open() {
-        Ok(db) => match db.monthly_token_total() {
+    match Database::open().await {
+        Ok(db) => match db.monthly_token_total().await {
             Ok(used) => {
                 let pct = (used as f64 / limit as f64 * 100.0) as u64;
                 let name = format!("monthly usage: {used}/{limit} ({pct}%)");
@@ -1012,7 +1022,7 @@ fn check_budget(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     }
 }
 
-fn check_prompt_cache(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_prompt_cache(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     if !config.llm.cache.enabled {
         checks.push(DiagnosticCheck::warn(
             "Prompt Cache",
@@ -1037,7 +1047,11 @@ fn check_prompt_cache(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     // we surface as a warning only when the primary provider is known to
     // support caching.
     let since = chrono::Utc::now().timestamp().saturating_sub(24 * 3600);
-    match Database::open().and_then(|db| db.cache_token_summary_since(since)) {
+    let summary_result: Result<(u64, u64, u64)> = match Database::open().await {
+        Ok(db) => db.cache_token_summary_since(since).await,
+        Err(e) => Err(e),
+    };
+    match summary_result {
         Ok((prompt, cached, created)) => {
             if prompt == 0 {
                 checks.push(DiagnosticCheck::pass(
@@ -1080,9 +1094,9 @@ fn provider_supports_cache(llm: &crate::config::LlmConfig) -> bool {
     )
 }
 
-fn check_plugins(checks: &mut Vec<DiagnosticCheck>) {
-    match Database::open() {
-        Ok(db) => match db.list_plugins() {
+async fn check_plugins(checks: &mut Vec<DiagnosticCheck>) {
+    match Database::open().await {
+        Ok(db) => match db.list_plugins().await {
             Ok(plugins) => {
                 if plugins.is_empty() {
                     checks.push(DiagnosticCheck::warn(
@@ -1110,7 +1124,7 @@ fn check_plugins(checks: &mut Vec<DiagnosticCheck>) {
 
                         if let Ok(data_dir) = Config::data_dir() {
                             if let Ok(result) =
-                                crate::integrity::verify_integrity(&db, &c.id, &data_dir)
+                                crate::integrity::verify_integrity(&db, &c.id, &data_dir).await
                             {
                                 let integrity_name = format!("{} file integrity", c.name);
                                 if result.ok {
@@ -1312,15 +1326,15 @@ fn classify_chunk_coverage(coverage: ChunkCoverage) -> DiagnosticCheck {
     )
 }
 
-fn collect_chunk_coverage(db: &Database, scopes: &[String]) -> ChunkCoverage {
+async fn collect_chunk_coverage(db: &Database, scopes: &[String]) -> ChunkCoverage {
     let mut coverage = ChunkCoverage::default();
     for scope in scopes {
-        let Ok(entries) = db.list_memory_entries(scope) else {
+        let Ok(entries) = db.list_memory_entries(scope).await else {
             continue;
         };
         for entry in entries {
             coverage.total_entries += 1;
-            let Ok(chunks) = db.get_chunks_for_file(scope, &entry.name) else {
+            let Ok(chunks) = db.get_chunks_for_file(scope, &entry.name).await else {
                 coverage.entries_missing_chunks += 1;
                 continue;
             };
@@ -1338,7 +1352,7 @@ fn collect_chunk_coverage(db: &Database, scopes: &[String]) -> ChunkCoverage {
     coverage
 }
 
-fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     if !config.memory.embeddings.enabled {
         checks.push(DiagnosticCheck::warn(
             "Embeddings",
@@ -1368,11 +1382,11 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
         }
     }
 
-    match Database::open() {
+    match Database::open().await {
         Ok(db) => {
             let scopes = {
                 let mut scopes = crate::memory::resolved_memory_scopes(config);
-                if let Ok(mut db_scopes) = db.list_memory_scopes() {
+                if let Ok(mut db_scopes) = db.list_memory_scopes().await {
                     scopes.append(&mut db_scopes);
                 }
                 scopes.sort();
@@ -1382,14 +1396,18 @@ fn check_embeddings(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             let mut global_count = 0usize;
             let mut entry_count = 0usize;
             for scope in &scopes {
-                global_count += db.count_embeddings(scope).unwrap_or(0);
-                entry_count += db.list_memory_entries(scope).map(|v| v.len()).unwrap_or(0);
+                global_count += db.count_embeddings(scope).await.unwrap_or(0);
+                entry_count += db
+                    .list_memory_entries(scope)
+                    .await
+                    .map(|v| v.len())
+                    .unwrap_or(0);
             }
 
             checks.push(classify_embedding_lag(global_count, entry_count));
-            checks.push(classify_chunk_coverage(collect_chunk_coverage(
-                &db, &scopes,
-            )));
+            checks.push(classify_chunk_coverage(
+                collect_chunk_coverage(&db, &scopes).await,
+            ));
         }
         Err(e) => {
             checks.push(DiagnosticCheck::warn(
