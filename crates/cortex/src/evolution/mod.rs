@@ -48,6 +48,9 @@ pub use share_card::render_ascii_card;
 use std::collections::HashMap;
 use std::fmt;
 
+use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
+
 use crate::constants::SECS_PER_DAY;
 use crate::db::Database;
 use crate::hooks::{Hook, HookAction, HookContext, HookData, HookPoint};
@@ -552,12 +555,12 @@ pub fn check_stage2_gates(
 }
 
 /// Compute how many consecutive days the dominant archetype has been stable.
-pub fn compute_archetype_stable_days(db: &Database) -> u32 {
+pub async fn compute_archetype_stable_days(db: &Database) -> u32 {
     // Delegates to the trusted replay so the Stage 2→3 gate evaluates against
     // the same archetype timeline that produced the dominant archetype. The
     // previous parallel walker bypassed HMAC verification, rate-limiting, and
     // source decay — it could disagree with `get_evolution_state()`.
-    let state = match db.get_evolution_state() {
+    let state = match db.get_evolution_state().await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!("evolution: failed to get evolution state: {e}");
@@ -586,8 +589,8 @@ pub(super) fn capitalize_first(s: &str) -> String {
 
 /// Bucket recent xp_gain events by source and return the top-N descending.
 /// Used to personalize the LLM naming prompt with the tools the agent actually uses.
-fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>> {
-    let events = db.load_all_evolution_events()?;
+async fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>> {
+    let events = db.load_all_evolution_events().await?;
     let mut counts: HashMap<String, u32> = HashMap::new();
     for e in &events {
         if e.event_type == "xp_gain" {
@@ -605,15 +608,15 @@ fn top_sources_from_db(db: &Database) -> anyhow::Result<Vec<(String, u32)>> {
 /// Load the current evolution + bond state as a snapshot pair. Returns
 /// `(None, 0)` for the evolution slot if the DB read fails; callers should
 /// treat that as a skip signal for the downstream milestone diff.
-fn snapshot_evolution_and_bond(db: &Database) -> (Option<EvolutionState>, u8) {
-    let evo = match db.get_evolution_state() {
+async fn snapshot_evolution_and_bond(db: &Database) -> (Option<EvolutionState>, u8) {
+    let evo = match db.get_evolution_state().await {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!("evolution: failed to snapshot state for milestone diff: {e}");
             None
         }
     };
-    let bond_events = match db.get_all_bond_events() {
+    let bond_events = match db.get_all_bond_events().await {
         Ok(events) => events,
         Err(e) => {
             tracing::warn!("evolution: failed to snapshot bond events for milestone diff: {e}");
@@ -632,10 +635,14 @@ fn snapshot_evolution_and_bond(db: &Database) -> (Option<EvolutionState>, u8) {
 /// emitted `XpBreakdown` records both the resolved state and its
 /// `posture_event_seq`, so replay can re-derive the same `final_xp`
 /// deterministically from the chain.
-pub(crate) fn build_posture_aware_xp(db: &Database, base: i32, align_bonus: i32) -> (i32, String) {
+pub(crate) async fn build_posture_aware_xp(
+    db: &Database,
+    base: i32,
+    align_bonus: i32,
+) -> (i32, String) {
     let base_u = base.max(0) as u32;
     let align_u = align_bonus.max(0) as u32;
-    let (state, posture_seq, fallback) = security::current_posture_for_xp(db);
+    let (state, posture_seq, fallback) = security::current_posture_for_xp(db).await;
     let breakdown = security::compute_xp_breakdown(base_u, align_u, state, posture_seq, fallback);
     let metadata = serde_json::json!({
         "xp_breakdown": breakdown,
@@ -647,7 +654,7 @@ pub(crate) fn build_posture_aware_xp(db: &Database, base: i32, align_bonus: i32)
 
 /// Persist a single milestone: a `level_up` row (for level thresholds), a
 /// `milestone_unlocked` row, and the paired `pending_celebration`.
-fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
+async fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
     let stage_str = next.stage.to_string();
 
     // `secure_headless_setup` carries a +100 XP bonus on top of the
@@ -657,13 +664,16 @@ fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
     // sees XP land before its dedup marker.
     if milestone.id == "secure_headless_setup" {
         let arch = milestone.archetype.map(|a| a.to_string());
-        if let Err(e) = db.record_evolution_event(
-            "milestone_bonus",
-            SECURE_HEADLESS_SETUP_XP,
-            arch.as_deref(),
-            "secure_headless_setup",
-            None,
-        ) {
+        if let Err(e) = db
+            .record_evolution_event(
+                "milestone_bonus",
+                SECURE_HEADLESS_SETUP_XP,
+                arch.as_deref(),
+                "secure_headless_setup",
+                None,
+            )
+            .await
+        {
             tracing::warn!(
                 "evolution: failed to record milestone_bonus for {}: {e}",
                 milestone.id
@@ -683,7 +693,10 @@ fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
                 "stage": stage_str,
             })
             .to_string();
-            if let Err(e) = db.record_evolution_event("level_up", 0, None, "hook", Some(&meta)) {
+            if let Err(e) = db
+                .record_evolution_event("level_up", 0, None, "hook", Some(&meta))
+                .await
+            {
                 tracing::warn!(
                     "evolution: failed to record level_up for {}: {e}",
                     milestone.id
@@ -699,13 +712,16 @@ fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
         "archetype": arch_str,
     })
     .to_string();
-    if let Err(e) = db.record_evolution_event(
-        "milestone_unlocked",
-        0,
-        arch_str.as_deref(),
-        "hook",
-        Some(&meta),
-    ) {
+    if let Err(e) = db
+        .record_evolution_event(
+            "milestone_unlocked",
+            0,
+            arch_str.as_deref(),
+            "hook",
+            Some(&meta),
+        )
+        .await
+    {
         tracing::warn!(
             "evolution: failed to record milestone_unlocked for {}: {e}",
             milestone.id
@@ -722,7 +738,7 @@ fn emit_milestone(db: &Database, milestone: &Milestone, next: &EvolutionState) {
     };
     match serde_json::to_string(&payload) {
         Ok(json) => {
-            if let Err(e) = db.insert_pending_celebration("milestone", &json) {
+            if let Err(e) = db.insert_pending_celebration("milestone", &json).await {
                 tracing::warn!(
                     "evolution: failed to insert milestone celebration for {}: {e}",
                     milestone.id
@@ -750,7 +766,7 @@ fn parse_level_from_id(id: &str) -> Option<u8> {
 /// Lifecycle hook that passively records evolution XP events and injects context.
 pub struct EvolutionHook {
     /// Database handle wrapped in a Mutex for thread-safety.
-    db: std::sync::Mutex<Database>,
+    db: AsyncMutex<Database>,
     /// Cached `evolution.enabled` flag. Read once at construction; toggling the
     /// setting takes effect on the next session (no hot reload).
     enabled: bool,
@@ -761,12 +777,13 @@ pub struct EvolutionHook {
 
 impl EvolutionHook {
     /// Create a new evolution hook, opening a database connection.
-    pub fn new() -> anyhow::Result<Self> {
+    pub async fn new() -> anyhow::Result<Self> {
         let enabled = crate::config::Config::load_from_db()
+            .await
             .map(|c| c.evolution.enabled)
             .unwrap_or(true);
         Ok(Self {
-            db: std::sync::Mutex::new(Database::open()?),
+            db: AsyncMutex::new(Database::open().await?),
             enabled,
             rt: tokio::runtime::Handle::try_current().ok(),
         })
@@ -776,41 +793,48 @@ impl EvolutionHook {
     #[cfg(test)]
     pub fn new_with(db: Database, enabled: bool) -> Self {
         Self {
-            db: std::sync::Mutex::new(db),
+            db: AsyncMutex::new(db),
             enabled,
             rt: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
-    fn record_xp(&self, source: &str, archetype: Option<Archetype>, base: i32, align_bonus: i32) {
-        let Ok(db) = self.db.lock() else {
-            tracing::warn!("evolution: mutex poisoned, skipping event");
-            return;
-        };
+    async fn record_xp(
+        &self,
+        source: &str,
+        archetype: Option<Archetype>,
+        base: i32,
+        align_bonus: i32,
+    ) {
+        let db = self.db.lock().await;
 
         // Snapshot pre-state so we can diff against post-state for milestones.
-        let (prev_evo, prev_bond) = snapshot_evolution_and_bond(&db);
+        let (prev_evo, prev_bond) = snapshot_evolution_and_bond(&db).await;
 
         let arch_str = archetype.map(|a| a.to_string());
-        let (final_xp, metadata) = build_posture_aware_xp(&db, base, align_bonus);
-        if let Err(e) = db.record_evolution_event(
-            "xp_gain",
-            final_xp,
-            arch_str.as_deref(),
-            source,
-            Some(&metadata),
-        ) {
+        let (final_xp, metadata) = build_posture_aware_xp(&db, base, align_bonus).await;
+        if let Err(e) = db
+            .record_evolution_event(
+                "xp_gain",
+                final_xp,
+                arch_str.as_deref(),
+                source,
+                Some(&metadata),
+            )
+            .await
+        {
             tracing::warn!("evolution: failed to record XP event: {e}");
             return;
         }
         // Check if we should attempt an evolution after this XP gain
-        self.attempt_evolution(&db);
+        self.attempt_evolution(&db).await;
 
         // Detect sub-evolution milestones against the post-state. Runs after
         // evolution attempt so a stage transition feeds into the diff.
-        let (next_evo, next_bond) = snapshot_evolution_and_bond(&db);
+        let (next_evo, next_bond) = snapshot_evolution_and_bond(&db).await;
         if let (Some(prev), Some(next)) = (prev_evo, next_evo) {
-            self.detect_milestones(&db, &prev, &next, prev_bond, next_bond);
+            self.detect_milestones(&db, &prev, &next, prev_bond, next_bond)
+                .await;
         }
     }
 
@@ -818,7 +842,7 @@ impl EvolutionHook {
     /// `milestone_unlocked` events plus mini-celebration rows for any newly
     /// unlocked milestones. Wrapped as a helper so sibling detection passes
     /// (e.g. mood) can sequence cleanly alongside.
-    fn detect_milestones(
+    async fn detect_milestones(
         &self,
         db: &Database,
         prev: &EvolutionState,
@@ -826,7 +850,7 @@ impl EvolutionHook {
         bond_prev: u8,
         bond_next: u8,
     ) {
-        let events = match db.load_all_evolution_events() {
+        let events = match db.load_all_evolution_events().await {
             Ok(events) => events,
             Err(e) => {
                 tracing::warn!("evolution: failed to load events for milestone check: {e}");
@@ -834,7 +858,7 @@ impl EvolutionHook {
             }
         };
         let now = chrono::Utc::now().timestamp();
-        let (current_posture_state, _, fallback) = security::current_posture_for_xp(db);
+        let (current_posture_state, _, fallback) = security::current_posture_for_xp(db).await;
         // Suppress posture-derived milestones when no posture event exists yet
         // (fresh DB) — `current_posture_for_xp` falls back to `Default` for XP
         // math, but milestones must wait until live posture is real.
@@ -844,7 +868,7 @@ impl EvolutionHook {
             // `previous_was_file_encrypted` is a "did this install ever
             // run on FileEncrypted" question — answered authoritatively
             // by the audit chain. Use the chain only for that.
-            let history = security::load_posture_history(db);
+            let history = security::load_posture_history(db).await;
             let previous_was_file_encrypted = history.iter().any(|s| {
                 s.global.secret_storage_backend == security::SecretStorageBackend::FileEncrypted
             });
@@ -854,7 +878,7 @@ impl EvolutionHook {
             // backend swap. Reading from `Config::load_from_db` matches
             // what the next snapshot will record, so the milestone gate
             // doesn't misfire on the boundary.
-            let current_backend = match crate::config::Config::load_from_db() {
+            let current_backend = match crate::config::Config::load_from_db().await {
                 Ok(c) => match c.security.kek_backend {
                     crate::config::security::KekBackend::OsKeychain
                     | crate::config::security::KekBackend::Auto => {
@@ -883,13 +907,13 @@ impl EvolutionHook {
         let unlocked =
             check_milestones(prev, next, bond_prev, bond_next, &events, now, posture_ctx);
         for milestone in unlocked {
-            emit_milestone(db, &milestone, next);
+            emit_milestone(db, &milestone, next).await;
         }
     }
 
     /// Check evolution gates and record an evolution event if all prerequisites are met.
-    fn attempt_evolution(&self, db: &Database) {
-        let evo_state = match db.get_evolution_state() {
+    async fn attempt_evolution(&self, db: &Database) {
+        let evo_state = match db.get_evolution_state().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("evolution: failed to get evolution state: {e}");
@@ -908,7 +932,7 @@ impl EvolutionHook {
         }
 
         // Get bond state for gate checks (use derived key for HMAC verification)
-        let bond_events = match db.get_all_bond_events() {
+        let bond_events = match db.get_all_bond_events().await {
             Ok(events) => events,
             Err(e) => {
                 tracing::warn!("evolution: failed to load bond events: {e}");
@@ -919,7 +943,7 @@ impl EvolutionHook {
         let bond_state = crate::bond::replay_events_with_key(&bond_key, &bond_events);
 
         // Get vitals state for gate checks
-        let vitals_state = match db.get_vitals_state() {
+        let vitals_state = match db.get_vitals_state().await {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("evolution: failed to get vitals state: {e}");
@@ -941,6 +965,7 @@ impl EvolutionHook {
                 let fourteen_days_ago = chrono::Utc::now().timestamp() - 14 * SECS_PER_DAY;
                 let (corrections, total) = match db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "correction")
+                    .await
                 {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -950,6 +975,7 @@ impl EvolutionHook {
                 };
                 let negatives = match db
                     .count_vitals_events_by_category_since(fourteen_days_ago, "negative_sentiment")
+                    .await
                 {
                     Ok((n, _)) => n,
                     Err(e) => {
@@ -962,7 +988,7 @@ impl EvolutionHook {
                 } else {
                     0.0
                 };
-                let archetype_stable_days = compute_archetype_stable_days(db);
+                let archetype_stable_days = compute_archetype_stable_days(db).await;
                 matches!(
                     check_stage2_gates(
                         &evo_state,
@@ -983,8 +1009,9 @@ impl EvolutionHook {
 
         let metadata =
             serde_json::json!({ "gates_verified": true, "pending_name": true }).to_string();
-        if let Err(e) =
-            db.record_evolution_event("evolution", 0, None, "gate_check", Some(&metadata))
+        if let Err(e) = db
+            .record_evolution_event("evolution", 0, None, "gate_check", Some(&metadata))
+            .await
         {
             tracing::warn!("evolution: failed to record evolution event: {e}");
             return;
@@ -1000,7 +1027,8 @@ impl EvolutionHook {
             Stage::Evolved => Stage::Final,
             Stage::Final => Stage::Final,
         };
-        self.spawn_evolution_naming(new_stage, evo_state.dominant_archetype);
+        self.spawn_evolution_naming(new_stage, evo_state.dominant_archetype)
+            .await;
 
         let to_stage = match evo_state.stage {
             Stage::Base => "evolved",
@@ -1022,7 +1050,7 @@ impl EvolutionHook {
         };
         match serde_json::to_string(&celebration) {
             Ok(payload_json) => {
-                if let Err(e) = db.insert_pending_celebration("evolution", &payload_json) {
+                if let Err(e) = db.insert_pending_celebration("evolution", &payload_json).await {
                     tracing::warn!("evolution: failed to insert pending celebration: {e}");
                 }
             }
@@ -1035,37 +1063,40 @@ impl EvolutionHook {
     /// Spawn a detached task to generate an evolution name + description.
     /// Falls back to a deterministic name on any error. No-op if no tokio
     /// runtime is available (e.g. pure-sync test context).
-    fn spawn_evolution_naming(&self, new_stage: Stage, archetype: Option<Archetype>) {
+    async fn spawn_evolution_naming(&self, new_stage: Stage, archetype: Option<Archetype>) {
         let Some(rt) = self.rt.clone() else {
             // No runtime: record the fallback synchronously via a blocking DB call.
             let (name, description) = classification::fallback_evolution_name(archetype, new_stage);
-            self.record_naming_event(archetype, &name, &description);
+            self.record_naming_event(archetype, &name, &description).await;
             return;
         };
         // Compute top tools under the already-held DB lock would deadlock; do
         // it lazily inside the task with a fresh Database::open().
         let archetype_copy = archetype;
         rt.spawn(async move {
-            let top_tools = match Database::open() {
-                Ok(db) => top_sources_from_db(&db).unwrap_or_default(),
+            let top_tools = match Database::open().await {
+                Ok(db) => top_sources_from_db(&db).await.unwrap_or_default(),
                 Err(_) => Vec::new(),
             };
             let (name, description) =
                 classification::generate_evolution_name(archetype_copy, new_stage, &top_tools)
                     .await;
             // Open a fresh DB handle inside the async task (original hook DB is behind a Mutex).
-            match Database::open() {
+            match Database::open().await {
                 Ok(db) => {
                     let arch_str = archetype_copy.map(|a| a.to_string());
                     let metadata =
                         serde_json::json!({ "name": name, "description": description }).to_string();
-                    if let Err(e) = db.record_evolution_event(
-                        "classification",
-                        0,
-                        arch_str.as_deref(),
-                        "llm_naming",
-                        Some(&metadata),
-                    ) {
+                    if let Err(e) = db
+                        .record_evolution_event(
+                            "classification",
+                            0,
+                            arch_str.as_deref(),
+                            "llm_naming",
+                            Some(&metadata),
+                        )
+                        .await
+                    {
                         tracing::warn!("evolution: failed to record naming event: {e}");
                     }
                 }
@@ -1077,20 +1108,25 @@ impl EvolutionHook {
     }
 
     /// Synchronous naming record — used when no tokio runtime is available.
-    fn record_naming_event(&self, archetype: Option<Archetype>, name: &str, description: &str) {
-        let Ok(db) = self.db.lock() else {
-            tracing::warn!("evolution: mutex poisoned, skipping naming event");
-            return;
-        };
+    async fn record_naming_event(
+        &self,
+        archetype: Option<Archetype>,
+        name: &str,
+        description: &str,
+    ) {
+        let db = self.db.lock().await;
         let arch_str = archetype.map(|a| a.to_string());
         let metadata = serde_json::json!({ "name": name, "description": description }).to_string();
-        if let Err(e) = db.record_evolution_event(
-            "classification",
-            0,
-            arch_str.as_deref(),
-            "llm_naming",
-            Some(&metadata),
-        ) {
+        if let Err(e) = db
+            .record_evolution_event(
+                "classification",
+                0,
+                arch_str.as_deref(),
+                "llm_naming",
+                Some(&metadata),
+            )
+            .await
+        {
             tracing::warn!("evolution: failed to record naming event: {e}");
         }
     }
@@ -1098,17 +1134,11 @@ impl EvolutionHook {
     /// Snapshot the current `Mood` by opening the DB and replaying vitals +
     /// bond + evolution state. Returns `None` if any load fails — callers
     /// treat that as "no transition to emit".
-    fn snapshot_mood(&self) -> Option<Mood> {
-        let db = match self.db.lock() {
-            Ok(db) => db,
-            Err(_) => {
-                tracing::warn!("evolution: mutex poisoned, cannot snapshot mood");
-                return None;
-            }
-        };
-        let evo = db.get_evolution_state().ok()?;
-        let vitals = db.get_vitals_state().ok()?;
-        let bond_events = db.get_all_bond_events().ok()?;
+    async fn snapshot_mood(&self) -> Option<Mood> {
+        let db = self.db.lock().await;
+        let evo = db.get_evolution_state().await.ok()?;
+        let vitals = db.get_vitals_state().await.ok()?;
+        let bond_events = db.get_all_bond_events().await.ok()?;
         let bond_key = db.derive_hmac_key(crate::bond::BOND_HMAC_DOMAIN);
         let bond = crate::bond::replay_events_with_key(&bond_key, &bond_events);
         Some(compute_mood(&evo, &vitals, &bond))
@@ -1117,24 +1147,24 @@ impl EvolutionHook {
     /// Emit a `mood_changed` event when the computed mood flipped between
     /// tool calls. `reason` names the source that triggered the transition
     /// (typically the tool name). Rate-limited at 5/hr by `rate_limit_for`.
-    fn emit_mood_changed(&self, from: Mood, to: Mood, reason: &str) {
-        let Ok(db) = self.db.lock() else {
-            tracing::warn!("evolution: mutex poisoned, skipping mood_changed event");
-            return;
-        };
+    async fn emit_mood_changed(&self, from: Mood, to: Mood, reason: &str) {
+        let db = self.db.lock().await;
         let metadata = serde_json::json!({
             "from_mood": from.to_string(),
             "to_mood": to.to_string(),
             "reason": reason,
         })
         .to_string();
-        if let Err(e) = db.record_evolution_event("mood_changed", 0, None, reason, Some(&metadata))
+        if let Err(e) = db
+            .record_evolution_event("mood_changed", 0, None, reason, Some(&metadata))
+            .await
         {
             tracing::warn!("evolution: failed to record mood_changed event: {e}");
         }
     }
 }
 
+#[async_trait]
 impl Hook for EvolutionHook {
     fn name(&self) -> &str {
         "evolution"
@@ -1150,14 +1180,15 @@ impl Hook for EvolutionHook {
         &[HookPoint::SessionStart, HookPoint::AfterToolCall]
     }
 
-    fn execute(&self, ctx: &HookContext) -> HookAction {
+    async fn execute(&self, ctx: &HookContext) -> HookAction {
         if !self.enabled {
             return HookAction::Continue;
         }
         match &ctx.data {
             HookData::SessionStart { .. } => {
                 // Record interaction XP
-                self.record_xp("session_start", None, BASE_XP_INTERACTION, 0);
+                self.record_xp("session_start", None, BASE_XP_INTERACTION, 0)
+                    .await;
             }
             HookData::AgentStart { .. } | HookData::LlmCall { .. } => {
                 // No-op: see `points()` for why per-turn injection was removed.
@@ -1190,13 +1221,13 @@ impl Hook for EvolutionHook {
                         (BASE_XP_TOOL_SUCCESS, bonus)
                     };
 
-                    let mood_before = self.snapshot_mood();
-                    self.record_xp(name, archetype, base, align_bonus);
+                    let mood_before = self.snapshot_mood().await;
+                    self.record_xp(name, archetype, base, align_bonus).await;
 
                     if let Some(before) = mood_before {
-                        if let Some(after) = self.snapshot_mood() {
+                        if let Some(after) = self.snapshot_mood().await {
                             if before != after {
-                                self.emit_mood_changed(before, after, name);
+                                self.emit_mood_changed(before, after, name).await;
                             }
                         }
                     }

@@ -34,23 +34,21 @@ use crate::db::Database;
 /// for the `secure_headless_setup` milestone, plus the current backend.
 /// Both pieces of data live in `evolution_events.metadata_json` /
 /// `audit_log_chain.event_json`.
-pub fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
+pub async fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
     // Excluding `event_purged = 1` rows is defensive: today retention
     // leaves `event_json` intact when it tombstones, but that's not part
     // of the audit-chain contract and a future tombstone format that
     // replaces the JSON would otherwise feed garbage to the parser.
-    let mut stmt = match db.conn().prepare(
-        "SELECT event_json FROM audit_log_chain
-         WHERE event_type = 'security_posture_changed' AND event_purged = 0
-         ORDER BY seq ASC",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!("posture history: prepare failed: {e}");
-            return Vec::new();
-        }
-    };
-    let mut rows = match stmt.query([]) {
+    let mut rows = match db
+        .conn()
+        .query(
+            "SELECT event_json FROM audit_log_chain
+             WHERE event_type = 'security_posture_changed' AND event_purged = 0
+             ORDER BY seq ASC",
+            (),
+        )
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("posture history: query failed: {e}");
@@ -58,18 +56,27 @@ pub fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
         }
     };
     let mut out = Vec::new();
-    while let Ok(Some(row)) = rows.next() {
-        let json: String = match row.get(0) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("posture history: read row failed: {e}");
-                continue;
+    loop {
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let json: String = match row.get::<String>(0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("posture history: read row failed: {e}");
+                        continue;
+                    }
+                };
+                match serde_json::from_str::<PostureSnapshot>(&json) {
+                    Ok(snap) => out.push(snap),
+                    Err(e) => {
+                        tracing::warn!("posture history: parse failed: {e}");
+                    }
+                }
             }
-        };
-        match serde_json::from_str::<PostureSnapshot>(&json) {
-            Ok(snap) => out.push(snap),
+            Ok(None) => break,
             Err(e) => {
-                tracing::warn!("posture history: parse failed: {e}");
+                tracing::warn!("posture history: row read failed: {e}");
+                break;
             }
         }
     }
@@ -85,16 +92,27 @@ pub fn load_posture_history(db: &Database) -> Vec<PostureSnapshot> {
 /// `(Default, 0, Some(PostureUndetermined))` so `xp_gain` writes still pass
 /// through `compute_xp_breakdown` and surface the fallback in their
 /// `XpBreakdown` for `borg doctor` escalation.
-pub fn current_posture_for_xp(db: &Database) -> (PostureState, i64, Option<FallbackReason>) {
-    let row: Option<(String, i64)> = db
+pub async fn current_posture_for_xp(
+    db: &Database,
+) -> (PostureState, i64, Option<FallbackReason>) {
+    let row: Option<(String, i64)> = match db
         .conn()
-        .query_row(
+        .query(
             "SELECT posture, evolution_event_id FROM posture_snapshots
              ORDER BY taken_at DESC, id DESC LIMIT 1",
-            [],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            (),
         )
-        .ok();
+        .await
+    {
+        Ok(mut rows) => match rows.next().await {
+            Ok(Some(r)) => match (r.get::<String>(0), r.get::<i64>(1)) {
+                (Ok(s), Ok(seq)) => Some((s, seq)),
+                _ => None,
+            },
+            _ => None,
+        },
+        Err(_) => None,
+    };
     match row.and_then(|(s, seq)| PostureState::parse(&s).map(|p| (p, seq))) {
         Some((state, seq)) => (state, seq, None),
         None => (
