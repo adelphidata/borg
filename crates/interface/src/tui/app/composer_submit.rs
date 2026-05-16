@@ -57,7 +57,9 @@ impl<'a> App<'a> {
         };
         let cmd = self.command_popup.lookup(name)?;
         let template = cmd.template.as_deref()?;
-        Some(super::super::custom_commands::expand_template(template, args))
+        Some(super::super::custom_commands::expand_template(
+            template, args,
+        ))
     }
 
     pub(in crate::tui) fn handle_submit(&mut self, input: &str) -> Result<AppAction> {

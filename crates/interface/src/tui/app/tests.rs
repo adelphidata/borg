@@ -38,10 +38,8 @@ fn doctor_card_empty_for_no_warnings() {
 
 #[test]
 fn doctor_card_singular_for_one_category() {
-    let lines = super::super::history::build_doctor_warning_lines(
-        &warns(&["Memory:Index staleness"]),
-        80,
-    );
+    let lines =
+        super::super::history::build_doctor_warning_lines(&warns(&["Memory:Index staleness"]), 80);
     let text = flatten(&lines);
     assert!(text.contains("⚠ 1 Warning "), "label: {text}");
     assert!(text.contains("Issue with Memory."), "summary: {text}");
@@ -50,10 +48,8 @@ fn doctor_card_singular_for_one_category() {
 
 #[test]
 fn doctor_card_two_categories_uses_and() {
-    let lines = super::super::history::build_doctor_warning_lines(
-        &warns(&["Memory:a", "Gateway:b"]),
-        80,
-    );
+    let lines =
+        super::super::history::build_doctor_warning_lines(&warns(&["Memory:a", "Gateway:b"]), 80);
     let text = flatten(&lines);
     assert!(
         text.contains("Issues with Memory and Gateway."),
@@ -1922,10 +1918,8 @@ fn esc_does_not_close_notes_it_cancels_the_batch() {
     // it was open, leaving users with no way to cancel from inside notes.
     // Now Esc always cancels the batch, regardless of notes state.
     let mut app = make_app();
-    let mut rx = seed_awaiting_with_questions(
-        &mut app,
-        vec![make_question("a", "A", &["x", "y"], false)],
-    );
+    let mut rx =
+        seed_awaiting_with_questions(&mut app, vec![make_question("a", "A", &["x", "y"], false)]);
 
     // Open notes, type something, then Esc.
     app.handle_key(key(KeyCode::Tab)).unwrap();

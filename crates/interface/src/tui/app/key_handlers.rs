@@ -17,10 +17,8 @@ use cortex::config::CollaborationMode;
 use super::super::history::{ApprovalStatus, HistoryCell};
 use super::super::plan_overlay::PlanOption;
 use super::super::transcript_pager::PagerAction;
-use super::{
-    extract_at_query, try_paste_clipboard_image, App, AppAction, AppState, BacktrackPhase,
-    QueuedMessage,
-};
+use super::composer_submit::{extract_at_query, try_paste_clipboard_image};
+use super::{App, AppAction, AppState, BacktrackPhase, QueuedMessage};
 
 impl<'a> App<'a> {
     // The terminal owns scrollback in inline-viewport mode (xterm Alternate
