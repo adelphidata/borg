@@ -49,6 +49,19 @@
 
 use crate::policy::{SandboxCommand, SandboxPolicy};
 
+pub mod ace;
+pub mod policy_resolve;
+pub mod sid;
+
+#[cfg(target_os = "windows")]
+pub mod acl;
+#[cfg(target_os = "windows")]
+pub mod process;
+#[cfg(target_os = "windows")]
+pub mod runtime;
+#[cfg(target_os = "windows")]
+pub mod token;
+
 /// Hidden subcommand name dispatched by `crates/interface/src/main.rs`
 /// before clap sees argv. Two leading underscores mark this as an
 /// internal subcommand — invoking it directly is unsupported and will

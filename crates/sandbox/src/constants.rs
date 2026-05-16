@@ -24,6 +24,9 @@ pub const SAFE_ENV_VARS: &[&str] = &[
     "TEMP", "TMP", "TERM",
 ];
 
+/// Same allowlist as the Unix variant but with Windows-specific entries
+/// (USERPROFILE, SYSTEMROOT, etc). See module docs for the rationale on
+/// why these can't be a single shared list.
 #[cfg(windows)]
 pub const SAFE_ENV_VARS: &[&str] = &[
     // SECURITY: PATH on Windows is part of the DLL search path. A
