@@ -706,17 +706,25 @@ impl App<'_> {
     /// `/heal` — run the self-healing maintenance sweep on demand. This is the
     /// same routine the daemon fires nightly at 02:00, exposed for users who
     /// want to force a sweep without waiting.
+    ///
+    /// Routes through `crate::commands::registry::run_heal_action` so the
+    /// CLI subcommand `borg heal` and this TUI slash command share one
+    /// implementation + one renderer.
     fn cmd_heal(&mut self) -> Result<AppAction> {
+        if crate::commands::registry::lookup("heal").is_none() {
+            self.push_system_message(
+                "internal: 'heal' command not registered in the command registry".to_string(),
+            );
+            return Ok(AppAction::Continue);
+        }
         let client = self.client.clone();
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut c = client.lock().await;
-                c.heal().await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async move { crate::commands::registry::run_heal_action(client).await })
         });
         match result {
-            Ok(report) => {
-                self.push_system_message(format_heal_report(&report));
+            Ok(crate::commands::registry::CommandOutcome::Text(text)) => {
+                self.push_system_message(text);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "on-demand /heal: daemon heal RPC failed");
@@ -1090,45 +1098,11 @@ fn format_elapsed_seconds(s: i64) -> String {
     format!("{h}h {mm}m")
 }
 
-/// Render a daemon-side [`protocols::admin::HealReport`] as a system-message
-/// body. Mirrors the look of `format_heal_summary` but consumes the
-/// gRPC-friendly proto returned by `Admin.Heal` rather than the in-process
-/// MaintenanceReport.
-pub(super) fn format_heal_report(report: &protocols::admin::HealReport) -> String {
-    let mut text = if report.skipped {
-        String::from("Self-healing sweep skipped\n───────────────────────────\n")
-    } else {
-        String::from("Self-healing sweep complete\n───────────────────────────\n")
-    };
-    if report.skipped {
-        text.push_str("maintenance.enabled is false");
-    } else {
-        text.push_str(&format!(
-            "Pruned {} log files ({} bytes truncated), {} activity rows, evicted {} embeddings, healed {} stalled tasks, recovered {} wedged runs, purged {} messages, tombstoned {} audit events",
-            report.pruned_logs,
-            report.log_bytes_truncated,
-            report.pruned_activity,
-            report.evicted_embeddings,
-            report.healed_tasks,
-            report.wedged_runs_recovered,
-            report.messages_purged,
-            report.audit_events_tombstoned,
-        ));
-    }
-    if !report.warnings.is_empty() {
-        text.push_str("\n\nWarnings:");
-        for w in &report.warnings {
-            text.push_str("\n  • ");
-            text.push_str(w);
-        }
-    }
-    text
-}
-
 /// Render a [`MaintenanceReport`] as the multi-line system-message body
 /// shown after `/heal`. Retained for tests covering the in-process formatter
-/// shape; the production `/heal` path now goes through [`format_heal_report`]
-/// against the daemon-side `HealReport`.
+/// shape; the production `/heal` path now goes through
+/// [`crate::commands::registry::format_heal_report`] against the daemon-side
+/// `HealReport`.
 #[cfg(test)]
 fn format_heal_summary(report: &cortex::maintenance::MaintenanceReport) -> String {
     let mut text = String::from("Self-healing sweep complete\n───────────────────────────\n");
@@ -1364,36 +1338,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn format_heal_report_renders_expanded_counts() {
-        let out = format_heal_report(&protocols::admin::HealReport {
-            pruned_logs: 2,
-            pruned_activity: 5,
-            evicted_embeddings: 7,
-            healed_tasks: 11,
-            warnings: vec!["Skills:tamper audit".into()],
-            log_bytes_truncated: 1234,
-            messages_purged: 17,
-            audit_events_tombstoned: 19,
-            wedged_runs_recovered: 23,
-            backups_pruned: 0,
-            auto_backup_path: String::new(),
-            skipped: false,
-        });
-        assert!(out.contains("1234 bytes truncated"), "{out:?}");
-        assert!(out.contains("recovered 23 wedged runs"), "{out:?}");
-        assert!(out.contains("Skills:tamper audit"), "{out:?}");
-    }
-
-    #[test]
-    fn format_heal_report_renders_skip_state() {
-        let out = format_heal_report(&protocols::admin::HealReport {
-            skipped: true,
-            ..Default::default()
-        });
-        assert!(out.starts_with("Self-healing sweep skipped"), "{out:?}");
-        assert!(out.contains("maintenance.enabled is false"), "{out:?}");
-    }
+    // Tests for `format_heal_report` moved to `commands::registry::tests`
+    // when the formatter was hoisted to the unified command registry. The
+    // TUI now consumes the registry's formatter directly, so re-testing it
+    // here would just check the same code twice.
 
     #[test]
     fn snapshot_skips_non_conversation_cells() {
