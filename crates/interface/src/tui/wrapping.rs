@@ -50,10 +50,17 @@ where
     for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
         match line {
             std::borrow::Cow::Borrowed(slice) => {
-                let start = slice.as_ptr() as usize - text.as_ptr() as usize;
-                let end = start + slice.len();
+                let synthetic_prefix = if line_index == 0 {
+                    opts.initial_indent
+                } else {
+                    opts.subsequent_indent
+                };
+                let range = borrowed_slice_range(text, slice).unwrap_or_else(|| {
+                    map_owned_wrapped_line_to_range(text, cursor, slice, synthetic_prefix)
+                });
+                let end = range.end;
                 let trailing_spaces = text[end..].chars().take_while(|c| *c == ' ').count();
-                lines.push(start..end + trailing_spaces + 1);
+                lines.push(range.start..end + trailing_spaces + 1);
                 cursor = end + trailing_spaces;
             }
             std::borrow::Cow::Owned(slice) => {
@@ -85,10 +92,16 @@ where
     for (line_index, line) in textwrap::wrap(text, &opts).iter().enumerate() {
         match line {
             std::borrow::Cow::Borrowed(slice) => {
-                let start = slice.as_ptr() as usize - text.as_ptr() as usize;
-                let end = start + slice.len();
-                lines.push(start..end);
-                cursor = end;
+                let synthetic_prefix = if line_index == 0 {
+                    opts.initial_indent
+                } else {
+                    opts.subsequent_indent
+                };
+                let range = borrowed_slice_range(text, slice).unwrap_or_else(|| {
+                    map_owned_wrapped_line_to_range(text, cursor, slice, synthetic_prefix)
+                });
+                cursor = range.end;
+                lines.push(range);
             }
             std::borrow::Cow::Owned(slice) => {
                 let synthetic_prefix = if line_index == 0 {
@@ -103,6 +116,30 @@ where
         }
     }
     lines
+}
+
+/// Resolves the byte range of `slice` inside `text` when `slice` actually
+/// points into `text`'s backing buffer.
+///
+/// `textwrap::wrap` returns `Cow::Borrowed` for unchanged source lines, but
+/// the slice is only guaranteed to point into `text` in the common case —
+/// edge cases (bracketed-paste sequences, internal string optimizations)
+/// can yield a borrowed slice with an unrelated pointer. Computing the byte
+/// offset via raw pointer subtraction in that case underflows and produces
+/// a garbage range, which then panics downstream when used to index `text`.
+/// Returning `None` lets the caller fall back to the slower owned-line
+/// mapper that recovers the range from the slice's content.
+fn borrowed_slice_range(text: &str, slice: &str) -> Option<Range<usize>> {
+    let text_start = text.as_ptr() as usize;
+    let text_end = text_start.checked_add(text.len())?;
+    let slice_start = slice.as_ptr() as usize;
+    let slice_end = slice_start.checked_add(slice.len())?;
+
+    if slice_start < text_start || slice_end > text_end {
+        return None;
+    }
+
+    Some((slice_start - text_start)..(slice_end - text_start))
 }
 
 /// Maps an owned (materialized) wrapped line back to a byte range in `text`.
@@ -1356,6 +1393,51 @@ them."#
 
         assert_eq!(rebuilt, text);
         assert!(ranges.len() > 1, "expected wrapped ranges, got: {ranges:?}");
+    }
+
+    /// Regression for codex commit 5d7e6a2503: a borrowed slice whose pointer
+    /// is outside the source text must be rejected, and the owned-line mapper
+    /// must recover a usable range from its content.
+    #[test]
+    fn borrowed_slice_range_rejects_external_slices() {
+        let text = "test message";
+        let external = String::from("test");
+
+        assert_eq!(borrowed_slice_range(text, &external), None);
+
+        let fallback = map_owned_wrapped_line_to_range(text, 0, &external, "");
+        assert_eq!(fallback, 0..4);
+    }
+
+    /// A borrowed slice that genuinely points into the source must round-trip
+    /// to the same byte offset that the pre-fix raw pointer subtraction
+    /// computed — proves the validating helper preserves the hot path.
+    #[test]
+    fn borrowed_slice_range_accepts_real_borrow() {
+        let text = "alpha bravo charlie";
+        let slice = &text[6..11]; // "bravo"
+        assert_eq!(borrowed_slice_range(text, slice), Some(6..11));
+    }
+
+    /// A borrowed slice whose backing buffer ends exactly at `text`'s
+    /// start (or starts exactly at its end) is still external and must be
+    /// rejected — boundary check on the half-open range.
+    #[test]
+    fn borrowed_slice_range_rejects_boundary_external_slices() {
+        let text = "abcdef";
+        let before = String::from("xyz");
+        let after = String::from("xyz");
+        // `before` and `after` are heap allocations entirely outside `text`.
+        assert_eq!(borrowed_slice_range(text, &before), None);
+        assert_eq!(borrowed_slice_range(text, &after), None);
+
+        // A slice that is a prefix of `text` is in-range.
+        assert_eq!(borrowed_slice_range(text, &text[..3]), Some(0..3));
+        // The empty tail at `text.len()` is in-range (degenerate but valid).
+        assert_eq!(
+            borrowed_slice_range(text, &text[text.len()..]),
+            Some(text.len()..text.len())
+        );
     }
 }
 

@@ -13,6 +13,10 @@ use tracing::instrument;
 /// Timeout for git subprocess calls.
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Path written to so that user-configured Git hooks never fire inside Borg's
+/// internal `git` subprocesses (ghost commits, status, log, etc.).
+const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 /// Directories excluded from ghost snapshots (build artifacts, deps, caches).
 const IGNORED_DIR_NAMES: &[&str] = &[
     "node_modules",
@@ -70,11 +74,20 @@ pub fn find_repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Run a git command with timeout, returns stdout on success.
+///
+/// Internal git invocations override user-repo config so Borg's bookkeeping
+/// stays independent of the surrounding repository:
+/// - `GIT_OPTIONAL_LOCKS=0` so `git status` doesn't block on a held index lock.
+/// - `core.fsmonitor=false` so a slow/broken fsmonitor binary can't stall us.
+/// - `core.hooksPath=/dev/null` (NUL on Windows) so user hooks never fire.
 #[instrument(skip_all, fields(git.args = ?args))]
 async fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
     let output = tokio::time::timeout(
         GIT_COMMAND_TIMEOUT,
         tokio::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", &format!("core.hooksPath={DISABLED_HOOKS_PATH}")])
             .args(args)
             .current_dir(cwd)
             .output(),
@@ -258,14 +271,22 @@ pub fn format_git_context(ctx: &GitContext) -> String {
 }
 
 /// Run a git command with a custom GIT_INDEX_FILE environment variable.
+///
+/// Applies the same hardening as [`run_git`]: even though ghost-commit plumbing
+/// operates against a temp index, `post-index-change` (and `fsmonitor-watchman`
+/// when fsmonitor is configured) still trigger off `git read-tree` /
+/// `git add --all` / `git write-tree` in a repo with `core.hooksPath` set.
 #[instrument(skip_all, fields(git.args = ?args))]
 async fn run_git_with_index(index_path: &str, args: &[&str], cwd: &Path) -> Result<String> {
     let output = tokio::time::timeout(
         GIT_COMMAND_TIMEOUT,
         tokio::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_INDEX_FILE", index_path)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(["-c", &format!("core.hooksPath={DISABLED_HOOKS_PATH}")])
             .args(args)
             .current_dir(cwd)
-            .env("GIT_INDEX_FILE", index_path)
             .output(),
     )
     .await
@@ -522,6 +543,170 @@ mod tests {
         assert!(
             recorded.iter().any(|s| s == "run_git"),
             "expected 'run_git' span, got: {recorded:?}"
+        );
+    }
+
+    /// Initialize a minimal git repo with one commit so plumbing operations
+    /// (status / log / rev-parse / read-tree) have something to read.
+    async fn init_test_repo(root: &Path) {
+        // Use direct subprocess (not run_git) so the test setup is independent
+        // of the hardening it exercises.
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "test@borg.local"][..],
+            &["config", "user.name", "Borg Test"][..],
+            &["config", "commit.gpgsign", "false"][..],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git setup");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        }
+        std::fs::write(root.join("README.md"), "borg test\n").unwrap();
+        for args in [&["add", "README.md"][..], &["commit", "-m", "init"][..]] {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git setup");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        }
+    }
+
+    /// Returns `(repo, hooks_dir, sentinel)`. The hooks directory contains an
+    /// executable `post-index-change` (and `pre-commit`) hook that writes the
+    /// sentinel file when invoked.
+    #[cfg(unix)]
+    fn setup_hook_canary(repo: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let hooks_dir = repo.join("borg-test-hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let sentinel = repo.join("hook-fired.sentinel");
+
+        // Every hook git might invoke during status/log/add/commit-tree writes
+        // the sentinel. If hooksPath isn't overridden, at least one of these
+        // fires.
+        for hook_name in [
+            "post-index-change",
+            "pre-commit",
+            "post-commit",
+            "post-rewrite",
+            "fsmonitor-watchman",
+        ] {
+            let hook = hooks_dir.join(hook_name);
+            std::fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\necho fired > \"{}\"\nexit 0\n",
+                    sentinel.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Point the repo at the canary hooks dir.
+        let out = std::process::Command::new("git")
+            .args(["config", "core.hooksPath"])
+            .arg(&hooks_dir)
+            .current_dir(repo)
+            .output()
+            .expect("git config hooksPath");
+        assert!(out.status.success(), "set hooksPath failed: {out:?}");
+
+        (hooks_dir, sentinel)
+    }
+
+    /// Regression for codex commit 9facdccb37: `git collect_git_context` must
+    /// not fire any hook configured via `core.hooksPath` in the target repo.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_git_context_does_not_fire_user_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path()).await;
+        let (_hooks_dir, sentinel) = setup_hook_canary(tmp.path());
+
+        let ctx = collect_git_context(tmp.path()).await;
+        assert!(ctx.branch.is_some(), "branch should resolve: {ctx:?}");
+        assert!(
+            !sentinel.exists(),
+            "hook fired during collect_git_context — core.hooksPath override missing"
+        );
+    }
+
+    /// Regression for codex commit 9facdccb37 applied to ghost-commit plumbing:
+    /// `create_ghost_commit` runs `git add --all` / `write-tree` / `commit-tree`,
+    /// each of which can invoke hooks (`post-index-change`, `pre-commit`,
+    /// `post-commit`, `post-rewrite`) when the user has `core.hooksPath` set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_ghost_commit_does_not_fire_user_hooks() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path()).await;
+        let (_hooks_dir, sentinel) = setup_hook_canary(tmp.path());
+
+        // Dirty the working tree so `add --all` actually touches the index.
+        std::fs::write(tmp.path().join("new-file.txt"), "ghost test\n").unwrap();
+
+        let ghost = create_ghost_commit(tmp.path())
+            .await
+            .expect("ghost commit should succeed despite configured hooks");
+        assert!(!ghost.commit_id.is_empty());
+        assert!(
+            !sentinel.exists(),
+            "hook fired during create_ghost_commit — run_git_with_index hardening missing"
+        );
+    }
+
+    /// Regression for codex commit 6ec8c4a6ec: a repo with a `core.fsmonitor`
+    /// configured must not invoke it during Borg's internal git subprocesses.
+    /// The override (`-c core.fsmonitor=false`) is what keeps `git status`
+    /// from spawning the user's monitor on every system-prompt assembly.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn collect_git_context_ignores_broken_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path()).await;
+
+        // Build a sentinel-writing fsmonitor script; if git ever invokes it,
+        // the sentinel file appears.
+        let fsmonitor = tmp.path().join("borg-fsmonitor.sh");
+        let sentinel = tmp.path().join("fsmonitor-fired.sentinel");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\necho fired > \"{}\"\nexit 0\n",
+                sentinel.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = std::process::Command::new("git")
+            .args(["config", "core.fsmonitor"])
+            .arg(&fsmonitor)
+            .current_dir(tmp.path())
+            .output()
+            .expect("git config fsmonitor");
+        assert!(out.status.success());
+
+        let start = std::time::Instant::now();
+        let ctx = collect_git_context(tmp.path()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "collect_git_context took {elapsed:?}"
+        );
+        assert!(ctx.branch.is_some(), "branch should resolve: {ctx:?}");
+        assert!(
+            !sentinel.exists(),
+            "fsmonitor script was invoked — core.fsmonitor=false override missing"
         );
     }
 }
