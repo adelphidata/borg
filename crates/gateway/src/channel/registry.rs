@@ -236,7 +236,9 @@ mod tests {
     fn scan_nonexistent_dir_succeeds() {
         let mut registry =
             ChannelRegistry::with_dir(PathBuf::from("/tmp/nonexistent_channels_dir_xyz")).unwrap();
-        assert!(registry.scan().is_ok());
+        registry
+            .scan()
+            .expect("scan must succeed even when the channels dir is missing");
         assert!(registry.list_channels().is_empty());
     }
 
@@ -351,6 +353,11 @@ description = "A test channel"
         .unwrap();
 
         let mut registry = ChannelRegistry::with_dir(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            registry.list_channels().len(),
+            1,
+            "with_dir scan should register exactly one channel"
+        );
         assert!(registry.get("a").is_some());
 
         // Replace channel `a` with channel `b` on disk.

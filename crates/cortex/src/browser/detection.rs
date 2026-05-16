@@ -157,13 +157,6 @@ mod tests {
     }
 
     #[test]
-    fn platform_candidates_returns_vec() {
-        let candidates = platform_candidates();
-        // Just verify it doesn't panic and returns a vec
-        let _ = candidates.len();
-    }
-
-    #[test]
     fn which_candidates_returns_vec() {
         let candidates = which_candidates();
         assert!(

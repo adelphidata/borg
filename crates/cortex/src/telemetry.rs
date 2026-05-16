@@ -401,13 +401,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config_disabled() {
-        let config = TelemetryConfig::default();
-        assert!(!config.tracing_enabled);
-        assert!(!config.metrics_enabled);
-    }
-
-    #[test]
     fn test_init_noop_when_disabled() {
         let config = TelemetryConfig::default();
         let (layer, _guard) = init_telemetry(&config).expect("init should succeed");

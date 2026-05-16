@@ -1361,22 +1361,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // -- Tasks tests (using temp DB) --
-
-    #[test]
-    fn test_tasks_validate_schedule_cron() {
-        assert!(cortex::tasks::validate_schedule("cron", "0 */5 * * * *").is_ok());
-    }
-
-    #[test]
-    fn test_tasks_validate_schedule_interval() {
-        assert!(cortex::tasks::validate_schedule("interval", "30m").is_ok());
-    }
-
-    #[test]
-    fn test_tasks_validate_schedule_invalid() {
-        assert!(cortex::tasks::validate_schedule("cron", "not valid").is_err());
-    }
+    // validate_schedule itself is exercised in `cortex::tasks` tests
+    // (validate_schedule_valid_cron / _interval / _invalid_* / _once_*).
 
     // -- Helper tests --
 

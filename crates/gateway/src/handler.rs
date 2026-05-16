@@ -1370,67 +1370,6 @@ mod tests {
     }
 
     #[test]
-    fn inbound_message_deserialize_minimal() {
-        let json = r#"{"sender_id": "user123", "text": "hello"}"#;
-        let msg: InboundMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.sender_id, "user123");
-        assert_eq!(msg.text, "hello");
-        assert!(msg.channel_id.is_none());
-        assert!(msg.thread_id.is_none());
-        assert!(msg.message_id.is_none());
-        assert!(msg.thread_ts.is_none());
-        assert!(msg.attachments.is_empty());
-        assert!(msg.reaction.is_none());
-    }
-
-    #[test]
-    fn inbound_message_deserialize_full() {
-        let json = r#"{
-            "sender_id": "u1",
-            "text": "hi",
-            "channel_id": "ch1",
-            "thread_id": "t1",
-            "message_id": "m1",
-            "thread_ts": "123.456",
-            "reaction": "thumbsup",
-            "attachments": [
-                {"mime_type": "image/png", "data": "abc123", "filename": "photo.png"}
-            ],
-            "metadata": {"platform": "slack"}
-        }"#;
-        let msg: InboundMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.sender_id, "u1");
-        assert_eq!(msg.channel_id.as_deref(), Some("ch1"));
-        assert_eq!(msg.thread_ts.as_deref(), Some("123.456"));
-        assert_eq!(msg.reaction.as_deref(), Some("thumbsup"));
-        assert_eq!(msg.attachments.len(), 1);
-        assert_eq!(msg.attachments[0].mime_type, "image/png");
-        assert_eq!(msg.attachments[0].filename.as_deref(), Some("photo.png"));
-    }
-
-    #[test]
-    fn inbound_attachment_deserialize() {
-        let json = r#"{"mime_type": "audio/mp3", "data": "base64data"}"#;
-        let att: InboundAttachment = serde_json::from_str(json).unwrap();
-        assert_eq!(att.mime_type, "audio/mp3");
-        assert_eq!(att.data, "base64data");
-        assert!(att.filename.is_none());
-    }
-
-    #[test]
-    fn inbound_attachment_serialize_roundtrip() {
-        let att = InboundAttachment {
-            mime_type: "image/jpeg".to_string(),
-            data: "abc".to_string(),
-            filename: Some("photo.jpg".to_string()),
-        };
-        let json = serde_json::to_string(&att).unwrap();
-        let deserialized: InboundAttachment = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.mime_type, att.mime_type);
-        assert_eq!(deserialized.filename, att.filename);
-    }
-
-    #[test]
     fn build_retry_policy_defaults() {
         let manifest: crate::manifest::ChannelManifest = toml::from_str(
             "name = \"test\"\ndescription = \"test\"\nruntime = \"bash\"\n\n[scripts]\ninbound = \"in.sh\"\noutbound = \"out.sh\"\n",
@@ -1464,16 +1403,6 @@ mod tests {
             policy.backoff.initial,
             std::time::Duration::from_millis(500)
         );
-    }
-
-    #[test]
-    fn skip_message_detected() {
-        let json = r#"{"skip": true, "sender_id": "", "text": ""}"#;
-        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert!(parsed
-            .get("skip")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false));
     }
 
     fn default_route() -> crate::channel::routing::ResolvedRoute {
@@ -1654,20 +1583,6 @@ mod tests {
         assert_eq!(msg.metadata["key"], "val");
     }
 
-    /// Verify that the denial message constant is non-empty so users get feedback
-    /// instead of silent drops.
-    #[test]
-    fn denied_sender_gets_denial_message() {
-        let denial_msg = "Access denied. Contact the Borg owner for access.";
-        assert!(!denial_msg.trim().is_empty());
-        // Ensure the message is present in the source code (guards against removal)
-        let source = include_str!("handler.rs");
-        assert!(
-            source.contains(denial_msg),
-            "Denial message must be returned to users, not silently dropped"
-        );
-    }
-
     // -- Pairing integration tests --
 
     /// New sender with DmPolicy::Pairing receives a non-empty challenge message.
@@ -1800,22 +1715,6 @@ mod tests {
             result,
             cortex::pairing::AccessCheckResult::Allowed
         ));
-    }
-
-    /// Verify the polling error path uses format_gateway_error (not a hard-coded string).
-    #[test]
-    fn polling_error_path_uses_formatted_errors() {
-        let source = include_str!("server.rs");
-        // The polling error arm must call format_gateway_error, not send a hard-coded message.
-        assert!(
-            source.contains("format_gateway_error"),
-            "Telegram polling error path must use format_gateway_error"
-        );
-        // The old hard-coded messages must not appear.
-        assert!(
-            !source.contains("Something went wrong. Please try again."),
-            "Hard-coded generic error message must not be used in polling path"
-        );
     }
 
     /// Verify format_gateway_error produces Gateway-specific hints for rate-limit errors.

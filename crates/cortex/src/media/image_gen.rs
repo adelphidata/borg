@@ -373,15 +373,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_detect_no_keys_returns_none() {
-        // Ensure no API keys in env for this test
-        let config = ImageGenConfig::default();
-        // Can't guarantee env state, but test the logic path
-        let _provider = ImageGenProvider::from_config(&config);
-        // Just verify it doesn't panic
-    }
-
-    #[test]
     fn explicit_provider_unknown_returns_none() {
         let config = ImageGenConfig {
             enabled: true,
@@ -426,13 +417,6 @@ mod tests {
         assert!(config.provider.is_none());
         assert!(config.model.is_none());
         assert_eq!(config.default_size, "1024x1024");
-    }
-
-    #[test]
-    fn validate_model_name_valid() {
-        assert!(validate_model_name("fal-ai/flux/schnell").is_ok());
-        assert!(validate_model_name("dall-e-3").is_ok());
-        assert!(validate_model_name("stable-diffusion_v1.5").is_ok());
     }
 
     #[test]

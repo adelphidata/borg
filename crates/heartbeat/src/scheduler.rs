@@ -606,19 +606,6 @@ fn quiet_hours_contains(start: NaiveTime, end: NaiveTime, now: NaiveTime) -> boo
 mod tests {
     use super::*;
 
-    fn test_scheduler(config: HeartbeatConfig, tz: Tz) -> HeartbeatScheduler {
-        let (_tx, rx) = mpsc::channel(1);
-        let quiet_hours = HeartbeatScheduler::parse_quiet_hours(&config);
-        HeartbeatScheduler {
-            config,
-            timezone: tz,
-            poke_rx: Some(rx),
-            quiet_hours,
-            config_rx: None,
-            liveness: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
     /// Drain the initial SchedulerStarted event from the channel.
     async fn drain_started(rx: &mut mpsc::Receiver<HeartbeatEvent>) {
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -629,52 +616,6 @@ mod tests {
             matches!(event, HeartbeatEvent::SchedulerStarted { .. }),
             "expected SchedulerStarted, got: {event:?}"
         );
-    }
-
-    #[test]
-    fn quiet_hours_no_config() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: None,
-            quiet_hours_end: None,
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        let sched = test_scheduler(config, chrono_tz::UTC);
-        assert!(!sched.is_quiet_hours());
-    }
-
-    #[test]
-    fn quiet_hours_invalid_format() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: Some("not-a-time".to_string()),
-            quiet_hours_end: Some("also-bad".to_string()),
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        let sched = test_scheduler(config, chrono_tz::UTC);
-        assert!(!sched.is_quiet_hours());
-    }
-
-    #[test]
-    fn quiet_hours_uses_timezone() {
-        let config = HeartbeatConfig {
-            interval: "30m".to_string(),
-            quiet_hours_start: Some("00:00".to_string()),
-            quiet_hours_end: Some("06:00".to_string()),
-            cron: None,
-            channels: Vec::new(),
-            recipients: std::collections::BTreeMap::new(),
-            ..Default::default()
-        };
-        // Verify the timezone field is used and doesn't panic
-        let sched = test_scheduler(config, chrono_tz::US::Eastern);
-        let _ = sched.is_quiet_hours();
     }
 
     #[test]

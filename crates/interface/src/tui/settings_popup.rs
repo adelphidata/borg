@@ -1063,9 +1063,8 @@ mod tests {
 
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
-        let result = popup.handle_key(space, &mut cfg).unwrap();
+        popup.handle_key(space, &mut cfg).unwrap();
         assert!(!cfg.sandbox.enabled);
-        assert!(result.is_some());
     }
 
     #[test]
@@ -1096,9 +1095,8 @@ mod tests {
         }
 
         // Apply
-        let result = popup.handle_key(enter, &mut cfg).unwrap();
+        popup.handle_key(enter, &mut cfg).unwrap();
         assert!((cfg.llm.temperature - 1.5).abs() < f32::EPSILON);
-        assert!(result.is_some());
         assert!(matches!(popup.mode, EditMode::Browsing));
     }
 

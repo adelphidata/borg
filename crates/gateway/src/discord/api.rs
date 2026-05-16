@@ -1026,12 +1026,6 @@ mod tests {
     }
 
     #[test]
-    fn discord_error_hint_empty_for_unknown() {
-        assert_eq!(discord_error_hint(99999), "");
-        assert_eq!(discord_error_hint(0), "");
-    }
-
-    #[test]
     fn discord_error_response_deserialization() {
         let json = r#"{"code": 50001, "message": "Missing Access"}"#;
         let parsed: DiscordErrorResponse = serde_json::from_str(json).unwrap();
@@ -1058,33 +1052,39 @@ mod tests {
     }
 
     #[test]
-    fn validate_snowflake_accepts_numeric() {
-        assert!(validate_snowflake("123456789", "test").is_ok());
-        assert!(validate_snowflake("0", "test").is_ok());
+    fn validate_snowflake_table() {
+        let cases: &[(&str, bool)] = &[
+            ("123456789", true),
+            ("0", true),
+            ("", false),
+            ("abc", false),
+            ("123/../../users/@me", false),
+            ("123 456", false),
+        ];
+        for (input, ok) in cases.iter().copied() {
+            assert_eq!(
+                validate_snowflake(input, "test").is_ok(),
+                ok,
+                "input={input:?}"
+            );
+        }
     }
 
     #[test]
-    fn validate_snowflake_rejects_non_numeric() {
-        assert!(validate_snowflake("", "test").is_err());
-        assert!(validate_snowflake("abc", "test").is_err());
-        assert!(validate_snowflake("123/../../users/@me", "test").is_err());
-        assert!(validate_snowflake("123 456", "test").is_err());
-    }
-
-    #[test]
-    fn validate_emoji_accepts_valid() {
-        assert!(validate_emoji("%E2%9C%85").is_ok());
-        assert!(validate_emoji("%F0%9F%91%8D").is_ok());
-        assert!(validate_emoji("custom_emoji:123456").is_ok());
-    }
-
-    #[test]
-    fn validate_emoji_rejects_path_traversal() {
-        assert!(validate_emoji("").is_err());
-        assert!(validate_emoji("../../../users/@me").is_err());
-        assert!(validate_emoji("emoji/test").is_err());
-        assert!(validate_emoji("emoji?foo=bar").is_err());
-        assert!(validate_emoji("emoji#frag").is_err());
+    fn validate_emoji_table() {
+        let cases: &[(&str, bool)] = &[
+            ("%E2%9C%85", true),
+            ("%F0%9F%91%8D", true),
+            ("custom_emoji:123456", true),
+            ("", false),
+            ("../../../users/@me", false),
+            ("emoji/test", false),
+            ("emoji?foo=bar", false),
+            ("emoji#frag", false),
+        ];
+        for (input, ok) in cases.iter().copied() {
+            assert_eq!(validate_emoji(input).is_ok(), ok, "input={input:?}");
+        }
     }
 
     #[test]

@@ -337,43 +337,25 @@ mod tests {
     // -- ScriptOutput --
 
     #[test]
-    fn script_output_success_with_zero_exit() {
-        let output = ScriptOutput {
-            stdout: "ok".into(),
-            stderr: String::new(),
-            exit_code: Some(0),
-        };
-        assert!(output.success());
-    }
-
-    #[test]
-    fn script_output_failure_with_nonzero_exit() {
-        let output = ScriptOutput {
-            stdout: String::new(),
-            stderr: "err".into(),
-            exit_code: Some(1),
-        };
-        assert!(!output.success());
-    }
-
-    #[test]
-    fn script_output_failure_with_none_exit() {
-        let output = ScriptOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: None,
-        };
-        assert!(!output.success());
-    }
-
-    #[test]
-    fn script_output_failure_with_signal_exit() {
-        let output = ScriptOutput {
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: Some(-1),
-        };
-        assert!(!output.success());
+    fn script_output_success_only_for_exit_zero() {
+        // success() is true iff the process exited normally with code 0.
+        // Signal termination (None) and any non-zero code (positive or
+        // negative) must report failure.
+        let cases: &[(Option<i32>, bool)] = &[
+            (Some(0), true),
+            (Some(1), false),
+            (Some(-1), false),
+            (Some(127), false),
+            (None, false),
+        ];
+        for (exit_code, expected) in cases.iter().copied() {
+            let output = ScriptOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code,
+            };
+            assert_eq!(output.success(), expected, "exit_code={exit_code:?}");
+        }
     }
 
     // -- resolve_runtime --

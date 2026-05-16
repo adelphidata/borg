@@ -716,9 +716,13 @@ mod tests {
 
     #[test]
     fn extract_retry_hint_with_seconds() {
-        let hint = extract_retry_hint("Rate limit: retry after 30 seconds");
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("30"));
+        // The hint must be wrapped in parens and contain the original "retry
+        // after N seconds" snippet so the user sees a usable wait time, not
+        // just the literal "30".
+        assert_eq!(
+            extract_retry_hint("Rate limit: retry after 30 seconds"),
+            Some("(retry after 30 seconds)".to_string())
+        );
     }
 
     #[test]

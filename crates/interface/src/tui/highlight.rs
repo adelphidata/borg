@@ -161,12 +161,21 @@ mod tests {
 
     #[test]
     fn common_langs_are_recognized() {
+        // (token, expected syntax `name` field). Checking the resolved name
+        // catches the case where `find_syntax` returns *some* syntax but the
+        // wrong one (e.g. plain-text fallback) — `.is_some()` would not.
         let ss = syntax_set();
-        assert!(find_syntax(ss, "rust").is_some());
-        assert!(find_syntax(ss, "python").is_some());
-        assert!(find_syntax(ss, "js").is_some());
-        // Extension lookup
-        assert!(find_syntax(ss, "rs").is_some());
-        assert!(find_syntax(ss, "py").is_some());
+        let cases: &[(&str, &str)] = &[
+            ("rust", "Rust"),
+            ("python", "Python"),
+            ("js", "JavaScript"),
+            ("rs", "Rust"),
+            ("py", "Python"),
+        ];
+        for (token, expected_name) in cases.iter().copied() {
+            let syntax = find_syntax(ss, token)
+                .unwrap_or_else(|| panic!("find_syntax({token:?}) returned None"));
+            assert_eq!(syntax.name, expected_name, "token={token:?}");
+        }
     }
 }

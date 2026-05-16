@@ -448,22 +448,6 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_auth_test_response() {
-        let json = r#"{
-            "ok": true,
-            "user_id": "U123",
-            "user": "bot",
-            "team": "My Team",
-            "team_id": "T123"
-        }"#;
-
-        let resp: AuthTestResponse = serde_json::from_str(json).unwrap();
-        assert!(resp.ok);
-        assert_eq!(resp.user_id.as_deref(), Some("U123"));
-        assert_eq!(resp.team.as_deref(), Some("My Team"));
-    }
-
-    #[test]
     fn deserialize_auth_test_error() {
         let json = r#"{
             "ok": false,

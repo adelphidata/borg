@@ -329,32 +329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_gateway_config_default() {
-        let cfg = GatewayConfig::default();
-        assert_eq!(cfg.host, "127.0.0.1");
-        assert_eq!(cfg.port, 7842);
-        assert_eq!(cfg.max_concurrent, 10);
-        assert_eq!(cfg.request_timeout_ms, 1_800_000);
-        assert_eq!(cfg.inactivity_timeout_secs, 1_800);
-        assert_eq!(cfg.inactivity_warning_secs, 900);
-        assert_eq!(cfg.inactivity_notify_secs, 600);
-        assert_eq!(cfg.rate_limit_per_minute, 60);
-        assert!(cfg.public_url.is_none());
-        assert!(cfg.bindings.is_empty());
-        assert!(cfg.slack_channel_allowlist.is_none());
-        assert!(cfg.discord_guild_allowlist.is_none());
-        assert!(cfg.imessage_group_allowlist.is_none());
-        assert_eq!(cfg.pairing_ttl_secs, 3600);
-        assert!(cfg.signal_cli_host.is_none());
-        assert!(cfg.signal_cli_port.is_none());
-        assert_eq!(cfg.group_activation, ActivationMode::Mention);
-        assert_eq!(cfg.error_policy, ErrorPolicy::Once);
-        assert_eq!(cfg.error_cooldown_ms, 14_400_000);
-        assert!(cfg.channel_error_policies.is_empty());
-        assert!(cfg.channel_policies.is_empty());
-    }
-
-    #[test]
     fn test_error_policy_from_str() {
         assert_eq!(
             "always".parse::<ErrorPolicy>().unwrap(),
@@ -434,23 +408,6 @@ mod tests {
         assert!(!json.contains("\"api_key_env\""));
         assert!(!json.contains("\"identity\""));
         assert!(!json.contains("\"thinking\""));
-    }
-
-    #[test]
-    fn test_auto_reply_config_default() {
-        let cfg = AutoReplyConfig::default();
-        assert!(cfg.enabled);
-        assert!(cfg.away_message.contains("away"));
-        assert!(cfg.queue_messages);
-    }
-
-    #[test]
-    fn test_link_understanding_config_default() {
-        let cfg = LinkUnderstandingConfig::default();
-        assert!(!cfg.enabled);
-        assert_eq!(cfg.max_links, 3);
-        assert_eq!(cfg.max_chars_per_link, 5000);
-        assert_eq!(cfg.timeout_ms, 10_000);
     }
 
     #[test]

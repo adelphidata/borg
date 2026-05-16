@@ -76,7 +76,7 @@ impl Scope {
         if name.contains("..")
             || name.contains('/')
             || name.contains('\\')
-            || name.chars().any(|c| c.is_control())
+            || name.chars().any(char::is_control)
         {
             return Err(ScopeError::InvalidProject(name));
         }

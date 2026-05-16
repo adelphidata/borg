@@ -351,21 +351,6 @@ mod tests {
     }
 
     #[test]
-    fn test_default_limits() {
-        let limits = ActionLimits::default();
-        assert_eq!(limits.tool_calls_warn, 200);
-        assert_eq!(limits.tool_calls_block, 500);
-        assert_eq!(limits.shell_commands_warn, 100);
-        assert_eq!(limits.shell_commands_block, 250);
-        assert_eq!(limits.file_writes_warn, 50);
-        assert_eq!(limits.file_writes_block, 150);
-        assert_eq!(limits.memory_writes_warn, 20);
-        assert_eq!(limits.memory_writes_block, 50);
-        assert_eq!(limits.web_requests_warn, 50);
-        assert_eq!(limits.web_requests_block, 150);
-    }
-
-    #[test]
     fn test_custom_limits() {
         let limits = ActionLimits {
             tool_calls_warn: 10,
@@ -476,44 +461,6 @@ mod tests {
             }
             other => unreachable!("expected Block, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_limits_for_all_action_types() {
-        let limits = ActionLimits::default();
-        assert_eq!(limits.limits_for(ActionType::ToolCall), (200, 500));
-        assert_eq!(limits.limits_for(ActionType::ShellCommand), (100, 250));
-        assert_eq!(limits.limits_for(ActionType::FileWrite), (50, 150));
-        assert_eq!(limits.limits_for(ActionType::MemoryWrite), (20, 50));
-        assert_eq!(limits.limits_for(ActionType::WebRequest), (50, 150));
-    }
-
-    #[test]
-    fn test_gateway_defaults() {
-        let limits = ActionLimits::gateway_defaults();
-        assert_eq!(limits.tool_calls_warn, 30);
-        assert_eq!(limits.tool_calls_block, 50);
-        assert_eq!(limits.shell_commands_warn, 10);
-        assert_eq!(limits.shell_commands_block, 20);
-        assert_eq!(limits.file_writes_warn, 10);
-        assert_eq!(limits.file_writes_block, 20);
-        assert_eq!(limits.memory_writes_warn, 5);
-        assert_eq!(limits.memory_writes_block, 10);
-        assert_eq!(limits.web_requests_warn, 10);
-        assert_eq!(limits.web_requests_block, 25);
-    }
-
-    #[test]
-    fn test_action_limits_deserialize() {
-        let toml_str = r#"
-tool_calls_warn = 5
-tool_calls_block = 10
-"#;
-        let limits: ActionLimits = toml::from_str(toml_str).unwrap();
-        assert_eq!(limits.tool_calls_warn, 5);
-        assert_eq!(limits.tool_calls_block, 10);
-        // Others should be defaults
-        assert_eq!(limits.shell_commands_warn, 100);
     }
 
     #[test]

@@ -308,32 +308,29 @@ fn resolve_keychain_fallback_returns_none_for_unknown_key() {
 }
 
 #[test]
-fn resolve_keychain_fallback_maps_known_keys() {
-    // Verify that known credential keys map to the expected keychain service/account
-    // by checking the source code contains the expected mappings
-    let source = include_str!("../mod.rs");
-    assert!(
-        source.contains(r#"("TELEGRAM_BOT_TOKEN", "messaging/telegram")"#),
-        "KEY_PLUGIN_MAP must include TELEGRAM_BOT_TOKEN"
-    );
-    assert!(
-        source.contains(r#"("SLACK_BOT_TOKEN", "messaging/slack")"#),
-        "KEY_PLUGIN_MAP must include SLACK_BOT_TOKEN"
-    );
-    assert!(
-        source.contains(r#"("DISCORD_BOT_TOKEN", "messaging/discord")"#),
-        "KEY_PLUGIN_MAP must include DISCORD_BOT_TOKEN"
-    );
-}
-
-#[test]
-fn resolve_credential_or_env_tries_keychain_fallback() {
-    // Verify the source code calls resolve_keychain_fallback as a final step
-    let source = include_str!("../mod.rs");
-    assert!(
-        source.contains("self.resolve_keychain_fallback(name)"),
-        "resolve_credential_or_env must call resolve_keychain_fallback as final fallback"
-    );
+fn keychain_plugin_for_key_maps_known_keys() {
+    let cases = [
+        ("TELEGRAM_BOT_TOKEN", Some("messaging/telegram")),
+        ("TELEGRAM_WEBHOOK_SECRET", Some("messaging/telegram")),
+        ("SLACK_BOT_TOKEN", Some("messaging/slack")),
+        ("SLACK_SIGNING_SECRET", Some("messaging/slack")),
+        ("DISCORD_BOT_TOKEN", Some("messaging/discord")),
+        ("DISCORD_PUBLIC_KEY", Some("messaging/discord")),
+        ("TEAMS_APP_ID", Some("messaging/teams")),
+        ("TEAMS_APP_SECRET", Some("messaging/teams")),
+        ("TWILIO_ACCOUNT_SID", Some("messaging/whatsapp")),
+        ("TWILIO_AUTH_TOKEN", Some("messaging/whatsapp")),
+        ("TWILIO_PHONE_NUMBER", Some("messaging/whatsapp")),
+        ("TWILIO_WHATSAPP_NUMBER", Some("messaging/whatsapp")),
+        ("GOOGLE_CHAT_SERVICE_TOKEN", Some("messaging/google-chat")),
+        ("GOOGLE_CHAT_WEBHOOK_TOKEN", Some("messaging/google-chat")),
+        ("SIGNAL_ACCOUNT", Some("messaging/signal")),
+        ("BORG_TEST_UNKNOWN_KEY_XYZ", None),
+        ("", None),
+    ];
+    for (key, expected) in cases {
+        assert_eq!(Config::keychain_plugin_for_key(key), expected, "key={key}");
+    }
 }
 
 #[test]

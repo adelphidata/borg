@@ -400,38 +400,55 @@ mod tests {
     }
 
     #[test]
-    fn validate_service_url_valid_botframework() {
-        assert!(validate_service_url("https://smba.trafficmanager.net.botframework.com/").is_ok());
-    }
-
-    #[test]
-    fn validate_service_url_valid_teams() {
-        assert!(validate_service_url("https://api.teams.microsoft.com/").is_ok());
-    }
-
-    #[test]
-    fn validate_service_url_valid_skype() {
-        assert!(validate_service_url("https://smba.skype.com/teams/").is_ok());
-    }
-
-    #[test]
-    fn validate_service_url_rejects_http() {
-        let result = validate_service_url("http://smba.trafficmanager.net.botframework.com/");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("HTTPS"));
-    }
-
-    #[test]
-    fn validate_service_url_rejects_unknown_host() {
-        let result = validate_service_url("https://evil.example.com/");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not allowed"));
-    }
-
-    #[test]
-    fn validate_service_url_rejects_invalid_url() {
-        let result = validate_service_url("not-a-url");
-        assert!(result.is_err());
+    fn validate_service_url_table() {
+        // Each invalid case names the substring the error message must contain
+        // so a regression in the error formatting fails loudly instead of
+        // silently passing.
+        struct Case {
+            url: &'static str,
+            expect_err_substr: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                url: "https://smba.trafficmanager.net.botframework.com/",
+                expect_err_substr: None,
+            },
+            Case {
+                url: "https://api.teams.microsoft.com/",
+                expect_err_substr: None,
+            },
+            Case {
+                url: "https://smba.skype.com/teams/",
+                expect_err_substr: None,
+            },
+            Case {
+                url: "http://smba.trafficmanager.net.botframework.com/",
+                expect_err_substr: Some("HTTPS"),
+            },
+            Case {
+                url: "https://evil.example.com/",
+                expect_err_substr: Some("not allowed"),
+            },
+            Case {
+                url: "not-a-url",
+                expect_err_substr: Some(""),
+            },
+        ];
+        for case in cases {
+            let result = validate_service_url(case.url);
+            match case.expect_err_substr {
+                None => assert!(result.is_ok(), "expected ok for {}", case.url),
+                Some(needle) => {
+                    let err = result.expect_err(&format!("expected err for {}", case.url));
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains(needle),
+                        "url={} err={msg:?} missing {needle:?}",
+                        case.url,
+                    );
+                }
+            }
+        }
     }
 
     #[test]

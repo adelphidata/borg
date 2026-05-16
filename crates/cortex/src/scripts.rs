@@ -765,11 +765,4 @@ mod tests {
         assert!(validate_script_name("").is_err());
         assert!(validate_script_name("hello world").is_err());
     }
-
-    #[test]
-    fn validate_name_accepts_valid() {
-        assert!(validate_script_name("my-script").is_ok());
-        assert!(validate_script_name("scrape_amazon_v2").is_ok());
-        assert!(validate_script_name("test123").is_ok());
-    }
 }

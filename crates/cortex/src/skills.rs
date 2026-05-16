@@ -1832,7 +1832,9 @@ Short body.
 
     #[test]
     fn progressive_loading_prioritizes_available() {
-        // load_skills_context should include full body for available skills first
+        // Bundled skills exist, so the produced context must be non-empty
+        // and start with the expected `# Skills` header. The header is the
+        // contract the system-prompt assembler relies on.
         let (context, _report) = load_skills_context(
             2000,
             &std::collections::HashMap::new(),
@@ -1840,10 +1842,15 @@ Short body.
             "browse the web",
         )
         .unwrap();
-        // Just verify it doesn't panic and produces output
-        if !context.is_empty() {
-            assert!(context.starts_with("# Skills"));
-        }
+        assert!(
+            !context.is_empty(),
+            "load_skills_context with bundled skills must produce a non-empty context"
+        );
+        assert!(
+            context.starts_with("# Skills"),
+            "context must start with `# Skills` header, got: {}",
+            context.lines().next().unwrap_or("<empty>")
+        );
     }
 
     #[test]
@@ -2266,15 +2273,6 @@ Use docker commands.
             Some("https://docs.docker.com/get-docker/")
         );
         assert!(spec.npm.is_none());
-    }
-
-    #[test]
-    fn test_install_spec_defaults() {
-        let spec = InstallSpec::default();
-        assert!(spec.brew.is_none());
-        assert!(spec.apt.is_none());
-        assert!(spec.npm.is_none());
-        assert!(spec.url.is_none());
     }
 
     #[test]

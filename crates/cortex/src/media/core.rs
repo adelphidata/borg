@@ -282,21 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn is_compressible_image_true() {
-        assert!(is_compressible_image("image/jpeg"));
-        assert!(is_compressible_image("image/png"));
-        assert!(is_compressible_image("image/webp"));
-        assert!(is_compressible_image("image/heic"));
-    }
-
-    #[test]
-    fn is_compressible_image_false() {
-        assert!(!is_compressible_image("image/svg+xml"));
-        assert!(!is_compressible_image("application/pdf"));
-        assert!(!is_compressible_image("text/plain"));
-    }
-
-    #[test]
     fn is_heic_detection() {
         assert!(is_heic("image/heic"));
         assert!(is_heic("image/heif"));

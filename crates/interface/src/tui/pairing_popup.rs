@@ -483,9 +483,9 @@ mod tests {
     #[test]
     fn enter_approves_pending() {
         let mut popup = make_popup(vec![make_pending("telegram", "123", "TG_ABC")]);
-        let result = popup.handle_key(key(KeyCode::Enter));
-        assert!(result.is_some());
-        let actions = result.unwrap();
+        let actions = popup
+            .handle_key(key(KeyCode::Enter))
+            .expect("Enter on a pending row must emit actions");
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             PairingAction::Approve { channel, code } => {
@@ -500,9 +500,9 @@ mod tests {
     #[test]
     fn a_approves_pending() {
         let mut popup = make_popup(vec![make_pending("telegram", "123", "TG_ABC")]);
-        let result = popup.handle_key(key(KeyCode::Char('a')));
-        assert!(result.is_some());
-        let actions = result.unwrap();
+        let actions = popup
+            .handle_key(key(KeyCode::Char('a')))
+            .expect("'a' on a pending row must emit actions");
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             PairingAction::Approve { channel, code } => {
@@ -525,9 +525,9 @@ mod tests {
         popup.handle_key(key(KeyCode::Down));
         popup.handle_key(key(KeyCode::Char('d')));
         // Now cursor is on an approved item, Enter collects revokes
-        let result = popup.handle_key(key(KeyCode::Enter));
-        assert!(result.is_some());
-        let actions = result.unwrap();
+        let actions = popup
+            .handle_key(key(KeyCode::Enter))
+            .expect("Enter must emit revoke actions when rows are marked");
         assert_eq!(actions.len(), 2);
     }
 
@@ -536,8 +536,14 @@ mod tests {
         let mut popup = make_popup(vec![make_approved("discord", "456")]);
         let result = popup.handle_key(key(KeyCode::Enter));
         assert!(result.is_none());
-        assert!(popup.status_message.is_some());
-        assert!(!popup.status_message.as_ref().unwrap().1); // not success
+        let (_, success) = popup
+            .status_message
+            .as_ref()
+            .expect("Enter with no changes must set a status message");
+        assert!(
+            !success,
+            "no-changes status must report failure, not success"
+        );
     }
 
     #[test]
