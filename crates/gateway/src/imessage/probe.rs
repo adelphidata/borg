@@ -70,7 +70,11 @@ mod tests {
 }
 
 /// Probe whether chat.db is accessible and return status + max ROWID.
-pub fn probe_imessage() -> ProbeResult {
+///
+/// Opens chat.db via turso. Turso has no read-only open flag — we rely on
+/// only issuing SELECT statements to enforce the read-only contract at the
+/// application boundary (per the migration plan).
+pub async fn probe_imessage() -> ProbeResult {
     let db_path = match dirs::home_dir() {
         Some(h) => h.join("Library/Messages/chat.db"),
         None => {
@@ -88,11 +92,19 @@ pub fn probe_imessage() -> ProbeResult {
         };
     }
 
-    let db_uri = format!("file:{}?mode=ro", db_path.display());
-    let conn = match rusqlite::Connection::open_with_flags(
-        &db_uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ) {
+    let db = match turso::Builder::new_local(&db_path.to_string_lossy())
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        Err(_) => {
+            return ProbeResult {
+                status: ProbeStatus::NoDiskAccess,
+                max_rowid: None,
+            }
+        }
+    };
+    let conn = match db.connect() {
         Ok(c) => c,
         Err(_) => {
             return ProbeResult {
@@ -102,12 +114,31 @@ pub fn probe_imessage() -> ProbeResult {
         }
     };
 
-    match conn.query_row("SELECT MAX(ROWID) FROM message", [], |row| {
-        row.get::<_, Option<i64>>(0)
-    }) {
-        Ok(max_rowid) => ProbeResult {
+    let mut rows = match conn.query("SELECT MAX(ROWID) FROM message", ()).await {
+        Ok(r) => r,
+        Err(e) => {
+            return ProbeResult {
+                status: ProbeStatus::QueryError(e.to_string()),
+                max_rowid: None,
+            }
+        }
+    };
+    match rows.next().await {
+        Ok(Some(row)) => match row.get::<Option<i64>>(0) {
+            Ok(max_rowid) => ProbeResult {
+                status: ProbeStatus::Ok,
+                max_rowid: max_rowid.or(Some(0)),
+            },
+            Err(e) => ProbeResult {
+                status: ProbeStatus::QueryError(e.to_string()),
+                max_rowid: None,
+            },
+        },
+        // No rows back from MAX() should never happen, but if it does treat
+        // it as an empty DB rather than an error so the operator sees Ok.
+        Ok(None) => ProbeResult {
             status: ProbeStatus::Ok,
-            max_rowid: max_rowid.or(Some(0)),
+            max_rowid: Some(0),
         },
         Err(e) => ProbeResult {
             status: ProbeStatus::QueryError(e.to_string()),

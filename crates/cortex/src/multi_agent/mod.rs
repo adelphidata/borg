@@ -417,8 +417,8 @@ impl AgentControl {
             };
 
             // Update DB
-            if let Ok(db) = crate::db::Database::open() {
-                if let Err(e) = db.update_sub_agent_status(&agent_id_clone, &status) {
+            if let Ok(db) = crate::db::Database::open().await {
+                if let Err(e) = db.update_sub_agent_status(&agent_id_clone, &status).await {
                     tracing::warn!(%agent_id_clone, "failed to update sub-agent status: {e}");
                 }
             }

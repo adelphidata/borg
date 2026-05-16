@@ -74,3 +74,16 @@ pub mod voice;
 pub use channel::registry::ChannelRegistry;
 pub use server::GatewayServer;
 pub use session_executor::{InboundTurn, InlineImage, SessionExecutor, SessionExecutorHandle};
+
+/// Future returned by [`DbOpener`]: an async DB open that yields a `Database`.
+/// Boxed so each HTTP-surface state struct can carry a uniform factory type.
+pub type DbOpenFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<cortex::db::Database>> + Send>,
+>;
+
+/// Per-request async DB factory used by the v1 HTTP surfaces (OpenAI-compat,
+/// generic webhook, MCP). Turso connections are `Send + Sync + Clone`, so this
+/// is no longer strictly required for sharing — but keeping per-handler opens
+/// matches the existing structure and aligns with `Database::open_with_timeout`
+/// (which is the right entry point for the gateway busy-timeout profile).
+pub type DbOpener = std::sync::Arc<dyn Fn() -> DbOpenFuture + Send + Sync>;

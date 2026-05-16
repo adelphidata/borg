@@ -6,6 +6,7 @@ use base64::Engine as _;
 use cortex::db::Database;
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use turso::params;
 
 /// One row in `webhook_definitions`.
 #[derive(Debug, Clone)]
@@ -40,7 +41,7 @@ pub struct CreatedWebhook {
 }
 
 /// Generate a fresh HMAC secret, persist its hash, return both.
-pub fn create(
+pub async fn create(
     db: &Database,
     name: &str,
     sender_path: &str,
@@ -68,8 +69,9 @@ pub fn create(
             "INSERT INTO webhook_definitions
                 (name, secret_hash, sender_path, thread_path, body_path, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![name, hash, sender_path, thread_path, body_path, now],
+            params!(name, hash.clone(), sender_path, thread_path, body_path, now),
         )
+        .await
         .with_context(|| format!("failed to insert webhook definition `{name}`"))?;
 
     Ok(CreatedWebhook {
@@ -88,82 +90,89 @@ pub fn create(
 
 /// Look up a definition by name. Returns `None` if not found OR
 /// revoked — verifiers should treat both the same.
-pub fn lookup(db: &Database, name: &str) -> Result<Option<WebhookDefinition>> {
-    let row = db
+pub async fn lookup(db: &Database, name: &str) -> Result<Option<WebhookDefinition>> {
+    let mut rows = db
         .conn()
-        .query_row(
+        .query(
             "SELECT name, secret_hash, sender_path, thread_path, body_path, created_at, revoked_at
              FROM webhook_definitions WHERE name = ?1",
-            rusqlite::params![name],
-            |r| {
-                Ok(WebhookDefinition {
-                    name: r.get(0)?,
-                    secret_hash: r.get(1)?,
-                    sender_path: r.get(2)?,
-                    thread_path: r.get(3)?,
-                    body_path: r.get(4)?,
-                    created_at: r.get(5)?,
-                    revoked_at: r.get(6)?,
-                })
-            },
+            params!(name),
         )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(anyhow::Error::from(other).context("webhook lookup failed")),
-        })?;
-    if let Some(ref r) = row {
-        if r.revoked_at.is_some() {
-            return Ok(None);
-        }
+        .await
+        .context("webhook lookup failed")?;
+    let Some(r) = rows.next().await.context("webhook lookup failed")? else {
+        return Ok(None);
+    };
+    let row = WebhookDefinition {
+        name: r.get::<String>(0)?,
+        secret_hash: r.get::<Vec<u8>>(1)?,
+        sender_path: r.get::<String>(2)?,
+        thread_path: r.get::<Option<String>>(3)?,
+        body_path: r.get::<String>(4)?,
+        created_at: r.get::<i64>(5)?,
+        revoked_at: r.get::<Option<i64>>(6)?,
+    };
+    if row.revoked_at.is_some() {
+        return Ok(None);
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// List all webhook definitions. Caller decides whether to filter
 /// revoked rows.
-pub fn list(db: &Database) -> Result<Vec<WebhookDefinition>> {
-    let conn = db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT name, secret_hash, sender_path, thread_path, body_path, created_at, revoked_at
-         FROM webhook_definitions
-         ORDER BY created_at DESC",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(WebhookDefinition {
-                name: r.get(0)?,
-                secret_hash: r.get(1)?,
-                sender_path: r.get(2)?,
-                thread_path: r.get(3)?,
-                body_path: r.get(4)?,
-                created_at: r.get(5)?,
-                revoked_at: r.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+pub async fn list(db: &Database) -> Result<Vec<WebhookDefinition>> {
+    let mut rows = db
+        .conn()
+        .query(
+            "SELECT name, secret_hash, sender_path, thread_path, body_path, created_at, revoked_at
+             FROM webhook_definitions
+             ORDER BY created_at DESC",
+            (),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next().await? {
+        out.push(WebhookDefinition {
+            name: r.get::<String>(0)?,
+            secret_hash: r.get::<Vec<u8>>(1)?,
+            sender_path: r.get::<String>(2)?,
+            thread_path: r.get::<Option<String>>(3)?,
+            body_path: r.get::<String>(4)?,
+            created_at: r.get::<i64>(5)?,
+            revoked_at: r.get::<Option<i64>>(6)?,
+        });
+    }
+    Ok(out)
 }
 
 /// Revoke a webhook definition by name. Idempotent.
-pub fn revoke(db: &Database, name: &str) -> Result<()> {
+pub async fn revoke(db: &Database, name: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-    let updated = db.conn().execute(
-        "UPDATE webhook_definitions SET revoked_at = ?1
-         WHERE name = ?2 AND revoked_at IS NULL",
-        rusqlite::params![now, name],
-    )?;
+    let updated = db
+        .conn()
+        .execute(
+            "UPDATE webhook_definitions SET revoked_at = ?1
+             WHERE name = ?2 AND revoked_at IS NULL",
+            params!(now, name),
+        )
+        .await?;
     if updated == 0 {
         // Either not found or already revoked. Distinguish so the
         // CLI can give a clearer error.
-        let exists: i64 = db
+        let exists: i64 = match db
             .conn()
-            .query_row(
+            .query(
                 "SELECT count(*) FROM webhook_definitions WHERE name = ?1",
-                rusqlite::params![name],
-                |r| r.get(0),
+                params!(name),
             )
-            .unwrap_or(0);
+            .await
+        {
+            Ok(mut rows) => match rows.next().await {
+                Ok(Some(r)) => r.get::<i64>(0).unwrap_or(0),
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
         if exists == 0 {
             return Err(anyhow!("no webhook with name `{name}`"));
         }
@@ -197,86 +206,86 @@ fn is_valid_name(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Tempfile-backed test DB (in-memory `test_db()` is private to
-    /// the core crate). The temp file is dropped when the test
-    /// returns; we keep it alive for the test's duration via the
-    /// `_tmp` binding the caller holds.
-    fn db_with_tempdir() -> (Database, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("test.db");
-        let conn = rusqlite::Connection::open(&path).expect("open conn");
-        (Database::from_connection(conn).expect("init db"), tmp)
+    async fn db() -> Database {
+        Database::test_db().await
     }
 
-    fn db() -> (Database, tempfile::TempDir) {
-        db_with_tempdir()
-    }
-
-    #[test]
-    fn create_returns_secret_and_persists_only_hash() {
+    #[tokio::test]
+    async fn create_returns_secret_and_persists_only_hash() {
         // Same property as auth tokens: plaintext shown once, only
         // the hash hits the DB. A forged signature attempt by an
         // attacker with DB read access would need to reverse SHA-256.
-        let (db, _tmp) = db();
-        let created = create(&db, "alerts", "$.user.id", None, "$.text").expect("create");
+        let db = db().await;
+        let created = create(&db, "alerts", "$.user.id", None, "$.text")
+            .await
+            .expect("create");
         assert!(!created.secret.is_empty());
 
-        let stored: Vec<u8> = db
+        let mut rows = db
             .conn()
-            .query_row(
+            .query(
                 "SELECT secret_hash FROM webhook_definitions WHERE name = ?1",
-                rusqlite::params!["alerts"],
-                |r| r.get(0),
+                params!("alerts"),
             )
-            .expect("row exists");
+            .await
+            .expect("query secret_hash");
+        let row = rows.next().await.expect("step").expect("row exists");
+        let stored: Vec<u8> = row.get::<Vec<u8>>(0).expect("get bytes");
         assert_eq!(stored.len(), 32);
         assert_ne!(stored, created.secret.as_bytes());
         assert_eq!(stored, hash_secret(&created.secret));
     }
 
-    #[test]
-    fn lookup_returns_none_for_revoked_or_missing() {
+    #[tokio::test]
+    async fn lookup_returns_none_for_revoked_or_missing() {
         // Revoked rows are tombstoned (created_at preserved) but must
         // be invisible to verifiers — same effect as deletion from
         // the request-path's perspective. Listing still surfaces them
         // for audit.
-        let (db, _tmp) = db();
-        create(&db, "live", "$.s", None, "$.b").expect("create");
-        create(&db, "doomed", "$.s", None, "$.b").expect("create");
-        revoke(&db, "doomed").expect("revoke");
+        let db = db().await;
+        create(&db, "live", "$.s", None, "$.b").await.expect("create");
+        create(&db, "doomed", "$.s", None, "$.b")
+            .await
+            .expect("create");
+        revoke(&db, "doomed").await.expect("revoke");
 
-        assert!(lookup(&db, "live").expect("lookup").is_some());
+        assert!(lookup(&db, "live").await.expect("lookup").is_some());
         assert!(
-            lookup(&db, "doomed").expect("lookup").is_none(),
+            lookup(&db, "doomed").await.expect("lookup").is_none(),
             "revoked webhook must not lookup as live"
         );
-        assert!(lookup(&db, "never-existed").expect("lookup").is_none());
+        assert!(lookup(&db, "never-existed").await.expect("lookup").is_none());
 
-        let all = list(&db).expect("list");
+        let all = list(&db).await.expect("list");
         assert_eq!(all.len(), 2, "list must surface tombstones");
     }
 
-    #[test]
-    fn duplicate_name_is_rejected() {
+    #[tokio::test]
+    async fn duplicate_name_is_rejected() {
         // Names route requests via `/v1/webhook/{name}`. Allowing a
         // collision would silently shadow the original definition.
-        let (db, _tmp) = db();
-        create(&db, "n", "$.s", None, "$.b").expect("first create");
-        let err = create(&db, "n", "$.s", None, "$.b").expect_err("dupe must fail");
+        let db = db().await;
+        create(&db, "n", "$.s", None, "$.b")
+            .await
+            .expect("first create");
+        let err = create(&db, "n", "$.s", None, "$.b")
+            .await
+            .expect_err("dupe must fail");
         assert!(
             err.to_string().to_ascii_lowercase().contains("webhook")
                 || err.to_string().to_ascii_lowercase().contains("unique"),
         );
     }
 
-    #[test]
-    fn invalid_names_are_rejected() {
+    #[tokio::test]
+    async fn invalid_names_are_rejected() {
         // The name appears unescaped in URLs; restricting to
         // alphanumeric/dash/underscore avoids URL-encoding bugs and
         // path-traversal-style mischief in the route layer.
-        let (db, _tmp) = db();
+        let db = db().await;
         for bad in ["", "  ", "with spaces", "../etc", "name?query", "name#frag"] {
             let err = create(&db, bad, "$.s", None, "$.b")
+                .await
                 .expect_err(&format!("invalid name `{bad}` must be rejected"));
             // Just assert it errored; the message can vary based on
             // whether `is_valid_name` or the empty-check fired first.
@@ -284,10 +293,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn revoke_unknown_name_errors() {
-        let (db, _tmp) = db();
-        let err = revoke(&db, "nothing").expect_err("must error");
+    #[tokio::test]
+    async fn revoke_unknown_name_errors() {
+        let db = db().await;
+        let err = revoke(&db, "nothing").await.expect_err("must error");
         assert!(err.to_string().contains("no webhook"));
     }
 }

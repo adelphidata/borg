@@ -89,7 +89,7 @@ impl Agent {
                 }
             }
             StreamEvent::Usage(usage) => {
-                self.record_usage(&usage);
+                self.record_usage(&usage).await;
                 let _ = event_tx.send(AgentEvent::Usage(usage)).await;
             }
             StreamEvent::Truncated => {

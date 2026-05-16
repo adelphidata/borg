@@ -27,8 +27,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Shared state for the generic-webhook routes.
 #[derive(Clone)]
 pub struct WebhookState {
-    /// Open a fresh DB connection per request — `Database` is `!Sync`.
-    pub db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync>,
+    /// Open a fresh DB connection per request.
+    pub db_open: crate::DbOpener,
     /// Pre-dispatch gate (rate-limit + sanitize + audit).
     pub gate: Arc<IngressGate>,
     /// Sink that receives admitted ingresses for downstream dispatch.
@@ -70,12 +70,12 @@ async fn webhook_handler(
         );
     }
 
-    let db = match (state.db_open)() {
+    let db = match (state.db_open)().await {
         Ok(d) => d,
         Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "backend unavailable"),
     };
 
-    let definition = match definitions::lookup(&db, &name) {
+    let definition = match definitions::lookup(&db, &name).await {
         Ok(Some(d)) => d,
         Ok(None) => {
             // Anti-enumeration: missing-vs-revoked are
@@ -200,7 +200,7 @@ mod tests {
         }
     }
 
-    fn make_state() -> (
+    async fn make_state() -> (
         WebhookState,
         Arc<RecordingSink>,
         super::super::definitions::CreatedWebhook,
@@ -209,13 +209,12 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("test.db");
         let path_for_factory = path.clone();
-        let db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> =
-            Arc::new(move || {
-                let conn = rusqlite::Connection::open(&path_for_factory)?;
-                Database::from_connection(conn)
-            });
+        let db_open: crate::DbOpener = Arc::new(move || {
+            let p = path_for_factory.clone();
+            Box::pin(async move { Database::open_at(&p).await })
+        });
 
-        let setup_db = (db_open)().expect("open setup db");
+        let setup_db = (db_open)().await.expect("open setup db");
         let created = super::super::definitions::create(
             &setup_db,
             "alerts",
@@ -223,6 +222,7 @@ mod tests {
             Some("$.thread_id"),
             "$.text",
         )
+        .await
         .expect("create webhook");
 
         let sink = Arc::new(RecordingSink::default());
@@ -275,7 +275,7 @@ mod tests {
         // configured fields, passes the gate, and reaches the sink
         // with the right session key + source. Regression here means
         // upstream events silently drop on the floor.
-        let (state, sink, created, _tmp) = make_state();
+        let (state, sink, created, _tmp) = make_state().await;
         let secret = secret_hex(&created);
         let body = r#"{"user":{"id":"u-42"},"text":"deploy started","thread_id":"t-7"}"#;
         let now = chrono::Utc::now().timestamp();
@@ -301,7 +301,7 @@ mod tests {
     async fn missing_signature_returns_400() {
         // Distinct from 401 (presented but bad): a missing header is
         // a client-misconfiguration error.
-        let (state, _sink, _created, _tmp) = make_state();
+        let (state, _sink, _created, _tmp) = make_state().await;
         let body = r#"{"user":{"id":"u"},"text":"x"}"#;
         let now = chrono::Utc::now().timestamp();
 
@@ -315,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn bad_signature_returns_401() {
         // Forged sig must hit 401, not 4xx-other and not 200.
-        let (state, sink, _created, _tmp) = make_state();
+        let (state, sink, _created, _tmp) = make_state().await;
         let body = r#"{"user":{"id":"u"},"text":"x"}"#;
         let now = chrono::Utc::now().timestamp();
         let bad = "v1=00000000000000000000000000000000000000000000000000000000000000ff";
@@ -333,7 +333,7 @@ mod tests {
     async fn replay_outside_window_returns_401() {
         // Stale timestamp: 6 minutes ago. Even with a perfectly
         // valid HMAC over `{stale_ts}.{body}`, the verifier rejects.
-        let (state, sink, created, _tmp) = make_state();
+        let (state, sink, created, _tmp) = make_state().await;
         let secret = secret_hex(&created);
         let body = r#"{"user":{"id":"u"},"text":"x"}"#;
         let stale = chrono::Utc::now().timestamp() - 360;
@@ -351,7 +351,7 @@ mod tests {
     async fn unknown_webhook_name_returns_404() {
         // Anti-enumeration: returns 404 before HMAC verify, same as
         // a revoked webhook would.
-        let (state, _sink, _created, _tmp) = make_state();
+        let (state, _sink, _created, _tmp) = make_state().await;
         let body = "{}";
         let now = chrono::Utc::now().timestamp();
         let resp = router(state)
@@ -371,7 +371,7 @@ mod tests {
         // sender_id missing → 400 with the path mentioned. Helps
         // operators debug their JSONPath config without exposing the
         // entire payload back to the upstream caller.
-        let (state, sink, created, _tmp) = make_state();
+        let (state, sink, created, _tmp) = make_state().await;
         let secret = secret_hex(&created);
         let body = r#"{"text":"hello"}"#; // no `user.id`
         let now = chrono::Utc::now().timestamp();
@@ -390,7 +390,7 @@ mod tests {
         // thread_id is configured at `$.thread_id` but the payload
         // doesn't include it — that's allowed for non-threaded
         // sources. The session key collapses to `sender:`.
-        let (state, sink, created, _tmp) = make_state();
+        let (state, sink, created, _tmp) = make_state().await;
         let secret = secret_hex(&created);
         let body = r#"{"user":{"id":"u-1"},"text":"x"}"#;
         let now = chrono::Utc::now().timestamp();
@@ -410,7 +410,7 @@ mod tests {
     async fn body_too_large_returns_413() {
         // Abuse defense: a 2 MiB payload should never reach the
         // (CPU-bound) HMAC verifier. The size cap is checked first.
-        let (state, _sink, _created, _tmp) = make_state();
+        let (state, _sink, _created, _tmp) = make_state().await;
         let big = "x".repeat(MAX_BODY_BYTES + 1);
         let resp = router(state)
             .oneshot(req("alerts", Some("v1=00"), Some("0"), &big))

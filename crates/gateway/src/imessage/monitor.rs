@@ -55,7 +55,7 @@ async fn monitor_loop(
         anyhow::bail!("chat.db not found at {}", db_path.display());
     }
 
-    let db_uri = format!("file:{}?mode=ro", db_path.display());
+    let db_path_str = db_path.to_string_lossy().into_owned();
 
     // Load persisted state (last_rowid)
     let state_path = channel_dir.join(STATE_FILE);
@@ -63,12 +63,14 @@ async fn monitor_loop(
 
     // If no state, initialize to current max ROWID (only process future messages)
     if last_rowid == 0 {
-        let conn = open_chatdb(&db_uri)?;
-        last_rowid = conn
-            .query_row("SELECT MAX(ROWID) FROM message", [], |row| {
-                row.get::<_, Option<i64>>(0)
-            })?
-            .unwrap_or(0);
+        let conn = open_chatdb(&db_path_str).await?;
+        let mut rows = conn
+            .query("SELECT MAX(ROWID) FROM message", ())
+            .await?;
+        last_rowid = match rows.next().await? {
+            Some(row) => row.get::<Option<i64>>(0)?.unwrap_or(0),
+            None => 0,
+        };
         save_last_rowid(&state_path, last_rowid).await;
     }
 
@@ -100,7 +102,7 @@ async fn monitor_loop(
                 break;
             }
             _ = interval.tick() => {
-                match poll_new_messages(&db_uri, last_rowid) {
+                match poll_new_messages(&db_path_str, last_rowid).await {
                     Ok(messages) => {
                         for payload in messages {
                             let rowid = payload.rowid;
@@ -362,19 +364,18 @@ fn load_attachments(metas: &[AttachmentMeta]) -> Vec<InboundAttachment> {
     out
 }
 
-fn poll_new_messages(db_uri: &str, last_rowid: i64) -> Result<Vec<IMessagePayload>> {
-    let conn = open_chatdb(db_uri)?;
-    poll_new_messages_with_conn(&conn, last_rowid)
+async fn poll_new_messages(db_path: &str, last_rowid: i64) -> Result<Vec<IMessagePayload>> {
+    let conn = open_chatdb(db_path).await?;
+    poll_new_messages_with_conn(&conn, last_rowid).await
 }
 
 /// Same as `poll_new_messages` but uses a caller-supplied connection. Split
-/// out so tests can drive the SQL against a fixture chat.db without going
-/// through `open_chatdb`'s read-only flag (the fixture builder needs RW).
-fn poll_new_messages_with_conn(
-    conn: &rusqlite::Connection,
+/// out so tests can drive the SQL against an in-memory fixture chat.db.
+async fn poll_new_messages_with_conn(
+    conn: &turso::Connection,
     last_rowid: i64,
 ) -> Result<Vec<IMessagePayload>> {
-    let mut stmt = conn.prepare(
+    let mut rows = conn.query(
         "SELECT m.ROWID, m.text, m.date, h.id, m.is_from_me, m.cache_roomnames, \
          c.chat_identifier, c.guid, m.thread_originator_guid, \
          parent.text AS reply_text, ph.id AS reply_sender \
@@ -389,36 +390,35 @@ fn poll_new_messages_with_conn(
          )) \
          ORDER BY m.ROWID ASC \
          LIMIT 50",
-    )?;
-
-    let rows = stmt.query_map([last_rowid], |row| {
-        let cache_roomnames: Option<String> = row.get(5)?;
-        let is_group = cache_roomnames.as_deref().is_some_and(|r| !r.is_empty());
-        let reply_text: Option<String> = row.get(9)?;
-        let reply_sender: Option<String> = row.get(10)?;
-        let reply_to = reply_text.map(|t| ReplyContext {
-            text: t,
-            sender: reply_sender,
-        });
-
-        Ok(IMessagePayload {
-            rowid: row.get(0)?,
-            text: row.get(1)?,
-            sender: row.get(3)?,
-            is_from_me: row.get::<_, i32>(4)? != 0,
-            chat_identifier: row.get(6)?,
-            chat_guid: row.get(7)?,
-            is_group,
-            reply_to,
-            attachments: Vec::new(),
-        })
-    })?;
+        turso::params!(last_rowid),
+    ).await?;
 
     let mut messages = Vec::new();
-    for row in rows {
-        match row {
+    while let Some(row) = rows.next().await? {
+        let parse = || -> Result<IMessagePayload> {
+            let cache_roomnames: Option<String> = row.get::<Option<String>>(5)?;
+            let is_group = cache_roomnames.as_deref().is_some_and(|r| !r.is_empty());
+            let reply_text: Option<String> = row.get::<Option<String>>(9)?;
+            let reply_sender: Option<String> = row.get::<Option<String>>(10)?;
+            let reply_to = reply_text.map(|t| ReplyContext {
+                text: t,
+                sender: reply_sender,
+            });
+            Ok(IMessagePayload {
+                rowid: row.get::<i64>(0)?,
+                text: row.get::<Option<String>>(1)?,
+                sender: row.get::<Option<String>>(3)?,
+                is_from_me: row.get::<i32>(4)? != 0,
+                chat_identifier: row.get::<Option<String>>(6)?,
+                chat_guid: row.get::<Option<String>>(7)?,
+                is_group,
+                reply_to,
+                attachments: Vec::new(),
+            })
+        };
+        match parse() {
             Ok(mut msg) => {
-                msg.attachments = load_attachment_meta(conn, msg.rowid);
+                msg.attachments = load_attachment_meta(conn, msg.rowid).await;
                 messages.push(msg);
             }
             Err(e) => warn!("Failed to parse message row: {e}"),
@@ -430,54 +430,59 @@ fn poll_new_messages_with_conn(
 
 /// Fetch attachment metadata for a single message. Returns empty on error so
 /// one malformed attachment row never drops the message itself.
-fn load_attachment_meta(conn: &rusqlite::Connection, message_rowid: i64) -> Vec<AttachmentMeta> {
+async fn load_attachment_meta(conn: &turso::Connection, message_rowid: i64) -> Vec<AttachmentMeta> {
     let sql = "SELECT a.filename, a.transfer_name, a.mime_type \
                FROM attachment a \
                JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID \
                WHERE maj.message_id = ?1";
-    let mut stmt = match conn.prepare(sql) {
-        Ok(s) => s,
+    let mut rows = match conn.query(sql, turso::params!(message_rowid)).await {
+        Ok(r) => r,
         Err(e) => {
-            warn!("Failed to prepare attachment query: {e}");
+            warn!("Failed to query attachments for rowid {message_rowid}: {e}");
             return Vec::new();
         }
     };
-    let rows = stmt.query_map([message_rowid], |row| {
-        let filename: Option<String> = row.get(0)?;
-        let transfer_name: Option<String> = row.get(1)?;
-        let mime_type: Option<String> = row.get(2)?;
-        Ok((filename, transfer_name, mime_type))
-    });
     let mut out = Vec::new();
-    match rows {
-        Ok(iter) => {
-            for r in iter {
-                match r {
-                    Ok((Some(path), transfer_name, mime_type)) => {
+    loop {
+        match rows.next().await {
+            Ok(Some(row)) => {
+                let filename = row.get::<Option<String>>(0);
+                let transfer_name = row.get::<Option<String>>(1);
+                let mime_type = row.get::<Option<String>>(2);
+                match (filename, transfer_name, mime_type) {
+                    (Ok(Some(path)), Ok(transfer_name), Ok(mime_type)) => {
                         out.push(AttachmentMeta {
                             path,
                             filename: transfer_name,
                             mime_type,
                         });
                     }
-                    Ok((None, _, _)) => {
+                    (Ok(None), _, _) => {
                         // Attachment row with no filename — nothing to read.
                     }
-                    Err(e) => warn!("Failed to read attachment row: {e}"),
+                    (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                        warn!("Failed to read attachment row: {e}");
+                    }
                 }
             }
+            Ok(None) => break,
+            Err(e) => {
+                warn!("Failed to iterate attachment rows for rowid {message_rowid}: {e}");
+                break;
+            }
         }
-        Err(e) => warn!("Failed to query attachments for rowid {message_rowid}: {e}"),
     }
     out
 }
 
-fn open_chatdb(db_uri: &str) -> Result<rusqlite::Connection> {
-    rusqlite::Connection::open_with_flags(
-        db_uri,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .context("Failed to open chat.db (check Full Disk Access)")
+async fn open_chatdb(db_path: &str) -> Result<turso::Connection> {
+    // Turso has no SQLITE_OPEN_READ_ONLY flag. Read-only is enforced at the
+    // application layer: this module only issues SELECTs against chat.db.
+    let db = turso::Builder::new_local(db_path)
+        .build()
+        .await
+        .context("Failed to open chat.db (check Full Disk Access)")?;
+    db.connect().context("Failed to connect to chat.db")
 }
 
 async fn load_last_rowid(state_path: &std::path::Path) -> i64 {
@@ -883,8 +888,12 @@ mod tests {
 
     /// Build a minimal chat.db schema sufficient to exercise poll_new_messages.
     /// Mirrors the columns Borg actually reads — not a full chat.db replica.
-    fn build_fixture_db() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
+    async fn build_fixture_db() -> turso::Connection {
+        let db = turso::Builder::new_local(":memory:")
+            .build()
+            .await
+            .expect("open in-memory turso db");
+        let conn = db.connect().expect("connect to in-memory db");
         conn.execute_batch(
             r#"
             CREATE TABLE handle (
@@ -922,36 +931,33 @@ mod tests {
             );
             "#,
         )
-        .unwrap();
+        .await
+        .expect("create fixture schema");
         conn
     }
 
-    #[test]
-    fn sql_extracts_basic_message() {
-        let conn = build_fixture_db();
-        conn.execute(
-            "INSERT INTO handle (ROWID, id) VALUES (1, '+15551234567')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
+    async fn exec(conn: &turso::Connection, sql: &str) {
+        conn.execute(sql, ()).await.expect("fixture exec");
+    }
+
+    #[tokio::test]
+    async fn sql_extracts_basic_message() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+15551234567')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, '+15551234567', 'iMessage;-;+15551234567')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id, is_from_me) \
              VALUES (10, 'msg-10', 'hello world', 1, 0)",
-            [],
         )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)",
-            [],
-        )
-        .unwrap();
+        .await;
+        exec(&conn, "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)").await;
 
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].rowid, 10);
         assert_eq!(msgs[0].text.as_deref(), Some("hello world"));
@@ -962,104 +968,100 @@ mod tests {
         assert!(msgs[0].attachments.is_empty());
     }
 
-    #[test]
-    fn sql_extracts_reply_context() {
-        let conn = build_fixture_db();
-        // Parent message
-        conn.execute(
-            "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')",
-            [],
-        )
-        .unwrap();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (2, 'bob@x.com')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_extracts_reply_context() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, 'alice@x.com')").await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (2, 'bob@x.com')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'g1', 'g1')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (5, 'parent-guid', 'are you free?', 1)",
-            [],
         )
-        .unwrap();
-        // Child reply with thread_originator_guid pointing to parent's guid
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id, thread_originator_guid) \
              VALUES (10, 'child-guid', 'yes', 2, 'parent-guid')",
-            [],
         )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 5), (1, 10)",
-            [],
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 5)",
         )
-        .unwrap();
+        .await;
+        exec(
+            &conn,
+            "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 10)",
+        )
+        .await;
 
-        let msgs = poll_new_messages_with_conn(&conn, 9).unwrap();
+        let msgs = poll_new_messages_with_conn(&conn, 9).await.unwrap();
         assert_eq!(msgs.len(), 1, "only the reply (rowid > 9) should appear");
         let reply = msgs[0].reply_to.as_ref().expect("reply_to populated");
         assert_eq!(reply.text, "are you free?");
         assert_eq!(reply.sender.as_deref(), Some("alice@x.com"));
     }
 
-    #[test]
-    fn sql_no_reply_returns_none() {
-        let conn = build_fixture_db();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_no_reply_returns_none() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (1, 'g1', 'hi', 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
-            [],
         )
-        .unwrap();
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        .await;
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert!(msgs[0].reply_to.is_none());
     }
 
-    #[test]
-    fn sql_extracts_attachment_metadata() {
-        let conn = build_fixture_db();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_extracts_attachment_metadata() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (1, 'g', 'see attached', 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO attachment (ROWID, filename, transfer_name, mime_type) \
              VALUES (100, '/tmp/borg-test-image.png', 'image.png', 'image/png')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 100)",
-            [],
         )
-        .unwrap();
+        .await;
 
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert_eq!(msgs[0].attachments.len(), 1);
         let att = &msgs[0].attachments[0];
         assert_eq!(att.path, "/tmp/borg-test-image.png");
@@ -1067,103 +1069,100 @@ mod tests {
         assert_eq!(att.mime_type.as_deref(), Some("image/png"));
     }
 
-    #[test]
-    fn sql_attachment_only_message_with_null_text_is_included() {
-        let conn = build_fixture_db();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_attachment_only_message_with_null_text_is_included() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (1, 'g', NULL, 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO attachment (ROWID, filename, transfer_name, mime_type) \
              VALUES (100, '/tmp/borg-test-image.png', 'image.png', 'image/png')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 100)",
-            [],
         )
-        .unwrap();
+        .await;
 
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].text.is_none());
         assert_eq!(msgs[0].attachments.len(), 1);
     }
 
-    #[test]
-    fn sql_attachment_with_null_filename_is_skipped() {
-        let conn = build_fixture_db();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_attachment_with_null_filename_is_skipped() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'c', 'c')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id) VALUES (1, 'g', 't', 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO attachment (ROWID, filename, transfer_name, mime_type) \
              VALUES (100, NULL, 'image.png', 'image/png')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message_attachment_join (message_id, attachment_id) VALUES (1, 100)",
-            [],
         )
-        .unwrap();
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        .await;
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         // Message still present; just no attachments.
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].attachments.is_empty());
     }
 
-    #[test]
-    fn sql_group_chat_flag_set_from_cache_roomnames() {
-        let conn = build_fixture_db();
-        conn.execute("INSERT INTO handle (ROWID, id) VALUES (1, '+1')", [])
-            .unwrap();
-        conn.execute(
+    #[tokio::test]
+    async fn sql_group_chat_flag_set_from_cache_roomnames() {
+        let conn = build_fixture_db().await;
+        exec(&conn, "INSERT INTO handle (ROWID, id) VALUES (1, '+1')").await;
+        exec(
+            &conn,
             "INSERT INTO chat (ROWID, chat_identifier, guid) VALUES (1, 'chat-grp', 'group-guid-1')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO message (ROWID, guid, text, handle_id, cache_roomnames) \
              VALUES (1, 'g', 'hi all', 1, 'chat-grp')",
-            [],
         )
-        .unwrap();
-        conn.execute(
+        .await;
+        exec(
+            &conn,
             "INSERT INTO chat_message_join (chat_id, message_id) VALUES (1, 1)",
-            [],
         )
-        .unwrap();
-        let msgs = poll_new_messages_with_conn(&conn, 0).unwrap();
+        .await;
+        let msgs = poll_new_messages_with_conn(&conn, 0).await.unwrap();
         assert!(msgs[0].is_group);
         assert_eq!(msgs[0].chat_guid.as_deref(), Some("group-guid-1"));
     }

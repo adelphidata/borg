@@ -220,7 +220,7 @@ pub fn start(
                     if !imessage_dir.join("channel.toml").exists() {
                         return Ok(());
                     }
-                    let probe = gateway::imessage::probe::probe_imessage();
+                    let probe = gateway::imessage::probe::probe_imessage().await;
                     match probe.status {
                         gateway::imessage::probe::ProbeStatus::Ok => {
                             if let Err(e) =

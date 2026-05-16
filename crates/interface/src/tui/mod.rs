@@ -116,27 +116,29 @@ fn spawn_gateway(config: &Config, shutdown: CancellationToken, metrics: BorgMetr
     if let Ok(data_dir) = Config::data_dir() {
         let imessage_dir = data_dir.join("channels/imessage");
         if imessage_dir.join("channel.toml").exists() {
-            let probe = gateway::imessage::probe::probe_imessage();
-            match probe.status {
-                gateway::imessage::probe::ProbeStatus::Ok => {
-                    let im_config = config.clone();
-                    let im_shutdown = shutdown;
-                    tokio::spawn(async move {
+            // probe_imessage is async (turso open + query), so the probe-and-spawn
+            // sequence runs inside a single tokio task.
+            let im_config = config.clone();
+            let im_shutdown = shutdown;
+            tokio::spawn(async move {
+                let probe = gateway::imessage::probe::probe_imessage().await;
+                match probe.status {
+                    gateway::imessage::probe::ProbeStatus::Ok => {
                         match gateway::imessage::start_imessage_monitor(im_config, im_shutdown)
                             .await
                         {
                             Ok(_handle) => tracing::info!("iMessage monitor started"),
                             Err(e) => tracing::warn!("iMessage monitor failed: {e}"),
                         }
-                    });
+                    }
+                    gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
+                        tracing::warn!("iMessage: Full Disk Access required (System Settings > Privacy & Security). Skipping monitor.");
+                    }
+                    other => {
+                        tracing::warn!("iMessage probe: {other}. Skipping monitor.");
+                    }
                 }
-                gateway::imessage::probe::ProbeStatus::NoDiskAccess => {
-                    tracing::warn!("iMessage: Full Disk Access required (System Settings > Privacy & Security). Skipping monitor.");
-                }
-                other => {
-                    tracing::warn!("iMessage probe: {other}. Skipping monitor.");
-                }
-            }
+            });
         }
     }
 

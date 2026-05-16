@@ -747,13 +747,17 @@ impl GatewayServer {
 
 /// Per-request DB factory used by the three v1 HTTP surfaces.
 ///
-/// `Database` is `!Sync` (rusqlite's statement cache is `RefCell`), so
-/// each handler opens its own connection. `open_with_timeout` matches
-/// what the channel handlers use elsewhere in this crate.
-fn db_open_factory() -> Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> {
+/// Turso connections are `Send + Sync + Clone`, but each handler still opens
+/// its own connection so the busy-timeout profile (`GATEWAY_BUSY_TIMEOUT_MS`)
+/// is applied per request. The factory returns a boxed Future so the closure
+/// stays a `Fn` (the inner `async move` block is what awaits the open).
+fn db_open_factory() -> crate::DbOpener {
     Arc::new(|| {
-        Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
-            .map_err(|e| anyhow::anyhow!("open db: {e}"))
+        Box::pin(async {
+            Database::open_with_timeout(Database::GATEWAY_BUSY_TIMEOUT_MS)
+                .await
+                .map_err(|e| anyhow::anyhow!("open db: {e}"))
+        })
     })
 }
 

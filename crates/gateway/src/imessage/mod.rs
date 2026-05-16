@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use cortex::config::Config;
 
 /// Start the native iMessage monitor. Reads `~/Library/Messages/chat.db`
-/// directly via rusqlite, processes inbound messages through echo detection
+/// directly via turso, processes inbound messages through echo detection
 /// and reflection guards, dispatches to the agent, and sends replies via
 /// osascript.
 ///

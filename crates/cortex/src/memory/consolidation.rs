@@ -380,12 +380,12 @@ fn fallback_summary(pass: ConsolidationPass, successful_writes: u64) -> String {
 /// Called on session end. Creates or appends to a `daily/{YYYY-MM-DD}` entry
 /// in the `memory_entries` table. The nightly consolidation job processes
 /// these daily entries into long-term topic entries.
-pub fn flush_short_term_to_daily(facts_text: &str) -> Result<()> {
+pub async fn flush_short_term_to_daily(facts_text: &str) -> Result<()> {
     if facts_text.trim().is_empty() {
         return Ok(());
     }
-    let db = crate::db::Database::open()?;
-    flush_short_term_to_daily_with_db(&db, facts_text)
+    let db = crate::db::Database::open().await?;
+    flush_short_term_to_daily_with_db(&db, facts_text).await
 }
 
 /// Flush using the caller's existing DB handle when one is available,
@@ -393,7 +393,7 @@ pub fn flush_short_term_to_daily(facts_text: &str) -> Result<()> {
 /// `Agent::flush_short_term_memory` so session-end flushes reuse the agent's
 /// already-open database instead of racing a new connection against any
 /// in-progress writes on the agent's handle.
-pub fn flush_short_term_to_daily_with_optional_db(
+pub async fn flush_short_term_to_daily_with_optional_db(
     db: Option<&crate::db::Database>,
     facts_text: &str,
 ) -> Result<()> {
@@ -401,14 +401,17 @@ pub fn flush_short_term_to_daily_with_optional_db(
         return Ok(());
     }
     match db {
-        Some(db) => flush_short_term_to_daily_with_db(db, facts_text),
-        None => flush_short_term_to_daily(facts_text),
+        Some(db) => flush_short_term_to_daily_with_db(db, facts_text).await,
+        None => flush_short_term_to_daily(facts_text).await,
     }
 }
 
 /// Same as [`flush_short_term_to_daily`] but uses a caller-provided database
 /// handle. Split out primarily so tests can run against an in-memory DB.
-pub fn flush_short_term_to_daily_with_db(db: &crate::db::Database, facts_text: &str) -> Result<()> {
+pub async fn flush_short_term_to_daily_with_db(
+    db: &crate::db::Database,
+    facts_text: &str,
+) -> Result<()> {
     if facts_text.trim().is_empty() {
         return Ok(());
     }
@@ -421,7 +424,7 @@ pub fn flush_short_term_to_daily_with_db(db: &crate::db::Database, facts_text: &
     );
     let content = format!("{header}{facts_text}");
 
-    db.append_memory_entry("global", &name, &content)?;
+    db.append_memory_entry("global", &name, &content).await?;
     tracing::debug!("Flushed short-term memory to {name}");
     Ok(())
 }

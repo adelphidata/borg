@@ -24,17 +24,13 @@ use super::types::{
 
 /// Shared state for the OpenAI-compat routes.
 ///
-/// `Database` is `!Sync` (rusqlite's statement cache is `RefCell`), so
-/// instead of stashing a connection here we open one per request via
-/// the supplied `db_open` factory. Tests inject a factory backed by an
-/// in-memory DB whose state survives the test by living in the
-/// closure's environment.
+/// We open one DB handle per request via the supplied async `db_open`
+/// factory. Tests inject a factory backed by a tempfile DB; production
+/// uses [`Database::open_with_timeout`].
 #[derive(Clone)]
 pub struct OpenAiState {
-    /// Open a fresh DB handle for the current request. Production
-    /// passes [`Database::open`]; tests pass a closure that returns a
-    /// shared `test_db` clone.
-    pub db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync>,
+    /// Open a fresh DB handle for the current request.
+    pub db_open: crate::DbOpener,
     /// Pre-dispatch gate (rate-limit + sanitize + audit).
     pub gate: Arc<IngressGate>,
     /// Dispatcher into the agent loop.
@@ -60,13 +56,18 @@ pub fn router(state: OpenAiState) -> Router {
 /// clients distinguish "no key" from "wrong key" only by the
 /// surrounding flow, not by message — anti-enumeration holds here.
 #[allow(clippy::result_large_err)]
-fn authenticate(headers: &HeaderMap, state: &OpenAiState) -> Result<PrincipalId, Response> {
-    let db = (state.db_open)().map_err(|_| auth_error("auth backend unavailable"))?;
-    authenticate_with_db(headers, &db)
+async fn authenticate(headers: &HeaderMap, state: &OpenAiState) -> Result<PrincipalId, Response> {
+    let db = (state.db_open)()
+        .await
+        .map_err(|_| auth_error("auth backend unavailable"))?;
+    authenticate_with_db(headers, &db).await
 }
 
 #[allow(clippy::result_large_err)]
-fn authenticate_with_db(headers: &HeaderMap, db: &Database) -> Result<PrincipalId, Response> {
+async fn authenticate_with_db(
+    headers: &HeaderMap,
+    db: &Database,
+) -> Result<PrincipalId, Response> {
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -75,7 +76,9 @@ fn authenticate_with_db(headers: &HeaderMap, db: &Database) -> Result<PrincipalI
         .strip_prefix("Bearer ")
         .ok_or_else(|| auth_error("Authorization header must use Bearer scheme"))?;
 
-    let row = tokens::verify(db, token).map_err(|_| auth_error("invalid client token"))?;
+    let row = tokens::verify(db, token)
+        .await
+        .map_err(|_| auth_error("invalid client token"))?;
     Ok(PrincipalId::new(format!("token:{}", row.label)))
 }
 
@@ -97,7 +100,7 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let principal = match authenticate(&headers, &state) {
+    let principal = match authenticate(&headers, &state).await {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -320,7 +323,7 @@ fn chunk_event(
 
 /// `GET /v1/models` — auth-protected enumeration of configured aliases.
 async fn list_models(State(state): State<OpenAiState>, headers: HeaderMap) -> Response {
-    if let Err(resp) = authenticate(&headers, &state) {
+    if let Err(resp) = authenticate(&headers, &state).await {
         return resp;
     }
     let now = chrono::Utc::now().timestamp();

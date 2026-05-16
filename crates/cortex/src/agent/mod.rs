@@ -330,11 +330,11 @@ struct AgentCommon {
 }
 
 /// Build the shared initialization state used by both `Agent::new` and `Agent::new_sub_agent`.
-fn build_common(config: &Config) -> Result<AgentCommon> {
-    let _ = LlmClient::new(config)?;
+async fn build_common(config: &Config) -> Result<AgentCommon> {
+    let _ = LlmClient::new(config).await?;
     let policy = config.policy.clone();
     let session = Session::new();
-    let db = match Database::open() {
+    let db = match Database::open().await {
         Ok(db) => Some(db),
         Err(e) => {
             warn!("Failed to open database on agent init: {e}");
@@ -346,7 +346,7 @@ fn build_common(config: &Config) -> Result<AgentCommon> {
     // Explicit user config (set higher) is preserved via `max`.
     let mut limits = config.security.action_limits.clone();
     if let Some(ref d) = db {
-        if let Ok(state) = d.get_evolution_state() {
+        if let Ok(state) = d.get_evolution_state().await {
             let stage = match state.stage {
                 crate::evolution::Stage::Base => crate::rate_guard::EvolutionStage::Base,
                 crate::evolution::Stage::Evolved => crate::rate_guard::EvolutionStage::Evolved,
@@ -485,8 +485,8 @@ impl Agent {
     }
 
     /// Create a new agent with the given config and metrics.
-    pub fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
-        let common = build_common(&config)?;
+    pub async fn new(config: Config, metrics: BorgMetrics) -> Result<Self> {
+        let common = build_common(&config).await?;
         let agent_control = if config.agents.enabled {
             Some(crate::multi_agent::AgentControl::new(
                 &config.agents,
@@ -498,7 +498,7 @@ impl Agent {
         };
 
         // Best-effort embedding cache pruning on startup
-        Self::prune_embedding_cache_on_startup(&config);
+        Self::prune_embedding_cache_on_startup(&config).await;
 
         Ok(Self::build_agent(
             config,
@@ -512,7 +512,7 @@ impl Agent {
     }
 
     /// Prune stale embedding cache entries on startup based on config.
-    fn prune_embedding_cache_on_startup(config: &Config) {
+    async fn prune_embedding_cache_on_startup(config: &Config) {
         let ttl_days = config.memory.cache_ttl_days;
         let max_entries = config.memory.cache_max_entries;
 
@@ -520,7 +520,7 @@ impl Agent {
             return;
         }
 
-        let db = match Database::open() {
+        let db = match Database::open().await {
             Ok(db) => db,
             Err(e) => {
                 tracing::warn!("Cache pruning: failed to open database: {e}");
@@ -530,7 +530,7 @@ impl Agent {
 
         if ttl_days > 0 {
             let max_age_secs = i64::from(ttl_days) * constants::SECS_PER_DAY;
-            match db.prune_embedding_cache(max_age_secs) {
+            match db.prune_embedding_cache(max_age_secs).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(
                     "Pruned {n} stale embedding cache entries (>{ttl_days} days old)"
@@ -540,7 +540,7 @@ impl Agent {
         }
 
         if max_entries > 0 {
-            match db.prune_embedding_cache_by_count(max_entries) {
+            match db.prune_embedding_cache_by_count(max_entries).await {
                 Ok(0) => {}
                 Ok(n) => {
                     tracing::info!("Pruned {n} embedding cache entries (over {max_entries} limit)")
@@ -617,10 +617,10 @@ impl Agent {
         );
     }
 
-    fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
+    async fn make_llm_client_from_config(&self, config: &Config) -> Result<LlmClient> {
         let mut client = match self.llm_role {
-            LlmRole::Primary => LlmClient::new(config)?,
-            LlmRole::Auxiliary => LlmClient::for_auxiliary(config)?,
+            LlmRole::Primary => LlmClient::new(config).await?,
+            LlmRole::Auxiliary => LlmClient::for_auxiliary(config).await?,
         };
         if let Some(ref sink) = self.cost_event_sink {
             if config.telemetry.cost_events {
@@ -644,7 +644,7 @@ impl Agent {
     }
 
     /// Create a sub-agent that shares the parent's config but has its own session.
-    pub fn new_sub_agent(
+    pub async fn new_sub_agent(
         config: Config,
         spawn_depth: u32,
         agents_config: &crate::config::MultiAgentConfig,
@@ -659,6 +659,7 @@ impl Agent {
             tools_filter,
             LlmRole::Primary,
         )
+        .await
     }
 
     /// Create a sub-agent that routes through the auxiliary LLM chain
@@ -666,7 +667,7 @@ impl Agent {
     /// scheduled prompts, heartbeat — so a primary-provider outage can't
     /// take down nightly cron. Tool-spawned sub-agents and interactive
     /// turns must keep using [`Agent::new_sub_agent`] (Primary).
-    pub fn new_sub_agent_aux(
+    pub async fn new_sub_agent_aux(
         config: Config,
         spawn_depth: u32,
         agents_config: &crate::config::MultiAgentConfig,
@@ -681,9 +682,10 @@ impl Agent {
             tools_filter,
             LlmRole::Auxiliary,
         )
+        .await
     }
 
-    fn new_sub_agent_with_role(
+    async fn new_sub_agent_with_role(
         config: Config,
         spawn_depth: u32,
         agents_config: &crate::config::MultiAgentConfig,
@@ -691,7 +693,7 @@ impl Agent {
         tools_filter: Option<Vec<String>>,
         llm_role: LlmRole,
     ) -> Result<Self> {
-        let common = build_common(&config)?;
+        let common = build_common(&config).await?;
         let agent_control = if agents_config.enabled && spawn_depth < agents_config.max_spawn_depth
         {
             Some(crate::multi_agent::AgentControl::new(
@@ -732,7 +734,7 @@ impl Agent {
     }
 
     /// Start a new session, clearing history.
-    pub fn new_session(&mut self) {
+    pub async fn new_session(&mut self) {
         // Fire SessionEnd for the previous session if any turns were executed
         if self.turn_count > 0 {
             let hook_ctx = self.hook_ctx(
@@ -742,8 +744,8 @@ impl Agent {
                     total_turns: self.turn_count,
                 },
             );
-            self.hook_registry.dispatch(&hook_ctx);
-            self.flush_short_term_memory();
+            self.hook_registry.dispatch(&hook_ctx).await;
+            self.flush_short_term_memory().await;
         }
 
         self.history.clear();
@@ -760,7 +762,7 @@ impl Agent {
                 session_id: self.session.meta.id.clone(),
             },
         );
-        self.hook_registry.dispatch(&hook_ctx);
+        self.hook_registry.dispatch(&hook_ctx).await;
     }
 
     /// Flush accumulated short-term memory facts to the daily log entry in
@@ -775,16 +777,18 @@ impl Agent {
     ///
     /// Fire-and-forget: background shutdown must not crash on a storage error.
     /// Any failure is logged but otherwise ignored.
-    pub fn flush_short_term_memory(&self) {
+    pub async fn flush_short_term_memory(&self) {
         let facts = self.short_term_memory.facts_as_text();
         if facts.trim().is_empty() {
             return;
         }
-        let guard = self.db_guard();
+        let guard = self.db_guard().await;
         if let Err(e) = crate::memory::consolidation::flush_short_term_to_daily_with_optional_db(
             guard.as_ref(),
             &facts,
-        ) {
+        )
+        .await
+        {
             warn!("flush_short_term_memory failed: {e}");
         }
     }
@@ -793,7 +797,7 @@ impl Agent {
     /// gateway handler finishing). Fires SessionEnd and flushes short-term
     /// memory even when no `new_session()` call follows. Safe to call multiple
     /// times; a no-op if no turns were executed.
-    pub fn end_session(&mut self) {
+    pub async fn end_session(&mut self) {
         if self.turn_count == 0 {
             return;
         }
@@ -804,8 +808,8 @@ impl Agent {
                 total_turns: self.turn_count,
             },
         );
-        self.hook_registry.dispatch(&hook_ctx);
-        self.flush_short_term_memory();
+        self.hook_registry.dispatch(&hook_ctx).await;
+        self.flush_short_term_memory().await;
         // Clear turn_count so a repeat end_session() is a no-op.
         self.turn_count = 0;
     }
@@ -831,7 +835,7 @@ impl Agent {
     /// message from its outstanding `tool` results — both Anthropic and
     /// OpenAI reject orphaned tool_use blocks on the next turn, so a
     /// well-meaning mid-turn mirror would brick the session.
-    pub fn append_assistant_message(&mut self, text: &str) {
+    pub async fn append_assistant_message(&mut self, text: &str) {
         if has_unresolved_tool_calls(&self.history) {
             warn!(
                 "append_assistant_message: refused — last assistant turn has unresolved \
@@ -839,18 +843,19 @@ impl Agent {
             );
             return;
         }
-        self.persist_message(Message::assistant(text));
+        self.persist_message(Message::assistant(text)).await;
     }
 
     /// Log a message and push it to history + SQLite in one step.
-    fn log_and_persist(&mut self, msg: Message) {
+    async fn log_and_persist(&mut self, msg: Message) {
         log_message(&msg);
-        self.persist_message(msg);
+        self.persist_message(msg).await;
     }
 
     /// Record a skipped/cancelled tool call as a tool_result message.
-    fn skip_tool_call(&mut self, tool_call_id: &str, reason: &str) {
-        self.log_and_persist(Message::tool_result(tool_call_id, reason));
+    async fn skip_tool_call(&mut self, tool_call_id: &str, reason: &str) {
+        self.log_and_persist(Message::tool_result(tool_call_id, reason))
+            .await;
     }
 
     /// Optionally redact secrets from a string based on config.
@@ -868,7 +873,7 @@ impl Agent {
     }
 
     /// Push a message to history and persist it to SQLite for crash recovery.
-    fn persist_message(&mut self, msg: Message) {
+    async fn persist_message(&mut self, msg: Message) {
         let session_id = self.session.meta.id.clone();
         let role = match msg.role {
             crate::types::Role::System => "system",
@@ -892,17 +897,20 @@ impl Agent {
             _ => (msg.text_content().map(str::to_string), None),
         };
         {
-            let guard = self.db_guard();
+            let guard = self.db_guard().await;
             if let Some(ref db) = *guard {
-                if let Err(e) = db.insert_message(
-                    &session_id,
-                    role,
-                    content_text.as_deref(),
-                    tool_calls_json.as_deref(),
-                    msg.tool_call_id.as_deref(),
-                    msg.timestamp.as_deref(),
-                    content_parts_json.as_deref(),
-                ) {
+                if let Err(e) = db
+                    .insert_message(
+                        &session_id,
+                        role,
+                        content_text.as_deref(),
+                        tool_calls_json.as_deref(),
+                        msg.tool_call_id.as_deref(),
+                        msg.timestamp.as_deref(),
+                        content_parts_json.as_deref(),
+                    )
+                    .await
+                {
                     warn!("Failed to persist message to SQLite: {e}");
                 }
             }
@@ -940,7 +948,7 @@ impl Agent {
     /// Compact conversation history to fit within context limits. Returns (before, after) message counts.
     pub async fn compact(&mut self) -> (usize, usize) {
         let before = history_tokens(&self.history);
-        let llm = match self.make_llm_client_from_config(&self.config) {
+        let llm = match self.make_llm_client_from_config(&self.config).await {
             Ok(l) => l,
             Err(_) => return (before, before),
         };
@@ -1174,7 +1182,7 @@ impl Agent {
             return Ok(());
         }
         let msg = Message::user(user_input);
-        self.log_and_persist(msg);
+        self.log_and_persist(msg).await;
         self.turn_count += 1;
         // Reset recent tool names each user turn so conditional loading
         // only considers tools used in the current turn's agent loop.
@@ -1191,7 +1199,7 @@ impl Agent {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        self.log_and_persist(msg);
+        self.log_and_persist(msg).await;
         self.turn_count += 1;
         self.run_agent_loop(event_tx, cancel).await
     }
@@ -1274,16 +1282,16 @@ impl Agent {
     }
 
     /// Check monthly token budget. Returns an error message if exceeded, a warning if near limit, or None.
-    fn check_budget(&self) -> BudgetCheck {
+    async fn check_budget(&self) -> BudgetCheck {
         let budget_limit = self.config.budget.monthly_token_limit;
         if budget_limit == 0 {
             return BudgetCheck::Ok;
         }
-        let Ok(db) = Database::open() else {
+        let Ok(db) = Database::open().await else {
             warn!("Budget enforcement skipped: database unavailable");
             return BudgetCheck::Ok;
         };
-        let Ok(used) = db.monthly_token_total() else {
+        let Ok(used) = db.monthly_token_total().await else {
             return BudgetCheck::Ok;
         };
         if used >= budget_limit {
@@ -1334,10 +1342,10 @@ impl Agent {
                 return Ok(());
             }
 
-            self.drain_sub_agent_completions();
+            self.drain_sub_agent_completions().await;
 
             // Budget enforcement
-            match self.check_budget() {
+            match self.check_budget().await {
                 BudgetCheck::Exceeded(msg) => {
                     let _ = event_tx.send(AgentEvent::Error(msg)).await;
                     let _ = event_tx.send(AgentEvent::TurnComplete).await;
@@ -1398,6 +1406,7 @@ impl Agent {
             let stream_handle = {
                 let mut llm_client = self
                     .make_llm_client_from_config(&self.config)
+                    .await
                     .context("Failed to initialize LLM client")?
                     .with_prompt_cache_key(self.session.meta.id.clone());
                 tokio::spawn(async move {
@@ -1427,7 +1436,7 @@ impl Agent {
                         let text_content = tag_filter.full_clean();
                         if !text_content.is_empty() {
                             let content = format!("{text_content}\n\n[response interrupted]");
-                            self.log_and_persist(Message::assistant(&content));
+                            self.log_and_persist(Message::assistant(&content)).await;
                         }
                         let _ = event_tx.send(AgentEvent::TurnComplete).await;
                         if let Err(e) = stream_handle.await {
@@ -1625,7 +1634,7 @@ impl Agent {
                 text_length: text_content.len(),
             },
         );
-        self.hook_registry.dispatch(&hook_ctx);
+        self.hook_registry.dispatch(&hook_ctx).await;
 
         // If the LLM stream errored mid-response, treat the turn as failed
         // regardless of whether partial tool calls survived — their JSON
@@ -1691,29 +1700,32 @@ impl Agent {
     /// Account for one `StreamEvent::Usage`: increment counters and persist to the
     /// token-usage table. Extracted from `run_agent_loop` to keep the outer future's
     /// frame small (the inner DB lock + pricing call captures a wide scope).
-    fn record_usage(&self, usage: &UsageData) {
+    async fn record_usage(&self, usage: &UsageData) {
         let total = usage.prompt_tokens + usage.completion_tokens;
         if total == 0 {
             return;
         }
         self.metrics.llm_tokens.add(total, &[]);
-        let guard = self.db_guard();
+        let guard = self.db_guard().await;
         let Some(ref db) = *guard else { return };
         let cost = crate::pricing::estimate_cost(
             &usage.model,
             usage.prompt_tokens,
             usage.completion_tokens,
         );
-        if let Err(e) = db.log_token_usage_with_cache(
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            total,
-            usage.cached_input_tokens,
-            usage.cache_creation_tokens,
-            &usage.provider,
-            &usage.model,
-            cost,
-        ) {
+        if let Err(e) = db
+            .log_token_usage_with_cache(
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                total,
+                usage.cached_input_tokens,
+                usage.cache_creation_tokens,
+                &usage.provider,
+                &usage.model,
+                cost,
+            )
+            .await
+        {
             warn!("Failed to log token usage: {e}");
         }
 
@@ -1729,7 +1741,7 @@ impl Agent {
         let now = chrono::Utc::now().timestamp();
         let provider_id = usage.provider.to_ascii_lowercase();
         let (actual_usd, rate_card_effective_at) =
-            match crate::budgets::RateCard::lookup(db.conn(), &provider_id, &usage.model, now) {
+            match crate::budgets::RateCard::lookup(db, &provider_id, &usage.model, now).await {
                 Ok(Some(row)) => {
                     let priced = crate::budgets::RateCard::price(
                         &row,
@@ -1786,7 +1798,7 @@ impl Agent {
                 }
             };
         if let Err(e) = crate::budgets::BudgetEngine::post_flight(
-            db.conn(),
+            db,
             None, // principal_id wiring is v3
             &provider_id,
             &usage.model,
@@ -1796,7 +1808,9 @@ impl Agent {
             usage.cached_input_tokens,
             actual_usd,
             Some(self.session.meta.id.as_str()),
-        ) {
+        )
+        .await
+        {
             warn!("Budget post-flight failed: {e}");
         }
     }
@@ -1825,9 +1839,10 @@ impl Agent {
     }
 
     /// Collect completed sub-agent results and persist them as tool result messages.
-    fn drain_sub_agent_completions(&mut self) {
+    async fn drain_sub_agent_completions(&mut self) {
         if let Some(ref mut ctrl) = self.agent_control {
-            for completion in ctrl.drain_completions() {
+            let completions = ctrl.drain_completions();
+            for completion in completions {
                 let ctx = format!(
                     "[Sub-agent \"{}\" (id: {}) status: {}]\n{}",
                     completion.nickname,
@@ -1838,7 +1853,8 @@ impl Agent {
                         .as_deref()
                         .unwrap_or("(no output)")
                 );
-                self.persist_message(Message::tool_result("sub-agent", &ctx));
+                self.persist_message(Message::tool_result("sub-agent", &ctx))
+                    .await;
             }
         }
     }
@@ -1878,7 +1894,9 @@ impl Agent {
         }
 
         let compaction_config = self.config.with_compaction_overrides();
-        let compaction_llm = self.make_llm_client_from_config(&compaction_config)?;
+        let compaction_llm = self
+            .make_llm_client_from_config(&compaction_config)
+            .await?;
         let protect_first_n = self.config.conversation.protect_first_n;
 
         if self.previous_summary.is_none() {
@@ -1981,7 +1999,7 @@ impl Agent {
             tool_call_id: None,
             timestamp: Some(chrono::Local::now().to_rfc3339()),
         };
-        self.log_and_persist(assistant_msg);
+        self.log_and_persist(assistant_msg).await;
 
         for inv in invalid {
             let body = format_invalid_tool_result(inv);
@@ -2003,7 +2021,8 @@ impl Agent {
                     result: body.clone(),
                 })
                 .await;
-            self.log_and_persist(Message::tool_result(&inv.id, &body));
+            self.log_and_persist(Message::tool_result(&inv.id, &body))
+                .await;
         }
 
         // Plan concurrent tool groups. The planner guarantees every group
@@ -2019,7 +2038,8 @@ impl Agent {
                 // Emit cancellation markers for the remaining calls so the LLM
                 // sees a tool_result for every tool_call it issued.
                 for idx in group {
-                    self.skip_tool_call(&tc[idx].id, "[tool call cancelled by user]");
+                    self.skip_tool_call(&tc[idx].id, "[tool call cancelled by user]")
+                        .await;
                 }
                 continue;
             }
@@ -2050,7 +2070,7 @@ impl Agent {
         };
 
         for steer_text in steers {
-            self.persist_message(Message::user(&steer_text));
+            self.persist_message(Message::user(&steer_text)).await;
             let _ = event_tx
                 .send(AgentEvent::SteerReceived { text: steer_text })
                 .await;
@@ -2066,7 +2086,8 @@ impl Agent {
     ) {
         for tool_call in tool_calls {
             if cancel.is_cancelled() {
-                self.skip_tool_call(&tool_call.id, "[tool call cancelled by user]");
+                self.skip_tool_call(&tool_call.id, "[tool call cancelled by user]")
+                    .await;
                 continue;
             }
 
@@ -2081,8 +2102,9 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(self.hook_registry.dispatch(&hook_ctx), HookAction::Skip) {
-                self.skip_tool_call(&tool_call.id, "[tool call skipped by hook]");
+            if matches!(self.hook_registry.dispatch(&hook_ctx).await, HookAction::Skip) {
+                self.skip_tool_call(&tool_call.id, "[tool call skipped by hook]")
+                    .await;
                 continue;
             }
 
@@ -2097,7 +2119,8 @@ impl Agent {
                 self.skip_tool_call(
                     &tool_call.id,
                     "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search) to explore the codebase and formulate your plan.",
-                );
+                )
+                .await;
                 continue;
             }
 
@@ -2110,7 +2133,8 @@ impl Agent {
                 self.skip_tool_call(
                     &tool_call.id,
                     &repeated_tool_call_block_message(name, count),
-                );
+                )
+                .await;
                 continue;
             }
 
@@ -2119,7 +2143,8 @@ impl Agent {
             match self.rate_guard.record(action_type) {
                 RateDecision::Block(reason) => {
                     warn!("Rate limit blocked tool call '{name}': {reason}");
-                    self.skip_tool_call(&tool_call.id, &format!("Error: {reason}"));
+                    self.skip_tool_call(&tool_call.id, &format!("Error: {reason}"))
+                        .await;
                     continue;
                 }
                 RateDecision::Warn(reason) => {
@@ -2164,7 +2189,8 @@ impl Agent {
                 self.turn_count,
                 name,
                 &xml,
-            );
+            )
+            .await;
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -2183,7 +2209,7 @@ impl Agent {
             } else {
                 Message::tool_result(&tool_call.id, &xml)
             };
-            self.log_and_persist(msg);
+            self.log_and_persist(msg).await;
         }
     }
 
@@ -2229,7 +2255,7 @@ impl Agent {
                     args: args.clone(),
                 },
             );
-            if matches!(self.hook_registry.dispatch(&hook_ctx), HookAction::Skip) {
+            if matches!(self.hook_registry.dispatch(&hook_ctx).await, HookAction::Skip) {
                 slots.push(Slot::Skipped {
                     reason: "[tool call skipped by hook]".into(),
                 });
@@ -2329,7 +2355,7 @@ impl Agent {
             let tool_call = tool_calls[idx];
             let (name, elapsed, result, args_for_event) = match slot {
                 Slot::Skipped { reason } => {
-                    self.skip_tool_call(&tool_call.id, &reason);
+                    self.skip_tool_call(&tool_call.id, &reason).await;
                     continue;
                 }
                 Slot::Approved { name: _, args } => match results[idx].take() {
@@ -2337,7 +2363,8 @@ impl Agent {
                     None => {
                         // Worker panicked — surface a placeholder error so the
                         // LLM still sees a tool_result for this call.
-                        self.skip_tool_call(&tool_call.id, "[tool call failed — worker panicked]");
+                        self.skip_tool_call(&tool_call.id, "[tool call failed — worker panicked]")
+                            .await;
                         continue;
                     }
                 },
@@ -2371,7 +2398,8 @@ impl Agent {
                 self.turn_count,
                 &name,
                 &xml,
-            );
+            )
+            .await;
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
                     tool_call_id: tool_call.id.clone(),
@@ -2390,7 +2418,7 @@ impl Agent {
             } else {
                 Message::tool_result(&tool_call.id, &xml)
             };
-            self.log_and_persist(msg);
+            self.log_and_persist(msg).await;
         }
     }
 

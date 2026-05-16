@@ -699,9 +699,9 @@ impl LlmClient {
     ///
     /// Both fall-throughs are silent — auxiliary failover must never block
     /// the daemon at boot.
-    pub fn for_auxiliary(config: &Config) -> Result<Self> {
+    pub async fn for_auxiliary(config: &Config) -> Result<Self> {
         let Some(aux) = config.llm.aux.as_ref() else {
-            return Self::new(config);
+            return Self::new(config).await;
         };
 
         // Resolve provider: explicit aux override → primary's provider.
@@ -711,7 +711,7 @@ impl LlmClient {
             // is also unset). Fall through so the existing primary-path
             // error surfaces a coherent message rather than us inventing
             // one here.
-            return Self::new(config);
+            return Self::new(config).await;
         };
 
         // Resolve the `"auto"` sentinel via the hardcoded provider→model
@@ -720,7 +720,7 @@ impl LlmClient {
         let resolved_model = if aux.model_is_auto() {
             match aux_model_picker::pick_aux_model(&provider_str) {
                 Some(m) => m.to_string(),
-                None => return Self::new(config),
+                None => return Self::new(config).await,
             }
         } else {
             aux.model.clone()
@@ -768,7 +768,7 @@ impl LlmClient {
 
         let mut synthetic_config = config.clone();
         synthetic_config.llm = synthetic;
-        Self::new(&synthetic_config)
+        Self::new(&synthetic_config).await
     }
 
     /// Attach a stable prompt cache key (typically the session id) so that
