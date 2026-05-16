@@ -15,7 +15,7 @@ use super::{
     require_str_param,
 };
 
-pub fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
+pub async fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let content = require_str_param(args, "content")?;
     let mode = if optional_bool_param(args, "append", false) {
@@ -26,14 +26,14 @@ pub fn handle_write_memory(args: &serde_json::Value) -> Result<String> {
     let scope = optional_str_param(args, "scope").unwrap_or("global");
     // Strip .md extension for DB entry names (backward compat with old tool calls)
     let name = filename.strip_suffix(".md").unwrap_or(filename);
-    write_memory_db(name, content, mode, scope)
+    write_memory_db(name, content, mode, scope).await
 }
 
-pub fn handle_read_memory(args: &serde_json::Value) -> Result<String> {
+pub async fn handle_read_memory(args: &serde_json::Value) -> Result<String> {
     let filename = require_str_param(args, "filename")?;
     let name = filename.strip_suffix(".md").unwrap_or(filename);
     let scope = optional_str_param(args, "scope").unwrap_or("global");
-    read_memory_db_or_not_found(name, scope)
+    read_memory_db_or_not_found(name, scope).await
 }
 
 /// Chunk metadata: (snippet, start_line, end_line).
@@ -41,7 +41,7 @@ type ChunkMeta<'a> = std::collections::HashMap<(String, i64), (&'a str, Option<i
 
 /// Run hybrid FTS + vector search for a single scope, returning merged results.
 #[allow(clippy::too_many_arguments)]
-fn search_scope(
+async fn search_scope(
     db: &Database,
     scope: &str,
     query: &str,
@@ -51,17 +51,26 @@ fn search_scope(
     vector_weight: f32,
     bm25_weight: f32,
 ) -> Vec<embeddings::SearchResult> {
-    // FTS search
-    let fts_rows = match db.fts_search(scope, query, max_results * 4) {
+    // FTS search returns candidates with a stub `0.0` score (Phase 5 removed
+    // the SQL `bm25()` accessor along with the FTS5 virtual table). Re-rank
+    // the candidate set in Rust using `bm25::score_candidates` so the BM25
+    // component of the hybrid mix carries actual signal instead of zeroes.
+    let fts_rows = match db.fts_search(scope, query, max_results * 4).await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("FTS search failed for scope {scope}: {e}");
             return Vec::new();
         }
     };
+    let fts_docs: Vec<&str> = fts_rows.iter().map(|(c, _)| c.content.as_str()).collect();
+    let bm25_scores = crate::memory::bm25::score_candidates(query, &fts_docs);
     let fts_owned: Vec<(String, i64, f32)> = fts_rows
         .iter()
-        .map(|(c, score)| (c.filename.clone(), c.chunk_index, *score))
+        .enumerate()
+        .map(|(i, (c, _stub_score))| {
+            let score = bm25_scores.get(i).copied().unwrap_or(0.0);
+            (c.filename.clone(), c.chunk_index, score)
+        })
         .collect();
 
     let fts_meta: ChunkMeta<'_> = fts_rows
@@ -75,7 +84,7 @@ fn search_scope(
         .collect();
 
     // Vector search across chunks
-    let chunks = match db.get_all_chunks(scope, None) {
+    let chunks = match db.get_all_chunks(scope, None).await {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("Chunk retrieval failed for scope {scope}: {e}");
@@ -163,13 +172,13 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     let search_memory = sources.contains(&"memory".to_string());
     let search_messages = sources.contains(&"messages".to_string());
 
-    let db = Database::open()?;
+    let db = Database::open().await?;
 
     // Branch for messages-only searches: skip embedding generation (unused here)
     // and return a transcript-flavored format.
     if search_messages && !search_memory {
         return Ok(format_message_fts_hits(
-            &db.messages_fts_search(query, max_results)?,
+            &db.messages_fts_search(query, max_results).await?,
         ));
     }
 
@@ -196,16 +205,19 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
     }
 
     for scope in &scopes {
-        all_results.extend(search_scope(
-            &db,
-            scope,
-            query,
-            query_embedding.as_deref(),
-            max_results,
-            min_score,
-            vector_weight,
-            bm25_weight,
-        ));
+        all_results.extend(
+            search_scope(
+                &db,
+                scope,
+                query,
+                query_embedding.as_deref(),
+                max_results,
+                min_score,
+                vector_weight,
+                bm25_weight,
+            )
+            .await,
+        );
     }
 
     // If no results, try a looser FTS search with individual terms
@@ -216,7 +228,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
                 std::collections::HashSet::new();
             for scope in &scopes {
                 for term in &terms {
-                    let fts_rows = match db.fts_search(scope, term, max_results) {
+                    let fts_rows = match db.fts_search(scope, term, max_results).await {
                         Ok(rows) => rows,
                         Err(e) => {
                             tracing::warn!("FTS fallback search failed for term '{term}' in scope {scope}: {e}");
@@ -270,7 +282,7 @@ pub async fn handle_memory_search(args: &serde_json::Value, config: &Config) -> 
 
     if search_messages {
         // Combined search: append message-FTS hits after memory results.
-        let hits = db.messages_fts_search(query, max_results)?;
+        let hits = db.messages_fts_search(query, max_results).await?;
         if !hits.is_empty() {
             let mut combined = memory_block;
             if !combined.is_empty() && combined != "No matching memories found." {

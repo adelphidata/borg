@@ -21,16 +21,16 @@ impl ScheduleArgs {
     }
 }
 
-pub(crate) fn handle_schedule(args: &ScheduleArgs, config: &Config) -> Result<String> {
-    tool_handlers::handle_schedule(args.as_value(), config)
+pub(crate) async fn handle_schedule(args: &ScheduleArgs, config: &Config) -> Result<String> {
+    tool_handlers::handle_schedule(args.as_value(), config).await
 }
 
-pub(crate) fn handle_manage_tasks(args: &ScheduleArgs, config: &Config) -> Result<String> {
-    tool_handlers::handle_manage_tasks(args.as_value(), config)
+pub(crate) async fn handle_manage_tasks(args: &ScheduleArgs, config: &Config) -> Result<String> {
+    tool_handlers::handle_manage_tasks(args.as_value(), config).await
 }
 
-pub(crate) fn handle_manage_cron(args: &ScheduleArgs, config: &Config) -> Result<String> {
-    tool_handlers::handle_manage_cron(args.as_value(), config)
+pub(crate) async fn handle_manage_cron(args: &ScheduleArgs, config: &Config) -> Result<String> {
+    tool_handlers::handle_manage_cron(args.as_value(), config).await
 }
 
 #[cfg(test)]
