@@ -322,7 +322,7 @@ pub async fn generate_embedding_cached(
     text: &str,
 ) -> Result<Vec<f32>> {
     let hash = content_hash(text);
-    let db = match Database::open() {
+    let db = match Database::open().await {
         Ok(db) => Some(db),
         Err(e) => {
             tracing::debug!("embeddings: cache unavailable, skipping: {e}");
@@ -334,12 +334,16 @@ pub async fn generate_embedding_cached(
 
     // Check cache
     if let Some(ref db) = db {
-        if let Ok(Some((cached_bytes, _dim))) =
-            db.get_cached_embedding(&provider.endpoint, &cache_model, &hash)
+        if let Ok(Some((cached_bytes, _dim))) = db
+            .get_cached_embedding(&provider.endpoint, &cache_model, &hash)
+            .await
         {
             debug!("Embedding cache hit for hash {}", &hash[..8]);
             // Best-effort: update last_accessed_at so TTL pruning reflects actual usage.
-            if let Err(e) = db.touch_cache_entry(&provider.endpoint, &cache_model, &hash) {
+            if let Err(e) = db
+                .touch_cache_entry(&provider.endpoint, &cache_model, &hash)
+                .await
+            {
                 tracing::debug!("touch_cache_entry failed: {e}");
             }
             return bytes_to_embedding(&cached_bytes);
@@ -352,13 +356,16 @@ pub async fn generate_embedding_cached(
     // Store in cache
     if let Some(ref db) = db {
         let bytes = embedding_to_bytes(&embedding);
-        if let Err(e) = db.cache_embedding(
-            &provider.endpoint,
-            &cache_model,
-            &hash,
-            &bytes,
-            provider.dimension,
-        ) {
+        if let Err(e) = db
+            .cache_embedding(
+                &provider.endpoint,
+                &cache_model,
+                &hash,
+                &bytes,
+                provider.dimension,
+            )
+            .await
+        {
             debug!("Failed to cache embedding: {e}");
         }
     }
@@ -382,8 +389,8 @@ pub async fn embed_memory_file(
     let hash = content_hash(content);
 
     // Check if embedding already exists with same hash
-    let db = Database::open()?;
-    if let Some(existing) = db.get_embedding(scope, filename)? {
+    let db = Database::open().await?;
+    if let Some(existing) = db.get_embedding(scope, filename).await? {
         if existing.content_hash == hash {
             debug!("Embedding for {scope}/{filename} is up to date, skipping");
             return Ok(());
@@ -400,7 +407,8 @@ pub async fn embed_memory_file(
         &bytes,
         provider.dimension,
         &provider.model,
-    )?;
+    )
+    .await?;
     debug!(
         "Stored embedding for {scope}/{filename} (dim={})",
         provider.dimension
@@ -424,7 +432,7 @@ pub async fn generate_query_embedding(
 
 /// Rank memory files by similarity to a pre-computed query embedding.
 /// Returns (filename, blended_score) sorted desc.
-pub fn rank_embeddings_by_similarity(
+pub async fn rank_embeddings_by_similarity(
     query_embedding: &[f32],
     scope: &str,
     recency_weight: f32,
@@ -433,7 +441,8 @@ pub fn rank_embeddings_by_similarity(
         query_embedding,
         &[scope.to_string()],
         recency_weight,
-    )?;
+    )
+    .await?;
     Ok(scoped
         .into_iter()
         .map(|(_scope, filename, score)| (filename, score))
@@ -442,15 +451,15 @@ pub fn rank_embeddings_by_similarity(
 
 /// Rank memory entries across one or more scopes by similarity to a
 /// pre-computed query embedding.
-pub fn rank_embeddings_by_similarity_scoped(
+pub async fn rank_embeddings_by_similarity_scoped(
     query_embedding: &[f32],
     scopes: &[String],
     recency_weight: f32,
 ) -> Result<Vec<(String, String, f32)>> {
-    let db = Database::open()?;
+    let db = Database::open().await?;
     let mut stored = Vec::new();
     for scope in scopes {
-        stored.extend(db.get_all_embeddings(scope)?);
+        stored.extend(db.get_all_embeddings(scope).await?);
     }
 
     if stored.is_empty() {
@@ -497,6 +506,7 @@ pub async fn rank_memories_by_similarity(
         scope,
         config.memory.embeddings.recency_weight,
     )
+    .await
 }
 
 /// Embed a memory file using chunking. Chunks the content, hashes each chunk,
@@ -522,8 +532,8 @@ pub async fn embed_memory_file_chunked(
         return Ok(());
     }
 
-    let db = Database::open()?;
-    let existing = db.get_chunks_for_file(scope, filename)?;
+    let db = Database::open().await?;
+    let existing = db.get_chunks_for_file(scope, filename).await?;
     let existing_map: std::collections::HashMap<i64, String> = existing
         .iter()
         .map(|c| (c.chunk_index, c.content_hash.clone()))
@@ -570,7 +580,7 @@ pub async fn embed_memory_file_chunked(
         });
     }
 
-    db.upsert_chunks(scope, filename, &chunk_data)?;
+    db.upsert_chunks(scope, filename, &chunk_data).await?;
     debug!("Stored {} chunks for {scope}/{filename}", chunk_data.len());
     Ok(())
 }

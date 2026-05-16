@@ -120,20 +120,15 @@ impl Agent {
         let rw = recency_weight;
         let scopes = resolved_memory_scopes(&self.config);
 
-        let ranking_result = tokio::task::spawn_blocking(move || {
+        let ranking_result =
             crate::memory::embeddings::rank_embeddings_by_similarity_scoped(&qe_global, &scopes, rw)
-        })
-        .await;
+                .await;
 
         let global_rankings = match ranking_result {
-            Ok(Ok(r)) if !r.is_empty() => r,
-            Ok(Ok(_)) => return self.load_memory(max_tokens, LoadStrategy::Recency).await,
-            Ok(Err(e)) => {
-                tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
-                return self.load_memory(max_tokens, LoadStrategy::Recency).await;
-            }
+            Ok(r) if !r.is_empty() => r,
+            Ok(_) => return self.load_memory(max_tokens, LoadStrategy::Recency).await,
             Err(e) => {
-                tracing::debug!("Ranking task panicked, falling back to recency: {e}");
+                tracing::trace!("Semantic ranking failed, falling back to recency: {e}");
                 return self.load_memory(max_tokens, LoadStrategy::Recency).await;
             }
         };
