@@ -86,7 +86,7 @@ impl GatewayServer {
         metrics: BorgMetrics,
         poke_tx: Option<mpsc::Sender<()>>,
         executor: Option<crate::SessionExecutorHandle>,
-    ) -> Result<Self> {
+    ) -> crate::Result<Self> {
         if let Some(exec) = executor {
             crate::session_executor::set_global(exec);
         }
@@ -100,7 +100,7 @@ impl GatewayServer {
 
     #[instrument(skip_all)]
     /// Start the HTTP server and listen for webhook requests until shutdown.
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> crate::Result<()> {
         let gateway_config = &self.config.gateway;
         let addr = format!("{}:{}", gateway_config.host, gateway_config.port);
 

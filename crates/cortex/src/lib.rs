@@ -65,6 +65,8 @@ pub mod daily_summary;
 pub mod db;
 /// Diagnostic checks for `borg doctor`.
 pub mod doctor;
+/// Typed `Error` umbrella for the crate's public API.
+pub mod error;
 /// Structured error formatting for user-facing messages.
 pub mod error_format;
 /// Conversation evolution and personality drift.
@@ -189,3 +191,5 @@ pub mod vitals;
 pub mod wasm_plugins;
 /// Web fetching and search capabilities.
 pub mod web;
+
+pub use error::{Error, Result};
