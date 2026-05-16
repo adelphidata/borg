@@ -432,61 +432,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_interval_minutes() {
-        let d = parse_interval("30m").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(1800));
+    fn parse_interval_table() {
+        // One table-driven test instead of nine per-suffix near-duplicates.
+        // Covers every accepted suffix, the bare-number case, whitespace
+        // tolerance, zero (a legal value), and the larger-than-overflow
+        // sanity row. Invalid inputs are checked separately so failure
+        // messages stay scoped.
+        let cases: &[(&str, u64)] = &[
+            ("30m", 1800),
+            ("2h", 7200),
+            ("1d", 86400),
+            ("60s", 60),
+            ("120", 120),       // bare number → seconds
+            ("  10m  ", 600),   // surrounding whitespace tolerated
+            ("0s", 0),          // explicit zero with suffix
+            ("0", 0),           // explicit zero, no suffix
+            ("24h", 24 * 3600), // 24h must not be silently routed through `d`
+        ];
+        for (input, expected_secs) in cases {
+            assert_eq!(
+                parse_interval(input).unwrap(),
+                std::time::Duration::from_secs(*expected_secs),
+                "parse_interval({input:?}) should yield {expected_secs}s",
+            );
+        }
     }
 
     #[test]
-    fn parse_interval_hours() {
-        let d = parse_interval("2h").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(7200));
-    }
-
-    #[test]
-    fn parse_interval_days() {
-        let d = parse_interval("1d").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(86400));
-    }
-
-    #[test]
-    fn parse_interval_seconds() {
-        let d = parse_interval("60s").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(60));
-    }
-
-    #[test]
-    fn parse_interval_bare_number() {
-        let d = parse_interval("120").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(120));
-    }
-
-    #[test]
-    fn parse_interval_with_whitespace() {
-        let d = parse_interval("  10m  ").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(600));
-    }
-
-    #[test]
-    fn parse_interval_zero() {
-        assert_eq!(
-            parse_interval("0s").unwrap(),
-            std::time::Duration::from_secs(0)
-        );
-        assert_eq!(
-            parse_interval("0").unwrap(),
-            std::time::Duration::from_secs(0)
-        );
-    }
-
-    #[test]
-    fn parse_interval_large_hours() {
-        let d = parse_interval("24h").unwrap();
-        assert_eq!(d, std::time::Duration::from_secs(24 * 3600));
-    }
-
-    #[test]
-    fn parse_interval_invalid() {
+    fn parse_interval_rejects_invalid() {
+        // The contract is `None`, not panic, on garbage input — the
+        // scheduler depends on this to mark tasks invalid instead of
+        // crashing the dispatch loop.
         assert!(parse_interval("abc").is_none());
         assert!(parse_interval("").is_none());
     }
@@ -588,12 +564,6 @@ mod tests {
     #[test]
     fn validate_schedule_unknown_type() {
         assert!(validate_schedule("weekly", "").is_err());
-    }
-
-    #[test]
-    fn parse_interval_is_pub() {
-        // Verifies parse_interval is now pub by calling it from tests
-        assert!(parse_interval("30m").is_some());
     }
 
     // ── Cron line parser tests ──

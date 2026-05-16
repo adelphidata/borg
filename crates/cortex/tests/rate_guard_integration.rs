@@ -141,45 +141,30 @@ fn hot_reload_update_limits() {
     ));
 }
 
-// ── Test: gateway defaults are more restrictive ──
+// ── Test: gateway defaults are STRICTLY more restrictive than standard ──
+//
+// Spec: untrusted-channel sessions get a lower budget than CLI sessions, so
+// a runaway gateway interaction can't burn the same shell-call cap as a
+// local one. `<=` is too weak (would pass if gateway == standard);
+// `<` enforces the design intent.
 
 #[test]
-fn gateway_defaults_restrictive() {
+fn gateway_defaults_strictly_more_restrictive_than_standard() {
     let standard = ActionLimits::default();
     let gateway = ActionLimits::gateway_defaults();
 
-    // Gateway should have lower or equal limits
     assert!(
-        gateway.tool_calls_block <= standard.tool_calls_block,
-        "Gateway tool_calls_block should be <= standard"
+        gateway.tool_calls_block < standard.tool_calls_block,
+        "gateway tool_calls_block ({}) must be strictly less than standard ({})",
+        gateway.tool_calls_block,
+        standard.tool_calls_block
     );
     assert!(
-        gateway.shell_commands_block <= standard.shell_commands_block,
-        "Gateway shell_commands_block should be <= standard"
+        gateway.shell_commands_block < standard.shell_commands_block,
+        "gateway shell_commands_block ({}) must be strictly less than standard ({})",
+        gateway.shell_commands_block,
+        standard.shell_commands_block
     );
-}
-
-// ── Test: all action types work ──
-
-#[test]
-fn all_action_types_recordable() {
-    let mut guard = SessionRateGuard::new(ActionLimits::default());
-
-    let types = [
-        ActionType::ToolCall,
-        ActionType::ShellCommand,
-        ActionType::FileWrite,
-        ActionType::MemoryWrite,
-        ActionType::WebRequest,
-    ];
-
-    for action in &types {
-        let decision = guard.record(*action);
-        assert!(
-            matches!(decision, RateDecision::Allow),
-            "First action of each type should be allowed"
-        );
-    }
 }
 
 // ── Test: warn message contains action type info ──

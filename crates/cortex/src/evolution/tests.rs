@@ -58,132 +58,68 @@ fn level_from_xp_max_at_99() {
 // ── Archetype Classification ──
 
 #[test]
-fn classify_builder_tools() {
-    assert_eq!(
-        classify_tool_archetype("apply_patch", None),
-        Some(Archetype::Builder)
-    );
-    assert_eq!(
-        classify_tool_archetype("apply_skill_patch", None),
-        Some(Archetype::Builder)
-    );
-}
-
-#[test]
-fn classify_guardian_tools() {
-    // Guardian is reached via shell commands with security keywords
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("ufw status")),
-        Some(Archetype::Guardian)
-    );
-}
-
-#[test]
-fn classify_analyst_tools() {
-    assert_eq!(
-        classify_tool_archetype("browser", None),
-        Some(Archetype::Analyst)
-    );
-    assert_eq!(
-        classify_tool_archetype("search", None),
-        Some(Archetype::Analyst)
-    );
-}
-
-#[test]
-fn classify_shell_ops_keywords() {
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("docker compose up -d")),
-        Some(Archetype::Ops)
-    );
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("kubectl apply -f deploy.yaml")),
-        Some(Archetype::Ops)
-    );
-}
-
-#[test]
-fn classify_shell_builder_keywords() {
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("cargo build --release")),
-        Some(Archetype::Builder)
-    );
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("npm install express")),
-        Some(Archetype::Builder)
-    );
-}
-
-#[test]
-fn classify_shell_tinkerer_keywords() {
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("ssh proxmox 'qm list'")),
-        Some(Archetype::Tinkerer)
-    );
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("tailscale status")),
-        Some(Archetype::Tinkerer)
-    );
-}
-
-#[test]
-fn classify_shell_marketer_keywords() {
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("launch mailchimp campaign")),
-        Some(Archetype::Marketer)
-    );
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("check ga4 conversion funnel")),
-        Some(Archetype::Marketer)
-    );
-    assert_eq!(
-        classify_tool_archetype("run_shell", Some("pull ROAS from google-ads")),
-        Some(Archetype::Marketer)
-    );
-}
-
-#[test]
-fn classify_unknown_tool_returns_none() {
-    assert_eq!(classify_tool_archetype("list_dir", None), None);
-    assert_eq!(classify_tool_archetype("read_file", None), None);
-}
-
-#[test]
-fn classify_channel_names() {
-    assert_eq!(
-        classify_tool_archetype("telegram_send", None),
-        Some(Archetype::Communicator)
-    );
-    assert_eq!(
-        classify_tool_archetype("slack_post", None),
-        Some(Archetype::Communicator)
-    );
-}
-
-#[test]
-fn all_archetypes_have_at_least_one_signal() {
-    // Verify each archetype can be reached
-    let cases: &[(&str, Option<&str>, Archetype)] = &[
-        ("run_shell", Some("docker ps"), Archetype::Ops),
+fn classify_tool_archetype_table() {
+    // Single table-driven test covering every archetype the classifier
+    // can reach plus the negative case. Per-archetype `classify_*` tests
+    // (one per variant) were collapsed here — each variant only needs
+    // one positive proof; the assertion message points at the failing row.
+    let positive: &[(&str, Option<&str>, Archetype)] = &[
+        // Direct tool → archetype mappings.
         ("apply_patch", None, Archetype::Builder),
+        ("apply_skill_patch", None, Archetype::Builder),
         ("browser", None, Archetype::Analyst),
+        ("search", None, Archetype::Analyst),
         ("telegram_send", None, Archetype::Communicator),
-        ("run_shell", Some("ufw status"), Archetype::Guardian),
+        ("slack_post", None, Archetype::Communicator),
         ("calendar", None, Archetype::Strategist),
         ("write_memory", None, Archetype::Creator),
-        // Caretaker, Merchant are primarily classified by user-created tools
-        ("run_shell", Some("homelab proxmox"), Archetype::Tinkerer),
+        // Shell-keyword routing covers Ops / Builder / Guardian / Tinkerer / Marketer.
+        ("run_shell", Some("docker compose up -d"), Archetype::Ops),
         (
             "run_shell",
-            Some("mailchimp campaign retargeting"),
+            Some("kubectl apply -f deploy.yaml"),
+            Archetype::Ops,
+        ),
+        ("run_shell", Some("cargo build --release"), Archetype::Builder),
+        ("run_shell", Some("npm install express"), Archetype::Builder),
+        ("run_shell", Some("ufw status"), Archetype::Guardian),
+        (
+            "run_shell",
+            Some("ssh proxmox 'qm list'"),
+            Archetype::Tinkerer,
+        ),
+        ("run_shell", Some("tailscale status"), Archetype::Tinkerer),
+        (
+            "run_shell",
+            Some("launch mailchimp campaign"),
+            Archetype::Marketer,
+        ),
+        (
+            "run_shell",
+            Some("check ga4 conversion funnel"),
+            Archetype::Marketer,
+        ),
+        (
+            "run_shell",
+            Some("pull ROAS from google-ads"),
             Archetype::Marketer,
         ),
     ];
-    for (tool, meta, expected) in cases {
+    for (tool, meta, expected) in positive {
         assert_eq!(
             classify_tool_archetype(tool, *meta),
             Some(*expected),
-            "Expected {expected} for tool={tool} meta={meta:?}"
+            "tool={tool} meta={meta:?} expected={expected:?}"
+        );
+    }
+
+    // Negative case: tools with no archetype mapping must return None
+    // (NOT silently default to some archetype).
+    for tool in &["list_dir", "read_file"] {
+        assert_eq!(
+            classify_tool_archetype(tool, None),
+            None,
+            "unmapped tool {tool} must return None"
         );
     }
 }
