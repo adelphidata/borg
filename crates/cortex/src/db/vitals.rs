@@ -117,12 +117,15 @@ impl Database {
 
     /// Load all vitals events ordered chronologically (for replay).
     async fn load_all_vitals_events(&self) -> Result<Vec<crate::vitals::VitalsEvent>> {
-        let mut rows = self.conn.query(
-            "SELECT id, category, source, stability_delta, focus_delta, sync_delta,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, category, source, stability_delta, focus_delta, sync_delta,
                     growth_delta, happiness_delta, metadata_json, created_at, hmac, prev_hmac
              FROM vitals_events ORDER BY id ASC",
-            (),
-        ).await?;
+                (),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(crate::vitals::VitalsEvent {
@@ -233,23 +236,27 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK").await;
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "vitals: rollback after record_vitals_event failure failed: {re}"
+                    );
+                }
                 Err(e)
             }
         }
     }
 
     /// Get vitals events since a given timestamp (for display, not replay).
-    pub async fn vitals_events_since(
-        &self,
-        since: i64,
-    ) -> Result<Vec<crate::vitals::VitalsEvent>> {
-        let mut rows = self.conn.query(
-            "SELECT id, category, source, stability_delta, focus_delta, sync_delta,
+    pub async fn vitals_events_since(&self, since: i64) -> Result<Vec<crate::vitals::VitalsEvent>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, category, source, stability_delta, focus_delta, sync_delta,
                     growth_delta, happiness_delta, metadata_json, created_at, hmac, prev_hmac
              FROM vitals_events WHERE created_at >= ?1 ORDER BY created_at DESC",
-            params!(since),
-        ).await?;
+                params!(since),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(crate::vitals::VitalsEvent {
@@ -301,10 +308,7 @@ impl Database {
     pub async fn get_last_bond_event_hmac(&self) -> Result<String> {
         let mut rows = self
             .conn
-            .query(
-                "SELECT hmac FROM bond_events ORDER BY id DESC LIMIT 1",
-                (),
-            )
+            .query("SELECT hmac FROM bond_events ORDER BY id DESC LIMIT 1", ())
             .await?;
         match rows.next().await? {
             Some(row) => Ok(row.get::<String>(0).unwrap_or_else(|_| "0".to_string())),
@@ -449,22 +453,24 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK").await;
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("vitals: rollback after record_bond_event failure failed: {re}");
+                }
                 Err(e)
             }
         }
     }
 
     /// Get bond events since a given timestamp (for display, DESC order).
-    pub async fn bond_events_since(
-        &self,
-        since: i64,
-    ) -> Result<Vec<crate::bond::BondEvent>> {
-        let mut rows = self.conn.query(
-            "SELECT id, event_type, score_delta, reason, hmac, prev_hmac, created_at
+    pub async fn bond_events_since(&self, since: i64) -> Result<Vec<crate::bond::BondEvent>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, event_type, score_delta, reason, hmac, prev_hmac, created_at
              FROM bond_events WHERE created_at >= ?1 ORDER BY created_at DESC",
-            params!(since),
-        ).await?;
+                params!(since),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(crate::bond::BondEvent {
@@ -481,10 +487,7 @@ impl Database {
     }
 
     /// Get last N bond events (for history display, DESC order).
-    pub async fn bond_events_recent(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<crate::bond::BondEvent>> {
+    pub async fn bond_events_recent(&self, limit: usize) -> Result<Vec<crate::bond::BondEvent>> {
         let mut rows = self
             .conn
             .query(
@@ -510,11 +513,7 @@ impl Database {
 
     /// Count bond events of a given type since a timestamp (for rate limiting).
     /// Pass empty string for event_type to count all events.
-    pub async fn count_bond_events_since(
-        &self,
-        since: i64,
-        event_type: &str,
-    ) -> Result<u32> {
+    pub async fn count_bond_events_since(&self, since: i64, event_type: &str) -> Result<u32> {
         let (sql, do_filter) = if event_type.is_empty() {
             (
                 "SELECT COUNT(*) FROM bond_events WHERE created_at >= ?1",
@@ -661,12 +660,15 @@ impl Database {
     pub(crate) async fn load_all_evolution_events(
         &self,
     ) -> Result<Vec<crate::evolution::EvolutionEvent>> {
-        let mut rows = self.conn.query(
-            "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
                     created_at, hmac, prev_hmac, session_id, pubkey_id
              FROM evolution_events ORDER BY id ASC",
-            (),
-        ).await?;
+                (),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(crate::evolution::EvolutionEvent {
@@ -850,7 +852,11 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK").await;
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "vitals: rollback after record_evolution_event failure failed: {re}"
+                    );
+                }
                 Err(e)
             }
         }
@@ -861,12 +867,15 @@ impl Database {
         &self,
         since: i64,
     ) -> Result<Vec<crate::evolution::EvolutionEvent>> {
-        let mut rows = self.conn.query(
-            "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, event_type, xp_delta, archetype, source, metadata_json,
                     created_at, hmac, prev_hmac, session_id, pubkey_id
              FROM evolution_events WHERE created_at >= ?1 ORDER BY created_at DESC",
-            params!(since),
-        ).await?;
+                params!(since),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(crate::evolution::EvolutionEvent {

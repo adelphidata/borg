@@ -111,32 +111,55 @@ impl Database {
         principal_id: &str,
         ts: i64,
     ) -> Result<i64> {
-        let tx = self.conn.unchecked_transaction().await?;
-        let prev: Vec<u8> = {
-            let mut rows = tx
-                .query(
-                    "SELECT hash FROM audit_log_chain ORDER BY seq DESC LIMIT 1",
-                    (),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(row) => row.get::<Vec<u8>>(0)?,
-                None => GENESIS_PREV_HASH.to_vec(),
-            }
-        };
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<i64> = async {
+            let prev: Vec<u8> = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT hash FROM audit_log_chain ORDER BY seq DESC LIMIT 1",
+                        (),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => row.get::<Vec<u8>>(0)?,
+                    None => GENESIS_PREV_HASH.to_vec(),
+                }
+            };
 
-        let hash = compute_row_hash(&prev, event_type, event_json, ts, false);
+            let hash = compute_row_hash(&prev, event_type, event_json, ts, false);
 
-        tx.execute(
-            "INSERT INTO audit_log_chain
+            self.conn
+                .execute(
+                    "INSERT INTO audit_log_chain
              (prev_hash, hash, event_type, event_json, ts, principal_id, event_purged)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params!(prev, hash.to_vec(), event_type, event_json, ts, principal_id),
-        )
-        .await?;
-        let seq = self.conn.last_insert_rowid();
-        tx.commit().await?;
-        Ok(seq)
+                    params!(
+                        prev,
+                        hash.to_vec(),
+                        event_type,
+                        event_json,
+                        ts,
+                        principal_id
+                    ),
+                )
+                .await?;
+            let seq = self.conn.last_insert_rowid();
+            Ok(seq)
+        }
+        .await;
+        match result {
+            Ok(seq) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(seq)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("audit: rollback after append failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Tombstone an audit event in place. Rewrites `event_json` to the
@@ -146,42 +169,57 @@ impl Database {
     ///
     /// Idempotent: tombstoning an already-tombstoned row is a no-op.
     pub async fn tombstone_audit_event(&self, seq: i64, purged_at: i64) -> Result<()> {
-        let tx = self.conn.unchecked_transaction().await?;
-        let row: Option<(String, bool)> = {
-            let mut rows = tx
-                .query(
-                    "SELECT event_type, event_purged
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<()> = async {
+            let row: Option<(String, bool)> = {
+                let mut rows = self
+                    .conn
+                    .query(
+                        "SELECT event_type, event_purged
                  FROM audit_log_chain WHERE seq = ?1",
-                    params!(seq),
-                )
-                .await?;
-            match rows.next().await? {
-                Some(r) => Some((r.get::<String>(0)?, r.get::<i64>(1)? != 0)),
-                None => None,
+                        params!(seq),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(r) => Some((r.get::<String>(0)?, r.get::<i64>(1)? != 0)),
+                    None => None,
+                }
+            };
+            let Some((event_type, already)) = row else {
+                anyhow::bail!("audit_log_chain row {seq} not found");
+            };
+            if already {
+                return Ok(());
             }
-        };
-        let Some((event_type, already)) = row else {
-            anyhow::bail!("audit_log_chain row {seq} not found");
-        };
-        if already {
-            tx.commit().await?;
-            return Ok(());
-        }
-        let payload = serde_json::json!({
-            "purged": 1,
-            "purged_at": purged_at,
-            "original_type": event_type,
-        })
-        .to_string();
-        tx.execute(
-            "UPDATE audit_log_chain
+            let payload = serde_json::json!({
+                "purged": 1,
+                "purged_at": purged_at,
+                "original_type": event_type,
+            })
+            .to_string();
+            self.conn
+                .execute(
+                    "UPDATE audit_log_chain
              SET event_json = ?1, event_purged = 1
              WHERE seq = ?2",
-            params!(payload, seq),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+                    params!(payload, seq),
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("audit: rollback after tombstone failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     pub async fn verify_audit_chain(&self) -> Result<AuditChainOutcome> {
@@ -510,7 +548,9 @@ mod tests {
     async fn tombstone_idempotent() {
         let db = test_db().await;
         append_n(&db, 4).await;
-        db.tombstone_audit_event(2, 1_700_000_999).await.expect("first");
+        db.tombstone_audit_event(2, 1_700_000_999)
+            .await
+            .expect("first");
         let head_after_first: Vec<u8> = {
             let mut rows = db
                 .conn()
@@ -520,7 +560,12 @@ mod tests {
                 )
                 .await
                 .expect("hash");
-            rows.next().await.expect("next").expect("row").get::<Vec<u8>>(0).expect("hash bytes")
+            rows.next()
+                .await
+                .expect("next")
+                .expect("row")
+                .get::<Vec<u8>>(0)
+                .expect("hash bytes")
         };
         db.tombstone_audit_event(2, 1_700_001_000)
             .await
@@ -534,7 +579,12 @@ mod tests {
                 )
                 .await
                 .expect("hash");
-            rows.next().await.expect("next").expect("row").get::<Vec<u8>>(0).expect("hash bytes")
+            rows.next()
+                .await
+                .expect("next")
+                .expect("row")
+                .get::<Vec<u8>>(0)
+                .expect("hash bytes")
         };
         // Idempotent: second call must NOT rewrite the hash with the new ts.
         assert_eq!(head_after_first, head_after_second);
@@ -573,8 +623,12 @@ mod tests {
     async fn multiple_tombstones_counted() {
         let db = test_db().await;
         append_n(&db, 10).await;
-        db.tombstone_audit_event(2, 1_700_000_999).await.expect("t1");
-        db.tombstone_audit_event(7, 1_700_000_999).await.expect("t2");
+        db.tombstone_audit_event(2, 1_700_000_999)
+            .await
+            .expect("t1");
+        db.tombstone_audit_event(7, 1_700_000_999)
+            .await
+            .expect("t2");
         match db.verify_audit_chain().await.expect("verify") {
             AuditChainOutcome::OkWithTombstones { count } => assert_eq!(count, 2),
             other => panic!("expected OkWithTombstones(2), got {other:?}"),

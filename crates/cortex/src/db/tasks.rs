@@ -120,11 +120,13 @@ impl Database {
         } else {
             crate::tasks::RUN_STATUS_SUCCESS
         };
-        self.conn.execute(
-            "INSERT INTO task_runs (task_id, started_at, duration_ms, result, error, status)
+        self.conn
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, result, error, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params!(task_id, started_at, duration_ms, result, error, status),
-        ).await?;
+                params!(task_id, started_at, duration_ms, result, error, status),
+            )
+            .await?;
         Ok(())
     }
 
@@ -208,7 +210,9 @@ impl Database {
         self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = self.claim_due_tasks_inner(now).await;
         if result.is_err() {
-            let _ = self.conn.execute_batch("ROLLBACK").await;
+            if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                tracing::warn!("tasks: rollback after claim_due_tasks failure failed: {re}");
+            }
         }
         result
     }
@@ -244,11 +248,13 @@ impl Database {
             }
 
             // Insert a 'running' task_run row
-            self.conn.execute(
-                "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+            self.conn
+                .execute(
+                    "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
                  VALUES (?1, ?2, 0, ?3)",
-                params!(task.id.clone(), now, crate::tasks::RUN_STATUS_RUNNING),
-            ).await?;
+                    params!(task.id.clone(), now, crate::tasks::RUN_STATUS_RUNNING),
+                )
+                .await?;
             let run_id = self.conn.last_insert_rowid();
             claimed.push(ClaimedTask { task, run_id });
         }
@@ -291,11 +297,13 @@ impl Database {
 
     /// Insert a 'running' task_run row (used for retry path). Returns the run ID.
     pub async fn start_task_run(&self, task_id: &str, started_at: i64) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
+        self.conn
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, status)
              VALUES (?1, ?2, 0, ?3)",
-            params!(task_id, started_at, crate::tasks::RUN_STATUS_RUNNING),
-        ).await?;
+                params!(task_id, started_at, crate::tasks::RUN_STATUS_RUNNING),
+            )
+            .await?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -313,11 +321,14 @@ impl Database {
         } else {
             crate::tasks::RUN_STATUS_SUCCESS
         };
-        let updated = self.conn.execute(
-            "UPDATE task_runs SET status = ?1, duration_ms = ?2, result = ?3, error = ?4
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE task_runs SET status = ?1, duration_ms = ?2, result = ?3, error = ?4
              WHERE id = ?5",
-            params!(status, duration_ms, result, error, run_id),
-        ).await?;
+                params!(status, duration_ms, result, error, run_id),
+            )
+            .await?;
         Ok(updated > 0)
     }
 
@@ -395,8 +406,10 @@ impl Database {
         since_ts: i64,
         limit: usize,
     ) -> Result<Vec<FailedRunGroup>> {
-        let mut rows = self.conn.query(
-            "SELECT s.id, s.name, COUNT(r.id) AS failures, \
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT s.id, s.name, COUNT(r.id) AS failures, \
                     MAX(r.started_at) AS latest_at, \
                     (SELECT r2.error FROM task_runs r2 \
                      WHERE r2.task_id = s.id \
@@ -409,8 +422,9 @@ impl Database {
              GROUP BY s.id, s.name \
              ORDER BY failures DESC, latest_at DESC \
              LIMIT ?3",
-            params!(crate::tasks::RUN_STATUS_FAILED, since_ts, limit as i64),
-        ).await?;
+                params!(crate::tasks::RUN_STATUS_FAILED, since_ts, limit as i64),
+            )
+            .await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(FailedRunGroup {
@@ -449,11 +463,13 @@ impl Database {
         started_at: i64,
         note: &str,
     ) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO task_runs (task_id, started_at, duration_ms, error, status)
+        self.conn
+            .execute(
+                "INSERT INTO task_runs (task_id, started_at, duration_ms, error, status)
              VALUES (?1, ?2, 0, ?3, ?4)",
-            params!(task_id, started_at, note, crate::tasks::RUN_STATUS_MISSED),
-        ).await?;
+                params!(task_id, started_at, note, crate::tasks::RUN_STATUS_MISSED),
+            )
+            .await?;
         Ok(())
     }
 
@@ -481,8 +497,10 @@ impl Database {
         let error_msg = format!(
             "self-healing: task_run wedged in 'running' past timeout (grace {default_grace_secs}s)"
         );
-        let updated = self.conn.execute(
-            "UPDATE task_runs \
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE task_runs \
              SET status = ?1, error = ?2 \
              WHERE id IN ( \
                  SELECT tr.id FROM task_runs tr \
@@ -490,14 +508,15 @@ impl Database {
                  WHERE tr.status = ?3 \
                    AND tr.started_at < ?4 - COALESCE(st.timeout_ms / 1000, ?5) \
              )",
-            params!(
-                crate::tasks::RUN_STATUS_FAILED,
-                error_msg,
-                crate::tasks::RUN_STATUS_RUNNING,
-                now,
-                default_grace_secs,
-            ),
-        ).await?;
+                params!(
+                    crate::tasks::RUN_STATUS_FAILED,
+                    error_msg,
+                    crate::tasks::RUN_STATUS_RUNNING,
+                    now,
+                    default_grace_secs,
+                ),
+            )
+            .await?;
         Ok(updated)
     }
 
@@ -511,27 +530,43 @@ impl Database {
     /// invisible to anything reading `scheduled_tasks.last_error` (e.g. the
     /// `borg tasks` listing, `tasks_with_last_error()`).
     pub async fn recover_stale_runs(&self, error_msg: &str) -> Result<u64> {
-        let tx = self.conn.unchecked_transaction().await?;
-        tx.execute(
-            "UPDATE scheduled_tasks SET last_error = ?1
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
+        let result: anyhow::Result<u64> = async {
+            self.conn
+                .execute(
+                    "UPDATE scheduled_tasks SET last_error = ?1
              WHERE last_error IS NULL
                AND id IN (SELECT DISTINCT task_id FROM task_runs WHERE status = ?2)",
-            params!(error_msg, crate::tasks::RUN_STATUS_RUNNING),
-        )
-        .await?;
-        let updated = tx
-            .execute(
-                "UPDATE task_runs SET status = ?1, error = ?2
+                    params!(error_msg, crate::tasks::RUN_STATUS_RUNNING),
+                )
+                .await?;
+            let updated = self
+                .conn
+                .execute(
+                    "UPDATE task_runs SET status = ?1, error = ?2
              WHERE status = ?3",
-                params!(
-                    crate::tasks::RUN_STATUS_FAILED,
-                    error_msg,
-                    crate::tasks::RUN_STATUS_RUNNING
-                ),
-            )
-            .await?;
-        tx.commit().await?;
-        Ok(updated)
+                    params!(
+                        crate::tasks::RUN_STATUS_FAILED,
+                        error_msg,
+                        crate::tasks::RUN_STATUS_RUNNING
+                    ),
+                )
+                .await?;
+            Ok(updated)
+        }
+        .await;
+        match result {
+            Ok(updated) => {
+                self.conn.execute_batch("COMMIT").await?;
+                Ok(updated)
+            }
+            Err(e) => {
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!("tasks: rollback after recover_stale_runs failure failed: {re}");
+                }
+                Err(e)
+            }
+        }
     }
 
     // ── Daemon Lock ──
@@ -547,7 +582,11 @@ impl Database {
                 self.conn.execute_batch("COMMIT").await?;
             }
             Err(_) => {
-                let _ = self.conn.execute_batch("ROLLBACK").await;
+                if let Err(re) = self.conn.execute_batch("ROLLBACK").await {
+                    tracing::warn!(
+                        "tasks: rollback after acquire_daemon_lock failure failed: {re}"
+                    );
+                }
             }
         }
         result
@@ -557,10 +596,7 @@ impl Database {
         let existing: Option<(i64, i64)> = {
             let mut rows = self
                 .conn
-                .query(
-                    "SELECT pid, heartbeat_at FROM daemon_lock WHERE id = 1",
-                    (),
-                )
+                .query("SELECT pid, heartbeat_at FROM daemon_lock WHERE id = 1", ())
                 .await?;
             match rows.next().await? {
                 Some(row) => Some((row.get::<i64>(0)?, row.get::<i64>(1)?)),
@@ -655,10 +691,7 @@ impl Database {
             .await?;
         let deleted = self
             .conn
-            .execute(
-                "DELETE FROM scheduled_tasks WHERE id = ?1",
-                params!(id),
-            )
+            .execute("DELETE FROM scheduled_tasks WHERE id = ?1", params!(id))
             .await?;
         Ok(deleted > 0)
     }
