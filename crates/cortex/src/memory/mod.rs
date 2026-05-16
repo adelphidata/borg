@@ -18,10 +18,14 @@ pub mod consolidation;
 pub mod embeddings;
 /// MMR diversity re-ranking (Jaccard similarity, greedy selection).
 pub mod mmr;
+/// Canonical [`scope_key::Scope`] / [`scope_key::ScopeKey`] types.
+pub mod scope_key;
 /// Short-term (working) memory for the current session.
 pub mod short_term_memory;
 /// Token estimation via tiktoken (cl100k_base BPE).
 pub mod tokenizer;
+
+pub use scope_key::{Scope, ScopeError, ScopeKey, GLOBAL_SCOPE};
 
 /// How to write to a memory file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

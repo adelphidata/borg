@@ -8,6 +8,12 @@ use anyhow::{bail, Result};
 
 /// Reject session IDs that could traverse the filesystem when used as
 /// path components. The on-disk session store keys files by ID directly.
+///
+/// Kept as a `&str` checker for back-compat with persisted IDs that may
+/// predate the stricter [`crate::session_types::SessionId`] invariants
+/// (ASCII-only, 128-byte cap, no control characters). New code should
+/// construct a `SessionId` directly so the validated value travels
+/// through the type system.
 pub fn validate_session_id(id: &str) -> Result<()> {
     if id.is_empty() {
         bail!("Session ID must not be empty");
