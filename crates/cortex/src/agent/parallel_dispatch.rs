@@ -25,10 +25,8 @@ use crate::types::ToolOutput;
 /// **No `ToolOutputDelta` from this path.** The surrounding loop emits
 /// `ToolExecuting` / `ToolResult` events with the correct `tool_call_id`,
 /// but the parallel dispatcher does not thread that id into the inner
-/// handlers. None of the parallel-safe tools today (`read_file`,
-/// `read_memory`, `memory_search`, `list_skills`, `list_channels`,
-/// `list_dir`, `web_fetch`, `web_search`, `apply_patch`) emit streaming
-/// output deltas, so the gap is invisible. Adding a tool here that wants
+/// handlers. None of the parallel-safe tools today emit streaming output
+/// deltas, so the gap is invisible. Adding a tool here that wants
 /// `ToolOutputDelta` requires extending this signature with `tool_call_id`
 /// first, otherwise the delta will land at the OpenAI compat layer with an
 /// empty id (see `agent_dispatcher::translate_events`).
@@ -99,6 +97,12 @@ pub(crate) async fn dispatch_parallel_safe_tool(
         crate::tool::Tool::WebSearch(args) => crate::tool::web_search::handle(args, config)
             .await
             .map(ToolOutput::Text),
+        crate::tool::Tool::VisionAnalyze(args) => {
+            crate::tool::vision_analyze::handle(args, config).await
+        }
+        crate::tool::Tool::VideoAnalyze(args) => {
+            crate::tool::video_analyze::handle(args, config).await
+        }
         crate::tool::Tool::ApplyPatch(args) => match execution_context {
             Some(ctx) => {
                 crate::tool::apply_patch::handle_apply_patch_with_context(args, config, ctx)
@@ -159,6 +163,24 @@ mod tests {
         assert!(
             msg.contains("non-parallel-safe") || msg.contains("planner/dispatch mismatch"),
             "error should name the mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_parallel_safe_tool_handles_video_analyze() {
+        let config = Config::default();
+        let (tx, _rx) = mpsc::channel(8);
+        let args = serde_json::json!({"video_url":"data:video/mp4;base64,AAAA"}).to_string();
+        let out = dispatch_parallel_safe_tool("video_analyze", &args, &config, &tx, None)
+            .await
+            .unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            ToolOutput::Multimodal { text, .. } => text,
+        };
+        assert!(
+            text.contains("requires AI Studio Gemini"),
+            "video_analyze must reach its handler rather than the fallback mismatch arm: {text}"
         );
     }
 

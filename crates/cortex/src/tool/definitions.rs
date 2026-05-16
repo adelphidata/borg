@@ -553,6 +553,7 @@ mod tests {
         config.tts.enabled = true;
         config.image_gen.enabled = true;
         config.goals.enabled = true;
+        config.computer_use.enabled = true;
         let defs = core_tool_definitions(&config);
 
         let summary_names: std::collections::HashSet<&str> =

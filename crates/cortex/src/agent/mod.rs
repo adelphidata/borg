@@ -110,6 +110,10 @@ pub use btw::{parse_btw_command, run_btw};
 pub use tool_classification::mutating_tool_names;
 use tool_classification::{classify_action, is_mutating_tool};
 
+fn typed_tool_blocked_in_plan_mode(config: &Config, tool: &crate::tool::Tool) -> bool {
+    config.conversation.collaboration_mode.blocks_mutations() && !tool.allowed_in_plan_mode()
+}
+
 /// Spawn a background task that logs panics instead of silently swallowing them.
 pub(crate) fn spawn_logged(
     name: &'static str,
@@ -1863,6 +1867,32 @@ mod tests {
         // request_user_input is now allowlisted: clarification questions don't
         // mutate state and are essential to Plan-mode requirement gathering.
         assert!(!is_mutating_tool("request_user_input"));
+    }
+
+    #[test]
+    fn typed_plan_mode_blocks_mutating_computer_use_actions() {
+        let mut config = Config::default();
+        config.conversation.collaboration_mode = crate::config::CollaborationMode::Plan;
+
+        let capture = crate::tool::Tool::parse(
+            crate::tool::names::COMPUTER_USE,
+            serde_json::json!({"action":"capture"}),
+        )
+        .unwrap();
+        assert!(
+            !typed_tool_blocked_in_plan_mode(&config, &capture),
+            "read-only computer_use capture must remain available in Plan mode"
+        );
+
+        let click = crate::tool::Tool::parse(
+            crate::tool::names::COMPUTER_USE,
+            serde_json::json!({"action":"click","x":1,"y":1}),
+        )
+        .unwrap();
+        assert!(
+            typed_tool_blocked_in_plan_mode(&config, &click),
+            "mutating computer_use click must be blocked by the typed Plan-mode gate"
+        );
     }
 
     #[test]

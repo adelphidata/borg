@@ -15,7 +15,7 @@ use tracing::instrument;
 
 use crate::types::ToolOutput;
 
-use super::{Agent, AgentEvent};
+use super::{typed_tool_blocked_in_plan_mode, Agent, AgentEvent};
 
 impl Agent {
     #[instrument(skip_all, fields(tool.name = %name))]
@@ -75,6 +75,13 @@ impl Agent {
                 )));
             }
         };
+
+        if typed_tool_blocked_in_plan_mode(&self.config, &tool) {
+            return Ok(ToolOutput::Text(
+                "Plan mode: mutating operations are not allowed. Use read-only tools (read_file, list_dir, list, memory_search, web_fetch, web_search, computer_use capture/list_apps/wait) to explore and formulate your plan."
+                    .into(),
+            ));
+        }
 
         // Variants returning ToolOutput directly (may contain multimodal content).
         match &tool {

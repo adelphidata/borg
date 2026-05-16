@@ -579,10 +579,12 @@ static FORK_BOMB: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|
 /// "if we report success it must succeed" invariant is upheld by the
 /// driver-text contract, not by post-hoc inspection here.
 ///
-/// Driver-returned text is capped at `MAX_DRIVER_TEXT_BYTES` to keep a
-/// misbehaving cua-driver build from pumping megabytes into LLM context.
+/// The final merged text is capped at `MAX_TOOL_TEXT_BYTES` to keep a
+/// misbehaving cua-driver build or oversized synthesized summary from
+/// pumping megabytes into LLM context.
 fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
     const MAX_DRIVER_TEXT_BYTES: usize = 4096;
+    const MAX_TOOL_TEXT_BYTES: usize = 4096;
     let mut driver_text = String::new();
     for part in resp.content {
         let DriverContent::Text(t) = part else {
@@ -608,11 +610,21 @@ fn merge_driver_text(summary: String, resp: DriverResponse) -> ToolOutput {
             "\n… [truncated {overflow} bytes from driver output]"
         ));
     }
-    if driver_text.is_empty() {
-        ToolOutput::Text(summary)
+    let mut merged = if driver_text.is_empty() {
+        summary
     } else {
-        ToolOutput::Text(format!("{summary}\n{driver_text}"))
+        format!("{summary}\n{driver_text}")
+    };
+    if merged.len() > MAX_TOOL_TEXT_BYTES {
+        let marker = "\n[truncated tool output]";
+        let mut cut = MAX_TOOL_TEXT_BYTES.saturating_sub(marker.len());
+        while !merged.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        merged.truncate(cut);
+        merged.push_str(marker);
     }
+    ToolOutput::Text(merged)
 }
 
 async fn click(args: &ComputerUseArgs, method: &str, driver: &dyn Driver) -> Result<ToolOutput> {
@@ -1242,7 +1254,7 @@ mod tests {
             "missing truncation marker: {text}"
         );
         assert!(
-            text.len() < 6_000,
+            text.len() <= 4096,
             "output not capped (len={}): {text}",
             text.len()
         );

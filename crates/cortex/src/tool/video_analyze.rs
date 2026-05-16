@@ -12,6 +12,7 @@
 
 use anyhow::Result;
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -71,6 +72,13 @@ pub(crate) async fn handle(args: &VideoAnalyzeArgs, config: &Config) -> Result<T
     let max_bytes = config.media.max_video_bytes;
 
     let (raw_bytes, hint_mime, filename, source_label) = if trimmed.starts_with("data:") {
+        if data_uri_exceeds_decoded_cap(trimmed, max_bytes) {
+            return Ok(ToolOutput::Text(format!(
+                "Error: video data URI is larger than {} MB; video_analyze caps at {} MB before decoding.",
+                max_bytes / (1024 * 1024),
+                max_bytes / (1024 * 1024)
+            )));
+        }
         match media::parse_data_uri(trimmed) {
             Ok(m) => {
                 let engine = base64::engine::general_purpose::STANDARD;
@@ -169,6 +177,15 @@ fn provider_is_gemini(config: &Config) -> bool {
     raw.eq_ignore_ascii_case("gemini")
 }
 
+fn data_uri_exceeds_decoded_cap(uri: &str, max_bytes: usize) -> bool {
+    let Some((_, data)) = uri.split_once(',') else {
+        return false;
+    };
+    let encoded_len = data.bytes().filter(|b| !b.is_ascii_whitespace()).count();
+    let max_encoded_len = max_bytes.div_ceil(3).saturating_mul(4);
+    encoded_len > max_encoded_len
+}
+
 /// Fetch a video over http(s) under url-policy + size caps. Mirrors
 /// `vision_analyze::fetch_remote` so the SSRF/redirect/post-fetch checks
 /// are identical — videos are bigger but the network attack surface is
@@ -238,7 +255,22 @@ async fn fetch_remote(
         }
     }
 
-    let bytes = resp.bytes().await?.to_vec();
+    let expected_len = resp
+        .content_length()
+        .map(|len| (len as usize).min(max_bytes));
+    let mut stream = resp.bytes_stream();
+    let mut bytes = Vec::with_capacity(expected_len.unwrap_or(0));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!(
+                "video is larger than {} MB; video_analyze caps at {} MB.",
+                max_bytes / (1024 * 1024),
+                max_bytes / (1024 * 1024)
+            );
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.len() > max_bytes {
         anyhow::bail!(
             "video is {} MB; video_analyze caps at {} MB.",
@@ -461,6 +493,25 @@ mod tests {
             other => panic!("expected text error, got {other:?}"),
         };
         assert!(text.contains("caps at"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_data_uri_before_decoding() {
+        let mut c = gemini_config();
+        c.media.max_video_bytes = 3;
+        let args = VideoAnalyzeArgs {
+            video_url: "data:video/mp4;base64,AAAAAAA=".into(),
+            question: None,
+        };
+        let out = handle(&args, &c).await.unwrap();
+        let text = match out {
+            ToolOutput::Text(t) => t,
+            other => panic!("expected text error, got {other:?}"),
+        };
+        assert!(
+            text.contains("before decoding"),
+            "oversized data URI should be rejected before base64 decode: {text}"
+        );
     }
 
     #[test]

@@ -267,13 +267,7 @@ fn build_contents_and_system(messages: &[Message]) -> (Vec<Value>, Option<String
                         );
                         "unknown_tool".to_string()
                     });
-                let content_text = msg.text_content().unwrap_or("").to_string();
-                pending_tool_responses.push(json!({
-                    "functionResponse": {
-                        "name": name,
-                        "response": {"content": content_text},
-                    }
-                }));
+                pending_tool_responses.extend(message_to_tool_response_parts(msg, &name));
             }
         }
     }
@@ -293,6 +287,30 @@ fn message_to_user_parts(msg: &Message) -> Vec<Value> {
         Some(MessageContent::Parts(parts)) => parts.iter().map(content_part_to_value).collect(),
         _ => Vec::new(),
     }
+}
+
+fn message_to_tool_response_parts(msg: &Message, name: &str) -> Vec<Value> {
+    let content_text = msg.text_content().unwrap_or("").to_string();
+    let mut parts = vec![json!({
+        "functionResponse": {
+            "name": name,
+            "response": {"content": content_text},
+        }
+    })];
+
+    // Multimodal tool outputs need both the Gemini functionResponse and the
+    // media parts. `video_analyze` relies on this path to make the video bytes
+    // visible to the next Gemini turn.
+    if let Some(MessageContent::Parts(content_parts)) = &msg.content {
+        parts.extend(
+            content_parts
+                .iter()
+                .filter(|part| !matches!(part, ContentPart::Text(_)))
+                .map(content_part_to_value),
+        );
+    }
+
+    parts
 }
 
 /// Returns (parts, function_call_names_in_order). The names list lets the
@@ -609,19 +627,26 @@ pub(crate) fn parse_gemini_sse_line(
         .and_then(Value::as_array)
     {
         for part in parts {
+            // Gemini 2.5 Thinking surfaces reasoning as `{"thought": "..."}`
+            // or `{"thought": true, "text": "..."}`. Surface it on its own
+            // channel so the TUI can dim it the way it does Anthropic thinking.
+            if let Some(thought_value) = part.get("thought") {
+                let thought = match thought_value {
+                    Value::String(s) => Some(s.as_str()),
+                    Value::Bool(true) => part.get("text").and_then(Value::as_str),
+                    _ => None,
+                };
+                if let Some(thought) = thought {
+                    if !thought.is_empty() {
+                        events.push(StreamEvent::ThinkingDelta(thought.to_string()));
+                    }
+                }
+                continue;
+            }
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if !text.is_empty() {
                     state.accumulator.text.push_str(text);
                     events.push(StreamEvent::TextDelta(text.to_string()));
-                }
-                continue;
-            }
-            // Gemini 2.5 Thinking surfaces reasoning as `{"thought": "..."}`
-            // (separate from `text`). Surface it on its own channel so the
-            // TUI can dim it the way it does Anthropic thinking.
-            if let Some(thought) = part.get("thought").and_then(Value::as_str) {
-                if !thought.is_empty() {
-                    events.push(StreamEvent::ThinkingDelta(thought.to_string()));
                 }
                 continue;
             }
@@ -661,12 +686,9 @@ pub(crate) fn parse_gemini_sse_line(
     {
         state.accumulator.finish_reason = Some(reason.to_string());
         match reason {
-            "STOP" => {
-                done_after = true;
-            }
+            "STOP" => {}
             "MAX_TOKENS" => {
                 events.push(StreamEvent::Truncated);
-                done_after = true;
             }
             "SAFETY" | "RECITATION" => {
                 // Mid-stream candidate-level block — surface and stop.
@@ -681,7 +703,6 @@ pub(crate) fn parse_gemini_sse_line(
                     model,
                     "gemini SSE: unknown finishReason `{other}` — treating as STOP"
                 );
-                done_after = true;
             }
         }
     }
@@ -701,6 +722,10 @@ pub(crate) fn parse_gemini_sse_line(
         };
         state.accumulator.usage = Some(usage.clone());
         events.push(StreamEvent::Usage(usage));
+    }
+
+    if state.accumulator.finish_reason.is_some() && state.accumulator.usage.is_some() {
+        done_after = true;
     }
 
     if events.is_empty() && !done_after {
@@ -833,6 +858,63 @@ mod tests {
         let fr = &tool_user_turn["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "vision_analyze");
         assert_eq!(fr["response"]["content"], "the image shows a cat");
+    }
+
+    #[test]
+    fn build_request_tool_result_preserves_multimodal_parts() {
+        let assistant_with_call = Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_video".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "video_analyze".into(),
+                    arguments: r#"{"video_url":"data:video/mp4;base64,AAAA"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        };
+        let tool_result = Message::tool_result_multimodal(
+            "call_video",
+            vec![
+                ContentPart::Text("Video from data URI (12 bytes).".into()),
+                ContentPart::VideoBase64 {
+                    media: MediaData {
+                        mime_type: "video/mp4".into(),
+                        data: "AAAA".into(),
+                        filename: Some("clip.mp4".into()),
+                    },
+                },
+            ],
+        );
+        let cfg = default_cfg();
+        let body = build_gemini_request(&make_request(
+            &[Message::user("describe"), assistant_with_call, tool_result],
+            None,
+            &cfg,
+        ));
+
+        let tool_turn = body["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| {
+                c["parts"]
+                    .as_array()
+                    .map(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+                    .unwrap_or(false)
+            })
+            .expect("tool response turn");
+        let parts = tool_turn["parts"].as_array().unwrap();
+        assert!(parts.iter().any(|p| p.get("functionResponse").is_some()));
+        let inline = parts
+            .iter()
+            .find_map(|p| p.get("inline_data"))
+            .expect("video inline_data must survive tool result conversion");
+        assert_eq!(inline["mime_type"], "video/mp4");
+        assert_eq!(inline["data"], "AAAA");
     }
 
     #[test]
@@ -1239,7 +1321,10 @@ mod tests {
     fn stream_finish_reason_max_tokens_emits_truncated() {
         let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#;
         let (_, emitted, done) = feed(&[line]);
-        assert!(done);
+        assert!(
+            !done,
+            "finishReason without usageMetadata should not stop before a later usage frame or EOF"
+        );
         assert!(emitted.iter().any(|e| matches!(e, StreamEvent::Truncated)));
     }
 
@@ -1263,6 +1348,18 @@ mod tests {
             emitted
                 .iter()
                 .any(|e| matches!(e, StreamEvent::ThinkingDelta(t) if t == "reasoning...")),
+            "expected ThinkingDelta, got {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn stream_thinking_delta_surfaced_for_legacy_bool_shape() {
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"legacy thought"}]}}]}"#;
+        let (_, emitted, _) = feed(&[line]);
+        assert!(
+            emitted
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ThinkingDelta(t) if t == "legacy thought")),
             "expected ThinkingDelta, got {emitted:?}"
         );
     }
@@ -1333,11 +1430,34 @@ mod tests {
     }
 
     #[test]
+    fn stream_finish_reason_waits_for_later_usage_metadata() {
+        let lines = &[
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}"#,
+            r#"data: {"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}"#,
+        ];
+        let (_, emitted, done) = feed(lines);
+        assert!(
+            done,
+            "usage frame after finishReason should terminate the stream"
+        );
+        let kinds: Vec<&str> = emitted
+            .iter()
+            .map(|e| match e {
+                StreamEvent::TextDelta(_) => "TextDelta",
+                StreamEvent::Usage(_) => "Usage",
+                StreamEvent::Done => "Done",
+                _ => "Other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["TextDelta", "Usage", "Done"]);
+    }
+
+    #[test]
     fn stream_finish_reason_max_tokens_emits_truncated_then_done() {
         // MAX_TOKENS: must emit BOTH `Truncated` (sets the truncation flag
         // for the next-turn hint) AND `Done` (terminates the loop). The
         // order matters — `Done` short-circuits, so it must come last.
-        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}"#;
+        let line = r#"data: {"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}"#;
         let (_, emitted, done) = feed(&[line]);
         assert!(done);
         let kinds: Vec<&str> = emitted
