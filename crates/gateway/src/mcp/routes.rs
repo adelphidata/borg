@@ -24,7 +24,7 @@ use super::server::McpServer;
 #[derive(Clone)]
 pub struct McpHttpState {
     /// Open a fresh DB for token verification per request.
-    pub db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync>,
+    pub db_open: crate::DbOpener,
     /// MCP server instance handling JSON-RPC dispatch.
     pub server: Arc<McpServer>,
 }
@@ -42,7 +42,7 @@ async fn mcp_post(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(resp) = authenticate(&headers, &state) {
+    if let Err(resp) = authenticate(&headers, &state).await {
         return resp;
     }
 
@@ -53,8 +53,10 @@ async fn mcp_post(
 }
 
 #[allow(clippy::result_large_err)]
-fn authenticate(headers: &HeaderMap, state: &McpHttpState) -> Result<(), Response> {
-    let db = (state.db_open)().map_err(|_| auth_error("auth backend unavailable"))?;
+async fn authenticate(headers: &HeaderMap, state: &McpHttpState) -> Result<(), Response> {
+    let db = (state.db_open)()
+        .await
+        .map_err(|_| auth_error("auth backend unavailable"))?;
     let auth = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -62,7 +64,9 @@ fn authenticate(headers: &HeaderMap, state: &McpHttpState) -> Result<(), Respons
     let token = auth
         .strip_prefix("Bearer ")
         .ok_or_else(|| auth_error("Authorization header must use Bearer scheme"))?;
-    tokens::verify(&db, token).map_err(|_| auth_error("invalid client token"))?;
+    tokens::verify(&db, token)
+        .await
+        .map_err(|_| auth_error("invalid client token"))?;
     Ok(())
 }
 
@@ -100,7 +104,7 @@ mod tests {
         }
     }
 
-    fn make_state() -> (
+    async fn make_state() -> (
         McpHttpState,
         cortex::auth::tokens::IssuedToken,
         tempfile::TempDir,
@@ -108,13 +112,14 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("test.db");
         let path_for_factory = path.clone();
-        let db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> =
-            Arc::new(move || {
-                let conn = rusqlite::Connection::open(&path_for_factory)?;
-                Database::from_connection(conn)
-            });
-        let setup_db = (db_open)().expect("open setup db");
-        let issued = cortex::auth::tokens::issue(&setup_db, "mcp-tok", "mcp").expect("issue token");
+        let db_open: crate::DbOpener = Arc::new(move || {
+            let p = path_for_factory.clone();
+            Box::pin(async move { Database::open_at(&p).await })
+        });
+        let setup_db = (db_open)().await.expect("open setup db");
+        let issued = cortex::auth::tokens::issue(&setup_db, "mcp-tok", "mcp")
+            .await
+            .expect("issue token");
         let tools: Vec<Box<dyn ReadOnlyToolHandler>> = vec![Box::new(StubTool)];
         let server = Arc::new(McpServer::new(tools, "0.1.0-test"));
         (McpHttpState { db_open, server }, issued, tmp)
@@ -143,7 +148,7 @@ mod tests {
         // MCP HTTP transport is just as sensitive as OpenAI-compat —
         // any unauthenticated MCP `tools/call` would let third
         // parties query Borg's memory store unrestricted.
-        let (state, _issued, _tmp) = make_state();
+        let (state, _issued, _tmp) = make_state().await;
         let resp = http_router(state)
             .oneshot(req_with(
                 None,
@@ -156,7 +161,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_invalid_token_rejected() {
-        let (state, _issued, _tmp) = make_state();
+        let (state, _issued, _tmp) = make_state().await;
         let resp = http_router(state)
             .oneshot(req_with(
                 Some("forged-token"),
@@ -172,7 +177,7 @@ mod tests {
         // End-to-end happy path: a valid token gets the registered
         // tools back over the wire. Catches breaks in HTTP→server
         // wiring (axum extract, JSON ser/de, dispatcher routing).
-        let (state, issued, _tmp) = make_state();
+        let (state, issued, _tmp) = make_state().await;
         let resp = http_router(state)
             .oneshot(req_with(
                 Some(&issued.plaintext),
@@ -198,7 +203,7 @@ mod tests {
         // Notifications get no JSON-RPC body but the HTTP response
         // still needs status — 204 is the right signal that the
         // server processed the message without producing a reply.
-        let (state, issued, _tmp) = make_state();
+        let (state, issued, _tmp) = make_state().await;
         let resp = http_router(state)
             .oneshot(req_with(
                 Some(&issued.plaintext),

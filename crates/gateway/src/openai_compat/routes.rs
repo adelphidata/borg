@@ -385,29 +385,27 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    fn make_state(
+    async fn make_state(
         chunks: Vec<AgentEventChunk>,
     ) -> (
         OpenAiState,
         cortex::auth::tokens::IssuedToken,
         tempfile::TempDir,
     ) {
-        // Use a tempfile-backed DB so the `db_open` factory returns
-        // the same persisted state every call. `test_db()` would give
-        // us an in-memory DB scoped to one connection, which the
-        // factory pattern can't share across requests — the test's
-        // setup token would not be visible to the route handler.
+        // Use a tempfile-backed DB so each call of the factory opens a
+        // fresh handle against the same persisted state. The route
+        // handler must see the setup token issued below.
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("test.db");
         let path_for_factory = path.clone();
-        let db_open: Arc<dyn Fn() -> anyhow::Result<Database> + Send + Sync> =
-            Arc::new(move || {
-                let conn = rusqlite::Connection::open(&path_for_factory)?;
-                Database::from_connection(conn)
-            });
+        let db_open: crate::DbOpener = Arc::new(move || {
+            let p = path_for_factory.clone();
+            Box::pin(async move { Database::open_at(&p).await })
+        });
 
-        let setup_db = (db_open)().expect("open setup db");
+        let setup_db = (db_open)().await.expect("open setup db");
         let issued = cortex::auth::tokens::issue(&setup_db, "test-tok", "openai_compat")
+            .await
             .expect("issue token");
 
         let gate = Arc::new(IngressGate::with_noop_audit(100, Duration::from_secs(1)));
@@ -464,7 +462,7 @@ mod tests {
     async fn missing_bearer_returns_401() {
         // Auth-bypass would expose the agent loop publicly. The
         // missing-header path must be 401, not 200, not 500.
-        let (state, _issued, _tmp) = make_state(vec![AgentEventChunk::Done]);
+        let (state, _issued, _tmp) = make_state(vec![AgentEventChunk::Done]).await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -483,7 +481,7 @@ mod tests {
     async fn wrong_token_returns_401() {
         // Brute-forcing tokens must hit the same generic 401 as a
         // missing header — no oracle for "did this token ever exist".
-        let (state, _issued, _tmp) = make_state(vec![AgentEventChunk::Done]);
+        let (state, _issued, _tmp) = make_state(vec![AgentEventChunk::Done]).await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -508,7 +506,8 @@ mod tests {
             AgentEventChunk::Text("hello ".into()),
             AgentEventChunk::Text("world".into()),
             AgentEventChunk::Done,
-        ]);
+        ])
+        .await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -549,7 +548,8 @@ mod tests {
             },
             AgentEventChunk::Text("found 3 results".into()),
             AgentEventChunk::Done,
-        ]);
+        ])
+        .await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -582,7 +582,8 @@ mod tests {
             AgentEventChunk::Text("hi ".into()),
             AgentEventChunk::Text("there".into()),
             AgentEventChunk::Done,
-        ]);
+        ])
+        .await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -642,7 +643,7 @@ mod tests {
         // OpenAI returns 400 on empty messages; we match for SDK
         // compatibility (the `openai` Python SDK raises BadRequestError
         // and decodes the JSON `error.message`).
-        let (state, issued, _tmp) = make_state(vec![AgentEventChunk::Done]);
+        let (state, issued, _tmp) = make_state(vec![AgentEventChunk::Done]).await;
         let app = router(state);
         let resp = app
             .oneshot(req_with(
@@ -660,7 +661,7 @@ mod tests {
         // aliases shouldn't be a public information leak. With auth,
         // it must return the configured set so SDK model pickers
         // populate.
-        let (state, issued, _tmp) = make_state(vec![AgentEventChunk::Done]);
+        let (state, issued, _tmp) = make_state(vec![AgentEventChunk::Done]).await;
         let app = router(state.clone());
         let resp = app
             .oneshot(
