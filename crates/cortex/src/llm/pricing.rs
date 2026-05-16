@@ -128,6 +128,39 @@ static OPENAI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(
     ])
 });
 
+static GEMINI_RATES: LazyLock<HashMap<&'static str, ModelRate>> = LazyLock::new(|| {
+    HashMap::from([
+        (
+            "gemini-2.5-pro",
+            ModelRate {
+                input_per_mtok: "1.25",
+                output_per_mtok: "10.00",
+            },
+        ),
+        (
+            "gemini-2.5-flash",
+            ModelRate {
+                input_per_mtok: "0.30",
+                output_per_mtok: "2.50",
+            },
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            ModelRate {
+                input_per_mtok: "0.10",
+                output_per_mtok: "0.40",
+            },
+        ),
+        (
+            "gemini-2.0-flash",
+            ModelRate {
+                input_per_mtok: "0.10",
+                output_per_mtok: "0.40",
+            },
+        ),
+    ])
+});
+
 static ANTHROPIC_RATES: LazyLock<HashMap<&'static str, AnthropicModelRate>> = LazyLock::new(|| {
     HashMap::from([
         (
@@ -217,12 +250,15 @@ fn normalize_model_id(model: &str) -> &str {
     model
         .strip_prefix("openai/")
         .or_else(|| model.strip_prefix("anthropic/"))
+        .or_else(|| model.strip_prefix("google/"))
+        .or_else(|| model.strip_prefix("gemini/"))
         .unwrap_or(model)
 }
 
 fn rates_for(provider: Provider) -> Option<&'static HashMap<&'static str, ModelRate>> {
     match provider {
         Provider::OpenAi => Some(&OPENAI_RATES),
+        Provider::Gemini => Some(&GEMINI_RATES),
         _ => None,
     }
 }
@@ -280,6 +316,7 @@ pub fn has_model_rate(provider: Provider, model: &str) -> bool {
     match provider {
         Provider::OpenAi => OPENAI_RATES.contains_key(normalize_model_id(model)),
         Provider::Anthropic => ANTHROPIC_RATES.contains_key(normalize_model_id(model)),
+        Provider::Gemini => GEMINI_RATES.contains_key(normalize_model_id(model)),
         _ => false,
     }
 }

@@ -100,6 +100,14 @@ pub enum LlmError {
     },
     /// Request was cancelled via cancellation token.
     Interrupted,
+    /// The credential backing the call was revoked mid-flight (operator
+    /// removal or 401/403 on a concurrent request). The pool's
+    /// `cancel_active_calls` fired the cancellation token bound to this
+    /// stream. Distinct from `Interrupted` because the agent layer should
+    /// rotate to a different credential and retry — the conversation is
+    /// recoverable. Distinct from `Fatal { AuthPermanent }` because the
+    /// stream was aborted from the pool side, not the provider's response.
+    AuthRevoked,
 }
 
 impl fmt::Display for LlmError {
@@ -108,6 +116,7 @@ impl fmt::Display for LlmError {
             Self::Retryable { source, .. } => write!(f, "{source}"),
             Self::Fatal { source, .. } => write!(f, "{source}"),
             Self::Interrupted => write!(f, "request interrupted"),
+            Self::AuthRevoked => write!(f, "credential revoked mid-stream"),
         }
     }
 }
@@ -125,6 +134,11 @@ impl LlmError {
         match self {
             Self::Retryable { reason, .. } | Self::Fatal { reason, .. } => *reason,
             Self::Interrupted => FailoverReason::Unknown,
+            // Surface mid-stream revocation as `Auth` so the agent layer
+            // routes it through the same rotate-credential path as a 401 on
+            // the response. `AuthPermanent` would short-circuit fallback;
+            // here we want the next pool credential to get a chance.
+            Self::AuthRevoked => FailoverReason::Auth,
         }
     }
 
@@ -197,10 +211,21 @@ pub(crate) fn classify_status(
             retry_after: None,
             reason: FailoverReason::Overloaded,
         },
-        401 => LlmError::Fatal {
-            source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
-            reason: FailoverReason::Auth,
-        },
+        401 => {
+            // Gemini AI Studio uses static API keys (no token-refresh dance)
+            // — a 401 means the key is wrong/revoked and rotation alone won't
+            // recover it. Treat as permanent so the pool retires the
+            // credential instead of cooling-down-and-retrying.
+            let reason = if matches!(provider, Provider::Gemini) {
+                FailoverReason::AuthPermanent
+            } else {
+                FailoverReason::Auth
+            };
+            LlmError::Fatal {
+                source: anyhow::anyhow!("{provider} returned 401 (auth error): {safe}"),
+                reason,
+            }
+        }
         403 => LlmError::Fatal {
             source: anyhow::anyhow!("{provider} returned 403 (auth permanent): {safe}"),
             reason: FailoverReason::AuthPermanent,
@@ -549,15 +574,46 @@ pub fn parse_retry_after(body: &str) -> Option<Duration> {
     let raw = &v["error"]["retry_after"];
     // Number form is the spec'd shape (OpenAI, OpenRouter native); string form
     // ("30", "1.5") is a fallback for upstreams that pass through a stringified
-    // value via OpenRouter's `error.metadata.raw` wrapper.
+    // value via OpenRouter's `error.metadata.raw` wrapper. Each candidate is
+    // validated finite/positive before short-circuiting so a degenerate
+    // `retry_after: 0` doesn't mask a valid Google `retryDelay` fallback.
+    let valid = |n: f64| -> Option<f64> {
+        if n.is_finite() && n > 0.0 {
+            Some(n)
+        } else {
+            None
+        }
+    };
     let secs = raw
         .as_f64()
-        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
-    if !secs.is_finite() || secs <= 0.0 {
-        return None;
-    }
+        .and_then(valid)
+        .or_else(|| {
+            raw.as_str()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .and_then(valid)
+        })
+        .or_else(|| parse_google_retry_delay(&v).and_then(valid))?;
     const MAX_RETRY: f64 = 24.0 * 60.0 * 60.0;
     Some(Duration::from_secs_f64(secs.min(MAX_RETRY)))
+}
+
+/// Walk `error.details[]` for the first `retryDelay` string in Google's
+/// `RetryInfo` proto encoding (e.g. `"37s"`, `"1.5s"`). Returns seconds as
+/// `f64` so the caller can apply the same clamp guards as the other shapes.
+fn parse_google_retry_delay(v: &serde_json::Value) -> Option<f64> {
+    let details = v.get("error")?.get("details")?.as_array()?;
+    for d in details {
+        let Some(raw) = d.get("retryDelay").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(stripped) = raw.strip_suffix('s') else {
+            continue;
+        };
+        if let Ok(n) = stripped.parse::<f64>() {
+            return Some(n);
+        }
+    }
+    None
 }
 
 /// Fallback extraction for free-form provider retry hints when the structured

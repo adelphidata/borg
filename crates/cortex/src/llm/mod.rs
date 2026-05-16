@@ -102,6 +102,7 @@ pub(crate) mod cloud_auth;
 mod cost;
 pub mod credential_pool;
 pub mod credential_sources;
+pub(crate) mod gemini;
 pub mod llm_error;
 pub mod model_registry;
 pub mod oauth_refresh;
@@ -1136,6 +1137,15 @@ impl LlmClient {
                 Some(cost) => (Some(cost), true, "table_anthropic".to_string()),
                 None => (None, false, "unknown".to_string()),
             },
+            Provider::Gemini => match pricing::estimate_cost_usd(
+                Provider::Gemini,
+                &model,
+                u64::from(prompt_tokens),
+                u64::from(completion_tokens),
+            ) {
+                Some(cost) => (Some(cost), true, "table_gemini".to_string()),
+                None => (None, false, "unknown".to_string()),
+            },
             _ => (None, false, "unknown".to_string()),
         };
 
@@ -1304,6 +1314,9 @@ impl LlmClient {
                 {
                     self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
                         .await
+                } else if matches!(self.provider, Provider::Gemini) {
+                    self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
+                        .await
                 } else if self.provider.is_openai_compatible() {
                     self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
                         .await
@@ -1462,6 +1475,8 @@ impl LlmClient {
             && vertex::is_anthropic_model(&self.llm_config.model)
         {
             self.chat_vertex_anthropic(messages, tools).await
+        } else if matches!(self.provider, Provider::Gemini) {
+            self.chat_gemini(messages, tools).await
         } else if self.provider.is_openai_compatible() {
             self.chat_openai(messages, tools).await
         } else {
@@ -2090,6 +2105,28 @@ impl LlmClient {
         tools: Option<&[ToolDefinition]>,
     ) -> Result<Message> {
         self.chat_http_transport_inner(transport::vertex_anthropic_transport(), messages, tools)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "gemini"))]
+    async fn stream_chat_gemini_inner(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+        tx: &mpsc::Sender<StreamEvent>,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<(), LlmError> {
+        self.stream_http_transport_inner(transport::gemini_transport(), messages, tools, tx, cancel)
+            .await
+    }
+
+    #[instrument(skip_all, fields(llm.provider = "gemini"))]
+    async fn chat_gemini(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<Message> {
+        self.chat_http_transport_inner(transport::gemini_transport(), messages, tools)
             .await
     }
 }

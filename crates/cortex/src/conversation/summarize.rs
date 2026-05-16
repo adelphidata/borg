@@ -70,6 +70,12 @@ pub(super) fn summarize_parts(parts: &[ContentPart]) -> String {
                     media.filename.as_deref().unwrap_or("attached")
                 ));
             }
+            ContentPart::VideoBase64 { media } => {
+                out.push_str(&format!(
+                    " [video: {}]",
+                    media.filename.as_deref().unwrap_or("attached")
+                ));
+            }
         }
     }
     out

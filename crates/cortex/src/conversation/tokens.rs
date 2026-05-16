@@ -24,6 +24,14 @@ pub(super) fn message_tokens(msg: &Message) -> usize {
                     let decoded_bytes = media.data.len() * 3 / 4;
                     (decoded_bytes / constants::AUDIO_BYTES_PER_TOKEN).max(AUDIO_TOKEN_ESTIMATE_MIN)
                 }
+                ContentPart::VideoBase64 { media } => {
+                    // Gemini tokenises video server-side and the only adapter
+                    // that ships bytes today is Gemini; for other providers we
+                    // emit a placeholder string, so a coarse audio-shaped
+                    // estimate is the conservative budget here.
+                    let decoded_bytes = media.data.len() * 3 / 4;
+                    (decoded_bytes / constants::AUDIO_BYTES_PER_TOKEN).max(AUDIO_TOKEN_ESTIMATE_MIN)
+                }
             })
             .sum(),
         None => 0,

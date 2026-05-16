@@ -149,6 +149,13 @@ impl Provider {
     }
 
     /// Whether this provider uses the OpenAI-compatible chat completions format.
+    ///
+    /// Gemini was historically routed through OpenAI-compat (Gemini AI Studio
+    /// exposes an OpenAI-shaped façade at `/v1beta/openai/chat/completions`),
+    /// but that path strips `inline_data` for video and refuses
+    /// Gemini-specific request fields (`thinkingConfig`, `cachedContents`).
+    /// Now routed through the native `gemini_transport()` so video parts and
+    /// the full request shape reach the model.
     pub fn is_openai_compatible(&self) -> bool {
         !matches!(
             self,
@@ -156,6 +163,7 @@ impl Provider {
                 | Provider::Bedrock
                 | Provider::ClaudeCli
                 | Provider::ClaudeCodeOAuth
+                | Provider::Gemini
         )
     }
 
@@ -190,15 +198,24 @@ impl Provider {
                 headers.insert("x-api-key", val);
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             }
-            Provider::OpenAi
-            | Provider::Gemini
-            | Provider::DeepSeek
-            | Provider::Groq
-            | Provider::XAi => {
+            Provider::OpenAi | Provider::DeepSeek | Provider::Groq | Provider::XAi => {
                 let bearer = format!("Bearer {api_key}");
                 let val = HeaderValue::from_str(&bearer)
                     .context("API key contains invalid characters for HTTP headers")?;
                 headers.insert("Authorization", val);
+            }
+            Provider::Gemini => {
+                // Native AI Studio (`/v1beta/models/...:generateContent`)
+                // authenticates raw API keys with `x-goog-api-key`, NOT
+                // `Authorization: Bearer` (which is reserved for OAuth /
+                // service-account access tokens and returns 401 for an
+                // API key). The pre-M4 OpenAI-compat façade did accept
+                // Bearer, which is why this lived in the same arm; M4
+                // splits it because the native endpoint rejects Bearer
+                // for static API keys.
+                let val = HeaderValue::from_str(api_key)
+                    .context("API key contains invalid characters for HTTP headers")?;
+                headers.insert("x-goog-api-key", val);
             }
             Provider::ClaudeCodeOAuth => {
                 // Anthropic wire format, but auth is OAuth Bearer (not x-api-key).

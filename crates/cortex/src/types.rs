@@ -48,6 +48,15 @@ pub enum ContentPart {
         /// The audio media data.
         media: MediaData,
     },
+    /// Base64-encoded video with metadata. Produced by the `video_analyze`
+    /// tool and consumed natively by the Gemini adapter. Every other
+    /// transport (OpenAI Chat compat, Anthropic, Bedrock) serializes a text
+    /// placeholder so the wire format stays valid — the operator-visible
+    /// degradation is "model can't see frames", not a hard failure.
+    VideoBase64 {
+        /// The video media data.
+        media: MediaData,
+    },
 }
 
 impl Serialize for ContentPart {
@@ -83,6 +92,25 @@ impl Serialize for ContentPart {
                 map.serialize_entry(
                     "input_audio",
                     &serde_json::json!({"data": media.data, "format": format}),
+                )?;
+                map.end()
+            }
+            // OpenAI Chat has no video content type, so this Serialize impl
+            // emits a `text` placeholder. The native Gemini adapter (M2)
+            // builds its own request shape and never routes through here,
+            // so this placeholder only fires when an operator misroutes a
+            // video to a non-Gemini provider — deliberate degradation, not
+            // silent loss.
+            ContentPart::VideoBase64 { media } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("type", "text")?;
+                map.serialize_entry(
+                    "text",
+                    &format!(
+                        "[video: {} ({})]",
+                        media.filename.as_deref().unwrap_or("attached"),
+                        media.mime_type
+                    ),
                 )?;
                 map.end()
             }
@@ -204,6 +232,12 @@ impl MessageContent {
                         ContentPart::AudioBase64 { media } => {
                             out.push_str(&format!(
                                 " [audio: {}]",
+                                media.filename.as_deref().unwrap_or("attached")
+                            ));
+                        }
+                        ContentPart::VideoBase64 { media } => {
+                            out.push_str(&format!(
+                                " [video: {}]",
                                 media.filename.as_deref().unwrap_or("attached")
                             ));
                         }
@@ -756,5 +790,80 @@ mod tests {
         let json = r#"{"title":"X","status":"unknown"}"#;
         let result = serde_json::from_str::<PlanStep>(json);
         assert!(result.is_err());
+    }
+
+    // ── ContentPart::VideoBase64 (Gemini adapter M1) ──
+
+    #[test]
+    fn video_base64_serialize_falls_back_to_text_for_openai() {
+        // The whole point of the placeholder serialize impl: OpenAI Chat
+        // has no video content type. Non-Gemini providers must still get
+        // a well-formed payload (text block) instead of a wire-format
+        // error or a silently dropped attachment.
+        let part = ContentPart::VideoBase64 {
+            media: MediaData {
+                mime_type: "video/mp4".into(),
+                data: "ZmFrZQ==".into(),
+                filename: Some("clip.mp4".into()),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "text");
+        assert_eq!(json["text"], "[video: clip.mp4 (video/mp4)]");
+    }
+
+    #[test]
+    fn video_base64_serialize_without_filename_uses_attached_placeholder() {
+        let part = ContentPart::VideoBase64 {
+            media: MediaData {
+                mime_type: "video/webm".into(),
+                data: "ZmFrZQ==".into(),
+                filename: None,
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["text"], "[video: attached (video/webm)]");
+    }
+
+    #[test]
+    fn video_base64_full_text_placeholder() {
+        // `full_text` is used for token-budget summaries and audit trails —
+        // it must mention every video part by filename so a reader can
+        // tell what was attached even though the bytes were stripped.
+        let mc = MessageContent::Parts(vec![
+            ContentPart::Text("see this clip".into()),
+            ContentPart::VideoBase64 {
+                media: MediaData {
+                    mime_type: "video/mp4".into(),
+                    data: "ZmFrZQ==".into(),
+                    filename: Some("clip.mp4".into()),
+                },
+            },
+        ]);
+        assert!(mc.full_text().contains("[video: clip.mp4]"));
+    }
+
+    #[test]
+    fn video_base64_deserialize_via_text_placeholder_round_trips_to_text() {
+        // Video isn't echoed back by any provider response today (Gemini
+        // returns text/functionCall). The Serialize impl emits a `text`
+        // block placeholder, which round-trips through the Deserialize
+        // impl as `ContentPart::Text` — that asymmetry is intentional:
+        // bytes only flow outward, never back. If a provider ever does
+        // surface a video part inbound, this test will need a real
+        // discriminator and update.
+        let part = ContentPart::VideoBase64 {
+            media: MediaData {
+                mime_type: "video/mp4".into(),
+                data: "ZmFrZQ==".into(),
+                filename: Some("clip.mp4".into()),
+            },
+        };
+        let json = serde_json::to_value(&part).unwrap();
+        let back: ContentPart = serde_json::from_value(json).unwrap();
+        match back {
+            ContentPart::Text(t) => assert!(t.contains("clip.mp4")),
+            other => unreachable!("expected Text fallback, got {other:?}"),
+        }
     }
 }

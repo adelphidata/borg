@@ -28,6 +28,10 @@ pub(crate) enum StreamState {
     OpenAiCompat,
     Anthropic(AnthropicStreamState),
     Bedrock(BedrockStreamState),
+    /// Native Gemini SSE accumulator. `Provider::Gemini` routes through
+    /// `gemini_transport()`, which produces this variant from
+    /// `new_stream_state()`.
+    Gemini(crate::llm::gemini::GeminiStreamState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +90,7 @@ static OPENAI_COMPAT_TRANSPORT: OpenAiCompatTransport = OpenAiCompatTransport;
 static ANTHROPIC_TRANSPORT: AnthropicTransport = AnthropicTransport;
 static BEDROCK_TRANSPORT: BedrockTransport = BedrockTransport;
 static VERTEX_ANTHROPIC_TRANSPORT: VertexAnthropicTransport = VertexAnthropicTransport;
+static GEMINI_TRANSPORT: crate::llm::gemini::GeminiTransport = crate::llm::gemini::GeminiTransport;
 
 pub(crate) fn openai_compat_transport() -> &'static dyn Transport {
     &OPENAI_COMPAT_TRANSPORT
@@ -101,6 +106,13 @@ pub(crate) fn bedrock_transport() -> &'static dyn Transport {
 
 pub(crate) fn vertex_anthropic_transport() -> &'static dyn Transport {
     &VERTEX_ANTHROPIC_TRANSPORT
+}
+
+/// Native Gemini AI Studio transport. `Provider::Gemini` routes through
+/// this transport rather than the OpenAI-compat façade so video parts
+/// and Gemini-specific request fields survive the round-trip.
+pub(crate) fn gemini_transport() -> &'static dyn Transport {
+    &GEMINI_TRANSPORT
 }
 
 pub(crate) fn extract_provider_cost_usd(usage: &StreamUsage) -> Option<String> {
@@ -864,6 +876,20 @@ fn build_openai_request(
     {
         apply_openai_cache_markers(&mut body, &request.llm_config.cache);
     }
+    // OpenAI's reasoning families (o-series, gpt-5*) replaced `max_tokens` with
+    // `max_completion_tokens` on the Chat Completions wire. Rewrite at the JSON
+    // boundary so the in-Rust `ChatRequest` struct stays single-named while the
+    // wire shape matches the endpoint. Match is model-driven (registry slug),
+    // not provider-driven, because the same slug routed through any host that
+    // proxies to api.openai.com (OpenRouter `openai/o3`, Azure deployments
+    // named after reasoning models) needs the same field name.
+    if super::model_registry::uses_max_completion_tokens(request.model) {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(v) = obj.remove("max_tokens") {
+                obj.insert("max_completion_tokens".to_string(), v);
+            }
+        }
+    }
     Ok(body)
 }
 
@@ -952,6 +978,11 @@ fn build_bedrock_request(request: &TransportRequest<'_>) -> serde_json::Value {
                                 crate::types::ContentPart::AudioBase64 { media } => {
                                     tool_result_content.push(serde_json::json!({
                                         "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
+                                    }));
+                                }
+                                crate::types::ContentPart::VideoBase64 { media } => {
+                                    tool_result_content.push(serde_json::json!({
+                                        "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video"))
                                     }));
                                 }
                             }
@@ -1055,6 +1086,11 @@ fn append_bedrock_content(content: &mut Vec<serde_json::Value>, message: &Messag
                     crate::types::ContentPart::AudioBase64 { media } => {
                         content.push(serde_json::json!({
                             "text": format!("[audio: {}]", media.filename.as_deref().unwrap_or("audio"))
+                        }));
+                    }
+                    crate::types::ContentPart::VideoBase64 { media } => {
+                        content.push(serde_json::json!({
+                            "text": format!("[video: {}]", media.filename.as_deref().unwrap_or("video"))
                         }));
                     }
                 }
