@@ -8,6 +8,8 @@ pub mod hex;
 pub mod panic_utils;
 /// Retry utilities with exponential backoff.
 pub mod retry;
+/// Wall-clock helpers.
+pub mod time;
 /// Text truncation with head+tail preservation.
 pub mod truncate;
 /// Tiny Unix filesystem helpers (chmod) shared across crates.
