@@ -5922,11 +5922,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "rand 0.9.4",
  "serde",
+ "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "which 7.0.3",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

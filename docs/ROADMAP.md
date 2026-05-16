@@ -368,6 +368,51 @@ top-down by priority, not by section order.
 
 ### Security & sandboxing
 
+- **Windows sandbox — validate Tier 1 on a real host.** Tier 1
+  (restricted token + DACL ACEs + `CreateProcessAsUserW`) was ported
+  in 2026-05 and cross-compiles cleanly against the Windows target,
+  but the FFI paths have never run. Spin up a Windows VM, run
+  `cargo test -p sandbox --lib --target x86_64-pc-windows-msvc` (the
+  `cfg(target_os = "windows")` tests in `sid::tests`,
+  `process::tests`, and any new ones added during validation), then
+  exercise the trampoline end-to-end: set `sandbox.enabled = true`,
+  ask the agent to `run_shell` something that reads
+  `~\.ssh\fake_file` (assert `Access is denied`) and that writes to
+  the workspace (assert success). Until this is done, treat Tier 1
+  as in-development and recommend operators run with
+  `sandbox.enabled = false` if they hit issues.
+- **Windows sandbox — Tier 2 elevated backend (WFP + sandbox users).**
+  Deferred. Real network isolation (WFP kernel filter rules) and a
+  separate user identity for the child require admin to set up.
+  Design: `borg service install --windows-sandbox` triggers a UAC
+  prompt, creates `BorgSandboxOffline` + `BorgSandboxOnline` users,
+  registers WFP rules denying outbound for the offline SID, and
+  persists state to `~/.borg/sandbox-windows/setup.json`. The
+  trampoline auto-promotes when setup.json is present and version-
+  current; auto-falls-back to Tier 1 otherwise. Mirrors the
+  `security.kek_backend = auto` pattern.
+- **Windows sandbox — replace argv-policy transport.** Deferred.
+  Today the trampoline carries the policy JSON on its own argv,
+  observable to any same-session local process via WMI / `tasklist
+  /v`. The policy is not a credential, but `deny_read` /
+  `deny_write` paths form a useful map for a different-vector
+  attacker. Replace with an inheritable anonymous-pipe handle the
+  trampoline reads on startup, or a transient HMAC-sealed file at
+  `~/.borg/run/sandbox-<nonce>.json` referenced on argv by path +
+  one-shot nonce only. SECURITY note in
+  `crates/sandbox/src/windows/mod.rs`.
+- **Windows sandbox — caller authentication on the trampoline
+  subcommand.** Deferred. The `__windows-sandbox-spawn` token alone
+  is a soft check, not a security boundary: any process that can
+  invoke `borg.exe` can hand-craft a `--policy` invocation. Add
+  parent-PID validation (same `borg.exe` path, same logon session)
+  or an inheritable shared-memory nonce only the spawning parent
+  could have written.
+- **Windows sandbox — CI runner.** Deferred. Tests under
+  `crates/sandbox/src/windows/` are gated `cfg(target_os =
+"windows")` and only execute when developers run them on a Windows
+  box. Add a `windows-latest` job to `.github/workflows/ci.yml`
+  matrix once Tier 1 has been validated manually.
 - **Docker / SSH sandbox backends.** `[O]` In addition to Seatbelt
   and bwrap, allow agent-issued shell to run inside a Docker container
   or over SSH to a remote VM. Makes Linux desktop installs (where
