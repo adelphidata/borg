@@ -1187,7 +1187,13 @@ struct EpochTimer {
 
 impl EpochTimer {
     fn new(engine: &wasmtime::Engine, timeout: std::time::Duration) -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        // Capacity 1 (NOT 0) so `try_send` from Drop always succeeds — even
+        // if the spawned thread hasn't yet entered `recv_timeout`. With a
+        // rendezvous (capacity 0) channel, try_send returns `Full` whenever
+        // the receiver hasn't reached its recv call yet, and Drop then
+        // blocks in `join()` for the full `timeout` waiting for the ticker
+        // to wake up. That race showed up as 5–60s test hangs.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         let engine_weak = engine.weak();
         let handle = std::thread::spawn(move || {
             if rx.recv_timeout(timeout).is_err() {
@@ -1206,16 +1212,15 @@ impl EpochTimer {
 impl Drop for EpochTimer {
     fn drop(&mut self) {
         if let Some(tx) = self.cancel.take() {
-            // try_send fails iff the receiver already exited via the timeout
-            // path — that's the expected "we already tripped the engine" case
-            // and not an error worth surfacing.
+            // With sync_channel(1), this writes to the buffer and returns
+            // immediately. The ticker thread will pop it on its next
+            // `recv_timeout` and exit cleanly. `Err` only happens if the
+            // ticker already exited (timeout fired or panicked), which is fine.
             let _ = tx.try_send(());
         }
         if let Some(h) = self.handle.take() {
-            // Joining a tiny sentinel thread that just returned should be
-            // immediate; if it isn't, the worst case is we wait a few extra
-            // ms for the channel's wakeup. Panics in the ticker (none
-            // expected — it does no fallible work) drop the JoinError silently.
+            // Bounded by the time it takes the ticker to read the buffered
+            // cancel and return — milliseconds, not the full timeout.
             let _ = h.join();
         }
     }
@@ -2732,6 +2737,7 @@ mod tests {
     }
 
     #[test]
+    #[ntest::timeout(15_000)]
     fn host_http_fetch_routes_through_services_and_enforces_allowlist() {
         // Guest forwards its (input_ptr, input_len) directly to borg:http.fetch.
         // execute_tool will have placed the JSON args (containing url/method)
@@ -2772,13 +2778,18 @@ mod tests {
             .unwrap();
         assert_eq!(body, b"{\"hello\":\"world\"}");
 
-        let calls = services.http_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "services should be called exactly once");
-        assert_eq!(calls[0].0, "POST", "method must reach services");
-        assert_eq!(
-            calls[0].1, "https://api.example.com/v1/echo",
-            "url must reach services"
-        );
+        // Scope each MutexGuard tightly — holding `calls` across the second
+        // `execute_tool_with_services` call would deadlock when we relock
+        // below on the same thread (std::sync::Mutex is non-reentrant).
+        {
+            let calls = services.http_calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "services should be called exactly once");
+            assert_eq!(calls[0].0, "POST", "method must reach services");
+            assert_eq!(
+                calls[0].1, "https://api.example.com/v1/echo",
+                "url must reach services"
+            );
+        }
 
         // Off-allowlist URL: host_http_fetch must return -1 BEFORE calling
         // services, so calls counter stays at 1.
@@ -2795,15 +2806,15 @@ mod tests {
             out.is_err(),
             "off-allowlist URL must fail to produce output"
         );
-        let calls_after = services.http_calls.lock().unwrap();
         assert_eq!(
-            calls_after.len(),
+            services.http_calls.lock().unwrap().len(),
             1,
             "services must NOT be called for off-allowlist URL"
         );
     }
 
     #[test]
+    #[ntest::timeout(15_000)]
     fn host_state_round_trip_through_services() {
         // Verify state.write then state.read round-trips through the services
         // trait. The guest performs write, then read, returning whatever the
