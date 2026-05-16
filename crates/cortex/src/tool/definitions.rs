@@ -59,6 +59,14 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
         "Describe or answer questions about a remote image",
     ),
     (
+        tool_names::VIDEO_ANALYZE,
+        "Describe or answer questions about a video (AI Studio Gemini only)",
+    ),
+    (
+        tool_names::COMPUTER_USE,
+        "macOS host UI automation: screen capture, click/type/scroll, app focus",
+    ),
+    (
         tool_names::GET_GOAL,
         "Read this session's active goal (status, budget, usage)",
     ),
@@ -178,6 +186,63 @@ pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["image_url"]
+            }),
+        ));
+
+        defs.push(ToolDefinition::new(
+            tool_names::VIDEO_ANALYZE,
+            "Fetch a video from an http(s) URL or data: URI and forward it inline to a Gemini model for description. Supports mp4, quicktime, webm, mkv. Requires `[llm.aux]` (or `[llm]`) configured for AI Studio Gemini (`provider = \"gemini\"`); fails fast on other providers, including Vertex-Gemini.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "video_url": {
+                        "type": "string",
+                        "description": "https URL or data:video/... base64 URI"
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "Optional question to focus the analysis"
+                    }
+                },
+                "required": ["video_url"]
+            }),
+        ));
+    }
+
+    if config.computer_use.enabled {
+        defs.push(ToolDefinition::new(
+            tool_names::COMPUTER_USE,
+            "Drive the host macOS GUI via cua-driver. Readonly: `capture` returns a screenshot inline as a multimodal image part; `list_apps` returns running applications with pids; `wait` blocks for duration_ms. Mutating: `click`/`double_click`/`right_click`/`middle_click` at (x,y); `drag` from (x,y) to (to_x,to_y); `scroll` by (delta_x,delta_y) at (x,y); `type` literal text; `key` a single hotkey (e.g. 'cmd+c') or a sequence via `keys`; `set_value` writes directly to a focused AX text field (preferred for forms — bypasses typing entirely); `focus_app` brings a target app to front (or routes input without raising via raise_window=false). Denylist refuses logout/lock/force-quit hotkeys and the loginwindow / Security settings focus targets before touching the driver.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "capture", "list_apps", "wait",
+                            "click", "double_click", "right_click", "middle_click",
+                            "drag", "scroll", "type", "key", "set_value", "focus_app"
+                        ],
+                        "description": "Which action to take."
+                    },
+                    "pid": {"type": "integer", "description": "Capture only. Target process id."},
+                    "window_id": {"type": "integer", "description": "Capture only. Target window id."},
+                    "duration_ms": {"type": "integer", "description": "Wait only. Milliseconds to sleep (capped at 300000)."},
+                    "x": {"type": "integer"},
+                    "y": {"type": "integer"},
+                    "to_x": {"type": "integer", "description": "Drag only."},
+                    "to_y": {"type": "integer", "description": "Drag only."},
+                    "delta_x": {"type": "integer", "description": "Scroll only."},
+                    "delta_y": {"type": "integer", "description": "Scroll only."},
+                    "text": {"type": "string", "description": "Type only."},
+                    "key": {"type": "string", "description": "Key only. e.g. 'cmd+c'."},
+                    "keys": {"type": "array", "items": {"type": "string"}},
+                    "element_index": {"type": "integer", "description": "Set_value only."},
+                    "value": {"type": "string", "description": "Set_value only."},
+                    "target": {"type": "string", "description": "Focus_app only. App name or bundle id."},
+                    "raise_window": {"type": "boolean"}
+                },
+                "required": ["action"]
             }),
         ));
     }

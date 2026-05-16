@@ -33,6 +33,7 @@ pub mod policy;
 
 pub(crate) mod apply_patch;
 pub(crate) mod browser;
+pub(crate) mod computer_use;
 pub(crate) mod create_goal;
 pub(crate) mod generate_image;
 pub(crate) mod get_goal;
@@ -47,6 +48,7 @@ pub(crate) mod run_shell;
 pub(crate) mod schedule;
 pub(crate) mod text_to_speech;
 pub(crate) mod update_goal;
+pub(crate) mod video_analyze;
 pub(crate) mod vision_analyze;
 pub(crate) mod web_fetch;
 pub(crate) mod web_search;
@@ -54,6 +56,7 @@ pub(crate) mod write_memory;
 
 pub(crate) use apply_patch::ApplyPatchArgs;
 pub(crate) use browser::BrowserArgs;
+pub(crate) use computer_use::ComputerUseArgs;
 pub(crate) use create_goal::CreateGoalArgs;
 pub(crate) use generate_image::GenerateImageArgs;
 pub(crate) use get_goal::GetGoalArgs;
@@ -68,6 +71,7 @@ pub(crate) use run_shell::RunShellArgs;
 pub(crate) use schedule::ScheduleArgs;
 pub(crate) use text_to_speech::TextToSpeechArgs;
 pub(crate) use update_goal::UpdateGoalArgs;
+pub(crate) use video_analyze::VideoAnalyzeArgs;
 pub(crate) use vision_analyze::VisionAnalyzeArgs;
 pub(crate) use web_fetch::WebFetchArgs;
 pub(crate) use web_search::WebSearchArgs;
@@ -115,6 +119,8 @@ pub(crate) enum Tool {
     GenerateImage(GenerateImageArgs),
     TextToSpeech(TextToSpeechArgs),
     VisionAnalyze(VisionAnalyzeArgs),
+    VideoAnalyze(VideoAnalyzeArgs),
+    ComputerUse(ComputerUseArgs),
 
     // User interaction
     RequestUserInput(RequestUserInputArgs),
@@ -201,6 +207,8 @@ impl Tool {
             tn::GENERATE_IMAGE => Tool::GenerateImage(from(tn::GENERATE_IMAGE, args)?),
             tn::TEXT_TO_SPEECH => Tool::TextToSpeech(from(tn::TEXT_TO_SPEECH, args)?),
             tn::VISION_ANALYZE => Tool::VisionAnalyze(from(tn::VISION_ANALYZE, args)?),
+            tn::VIDEO_ANALYZE => Tool::VideoAnalyze(from(tn::VIDEO_ANALYZE, args)?),
+            tn::COMPUTER_USE => Tool::ComputerUse(from(tn::COMPUTER_USE, args)?),
 
             // User input
             tn::REQUEST_USER_INPUT => Tool::RequestUserInput(from(tn::REQUEST_USER_INPUT, args)?),
@@ -246,6 +254,8 @@ impl Tool {
             Tool::GenerateImage(_) => tn::GENERATE_IMAGE,
             Tool::TextToSpeech(_) => tn::TEXT_TO_SPEECH,
             Tool::VisionAnalyze(_) => tn::VISION_ANALYZE,
+            Tool::VideoAnalyze(_) => tn::VIDEO_ANALYZE,
+            Tool::ComputerUse(_) => tn::COMPUTER_USE,
             Tool::RequestUserInput(_) => tn::REQUEST_USER_INPUT,
             Tool::GetGoal(_) => tn::GET_GOAL,
             Tool::CreateGoal(_) => tn::CREATE_GOAL,
@@ -276,7 +286,8 @@ impl Tool {
             | Tool::WebSearch(_)
             | Tool::ApplyPatch(_)
             | Tool::ApplySkillPatch(_)
-            | Tool::VisionAnalyze(_) => true,
+            | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_) => true,
 
             Tool::WriteMemory(_)
             | Tool::CreateChannel(_)
@@ -288,6 +299,7 @@ impl Tool {
             | Tool::Browser(_)
             | Tool::GenerateImage(_)
             | Tool::TextToSpeech(_)
+            | Tool::ComputerUse(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
             | Tool::CreateGoal(_)
@@ -309,7 +321,7 @@ impl Tool {
     /// variant exists so any post-parse caller has the same single source
     /// of truth without re-implementing the read-only allowlist.
     #[allow(dead_code)]
-    pub(crate) const fn allowed_in_plan_mode(&self) -> bool {
+    pub(crate) fn allowed_in_plan_mode(&self) -> bool {
         match self {
             Tool::ReadFile(_)
             | Tool::ListDir(_)
@@ -323,7 +335,10 @@ impl Tool {
             | Tool::WebSearch(_)
             | Tool::RequestUserInput(_)
             | Tool::GetGoal(_)
-            | Tool::VisionAnalyze(_) => true,
+            | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_) => true,
+
+            Tool::ComputerUse(args) => computer_use::action_allowed_in_plan_mode(&args.action),
 
             Tool::WriteMemory(_)
             | Tool::ApplyPatch(_)
@@ -369,9 +384,11 @@ impl Tool {
             Tool::WebFetch(_) | Tool::WebSearch(_) => ToolGroup::Web,
             Tool::Browser(_) => ToolGroup::Ui,
             Tool::Schedule(_) | Tool::ManageTasks(_) | Tool::ManageCron(_) => ToolGroup::Scheduling,
-            Tool::GenerateImage(_) | Tool::TextToSpeech(_) | Tool::VisionAnalyze(_) => {
-                ToolGroup::Media
-            }
+            Tool::GenerateImage(_)
+            | Tool::TextToSpeech(_)
+            | Tool::VisionAnalyze(_)
+            | Tool::VideoAnalyze(_)
+            | Tool::ComputerUse(_) => ToolGroup::Media,
             Tool::SpawnAgent(_)
             | Tool::SendToAgent(_)
             | Tool::WaitForAgent(_)
@@ -387,6 +404,10 @@ impl Tool {
 /// works on raw names (so callers can gate Plan-mode access before
 /// arg-parsing has happened).
 pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
+    // Note: `COMPUTER_USE` is listed here because *some* of its actions are
+    // read-only. The agent loop must additionally consult
+    // [`Tool::allowed_in_plan_mode`] after parsing to enforce the per-action
+    // gate — mutating actions MUST stay blocked in Plan mode.
     matches_any(
         name,
         &[
@@ -403,6 +424,8 @@ pub(crate) const fn allowed_in_plan_mode_name(name: &str) -> bool {
             tn::REQUEST_USER_INPUT,
             tn::GET_GOAL,
             tn::VISION_ANALYZE,
+            tn::VIDEO_ANALYZE,
+            tn::COMPUTER_USE,
         ],
     )
 }
@@ -426,6 +449,7 @@ pub(crate) const fn is_parallel_safe_name(name: &str) -> bool {
             tn::APPLY_PATCH,
             tn::APPLY_SKILL_PATCH,
             tn::VISION_ANALYZE,
+            tn::VIDEO_ANALYZE,
         ],
     )
 }

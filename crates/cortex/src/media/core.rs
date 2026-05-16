@@ -127,6 +127,14 @@ pub fn compress_content_parts(parts: &mut [ContentPart], max_bytes: usize) {
     }
 }
 
+/// True when `mime_type` names a video container Gemini accepts via inline_data.
+pub fn is_supported_video(mime_type: &str) -> bool {
+    matches!(
+        mime_type,
+        "video/mp4" | "video/quicktime" | "video/webm" | "video/x-matroska"
+    )
+}
+
 /// Check if MIME type is a compressible image format.
 pub fn is_compressible_image(mime_type: &str) -> bool {
     matches!(
@@ -202,6 +210,15 @@ pub fn infer_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     }
     if bytes[0] == 0x42 && bytes[1] == 0x4D {
         return Some("image/bmp");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        if &bytes[8..12] == b"qt  " {
+            return Some("video/quicktime");
+        }
+        return Some("video/mp4");
+    }
+    if bytes.len() >= 4 && bytes[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        return Some("video/webm");
     }
     None
 }

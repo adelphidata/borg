@@ -248,6 +248,8 @@ pub struct MediaConfig {
     pub compression_enabled: bool,
     /// Max image dimension in pixels (longest side). Default: 2048.
     pub max_dimension_px: u32,
+    /// Max raw video size in bytes accepted by `video_analyze`. Default: 50MB.
+    pub max_video_bytes: usize,
 }
 
 impl Default for MediaConfig {
@@ -256,6 +258,7 @@ impl Default for MediaConfig {
             max_image_bytes: 6 * 1024 * 1024,
             compression_enabled: true,
             max_dimension_px: 2048,
+            max_video_bytes: 50 * 1024 * 1024,
         }
     }
 }

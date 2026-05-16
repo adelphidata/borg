@@ -1,3 +1,4 @@
+pub mod computer_use;
 pub mod consolidation;
 pub mod data;
 pub mod gateway;
@@ -16,6 +17,7 @@ pub mod update;
 #[cfg(all(test, feature = "phase9-tests-disabled"))]
 mod tests;
 
+pub use computer_use::*;
 pub use consolidation::*;
 pub use data::*;
 pub use gateway::*;
@@ -117,6 +119,9 @@ pub struct Config {
     /// Media understanding settings.
     #[serde(default)]
     pub media: MediaConfig,
+    /// macOS-only `computer_use` tool — screen capture and UI control via cua-driver.
+    #[serde(default)]
+    pub computer_use: ComputerUseConfig,
     /// AI image generation settings.
     #[serde(default)]
     pub image_gen: ImageGenConfig,
