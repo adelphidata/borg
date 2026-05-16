@@ -302,8 +302,11 @@ Rules:
         }
     }
 
-    pub(super) fn build_tool_definitions(&self, user_message: &str) -> Vec<ToolDefinition> {
-        let mut tools = crate::tool::definitions::core_tool_definitions(&self.config);
+    pub(super) async fn build_tool_definitions(
+        &self,
+        user_message: &str,
+    ) -> Vec<ToolDefinition> {
+        let mut tools = crate::tool::definitions::core_tool_definitions(&self.config).await;
         if self.agent_control.is_some() {
             tools.extend(crate::multi_agent::tools::tool_definitions(
                 self.spawn_depth,
@@ -547,7 +550,7 @@ Rules:
         // (objective-updated). Pushed into history before message
         // assembly so the LLM sees it as a synthetic user message and
         // the transcript captures the steering for audit.
-        self.drain_pending_goal_steering();
+        self.drain_pending_goal_steering().await;
 
         let mut system_prompt = self
             .build_system_prompt()
@@ -572,7 +575,7 @@ Rules:
             self.setup_just_consumed = false;
             Vec::new()
         } else {
-            self.build_tool_definitions(&user_msg)
+            self.build_tool_definitions(&user_msg).await
         };
 
         // Fire BeforeAgentStart (first iteration) or BeforeLlmCall

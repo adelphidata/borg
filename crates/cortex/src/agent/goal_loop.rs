@@ -215,7 +215,7 @@ impl Agent {
             return false;
         }
         let prompt = prompts::continuation_prompt(&goal);
-        self.log_and_persist(Message::user(prompt));
+        self.log_and_persist(Message::user(prompt)).await;
         true
     }
 
@@ -340,7 +340,7 @@ impl Agent {
     /// the next LLM call sees the steering as a synthetic user message and
     /// the transcript reflects "why did the agent suddenly switch
     /// behavior."
-    pub(super) fn drain_pending_goal_steering(&mut self) {
+    pub(super) async fn drain_pending_goal_steering(&mut self) {
         let Some(steering) = self.goal_runtime.take_pending_steering() else {
             return;
         };
@@ -354,6 +354,6 @@ impl Agent {
             },
             steering.body
         );
-        self.log_and_persist(Message::user(body));
+        self.log_and_persist(Message::user(body)).await;
     }
 }

@@ -366,7 +366,8 @@ impl AgentControl {
         let fork_context_owned: Option<Vec<crate::types::Message>> =
             fork_context.map(<[crate::types::Message]>::to_vec);
         let agents_config = parent_config.agents.clone();
-        let tools_filter = compute_tools_filter(role.as_ref(), tools_blocklist, parent_config);
+        let tools_filter =
+            compute_tools_filter(role.as_ref(), tools_blocklist, parent_config).await;
 
         let join_handle = tokio::spawn(async move {
             // Acquire semaphore permit
@@ -640,7 +641,10 @@ impl AgentControl {
         let mut agent_ids: Vec<std::result::Result<String, SubAgentCompletion>> =
             Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
-            let role = task.role_name.as_deref().and_then(roles::load_role);
+            let role = match task.role_name.as_deref() {
+                Some(name) => roles::load_role(name).await,
+                None => None,
+            };
             match self
                 .spawn_agent(
                     &task.goal,
@@ -739,7 +743,7 @@ impl Drop for AgentControl {
 ///       `parent_enabled_tools - blocklist` — this prevents the child from
 ///       inheriting access to tools the parent explicitly blocked.
 /// - If only an allowlist is present, it's returned as-is.
-fn compute_tools_filter(
+async fn compute_tools_filter(
     role: Option<&AgentRole>,
     blocklist: Option<&[&str]>,
     parent_config: &Config,
@@ -763,7 +767,8 @@ fn compute_tools_filter(
             // Without unioning multi-agent here, children would silently lose
             // access to e.g. `wait_for_agent` even if a caller deliberately
             // removed it from the blocklist — a confusing invariant to debug.
-            let mut parent_tools = crate::tool::definitions::core_tool_definitions(parent_config);
+            let mut parent_tools =
+                crate::tool::definitions::core_tool_definitions(parent_config).await;
             parent_tools.extend(tools::tool_definitions(0, u32::MAX));
             let block_set: std::collections::HashSet<&str> = block.iter().copied().collect();
             let filtered: Vec<String> = parent_tools

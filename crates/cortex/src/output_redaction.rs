@@ -74,25 +74,64 @@ pub struct RedactionPolicy {
 impl RedactionPolicy {
     /// Production constructor: redaction governed by `enabled`, hits
     /// persisted to the shared `redaction_audit` table.
+    ///
+    /// `record_redactions` is async (turso DB), and `apply()` is invoked
+    /// from sync sinks, so the audit closure spawns the write onto the
+    /// ambient tokio runtime. The DB connection is extracted inside the
+    /// (sync) std::sync::Mutex and the guard dropped *before* any await,
+    /// so we never hold a `!Send` guard across `.await`. Audit is
+    /// best-effort by design — a runtime hiccup is logged and swallowed,
+    /// never blocking delivery of an already-redacted message.
     pub fn from_db(enabled: bool, db: Arc<Mutex<Database>>) -> Self {
         let audit: Arc<RedactionAuditFn> = Arc::new(move |sink, ctx, hits| {
-            let guard = match db.lock() {
-                Ok(g) => g,
-                Err(poisoned) => {
-                    tracing::warn!(
-                        sink = %sink,
-                        "redaction audit DB mutex poisoned; recovering and recording anyway"
-                    );
-                    poisoned.into_inner()
-                }
+            let db = db.clone();
+            let sink = sink.to_string();
+            let ctx = ctx.map(|s| s.to_string());
+            let hits = hits.to_vec();
+            // Snapshot the turso `Connection` under the sync mutex, drop
+            // the guard, then perform the async inserts. The connection
+            // is internally Arc'd so the clone is cheap.
+            let conn = {
+                let guard = match db.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => {
+                        tracing::warn!(
+                            sink = %sink,
+                            "redaction audit DB mutex poisoned; recovering and recording anyway"
+                        );
+                        poisoned.into_inner()
+                    }
+                };
+                guard.conn().clone()
             };
-            if let Err(e) = guard.record_redactions(sink, ctx, hits) {
-                tracing::warn!(
-                    sink = %sink,
-                    error = %e,
-                    "failed to persist redaction_audit row; redaction still applied"
-                );
-            }
+            tokio::spawn(async move {
+                if hits.is_empty() {
+                    return;
+                }
+                let now = chrono::Utc::now().timestamp();
+                for hit in &hits {
+                    if let Err(e) = conn
+                        .execute(
+                            "INSERT INTO redaction_audit (ts, sink, label, hit_count, context_key)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            turso::params!(
+                                now,
+                                sink.clone(),
+                                hit.label.to_string(),
+                                hit.count as i64,
+                                ctx.clone()
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            sink = %sink,
+                            error = %e,
+                            "failed to persist redaction_audit row; redaction still applied"
+                        );
+                    }
+                }
+            });
         });
         Self {
             enabled,

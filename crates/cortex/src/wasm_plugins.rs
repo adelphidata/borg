@@ -434,7 +434,8 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
                 "limit_per_minute": guard.rate_limit_per_minute,
                 "burst": guard.rate_limit_burst,
             }),
-        );
+        )
+        .await;
         anyhow::bail!(
             "WASM plugin '{}' is rate-limited; retry in {:.1}s",
             row.plugin_id,
@@ -479,7 +480,8 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
                             "from": "legacy",
                             "to": "current",
                         }),
-                    );
+                    )
+                    .await;
                     effective_hmac = new_seal;
                 }
                 Err(e) => {
@@ -495,7 +497,8 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
                             "reason": e.to_string(),
                             "reason_category": "reseal_failed",
                         }),
-                    );
+                    )
+                    .await;
                     db.quarantine_wasm_plugin(&row.plugin_id, &e.to_string())
                         .await?;
                     return Err(e).context("WASM plugin quarantined");
@@ -512,7 +515,8 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
                     "reason": current_err.to_string(),
                     "reason_category": "integrity_failure",
                 }),
-            );
+            )
+            .await;
             db.quarantine_wasm_plugin(&row.plugin_id, &current_err.to_string())
                 .await?;
             return Err(current_err).context("WASM plugin quarantined");
@@ -573,7 +577,8 @@ pub async fn try_execute_tool(name: &str, args: &serde_json::Value) -> Result<Op
             "error_category": error_category.map(WasmExecuteErrorKind::as_str),
             "duration_ms": duration_ms,
         }),
-    );
+    )
+    .await;
 
     let output = result.with_context(|| format!("WASM plugin tool '{}' failed", row.tool_name))?;
     Ok(Some(output))
@@ -1327,7 +1332,8 @@ pub async fn install_from_dir(dir: &Path) -> Result<InstalledSummary> {
             "deprecated_key": deprecated_warning.is_some(),
             "sunset_at": deprecated_warning,
         }),
-    );
+    )
+    .await;
     crate::telemetry::wasm_metrics::record_install(&package.manifest.publisher.public_key);
 
     Ok(InstalledSummary {

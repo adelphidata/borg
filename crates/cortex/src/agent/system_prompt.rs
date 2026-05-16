@@ -73,8 +73,8 @@ impl Agent {
     /// wait/close set). Dynamic tools (WASM plugins, integrations registered
     /// via skills) won't have a static entry — for those the section falls
     /// back to the first sentence of the tool's `ToolDefinition::description`.
-    pub(super) fn build_tooling_section(&self) -> String {
-        let mut defs = crate::tool::definitions::core_tool_definitions(&self.config);
+    pub(super) async fn build_tooling_section(&self) -> String {
+        let mut defs = crate::tool::definitions::core_tool_definitions(&self.config).await;
         if self.agent_control.is_some() {
             defs.extend(crate::multi_agent::tools::tool_definitions(
                 self.spawn_depth,

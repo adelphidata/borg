@@ -79,7 +79,7 @@ pub const TOOL_SUMMARIES: &[(&str, &str)] = &[
 /// Prefer adding actions/parameters to an existing tool over creating a new one.
 /// If a new tool is truly needed, ensure it cannot be achieved via `run_shell` or
 /// an existing tool with an extra action variant.
-pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
+pub async fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
     let mut defs = vec![
         ToolDefinition::new(tool_names::WRITE_MEMORY, "Write or append a long-term memory entry. Use scope='global' for shared memory or a scoped key such as 'project:abc' or a channel-specific memory scope when isolation matters.", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Memory entry name. A trailing .md is stripped for backward compatibility."},"content":{"type":"string","description":"Content to write"},"append":{"type":"boolean","description":"Append instead of overwriting","default":false},"scope":{"type":"string","description":"Memory scope. Defaults to 'global'; may also be values like 'project:abc' or another configured scoped-memory key.","default":"global"}},"required":["filename","content"]})),
         ToolDefinition::new(tool_names::READ_MEMORY, "Read a long-term memory entry by name and optional scope.", serde_json::json!({"type":"object","properties":{"filename":{"type":"string","description":"Memory entry name to read"},"scope":{"type":"string","description":"Memory scope. Defaults to 'global'.","default":"global"}},"required":["filename"]})),
@@ -98,7 +98,7 @@ pub fn core_tool_definitions(config: &Config) -> Vec<ToolDefinition> {
 
     defs.push(build_schedule_tool_def());
 
-    defs.extend(crate::wasm_plugins::tool_definitions());
+    defs.extend(crate::wasm_plugins::tool_definitions().await);
     defs.extend(crate::mcp_clients::tool_definitions());
 
     if config.browser.enabled {

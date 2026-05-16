@@ -28,13 +28,17 @@ const BONUS_XP_PLAN_ALIGNED: i32 = 1;
 /// The plan text is classified via [`classify_plan_content`]; if no
 /// archetype matches, the XP is still awarded against the base tier so plan
 /// content the keyword tables don't recognize doesn't silently drop reward.
-pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) -> Result<bool> {
-    if already_emitted(db, session_id)? {
+pub async fn record_plan_emission(
+    db: &Database,
+    session_id: &str,
+    plan_text: &str,
+) -> Result<bool> {
+    if already_emitted(db, session_id).await? {
         return Ok(false);
     }
 
     let archetype = classify_plan_content(plan_text);
-    let dominant = match db.get_evolution_state() {
+    let dominant = match db.get_evolution_state().await {
         Ok(s) => s.dominant_archetype,
         Err(e) => {
             tracing::warn!("plan_emission: get_evolution_state failed: {e}");
@@ -45,7 +49,7 @@ pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) ->
     let aligned = matches!((archetype, dominant), (Some(a), Some(b)) if a == b);
     let align_bonus = if aligned { BONUS_XP_PLAN_ALIGNED } else { 0 };
 
-    let (state, posture_seq, fallback) = super::security::current_posture_for_xp(db);
+    let (state, posture_seq, fallback) = super::security::current_posture_for_xp(db).await;
     let breakdown = super::security::compute_xp_breakdown(
         BASE_XP_PLAN as u32,
         align_bonus as u32,
@@ -61,16 +65,18 @@ pub fn record_plan_emission(db: &Database, session_id: &str, plan_text: &str) ->
         "plan_emission",
         Some(&metadata),
         Some(session_id),
-    )?;
+    )
+    .await?;
     Ok(true)
 }
 
-fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
+async fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
     let conn = db.conn();
     // Prefer the indexed `session_id` column; legacy rows fall back to
     // `json_extract` so dedup still holds across the schema bump.
-    let existing: i64 = conn.query_row(
-        "SELECT EXISTS(
+    let mut rows = conn
+        .query(
+            "SELECT EXISTS(
              SELECT 1 FROM evolution_events
              WHERE source = 'plan_emission'
                AND (
@@ -78,9 +84,13 @@ fn already_emitted(db: &Database, session_id: &str) -> Result<bool> {
                  OR json_extract(metadata_json, '$.session_id') = ?1
                )
          )",
-        rusqlite::params![session_id],
-        |row| row.get(0),
-    )?;
+            turso::params![session_id],
+        )
+        .await?;
+    let existing: i64 = match rows.next().await? {
+        Some(row) => row.get::<i64>(0)?,
+        None => 0,
+    };
     Ok(existing != 0)
 }
 

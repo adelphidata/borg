@@ -156,7 +156,8 @@ pub async fn handle_run_shell_with_context(
                     "tool": "run_shell",
                     "command_redacted": redact_command_for_audit(command),
                 }),
-            );
+            )
+            .await;
             return Ok("Shell command denied by policy.".to_string());
         }
         crate::policy::PolicyDecision::AutoApprove => {}

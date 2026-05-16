@@ -24,9 +24,9 @@ const MAX_PER_SESSION_CHARS: usize = 2000;
 /// Gathers activity data from the past 24 hours, then prepends the
 /// summarization instructions. Returns a string ready to send as the
 /// user message to the LLM.
-pub fn build_daily_summary_prompt() -> Result<String> {
-    let db = Database::open()?;
-    let context = gather_daily_context(&db)?;
+pub async fn build_daily_summary_prompt() -> Result<String> {
+    let db = Database::open().await?;
+    let context = gather_daily_context(&db).await?;
     Ok(format!("{SUMMARY_PROMPT}{context}"))
 }
 
@@ -35,12 +35,12 @@ pub fn build_daily_summary_prompt() -> Result<String> {
 /// Returns a formatted markdown string with:
 /// - Session transcripts (user/assistant messages only)
 /// - Task run statistics
-pub fn gather_daily_context(db: &Database) -> Result<String> {
+pub async fn gather_daily_context(db: &Database) -> Result<String> {
     let since = chrono::Utc::now().timestamp() - SECS_PER_DAY;
     let mut out = String::new();
 
     // ── Sessions ──
-    let sessions = db.sessions_since(since)?;
+    let sessions = db.sessions_since(since).await?;
     out.push_str(&format!("## Sessions ({} in last 24h)\n\n", sessions.len()));
 
     let mut total_chars = 0;
@@ -61,7 +61,7 @@ pub fn gather_daily_context(db: &Database) -> Result<String> {
             .unwrap_or_default();
         out.push_str(&format!("### {title} ({time})\n\n"));
 
-        let messages = match db.load_session_messages(&session.id) {
+        let messages = match db.load_session_messages(&session.id).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("Failed to load messages for session {}: {e}", session.id);
@@ -75,7 +75,7 @@ pub fn gather_daily_context(db: &Database) -> Result<String> {
     }
 
     // ── Task runs ──
-    let (success, total) = db.count_task_runs_since(since, Some("success"))?;
+    let (success, total) = db.count_task_runs_since(since, Some("success")).await?;
     let failed = total - success;
     out.push_str(&format!(
         "## Task Runs\n\n{total} total, {success} successful, {failed} failed\n"

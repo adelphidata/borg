@@ -278,7 +278,10 @@ pub async fn handle_spawn_agent(
     }
 
     let message = require_str_param(args, "message")?;
-    let role = role_name.and_then(roles::load_role);
+    let role = match role_name {
+        Some(name) => roles::load_role(name).await,
+        None => None,
+    };
     let context = if fork_context { parent_history } else { None };
 
     if blocking {
@@ -398,7 +401,7 @@ pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
 
     match action {
         "list" => {
-            let all_roles = roles::list_all_roles();
+            let all_roles = roles::list_all_roles().await;
             let list: Vec<serde_json::Value> = all_roles
                 .iter()
                 .map(|r| {

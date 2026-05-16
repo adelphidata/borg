@@ -71,7 +71,7 @@ pub fn decide_cache(
 /// Look up the cache and decide what to serve. Synchronous; the caller is
 /// responsible for awaiting the live call (if needed) without holding any
 /// `&Database` borrow across the await.
-fn cache_lookup(
+async fn cache_lookup(
     db: &Database,
     provider: &str,
     query_hash: &str,
@@ -80,7 +80,7 @@ fn cache_lookup(
     ttl_secs: u64,
     now_secs: i64,
 ) -> Result<CacheDecision> {
-    let cached = db.web_search_cache_get(provider, query_hash)?;
+    let cached = db.web_search_cache_get(provider, query_hash).await?;
     Ok(decide_cache(
         mode,
         query,
@@ -90,8 +90,8 @@ fn cache_lookup(
     ))
 }
 
-/// Persist a fresh body. Synchronous mate of `cache_lookup`.
-fn cache_store(
+/// Persist a fresh body. Async mate of `cache_lookup`.
+async fn cache_store(
     db: &Database,
     provider: &str,
     query_hash: &str,
@@ -100,6 +100,7 @@ fn cache_store(
     now_secs: i64,
 ) -> Result<()> {
     db.web_search_cache_put(provider, query_hash, query, body, now_secs)
+        .await
 }
 
 #[instrument(skip_all, fields(tool.name = "web_fetch"))]
@@ -126,7 +127,7 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
     let mode = SearchMode::parse(args["mode"].as_str());
     let provider = web::resolve_provider_id(&config.web).to_string();
 
-    let db = match Database::open() {
+    let db = match Database::open().await {
         Ok(d) => d,
         Err(e) => {
             // Cache unavailable — degrade to a live fetch rather than failing the tool.
@@ -140,7 +141,7 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
     let now = chrono::Utc::now().timestamp();
     let ttl = config.web.search_cache_ttl_secs;
     let hash = crate::db::web_search_cache::hash_query(query);
-    let decision = match cache_lookup(&db, &provider, &hash, mode, query, ttl, now) {
+    let decision = match cache_lookup(&db, &provider, &hash, mode, query, ttl, now).await {
         Ok(d) => d,
         Err(e) => return Ok(format!("Error searching: {e}")),
     };
@@ -150,8 +151,10 @@ pub async fn handle_web_search(args: &serde_json::Value, config: &Config) -> Res
         CacheDecision::Serve(body) => Ok(body),
         CacheDecision::CallLive => match web::web_search(query, &config.web).await {
             Ok(body) => {
-                if let Ok(db2) = Database::open() {
-                    if let Err(e) = cache_store(&db2, &provider, &hash, query, &body, now) {
+                if let Ok(db2) = Database::open().await {
+                    if let Err(e) =
+                        cache_store(&db2, &provider, &hash, query, &body, now).await
+                    {
                         tracing::warn!(error = %e, "web_search cache write failed");
                     }
                 }

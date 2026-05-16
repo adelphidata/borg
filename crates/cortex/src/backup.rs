@@ -33,9 +33,13 @@ use crate::util::hex::hex_encode;
 /// Read the live `BORG_HOME/borg.db`'s schema version through a read-only
 /// connection. Used by `borg backup create` to tag the new tarball without
 /// the CLI having to import `Database` directly.
-pub fn live_schema_version() -> Result<u32> {
-    let db = Database::open_readonly().context("open db read-only")?;
-    db.schema_version().context("read meta.schema_version")
+pub async fn live_schema_version() -> Result<u32> {
+    let db = Database::open_readonly()
+        .await
+        .context("open db read-only")?;
+    db.schema_version()
+        .await
+        .context("read meta.schema_version")
 }
 
 /// File names / directories excluded from a backup tarball.
@@ -140,7 +144,7 @@ pub fn create_backup(borg_home: &Path, out_dir: &Path, schema_version: u32) -> R
 /// opens the embedded SQLite, runs `verify_audit_chain`, and reports the
 /// outcome. Returns `Err` on any check that disqualifies the tarball from
 /// being restorable.
-pub fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
+pub async fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
     let tmp = tempfile::tempdir().context("verify: tempdir")?;
     let (manifest, body_tar) = extract_outer(file, tmp.path())?;
 
@@ -178,15 +182,27 @@ pub fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
     if !db_path.exists() {
         bail!("backup is missing borg.db");
     }
-    let db = Database::open_at(&db_path).context("verify: open extracted SQLite")?;
-    let outcome = db.verify_audit_chain().context("verify: audit chain")?;
+    let db = Database::open_at(&db_path)
+        .await
+        .context("verify: open extracted SQLite")?;
+    let outcome = db
+        .verify_audit_chain()
+        .await
+        .context("verify: audit chain")?;
     if let AuditChainOutcome::Tampered { seq } = outcome {
         bail!("backup audit chain TAMPERED at seq={seq}");
     }
-    let messages_count: i64 = db
-        .conn()
-        .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-        .context("verify: count messages")?;
+    let messages_count: i64 = {
+        let mut rows = db
+            .conn()
+            .query("SELECT COUNT(*) FROM messages", ())
+            .await
+            .context("verify: count messages")?;
+        match rows.next().await.context("verify: count messages row")? {
+            Some(row) => row.get::<i64>(0).context("verify: count column")?,
+            None => 0,
+        }
+    };
 
     Ok(BackupVerifyReport {
         manifest,
@@ -198,8 +214,8 @@ pub fn verify_backup(file: &Path) -> Result<BackupVerifyReport> {
 /// Restore `file` into `borg_home`. Refuses if `borg_home` already
 /// contains state and `force` is false. With `force = true`, renames the
 /// existing dir to `<borg_home>.bak.<unix_ts>` before extracting.
-pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> {
-    let report = verify_backup(file)?;
+pub async fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> {
+    let report = verify_backup(file).await?;
     if borg_home.exists() && has_existing_state(borg_home)? {
         if !force {
             bail!(
@@ -243,7 +259,9 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
     // own daemon_start event right after.
     let db_path = crate::paths::db_path(borg_home);
     if db_path.exists() {
-        let db = Database::open_at(&db_path).context("restore: open restored SQLite")?;
+        let db = Database::open_at(&db_path)
+            .await
+            .context("restore: open restored SQLite")?;
         let payload = serde_json::json!({
             "src_file": file.display().to_string(),
             "schema_version": report.manifest.schema_version,
@@ -251,12 +269,15 @@ pub fn restore_backup(file: &Path, borg_home: &Path, force: bool) -> Result<()> 
             "sha256_pre_compress": report.manifest.sha256_pre_compress,
         })
         .to_string();
-        if let Err(e) = db.append_audit_event(
-            "state_restored",
-            &payload,
-            "system",
-            chrono::Utc::now().timestamp(),
-        ) {
+        if let Err(e) = db
+            .append_audit_event(
+                "state_restored",
+                &payload,
+                "system",
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+        {
             tracing::warn!("restore: failed to append state_restored audit event: {e}");
         }
     }

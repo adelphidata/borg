@@ -292,7 +292,7 @@ impl DiagnosticRunner {
                 "Browser"
             }
             13 => {
-                check_agents(config, &mut checks);
+                check_agents(config, &mut checks).await;
                 "Agents"
             }
             14 => {
@@ -1219,7 +1219,7 @@ fn check_browser(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     ));
 }
 
-fn check_agents(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
+async fn check_agents(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
     if !config.agents.enabled {
         checks.push(DiagnosticCheck::warn(
             "Agents",
@@ -1247,7 +1247,7 @@ fn check_agents(config: &Config, checks: &mut Vec<DiagnosticCheck>) {
             ),
         ));
     }
-    let roles = crate::multi_agent::roles::list_all_roles();
+    let roles = crate::multi_agent::roles::list_all_roles().await;
     checks.push(DiagnosticCheck::pass(
         "Agents",
         format!("{} role(s) available", roles.len()),

@@ -8,7 +8,7 @@ use crate::db::Database;
 use super::{MigrationPlan, MigrationResult, SourceData};
 
 /// Apply a migration plan to the Borg data directory.
-pub fn apply_plan(
+pub async fn apply_plan(
     plan: &MigrationPlan,
     data: &SourceData,
     borg_data_dir: &Path,
@@ -23,10 +23,10 @@ pub fn apply_plan(
     };
 
     // Apply config changes to DB
-    apply_config_changes(plan, &mut result)?;
+    apply_config_changes(plan, &mut result).await?;
 
     // Apply credentials to DB
-    apply_credentials(plan, data, &mut result)?;
+    apply_credentials(plan, data, &mut result).await?;
 
     // Copy memory files
     apply_memory_files(plan, borg_data_dir, &mut result)?;
@@ -40,20 +40,22 @@ pub fn apply_plan(
     Ok(result)
 }
 
-fn apply_config_changes(plan: &MigrationPlan, result: &mut MigrationResult) -> Result<()> {
+async fn apply_config_changes(plan: &MigrationPlan, result: &mut MigrationResult) -> Result<()> {
     let active_changes: Vec<_> = plan.config_changes.iter().filter(|c| !c.skipped).collect();
 
     if active_changes.is_empty() {
         return Ok(());
     }
 
-    let db = Database::open().context("Failed to open database for migration")?;
+    let db = Database::open()
+        .await
+        .context("Failed to open database for migration")?;
 
     for change in &active_changes {
         // Use apply_setting for validation, then write to DB
         let mut scratch = crate::config::Config::default();
         match scratch.apply_setting(&change.key, &change.new_value) {
-            Ok(_) => match db.set_setting(&change.key, &change.new_value) {
+            Ok(_) => match db.set_setting(&change.key, &change.new_value).await {
                 Ok(()) => result.config_changes_applied += 1,
                 Err(e) => result.warnings.push(format!("Config {}: {e}", change.key)),
             },
@@ -64,7 +66,7 @@ fn apply_config_changes(plan: &MigrationPlan, result: &mut MigrationResult) -> R
     Ok(())
 }
 
-fn apply_credentials(
+async fn apply_credentials(
     plan: &MigrationPlan,
     data: &SourceData,
     result: &mut MigrationResult,
@@ -73,14 +75,15 @@ fn apply_credentials(
         return Ok(());
     }
 
-    let db = Database::open().context("Failed to open database for credential migration")?;
+    let db = Database::open()
+        .await
+        .context("Failed to open database for credential migration")?;
 
     // Load existing credentials from DB
-    let mut creds: std::collections::HashMap<String, crate::config::CredentialValue> = db
-        .get_setting("credentials")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
+    let existing_json = db.get_setting("credentials").await.ok().flatten();
+    let mut creds: std::collections::HashMap<String, crate::config::CredentialValue> = existing_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, crate::config::CredentialValue>>(s).ok())
         .unwrap_or_default();
 
     for key_name in &plan.credentials_to_add {
@@ -96,7 +99,7 @@ fn apply_credentials(
 
     if !creds.is_empty() {
         if let Ok(json) = serde_json::to_string(&creds) {
-            db.set_setting("credentials", &json)?;
+            db.set_setting("credentials", &json).await?;
         }
     }
 

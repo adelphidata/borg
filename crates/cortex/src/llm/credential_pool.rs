@@ -549,7 +549,7 @@ impl CredentialPool {
                     source_json: r.get::<String>(4)?,
                     use_count: r.get::<i64>(5)? as u64,
                     last_status: r.get::<String>(6)?,
-                    last_status_at_ms: r.get::<i64>(7)?,
+                    last_status_at_ms: r.get::<Option<i64>>(7)?,
                     last_error_code: r.get::<Option<i64>>(8)?.map(|x| x as u16),
                     last_error_reason: r.get::<Option<String>>(9)?,
                     last_error_message: r.get::<Option<String>>(10)?,

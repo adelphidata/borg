@@ -41,9 +41,9 @@ pub fn builtin_role(name: &str) -> Option<AgentRole> {
 }
 
 /// Seed the built-in roles into the database if they don't already exist.
-pub fn seed_builtin_roles(db: &Database) -> anyhow::Result<()> {
+pub async fn seed_builtin_roles(db: &Database) -> anyhow::Result<()> {
     for (name, desc, temp, tools) in BUILTIN_ROLES {
-        if db.get_role(name)?.is_none() {
+        if db.get_role(name).await?.is_none() {
             let tools_json =
                 serde_json::to_string(&tools.iter().collect::<Vec<_>>()).unwrap_or_default();
             db.insert_role(
@@ -56,17 +56,18 @@ pub fn seed_builtin_roles(db: &Database) -> anyhow::Result<()> {
                 Some(&tools_json),
                 None,
                 true,
-            )?;
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
 /// Load a role from the database, falling back to built-in defaults.
-pub fn load_role(name: &str) -> Option<AgentRole> {
+pub async fn load_role(name: &str) -> Option<AgentRole> {
     // Try DB first
-    if let Ok(db) = Database::open() {
-        if let Ok(Some(row)) = db.get_role(name) {
+    if let Ok(db) = Database::open().await {
+        if let Ok(Some(row)) = db.get_role(name).await {
             let tools_allowed = row
                 .tools_allowed
                 .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok());
@@ -87,13 +88,13 @@ pub fn load_role(name: &str) -> Option<AgentRole> {
 }
 
 /// List all available roles (DB + built-in).
-pub fn list_all_roles() -> Vec<AgentRole> {
+pub async fn list_all_roles() -> Vec<AgentRole> {
     let mut roles = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     // DB roles take priority
-    if let Ok(db) = Database::open() {
-        if let Ok(db_roles) = db.list_roles() {
+    if let Ok(db) = Database::open().await {
+        if let Ok(db_roles) = db.list_roles().await {
             for row in db_roles {
                 seen.insert(row.name.clone());
                 let tools_allowed = row

@@ -132,7 +132,7 @@ pub fn is_security_relevant_setting(key: &str) -> bool {
 /// Append a `SETTINGS_CHANGED` audit event when `key` is security-relevant
 /// and the value actually changed. Old/new values are truncated to keep
 /// the chain bounded — full values are still in the `settings` table.
-fn emit_settings_changed_if_relevant(key: &str, old: Option<&str>, new: Option<&str>) {
+async fn emit_settings_changed_if_relevant(key: &str, old: Option<&str>, new: Option<&str>) {
     if !is_security_relevant_setting(key) {
         return;
     }
@@ -147,7 +147,8 @@ fn emit_settings_changed_if_relevant(key: &str, old: Option<&str>, new: Option<&
             "old": old.map(truncate_setting_value_for_audit),
             "new": new.map(truncate_setting_value_for_audit),
         }),
-    );
+    )
+    .await;
 }
 
 fn truncate_setting_value_for_audit(v: &str) -> String {
@@ -200,7 +201,7 @@ impl SettingsResolver {
         let confirmation = scratch.apply_setting(key, value)?;
         let prev = self.read_prior_for_audit(key).await;
         self.db.set_setting(key, value).await?;
-        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value));
+        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(value)).await;
         // Clearing a parent blob (`llm.aux = ""`) must also wipe its
         // sub-key rows. Settings replay applies all rows in lex order, so
         // a leftover `llm.aux.model = "<old>"` would auto-resurrect aux
@@ -220,7 +221,7 @@ impl SettingsResolver {
             .ok_or_else(|| anyhow::anyhow!("Unknown setting key: {key}"))?;
         let prev = self.read_prior_for_audit(key).await;
         self.db.set_setting(key, &default_value).await?;
-        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value));
+        emit_settings_changed_if_relevant(key, prev.as_deref(), Some(&default_value)).await;
         // `unset llm.aux` writes the default ("") for the parent and must
         // cascade — see the matching path in `set` for rationale.
         if key == "llm.aux" {

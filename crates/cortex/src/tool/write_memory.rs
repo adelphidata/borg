@@ -128,20 +128,20 @@ fn maybe_slide_quiet_hours_tz(content: &str) {
     }
     let owned = content.to_string();
     crate::agent::spawn_logged("tz_slide", async move {
-        if let Err(e) = run_tz_slide(&owned) {
+        if let Err(e) = run_tz_slide(&owned).await {
             tracing::warn!("tz_slide failed: {e}");
         }
     });
 }
 
-fn run_tz_slide(content: &str) -> Result<()> {
+async fn run_tz_slide(content: &str) -> Result<()> {
     let Some(detected) = extract_timezone_mention(content) else {
         return Ok(());
     };
-    let db = crate::db::Database::open()?;
-    let quiet_start = db.get_setting("heartbeat.quiet_hours_start")?;
-    let quiet_end = db.get_setting("heartbeat.quiet_hours_end")?;
-    let current_tz = db.get_setting("user.timezone")?;
+    let db = crate::db::Database::open().await?;
+    let quiet_start = db.get_setting("heartbeat.quiet_hours_start").await?;
+    let quiet_end = db.get_setting("heartbeat.quiet_hours_end").await?;
+    let current_tz = db.get_setting("user.timezone").await?;
     let Some(target) = decide_tz_slide(
         &detected,
         quiet_start.as_deref(),
@@ -150,7 +150,7 @@ fn run_tz_slide(content: &str) -> Result<()> {
     ) else {
         return Ok(());
     };
-    db.set_setting("user.timezone", &target)?;
+    db.set_setting("user.timezone", &target).await?;
     tracing::info!(
         "Quiet-hours timezone slid {} → {} (mentioned in memory; defaults intact)",
         current_tz.as_deref().unwrap_or("(unset)"),

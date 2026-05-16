@@ -133,16 +133,16 @@ impl Agent {
                 total_tool_calls: 0,
             },
         );
-        self.hook_registry.dispatch(&hook_ctx);
+        self.hook_registry.dispatch(&hook_ctx).await;
 
         // Don't persist empty assistant responses — they pollute the context
         // window and cause Gemini to reject subsequent requests ("no parts").
         if !text_content.trim().is_empty() {
-            self.log_and_persist(Message::assistant(text_content));
+            self.log_and_persist(Message::assistant(text_content)).await;
         } else {
             tracing::debug!("Skipping persistence of empty assistant response");
         }
-        self.maybe_record_plan_emission(text_content);
+        self.maybe_record_plan_emission(text_content).await;
         self.auto_save();
         self.metrics.agent_turns.add(1, &[]);
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
@@ -152,7 +152,7 @@ impl Agent {
     /// `<proposed_plan>` block. Per-session cap lives in
     /// `evolution::plan_emission::record_plan_emission` (DB-backed via
     /// `EXISTS` over evolution_events.metadata_json).
-    pub(super) fn maybe_record_plan_emission(&self, text_content: &str) {
+    pub(super) async fn maybe_record_plan_emission(&self, text_content: &str) {
         if self.config.conversation.collaboration_mode != crate::config::CollaborationMode::Plan {
             return;
         }
@@ -161,12 +161,14 @@ impl Agent {
             return;
         }
         let session_id = self.session.meta.id.clone();
-        let guard = self.db_guard();
+        let guard = self.db_guard().await;
         let Some(db) = guard.as_ref() else {
             tracing::debug!("plan_emission: no DB available, skipping");
             return;
         };
-        match crate::evolution::plan_emission::record_plan_emission(db, &session_id, text_content) {
+        match crate::evolution::plan_emission::record_plan_emission(db, &session_id, text_content)
+            .await
+        {
             Ok(true) => tracing::debug!("plan_emission: recorded for session {session_id}"),
             Ok(false) => {
                 tracing::debug!("plan_emission: already recorded for session {session_id}")
@@ -198,7 +200,7 @@ impl Agent {
             } else {
                 format!("{text_content}\n\n[stream interrupted: {err}]")
             };
-            self.log_and_persist(Message::assistant(&content));
+            self.log_and_persist(Message::assistant(&content)).await;
             let _ = event_tx.send(AgentEvent::TurnComplete).await;
             return TextOnlyOutcome::TerminateTurn;
         }
@@ -206,7 +208,8 @@ impl Agent {
         if should_nudge_for_response(text_content, needs_response, nudged_for_response) {
             self.log_and_persist(Message::system(
                 "Respond to the user with a brief confirmation of what you just did.",
-            ));
+            ))
+            .await;
             return TextOnlyOutcome::NudgeAndContinue;
         }
 
@@ -232,7 +235,7 @@ impl Agent {
         } else {
             format!("{text_content}\n\n{trailer}")
         };
-        self.log_and_persist(Message::assistant(&content));
+        self.log_and_persist(Message::assistant(&content)).await;
         let _ = event_tx.send(AgentEvent::TurnComplete).await;
     }
 }

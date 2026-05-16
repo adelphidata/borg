@@ -1018,7 +1018,7 @@ impl Agent {
         system.push_str("\n</system_instructions>\n\n");
 
         // Tooling: list available tools with summaries
-        system.push_str(&self.build_tooling_section());
+        system.push_str(&self.build_tooling_section().await);
 
         // Tool call style guidance
         system.push_str(Self::build_tool_call_style_section());
@@ -2458,16 +2458,10 @@ impl Agent {
         let tool = match crate::tool::Tool::parse(name, raw_args.clone()) {
             Ok(t) => t,
             Err(crate::tool::ToolParseError::UnknownTool(n)) => {
-                // WASM plugin execution does sync DB + FS + wasmtime compile + run; offload
-                // to a blocking thread so the agent loop's reactor isn't starved for up to
-                // the manifest's timeout_ms budget.
-                let args_owned = raw_args.clone();
-                let n_owned = n.clone();
-                let plugin_result = tokio::task::spawn_blocking(move || {
-                    crate::wasm_plugins::try_execute_tool(&n_owned, &args_owned)
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("WASM plugin task join failed: {e}"))??;
+                // WASM plugin execution does async DB + FS + wasmtime compile + run.
+                // The wasmtime portion is CPU-bound; tolerate the in-band await
+                // here for now — the manifest's timeout_ms budget already bounds it.
+                let plugin_result = crate::wasm_plugins::try_execute_tool(&n, &raw_args).await?;
                 if let Some(output) = plugin_result {
                     return Ok(ToolOutput::Text(output));
                 }
@@ -2700,8 +2694,8 @@ impl Agent {
 
     /// Close the database connection, releasing all file locks.
     /// Call before deleting the data directory (e.g. during uninstall).
-    pub fn close_db(&self) {
-        let mut guard = self.db_guard();
+    pub async fn close_db(&self) {
+        let mut guard = self.db_guard().await;
         if guard.take().is_some() {
             tracing::info!("Database connection closed for uninstall");
         }
@@ -2771,7 +2765,7 @@ async fn dispatch_parallel_safe_tool(
             None => crate::tool::read_file::handle(args, config),
         },
         crate::tool::Tool::ReadMemory(args) => {
-            crate::tool::read_memory::handle(args).map(ToolOutput::Text)
+            crate::tool::read_memory::handle(args).await.map(ToolOutput::Text)
         }
         crate::tool::Tool::MemorySearch(args) => crate::tool::memory_search::handle(args, config)
             .await

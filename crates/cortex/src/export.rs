@@ -68,12 +68,12 @@ impl Default for ExportOptions {
 ///
 /// Returns `(rendered, suggested_filename)`. The caller decides whether to
 /// write to stdout, a file, or both.
-pub fn export_session(
+pub async fn export_session(
     db: &Database,
     session_id: &str,
     opts: ExportOptions,
 ) -> Result<(String, String)> {
-    let session = load_session(db, session_id)?;
+    let session = load_session(db, session_id).await?;
     let rendered = match opts.format {
         ExportFormat::Json => render_json(&session)?,
         ExportFormat::Csv => render_csv(&session),
@@ -86,14 +86,16 @@ pub fn export_session(
 /// Reconstruct a full `Session` from the DB. Fails loudly if the session
 /// row or messages are missing — we don't silently emit an empty export
 /// (see CLAUDE.md "no lying" invariant).
-fn load_session(db: &Database, session_id: &str) -> Result<Session> {
+async fn load_session(db: &Database, session_id: &str) -> Result<Session> {
     let row = db
         .session_by_id(session_id)
+        .await
         .with_context(|| format!("looking up session '{session_id}'"))?
         .ok_or_else(|| anyhow!("session '{session_id}' not found"))?;
 
     let rows = db
         .load_session_messages(session_id)
+        .await
         .with_context(|| format!("loading messages for session '{session_id}'"))?;
 
     let mut messages = Vec::with_capacity(rows.len());
