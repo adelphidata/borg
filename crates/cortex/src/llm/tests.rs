@@ -2564,3 +2564,89 @@ fn azure_openai_construction_respects_base_url_override() {
         "https://proxy.internal/azure-openai/chat/completions?api-version=2024-10-21"
     );
 }
+
+// ── reclassify_revoked_outcome ────────────────────────────────────────────
+//
+// Regression guards for the mid-stream credential-revocation contract.
+// Before these tests existed, an SSE stream cancelled by a revoked
+// credential surfaced as `Ok(())` to the outer loop (because
+// `process_sse_stream` and the Bedrock loop emit `StreamEvent::Done` then
+// return `Ok(())` on cancel) — the truncated turn was committed as success.
+// The reclassifier must convert that `Ok(())` (and any other inner outcome)
+// into `LlmError::AuthRevoked` whenever the revocation token fired while
+// the user-provided cancel did not.
+
+#[test]
+fn reclassify_converts_ok_into_auth_revoked_when_only_revocation_fired() {
+    let user = CancellationToken::new();
+    let revocation = CancellationToken::new();
+    revocation.cancel();
+
+    let out = reclassify_revoked_outcome(Ok(()), &user, Some(&revocation));
+    assert!(
+        matches!(out, Err(LlmError::AuthRevoked)),
+        "mid-stream revocation must surface as AuthRevoked, not silent success; got {out:?}"
+    );
+}
+
+#[test]
+fn reclassify_converts_inner_err_into_auth_revoked_when_only_revocation_fired() {
+    let user = CancellationToken::new();
+    let revocation = CancellationToken::new();
+    revocation.cancel();
+
+    let inner = Err(LlmError::Retryable {
+        source: anyhow::anyhow!("stream chunk read error"),
+        retry_after: None,
+        reason: FailoverReason::Timeout,
+    });
+    let out = reclassify_revoked_outcome(inner, &user, Some(&revocation));
+    assert!(matches!(out, Err(LlmError::AuthRevoked)));
+}
+
+#[test]
+fn reclassify_preserves_user_cancellation_outcome() {
+    // The user-provided cancel firing means the caller wanted to abort;
+    // don't relabel that as a credential issue even if revocation also
+    // fired in the same window.
+    let user = CancellationToken::new();
+    user.cancel();
+    let revocation = CancellationToken::new();
+    revocation.cancel();
+
+    let out = reclassify_revoked_outcome(Err(LlmError::Interrupted), &user, Some(&revocation));
+    assert!(matches!(out, Err(LlmError::Interrupted)));
+}
+
+#[test]
+fn reclassify_preserves_natural_completion_when_revocation_did_not_fire() {
+    let user = CancellationToken::new();
+    let revocation = CancellationToken::new();
+    // Note: revocation NOT cancelled.
+
+    let out = reclassify_revoked_outcome(Ok(()), &user, Some(&revocation));
+    assert!(out.is_ok(), "natural completion must not be relabeled");
+}
+
+#[test]
+fn reclassify_preserves_outcome_when_no_revocation_token_present() {
+    // Single-credential / no-pool configurations pass `None` for the
+    // revocation token; the reclassifier must be a no-op there.
+    let user = CancellationToken::new();
+    let out = reclassify_revoked_outcome(Ok(()), &user, None);
+    assert!(out.is_ok());
+
+    let err = Err(LlmError::Retryable {
+        source: anyhow::anyhow!("network blip"),
+        retry_after: None,
+        reason: FailoverReason::Timeout,
+    });
+    let out = reclassify_revoked_outcome(err, &user, None);
+    assert!(matches!(
+        out,
+        Err(LlmError::Retryable {
+            reason: FailoverReason::Timeout,
+            ..
+        })
+    ));
+}

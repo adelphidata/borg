@@ -9,6 +9,7 @@
 //! See `docs/llm-resilience.md` for the operator-facing surface.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,6 +18,7 @@ use rand::prelude::IndexedRandom;
 use rand::Rng;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::db::Database;
@@ -430,6 +432,26 @@ pub struct CredentialPool {
     /// OAuth refresh. Mirrors `PoolLoadConfig.oauth_home` (production resolves
     /// via `dirs::home_dir`; tests inject a `tempdir`).
     oauth_home_for_writeback: Option<std::path::PathBuf>,
+    /// In-flight LLM calls indexed by credential id, each with a
+    /// `CancellationToken` the streaming path selects on. When the credential
+    /// transitions to removed (401/403 or operator revoke), every registered
+    /// token fires so the stream aborts with `LlmError::AuthRevoked` instead
+    /// of hanging until the next provider chunk fails. Lives in its own
+    /// `Mutex` (not under `inner`) so registering/unregistering doesn't
+    /// contend with `pick`/`report_*`.
+    active_calls: Mutex<HashMap<String, Vec<ActiveCallEntry>>>,
+    /// Monotonic id generator for `ActiveCallEntry`. Lets `Drop` of the
+    /// `ActiveCallGuard` remove its exact entry without relying on token
+    /// pointer equality (which `CancellationToken` clones share under the
+    /// hood).
+    next_active_call_id: AtomicU64,
+}
+
+/// One in-flight LLM call awaiting cancellation if its credential is revoked.
+#[derive(Debug)]
+struct ActiveCallEntry {
+    id: u64,
+    token: CancellationToken,
 }
 
 impl std::fmt::Debug for CredentialPool {
@@ -787,6 +809,8 @@ impl CredentialPool {
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             refresh_endpoint_override: Mutex::new(None),
             oauth_home_for_writeback: cfg.oauth_home,
+            active_calls: Mutex::new(HashMap::new()),
+            next_active_call_id: AtomicU64::new(1),
         }))
     }
 
@@ -1304,9 +1328,17 @@ impl CredentialPool {
         }
 
         let cred = g.creds.iter().find(|c| c.id == credential_id).cloned();
+        let auth_failure = matches!(reason, FailoverReason::Auth | FailoverReason::AuthPermanent);
         drop(g);
         if let Some(c) = cred {
             self.persist_credential(&c);
+        }
+        // Auth-class failures tombstone the credential — any in-flight LLM
+        // call still bound to it must abort instead of hanging on the next
+        // chunk read. Done after `drop(g)` so the cancel doesn't race with
+        // a streaming task waking up under the `inner` lock.
+        if auth_failure {
+            self.cancel_active_calls(credential_id);
         }
     }
 
@@ -1507,6 +1539,10 @@ impl CredentialPool {
 
         self.persist_credential(&removed);
         self.persist_suppression_row(&source, now);
+        // Operator-initiated revocation must abort any LLM call that pulled
+        // this credential before its tombstone landed — otherwise the stream
+        // keeps running on a key the operator just decided was compromised.
+        self.cancel_active_calls(&removed.id);
         Some(removed)
     }
 
@@ -1892,6 +1928,131 @@ impl Drop for LeaseHandle {
                 *count -= 1;
             }
         }
+    }
+}
+
+// ── ActiveCallGuard ───────────────────────────────────────────────────────
+
+/// RAII handle for a registered in-flight call. Holding the guard keeps the
+/// associated `CancellationToken` registered with the pool; dropping it
+/// removes the entry so a natural completion doesn't leave a stale token
+/// that would silently absorb a later revocation.
+pub struct ActiveCallGuard {
+    pool: Arc<CredentialPool>,
+    credential_id: String,
+    call_id: u64,
+    token: CancellationToken,
+}
+
+impl ActiveCallGuard {
+    /// The cancellation token to select on while the stream is in flight.
+    /// Fires when the credential is revoked (401/403 or operator removal).
+    pub fn token(&self) -> &CancellationToken {
+        &self.token
+    }
+
+    /// True if the token has already been cancelled (credential was revoked
+    /// before or during the call). Callers can short-circuit a fresh request
+    /// without dispatching.
+    pub fn is_revoked(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
+impl Drop for ActiveCallGuard {
+    fn drop(&mut self) {
+        let mut g = self
+            .pool
+            .active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = g.get_mut(&self.credential_id) {
+            entries.retain(|e| e.id != self.call_id);
+            if entries.is_empty() {
+                g.remove(&self.credential_id);
+            }
+        }
+    }
+}
+
+impl CredentialPool {
+    /// Register an in-flight call against `credential_id`. Returns an RAII
+    /// guard whose `token()` the streaming path must select on. When the
+    /// credential is revoked, the token fires; when the guard is dropped
+    /// (natural completion), the entry is removed.
+    ///
+    /// If the credential is already removed at registration time, the
+    /// returned token is already cancelled — callers can short-circuit
+    /// without dispatching the request.
+    pub fn register_active_call(self: &Arc<Self>, credential_id: &str) -> ActiveCallGuard {
+        let token = CancellationToken::new();
+        let already_removed = {
+            let g = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.creds
+                .iter()
+                .find(|c| c.id == credential_id)
+                .is_some_and(PooledCredential::is_removed)
+        };
+        if already_removed {
+            token.cancel();
+        }
+        let call_id = self.next_active_call_id.fetch_add(1, Ordering::Relaxed);
+        let mut g = self
+            .active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.entry(credential_id.to_string())
+            .or_default()
+            .push(ActiveCallEntry {
+                id: call_id,
+                token: token.clone(),
+            });
+        ActiveCallGuard {
+            pool: Arc::clone(self),
+            credential_id: credential_id.to_string(),
+            call_id,
+            token,
+        }
+    }
+
+    /// Cancel every in-flight call registered against `credential_id`.
+    /// Idempotent — re-cancelling a token is a no-op. Called from the
+    /// credential-removal paths (`mark_failover` Auth*, explicit revoke).
+    pub fn cancel_active_calls(&self, credential_id: &str) {
+        let mut g = self
+            .active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entries) = g.remove(credential_id) {
+            for entry in &entries {
+                entry.token.cancel();
+            }
+            if !entries.is_empty() {
+                info!(
+                    target: "cortex::llm::credential_pool",
+                    credential_id = %credential_id,
+                    aborted_calls = entries.len(),
+                    reason = "auth-revoked",
+                    "cancelled in-flight LLM calls bound to revoked credential"
+                );
+            }
+        }
+    }
+
+    /// Test-only: number of currently registered active calls for
+    /// `credential_id`. Lets cancellation tests assert the registry is
+    /// drained after natural completion / revocation without poking
+    /// private fields.
+    #[doc(hidden)]
+    pub fn active_call_count(&self, credential_id: &str) -> usize {
+        let g = self
+            .active_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.get(credential_id).map(Vec::len).unwrap_or(0)
     }
 }
 
@@ -4129,5 +4290,212 @@ mod tests {
         // otherwise `borg auth list` shows phantom bucket state on a key that
         // can never be used again.
         assert!(pool.entries()[0].rate_limit.is_none());
+    }
+
+    // ── Active-call cancellation (mid-stream credential revocation) ──
+    //
+    // Invariant: when a credential's tombstone gets set (auth failure or
+    // operator revoke), every in-flight LLM call still bound to that
+    // credential must be cancelled so the streaming path returns
+    // `LlmError::AuthRevoked` instead of hanging on the next chunk read.
+    // Sibling credentials' in-flight calls must NOT be cancelled — that
+    // would interrupt unrelated traffic.
+
+    #[test]
+    fn revocation_cancels_active_call_on_same_credential() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        let id = pool.entries()[0].id.clone();
+
+        // Simulate an in-flight LLM call: the transport would have registered
+        // an active-call entry and would now be awaiting on the token.
+        let guard = pool.register_active_call(&id);
+        assert!(
+            !guard.is_revoked(),
+            "fresh registration must not be cancelled"
+        );
+        assert_eq!(pool.active_call_count(&id), 1);
+
+        // 401 on a parallel call (or operator unpair) tombstones the
+        // credential through `report_failure`.
+        pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+
+        // The in-flight call's token must now fire so the streaming path
+        // unblocks. Registry is drained — re-registering would have to
+        // re-add to a fresh entry.
+        assert!(
+            guard.token().is_cancelled(),
+            "report_failure(Auth) must fire the active-call token"
+        );
+        assert_eq!(
+            pool.active_call_count(&id),
+            0,
+            "cancel_active_calls must remove the entry, not just fire it"
+        );
+    }
+
+    #[test]
+    fn revocation_does_not_cancel_calls_on_other_credentials() {
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1"), ("beta", "k2")]),
+        )
+        .unwrap();
+        let alpha = pool.entries()[0].id.clone();
+        let beta = pool.entries()[1].id.clone();
+
+        let guard_alpha = pool.register_active_call(&alpha);
+        let guard_beta = pool.register_active_call(&beta);
+
+        // Revoke only alpha. Beta's stream must keep flowing — interrupting
+        // every concurrent call when one key fails would turn a soft auth
+        // failure into a full conversation outage.
+        pool.report_failure(&alpha, FailoverReason::AuthPermanent, Some(403), None, None);
+
+        assert!(guard_alpha.token().is_cancelled());
+        assert!(
+            !guard_beta.token().is_cancelled(),
+            "revocation must be scoped to the failing credential"
+        );
+        assert_eq!(pool.active_call_count(&alpha), 0);
+        assert_eq!(pool.active_call_count(&beta), 1);
+    }
+
+    #[test]
+    fn operator_remove_index_cancels_active_calls() {
+        // Operator unpair / `borg auth remove` goes through `remove_index`,
+        // not `report_failure`. That path must also drain the active-call
+        // registry — otherwise a deliberate revocation leaves the live
+        // stream running on a key the operator just decided to retire.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        let id = pool.entries()[0].id.clone();
+        let guard = pool.register_active_call(&id);
+
+        let removed = pool.remove_index(1).expect("index 1 exists");
+        assert_eq!(removed.id, id);
+
+        assert!(
+            guard.token().is_cancelled(),
+            "remove_index must fire the active-call token"
+        );
+        assert_eq!(pool.active_call_count(&id), 0);
+    }
+
+    #[test]
+    fn natural_completion_drops_active_call_entry() {
+        // RAII safety net: a stream that completes normally must not leave a
+        // dangling entry in the registry. Otherwise the registry grows
+        // unbounded and a *future* revocation would also fire on this
+        // long-dead call — meaningless cancel work plus log noise.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        let id = pool.entries()[0].id.clone();
+        {
+            let _guard = pool.register_active_call(&id);
+            assert_eq!(pool.active_call_count(&id), 1);
+        }
+        // Guard dropped — registry must be drained.
+        assert_eq!(
+            pool.active_call_count(&id),
+            0,
+            "ActiveCallGuard Drop must remove the registry entry"
+        );
+    }
+
+    #[test]
+    fn register_for_already_removed_credential_returns_cancelled_token() {
+        // Race window: the operator revokes a credential between the
+        // transport picking it via `acquire_lease` and registering its
+        // active call. Without an at-registration check, the call would
+        // dispatch on a tombstoned key and only discover the revocation
+        // when the provider 401s. The pool short-circuits by pre-cancelling
+        // the token at registration time.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        let id = pool.entries()[0].id.clone();
+        pool.report_failure(&id, FailoverReason::Auth, Some(401), None, None);
+
+        let guard = pool.register_active_call(&id);
+        assert!(
+            guard.is_revoked(),
+            "registering against a tombstoned credential must return a pre-cancelled token"
+        );
+    }
+
+    #[test]
+    fn non_auth_failure_does_not_cancel_active_calls() {
+        // 429 / 402 cool a credential but don't tombstone it — the active
+        // call must keep flowing (the rate-limit applies to *future*
+        // requests, not the one already in flight). Revoking here would
+        // turn benign rate-limit cooldowns into user-visible cancellations.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        let id = pool.entries()[0].id.clone();
+        let guard = pool.register_active_call(&id);
+
+        pool.report_failure(
+            &id,
+            FailoverReason::RateLimit,
+            Some(429),
+            Some(Duration::from_secs(30)),
+            None,
+        );
+
+        assert!(
+            !guard.token().is_cancelled(),
+            "RateLimit cooling must NOT cancel in-flight calls"
+        );
+        assert_eq!(pool.active_call_count(&id), 1);
+    }
+
+    #[test]
+    fn cancel_active_calls_for_unknown_credential_is_noop() {
+        // Defensive: callers may pass stale ids (e.g. a credential removed
+        // between revocation events). The pool must not panic or pollute
+        // the registry with bogus entries.
+        let (db, path, _g) = open_test_db();
+        let pool = CredentialPool::load(
+            &db,
+            &path,
+            Provider::OpenRouter,
+            cfg_with(&[("alpha", "k1")]),
+        )
+        .unwrap();
+        pool.cancel_active_calls("no-such-id");
+        assert_eq!(pool.active_call_count("no-such-id"), 0);
     }
 }

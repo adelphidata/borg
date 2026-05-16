@@ -395,6 +395,12 @@ pub struct LlmClient {
     /// Lease held during an in-flight request. Drops at the end of each
     /// attempt to return the credential's lease counter to the pool.
     _active_lease: Option<credential_pool::LeaseHandle>,
+    /// Active-call registration guard. Holds a `CancellationToken` that the
+    /// pool fires when the leased credential is revoked, so the streaming
+    /// path aborts with `LlmError::AuthRevoked` instead of hanging on the
+    /// next provider chunk. Dropped at the end of each attempt to keep the
+    /// pool's `active_calls` registry from leaking stale entries.
+    _active_call_guard: Option<credential_pool::ActiveCallGuard>,
     /// Per-credential `base_url` override pulled from the active lease at
     /// acquire time. `None` outside an in-flight request, or when the
     /// leased credential uses the provider's default URL. `effective_base_url`
@@ -454,6 +460,71 @@ fn bearer_headers(token: &str) -> std::result::Result<reqwest::header::HeaderMap
     })?;
     headers.insert(reqwest::header::AUTHORIZATION, value);
     Ok(headers)
+}
+
+/// RAII guard that aborts a revocation-watcher task on drop. Without this,
+/// a successful stream would leave the watcher awaiting forever (the
+/// revocation token would only fire on a future credential removal, long
+/// after the call completed). Dropping it on the success path tears the
+/// task down immediately.
+struct RevocationWatcherGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for RevocationWatcherGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+    }
+}
+
+/// Build a cancellation token that fires when *either* the user-provided
+/// `user_cancel` OR the optional `revocation` token (from the credential
+/// pool's active-call registry) is cancelled. Returns the combined token
+/// plus a guard that cleans up the bridging task on drop.
+///
+/// Uses `user_cancel.child_token()` so the parent-cancellation arm is
+/// handled by tokio_util natively; the spawned task only watches the
+/// revocation side and forwards into the child.
+fn combine_with_revocation_token(
+    user_cancel: &CancellationToken,
+    revocation: Option<CancellationToken>,
+) -> (CancellationToken, RevocationWatcherGuard) {
+    let combined = user_cancel.child_token();
+    let handle = revocation.map(|rev| {
+        let combined_clone = combined.clone();
+        tokio::spawn(async move {
+            rev.cancelled().await;
+            combined_clone.cancel();
+        })
+    });
+    (combined, RevocationWatcherGuard { handle })
+}
+
+/// Reclassify an inner stream outcome whose only cause was mid-stream
+/// credential revocation. The SSE/Bedrock cancel arms return `Ok(())` (and
+/// deliberately do NOT emit `StreamEvent::Done`, so the consumer keeps
+/// reading the same channel while the retry loop rotates credentials);
+/// other inner sites may surface a generic `Retryable {Timeout}` when the
+/// chunk source vanishes. Both must become `AuthRevoked` so the outer loop
+/// routes through credential rotation rather than terminating the turn as
+/// success or burning a provider-fallback slot.
+///
+/// Returns the input untouched when the user-provided cancel fired (caller
+/// wanted to cancel) or when revocation did not fire (genuine outcome).
+fn reclassify_revoked_outcome(
+    result: std::result::Result<(), LlmError>,
+    user_cancel: &CancellationToken,
+    revocation: Option<&CancellationToken>,
+) -> std::result::Result<(), LlmError> {
+    let revocation_fired_alone =
+        revocation.is_some_and(|t| t.is_cancelled() && !user_cancel.is_cancelled());
+    if revocation_fired_alone {
+        Err(LlmError::AuthRevoked)
+    } else {
+        result
+    }
 }
 
 /// Compose the Azure OpenAI chat-completions URL from
@@ -669,6 +740,7 @@ impl LlmClient {
             fallback_keys: keys_remaining,
             primary_pool,
             _active_lease: None,
+            _active_call_guard: None,
             active_credential_base_url: None,
             provider_slots,
             active_slot_index: usize::MAX,
@@ -1003,7 +1075,10 @@ impl LlmClient {
         loop {
             let chunk = tokio::select! {
                 _ = cancel.cancelled() => {
-                    let _ = tx.send(StreamEvent::Done).await;
+                    // See `crate::sse::process_sse_stream` cancel arm — we
+                    // intentionally do not emit `StreamEvent::Done` here so a
+                    // revocation-driven cancel does not poison the consumer
+                    // before the retry loop rotates credentials.
                     return Ok(());
                 }
                 maybe_chunk = async {
@@ -1263,6 +1338,12 @@ impl LlmClient {
                         // Park the lease on `self` so its Drop fires after the
                         // result is processed below.
                         self._active_lease = Some(lease);
+                        // Register an active-call entry for this credential.
+                        // The guard's token fires if the credential is revoked
+                        // mid-stream (operator unpair or 401/403 on a parallel
+                        // call), letting us abort the SSE loop instead of
+                        // hanging until the next chunk read.
+                        self._active_call_guard = Some(pool.register_active_call(&id));
                         Some(id)
                     } else {
                         // No credential is currently usable. That means either
@@ -1300,27 +1381,38 @@ impl LlmClient {
                     None
                 };
 
+                // Combine the user-provided cancel signal with the active
+                // call guard's revocation token so the inner stream aborts
+                // on either. The watcher task is bounded by the function
+                // scope: dropping `_watcher_guard` aborts it, and either
+                // token firing also ends it naturally.
+                let revocation_token = self._active_call_guard.as_ref().map(|g| g.token().clone());
+                let (effective_cancel, _watcher_guard) =
+                    combine_with_revocation_token(&cancel, revocation_token.clone());
+
                 let result = if matches!(self.provider, Provider::ClaudeCli) {
-                    self.stream_chat_claude_cli_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_claude_cli_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 } else if matches!(self.provider, Provider::Bedrock) {
-                    self.stream_chat_bedrock_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_bedrock_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 } else if self.provider == Provider::VertexAi
                     && vertex::is_anthropic_model(&self.llm_config.model)
                 {
-                    self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_vertex_anthropic_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 } else if matches!(self.provider, Provider::Gemini) {
-                    self.stream_chat_gemini_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_gemini_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 } else if self.provider.is_openai_compatible() {
-                    self.stream_chat_openai_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_openai_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 } else {
-                    self.stream_chat_anthropic_inner(messages, tools, &tx, &cancel)
+                    self.stream_chat_anthropic_inner(messages, tools, &tx, &effective_cancel)
                         .await
                 };
+
+                let result = reclassify_revoked_outcome(result, &cancel, revocation_token.as_ref());
 
                 // Lease drop happens here as we re-bind below; report outcome
                 // to the pool by id before the lease's Drop returns it.
@@ -1332,6 +1424,7 @@ impl LlmClient {
                             pool.report_success(id);
                         }
                         self._active_lease = None;
+                        self._active_call_guard = None;
                         self.active_credential_base_url = None;
                         self.record_provider_success();
                         return Ok(());
@@ -1359,6 +1452,7 @@ impl LlmClient {
                                 Some(&e.to_string()),
                             );
                             self._active_lease = None;
+                            self._active_call_guard = None;
                             self.active_credential_base_url = None;
                             if e.should_rotate_credential() && pool.has_available() {
                                 info!("{reason} error, pool re-picking next credential");

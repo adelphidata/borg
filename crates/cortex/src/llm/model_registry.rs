@@ -465,6 +465,37 @@ pub fn max_context_window_for(model: &str) -> u32 {
         .unwrap_or(DEFAULT_CONTEXT_WINDOW)
 }
 
+/// Slugs of OpenAI reasoning models whose Chat Completions endpoint requires
+/// `max_completion_tokens` in place of the deprecated `max_tokens`. Sending
+/// `max_tokens` to these endpoints either silently ignores the cap or 400s.
+///
+/// Scoped intentionally to OpenAI's reasoning families. Other vendors that
+/// also support extended thinking (Anthropic, Gemini, qwen3, gpt-oss, ...)
+/// keep accepting `max_tokens` and are routed through native transports
+/// (Anthropic/Gemini) or OpenAI-compat hosts that tolerate either name.
+const OPENAI_MAX_COMPLETION_TOKENS_SLUGS: &[&str] = &[
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "o4-mini",
+    "o3",
+    "o1",
+    "o1-mini",
+    "o1-preview",
+];
+
+/// True when the model's outbound request must use `max_completion_tokens`
+/// instead of `max_tokens` on the OpenAI Chat Completions wire.
+///
+/// Match is on the registry slug (vendor-prefix-stripped, longest match),
+/// so `openai/o3`, `o3-2025-04-16`, and `o3` all resolve identically.
+pub fn uses_max_completion_tokens(model: &str) -> bool {
+    match lookup(model) {
+        Some(meta) => OPENAI_MAX_COMPLETION_TOKENS_SLUGS.contains(&meta.slug),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +684,57 @@ mod tests {
                 entry.slug
             );
         }
+    }
+
+    #[test]
+    fn uses_max_completion_tokens_matches_openai_reasoning_only() {
+        // Invariant: OpenAI's o-series + gpt-5* must opt in (their Chat
+        // Completions endpoint requires `max_completion_tokens`); every
+        // other family must opt out so we don't accidentally rename
+        // `max_tokens` for providers that still expect it.
+        for slug in OPENAI_MAX_COMPLETION_TOKENS_SLUGS {
+            assert!(
+                uses_max_completion_tokens(slug),
+                "{slug} must require max_completion_tokens"
+            );
+        }
+        // Non-OpenAI thinking models continue to use `max_tokens`.
+        for slug in [
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "gemini-3-pro",
+            "gemini-2.5-pro",
+            "qwen3-32b",
+            "gpt-oss-120b",
+            "deepseek-r1-distill-llama-70b",
+            "grok-4-fast-reasoning",
+        ] {
+            assert!(
+                !uses_max_completion_tokens(slug),
+                "{slug} must keep max_tokens — non-OpenAI provider"
+            );
+        }
+        // OpenAI non-reasoning families stay on the legacy name.
+        for slug in ["gpt-4o", "gpt-4.1", "gpt-4", "gpt-3.5-turbo"] {
+            assert!(
+                !uses_max_completion_tokens(slug),
+                "{slug} must keep max_tokens — non-reasoning OpenAI model"
+            );
+        }
+        // Unknown / empty falls through to false; never crashes.
+        assert!(!uses_max_completion_tokens("totally-unknown-model"));
+        assert!(!uses_max_completion_tokens(""));
+    }
+
+    #[test]
+    fn uses_max_completion_tokens_honors_vendor_prefix_and_versioned_slug() {
+        // The registry already strips vendor prefixes and matches by longest
+        // prefix; the helper must inherit that behavior so `openai/o3` and
+        // `o3-2025-04-16` both trigger the rename. Without this the wire
+        // rewrite silently misses operator-pasted or dated slugs.
+        assert!(uses_max_completion_tokens("openai/o3"));
+        assert!(uses_max_completion_tokens("o3-2025-04-16"));
+        assert!(uses_max_completion_tokens("gpt-5-2025-08-07"));
+        assert!(uses_max_completion_tokens("o1-mini-2024-09-12"));
     }
 }

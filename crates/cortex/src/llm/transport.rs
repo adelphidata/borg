@@ -877,6 +877,20 @@ fn build_openai_request(
     {
         apply_openai_cache_markers(&mut body, &request.llm_config.cache);
     }
+    // OpenAI's reasoning families (o-series, gpt-5*) replaced `max_tokens` with
+    // `max_completion_tokens` on the Chat Completions wire. Rewrite at the JSON
+    // boundary so the in-Rust `ChatRequest` struct stays single-named while the
+    // wire shape matches the endpoint. Match is model-driven (registry slug),
+    // not provider-driven, because the same slug routed through any host that
+    // proxies to api.openai.com (OpenRouter `openai/o3`, Azure deployments
+    // named after reasoning models) needs the same field name.
+    if super::model_registry::uses_max_completion_tokens(request.model) {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(v) = obj.remove("max_tokens") {
+                obj.insert("max_completion_tokens".to_string(), v);
+            }
+        }
+    }
     Ok(body)
 }
 
@@ -1607,5 +1621,115 @@ mod tests {
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert_eq!(body["stream"], true);
         assert_eq!(body["messages"][0]["role"], "user");
+    }
+
+    fn openai_request<'a>(model: &'a str, messages: &'a [Message]) -> TransportRequest<'a> {
+        TransportRequest {
+            provider: Provider::OpenAi,
+            model,
+            messages,
+            tools: None,
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        }
+    }
+
+    #[test]
+    fn openai_reasoning_model_sends_max_completion_tokens() {
+        // Invariant: OpenAI's reasoning families (o-series, gpt-5*) replaced
+        // `max_tokens` with `max_completion_tokens` on the Chat Completions
+        // wire. Sending `max_tokens` to those endpoints either silently
+        // ignores the cap or returns 400 — caught here.
+        let messages = vec![Message::user("hello")];
+        for model in [
+            "o3",
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o4-mini",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+        ] {
+            let req = openai_request(model, &messages);
+            let body = build_openai_request(&req, true).expect("build");
+            assert!(
+                body.get("max_completion_tokens").is_some(),
+                "model {model} must serialize max_completion_tokens"
+            );
+            assert!(
+                body.get("max_tokens").is_none(),
+                "model {model} must not serialize legacy max_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_non_reasoning_model_keeps_max_tokens() {
+        // The rewrite must not touch models whose endpoint still uses the
+        // legacy `max_tokens` name (gpt-4o, gpt-4.1, gpt-3.5-turbo, ...).
+        // A naive "rename everywhere" would break those.
+        let messages = vec![Message::user("hello")];
+        for model in ["gpt-4o", "gpt-4.1", "gpt-3.5-turbo"] {
+            let req = openai_request(model, &messages);
+            let body = build_openai_request(&req, true).expect("build");
+            assert!(
+                body.get("max_tokens").is_some(),
+                "model {model} must serialize max_tokens"
+            );
+            assert!(
+                body.get("max_completion_tokens").is_none(),
+                "model {model} must not serialize max_completion_tokens"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_reasoning_model_preserves_max_tokens_value() {
+        // The rename must carry the numeric value through unchanged —
+        // a silent zero or truncation would let the model run unbounded.
+        use crate::config::LlmConfig;
+        let mut cfg = LlmConfig::default();
+        cfg.max_tokens = 4321;
+        let cfg_box: &'static LlmConfig = Box::leak(Box::new(cfg));
+
+        let messages = vec![Message::user("hi")];
+        let req = TransportRequest {
+            provider: Provider::OpenAi,
+            model: "o3",
+            messages: &messages,
+            tools: None,
+            llm_config: cfg_box,
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+
+        let body = build_openai_request(&req, true).expect("build");
+        assert_eq!(
+            body["max_completion_tokens"].as_u64(),
+            Some(4321),
+            "value must carry through the rename unchanged"
+        );
+    }
+
+    #[test]
+    fn openai_reasoning_model_rewrite_works_with_vendor_prefix() {
+        // OpenRouter and copy-paste from docs commonly route through
+        // slashed slugs like `openai/o3`. The registry strips the vendor
+        // prefix during lookup, so the rewrite must trigger for these too.
+        let messages = vec![Message::user("hi")];
+        let req = TransportRequest {
+            provider: Provider::OpenRouter,
+            model: "openai/o3",
+            messages: &messages,
+            tools: None,
+            llm_config: default_llm_config(),
+            prompt_cache_key: None,
+            cost_events_enabled: false,
+        };
+        let body = build_openai_request(&req, true).expect("build");
+        assert!(body.get("max_completion_tokens").is_some());
+        assert!(body.get("max_tokens").is_none());
     }
 }

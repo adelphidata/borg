@@ -47,7 +47,19 @@ where
     loop {
         let chunk = tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = tx.send(StreamEvent::Done).await;
+                // Do NOT emit StreamEvent::Done here. The agent-loop consumer
+                // treats `Done` as the authoritative end-of-turn signal; if we
+                // fired it on a revocation-driven cancel, the consumer would
+                // commit a truncated turn before `stream_chat_with_cancel`'s
+                // retry loop could rotate to a healthy credential and stream
+                // the real response on the same channel. The retry path keeps
+                // `tx` open across attempts, so the consumer naturally
+                // resumes reading once rotation delivers fresh chunks.
+                //
+                // User-initiated cancellation goes through the same arm, but
+                // the consumer is independently selecting on the same `cancel`
+                // token and reaches its own teardown without needing a `Done`
+                // from us.
                 return Ok(());
             }
             maybe_chunk = async {
@@ -271,11 +283,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_stops_stream() {
+    async fn cancellation_stops_stream_without_emitting_done() {
+        // Regression guard: when the cancel token fires (whether from
+        // user-cancel or from a revoked credential's revocation watcher),
+        // the SSE loop must exit cleanly WITHOUT pushing
+        // `StreamEvent::Done` to the channel. The agent-loop consumer
+        // treats `Done` as authoritative end-of-turn, so emitting it on a
+        // revocation-driven cancel would commit a truncated turn before
+        // the outer retry loop's rotation delivers the real response on
+        // the same channel.
         let (tx, mut rx) = mpsc::channel(16);
         let cancel = CancellationToken::new();
-
-        // Create a stream that yields one chunk then "blocks" (empty)
         let stream = make_stream(vec![]);
         cancel.cancel();
 
@@ -283,10 +301,18 @@ mod tests {
             SseAction::Continue
         })
         .await;
+        assert!(
+            result.is_ok(),
+            "cancel arm returns Ok so the outer reclassifier can decide"
+        );
 
-        assert!(result.is_ok());
-        let e = rx.recv().await.unwrap();
-        assert!(matches!(e, StreamEvent::Done));
+        // Drop the sender so `recv()` doesn't hang on a still-open channel.
+        drop(tx);
+        let event = rx.recv().await;
+        assert!(
+            event.is_none(),
+            "cancel arm must not push any StreamEvent; channel should be empty (got {event:?})"
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,14 @@ pub enum LlmError {
     },
     /// Request was cancelled via cancellation token.
     Interrupted,
+    /// The credential backing the call was revoked mid-flight (operator
+    /// removal or 401/403 on a concurrent request). The pool's
+    /// `cancel_active_calls` fired the cancellation token bound to this
+    /// stream. Distinct from `Interrupted` because the agent layer should
+    /// rotate to a different credential and retry — the conversation is
+    /// recoverable. Distinct from `Fatal { AuthPermanent }` because the
+    /// stream was aborted from the pool side, not the provider's response.
+    AuthRevoked,
 }
 
 impl fmt::Display for LlmError {
@@ -108,6 +116,7 @@ impl fmt::Display for LlmError {
             Self::Retryable { source, .. } => write!(f, "{source}"),
             Self::Fatal { source, .. } => write!(f, "{source}"),
             Self::Interrupted => write!(f, "request interrupted"),
+            Self::AuthRevoked => write!(f, "credential revoked mid-stream"),
         }
     }
 }
@@ -125,6 +134,11 @@ impl LlmError {
         match self {
             Self::Retryable { reason, .. } | Self::Fatal { reason, .. } => *reason,
             Self::Interrupted => FailoverReason::Unknown,
+            // Surface mid-stream revocation as `Auth` so the agent layer
+            // routes it through the same rotate-credential path as a 401 on
+            // the response. `AuthPermanent` would short-circuit fallback;
+            // here we want the next pool credential to get a chance.
+            Self::AuthRevoked => FailoverReason::Auth,
         }
     }
 
@@ -1328,6 +1342,44 @@ mod tests {
         };
         assert!(auth.should_rotate_credential());
         assert!(!perm.should_rotate_credential());
+    }
+
+    #[test]
+    fn auth_revoked_routes_through_credential_rotation_not_provider_fallback_only() {
+        // Invariant: `AuthRevoked` (mid-stream revocation from the pool) must
+        // behave like a fresh 401 — rotate to the next pool credential and
+        // keep the conversation alive. Treating it as `AuthPermanent` would
+        // skip rotation and burn the whole fallback chain; treating it as
+        // `Interrupted` would silently end the conversation with no retry.
+        let err = LlmError::AuthRevoked;
+        assert_eq!(err.reason(), FailoverReason::Auth);
+        assert!(
+            err.should_rotate_credential(),
+            "AuthRevoked must rotate to another pool credential"
+        );
+        assert!(
+            err.should_fallback(),
+            "AuthRevoked must allow provider-level fallback if rotation exhausts"
+        );
+        assert!(
+            !err.is_retryable(),
+            "AuthRevoked is not retryable on the same credential — that key is gone"
+        );
+        assert!(
+            !err.is_fast_fail(),
+            "AuthRevoked must not fast-fail; rotation/fallback should still run"
+        );
+        assert!(
+            !err.should_compress(),
+            "AuthRevoked has nothing to do with context-window pressure"
+        );
+        // Display must carry a recognizable phrase so the agent log / surfaced
+        // error tells the operator why the stream ended.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("revoked"),
+            "AuthRevoked Display should mention revocation, got {rendered:?}"
+        );
     }
 
     #[test]
