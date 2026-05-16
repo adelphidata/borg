@@ -2520,13 +2520,16 @@ impl Agent {
 
         // Variants returning Result<String> wrap to ToolOutput::Text below.
         let text_result: Result<String> = match &tool {
-            crate::tool::Tool::WriteMemory(args) => crate::tool::write_memory::handle(
-                args,
-                &self.config,
-                &self.config_arc,
-                &mut self.caches,
-            ),
-            crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args),
+            crate::tool::Tool::WriteMemory(args) => {
+                crate::tool::write_memory::handle(
+                    args,
+                    &self.config,
+                    &self.config_arc,
+                    &mut self.caches,
+                )
+                .await
+            }
+            crate::tool::Tool::ReadMemory(args) => crate::tool::read_memory::handle(args).await,
             crate::tool::Tool::MemorySearch(args) => {
                 crate::tool::memory_search::handle(args, &self.config).await
             }
@@ -2602,10 +2605,10 @@ impl Agent {
                 crate::tool::multi_agent::handle_list_agents(self.agent_control.as_ref())
             }
             crate::tool::Tool::CloseAgent(args) => {
-                crate::tool::multi_agent::handle_close_agent(args, &mut self.agent_control)
+                crate::tool::multi_agent::handle_close_agent(args, &mut self.agent_control).await
             }
             crate::tool::Tool::ManageRoles(args) => {
-                crate::tool::multi_agent::handle_manage_roles(args)
+                crate::tool::multi_agent::handle_manage_roles(args).await
             }
             crate::tool::Tool::GetGoal(args) => {
                 if !self.config.goals.enabled {

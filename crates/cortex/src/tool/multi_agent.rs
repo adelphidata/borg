@@ -71,19 +71,19 @@ pub(crate) fn handle_list_agents(agent_control: Option<&AgentControl>) -> Result
     }
 }
 
-pub(crate) fn handle_close_agent(
+pub(crate) async fn handle_close_agent(
     args: &MultiAgentArgs,
     agent_control: &mut Option<AgentControl>,
 ) -> Result<String> {
     if let Some(ref mut ctrl) = agent_control {
-        multi_agent::tools::handle_close_agent(args.as_value(), ctrl)
+        multi_agent::tools::handle_close_agent(args.as_value(), ctrl).await
     } else {
         Ok(MULTI_AGENT_DISABLED.to_string())
     }
 }
 
-pub(crate) fn handle_manage_roles(args: &MultiAgentArgs) -> Result<String> {
-    multi_agent::tools::handle_manage_roles(args.as_value())
+pub(crate) async fn handle_manage_roles(args: &MultiAgentArgs) -> Result<String> {
+    multi_agent::tools::handle_manage_roles(args.as_value()).await
 }
 
 #[cfg(test)]

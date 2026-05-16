@@ -23,8 +23,8 @@ impl ReadMemoryArgs {
     }
 }
 
-pub(crate) fn handle(args: &ReadMemoryArgs) -> Result<String> {
-    tool_handlers::handle_read_memory(&args.to_value())
+pub(crate) async fn handle(args: &ReadMemoryArgs) -> Result<String> {
+    tool_handlers::handle_read_memory(&args.to_value()).await
 }
 
 #[cfg(test)]

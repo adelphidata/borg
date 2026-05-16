@@ -46,14 +46,14 @@ impl WriteMemoryArgs {
 ///
 /// All side effects log on failure rather than aborting — they never block
 /// the primary write or fail the tool call.
-pub(crate) fn handle(
+pub(crate) async fn handle(
     args: &WriteMemoryArgs,
     config: &Config,
     config_arc: &Arc<Config>,
     caches: &mut SystemPromptCache,
 ) -> Result<String> {
     let value = args.to_value();
-    let result = tool_handlers::handle_write_memory(&value);
+    let result = tool_handlers::handle_write_memory(&value).await;
 
     if result.is_ok() {
         let scope = args.scope.as_deref().unwrap_or("global");
@@ -82,21 +82,21 @@ fn spawn_embedding_task(args: &WriteMemoryArgs, config_arc: &Arc<Config>) {
         .strip_suffix(".md")
         .unwrap_or(&raw_filename)
         .to_string();
-    let full_content = match crate::memory::read_memory_db(&entry_name, &scope) {
-        Ok(Some(content)) => crate::security::secrets::redact_secrets(&content),
-        Ok(None) => {
-            tracing::debug!(
-                "spawn_embedding_task: entry {entry_name} (scope {scope}) missing, skipping embed"
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!("Failed to read memory entry {entry_name} for embedding: {e}");
-            return;
-        }
-    };
     let filename = entry_name;
     crate::agent::spawn_logged("embed_memory_write", async move {
+        let full_content = match crate::memory::read_memory_db(&filename, &scope).await {
+            Ok(Some(content)) => crate::security::secrets::redact_secrets(&content),
+            Ok(None) => {
+                tracing::debug!(
+                    "spawn_embedding_task: entry {filename} (scope {scope}) missing, skipping embed"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read memory entry {filename} for embedding: {e}");
+                return;
+            }
+        };
         if let Err(e) =
             crate::memory::embeddings::embed_memory_file(&config, &filename, &full_content, &scope)
                 .await

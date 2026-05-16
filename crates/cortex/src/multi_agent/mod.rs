@@ -224,7 +224,7 @@ impl AgentControl {
     }
 
     /// Build the SubAgentInfo and record it in the database.
-    fn prepare_sub_agent_info(
+    async fn prepare_sub_agent_info(
         &self,
         agent_id: &str,
         nickname: &str,
@@ -244,15 +244,18 @@ impl AgentControl {
         };
 
         // Record in DB
-        if let Ok(db) = crate::db::Database::open() {
-            if let Err(e) = db.insert_sub_agent_run(
-                agent_id,
-                nickname,
-                role_name,
-                &self.parent_session_id,
-                session_id,
-                child_depth,
-            ) {
+        if let Ok(db) = crate::db::Database::open().await {
+            if let Err(e) = db
+                .insert_sub_agent_run(
+                    agent_id,
+                    nickname,
+                    role_name,
+                    &self.parent_session_id,
+                    session_id,
+                    child_depth,
+                )
+                .await
+            {
                 tracing::warn!(agent_id, "failed to insert sub-agent run record: {e}");
             }
         }
@@ -341,13 +344,15 @@ impl AgentControl {
         let session_id = uuid::Uuid::new_v4().to_string();
 
         // Prepare info and record in DB
-        let info = self.prepare_sub_agent_info(
-            &agent_id,
-            &chosen_nickname,
-            &role_name,
-            &session_id,
-            child_depth,
-        );
+        let info = self
+            .prepare_sub_agent_info(
+                &agent_id,
+                &chosen_nickname,
+                &role_name,
+                &session_id,
+                child_depth,
+            )
+            .await;
 
         // Spawn tokio task
         let (input_tx, input_rx) = mpsc::channel::<String>(16);
@@ -538,7 +543,7 @@ impl AgentControl {
     }
 
     /// Shut down a specific sub-agent.
-    pub fn shutdown_agent(&mut self, agent_id: &str) -> Result<()> {
+    pub async fn shutdown_agent(&mut self, agent_id: &str) -> Result<()> {
         let handle = self
             .agents
             .get_mut(agent_id)
@@ -547,8 +552,11 @@ impl AgentControl {
         handle.info.status = SubAgentStatus::Shutdown;
 
         // Update DB
-        if let Ok(db) = crate::db::Database::open() {
-            if let Err(e) = db.update_sub_agent_status(agent_id, &SubAgentStatus::Shutdown) {
+        if let Ok(db) = crate::db::Database::open().await {
+            if let Err(e) = db
+                .update_sub_agent_status(agent_id, &SubAgentStatus::Shutdown)
+                .await
+            {
                 tracing::warn!(agent_id, "failed to update sub-agent shutdown status: {e}");
             }
         }
@@ -793,7 +801,8 @@ fn run_sub_agent(
             &agents_config,
             crate::telemetry::BorgMetrics::noop(),
             tools_filter,
-        )?;
+        )
+        .await?;
 
         // Inject fork context if provided
         if let Some(context) = fork_context {
@@ -819,8 +828,11 @@ fn run_sub_agent(
         full_message.push_str(&initial_message);
 
         // Update DB status to running
-        if let Ok(db) = crate::db::Database::open() {
-            if let Err(e) = db.update_sub_agent_status(&agent_id, &SubAgentStatus::Running) {
+        if let Ok(db) = crate::db::Database::open().await {
+            if let Err(e) = db
+                .update_sub_agent_status(&agent_id, &SubAgentStatus::Running)
+                .await
+            {
                 tracing::warn!(%agent_id, "failed to update sub-agent running status: {e}");
             }
         }

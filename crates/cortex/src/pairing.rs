@@ -189,7 +189,7 @@ pub fn resolve_dm_policy(config: &Config, channel_name: &str) -> DmPolicy {
 /// Check whether a sender is allowed to interact with the bot on a given channel.
 ///
 /// `agent_name` is used to personalize the challenge message (defaults to "Borg").
-pub fn check_sender_access(
+pub async fn check_sender_access(
     db: &Database,
     config: &Config,
     channel_name: &str,
@@ -203,11 +203,11 @@ pub fn check_sender_access(
         DmPolicy::Disabled => Ok(AccessCheckResult::Denied {
             reason: "This Borg is not accepting messages on this channel.".into(),
         }),
-        DmPolicy::Pairing => check_pairing(db, config, channel_name, sender_id, agent_name),
+        DmPolicy::Pairing => check_pairing(db, config, channel_name, sender_id, agent_name).await,
     }
 }
 
-fn check_pairing(
+async fn check_pairing(
     db: &Database,
     config: &Config,
     channel_name: &str,
@@ -215,7 +215,7 @@ fn check_pairing(
     agent_name: Option<&str>,
 ) -> Result<AccessCheckResult> {
     // Check if sender is already approved
-    if db.is_sender_approved(channel_name, sender_id)? {
+    if db.is_sender_approved(channel_name, sender_id).await? {
         return Ok(AccessCheckResult::Allowed);
     }
 
@@ -224,7 +224,9 @@ fn check_pairing(
 
     // Rate limit: max N new codes per sender per hour (checked before reuse
     // so that even reused-code responses are gated after excessive attempts)
-    let attempts = db.count_pairing_attempts(channel_name, sender_id, constants::SECS_PER_HOUR)?;
+    let attempts = db
+        .count_pairing_attempts(channel_name, sender_id, constants::SECS_PER_HOUR)
+        .await?;
     if attempts >= constants::PAIRING_MAX_ATTEMPTS_PER_HOUR {
         tracing::warn!(
             channel = channel_name,
@@ -237,7 +239,7 @@ fn check_pairing(
     }
 
     // Check for existing non-expired pending request (reuse code)
-    if let Some(existing) = db.find_pending_for_sender(channel_name, sender_id)? {
+    if let Some(existing) = db.find_pending_for_sender(channel_name, sender_id).await? {
         let message = format_challenge(name, sender_id, &existing.code, ttl);
         return Ok(AccessCheckResult::Challenge {
             code: existing.code,
@@ -247,7 +249,8 @@ fn check_pairing(
 
     // Generate new pairing code and create request
     let code = generate_code(channel_name);
-    db.create_pairing_request(channel_name, sender_id, &code, None, ttl)?;
+    db.create_pairing_request(channel_name, sender_id, &code, None, ttl)
+        .await?;
 
     let message = format_challenge(name, sender_id, &code, ttl);
     Ok(AccessCheckResult::Challenge { code, message })

@@ -124,13 +124,13 @@ pub fn is_consolidation_task_id(task_id: &str) -> bool {
 
 /// Run both consolidation passes synchronously using the real agent loop.
 pub async fn run_dream(config: &crate::config::Config) -> Result<DreamReport> {
-    let db = crate::db::Database::open()?;
+    let db = crate::db::Database::open().await?;
     let nightly = run_pass(config, ConsolidationPass::Nightly).await?;
     let weekly = run_pass(config, ConsolidationPass::Weekly).await?;
     let now = chrono::Utc::now().timestamp().to_string();
 
-    db.set_setting(SETTING_LAST_NIGHTLY, &now)?;
-    db.set_setting(SETTING_LAST_WEEKLY, &now)?;
+    db.set_setting(SETTING_LAST_NIGHTLY, &now).await?;
+    db.set_setting(SETTING_LAST_WEEKLY, &now).await?;
 
     let mut warnings = nightly.warnings;
     warnings.extend(weekly.warnings);
@@ -152,12 +152,13 @@ pub async fn run_single_pass(
     config: &crate::config::Config,
     pass: ConsolidationPass,
 ) -> Result<DreamReport> {
-    let db = crate::db::Database::open()?;
+    let db = crate::db::Database::open().await?;
     let execution = run_pass(config, pass).await?;
     db.set_setting(
         pass.settings_key(),
         &chrono::Utc::now().timestamp().to_string(),
-    )?;
+    )
+    .await?;
 
     Ok(match pass {
         ConsolidationPass::Nightly => DreamReport {
@@ -198,7 +199,8 @@ async fn run_pass(
                 .map(|tool| (*tool).to_string())
                 .collect(),
         ),
-    )?;
+    )
+    .await?;
     agent.inject_history_message(crate::types::Message::system(pass.system_instruction()));
 
     let (event_tx, mut event_rx) = mpsc::channel(256);

@@ -383,17 +383,17 @@ pub fn handle_list_agents(agent_control: &AgentControl) -> Result<String> {
 }
 
 /// Handle the close_agent tool call.
-pub fn handle_close_agent(
+pub async fn handle_close_agent(
     args: &serde_json::Value,
     agent_control: &mut AgentControl,
 ) -> Result<String> {
     let agent_id = require_str_param(args, "agent_id")?;
-    agent_control.shutdown_agent(agent_id)?;
+    agent_control.shutdown_agent(agent_id).await?;
     Ok(json!({"status": "shutdown"}).to_string())
 }
 
 /// Handle the manage_roles tool call.
-pub fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
+pub async fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
     let action = require_str_param(args, "action")?;
 
     match action {
@@ -431,7 +431,7 @@ pub fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
             });
             let max_iterations = args["max_iterations"].as_u64().map(|v| v as i64);
 
-            let db = crate::db::Database::open()?;
+            let db = crate::db::Database::open().await?;
             db.insert_role(
                 name,
                 description,
@@ -442,13 +442,14 @@ pub fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
                 tools_json.as_deref(),
                 max_iterations,
                 false,
-            )?;
+            )
+            .await?;
             Ok(json!({"status": "created", "name": name}).to_string())
         }
         "update" => {
             let name = require_str_param(args, "name")?;
-            let db = crate::db::Database::open()?;
-            if db.get_role(name)?.is_none() {
+            let db = crate::db::Database::open().await?;
+            if db.get_role(name).await?.is_none() {
                 return Ok(json!({"error": format!("Role '{name}' not found")}).to_string());
             }
             let description = args["description"].as_str();
@@ -474,13 +475,14 @@ pub fn handle_manage_roles(args: &serde_json::Value) -> Result<String> {
                 system_instructions,
                 tools_json.as_deref(),
                 max_iterations,
-            )?;
+            )
+            .await?;
             Ok(json!({"status": "updated", "name": name}).to_string())
         }
         "delete" => {
             let name = require_str_param(args, "name")?;
-            let db = crate::db::Database::open()?;
-            db.delete_role(name)?;
+            let db = crate::db::Database::open().await?;
+            db.delete_role(name).await?;
             Ok(json!({"status": "deleted", "name": name}).to_string())
         }
         _ => Ok(json!({"error": format!("Unknown action: {action}")}).to_string()),
