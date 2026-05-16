@@ -3177,6 +3177,7 @@ dependencies = [
  "ratatui",
  "reqwest 0.12.28",
  "rusqlite",
+ "sandbox",
  "serde",
  "serde_json",
  "syntect",

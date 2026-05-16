@@ -18,6 +18,7 @@ plugins = { path = "../plugins" }
 protocols = { path = "../protocols" }
 borgd = { path = "../borgd" }
 identity = { path = "../identity" }
+sandbox = { path = "../sandbox" }
 tonic = { workspace = true }
 prost = { workspace = true }
 hyper-util = { workspace = true }

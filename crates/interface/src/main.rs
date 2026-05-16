@@ -353,12 +353,74 @@ enum BackupCmd {
 const RUNTIME_STACK_SIZE: usize = 4 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // Hidden Windows sandbox trampoline. Dispatched BEFORE clap so the
+    // subcommand never appears in `--help` and so an older borg.exe that
+    // doesn't recognize the token still fails closed (clap would reject
+    // it as an unknown subcommand, which is also acceptable, but
+    // intercepting here means we control the error message). The
+    // dispatcher is compiled on every target — on non-Windows it returns
+    // an error rather than silently no-oping, so a misconfigured
+    // self-exec on the wrong platform is loud, not silent.
+    if let Some(arg1) = std::env::args().nth(1) {
+        if arg1 == sandbox::windows::SPAWN_SUBCOMMAND {
+            return run_windows_sandbox_trampoline();
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(RUNTIME_STACK_SIZE)
         .thread_name("borg-worker")
         .build()?;
     runtime.block_on(async_main())
+}
+
+/// Entry point for `borg __windows-sandbox-spawn ...` — re-executed by
+/// `SandboxPolicy::wrap_command` on Windows when sandbox is enabled.
+///
+/// **Currently fails closed.** The trampoline parses its argv to validate
+/// the wire format (catches caller bugs early) and then exits with an
+/// error because the runtime restricted-token / DACL logic has not yet
+/// been ported. This is *intentional*: the alternative — silently
+/// running the wrapped program unsandboxed — would let a Windows user
+/// believe `sandbox.enabled = true` is protecting them when it isn't.
+/// Failing loud surfaces the gap to the operator.
+fn run_windows_sandbox_trampoline() -> Result<()> {
+    let raw_argv: Vec<String> = std::env::args().collect();
+    // argv[0] is borg.exe, argv[1] is the subcommand token; everything
+    // after is the trampoline payload. parse_trampoline_args expects the
+    // slice with the subcommand token already stripped.
+    let payload = if raw_argv.len() >= 2 {
+        &raw_argv[2..]
+    } else {
+        &[]
+    };
+
+    match sandbox::windows::parse_trampoline_args(payload) {
+        Ok(invocation) => {
+            // Surface the parsed program/policy to logs so an operator
+            // who hits this can confirm the parent constructed the right
+            // invocation before the runtime gap caused the failure.
+            tracing::error!(
+                program = %invocation.program,
+                tool_dir = %invocation.tool_dir.display(),
+                "Windows sandbox trampoline reached but runtime is not yet implemented"
+            );
+            eprintln!(
+                "borg: Windows sandbox runtime is not yet implemented. The \
+                 trampoline successfully parsed its arguments but cannot \
+                 apply the restricted token. Refusing to run `{}` \
+                 unsandboxed.",
+                invocation.program
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Windows sandbox trampoline argv parse failed");
+            eprintln!("borg: malformed sandbox trampoline invocation: {e}");
+            std::process::exit(2);
+        }
+    }
 }
 
 async fn async_main() -> Result<()> {
