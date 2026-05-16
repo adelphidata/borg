@@ -46,6 +46,12 @@ where
 
     loop {
         let chunk = tokio::select! {
+            // `biased;` ensures cancellation always wins over a ready stream
+            // chunk. Without it, an EOF + already-cancelled token race
+            // non-deterministically picks the EOF arm and emits a spurious
+            // `StreamEvent::Done` — see the `cancellation_stops_stream_without_emitting_done`
+            // regression guard and the invariant comment in the cancel arm below.
+            biased;
             _ = cancel.cancelled() => {
                 // Do NOT emit StreamEvent::Done here. The agent-loop consumer
                 // treats `Done` as the authoritative end-of-turn signal; if we
