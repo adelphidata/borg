@@ -133,13 +133,7 @@ pub async fn run_wal_and_vacuum(db: &Database, now: i64, interval_days: u32) -> 
         }
     }
 
-    // 2. Always: incremental_vacuum to release pages already on the
-    //    freelist back to the OS. Cheap when the freelist is empty.
-    if let Err(e) = db.conn().execute_batch("PRAGMA incremental_vacuum;").await {
-        tracing::warn!("maintenance: incremental_vacuum failed: {e}");
-    }
-
-    // 3. Conditional: full VACUUM. Read fragmentation stats — failure here
+    // 2. Conditional: full VACUUM. Read fragmentation stats — failure here
     //    means we can't decide, so skip VACUUM rather than guess.
     let stats = match fragmentation_stats(db).await {
         Ok(s) => s,

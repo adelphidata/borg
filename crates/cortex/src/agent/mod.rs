@@ -1253,10 +1253,17 @@ impl Agent {
                     );
                     for (filename, path) in files {
                         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                            let _ = crate::memory::embeddings::embed_memory_file_chunked(
+                            if let Err(e) = crate::memory::embeddings::embed_memory_file_chunked(
                                 &config, &filename, &content, "extra",
                             )
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    file = %filename,
+                                    "embed_memory_file_chunked failed for extra-path file"
+                                );
+                            }
                         }
                     }
                 });
@@ -1275,7 +1282,11 @@ impl Agent {
                         }
                     }
                     let _guard = IndexGuard;
-                    let _ = crate::session_indexer::index_pending_sessions(&config, 10).await;
+                    if let Err(e) =
+                        crate::session_indexer::index_pending_sessions(&config, 10).await
+                    {
+                        tracing::warn!(error = %e, "index_pending_sessions failed");
+                    }
                 });
             }
         }

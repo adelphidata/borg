@@ -17,7 +17,7 @@ impl Database {
         let defaults = Config::default();
         let now = chrono::Utc::now().timestamp();
 
-        self.conn.execute_batch("BEGIN").await?;
+        self.conn.execute_batch("BEGIN IMMEDIATE").await?;
         let result = async {
             let mut stmt = self
                 .conn

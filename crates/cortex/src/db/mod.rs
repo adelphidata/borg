@@ -311,7 +311,7 @@ impl Database {
         // NOTE: auto_vacuum / incremental_vacuum are unsupported in Turso
         // 0.6 — the equivalent reclamation lives in the maintenance
         // sweep's conditional full VACUUM.
-        let db = Self {
+        let mut db = Self {
             conn,
             hmac_salt: Vec::new(),
             evolution_signing_key: Mutex::new(None),
@@ -322,19 +322,9 @@ impl Database {
             db.run_migrations().await?;
             // INSERT OR IGNORE preserves existing user overrides; idempotent.
             db.ensure_all_settings().await?;
+            db.hmac_salt = db.get_or_create_hmac_salt().await?;
         }
-        let salt = if read_only {
-            Vec::new()
-        } else {
-            db.get_or_create_hmac_salt().await?
-        };
-        Ok(Self {
-            conn: db.conn,
-            hmac_salt: salt,
-            evolution_signing_key: Mutex::new(None),
-            evolution_keystore_override: Mutex::new(None),
-            read_only,
-        })
+        Ok(db)
     }
 
     /// Inject a keystore for the evolution signing path. Intended for
